@@ -544,6 +544,7 @@ fn emit_respawn_event(
         state: "request_store.respawn".to_string(),
         fields,
         submitter_cwd: None,
+        source: None,
     };
     append_event(requester_state_file, &payload, &respawned_at).with_context(|| {
         format!(
@@ -596,6 +597,8 @@ mod tests {
             created_at: "2026-05-24T00:00:00Z".into(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: "wf".into(),
             intent: None,

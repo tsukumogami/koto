@@ -27,6 +27,12 @@ header:
       type: string
       required: false
       nullable: true
+    template_source_file:
+      type: string
+      required: false
+    origin:
+      type: object
+      required: false
     execution_dir:
       type: string
       required: false
@@ -65,6 +71,9 @@ events:
         type: object
         required: false
         nullable: true
+      context_assignments:
+        type: object
+        required: false
 
   directed_transition:
     tier: 1
@@ -104,6 +113,10 @@ events:
         type: object
         required: true
       submitter_cwd:
+        type: string
+        required: false
+        nullable: true
+      source:
         type: string
         required: false
         nullable: true
@@ -275,6 +288,13 @@ events:
         type: string
         required: true
 
+  variables_rebound:
+    tier: 2
+    fields:
+      variables:
+        type: object
+        required: true
+
   execution_anchor_adopted:
     tier: 2
     fields:
@@ -291,6 +311,46 @@ events:
         nullable: true
       to:
         type: string
+        required: true
+
+  decider_consulted:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      visit_seq:
+        type: integer
+        required: true
+      provider:
+        type: string
+        required: true
+      model:
+        type: string
+        required: true
+      input_sha256:
+        type: string
+        required: false
+        nullable: true
+      outcome:
+        type: string
+        required: true
+        enum: ["applied", "not_applied", "input_unavailable", "error"]
+      error_class:
+        type: string
+        required: false
+        nullable: true
+      latency_ms:
+        type: integer
+        required: true
+      directive_bytes:
+        type: integer
+        required: true
+      endpoint_origin:
+        type: string
+        required: false
+      fields:
+        type: object
         required: true
 
   scheduler_ran:
@@ -339,6 +399,14 @@ version signal.
   "session_id": "550e8400-e29b-41d4-a716-446655440000",
   "parent_workflow": null,
   "template_source_dir": "/home/user/.claude/plugins/cache/shirabe/skills/work-on",
+  "template_source_file": "work-on.md",
+  "origin": {
+    "anchor": "/home/user/src/koto",
+    "store": {
+      "kind": "local",
+      "base": "/home/user/.koto/sessions"
+    }
+  },
   "execution_dir": "/home/user/src/koto"
 }
 ```
@@ -352,6 +420,8 @@ version signal.
 | `session_id` | string | No | UUID v4 generated at `koto init` time. Absent (empty string) in files written before this field existed. |
 | `parent_workflow` | string | No | Name of the parent workflow for batch-spawned children. Absent for top-level sessions. |
 | `template_source_dir` | string | No | Absolute path to the directory containing the source template at init time. Absent for stdin/inline templates and older files. |
+| `template_source_file` | string | No | File name (no directory) of the source template `koto init` compiled the session from, such as `work-on.md`. Together with `template_hash` it is the session's template identity, which `koto request attach` compares against the template a request leg names. Absent for `--from-stdin` sessions and older files; a leg attach refuses such a session rather than guessing. |
+| `origin` | object | No | Where the session was started: `anchor` (the canonical execution anchor at creation) and `store` (`kind`, `"local"` or `"cloud"`, and `base`, the canonical sessions directory). Written by `koto init` and every child spawn. `koto init --attach-live` compares it against the caller's own record and refuses a same-named session from another worktree or store. Absent on older files; nothing backfills it, and `--attach-live` refuses such a session. |
 | `execution_dir` | string | No | The session's execution anchor: the canonical absolute directory its ticks run gates and actions in. Recorded at `koto init` time from the process working directory, or from `--execution-dir`. A child copies its parent's value. Absent on files written before the field existed and on sessions created through `koto session start`; the first tick of such a session adopts the directory it is ticked from, writes it here, and records an `execution_anchor_adopted` event. Once recorded, `koto session rebind` is the only thing that changes it, and it records an `execution_anchor_rebound` event when it does. |
 
 `execution_dir` is where a session's commands *start*, not a boundary on what
@@ -481,6 +551,14 @@ Records every automatic or evidence-driven state change. The primary workflow pr
 | `to` | string | Yes | Destination state name. |
 | `condition_type` | string | Yes | Transition trigger: `"auto"`, `"gate"`, or `"skip_if"`. |
 | `skip_if_matched` | object | No | Present when `condition_type` is `"skip_if"`. Carries the key-value pairs from the `skip_if` map that triggered the transition. |
+| `context_assignments` | object | No | The taken edge's `context_assignments`, resolved when the transition fired: each context key mapped to the string value written. Absent when the edge declares none. |
+
+The event is the durable record of an assignment: the values ride the same
+append as the transition, and the context store is written from them right
+after. If that write doesn't land, the next read repairs the store from the
+log. A later `context_added` or `context_removed` for the same key supersedes
+an assignment, so a consumer reconstructing context folds all three in `seq`
+order, last write wins.
 
 ---
 
@@ -550,6 +628,7 @@ Records what an agent submitted for a state.
 | `state` | string | Yes | State the evidence was submitted for. |
 | `fields` | object | Yes | Agent-provided key-value evidence. Values are arbitrary JSON. |
 | `submitter_cwd` | string | No | Working directory of the submitting process. Used internally by the batch scheduler. Consumers MAY ignore this field. |
+| `source` | string | No | Who produced the evidence when it wasn't the agent. `"decider"` marks an answer koto applied from an opted-in decider; absent means the agent submitted it. Only koto sets it: a `source` key in `--with-data` lands in `fields`. Consumers MUST tolerate values they don't recognize. |
 
 ---
 
@@ -924,6 +1003,39 @@ that confirmed.
 
 ---
 
+#### `variables_rebound`
+
+Records that an accepted attach to a live session re-applied the template's
+`rebind: true` variables from the attaching invocation. Variables are otherwise
+fixed by `workflow_initialized`; this event is the only way a declared variable
+changes afterwards, and nothing but an accepted attach writes it.
+
+```json
+{
+  "type": "variables_rebound",
+  "payload": {
+    "variables": {
+      "MERGE": "true"
+    }
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `variables` | object | Yes | The variables this attach changed, each mapped to its new value. A `rebind: true` variable whose value didn't change is left out, and an attach that changes nothing appends no event. |
+
+Consumers fold these in event order together with `workflow_initialized` and
+`variable_captured`: the later of two rebinds wins, and the new value is what
+the next tick substitutes and what `vars.*` conditions see. Every value has
+already passed the variable's declared constraint and the allowlist.
+
+The event is additive and doesn't change the state file's schema version. An
+older koto build reads it as an unknown event and keeps reading the log, though
+it won't apply the new values.
+
+---
+
 #### `execution_anchor_adopted`
 
 Written once, on the first tick of a session whose header carries no
@@ -980,6 +1092,70 @@ bound to writes nothing, so consecutive events always differ.
 
 The event is appended before the header field is written, the same ordering
 `execution_anchor_adopted` uses and for the same reason.
+
+---
+
+#### `decider_consulted`
+
+Records one consultation of an opted-in decider: koto asked a typed decision
+model to answer a state's declared fields instead of stopping for the agent's
+evidence. It appears only for users who opted in, only on states whose
+template declares a `decider` block, and at most once per visit to a state.
+
+```json
+{
+  "type": "decider_consulted",
+  "payload": {
+    "state": "review",
+    "visit_seq": 4,
+    "provider": "jev",
+    "model": "jev-1.2.3",
+    "input_sha256": "3b1f...e09a",
+    "outcome": "not_applied",
+    "latency_ms": 212,
+    "directive_bytes": 318,
+    "endpoint_origin": "default",
+    "fields": {
+      "verdict": {
+        "declaration_hash": "9c2d...71f0",
+        "modes": {"proceed": "shadow", "exit": "never"},
+        "probabilities": {"proceed": 0.95, "exit": 0.03, "unclear": 0.02},
+        "winning": "proceed",
+        "confidence": 0.95,
+        "threshold": 0.9,
+        "at_threshold": true,
+        "outcome": "shadow"
+      }
+    }
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `state` | string | Yes | The state consulted. |
+| `visit_seq` | integer | Yes | The `seq` of the event that began this visit to the state. A visit is consulted at most once. |
+| `provider` | string | Yes | The provider name, such as `"jev"`. |
+| `model` | string | Yes | The model build the provider reported, or `"unknown"`. |
+| `input_sha256` | string | No | SHA-256 of the assembled inputs. Absent when they couldn't be assembled. |
+| `outcome` | string | Yes | `"applied"`, `"not_applied"`, `"input_unavailable"`, or `"error"`. |
+| `error_class` | string | No | How the provider call failed, present only with `"error"`. Consumers MUST tolerate values they don't recognize. |
+| `latency_ms` | integer | Yes | Wall time of the provider call. |
+| `directive_bytes` | integer | Yes | Byte length of the directive and details the agent would have received for this state. |
+| `endpoint_origin` | string | No | Where the endpoint came from: `"default"`, `"user"`, or `"env"`. |
+| `fields` | object | Yes | Keyed by declared field. Each holds its `declaration_hash`, the effective `modes`, `probabilities` rounded to four places (absent when there was no usable answer), `winning`, `confidence`, `threshold`, `at_threshold`, and a per-field `outcome`. |
+
+The event carries no input content and no credentials: inputs appear only as
+`input_sha256`, and the API key, the response body, and error text are never
+recorded.
+
+An `applied` outcome is always followed by an `evidence_submitted` with
+`source: "decider"` carrying the answer, then a `transitioned` out of the
+state. Any other outcome leaves the state waiting for the agent, exactly as it
+would for a user who hadn't opted in.
+
+koto also appends each consultation to `~/.koto/_decider_ledger.jsonl`, which
+outlives the session log; see `docs/workspace-layout.md`.
 
 ---
 

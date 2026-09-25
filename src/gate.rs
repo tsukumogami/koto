@@ -1,7 +1,10 @@
-//! Gate evaluator for command, context-exists, and context-matches gates.
+//! Gate evaluator for command, context-exists, context-matches, and
+//! request-leg gates (children-complete is evaluated through a caller-supplied
+//! closure).
 //!
 //! Command gates spawn shell commands in isolated process groups with
 //! configurable timeouts. Context gates check the session context store.
+//! Request-leg gates read one leg of a request log, without writing to it.
 //! Evaluates all gates without short-circuiting so callers see every blocking
 //! condition in a single response.
 
@@ -11,10 +14,12 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::action::{run_shell_command, CommandOutput, FailureKind};
+use crate::engine::request_store::{self, LegView, RequestStoreError, ValidatedRequestId};
+use crate::engine::types::{CloseDisposition, LegDisposition, LegResultSource, RequestState};
 use crate::session::context::ContextStore;
 use crate::template::types::{
     Gate, GATE_TYPE_CHILDREN_COMPLETE, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS,
-    GATE_TYPE_CONTEXT_MATCHES,
+    GATE_TYPE_CONTEXT_MATCHES, GATE_TYPE_REQUEST_LEG, SUPPORTED_GATE_TYPES,
 };
 
 /// Outcome of a structured gate evaluation.
@@ -74,10 +79,36 @@ pub fn evaluate_gates(
     session: Option<&str>,
     children_evaluator: Option<&dyn Fn(&Gate) -> StructuredGateResult>,
 ) -> BTreeMap<String, StructuredGateResult> {
+    evaluate_gates_with_request_store(
+        gates,
+        working_dir,
+        context_store,
+        session,
+        children_evaluator,
+        None,
+    )
+}
+
+/// [`evaluate_gates`], with the request store `request-leg` gates read.
+///
+/// `request_root` is the workspace root the store lives under (`~/.koto`).
+/// `None` means no request store is available -- a non-unix host, or a
+/// session on the cloud backend, where request records do not replicate --
+/// and every `request-leg` gate then reports outcome `Error` with the reason
+/// in `error`, rather than passing or blocking silently.
+pub fn evaluate_gates_with_request_store(
+    gates: &BTreeMap<String, Gate>,
+    working_dir: &Path,
+    context_store: Option<&dyn ContextStore>,
+    session: Option<&str>,
+    children_evaluator: Option<&dyn Fn(&Gate) -> StructuredGateResult>,
+    request_root: Option<&Path>,
+) -> BTreeMap<String, StructuredGateResult> {
     let mut results = BTreeMap::new();
     for (name, gate) in gates {
         let result = match gate.gate_type.as_str() {
             GATE_TYPE_COMMAND => evaluate_command_gate(gate, working_dir),
+            GATE_TYPE_REQUEST_LEG => evaluate_request_leg_gate(gate, request_root),
             GATE_TYPE_CONTEXT_EXISTS => evaluate_context_exists_gate(gate, context_store, session),
             GATE_TYPE_CONTEXT_MATCHES => {
                 evaluate_context_matches_gate(gate, context_store, session)
@@ -111,9 +142,9 @@ pub fn evaluate_gates(
                 output: serde_json::json!({
                     "exit_code": -1,
                     "error": format!(
-                        "unsupported gate type '{}'; only command, context-exists, \
-                         context-matches, and children-complete gates are evaluated",
-                        other
+                        "unsupported gate type '{}'; only {} gates are evaluated",
+                        other,
+                        SUPPORTED_GATE_TYPES.join(", ")
                     )
                 }),
             },
@@ -121,6 +152,242 @@ pub fn evaluate_gates(
         results.insert(name.clone(), result);
     }
     results
+}
+
+/// The structured output of a `request-leg` gate, before it becomes JSON.
+///
+/// Every field is always emitted, so a `when` clause or an assignment can
+/// read any of them on any outcome. The key set is the schema
+/// `gate_type_schema("request-leg")` declares; `request_leg_output_keys_match_the_schema`
+/// holds the two together.
+#[derive(Debug, Default)]
+struct RequestLegOutput {
+    found: bool,
+    disposition: &'static str,
+    bound: bool,
+    source: &'static str,
+    status: String,
+    final_state: String,
+    template: String,
+    outcome: String,
+    step: String,
+    reason: String,
+    valid: bool,
+    payload: serde_json::Map<String, serde_json::Value>,
+    error: String,
+}
+
+impl RequestLegOutput {
+    fn into_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "found": self.found,
+            "disposition": self.disposition,
+            "bound": self.bound,
+            "source": self.source,
+            "status": self.status,
+            "final_state": self.final_state,
+            "template": self.template,
+            "outcome": self.outcome,
+            "step": self.step,
+            "reason": self.reason,
+            "valid": self.valid,
+            "payload": serde_json::Value::Object(self.payload),
+            "error": self.error,
+        })
+    }
+}
+
+/// An `Error` result for a `request-leg` gate that could not read the leg.
+///
+/// `disposition` stays empty rather than `missing`: the gate does not know
+/// whether the leg exists, and an arm keyed on `disposition: missing` must
+/// not fire on a store it could not read.
+fn request_leg_error(error: String) -> StructuredGateResult {
+    StructuredGateResult {
+        outcome: GateOutcome::Error,
+        output: RequestLegOutput {
+            error,
+            ..Default::default()
+        }
+        .into_json(),
+    }
+}
+
+/// A `Failed` result reporting a request or leg that is not there.
+fn request_leg_missing(error: String) -> StructuredGateResult {
+    StructuredGateResult {
+        outcome: GateOutcome::Failed,
+        output: RequestLegOutput {
+            disposition: "missing",
+            error,
+            ..Default::default()
+        }
+        .into_json(),
+    }
+}
+
+/// Evaluate a `request-leg` gate: read one leg of one request and report its
+/// disposition and recorded result.
+///
+/// The gate only reads. It takes no lock and appends nothing, so evaluating
+/// it can never bind, resolve, or abandon the leg it watches.
+///
+/// - A resolved leg passes, carrying the result's status and payload.
+/// - An abandoned leg, or an unresolved leg on a request that was abandoned
+///   or closed, passes with `disposition: abandoned`, so a workflow can route
+///   it instead of waiting on an answer that cannot come.
+/// - An open leg fails; `gate_blocking_category` classes the type as
+///   temporal, so the state waits rather than asking for a correction.
+/// - A request or leg that is not there fails with `disposition: missing`.
+/// - A request id or leg name that is unusable after substitution, an
+///   unreadable record, or no request store at all is an `Error`, with the
+///   reason in `error` and nothing read.
+pub fn evaluate_request_leg_gate(gate: &Gate, request_root: Option<&Path>) -> StructuredGateResult {
+    let Some(root) = request_root else {
+        return request_leg_error(
+            "request-leg gate requires the local request store, which this session cannot \
+             reach (request records are local to the host and are not available on a \
+             non-unix host or under the cloud backend)"
+                .to_string(),
+        );
+    };
+    // The compiler checked a literal value; a substituted one is checked here,
+    // before any path is built from it.
+    let request_id = match ValidatedRequestId::new(&gate.request) {
+        Ok(id) => id,
+        Err(e) => {
+            return request_leg_error(format!(
+                "request-leg gate: request {:?} is not a usable request id: {}",
+                gate.request, e
+            ))
+        }
+    };
+    if let Err(e) = request_store::validate_leg_name(&gate.leg) {
+        return request_leg_error(format!(
+            "request-leg gate: leg {:?} is not a usable leg name: {}",
+            gate.leg, e
+        ));
+    }
+    let view = match request_store::read_view(root, &request_id) {
+        Ok(view) => view,
+        Err(RequestStoreError::NotFound { .. }) => {
+            return request_leg_missing(format!("request {:?} not found", gate.request));
+        }
+        Err(e) => {
+            return request_leg_error(format!(
+                "request-leg gate could not read request {:?}: {}",
+                gate.request, e
+            ))
+        }
+    };
+    let Some(leg) = view.legs.get(&gate.leg) else {
+        return request_leg_missing(format!(
+            "leg {:?} not found on request {:?}",
+            gate.leg, gate.request
+        ));
+    };
+
+    let mut out = RequestLegOutput {
+        found: true,
+        bound: leg.bound_child.is_some(),
+        ..Default::default()
+    };
+    let request_given_up = view.request_state == RequestState::Closed
+        || view.close_disposition == Some(CloseDisposition::RequestAbandoned);
+    match leg.disposition {
+        LegDisposition::Resolved => {
+            fill_resolved(&mut out, leg, gate);
+            StructuredGateResult {
+                outcome: GateOutcome::Passed,
+                output: out.into_json(),
+            }
+        }
+        LegDisposition::Abandoned => {
+            out.disposition = "abandoned";
+            StructuredGateResult {
+                outcome: GateOutcome::Passed,
+                output: out.into_json(),
+            }
+        }
+        LegDisposition::Open if request_given_up => {
+            // Nothing can resolve a leg on a closed request, so waiting on it
+            // would block forever. Report it the way an abandoned leg reads.
+            out.disposition = "abandoned";
+            StructuredGateResult {
+                outcome: GateOutcome::Passed,
+                output: out.into_json(),
+            }
+        }
+        LegDisposition::Open => {
+            out.disposition = "open";
+            StructuredGateResult {
+                outcome: GateOutcome::Failed,
+                output: out.into_json(),
+            }
+        }
+    }
+}
+
+/// Fill the result fields of a resolved leg's output.
+fn fill_resolved(out: &mut RequestLegOutput, leg: &LegView, gate: &Gate) {
+    out.disposition = "resolved";
+    out.source = match leg.result_source {
+        Some(LegResultSource::Promoted) => "promoted",
+        Some(LegResultSource::Explicit) => "explicit",
+        Some(LegResultSource::Refused) => "refused",
+        None => "",
+    };
+    let Some(result) = &leg.result else {
+        return;
+    };
+    out.status = serde_json::to_value(result.status)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    // `final_state` and `template` identify the session that answered, so
+    // they are reported only for a promoted result; an explicit or refused
+    // one came from no terminal state.
+    if leg.result_source == Some(LegResultSource::Promoted) {
+        out.final_state = leg.result_final_state.clone().unwrap_or_default();
+        // The source file name: the identity a leg's `template` admits.
+        out.template = leg
+            .bound_template
+            .as_ref()
+            .map(|t| t.source.clone())
+            .unwrap_or_default();
+    }
+    let payload_is_object = match &result.payload {
+        None => true,
+        Some(serde_json::Value::Object(map)) => {
+            out.payload = map.clone();
+            true
+        }
+        // A non-object payload has no keys to route on; it is reported as `{}`
+        // so the field keeps its declared type, and it makes the leg invalid.
+        Some(_) => false,
+    };
+    let string_key = |key: &str| {
+        out.payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    out.outcome = string_key("outcome");
+    out.step = string_key("step");
+    out.reason = string_key("reason");
+    out.valid = payload_is_object && expect_satisfied(gate, &out.payload);
+}
+
+/// Whether `payload` carries every key `expect` names with a listed value.
+/// No `expect` accepts any payload; keys `expect` does not name are ignored.
+fn expect_satisfied(gate: &Gate, payload: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let Some(expect) = &gate.expect else {
+        return true;
+    };
+    expect
+        .iter()
+        .all(|(key, allowed)| payload.get(key).is_some_and(|v| allowed.contains(v)))
 }
 
 fn evaluate_context_exists_gate(
@@ -342,6 +609,9 @@ pub fn built_in_default(gate_type: &str) -> Option<serde_json::Value> {
             "children": [],
             "error": ""
         })),
+        // Shared with `gate_type_builtin_default` rather than restated: a
+        // resolved, valid record naming no child outcome.
+        GATE_TYPE_REQUEST_LEG => Some(crate::template::types::request_leg_builtin_default()),
         _ => None,
     }
 }
@@ -352,7 +622,9 @@ pub fn built_in_default(gate_type: &str) -> Option<serde_json::Value> {
 /// `"corrective"` means the agent needs to take corrective action.
 pub fn gate_blocking_category(gate_type: &str) -> &'static str {
     match gate_type {
-        GATE_TYPE_CHILDREN_COMPLETE => "temporal",
+        // An open request leg is waiting on another session, like unfinished
+        // children: the state waits rather than asking for a correction.
+        GATE_TYPE_CHILDREN_COMPLETE | GATE_TYPE_REQUEST_LEG => "temporal",
         _ => "corrective",
     }
 }
@@ -374,6 +646,10 @@ mod tests {
             override_default: None,
             completion: None,
             name_filter: None,
+            overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -648,6 +924,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -674,6 +954,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -698,6 +982,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -728,6 +1016,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -759,6 +1051,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -785,6 +1081,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -808,6 +1108,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -834,6 +1138,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -1027,6 +1335,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         gates.insert(
@@ -1040,6 +1352,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         gates.insert(
@@ -1053,6 +1369,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -1061,5 +1381,512 @@ mod tests {
         assert_eq!(results["cmd"].outcome, GateOutcome::Passed);
         assert_eq!(results["ctx_exists"].outcome, GateOutcome::Passed);
         assert_eq!(results["ctx_matches"].outcome, GateOutcome::Passed);
+    }
+
+    // -----------------------------------------------------------------
+    // request-leg gates
+    // -----------------------------------------------------------------
+
+    mod request_leg {
+        use super::super::*;
+        use crate::engine::request_store::{
+            abandon_leg, attach_leg, bind_leg, close_request, create_request, record_refusal,
+            record_result, AbandonLeg, AttachLeg, AttachingSession, BindLeg, CloseRequest,
+            LegRefusal, LegResult, LegSpec, NewRequest, RequestBounds,
+        };
+        use crate::engine::types::{
+            LegDeclaration, TemplateIdentity, TerminalOutcome, WorkflowResult,
+        };
+        use crate::template::types::{gate_type_schema, GATE_TYPE_REQUEST_LEG};
+        use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+        const TS: &str = "2026-01-01T00:00:00.000Z";
+
+        fn gate(request: &str, leg: &str) -> Gate {
+            Gate {
+                gate_type: GATE_TYPE_REQUEST_LEG.to_string(),
+                command: String::new(),
+                timeout: 0,
+                key: String::new(),
+                pattern: String::new(),
+                override_default: None,
+                completion: None,
+                name_filter: None,
+                overridable: false,
+                request: request.to_string(),
+                leg: leg.to_string(),
+                expect: None,
+            }
+        }
+
+        fn with_expect(mut g: Gate, pairs: &[(&str, &[&str])]) -> Gate {
+            let mut expect = BTreeMap::new();
+            for (key, values) in pairs {
+                expect.insert(
+                    key.to_string(),
+                    values.iter().map(|v| serde_json::json!(v)).collect(),
+                );
+            }
+            g.expect = Some(expect);
+            g
+        }
+
+        /// A one-leg request (`scope`) in a fresh store.
+        fn seed(root: &Path) -> String {
+            let spec = NewRequest {
+                requested_by: "coord".to_string(),
+                coordinator_of_record: "coord".to_string(),
+                legs: vec![LegSpec {
+                    name: "scope".to_string(),
+                    declaration: LegDeclaration {
+                        role: "scope".to_string(),
+                        template: "scope.md".into(),
+                        inputs: serde_json::json!("brief"),
+                    },
+                }],
+                inputs: None,
+                created_at: TS.to_string(),
+            };
+            create_request(root, &spec, &RequestBounds::default())
+                .unwrap()
+                .as_str()
+                .to_string()
+        }
+
+        fn id(raw: &str) -> ValidatedRequestId {
+            ValidatedRequestId::new(raw).unwrap()
+        }
+
+        fn resolve_explicit(root: &Path, req: &str, payload: Option<serde_json::Value>) {
+            record_result(
+                root,
+                &id(req),
+                &LegResult {
+                    leg_name: "scope".to_string(),
+                    result: WorkflowResult {
+                        status: TerminalOutcome::Success,
+                        summary: "done".to_string(),
+                        payload,
+                    },
+                    source: LegResultSource::Explicit,
+                    issued_by: None,
+                    timestamp: TS.to_string(),
+                    final_state: Some("ignored for explicit".to_string()),
+                },
+            )
+            .unwrap();
+        }
+
+        /// Self-attach a root session to the leg, then promote its result
+        /// from `final_state`.
+        fn attach_and_promote(
+            root: &Path,
+            req: &str,
+            final_state: &str,
+            payload: serde_json::Value,
+        ) {
+            attach_leg(
+                root,
+                &id(req),
+                &AttachLeg {
+                    leg_name: "scope".to_string(),
+                    session: AttachingSession {
+                        session_id: "root-1".to_string(),
+                        template: Some(TemplateIdentity {
+                            name: Some("scope".to_string()),
+                            hash: "abc".to_string(),
+                            source: "scope.md".to_string(),
+                        }),
+                        variables: BTreeMap::new(),
+                        bindings: HashMap::new(),
+                        terminal_state: None,
+                        pointer: None,
+                    },
+                    issued_by: None,
+                    timestamp: TS.to_string(),
+                },
+            )
+            .unwrap();
+            record_result(
+                root,
+                &id(req),
+                &LegResult {
+                    leg_name: "scope".to_string(),
+                    result: WorkflowResult {
+                        status: TerminalOutcome::Success,
+                        summary: "scoped".to_string(),
+                        payload: Some(payload),
+                    },
+                    source: LegResultSource::Promoted,
+                    issued_by: None,
+                    timestamp: TS.to_string(),
+                    final_state: Some(final_state.to_string()),
+                },
+            )
+            .unwrap();
+        }
+
+        fn eval(root: &Path, g: &Gate) -> StructuredGateResult {
+            evaluate_request_leg_gate(g, Some(root))
+        }
+
+        fn keys(v: &serde_json::Value) -> BTreeSet<String> {
+            v.as_object().unwrap().keys().cloned().collect()
+        }
+
+        #[test]
+        fn request_leg_output_keys_match_the_schema() {
+            let schema: BTreeSet<String> = gate_type_schema(GATE_TYPE_REQUEST_LEG)
+                .unwrap()
+                .iter()
+                .map(|(name, _)| name.to_string())
+                .collect();
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let req = seed(root);
+            // Every shape the evaluator emits: no store, a bad id, missing,
+            // open, resolved.
+            let outputs = [
+                evaluate_request_leg_gate(&gate(&req, "scope"), None).output,
+                eval(root, &gate("BAD", "scope")).output,
+                eval(root, &gate("req-nope", "scope")).output,
+                eval(root, &gate(&req, "scope")).output,
+            ];
+            resolve_explicit(root, &req, Some(serde_json::json!({"outcome": "scoped"})));
+            let resolved = eval(root, &gate(&req, "scope")).output;
+            for out in outputs.iter().chain(std::iter::once(&resolved)) {
+                assert_eq!(keys(out), schema, "output {out} must match the schema");
+                // And each value has the schema's type.
+                for (name, t) in gate_type_schema(GATE_TYPE_REQUEST_LEG).unwrap() {
+                    let v = &out[*name];
+                    let ok = match t {
+                        crate::template::types::GateSchemaFieldType::Boolean => v.is_boolean(),
+                        crate::template::types::GateSchemaFieldType::Str => v.is_string(),
+                        crate::template::types::GateSchemaFieldType::Object => v.is_object(),
+                        crate::template::types::GateSchemaFieldType::Number => v.is_number(),
+                        crate::template::types::GateSchemaFieldType::Array => v.is_array(),
+                    };
+                    assert!(ok, "field {name} has the wrong type in {out}");
+                }
+            }
+            // The built-in default has the same shape.
+            assert_eq!(
+                keys(&built_in_default(GATE_TYPE_REQUEST_LEG).unwrap()),
+                schema
+            );
+        }
+
+        #[test]
+        fn no_request_store_is_an_error_not_a_pass() {
+            let r = evaluate_request_leg_gate(&gate("req-a", "scope"), None);
+            assert_eq!(r.outcome, GateOutcome::Error);
+            assert_eq!(r.output["found"], false);
+            assert!(!r.output["error"].as_str().unwrap().is_empty());
+        }
+
+        #[test]
+        fn evaluate_gates_without_a_store_reports_an_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut gates = BTreeMap::new();
+            gates.insert("leg".to_string(), gate("req-a", "scope"));
+            let results = evaluate_gates(&gates, dir.path(), None, None, None);
+            assert_eq!(results["leg"].outcome, GateOutcome::Error);
+            assert!(
+                !results["leg"].output["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unsupported"),
+                "request-leg must not fall through to the unsupported-type arm"
+            );
+        }
+
+        #[test]
+        fn a_bad_substituted_value_is_an_error_and_reads_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            for g in [
+                gate("Upper-Case", "scope"),
+                gate("../escape", "scope"),
+                gate("", "scope"),
+                gate("req-a", "-leg"),
+                gate("req-a", ""),
+            ] {
+                let r = eval(root, &g);
+                assert_eq!(r.outcome, GateOutcome::Error, "{g:?}");
+                assert_eq!(r.output["found"], false);
+                assert_eq!(r.output["disposition"], "");
+                assert!(!r.output["error"].as_str().unwrap().is_empty());
+            }
+            // Nothing was created under the root.
+            assert!(!root.join("requests").exists());
+        }
+
+        #[test]
+        fn a_missing_request_or_leg_reports_missing() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let r = eval(root, &gate("req-nope", "scope"));
+            assert_eq!(r.outcome, GateOutcome::Failed);
+            assert_eq!(r.output["found"], false);
+            assert_eq!(r.output["disposition"], "missing");
+            assert!(r.output["error"].as_str().unwrap().contains("req-nope"));
+
+            let req = seed(root);
+            let r = eval(root, &gate(&req, "execute"));
+            assert_eq!(r.outcome, GateOutcome::Failed);
+            assert_eq!(r.output["found"], false);
+            assert_eq!(r.output["disposition"], "missing");
+            assert!(r.output["error"].as_str().unwrap().contains("execute"));
+        }
+
+        #[test]
+        fn an_open_leg_blocks_and_reports_whether_it_is_bound() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let req = seed(root);
+            let r = eval(root, &gate(&req, "scope"));
+            assert_eq!(r.outcome, GateOutcome::Failed);
+            assert_eq!(r.output["found"], true);
+            assert_eq!(r.output["disposition"], "open");
+            assert_eq!(r.output["bound"], false);
+            assert_eq!(r.output["valid"], false);
+
+            bind_leg(
+                root,
+                &id(&req),
+                &BindLeg {
+                    leg_name: "scope".to_string(),
+                    child_session_id: "child-1".to_string(),
+                    dispatch_epoch: Some(1),
+                    issued_by: None,
+                    timestamp: TS.to_string(),
+                },
+            )
+            .unwrap();
+            let r = eval(root, &gate(&req, "scope"));
+            assert_eq!(r.outcome, GateOutcome::Failed);
+            assert_eq!(r.output["disposition"], "open");
+            assert_eq!(r.output["bound"], true);
+            assert_eq!(gate_blocking_category(GATE_TYPE_REQUEST_LEG), "temporal");
+        }
+
+        #[test]
+        fn a_promoted_result_reports_its_payload_final_state_and_template() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let req = seed(root);
+            attach_and_promote(
+                root,
+                &req,
+                "done_scoped",
+                serde_json::json!({
+                    "outcome": "scoped",
+                    "step": "plan",
+                    "reason": 7,
+                    "pr": "https://example.test/pr/1",
+                    "nested": {"deep": "yes"}
+                }),
+            );
+            let r = eval(root, &gate(&req, "scope"));
+            assert_eq!(r.outcome, GateOutcome::Passed);
+            let out = &r.output;
+            assert_eq!(out["found"], true);
+            assert_eq!(out["disposition"], "resolved");
+            assert_eq!(out["bound"], true);
+            assert_eq!(out["source"], "promoted");
+            assert_eq!(out["status"], "success");
+            assert_eq!(out["final_state"], "done_scoped");
+            assert_eq!(out["template"], "scope.md");
+            assert_eq!(out["outcome"], "scoped");
+            assert_eq!(out["step"], "plan");
+            // Not a string, so it reads empty rather than as its JSON text.
+            assert_eq!(out["reason"], "");
+            assert_eq!(out["payload"]["pr"], "https://example.test/pr/1");
+            assert_eq!(out["payload"]["nested"]["deep"], "yes");
+            assert_eq!(out["valid"], true);
+            assert_eq!(out["error"], "");
+        }
+
+        #[test]
+        fn an_explicit_result_names_no_final_state_or_template() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let req = seed(root);
+            resolve_explicit(root, &req, None);
+            let r = eval(root, &gate(&req, "scope"));
+            assert_eq!(r.outcome, GateOutcome::Passed);
+            assert_eq!(r.output["source"], "explicit");
+            assert_eq!(r.output["final_state"], "");
+            assert_eq!(r.output["template"], "");
+            assert_eq!(r.output["payload"], serde_json::json!({}));
+            assert_eq!(r.output["outcome"], "");
+            assert_eq!(r.output["valid"], true);
+        }
+
+        #[test]
+        fn a_refused_result_reports_source_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let req = seed(root);
+            record_refusal(
+                root,
+                &id(&req),
+                &LegRefusal {
+                    leg_name: "scope".to_string(),
+                    result: WorkflowResult::with_string_payload(
+                        TerminalOutcome::Failure,
+                        "refused",
+                        [("outcome", "refused"), ("reason", "var_mismatch")],
+                    ),
+                    issued_by: None,
+                    timestamp: TS.to_string(),
+                },
+            )
+            .unwrap();
+            let r = eval(root, &gate(&req, "scope"));
+            assert_eq!(r.outcome, GateOutcome::Passed);
+            assert_eq!(r.output["source"], "refused");
+            assert_eq!(r.output["status"], "failure");
+            assert_eq!(r.output["outcome"], "refused");
+            assert_eq!(r.output["reason"], "var_mismatch");
+            assert_eq!(r.output["final_state"], "");
+            assert_eq!(r.output["template"], "");
+        }
+
+        #[test]
+        fn an_abandoned_leg_passes_as_abandoned() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let req = seed(root);
+            abandon_leg(
+                root,
+                &id(&req),
+                &AbandonLeg {
+                    leg_name: "scope".to_string(),
+                    rationale: "superseded".to_string(),
+                    issued_by: None,
+                    timestamp: TS.to_string(),
+                },
+            )
+            .unwrap();
+            let r = eval(root, &gate(&req, "scope"));
+            assert_eq!(r.outcome, GateOutcome::Passed);
+            assert_eq!(r.output["disposition"], "abandoned");
+            assert_eq!(r.output["valid"], false);
+        }
+
+        #[test]
+        fn an_open_leg_on_an_abandoned_request_passes_as_abandoned() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let req = seed(root);
+            close_request(
+                root,
+                &id(&req),
+                &CloseRequest {
+                    disposition: Some(CloseDisposition::RequestAbandoned),
+                    issued_by: None,
+                    timestamp: TS.to_string(),
+                },
+            )
+            .unwrap();
+            let r = eval(root, &gate(&req, "scope"));
+            assert_eq!(r.outcome, GateOutcome::Passed);
+            assert_eq!(r.output["disposition"], "abandoned");
+        }
+
+        #[test]
+        fn valid_follows_expect() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let expect: &[(&str, &[&str])] = &[("outcome", &["scoped", "declined"])];
+
+            let cases: Vec<(Option<serde_json::Value>, bool, &str)> = vec![
+                (
+                    Some(serde_json::json!({"outcome": "scoped"})),
+                    true,
+                    "listed value",
+                ),
+                (
+                    Some(serde_json::json!({"outcome": "scoped", "extra": "x"})),
+                    true,
+                    "extra key expect does not name",
+                ),
+                (
+                    Some(serde_json::json!({"outcome": "other"})),
+                    false,
+                    "value outside the list",
+                ),
+                (
+                    Some(serde_json::json!({"step": "plan"})),
+                    false,
+                    "missing key",
+                ),
+                (
+                    Some(serde_json::json!("scoped")),
+                    false,
+                    "non-object payload",
+                ),
+                (None, false, "no payload at all"),
+            ];
+            for (payload, want, label) in cases {
+                let req = seed(root);
+                resolve_explicit(root, &req, payload);
+                let r = eval(root, &with_expect(gate(&req, "scope"), expect));
+                assert_eq!(r.output["valid"], want, "{label}");
+                assert!(r.output["payload"].is_object(), "{label}");
+            }
+
+            // No expect: any resolved object payload is valid, and a
+            // non-object one is not.
+            let req = seed(root);
+            resolve_explicit(root, &req, Some(serde_json::json!({"anything": 1})));
+            assert_eq!(eval(root, &gate(&req, "scope")).output["valid"], true);
+            let req = seed(root);
+            resolve_explicit(root, &req, Some(serde_json::json!([1, 2])));
+            assert_eq!(eval(root, &gate(&req, "scope")).output["valid"], false);
+
+            // Non-resolved dispositions are never valid, expect or not.
+            let req = seed(root);
+            assert_eq!(
+                eval(root, &with_expect(gate(&req, "scope"), expect)).output["valid"],
+                false
+            );
+        }
+
+        #[test]
+        fn evaluating_the_gate_never_writes_to_the_request_log() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let req = seed(root);
+            let revision =
+                |root: &Path| request_store::read_view(root, &id(&req)).unwrap().revision;
+            let log = root.join("requests").join(&req).join("request.jsonl");
+            let before_open = (revision(root), std::fs::read(&log).unwrap());
+            eval(root, &gate(&req, "scope"));
+            eval(root, &gate(&req, "scope"));
+            assert_eq!(before_open, (revision(root), std::fs::read(&log).unwrap()));
+
+            resolve_explicit(root, &req, Some(serde_json::json!({"outcome": "scoped"})));
+            let before_resolved = (revision(root), std::fs::read(&log).unwrap());
+            eval(root, &gate(&req, "scope"));
+            assert_eq!(
+                before_resolved,
+                (revision(root), std::fs::read(&log).unwrap())
+            );
+        }
+
+        #[test]
+        fn built_in_default_is_a_resolved_valid_record_naming_no_outcome() {
+            let d = built_in_default(GATE_TYPE_REQUEST_LEG).unwrap();
+            assert_eq!(d["found"], true);
+            assert_eq!(d["disposition"], "resolved");
+            assert_eq!(d["bound"], true);
+            assert_eq!(d["source"], "promoted");
+            assert_eq!(d["valid"], true);
+            assert_eq!(d["payload"], serde_json::json!({}));
+            assert_eq!(d["outcome"], "");
+            assert_eq!(d["error"], "");
+        }
     }
 }

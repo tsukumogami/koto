@@ -100,6 +100,12 @@ pub enum NextResponse {
         state: String,
         advanced: bool,
         unassigned_children: Vec<UnassignedChild>,
+        /// The session's result: the declared `result:` map resolved into
+        /// `payload`, or the evidence-derived envelope when the terminal
+        /// declares none. `koto next` always fills it before printing;
+        /// `None` exists for response construction that has no session to
+        /// read (dispatch, unit tests), and is omitted from the wire.
+        result: Option<crate::engine::types::WorkflowResult>,
     },
     ActionRequiresConfirmation {
         state: String,
@@ -184,6 +190,26 @@ pub fn execution_anchor_adopted_notice(name: &str, anchor: &std::path::Path) -> 
 }
 
 impl NextResponse {
+    /// Return this response with `result` set, when it is a `Terminal`.
+    /// Every other variant is returned unchanged: only a terminal response
+    /// carries a result.
+    pub fn with_terminal_result(self, value: crate::engine::types::WorkflowResult) -> Self {
+        match self {
+            NextResponse::Terminal {
+                state,
+                advanced,
+                unassigned_children,
+                ..
+            } => NextResponse::Terminal {
+                state,
+                advanced,
+                unassigned_children,
+                result: Some(value),
+            },
+            other => other,
+        }
+    }
+
     /// Return a new `NextResponse` with the directive and details fields substituted
     /// using the given function. Terminal variants have no directive and are returned
     /// unchanged.
@@ -621,14 +647,19 @@ impl Serialize for NextResponse {
                 state,
                 advanced,
                 unassigned_children,
+                result,
             } => {
-                let mut map = serializer.serialize_map(Some(6))?;
+                let count = 6 + result.as_ref().map_or(0, |_| 1);
+                let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("action", "done")?;
                 map.serialize_entry("state", state)?;
                 map.serialize_entry("advanced", advanced)?;
                 map.serialize_entry("expects", &None::<()>)?;
                 map.serialize_entry("unassigned_children", unassigned_children)?;
                 map.serialize_entry("error", &None::<()>)?;
+                if let Some(r) = result {
+                    map.serialize_entry("result", r)?;
+                }
                 map.end()
             }
             NextResponse::ActionRequiresConfirmation {
@@ -805,6 +836,16 @@ pub struct ExpectsFieldSchema {
     pub values: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item_schema: Option<serde_json::Value>,
+    /// The field's question. Set only for a field with a `decider` block, so
+    /// every other field serializes exactly as it did before the block
+    /// existed, even when its template gives it a description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// One entry per value (`"true"` and `"false"` for a boolean), each the
+    /// answer's description. Set only for a field with a `decider` block. The
+    /// escape value never appears here, as it never appears in `values`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_descriptions: Option<BTreeMap<String, String>>,
 }
 
 /// A transition option surfaced to the agent.
@@ -831,9 +872,9 @@ pub struct BlockingCondition {
     /// something) for all other gate types.
     #[serde(default = "default_category")]
     pub category: String,
-    // False until Feature 2 (override mechanism) lands. Feature 2 sets this
-    // true when the gate has an override_default, signaling the agent can call
-    // `koto overrides record` to substitute gate output with the default.
+    // True when the gate accepts overrides and has a default to apply,
+    // signaling the agent can call `koto overrides record` to substitute gate
+    // output. Always false for a gate declared `overridable: false`.
     pub agent_actionable: bool,
     pub output: serde_json::Value,
 }
@@ -873,9 +914,10 @@ pub struct ErrorDetail {
 /// Passed gates are excluded. Each non-passing gate produces a `BlockingCondition`
 /// with `condition_type` taken from the gate definition (falling back to `"command"`
 /// when the gate name is not found in `gate_defs`), and `output` from the structured
-/// gate result. `agent_actionable` is set to `true` when the gate has either an
-/// instance-level `override_default` or a built-in default for its gate type, signaling
-/// that the agent can call `koto overrides record` to substitute the gate output.
+/// gate result. `agent_actionable` is set to `true` when the gate accepts overrides
+/// and has either an instance-level `override_default` or a built-in default for its
+/// gate type, signaling that the agent can call `koto overrides record` to substitute
+/// the gate output. A gate declared `overridable: false` is never agent-actionable.
 ///
 /// The reserved `__action__` name is not a gate: it carries a failed
 /// `default_action` through this same list (DESIGN-koto-runs-commands.md
@@ -911,9 +953,15 @@ pub fn blocking_conditions_from_gates(
                 .map(|g| g.gate_type.clone())
                 .unwrap_or_else(|| "command".to_string());
             let category = crate::gate::gate_blocking_category(&condition_type).to_string();
+            // An override is the action this flag advertises, so a gate that
+            // refuses overrides is never agent-actionable, whatever its defaults.
             let agent_actionable = gate_defs
                 .get(name)
-                .map(|g| g.override_default.is_some() || built_in_default(&g.gate_type).is_some())
+                .map(|g| {
+                    g.overridable
+                        && (g.override_default.is_some()
+                            || built_in_default(&g.gate_type).is_some())
+                })
                 .unwrap_or(false);
             Some(BlockingCondition {
                 name: name.clone(),
@@ -998,6 +1046,23 @@ pub fn derive_expects(state: &TemplateState) -> Option<ExpectsSchema> {
             } else {
                 None
             };
+            // A declared field carries its question and one description per
+            // value. The answers map is keyed by exactly the field's values
+            // (validation guarantees it), so the escape, which lives apart
+            // from the answers, can't leak in.
+            let (description, value_descriptions) = match &schema.decider {
+                Some(decider) => (
+                    Some(schema.description.clone()),
+                    Some(
+                        decider
+                            .answers
+                            .iter()
+                            .map(|(value, answer)| (value.clone(), answer.description.clone()))
+                            .collect(),
+                    ),
+                ),
+                None => (None, None),
+            };
             (
                 name.clone(),
                 ExpectsFieldSchema {
@@ -1005,6 +1070,8 @@ pub fn derive_expects(state: &TemplateState) -> Option<ExpectsSchema> {
                     required: schema.required,
                     values: schema.values.clone(),
                     item_schema,
+                    description,
+                    value_descriptions,
                 },
             )
         })
@@ -1067,6 +1134,7 @@ mod tests {
             state: "done".to_string(),
             advanced: true,
             unassigned_children: vec![],
+            result: None,
         };
         assert_eq!(
             terminal.clone().with_directive_prefix(RECOVERY_POINTER),
@@ -1100,6 +1168,8 @@ mod tests {
                 required: true,
                 values: vec!["proceed".to_string(), "escalate".to_string()],
                 item_schema: None,
+                description: None,
+                value_descriptions: None,
             },
         );
 
@@ -1163,6 +1233,8 @@ mod tests {
                 required: false,
                 values: vec![],
                 item_schema: None,
+                description: None,
+                value_descriptions: None,
             },
         );
 
@@ -1283,6 +1355,8 @@ mod tests {
                 required: true,
                 values: vec![],
                 item_schema: None,
+                description: None,
+                value_descriptions: None,
             },
         );
 
@@ -1348,6 +1422,8 @@ mod tests {
                 required: true,
                 values: vec![],
                 item_schema: None,
+                description: None,
+                value_descriptions: None,
             },
         );
 
@@ -1381,6 +1457,7 @@ mod tests {
             state: "done".to_string(),
             advanced: true,
             unassigned_children: vec![],
+            result: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -1407,6 +1484,7 @@ mod tests {
             state: "complete".to_string(),
             advanced: false,
             unassigned_children: vec![],
+            result: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -1483,6 +1561,7 @@ mod tests {
             state: "done".to_string(),
             advanced: true,
             unassigned_children: vec![],
+            result: None,
         };
         assert_eq!(
             terminal
@@ -1527,6 +1606,7 @@ mod tests {
             state: "done".to_string(),
             advanced: true,
             unassigned_children: vec![],
+            result: None,
         };
         assert!(!terminal.carries_details());
 
@@ -1666,6 +1746,8 @@ mod tests {
             required: true,
             values: vec![],
             item_schema: None,
+            description: None,
+            value_descriptions: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&schema).unwrap();
@@ -1684,6 +1766,8 @@ mod tests {
             required: true,
             values: vec!["a".to_string(), "b".to_string()],
             item_schema: None,
+            description: None,
+            value_descriptions: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&schema).unwrap();
@@ -1764,6 +1848,7 @@ mod tests {
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         }
     }
 
@@ -1783,6 +1868,7 @@ mod tests {
                 required: true,
                 values: vec!["proceed".to_string(), "escalate".to_string()],
                 description: String::new(),
+                decider: None,
             },
         );
         accepts.insert(
@@ -1792,6 +1878,7 @@ mod tests {
                 required: false,
                 values: vec![],
                 description: "Optional notes".to_string(),
+                decider: None,
             },
         );
 
@@ -1804,10 +1891,12 @@ mod tests {
             Transition {
                 target: "implement".to_string(),
                 when: Some(when_proceed),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "review".to_string(),
                 when: Some(when_escalate),
+                context_assignments: Default::default(),
             },
         ];
 
@@ -1861,6 +1950,7 @@ mod tests {
                 required: true,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
 
@@ -1868,6 +1958,7 @@ mod tests {
         let transitions = vec![Transition {
             target: "next_state".to_string(),
             when: None,
+            context_assignments: Default::default(),
         }];
 
         let state = make_template_state(Some(accepts), transitions);
@@ -1897,6 +1988,10 @@ mod tests {
             override_default: None,
             completion: None,
             name_filter: None,
+            overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -1910,6 +2005,10 @@ mod tests {
             override_default: None,
             completion: None,
             name_filter: None,
+            overridable: true,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
         }
     }
 
@@ -2123,6 +2222,7 @@ mod tests {
                 required: true,
                 values: vec!["a".to_string(), "b".to_string()],
                 description: String::new(),
+                decider: None,
             },
         );
 
@@ -2133,10 +2233,12 @@ mod tests {
             Transition {
                 target: "path_a".to_string(),
                 when: Some(when),
+                context_assignments: Default::default(),
             },
             Transition {
                 target: "fallback".to_string(),
                 when: None,
+                context_assignments: Default::default(),
             },
         ];
 
@@ -2197,6 +2299,10 @@ mod tests {
                 override_default: Some(serde_json::json!({"result": "ok"})),
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -2205,6 +2311,50 @@ mod tests {
         assert!(
             conditions[0].agent_actionable,
             "gate with instance override_default must have agent_actionable true"
+        );
+    }
+
+    #[test]
+    fn agent_actionable_false_for_non_overridable_gate() {
+        // A failing command gate has a built-in default, but it refuses
+        // overrides, so there is nothing for the agent to do with it.
+        let mut gate_results = BTreeMap::new();
+        for name in ["locked", "open"] {
+            gate_results.insert(
+                name.to_string(),
+                StructuredGateResult {
+                    outcome: GateOutcome::Failed,
+                    output: serde_json::json!({"exit_code": 1, "error": ""}),
+                },
+            );
+        }
+        let gate = |overridable: bool| Gate {
+            gate_type: "command".to_string(),
+            command: "exit 1".to_string(),
+            timeout: 0,
+            key: String::new(),
+            pattern: String::new(),
+            override_default: None,
+            completion: None,
+            name_filter: None,
+            overridable,
+            request: String::new(),
+            leg: String::new(),
+            expect: None,
+        };
+        let mut gate_defs = BTreeMap::new();
+        gate_defs.insert("locked".to_string(), gate(false));
+        gate_defs.insert("open".to_string(), gate(true));
+
+        let conditions = blocking_conditions_from_gates(&gate_results, &gate_defs);
+        let by_name: BTreeMap<_, _> = conditions.iter().map(|c| (c.name.as_str(), c)).collect();
+        assert!(
+            !by_name["locked"].agent_actionable,
+            "a non-overridable gate must report agent_actionable false"
+        );
+        assert!(
+            by_name["open"].agent_actionable,
+            "an overridable gate with a default keeps agent_actionable true"
         );
     }
 
@@ -2232,6 +2382,10 @@ mod tests {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -2258,6 +2412,7 @@ mod tests {
                 required,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         accepts
@@ -2356,6 +2511,7 @@ mod tests {
                 required: false,
                 values: vec![],
                 description: String::new(),
+                decider: None,
             },
         );
         let state = make_template_state(Some(accepts), vec![]);
@@ -2660,6 +2816,7 @@ mod tests {
             state: "done".into(),
             advanced: true,
             unassigned_children: vec![],
+            result: None,
         };
         let v: serde_json::Value = serde_json::to_value(&terminal).unwrap();
         assert_eq!(v["unassigned_children"], serde_json::json!([]));

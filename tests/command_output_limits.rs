@@ -313,6 +313,10 @@ fn gate_evaluator_does_not_report_a_loud_gate_as_timed_out() {
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 

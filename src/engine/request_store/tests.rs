@@ -18,7 +18,7 @@ fn ts(n: u32) -> String {
 fn declaration(role: &str) -> LegDeclaration {
     LegDeclaration {
         role: role.to_string(),
-        template: "review".to_string(),
+        template: "review".into(),
         inputs: serde_json::json!({"brief": role}),
     }
 }
@@ -65,6 +65,7 @@ fn resolve(root: &Path, id: &ValidatedRequestId, leg: &str, summary: &str) -> Ap
             source: LegResultSource::Explicit,
             issued_by: Some("coord-a".to_string()),
             timestamp: ts(3),
+            final_state: None,
         },
     )
     .expect("resolve must succeed")
@@ -551,6 +552,7 @@ fn a_second_result_on_a_resolved_leg_is_rejected() {
             source: LegResultSource::Explicit,
             issued_by: None,
             timestamp: ts(7),
+            final_state: None,
         },
     )
     .expect_err("a second result must be rejected");
@@ -597,6 +599,7 @@ fn a_result_on_an_abandoned_leg_is_rejected_distinctly() {
             source: LegResultSource::Promoted,
             issued_by: None,
             timestamp: ts(7),
+            final_state: None,
         },
     )
     .expect_err("a result on an abandoned leg must be rejected");
@@ -923,7 +926,7 @@ fn a_too_deep_json_payload_is_rejected() {
             name: "reviewer-a".to_string(),
             declaration: LegDeclaration {
                 role: "perf".to_string(),
-                template: "review".to_string(),
+                template: "review".into(),
                 inputs: deep,
             },
         }],
@@ -1059,6 +1062,7 @@ fn two_simultaneous_resolves_of_one_leg_leave_exactly_one_winner() {
                             source: LegResultSource::Explicit,
                             issued_by: None,
                             timestamp: ts(3),
+                            final_state: None,
                         },
                     )
                 })
@@ -1125,6 +1129,7 @@ fn an_identical_resolve_retry_is_not_a_spurious_second_result_rejection() {
         source: LegResultSource::Explicit,
         issued_by: None,
         timestamp: ts(3),
+        final_state: None,
     };
 
     record_result(root, &id, &payload).expect("first");
@@ -1654,4 +1659,639 @@ fn the_quiet_reader_recovers_exactly_what_the_warning_one_does() {
     assert_eq!(loud_header, quiet_header);
     assert_eq!(loud_events.len(), quiet_events.len());
     assert_eq!(quiet_events.len(), 2, "both recover the intact events");
+}
+
+// ===== Root attach, self-attached legs, and the refused source =====
+
+use crate::engine::leg_pointer::LegPointer;
+use crate::engine::types::{LegAttach, TemplateIdentity};
+use crate::template::types::VariableDecl;
+
+/// A request with one `scope` leg naming `scope.md` and pinning TOPIC.
+fn seed_scope(root: &Path) -> ValidatedRequestId {
+    let spec = NewRequest {
+        legs: vec![LegSpec {
+            name: "scope".to_string(),
+            declaration: LegDeclaration {
+                role: "scope".to_string(),
+                template: LegTemplates::Many(vec!["scope.md".into(), "scope-alt.md".into()]),
+                inputs: serde_json::json!({"TOPIC": "t1", "MERGE": "true"}),
+            },
+        }],
+        inputs: None,
+        ..two_leg_spec()
+    };
+    create_request(root, &spec, &RequestBounds::default()).expect("create")
+}
+
+/// A live root session built from `source`, with TOPIC=t1 and MERGE a
+/// rebind variable recorded as false.
+fn root_session(session_id: &str, source: &str) -> AttachingSession {
+    let mut variables = BTreeMap::new();
+    variables.insert(
+        "TOPIC".to_string(),
+        VariableDecl {
+            required: true,
+            ..Default::default()
+        },
+    );
+    variables.insert(
+        "MERGE".to_string(),
+        VariableDecl {
+            default: "false".to_string(),
+            rebind: true,
+            ..Default::default()
+        },
+    );
+    let mut bindings = std::collections::HashMap::new();
+    bindings.insert("TOPIC".to_string(), "t1".to_string());
+    bindings.insert("MERGE".to_string(), "false".to_string());
+    AttachingSession {
+        session_id: session_id.to_string(),
+        template: Some(TemplateIdentity {
+            name: Some("scope".to_string()),
+            hash: "abc".to_string(),
+            source: source.to_string(),
+        }),
+        variables,
+        bindings,
+        terminal_state: None,
+        pointer: None,
+    }
+}
+
+fn attach_req(session: AttachingSession) -> AttachLeg {
+    AttachLeg {
+        leg_name: "scope".to_string(),
+        session,
+        issued_by: None,
+        timestamp: ts(2),
+    }
+}
+
+fn log_bytes(root: &Path, id: &ValidatedRequestId) -> Vec<u8> {
+    std::fs::read(log_path(root, id)).expect("read log")
+}
+
+#[test]
+fn a_root_attach_records_self_and_the_template_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed_scope(root);
+
+    let outcome = attach_leg(
+        root,
+        &id,
+        &attach_req(root_session("scope-t1", "scope-alt.md")),
+    )
+    .expect("attach");
+    assert!(outcome.written);
+    let view = read_view(root, &id).expect("view");
+    let leg = view.leg("scope").expect("leg");
+    assert_eq!(leg.bound_child.as_deref(), Some("scope-t1"));
+    assert_eq!(leg.attach, Some(LegAttach::SelfAttached));
+    assert_eq!(leg.bound_epoch, None);
+    assert_eq!(
+        leg.bound_template.as_ref().map(|t| t.source.as_str()),
+        Some("scope-alt.md")
+    );
+
+    // Again: a no-op.
+    let again = attach_leg(
+        root,
+        &id,
+        &attach_req(root_session("scope-t1", "scope-alt.md")),
+    )
+    .expect("again");
+    assert!(!again.written);
+}
+
+#[test]
+fn precheck_attach_agrees_with_attach_and_writes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed_scope(root);
+    let before = log_bytes(root, &id);
+
+    // Admitted, not yet bound: `false`, and nothing written.
+    let ok = attach_req(root_session("scope-t1", "scope.md"));
+    assert!(!precheck_attach(root, &id, &ok).expect("admitted"));
+    // Refused the way attach refuses it.
+    let err = precheck_attach(root, &id, &attach_req(root_session("s", "other.md"))).unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::TemplateMismatch { .. }),
+        "{err}"
+    );
+    assert_eq!(log_bytes(root, &id), before);
+
+    // Once bound to this session: `true`, a no-op attach.
+    attach_leg(root, &id, &ok).expect("attach");
+    assert!(precheck_attach(root, &id, &ok).expect("already bound"));
+    // Bound to another session: refused.
+    let err =
+        precheck_attach(root, &id, &attach_req(root_session("other", "scope.md"))).unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::LegBoundToDifferentChild { .. }),
+        "{err}"
+    );
+}
+
+#[test]
+fn attach_refusals_are_typed_and_write_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed_scope(root);
+    let before = log_bytes(root, &id);
+
+    let err = attach_leg(root, &id, &attach_req(root_session("s", "other.md"))).unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::TemplateMismatch { .. }),
+        "{err}"
+    );
+
+    let mut no_file = root_session("s", "scope.md");
+    no_file.template = None;
+    let err = attach_leg(root, &id, &attach_req(no_file)).unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::TemplateMismatch { .. }),
+        "{err}"
+    );
+
+    let mut wrong_topic = root_session("s", "scope.md");
+    wrong_topic
+        .bindings
+        .insert("TOPIC".to_string(), "t2".to_string());
+    match attach_leg(root, &id, &attach_req(wrong_topic)).unwrap_err() {
+        RequestStoreError::InputMismatch {
+            key,
+            recorded,
+            expected,
+            ..
+        } => {
+            assert_eq!(key, "TOPIC");
+            assert_eq!(recorded.as_deref(), Some("t2"));
+            assert_eq!(expected, "t1");
+        }
+        other => panic!("expected InputMismatch, got {other}"),
+    }
+
+    let mut undeclared = root_session("s", "scope.md");
+    undeclared.variables.remove("TOPIC");
+    match attach_leg(root, &id, &attach_req(undeclared)).unwrap_err() {
+        RequestStoreError::InputMismatch { key, recorded, .. } => {
+            assert_eq!(key, "TOPIC");
+            assert_eq!(recorded, None);
+        }
+        other => panic!("expected InputMismatch, got {other}"),
+    }
+
+    let mut terminal = root_session("s", "scope.md");
+    terminal.terminal_state = Some("done".to_string());
+    let err = attach_leg(root, &id, &attach_req(terminal)).unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::SessionTerminal { .. }),
+        "{err}"
+    );
+
+    assert_eq!(log_bytes(root, &id), before, "no refusal writes");
+}
+
+#[test]
+fn the_bound_child_check_is_made_under_the_lock() {
+    // The store function is the only gate: a caller that read the leg
+    // unbound and then lost a race to a bind is still refused here.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed_scope(root);
+    bind_leg(
+        root,
+        &id,
+        &BindLeg {
+            leg_name: "scope".to_string(),
+            child_session_id: "someone-else".to_string(),
+            dispatch_epoch: Some(0),
+            issued_by: None,
+            timestamp: ts(1),
+        },
+    )
+    .expect("bind");
+    let before = log_bytes(root, &id);
+    let err = attach_leg(root, &id, &attach_req(root_session("scope-t1", "scope.md"))).unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::LegBoundToDifferentChild { .. }),
+        "{err}"
+    );
+    assert_eq!(log_bytes(root, &id), before);
+
+    // Same for an abandon that landed first.
+    let other = seed_scope(root);
+    abandon_leg(
+        root,
+        &other,
+        &AbandonLeg {
+            leg_name: "scope".to_string(),
+            rationale: "gone".to_string(),
+            issued_by: None,
+            timestamp: ts(1),
+        },
+    )
+    .expect("abandon");
+    let err = attach_leg(
+        root,
+        &other,
+        &attach_req(root_session("scope-t1", "scope.md")),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::LegAbandoned { .. }),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_pointer_is_re_pointed_only_away_from_a_released_leg() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let live = seed_scope(root);
+    let target = seed_scope(root);
+    attach_leg(
+        root,
+        &live,
+        &attach_req(root_session("scope-t1", "scope.md")),
+    )
+    .expect("attach");
+
+    let pointing_at = |id: &ValidatedRequestId, leg: &str| {
+        let mut s = root_session("scope-t1", "scope.md");
+        s.pointer = Some(LegPointer {
+            request_id: id.as_str().to_string(),
+            leg_name: leg.to_string(),
+            bound_at: ts(1),
+        });
+        s
+    };
+
+    // Live leg on another request: refused.
+    let err = attach_leg(root, &target, &attach_req(pointing_at(&live, "scope"))).unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::SessionBoundToDifferentLeg { .. }),
+        "{err}"
+    );
+
+    // A pointer at a leg that no longer exists, or a request that does
+    // not, holds nothing live.
+    let ghost = ValidatedRequestId::new("req-ghost").expect("id");
+    let fresh = seed_scope(root);
+    attach_leg(root, &fresh, &attach_req(pointing_at(&ghost, "scope"))).expect("ghost pointer");
+
+    // Abandoned leg on a still-open request: released.
+    let mut spec = two_leg_spec();
+    spec.legs[0].declaration.template = "scope.md".into();
+    spec.legs[0].declaration.inputs = serde_json::json!({});
+    let two = create_request(root, &spec, &RequestBounds::default()).expect("create");
+    abandon_leg(
+        root,
+        &two,
+        &AbandonLeg {
+            leg_name: "reviewer-b".to_string(),
+            rationale: "gone".to_string(),
+            issued_by: None,
+            timestamp: ts(1),
+        },
+    )
+    .expect("abandon");
+    let released = seed_scope(root);
+    attach_leg(
+        root,
+        &released,
+        &attach_req(pointing_at(&two, "reviewer-b")),
+    )
+    .expect("an abandoned leg releases its session");
+
+    // Closed request: released.
+    close_request(
+        root,
+        &live,
+        &CloseRequest {
+            disposition: None,
+            issued_by: None,
+            timestamp: ts(4),
+        },
+    )
+    .expect("close");
+    attach_leg(root, &target, &attach_req(pointing_at(&live, "scope")))
+        .expect("a closed request releases its session");
+}
+
+#[test]
+fn the_fenced_writes_are_refused_on_a_self_attached_leg_inside_the_store() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed_scope(root);
+    attach_leg(root, &id, &attach_req(root_session("scope-t1", "scope.md"))).expect("attach");
+    let before = log_bytes(root, &id);
+
+    let err = append_progress(
+        root,
+        &id,
+        &LegProgress {
+            leg_name: "scope".to_string(),
+            content: progress_content("x"),
+            issued_by: None,
+            timestamp: ts(3),
+        },
+        &RequestBounds::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RequestStoreError::SelfAttachedLeg {
+                verb: "progress",
+                ..
+            }
+        ),
+        "{err}"
+    );
+
+    let err = record_result(
+        root,
+        &id,
+        &LegResult {
+            leg_name: "scope".to_string(),
+            result: result("forged"),
+            source: LegResultSource::Explicit,
+            issued_by: None,
+            timestamp: ts(3),
+            final_state: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RequestStoreError::SelfAttachedLeg {
+                verb: "resolve",
+                ..
+            }
+        ),
+        "{err}"
+    );
+
+    let err = abandon_leg(
+        root,
+        &id,
+        &AbandonLeg {
+            leg_name: "scope".to_string(),
+            rationale: "stop".to_string(),
+            issued_by: None,
+            timestamp: ts(3),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RequestStoreError::SelfAttachedLeg {
+                verb: "abandon",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(log_bytes(root, &id), before);
+
+    // Promotion still lands.
+    record_result(
+        root,
+        &id,
+        &LegResult {
+            leg_name: "scope".to_string(),
+            result: result("real"),
+            source: LegResultSource::Promoted,
+            issued_by: None,
+            timestamp: ts(4),
+            final_state: None,
+        },
+    )
+    .expect("promotion onto a self-attached leg");
+}
+
+#[test]
+fn request_scoped_abandon_reaches_a_self_attached_leg() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed_scope(root);
+    attach_leg(root, &id, &attach_req(root_session("scope-t1", "scope.md"))).expect("attach");
+    let outcome = abandon_leg_for_request(
+        root,
+        &id,
+        &AbandonLeg {
+            leg_name: "scope".to_string(),
+            rationale: "superseded".to_string(),
+            issued_by: None,
+            timestamp: ts(3),
+        },
+    )
+    .expect("request-scoped abandon");
+    assert!(outcome.written);
+    let view = read_view(root, &id).expect("view");
+    assert_eq!(
+        view.leg("scope").unwrap().disposition,
+        LegDisposition::Abandoned
+    );
+}
+
+fn refusal(reason: &str) -> LegRefusal {
+    LegRefusal {
+        leg_name: "scope".to_string(),
+        result: WorkflowResult {
+            status: TerminalOutcome::Failure,
+            summary: format!("refused: {reason}"),
+            payload: Some(serde_json::json!({"outcome": "refused", "reason": reason})),
+        },
+        issued_by: None,
+        timestamp: ts(5),
+    }
+}
+
+#[test]
+fn a_refusal_resolves_an_open_unbound_leg_with_the_refused_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed_scope(root);
+    let outcome = record_refusal(root, &id, &refusal("template-mismatch")).expect("refusal");
+    assert!(outcome.written);
+    let view = read_view(root, &id).expect("view");
+    let leg = view.leg("scope").unwrap();
+    assert_eq!(leg.disposition, LegDisposition::Resolved);
+    assert_eq!(leg.result_source, Some(LegResultSource::Refused));
+    let json = serde_json::to_value(leg).expect("serialize");
+    assert_eq!(json["result_source"], "refused");
+
+    // A retry of the same refusal is recognized, not a second result.
+    let again = record_refusal(root, &id, &refusal("template-mismatch")).expect("retry");
+    assert!(!again.written);
+}
+
+#[test]
+fn a_refusal_is_rejected_on_a_bound_resolved_abandoned_or_closed_leg() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+
+    let bound = seed_scope(root);
+    attach_leg(
+        root,
+        &bound,
+        &attach_req(root_session("scope-t1", "scope.md")),
+    )
+    .expect("attach");
+    let before = log_bytes(root, &bound);
+    let err = record_refusal(root, &bound, &refusal("x")).unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::LegBoundToChild { .. }),
+        "{err}"
+    );
+    assert_eq!(log_bytes(root, &bound), before);
+
+    let resolved = seed_scope(root);
+    record_result(
+        root,
+        &resolved,
+        &LegResult {
+            leg_name: "scope".to_string(),
+            result: result("answered"),
+            source: LegResultSource::Explicit,
+            issued_by: None,
+            timestamp: ts(3),
+            final_state: None,
+        },
+    )
+    .expect("resolve");
+    let err = record_refusal(root, &resolved, &refusal("x")).unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::LegAlreadyResolved { .. }),
+        "{err}"
+    );
+
+    let abandoned = seed_scope(root);
+    abandon_leg(
+        root,
+        &abandoned,
+        &AbandonLeg {
+            leg_name: "scope".to_string(),
+            rationale: "gone".to_string(),
+            issued_by: None,
+            timestamp: ts(3),
+        },
+    )
+    .expect("abandon");
+    let err = record_refusal(root, &abandoned, &refusal("x")).unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::LegAbandoned { .. }),
+        "{err}"
+    );
+
+    let closed = seed_scope(root);
+    close_request(
+        root,
+        &closed,
+        &CloseRequest {
+            disposition: None,
+            issued_by: None,
+            timestamp: ts(3),
+        },
+    )
+    .expect("close");
+    let err = record_refusal(root, &closed, &refusal("x")).unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::RequestClosed { .. }),
+        "{err}"
+    );
+}
+
+#[test]
+fn record_result_cannot_write_the_refused_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed_scope(root);
+    let before = log_bytes(root, &id);
+    let err = record_result(
+        root,
+        &id,
+        &LegResult {
+            leg_name: "scope".to_string(),
+            result: result("forged refusal"),
+            source: LegResultSource::Refused,
+            issued_by: None,
+            timestamp: ts(3),
+            final_state: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, RequestStoreError::RefusedSourceReserved { .. }),
+        "{err}"
+    );
+    assert_eq!(log_bytes(root, &id), before);
+}
+
+#[test]
+fn a_template_list_is_bounded_at_create_and_a_single_string_replays_unchanged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    for templates in [
+        LegTemplates::Many(vec![]),
+        LegTemplates::Many(
+            (0..=MAX_LEG_TEMPLATES)
+                .map(|n| format!("t{n}.md"))
+                .collect(),
+        ),
+        LegTemplates::Many(vec!["a.md".into(), String::new()]),
+    ] {
+        let mut spec = two_leg_spec();
+        spec.legs[0].declaration.template = templates;
+        let err = create_request(root, &spec, &RequestBounds::default()).unwrap_err();
+        assert!(
+            matches!(err, RequestStoreError::InvalidLegTemplate { .. }),
+            "{err}"
+        );
+    }
+
+    // The single-string form serializes exactly as before lists existed.
+    let json = serde_json::to_value(declaration("perf")).expect("serialize");
+    assert_eq!(json["template"], "review");
+    let back: LegDeclaration =
+        serde_json::from_value(serde_json::json!({"role":"r","template":"x.md","inputs":{}}))
+            .expect("old shape");
+    assert_eq!(back.template, LegTemplates::One("x.md".into()));
+}
+
+#[test]
+fn a_pre_attach_bind_event_replays_with_no_attach_or_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed(root);
+    bind_leg(
+        root,
+        &id,
+        &BindLeg {
+            leg_name: "reviewer-a".to_string(),
+            child_session_id: "child-1".to_string(),
+            dispatch_epoch: Some(0),
+            issued_by: None,
+            timestamp: ts(1),
+        },
+    )
+    .expect("bind");
+    let log = std::fs::read_to_string(log_path(root, &id)).expect("read");
+    assert!(
+        !log.contains("\"attach\"") && !log.contains("\"template\":{"),
+        "a coordinator's bind writes the same event shape as before: {log}"
+    );
+    let view = read_view(root, &id).expect("view");
+    let leg = view.leg("reviewer-a").unwrap();
+    assert_eq!(leg.attach, None);
+    let json = serde_json::to_value(leg).expect("serialize");
+    assert!(json.get("attach").is_none() && json.get("bound_template").is_none());
 }

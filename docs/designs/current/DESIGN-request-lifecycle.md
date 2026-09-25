@@ -782,6 +782,102 @@ It is recorded in Consequences and as a follow-up. Any future prune must not
 unlink the lock file while a writer holds it, or two writers would lock
 different inodes.
 
+### Amendment: root sessions attach themselves to a leg
+
+**Chosen: an eleventh verb, `koto request attach <request> <leg> --session
+<session>`, that admits a root session (one with no parent workflow) to a leg
+it will answer, gated by checks that take the place of the epoch fence, and
+that refuses the fenced verbs outright on a leg so attached.**
+
+Decision 3 made the dispatch epoch the only thing standing between a leg and a
+displaced writer, and `bind` refuses any session the fence can't cover. That
+excludes a whole class of caller the store is otherwise well suited to: a
+workflow that runs another workflow as a stable, root, `--no-cleanup` session
+and wants that session's terminal result recorded against the current run.
+Such a session has no parent and no epoch, but it also has none of the hazards
+the epoch exists for, and the carve-out rests on that.
+
+**Roots are never redelegated, and their results arrive only by promotion.**
+The fence exists because a dispatched child can be redelegated in place,
+leaving a displaced agent holding a valid leg identity and a stale epoch. A
+root session is never redelegated: there is no second dispatch of it, so there
+is no stale writer to fence out, and no legitimate writer of `progress`,
+`resolve`, or leg-scoped `abandon` on its leg other than the session's own
+terminal tick, which writes through promotion (Decision 6). So on a
+self-attached leg those three verbs are refused outright with
+`self_attached_leg`, whatever `--dispatch-epoch` says, rather than fenced at
+an epoch the leg does not have. The refusal is made in the CLI's fence and
+again inside the store's lock, so a leg attached between the two can't be
+written. Request-scoped `abandon-request` and `close` stay available: they
+carry no single epoch and were already accepted as unfenced, and abandoning a
+request is how a newer run supersedes an older one. Promotion is unchanged: a
+self-attached root ticked to a terminal under `--no-cleanup` resolves its leg
+with `result_source: promoted` and keeps its session, and a promotion onto an
+abandoned leg or a closed request is the existing warn-and-drop.
+
+**Admission is the boundary, so every check runs before any write, and the
+ones that read the request run inside the lock.** In order:
+
+1. The request is open and the leg is open, reusing `request_closed`,
+   `leg_already_resolved` and `leg_abandoned`.
+2. The session is neither at a terminal state nor cancelled
+   (`session_terminal`). A finished session can never answer a leg.
+3. The session's template identity matches an entry the leg's `template`
+   names (`template_mismatch`). A leg's `template` may now be one string, as
+   before, or a list of one to eight strings, so one leg can accept a
+   workflow's alternative templates; `create` rejects an empty or overlong
+   list. **The matching rule:** an entry is compared, exactly and
+   case-sensitively, against the file name of the source template the session
+   was compiled from (`scope.md`), which `koto init` now records on the
+   session header as `template_source_file`. The compiled `name:` and the
+   template hash are recorded for audit and never compared: a throwaway
+   template can declare any `name:` it likes, and a hash would pin one
+   revision of a template that legitimately changes. A session created with
+   `--from-stdin`, or before the file name was recorded, has no identity and
+   matches nothing. The rule is stated once more on `LegTemplates::admits`.
+4. For each key in the leg's `inputs` (when `inputs` is an object), the
+   session's template declares that variable, and unless it is
+   `rebind: true` the session's recorded value equals the input
+   (`input_mismatch`, naming the key, the recorded value and the leg's value).
+   A string input compares as itself and a number or boolean as its JSON
+   text. A `rebind: true` variable is a per-invocation setting and is not
+   compared. Inputs that are not an object state no variable expectations.
+5. The leg is unbound, or already bound to this very session, which is a
+   no-op success with no second event. A leg bound to anyone else is refused
+   with `leg_bound_to_different_child`, whatever that session's state.
+6. The session's pointer is absent, already names this leg, or names a leg
+   that was abandoned or whose request closed; only then is it re-pointed.
+   Otherwise `child_bound_to_different_leg`: one run can't take over another
+   live run's leg. When the pointer names a different request, that request is
+   read without taking its lock (two request locks would need an order every
+   writer agreed on), which is sound because both releasing conditions are
+   monotonic: an abandoned leg and a closed request never reopen.
+
+The `request.leg_bound` event for a root records `attach: "self"` and the
+session's template identity (`name`, `hash`, `source`), as additive
+serde-optional fields, and no `dispatch_epoch`. Existing logs replay
+unchanged, and `koto request get` shows `attach` and `bound_template` on the
+leg only when they are present. A dispatched child presented to `attach`
+binds exactly as `bind` does; a session that is neither a dispatched child nor
+a root (a non-dispatched `--parent` child) is refused by both verbs with
+`child_not_fenceable`, whose message now names the root carve-out.
+
+**A refusal can be recorded on the leg itself.** `LegResultSource` gains
+`refused`, written only by a dedicated lock-guarded store write that resolves
+a leg when it is open and unbound and rejects a bound, resolved, abandoned or
+closed one. `koto request resolve` can't write it. It exists so that a caller
+entering a workflow on a leg's behalf, and refused by koto, leaves the
+requester a result rather than a leg that waits forever.
+
+**Alternative — admit roots to `bind` and fence them at epoch zero.**
+Rejected: a root's epoch never moves, so the fence would compare against a
+constant every party can present, which is no fence at all while looking like
+one. **Alternative — make the running workflows `--parent` children of the
+requester.** Rejected here because a `--parent` child either deletes itself at
+its terminal or, under `--no-cleanup`, reports nothing to its parent, and
+because a new parent initialized under the same name inherits the old run's
+live children.
+
 ## Decision Outcome
 
 The design hangs together on one insight and one primitive.
@@ -818,7 +914,8 @@ that already exists rather than adding a step beside it.
 | Event variants | `src/engine/types.rs` | The six variants, their wire strings, `LegDeclaration`, `LegResultSource` |
 | Component-name grammar | `src/engine/name_grammar.rs` (new, neutral) | The shared 1..=64 / `[A-Za-z0-9_-]` / no-leading-hyphen check, consumed by both batch and request validation |
 | Atomic create helpers | `src/engine/atomic_fs.rs` (new, neutral) | Temp-and-rename-with-no-replace and root-directory creation, moved out of the session backend |
-| CLI noun group | `src/cli/request.rs` | The ten subcommands, envelope serialization, exit mapping |
+| CLI noun group | `src/cli/request.rs` | The ten subcommands (eleven with the root attach amendment's `attach`), envelope serialization, exit mapping |
+| Root attach | `src/engine/request_store/attach.rs` | Admission checks for a self-attaching root session, run under the request lock |
 | Wait loop | `src/cli/request.rs` | Predicate evaluation, deadline, signal handling |
 | Promotion hook | `src/cli/mod.rs` terminal path | Step 3 of the terminal ordering |
 | Abandonment notice | `src/cli/mod.rs` directive funnels | Notice splice and envelope sibling |

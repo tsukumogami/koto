@@ -2,9 +2,14 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use std::time::Duration;
 
-use super::{KotoConfig, RequestStoreConfig};
+use anyhow::{Context, Result};
+use url::Url;
+
+use super::validate::{check_decider_endpoint, DECIDER_TIMEOUT_DEFAULT_MS, DECIDER_TIMEOUT_MAX_MS};
+use super::{DeciderConfig, KotoConfig, RequestStoreConfig};
+use crate::decider::{ApiKey, GlobalMode, SettingOrigin};
 
 /// Override values for the `request_store` config block that come from
 /// outside the layered config files. Each `None` means "no override at
@@ -28,6 +33,13 @@ pub struct RequestStoreOverrides {
 
 /// Load and merge configuration from all sources.
 ///
+/// The `[decider]` table follows its own layer rules (see
+/// [`merge_decider`] and [`apply_decider_env`]): project config can only
+/// contribute a mode, and its key, endpoint, and timeout are dropped here.
+/// Problems in `[decider]` never fail the load; they're collected as
+/// warnings that [`resolve_decider`] returns. This function prints
+/// nothing.
+///
 /// Precedence (highest to lowest):
 /// 1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
 ///    `KOTO_REQUEST_STORE_*` for request-store dimensions)
@@ -48,18 +60,26 @@ pub fn load_config() -> Result<KotoConfig> {
     // Layer 1: user config
     if let Some(user_path) = user_config_path() {
         if user_path.exists() {
-            let user_config = load_config_file(&user_path)
-                .with_context(|| format!("loading user config from {}", user_path.display()))?;
+            let user_config = load_config_file(&user_path, "user config")?;
             merge_config(&mut config, &user_config);
+            merge_decider(
+                &mut config.decider,
+                &user_config.config.decider,
+                ConfigLayer::User,
+            );
         }
     }
 
     // Layer 2: project config
     let project_path = project_config_path();
     if project_path.exists() {
-        let project_config = load_config_file(&project_path)
-            .with_context(|| format!("loading project config from {}", project_path.display()))?;
+        let project_config = load_config_file(&project_path, "project config")?;
         merge_config(&mut config, &project_config);
+        merge_decider(
+            &mut config.decider,
+            &project_config.config.decider,
+            ConfigLayer::Project,
+        );
     }
 
     // Layer 3: env var overrides for credentials
@@ -73,6 +93,9 @@ pub fn load_config() -> Result<KotoConfig> {
     // Layer 3b: KOTO_REQUEST_STORE_* env-var overrides for the
     // request_store block.
     apply_request_store_env_overrides(&mut config.request_store);
+
+    // Layer 3c: KOTO_DECIDER* env overrides for the global decider values.
+    apply_decider_env(&mut config.decider, |k| env::var(k).ok());
 
     Ok(config)
 }
@@ -166,10 +189,18 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
 /// is parsed separately from `KotoConfig` so we can distinguish "field
 /// present in the source file" from "field defaulted by serde" -- the
 /// merge step only overlays explicitly-set fields onto the target.
-fn load_config_file(path: &Path) -> Result<LoadedConfig> {
-    let content = fs::read_to_string(path)?;
-    let config: KotoConfig = toml::from_str(&content)?;
-    let raw: toml::Value = content.parse()?;
+///
+/// A parse failure is reported as a [`ConfigParseError`], which carries
+/// only the path and position: the toml error's message and source
+/// snippet can quote a line holding a key, so neither is kept.
+fn load_config_file(path: &Path, label: &'static str) -> Result<LoadedConfig> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("loading {} from {}", label, path.display()))?;
+    let raw: toml::Value = content
+        .parse()
+        .map_err(|e| ConfigParseError::new(label, path, &content, &e, ParseProblem::Syntax))?;
+    let config: KotoConfig = toml::from_str(&content)
+        .map_err(|e| ConfigParseError::new(label, path, &content, &e, ParseProblem::Shape))?;
     let request_store_keys = raw
         .as_table()
         .and_then(|t| t.get("request_store"))
@@ -199,6 +230,85 @@ fn load_config_file(path: &Path) -> Result<LoadedConfig> {
         request_store_has_recursion,
         workflows_native_present,
     })
+}
+
+/// What kind of parse failure a [`ConfigParseError`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseProblem {
+    /// The file isn't valid TOML.
+    Syntax,
+    /// The file is valid TOML but a value has the wrong type or shape.
+    Shape,
+}
+
+/// A config file that failed to parse.
+///
+/// Holds only fixed text, the file's label and path, and the 1-based line
+/// and column of the problem. The underlying toml error is dropped on
+/// purpose: its message and source snippet quote the offending line, and a
+/// user config line can hold `decider.api_key`. Nothing built from this
+/// error (`Display`, `Debug`, or an anyhow chain) can carry file content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigParseError {
+    label: &'static str,
+    path: PathBuf,
+    position: Option<(usize, usize)>,
+    problem: ParseProblem,
+}
+
+impl ConfigParseError {
+    /// Build the error from a toml error, keeping only its position.
+    pub fn new(
+        label: &'static str,
+        path: &Path,
+        content: &str,
+        err: &toml::de::Error,
+        problem: ParseProblem,
+    ) -> Self {
+        ConfigParseError {
+            label,
+            path: path.to_path_buf(),
+            position: err.span().map(|span| line_column(content, span.start)),
+            problem,
+        }
+    }
+
+    /// 1-based line and column of the problem, when the parser gave one.
+    pub fn position(&self) -> Option<(usize, usize)> {
+        self.position
+    }
+}
+
+impl std::fmt::Display for ConfigParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self.problem {
+            ParseProblem::Syntax => "is not valid TOML",
+            ParseProblem::Shape => "has a value of the wrong type or shape",
+        };
+        write!(f, "{} {} {}", self.label, self.path.display(), what)?;
+        if let Some((line, column)) = self.position {
+            write!(f, " at line {}, column {}", line, column)?;
+        }
+        write!(
+            f,
+            " (the file's content isn't shown because it can hold credentials)"
+        )
+    }
+}
+
+impl std::error::Error for ConfigParseError {}
+
+/// 1-based line and column (in characters) of byte offset `offset`.
+fn line_column(content: &str, offset: usize) -> (usize, usize) {
+    let mut offset = offset.min(content.len());
+    while !content.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let before = &content[..offset];
+    let line = before.matches('\n').count() + 1;
+    let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let column = before[line_start..].chars().count() + 1;
+    (line, column)
 }
 
 /// A loaded config plus metadata about which request_store fields the
@@ -286,6 +396,384 @@ fn merge_config(target: &mut KotoConfig, source: &LoadedConfig) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Decider configuration
+// ---------------------------------------------------------------------------
+
+/// The decision endpoint used when neither `KOTO_DECIDER_ENDPOINT` nor
+/// user `decider.endpoint` is set. This is the full URL of the decision
+/// call (a `POST`), not a base URL. `KOTO_DECIDER_ENDPOINT` or user
+/// `decider.endpoint` overrides it.
+///
+/// Jev's decision endpoint, per <https://docs.typesafe.ai/introduction/quickstart>
+/// and <https://docs.typesafe.ai/api.md>.
+pub const DEFAULT_DECIDER_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
+
+/// Env var that sets the global decider mode.
+pub const ENV_DECIDER_MODE: &str = "KOTO_DECIDER";
+/// Env var that supplies the decider API key.
+pub const ENV_DECIDER_API_KEY: &str = "KOTO_DECIDER_API_KEY";
+/// Env var that sets the decider endpoint.
+pub const ENV_DECIDER_ENDPOINT: &str = "KOTO_DECIDER_ENDPOINT";
+
+/// Which config file a `[decider]` table was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigLayer {
+    /// `~/.koto/config.toml`.
+    User,
+    /// `.koto/config.toml` in the working directory.
+    Project,
+}
+
+/// Merge one file's `[decider]` table into the accumulated config.
+///
+/// From user config every field is taken and tagged with the `User`
+/// origin. From project config only `mode` is taken, into
+/// `project_mode`; `api_key`, `endpoint`, and `timeout_ms` are dropped at
+/// load time, so a checked-in `.koto/config.toml` can never supply a key,
+/// point a user's key at another server, or stretch the timeout. Dropped
+/// values produce a warning that names the key but not its value.
+pub fn merge_decider(target: &mut DeciderConfig, source: &DeciderConfig, layer: ConfigLayer) {
+    let label = match layer {
+        ConfigLayer::User => "user config",
+        ConfigLayer::Project => "project config",
+    };
+    for w in &source.warnings {
+        target.warnings.push(format!("{}: {}", label, w));
+    }
+    match layer {
+        ConfigLayer::User => {
+            if let Some(v) = &source.mode {
+                target.mode = Some(v.clone());
+                target.mode_origin = SettingOrigin::User;
+            }
+            if let Some(v) = &source.api_key {
+                target.api_key = Some(v.clone());
+                target.api_key_origin = SettingOrigin::User;
+            }
+            if let Some(v) = &source.endpoint {
+                target.endpoint = Some(v.clone());
+                target.endpoint_origin = SettingOrigin::User;
+            }
+            if let Some(v) = source.timeout_ms {
+                target.timeout_ms = Some(v);
+            }
+        }
+        ConfigLayer::Project => {
+            if let Some(v) = &source.mode {
+                target.project_mode = Some(v.clone());
+            }
+            if source.api_key.is_some() {
+                target.warnings.push(format!(
+                    "{}: decider.api_key is ignored in project config (set it in user config or {})",
+                    label, ENV_DECIDER_API_KEY
+                ));
+            }
+            if source.endpoint.is_some() {
+                target.warnings.push(format!(
+                    "{}: decider.endpoint is ignored in project config (set it in user config or {})",
+                    label, ENV_DECIDER_ENDPOINT
+                ));
+            }
+            if source.timeout_ms.is_some() {
+                target.warnings.push(format!(
+                    "{}: decider.timeout_ms is ignored in project config (set it in user config)",
+                    label
+                ));
+            }
+        }
+    }
+}
+
+/// Apply the `KOTO_DECIDER*` env overrides through `lookup`.
+///
+/// A non-empty `KOTO_DECIDER`, `KOTO_DECIDER_API_KEY`, or
+/// `KOTO_DECIDER_ENDPOINT` replaces the global mode, key, or endpoint from
+/// user config and tags it with the `Env` origin. An empty (or
+/// whitespace-only) value counts as unset. [`load_config`] passes
+/// `std::env::var`; tests pass an explicit map instead of mutating the
+/// process environment.
+pub fn apply_decider_env<F>(cfg: &mut DeciderConfig, lookup: F)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let non_empty = |k: &str| lookup(k).filter(|v| !v.trim().is_empty());
+    if let Some(v) = non_empty(ENV_DECIDER_MODE) {
+        cfg.mode = Some(v);
+        cfg.mode_origin = SettingOrigin::Env;
+    }
+    if let Some(v) = non_empty(ENV_DECIDER_API_KEY) {
+        cfg.api_key = Some(v);
+        cfg.api_key_origin = SettingOrigin::Env;
+    }
+    if let Some(v) = non_empty(ENV_DECIDER_ENDPOINT) {
+        cfg.endpoint = Some(v);
+        cfg.endpoint_origin = SettingOrigin::Env;
+    }
+}
+
+/// Resolved decider settings: the one place opt-in is decided.
+///
+/// Built only by [`resolve_decider`]. Fields are private so a caller
+/// can't assemble settings that skip the endpoint or same-layer rules.
+#[derive(Debug, Clone)]
+pub struct DeciderSettings {
+    mode: GlobalMode,
+    user_mode: GlobalMode,
+    project_mode: Option<GlobalMode>,
+    api_key: Option<ApiKey>,
+    api_key_origin: SettingOrigin,
+    endpoint: Option<Url>,
+    endpoint_origin: SettingOrigin,
+    timeout: Duration,
+}
+
+impl DeciderSettings {
+    /// Whether the user is opted in to decider consultations.
+    ///
+    /// True only when the effective global mode (after the project
+    /// minimum) is `shadow` or `auto`, a key is present, the endpoint
+    /// parsed and passed the scheme, loopback, and userinfo rules, and the
+    /// endpoint comes from the key's own layer or is the built-in default.
+    /// Reads only fields on `self`: no env or file access.
+    pub fn opted_in(&self) -> bool {
+        if self.mode == GlobalMode::Off {
+            return false;
+        }
+        if self.api_key.is_none() {
+            return false;
+        }
+        let endpoint_ok = match &self.endpoint {
+            Some(url) => check_decider_endpoint(url.as_str()).is_ok(),
+            None => false,
+        };
+        endpoint_ok && same_layer(self.api_key_origin, self.endpoint_origin)
+    }
+
+    /// Effective global mode: the minimum of the user-level and project
+    /// modes.
+    pub fn mode(&self) -> GlobalMode {
+        self.mode
+    }
+
+    /// The user-level mode (`KOTO_DECIDER` or user `decider.mode`), before
+    /// the project minimum. An unrecognized value is `off`.
+    pub fn user_mode(&self) -> GlobalMode {
+        self.user_mode
+    }
+
+    /// The project mode, or `None` when project config sets none. An
+    /// unrecognized value is `Some(Off)`.
+    pub fn project_mode(&self) -> Option<GlobalMode> {
+        self.project_mode
+    }
+
+    /// The API key, if one is configured.
+    pub fn api_key(&self) -> Option<&ApiKey> {
+        self.api_key.as_ref()
+    }
+
+    /// Layer the key came from (`User` or `Env`; `Default` when absent).
+    pub fn api_key_origin(&self) -> SettingOrigin {
+        self.api_key_origin
+    }
+
+    /// The decision endpoint, or `None` when the configured value was
+    /// refused (unparseable, bad scheme, or userinfo).
+    pub fn endpoint(&self) -> Option<&Url> {
+        self.endpoint.as_ref()
+    }
+
+    /// Layer the endpoint came from: `default`, `user`, or `env`.
+    pub fn endpoint_origin(&self) -> SettingOrigin {
+        self.endpoint_origin
+    }
+
+    /// Per-consultation timeout, bounded to 1..=10000 ms.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
+/// The same-layer rule: a key is sent only to the built-in default
+/// endpoint or to an endpoint from the key's own layer.
+fn same_layer(key: SettingOrigin, endpoint: SettingOrigin) -> bool {
+    matches!(
+        (key, endpoint),
+        (_, SettingOrigin::Default)
+            | (SettingOrigin::User, SettingOrigin::User)
+            | (SettingOrigin::Env, SettingOrigin::Env)
+    )
+}
+
+/// A value present with no recorded origin came from a config file.
+fn file_origin_if_unset(origin: SettingOrigin) -> SettingOrigin {
+    match origin {
+        SettingOrigin::Default => SettingOrigin::User,
+        o => o,
+    }
+}
+
+fn key_source_label(origin: SettingOrigin) -> &'static str {
+    match origin {
+        SettingOrigin::Env => ENV_DECIDER_API_KEY,
+        _ => "user config",
+    }
+}
+
+fn endpoint_source_label(origin: SettingOrigin) -> &'static str {
+    match origin {
+        SettingOrigin::Env => ENV_DECIDER_ENDPOINT,
+        SettingOrigin::User => "user config",
+        SettingOrigin::Default => "the default",
+    }
+}
+
+fn mode_warning(source: &str, raw: &str) -> String {
+    if raw.trim().eq_ignore_ascii_case("never") {
+        format!(
+            "{}: decider mode 'never' is template-only; the decider is off",
+            source
+        )
+    } else {
+        format!(
+            "{}: decider mode is not one of off, shadow, auto; the decider is off",
+            source
+        )
+    }
+}
+
+/// Resolve the effective decider settings from a loaded `DeciderConfig`.
+///
+/// Pure: no env reads, no file reads, no printing. Returns the settings
+/// and every warning (load-time ones included) for the caller to print.
+/// No warning contains the key or endpoint userinfo.
+///
+/// - The global mode is `KOTO_DECIDER` or user `decider.mode`, default
+///   `off`; an unrecognized value is `off` with a warning.
+/// - The effective mode is the minimum of the global and project modes;
+///   an unrecognized project mode is `off` with a warning.
+/// - The timeout defaults to 2000 ms, is capped at 10000 ms, and falls
+///   back to 2000 ms on zero or a negative value, each with a warning.
+/// - Endpoint and same-layer problems warn only when they're what stands
+///   between the user and opt-in (mode not `off` and a key present).
+pub fn resolve_decider(cfg: &DeciderConfig) -> (DeciderSettings, Vec<String>) {
+    let mut warnings = cfg.warnings.clone();
+
+    // Global mode.
+    let global = match &cfg.mode {
+        None => GlobalMode::Off,
+        Some(raw) => GlobalMode::parse(raw).unwrap_or_else(|| {
+            let source = match cfg.mode_origin {
+                SettingOrigin::Env => ENV_DECIDER_MODE,
+                _ => "user config",
+            };
+            warnings.push(mode_warning(source, raw));
+            GlobalMode::Off
+        }),
+    };
+
+    // Project minimum: can only lower. The rule itself lives in
+    // `engine::decider::effective_mode`.
+    let project_mode = cfg.project_mode.as_ref().map(|raw| {
+        GlobalMode::parse(raw).unwrap_or_else(|| {
+            warnings.push(mode_warning("project config", raw));
+            GlobalMode::Off
+        })
+    });
+    let mode = crate::engine::decider::effective_global_mode(global, project_mode);
+
+    // Timeout.
+    let timeout_ms: u64 = match cfg.timeout_ms {
+        None => DECIDER_TIMEOUT_DEFAULT_MS,
+        Some(n) if n <= 0 => {
+            warnings.push(format!(
+                "user config: decider.timeout_ms must be at least 1; using {}",
+                DECIDER_TIMEOUT_DEFAULT_MS
+            ));
+            DECIDER_TIMEOUT_DEFAULT_MS
+        }
+        Some(n) if n as u64 > DECIDER_TIMEOUT_MAX_MS => {
+            warnings.push(format!(
+                "user config: decider.timeout_ms is above the {} ms cap; using {}",
+                DECIDER_TIMEOUT_MAX_MS, DECIDER_TIMEOUT_MAX_MS
+            ));
+            DECIDER_TIMEOUT_MAX_MS
+        }
+        Some(n) => n as u64,
+    };
+
+    // Key. One that can't travel in an HTTP header (a control or
+    // non-ASCII character) counts as absent, so it never opts the user in
+    // and never reaches the transport. The warning names only the source.
+    let api_key = match cfg.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
+        Some(k) if ApiKey::is_header_safe(k) => Some(ApiKey::new(k)),
+        Some(_) => {
+            warnings.push(format!(
+                "{}: the decider API key contains a control or non-ASCII character \
+                 and can't be sent; ignoring it, so the decider is off",
+                key_source_label(file_origin_if_unset(cfg.api_key_origin))
+            ));
+            None
+        }
+        None => None,
+    };
+    let api_key_origin = if api_key.is_some() {
+        file_origin_if_unset(cfg.api_key_origin)
+    } else {
+        SettingOrigin::Default
+    };
+
+    // Endpoint.
+    let (endpoint, endpoint_origin, endpoint_err) = match &cfg.endpoint {
+        None => (
+            Some(Url::parse(DEFAULT_DECIDER_ENDPOINT).expect("default endpoint parses")),
+            SettingOrigin::Default,
+            None,
+        ),
+        Some(raw) => {
+            let origin = file_origin_if_unset(cfg.endpoint_origin);
+            match check_decider_endpoint(raw) {
+                Ok(url) => (Some(url), origin, None),
+                Err(e) => (None, origin, Some(e)),
+            }
+        }
+    };
+
+    let wants_consult = mode != GlobalMode::Off && api_key.is_some();
+    if wants_consult {
+        if let Some(e) = &endpoint_err {
+            warnings.push(format!(
+                "{}: {}; the decider is off",
+                endpoint_source_label(endpoint_origin),
+                e
+            ));
+        } else if !same_layer(api_key_origin, endpoint_origin) {
+            warnings.push(format!(
+                "the decider API key comes from {} but the endpoint comes from {}; \
+                 a key is only sent to an endpoint set in the same place or to the default, \
+                 so the decider is off",
+                key_source_label(api_key_origin),
+                endpoint_source_label(endpoint_origin)
+            ));
+        }
+    }
+
+    (
+        DeciderSettings {
+            mode,
+            user_mode: global,
+            project_mode,
+            api_key,
+            api_key_origin,
+            endpoint,
+            endpoint_origin,
+            timeout: Duration::from_millis(timeout_ms),
+        },
+        warnings,
+    )
+}
+
 /// Path to the user config file: ~/.koto/config.toml
 pub fn user_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".koto").join("config.toml"))
@@ -322,8 +810,11 @@ pub fn load_toml_value(path: &Path) -> Result<toml::Value> {
     if !path.exists() {
         return Ok(toml::Value::Table(toml::map::Map::new()));
     }
-    let content = fs::read_to_string(path)?;
-    let value: toml::Value = content.parse()?;
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("loading config file {}", path.display()))?;
+    let value: toml::Value = content.parse().map_err(|e| {
+        ConfigParseError::new("config file", path, &content, &e, ParseProblem::Syntax)
+    })?;
     Ok(value)
 }
 
@@ -334,6 +825,41 @@ pub fn write_toml_value(path: &Path, value: &toml::Value) -> Result<()> {
     }
     let content = toml::to_string_pretty(value)?;
     fs::write(path, content)?;
+    Ok(())
+}
+
+/// Write the user config file, which can hold credentials.
+///
+/// On Unix the file is created with mode 0600, and an existing file is
+/// tightened to 0600 before its new content is written, so a key never
+/// sits in a group- or world-readable file.
+pub fn write_user_toml_value(path: &Path, value: &toml::Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = toml::to_string_pretty(value)?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if path.exists() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(content.as_bytes())?;
+        // `mode` above applies only on creation and is subject to the
+        // umask; set it explicitly so the result is always 0600.
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, content)?;
+    }
     Ok(())
 }
 
@@ -368,6 +894,7 @@ mod tests {
         // With no config files, we get defaults.
         // Run in a temp dir and override HOME to avoid picking up real user/project config.
         let tmp = TempDir::new().unwrap();
+        let _lock = process_env_lock();
         let _guard = SetCwd::new(tmp.path());
         let _home_guard = SetEnv::new("HOME", tmp.path().to_str().unwrap());
 
@@ -402,6 +929,7 @@ mod tests {
                 },
                 request_store: RequestStoreConfig::default(),
                 workflows: Default::default(),
+                decider: Default::default(),
             },
             request_store_keys: vec![],
             request_store_has_recursion: false,
@@ -442,7 +970,7 @@ mod tests {
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[workflows]\nnative = true\n").unwrap();
 
-        let loaded = load_config_file(&path).unwrap();
+        let loaded = load_config_file(&path, "user config").unwrap();
         assert!(loaded.config.workflows.native);
         assert!(loaded.workflows_native_present);
     }
@@ -453,7 +981,7 @@ mod tests {
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[session]\nbackend = \"local\"\n").unwrap();
 
-        let loaded = load_config_file(&path).unwrap();
+        let loaded = load_config_file(&path, "user config").unwrap();
         // Absent from the file: not tracked for merge, and left at the default (on).
         assert!(!loaded.workflows_native_present);
         assert!(loaded.config.workflows.native);
@@ -465,7 +993,7 @@ mod tests {
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[workflows]\nnative = false\n").unwrap();
 
-        let loaded = load_config_file(&path).unwrap();
+        let loaded = load_config_file(&path, "user config").unwrap();
         assert!(loaded.workflows_native_present);
         assert!(!loaded.config.workflows.native);
     }
@@ -505,6 +1033,7 @@ mod tests {
     #[test]
     fn test_env_var_override() {
         let tmp = TempDir::new().unwrap();
+        let _lock = process_env_lock();
         let _guard = SetCwd::new(tmp.path());
         let _home_guard = SetEnv::new("HOME", tmp.path().to_str().unwrap());
 
@@ -530,6 +1059,7 @@ mod tests {
     #[test]
     fn test_project_config_overrides_user() {
         let tmp = TempDir::new().unwrap();
+        let _lock = process_env_lock();
         let _guard = SetCwd::new(tmp.path());
         let _home_guard = SetEnv::new("HOME", tmp.path().to_str().unwrap());
         env::remove_var("AWS_ACCESS_KEY_ID");
@@ -569,6 +1099,623 @@ mod tests {
         let loaded = load_toml_value(&path).unwrap();
         let config: KotoConfig = loaded.try_into().unwrap();
         assert_eq!(config.session.backend, "cloud");
+    }
+
+    #[test]
+    fn parse_errors_carry_only_path_and_position() {
+        const SECRET: &str = "sk-PARSE-SECRET-91";
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let cases = [
+            (format!("[decider]\napi_key = \"{SECRET}\n"), (2, 30)),
+            (format!("# é\n[session]\ncloud = \"{SECRET}\"\n"), (3, 9)),
+        ];
+        for (body, pos) in cases {
+            std::fs::write(&path, &body).unwrap();
+            let errs = [
+                load_config_file(&path, "user config").err().unwrap(),
+                // load_toml_value only parses TOML; the shape case is valid.
+                match load_toml_value(&path) {
+                    Err(e) => e,
+                    Ok(_) => continue,
+                },
+            ];
+            for e in errs {
+                for text in [
+                    format!("{}", e),
+                    format!("{:#}", e),
+                    format!("{:?}", e),
+                    format!("{:#?}", e),
+                ] {
+                    assert!(!text.contains(SECRET), "{}", text);
+                    assert!(!text.contains("api_key"), "{}", text);
+                    assert!(!text.contains("cloud"), "{}", text);
+                }
+                let shown = format!("{}", e);
+                assert!(shown.contains(&path.display().to_string()), "{}", shown);
+                let parse = e.downcast_ref::<ConfigParseError>().unwrap();
+                assert_eq!(parse.position(), Some(pos), "{}", shown);
+                assert!(e.source().is_none(), "no toml error kept: {}", shown);
+            }
+        }
+    }
+
+    #[test]
+    fn line_column_counts_chars_and_clamps() {
+        assert_eq!(line_column("", 0), (1, 1));
+        assert_eq!(line_column("ab\ncd", 4), (2, 2));
+        assert_eq!(line_column("é=x", 2), (1, 2));
+        // Inside a multi-byte char and past the end both clamp.
+        assert_eq!(line_column("é", 1), (1, 1));
+        assert_eq!(line_column("a\n", 99), (2, 1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Decider: merge, env, resolve, opt-in
+    // -----------------------------------------------------------------------
+
+    mod decider {
+        use super::super::*;
+        use std::collections::HashMap;
+        use tempfile::TempDir;
+
+        const KEY: &str = "sk-test-DISTINCTIVE-9f8e7d";
+
+        fn parse(body: &str) -> DeciderConfig {
+            let cfg: KotoConfig = toml::from_str(body).expect("file parses");
+            cfg.decider
+        }
+
+        /// Build a `DeciderConfig` the way `load_config` does, from explicit
+        /// user and project file bodies and an explicit env map.
+        fn build(user: &str, project: &str, env: &[(&str, &str)]) -> DeciderConfig {
+            let mut out = DeciderConfig::default();
+            merge_decider(&mut out, &parse(user), ConfigLayer::User);
+            merge_decider(&mut out, &parse(project), ConfigLayer::Project);
+            let map: HashMap<String, String> = env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            apply_decider_env(&mut out, |k| map.get(k).cloned());
+            out
+        }
+
+        fn resolve(
+            user: &str,
+            project: &str,
+            env: &[(&str, &str)],
+        ) -> (DeciderSettings, Vec<String>) {
+            resolve_decider(&build(user, project, env))
+        }
+
+        fn user_key(mode: &str) -> String {
+            format!("[decider]\nmode = \"{}\"\napi_key = \"{}\"\n", mode, KEY)
+        }
+
+        fn assert_no_secret(warnings: &[String]) {
+            for w in warnings {
+                assert!(!w.contains(KEY), "warning leaks the key: {w}");
+            }
+        }
+
+        // ---- merge ---------------------------------------------------------
+
+        #[test]
+        fn project_key_endpoint_timeout_are_dropped_at_load() {
+            let project = "[decider]\napi_key = \"proj-key\"\nendpoint = \"https://evil.example/d\"\ntimeout_ms = 9000\n";
+            let cfg = build("", project, &[]);
+            assert!(cfg.api_key.is_none());
+            assert!(cfg.endpoint.is_none());
+            assert!(cfg.timeout_ms.is_none());
+            assert_eq!(cfg.warnings.len(), 3, "{:?}", cfg.warnings);
+            for w in &cfg.warnings {
+                assert!(!w.contains("proj-key"), "{w}");
+                assert!(!w.contains("evil.example"), "{w}");
+            }
+            let (s, _) = resolve_decider(&cfg);
+            assert!(s.api_key().is_none());
+            assert_eq!(s.endpoint_origin(), SettingOrigin::Default);
+            assert_eq!(s.endpoint().unwrap().as_str(), DEFAULT_DECIDER_ENDPOINT);
+            assert_eq!(s.timeout(), Duration::from_millis(2000));
+        }
+
+        #[test]
+        fn project_endpoint_never_replaces_user_endpoint() {
+            let user = "[decider]\nendpoint = \"https://a.example/decide\"\n";
+            let project = "[decider]\nendpoint = \"https://b.example/decide\"\n";
+            let (s, _) = resolve(user, project, &[]);
+            assert_eq!(s.endpoint().unwrap().as_str(), "https://a.example/decide");
+            assert_eq!(s.endpoint_origin(), SettingOrigin::User);
+            assert!(!format!("{:?}", s).contains("b.example"));
+
+            let (s, _) = resolve("", project, &[]);
+            assert_eq!(s.endpoint().unwrap().as_str(), DEFAULT_DECIDER_ENDPOINT);
+            assert_eq!(s.endpoint_origin(), SettingOrigin::Default);
+            assert!(!format!("{:?}", s).contains("b.example"));
+        }
+
+        #[test]
+        fn project_mode_lands_only_in_project_mode() {
+            let cfg = build(
+                "[decider]\nmode = \"shadow\"\n",
+                "[decider]\nmode = \"auto\"\n",
+                &[],
+            );
+            assert_eq!(cfg.mode.as_deref(), Some("shadow"));
+            assert_eq!(cfg.project_mode.as_deref(), Some("auto"));
+
+            let cfg = build("", "[decider]\nmode = \"auto\"\n", &[]);
+            assert!(cfg.mode.is_none());
+            assert_eq!(cfg.project_mode.as_deref(), Some("auto"));
+        }
+
+        #[test]
+        fn merge_config_leaves_decider_alone() {
+            let mut base = KotoConfig::default();
+            let loaded = LoadedConfig {
+                config: toml::from_str("[decider]\nmode = \"auto\"\napi_key = \"x\"\n").unwrap(),
+                request_store_keys: vec![],
+                request_store_has_recursion: false,
+                workflows_native_present: false,
+            };
+            merge_config(&mut base, &loaded);
+            assert!(base.decider.is_empty());
+            assert!(base.decider.project_mode.is_none());
+        }
+
+        // ---- lenient parsing ----------------------------------------------
+
+        #[test]
+        fn wrong_types_and_unknown_keys_load_with_warnings() {
+            let body = "[session]\nbackend = \"cloud\"\n\n[decider]\nmode = 3\ntimeout_ms = \"fast\"\nbogus = true\nendpoint = \"https://ok.example/d\"\n";
+            let cfg: KotoConfig = toml::from_str(body).expect("still parses");
+            assert_eq!(cfg.session.backend, "cloud");
+            assert!(cfg.decider.mode.is_none());
+            assert!(cfg.decider.timeout_ms.is_none());
+            assert_eq!(
+                cfg.decider.endpoint.as_deref(),
+                Some("https://ok.example/d")
+            );
+            assert_eq!(cfg.decider.warnings.len(), 3, "{:?}", cfg.decider.warnings);
+        }
+
+        #[test]
+        fn non_table_decider_loads_with_warning() {
+            let cfg: KotoConfig = toml::from_str("decider = 3\n").expect("still parses");
+            assert!(cfg.decider.is_empty());
+            assert_eq!(cfg.decider.warnings.len(), 1);
+        }
+
+        #[test]
+        fn load_config_file_is_lenient_for_both_layers() {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("config.toml");
+            fs::write(
+                &path,
+                "[session]\nbackend = \"cloud\"\n[decider]\nmode = 3\ntimeout_ms = \"fast\"\n",
+            )
+            .unwrap();
+            let loaded = load_config_file(&path, "user config").expect("loads");
+            assert_eq!(loaded.config.session.backend, "cloud");
+
+            let mut out = DeciderConfig::default();
+            merge_decider(&mut out, &loaded.config.decider, ConfigLayer::Project);
+            let (s, w) = resolve_decider(&out);
+            assert_eq!(s.mode(), GlobalMode::Off);
+            assert_eq!(w.len(), 2, "{w:?}");
+            assert!(w.iter().all(|w| w.starts_with("project config: ")), "{w:?}");
+        }
+
+        // ---- env ------------------------------------------------------------
+
+        #[test]
+        fn env_replaces_user_values() {
+            let user = "[decider]\nmode = \"off\"\napi_key = \"user-key\"\nendpoint = \"https://u.example/d\"\n";
+            let cfg = build(
+                user,
+                "",
+                &[
+                    ("KOTO_DECIDER", "auto"),
+                    ("KOTO_DECIDER_API_KEY", "env-key"),
+                    ("KOTO_DECIDER_ENDPOINT", "https://e.example/d"),
+                ],
+            );
+            assert_eq!(cfg.mode.as_deref(), Some("auto"));
+            assert_eq!(cfg.mode_origin, SettingOrigin::Env);
+            assert_eq!(cfg.api_key.as_deref(), Some("env-key"));
+            assert_eq!(cfg.api_key_origin, SettingOrigin::Env);
+            assert_eq!(cfg.endpoint.as_deref(), Some("https://e.example/d"));
+            assert_eq!(cfg.endpoint_origin, SettingOrigin::Env);
+        }
+
+        #[test]
+        fn empty_env_counts_as_unset() {
+            let user = "[decider]\nmode = \"shadow\"\napi_key = \"user-key\"\nendpoint = \"https://u.example/d\"\n";
+            let cfg = build(
+                user,
+                "",
+                &[
+                    ("KOTO_DECIDER", ""),
+                    ("KOTO_DECIDER_API_KEY", ""),
+                    ("KOTO_DECIDER_ENDPOINT", "  "),
+                ],
+            );
+            assert_eq!(cfg.mode.as_deref(), Some("shadow"));
+            assert_eq!(cfg.mode_origin, SettingOrigin::User);
+            assert_eq!(cfg.api_key_origin, SettingOrigin::User);
+            assert_eq!(cfg.endpoint_origin, SettingOrigin::User);
+        }
+
+        // ---- mode -----------------------------------------------------------
+
+        #[test]
+        fn mode_defaults_off_so_a_key_alone_does_not_opt_in() {
+            let (s, w) = resolve(&format!("[decider]\napi_key = \"{}\"\n", KEY), "", &[]);
+            assert_eq!(s.mode(), GlobalMode::Off);
+            assert!(!s.opted_in());
+            assert!(w.is_empty(), "{w:?}");
+            let (s, _) = resolve("", "", &[("KOTO_DECIDER_API_KEY", KEY)]);
+            assert!(!s.opted_in());
+        }
+
+        #[test]
+        fn mode_parsing_trims_and_lowercases() {
+            let (s, w) = resolve("[decider]\nmode = \" Shadow \"\n", "", &[]);
+            assert_eq!(s.mode(), GlobalMode::Shadow);
+            assert!(w.is_empty());
+        }
+
+        #[test]
+        fn env_never_and_bogus_resolve_off_with_one_warning() {
+            for bad in ["never", "bogus"] {
+                let (s, w) = resolve("", "", &[("KOTO_DECIDER", bad)]);
+                assert_eq!(s.mode(), GlobalMode::Off, "{bad}");
+                assert_eq!(w.len(), 1, "{bad}: {w:?}");
+                assert!(w[0].contains("KOTO_DECIDER"), "{bad}: {w:?}");
+            }
+        }
+
+        #[test]
+        fn user_never_and_bogus_resolve_off_with_one_warning() {
+            for bad in ["never", "bogus"] {
+                let (s, w) = resolve(&format!("[decider]\nmode = \"{bad}\"\n"), "", &[]);
+                assert_eq!(s.mode(), GlobalMode::Off, "{bad}");
+                assert_eq!(w.len(), 1, "{bad}: {w:?}");
+                assert!(w[0].contains("user config"), "{bad}: {w:?}");
+            }
+        }
+
+        #[test]
+        fn bogus_project_mode_resolves_off_with_warning() {
+            let (s, w) = resolve(&user_key("auto"), "[decider]\nmode = \"turbo\"\n", &[]);
+            assert_eq!(s.mode(), GlobalMode::Off);
+            assert!(!s.opted_in());
+            assert_eq!(w.len(), 1, "{w:?}");
+            assert!(w[0].contains("project config"), "{w:?}");
+        }
+
+        #[test]
+        fn resolved_mode_is_minimum_of_global_and_project() {
+            let cases: &[(&str, Option<&str>, GlobalMode)] = &[
+                ("shadow", Some("auto"), GlobalMode::Shadow),
+                ("auto", Some("shadow"), GlobalMode::Shadow),
+                ("auto", Some("off"), GlobalMode::Off),
+                ("auto", None, GlobalMode::Auto),
+                ("off", Some("auto"), GlobalMode::Off),
+            ];
+            for (user, project, want) in cases {
+                let project_body = project
+                    .map(|p| format!("[decider]\nmode = \"{p}\"\n"))
+                    .unwrap_or_default();
+                let (s, _) = resolve(
+                    &format!("[decider]\nmode = \"{user}\"\n"),
+                    &project_body,
+                    &[],
+                );
+                assert_eq!(s.mode(), *want, "user {user} project {project:?}");
+            }
+            let (s, _) = resolve(
+                "",
+                "[decider]\nmode = \"shadow\"\n",
+                &[("KOTO_DECIDER", "auto")],
+            );
+            assert_eq!(s.mode(), GlobalMode::Shadow);
+        }
+
+        #[test]
+        fn a_key_that_cannot_be_a_header_is_absent_with_a_warning() {
+            let bad = [
+                format!("{KEY}\nX"),
+                format!("{KEY}\rX"),
+                format!("{KEY}\tX"),
+                format!("{KEY}\u{7f}"),
+                format!("{KEY}\u{e9}"),
+            ];
+            for raw in &bad {
+                // From the environment.
+                let (s, w) = resolve(
+                    "",
+                    "",
+                    &[("KOTO_DECIDER", "auto"), (ENV_DECIDER_API_KEY, raw)],
+                );
+                assert!(s.api_key().is_none(), "{raw:?}");
+                assert!(!s.opted_in(), "{raw:?}");
+                assert_eq!(s.api_key_origin(), SettingOrigin::Default);
+                assert_no_secret(&w);
+                assert_eq!(w.len(), 1, "{w:?}");
+                assert!(w[0].starts_with(ENV_DECIDER_API_KEY), "{w:?}");
+                assert!(w[0].contains("control or non-ASCII"), "{w:?}");
+
+                // From user config (TOML escapes carry the character).
+                let mut cfg = build("[decider]\nmode = \"auto\"\n", "", &[]);
+                cfg.api_key = Some(raw.clone());
+                cfg.api_key_origin = SettingOrigin::User;
+                let (s, w) = resolve_decider(&cfg);
+                assert!(s.api_key().is_none() && !s.opted_in(), "{raw:?}");
+                assert_no_secret(&w);
+                assert!(w.iter().any(|m| m.starts_with("user config")), "{w:?}");
+            }
+            // An ordinary key is untouched and still opts in.
+            let (s, w) = resolve(&user_key("auto"), "", &[]);
+            assert!(s.opted_in(), "{w:?}");
+        }
+
+        #[test]
+        fn project_can_never_raise_mode() {
+            let modes = ["off", "shadow", "auto", "never", "bogus", ""];
+            for g in modes {
+                for p in modes {
+                    let (s, _) = resolve(
+                        &format!("[decider]\nmode = \"{g}\"\n"),
+                        &format!("[decider]\nmode = \"{p}\"\n"),
+                        &[],
+                    );
+                    let global = GlobalMode::parse(g).unwrap_or(GlobalMode::Off);
+                    assert!(s.mode() <= global, "global {g} project {p}");
+                }
+            }
+        }
+
+        // ---- opted_in -------------------------------------------------------
+
+        fn baseline_env() -> Vec<(&'static str, &'static str)> {
+            vec![
+                ("KOTO_DECIDER", "auto"),
+                ("KOTO_DECIDER_API_KEY", KEY),
+                ("KOTO_DECIDER_ENDPOINT", "https://env.example/decide"),
+            ]
+        }
+
+        #[test]
+        fn opted_in_baseline() {
+            let (s, w) = resolve("", "", &baseline_env());
+            assert!(s.opted_in());
+            assert!(w.is_empty(), "{w:?}");
+            let (s, _) = resolve(&user_key("shadow"), "", &[]);
+            assert!(s.opted_in());
+        }
+
+        #[test]
+        fn opted_in_false_when_global_mode_off() {
+            let mut env = baseline_env();
+            env[0] = ("KOTO_DECIDER", "off");
+            assert!(!resolve("", "", &env).0.opted_in());
+        }
+
+        #[test]
+        fn opted_in_false_when_project_mode_off() {
+            let (s, _) = resolve(&user_key("auto"), "[decider]\nmode = \"off\"\n", &[]);
+            assert!(!s.opted_in());
+        }
+
+        #[test]
+        fn opted_in_false_without_key_and_no_warning() {
+            let env: Vec<_> = baseline_env()
+                .into_iter()
+                .filter(|(k, _)| *k != "KOTO_DECIDER_API_KEY")
+                .collect();
+            let (s, w) = resolve("", "", &env);
+            assert!(!s.opted_in());
+            assert!(w.is_empty(), "auto without a key must not warn: {w:?}");
+        }
+
+        #[test]
+        fn opted_in_false_for_unparseable_endpoint() {
+            let mut env = baseline_env();
+            env[2] = ("KOTO_DECIDER_ENDPOINT", "not a url");
+            let (s, w) = resolve("", "", &env);
+            assert!(!s.opted_in());
+            assert!(s.endpoint().is_none());
+            assert_eq!(w.len(), 1, "{w:?}");
+        }
+
+        #[test]
+        fn opted_in_false_for_plain_http_non_loopback() {
+            for bad in [
+                "http://example.com/decide",
+                "http://localhost.example.com/decide",
+                "http://10.0.0.1/decide",
+                "ftp://example.com/decide",
+            ] {
+                let mut env = baseline_env();
+                env[2] = ("KOTO_DECIDER_ENDPOINT", bad);
+                let (s, w) = resolve("", "", &env);
+                assert!(!s.opted_in(), "{bad}");
+                assert_eq!(w.len(), 1, "{bad}: {w:?}");
+            }
+        }
+
+        #[test]
+        fn plain_http_loopback_is_accepted() {
+            for ok in [
+                "http://127.0.0.1:4000/decide",
+                "http://[::1]:4000/decide",
+                "http://localhost:4000/decide",
+            ] {
+                let mut env = baseline_env();
+                env[2] = ("KOTO_DECIDER_ENDPOINT", ok);
+                let (s, w) = resolve("", "", &env);
+                assert!(s.opted_in(), "{ok}: {w:?}");
+            }
+        }
+
+        #[test]
+        fn opted_in_false_for_userinfo_and_warning_hides_it() {
+            for bad in [
+                "https://user:pass@host.example/decide",
+                "https://token@host.example/decide",
+            ] {
+                let mut env = baseline_env();
+                env[2] = ("KOTO_DECIDER_ENDPOINT", bad);
+                let (s, w) = resolve("", "", &env);
+                assert!(!s.opted_in(), "{bad}");
+                assert_eq!(w.len(), 1, "{bad}: {w:?}");
+                for word in ["user", "pass", "token"] {
+                    assert!(!w[0].contains(word), "{bad}: {:?}", w[0]);
+                }
+                assert_no_secret(&w);
+            }
+        }
+
+        #[test]
+        fn endpoint_warning_prints_only_scheme_host_path() {
+            let mut env = baseline_env();
+            env[2] = (
+                "KOTO_DECIDER_ENDPOINT",
+                "http://example.com:81/decide?q=secretq#fragf",
+            );
+            let (_, w) = resolve("", "", &env);
+            assert_eq!(w.len(), 1);
+            assert!(w[0].contains("http://example.com/decide"), "{:?}", w[0]);
+            for bad in ["secretq", "fragf", ":81"] {
+                assert!(!w[0].contains(bad), "{:?}", w[0]);
+            }
+        }
+
+        #[test]
+        fn same_layer_rule_all_combinations() {
+            let user_ep = "[decider]\nendpoint = \"https://u.example/d\"\n";
+            // env key + env endpoint: ok
+            let (s, _) = resolve("", "", &baseline_env());
+            assert!(s.opted_in());
+            // env key + default endpoint: ok
+            let (s, _) = resolve("", "", &baseline_env()[..2]);
+            assert!(s.opted_in());
+            assert_eq!(s.endpoint_origin(), SettingOrigin::Default);
+            // user key + user endpoint: ok
+            let body = format!("{}endpoint = \"https://u.example/d\"\n", user_key("auto"));
+            let (s, _) = resolve(&body, "", &[]);
+            assert!(s.opted_in());
+            assert_eq!(s.endpoint_origin(), SettingOrigin::User);
+            // user key + default endpoint: ok
+            let (s, _) = resolve(&user_key("auto"), "", &[]);
+            assert!(s.opted_in());
+            assert_eq!(s.endpoint_origin(), SettingOrigin::Default);
+            // env key + user endpoint: refused with a warning
+            let (s, w) = resolve(user_ep, "", &baseline_env()[..2]);
+            assert!(!s.opted_in());
+            assert_eq!(w.len(), 1, "{w:?}");
+            assert_no_secret(&w);
+            // user key + env endpoint (the injected-endpoint case): refused
+            let (s, w) = resolve(
+                &user_key("auto"),
+                "",
+                &[("KOTO_DECIDER_ENDPOINT", "https://attacker.example/grab")],
+            );
+            assert!(!s.opted_in());
+            assert_eq!(s.api_key_origin(), SettingOrigin::User);
+            assert_eq!(s.endpoint_origin(), SettingOrigin::Env);
+            assert_eq!(w.len(), 1, "{w:?}");
+            assert_no_secret(&w);
+        }
+
+        #[test]
+        fn opted_in_is_stable_across_env_changes() {
+            let (s, _) = resolve("", "", &baseline_env());
+            // opted_in reads only fields; the real process env is irrelevant.
+            assert!(s.opted_in());
+            assert!(s.opted_in());
+        }
+
+        // ---- timeout --------------------------------------------------------
+
+        #[test]
+        fn timeout_default_cap_and_fallback() {
+            let (s, w) = resolve("", "", &[]);
+            assert_eq!(s.timeout(), Duration::from_millis(2000));
+            assert!(w.is_empty());
+
+            let (s, w) = resolve("[decider]\ntimeout_ms = 500\n", "", &[]);
+            assert_eq!(s.timeout(), Duration::from_millis(500));
+            assert!(w.is_empty());
+
+            let (s, w) = resolve("[decider]\ntimeout_ms = 60000\n", "", &[]);
+            assert_eq!(s.timeout(), Duration::from_millis(10_000));
+            assert_eq!(w.len(), 1);
+
+            for bad in ["0", "-3", "\"fast\""] {
+                let (s, w) = resolve(&format!("[decider]\ntimeout_ms = {bad}\n"), "", &[]);
+                assert_eq!(s.timeout(), Duration::from_millis(2000), "{bad}");
+                assert_eq!(w.len(), 1, "{bad}: {w:?}");
+            }
+        }
+
+        // ---- key handling ---------------------------------------------------
+
+        #[test]
+        fn debug_never_contains_the_key() {
+            let cfg = build(&user_key("auto"), "", &[]);
+            assert!(!format!("{:?}", cfg).contains(KEY));
+            let (s, _) = resolve_decider(&cfg);
+            assert!(!format!("{:?}", s).contains(KEY));
+            assert!(!format!("{:?}", s.api_key()).contains(KEY));
+            assert_eq!(s.api_key().unwrap().expose_for_transport(), KEY);
+        }
+
+        #[test]
+        fn default_endpoint_is_a_full_https_url() {
+            assert_eq!(
+                DEFAULT_DECIDER_ENDPOINT,
+                "https://api.typesafe.ai/v1/systemone"
+            );
+            let u = Url::parse(DEFAULT_DECIDER_ENDPOINT).unwrap();
+            assert_eq!(u.scheme(), "https");
+            assert!(u.path().len() > 1, "a full decision URL, not a base");
+            assert!(
+                crate::config::validate::check_decider_endpoint(DEFAULT_DECIDER_ENDPOINT).is_ok()
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // User config file permissions
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn write_user_toml_value_creates_and_tightens_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".koto").join("config.toml");
+        let mut val = toml::Value::Table(toml::map::Map::new());
+        crate::config::set_value_in_toml(&mut val, "decider.mode", "shadow").unwrap();
+
+        write_user_toml_value(&path, &val).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        write_user_toml_value(&path, &val).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    /// Serializes the tests that change the process-wide cwd and env.
+    /// Without it they race each other under the parallel test runner:
+    /// one test's `SetCwd` restore can land while another is mid-load.
+    fn process_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// RAII guard that sets an env var and restores the previous value on drop.

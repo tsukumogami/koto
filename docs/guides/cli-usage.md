@@ -52,6 +52,37 @@ This creates a session directory at `~/.koto/sessions/<name>/` and writes a stat
 
 Exits non-zero if a workflow with that name already exists or if the template is invalid.
 
+Every new session's header carries an **origin record**, `origin`: the session's execution anchor (the canonical directory its commands run in) and the identity of the session store that holds it (`kind`, `local` or `cloud`, and the canonical sessions directory `base`). Session names are machine-wide, so the record is what tells two same-named sessions from different worktrees or stores apart. `koto session rebind` moves the record's anchor along with the session. Sessions created before this field existed have none, and nothing backfills it.
+
+#### Entry flags
+
+A skill that enters the same session on every invocation passes these flags instead of reading the session first and deciding what to do. With any of them, or with `--vars-file`, one `koto init` call ends in one of four outcomes:
+
+- a new session (`"outcome": "created"`);
+- an attached live session (`"outcome": "attached"`), with its `rebind: true` variables re-applied;
+- a fresh session replacing a finished one (`"outcome": "replaced"`);
+- a refusal with a typed `code`, almost always exit 2, that changes nothing.
+
+```bash
+koto init <name> --template <path> --vars-file <file> [--attach-live] [--replace-terminal] [--koto-leg <request-id>:<leg>]
+```
+
+- `--vars-file <path>` reads the variables from a JSON list of `["KEY", "VALUE"]` string pairs, such as `[["TOPIC","t1"],["MERGE","true"]]`. A list rather than an object, so a repeated key survives to be refused as `duplicate_var`. Values pass the same checks as `--var`. The file must be a regular file of at most 64 KiB and not a symlink; anything else, including malformed JSON or a pair that isn't two strings, is refused with `invalid_vars_file`. It can't be combined with `--var`. With `--vars-file` or any entry flag, variables are validated before the name is looked up, so a bad value against an existing session is reported as the variable error, not "already exists".
+- `--replace-terminal` replaces a session that is finished (in a terminal state, or cancelled): koto removes it and creates a fresh one under the same name. The output carries the old session's `replaced_state` and `replaced_result`, its workflow result (`null` for a cancelled session that recorded none). Removing the session removes its override log too. A running session is refused with `session_live`.
+- `--attach-live` attaches to a running session instead of refusing the name. koto checks, in order, that the session was built from a template file with the same name as `--template` (`template_mismatch`, with `recorded` and `requested`); that its origin record equals this invocation's, meaning the same execution anchor (`--execution-dir` or the working directory) and the same session store (`origin_mismatch`); and that every non-`rebind` variable passed explicitly equals the recorded value (`var_mismatch`, naming `var`, `recorded` and `requested`). Variables the caller doesn't pass aren't compared. A session with no origin record is refused with `origin_mismatch` and a message that says so: finish it with the koto version that started it, or remove it with `koto session cleanup <name>`. On acceptance every `rebind: true` variable is re-applied from this invocation (its value, else the declared default), recorded as one `variables_rebound` event, and the output lists the changes under `rebound`. A finished session is refused with `session_terminal`. `--intent` is not applied to an attached session.
+- With both `--attach-live` and `--replace-terminal`, a running session is attached, a finished one is replaced, and a missing one is created.
+- `--koto-leg <request-id>:<leg>` attaches the created, attached or replacement session to a request leg in the same call, with every check `koto request attach` makes (see [request attach](#request-attach)). A value that doesn't match the request-id and leg-name grammars is a usage error. The output gains `leg`: `{"request_id", "leg", "written"}`.
+
+Without `--attach-live` or `--replace-terminal`, an existing session still gets the "already exists" message and exit 1. The three entry flags are rejected with `--from-stdin` and with `--parent` (`invalid_usage`, exit 2).
+
+**Order of checks and writes.** Every check runs before anything is written: variables, then the existing session's template, origin and fixed variables, then the leg checks. Writes follow in a fixed order: create or replace the session, bind the leg, then re-apply the rebind variables. So a refused invocation leaves the session and its variables as they were; a stale invocation that names an abandoned leg, or a leg another session holds, can't flip a rebind variable such as `MERGE`. If the leg bind loses a race after the checks passed, the invocation exits with the bind's error, removes a session it just created, and leaves an attached session's variables unchanged.
+
+**Refusals recorded on the leg.** Under `--koto-leg`, every refusal is also written onto the named leg when that leg is open and unbound: it resolves with `result_source: refused`, status `failure`, and a payload `{"outcome": "refused", "reason", "var", "recorded", "requested"}`. `reason` is `invalid-var:<V>`, `duplicate-var:<V>`, `unknown-var:<V>`, `var-mismatch:<V>`, `template-mismatch`, `origin-mismatch`, or, for any other refusal, its error code in the same kebab form (`session-terminal`, `session-live`, `leg-abandoned`, `input-mismatch`, and so on). The other three keys are empty strings when they don't apply. A leg that is bound, resolved or abandoned, or a request that is closed or doesn't exist, gets nothing, and a refusal never binds the leg or writes a leg pointer. The exit code and the printed error are the same with and without `--koto-leg`.
+
+```json
+{"name":"scope-t1","state":"work","outcome":"attached","rebound":{"MERGE":"false"},"leg":{"request_id":"req-...","leg":"scope","written":true}}
+```
+
 ### next
 
 Returns the directive for the current state. This is the main agent-facing command -- it tells the agent what to do next, what evidence to submit, and whether any gates are blocking.
@@ -727,8 +758,14 @@ koto config list --json
 | `session.cloud.access_key` | Access key ID | -- | no |
 | `session.cloud.secret_key` | Secret access key | -- | no |
 | `workflows.native` | `true`, `false` | `true` | yes |
+| `decider.mode` | `"off"`, `"shadow"`, `"auto"` | `"off"` | yes (can only lower the mode) |
+| `decider.api_key` | Decider API key | -- | no |
+| `decider.endpoint` | `https` URL of the decision call (plain `http` only for loopback) | `"https://api.typesafe.ai/v1/systemone"` | no |
+| `decider.timeout_ms` | Integer, 1 to 10000 | `2000` | no |
 
 Credential keys (`access_key`, `secret_key`) can also be provided through environment variables `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Environment variables take precedence over config file values.
+
+The `decider` keys opt a user in to consulting a decider on template fields that declare one. `KOTO_DECIDER`, `KOTO_DECIDER_API_KEY`, and `KOTO_DECIDER_ENDPOINT` override `mode`, `api_key`, and `endpoint`. Unlike other keys, a project `decider.mode` doesn't replace the user's: the lower of the two applies, so a repository can turn the decider down but never on. koto ignores `api_key`, `endpoint`, and `timeout_ms` in project config with a warning. A key is sent only to an endpoint set in the same place (both env or both user config) or to the default, and `koto config get decider.api_key` prints `<set>`, never the key. A key must be printable ASCII: one holding a control character (a newline, say) or a non-ASCII character is ignored with a warning, and `koto config set` refuses it. A config file that won't parse is reported by path, line, and column only; koto never prints its content, since it can hold a key. See [decider-authoring.md](decider-authoring.md) for opting in, what a consultation sends, and how a template value is promoted.
 
 `workflows.native` controls rendering koto sessions in Claude Code's `/workflows` screen (see [native-workflows-verification.md](native-workflows-verification.md)); it is on by default and a participating session self-discovers its target directory from `CLAUDE_CODE_SESSION_ID`. Set it to `false` to opt out. A fully headless run (no Claude Code environment) renders nothing regardless.
 
@@ -865,6 +902,51 @@ koto dashboard --once my-workflow
 koto dashboard --interval 200
 ```
 
+### decider report
+
+Reads the decider ledger and reports, per question and per value, how often the decider agreed with agents. With `--fixtures` it also runs a golden fixture set against the configured decider and marks each value promotion-eligible or not. The command only reads: it never changes a mode, never writes the ledger or a session log, and compiles the template in memory without touching the compile cache. The promotion workflow it supports is described in [decider-authoring.md](decider-authoring.md#promoting-a-value-to-auto).
+
+```bash
+koto decider report [--ledger <path>] [--state <state>] [--json] [--include-custom-endpoints]
+koto decider report --fixtures <path> --template <path> --state <state> [--field <field>] [--json] [--include-custom-endpoints]
+```
+
+**Optional flags:**
+- `--ledger <path>` -- Ledger to read. Defaults to `_decider_ledger.jsonl` in the koto home directory (`~/.koto/_decider_ledger.jsonl`, resolved from `HOME`). A missing ledger is an empty report, not an error.
+- `--state <state>` -- Report only questions on this state, in the table and in JSON. With `--fixtures`, it's also the state whose declaration the fixtures exercise.
+- `--json` -- Print the report as JSON instead of a table.
+- `--include-custom-endpoints` -- Count consultations and fixture runs sent to a user-config or `KOTO_DECIDER_ENDPOINT` endpoint toward promotion eligibility. Without it, only the default endpoint counts, so stub and redirected runs can't reach the bar. Metrics include custom-endpoint consultations either way.
+- `--fixtures <path>` -- Run this JSON Lines fixture set and judge promotion eligibility. Needs `--template` and `--state`.
+- `--template <path>` -- Template source whose declaration the fixtures exercise. Only valid with `--fixtures`.
+- `--field <field>` -- The declared field to exercise when the state declares more than one. Only valid with `--fixtures`.
+
+**What the ledger report shows.** A question is one state, field, and declaration hash; changing a declaration's question, values, descriptions, or inputs starts a new question, while changing a mode or threshold doesn't. For each question the report shows consultations by outcome, paired observations (a consultation and the agent's later answer for the same visit), and per value: paired count, recall, coverage, and disagreements where the decider picked that value at or above threshold and the agent chose another. It also shows a confusion matrix (rows are the agent's values; columns are the decider's confident value, `below_threshold`, `escape`, and `no_answer`), the disagreeing visits, fallback and error rates (errors broken down by `error_class`), latency p50 and p95 (nearest rank, leaving out `input_unavailable` consultations), agent stops removed, and directive bytes not delivered. Coverage uses well-formed answers (`applied` and `not_applied`) as its denominator, and the table prints the share over all consultations beside it. A question with at least 30 consultations that had a value in `auto`, whose coverage over those is below 30%, carries a `low_coverage` flag.
+
+The header counts ledger lines, skipped malformed lines, lines of an unknown kind, duplicate consultations, orphaned answers, consultations with no session id (counted but never paired), and consultations from a custom endpoint along with how many of those are excluded from eligibility.
+
+**Fixture file.** One JSON object per line with `inputs` (each declared input label mapped to its text), `expected` (a declared value, the escape, or a JSON `true`/`false` for a boolean field), and an optional `id`. Every line is checked before anything is sent: an unknown key, an undeclared `expected`, a missing or extra input label, or an input over its `max_bytes` stops the run with the line number. Each case goes through the same request building, provider client, and evaluation the runtime uses, and nothing it does is recorded.
+
+**Opt-in and network.** A fixture run needs an opted-in decider: an effective mode of `shadow` or `auto` (a project `.koto/config.toml` can only lower it), an API key, and an endpoint from the key's own layer or the default. Without that, the command says fixture runs need an opted-in decider and sends nothing. A refused connection or a rejected key stops the run. A timeout or an unusable answer on one case records that case as `no_answer` and the run continues.
+
+**Eligibility conditions.** A value is `eligible` when all of these hold, and otherwise the output names each condition that failed:
+- at least 10 fixture cases labelled with the value (the escape needs none; a boolean needs 10 each for `true` and `false`);
+- at least 40 fixture cases in total, escape-labelled cases included;
+- every fixture case got an answer (one `no_answer` makes every value ineligible);
+- no fixture labelled otherwise is answered with the value at or above its threshold;
+- macro recall exceeds always choosing the most frequent label (that baseline is 0 when the escape is the most frequent label);
+- at least 30 paired observations under the current declaration hash;
+- at most 1 ledger disagreement where the decider chose the value;
+- the fixture run used the default endpoint, unless `--include-custom-endpoints` is passed.
+
+A value the template marks `never` is still judged and is shown with a `(template: never)` note.
+
+**JSON output.** The top-level keys are `ledger`, `header`, `questions`, and `fixtures` (`null` without `--fixtures`). Each question carries `values`, `confusion`, `rates`, `latency_ms`, `success_measures`, and `flags`. The `fixtures` object carries the declaration hash, the case results, `macro_recall`, `majority_baseline`, and per-value `eligible`, `status`, `conditions`, and `reasons`.
+
+**Exit codes:**
+- `0` -- The report printed, whether or not any value is eligible.
+- `2` -- A caller problem: a flag combination clap rejects, a fixture run without an opted-in decider, a template that doesn't compile, a state with no declared field (or several and no `--field`), a bad fixture line, or an endpoint the run can't reach or that rejects the key.
+- `3` -- The ledger exists but can't be read.
+
 ### version
 
 Prints version information as JSON.
@@ -963,6 +1045,29 @@ The `koto next` verb accepts `--redelegation-cap <n>` to override the resolved `
 ### next --dispatch-epoch
 
 The `koto next` verb accepts `--dispatch-epoch <n>` to write the current tick's `ChildDispatched` audit event with the supplied dispatch epoch. Used by recovery walks (Issue 11 cases 3b/3c) when a header rewrite has bumped a child's epoch and the coordinator's log needs to record the bump as a fresh dispatch.
+
+### request attach
+
+Attaches a session to a request leg it will answer, so the session's terminal result is recorded on the leg.
+
+```bash
+koto request attach <request-id> <leg> --session <session-id> [--issued-by <id>]
+```
+
+A **root session** (created without `--parent`) binds itself to the leg. It has no dispatch epoch, so koto admits it only when every check passes, and writes nothing otherwise:
+
+- the request and the leg are open (`request_closed`, `leg_already_resolved`, `leg_abandoned`);
+- the session is not at a terminal state and was not cancelled (`session_terminal`);
+- the session was built from a template the leg names (`template_mismatch`). The leg's `template` is one file name or a list of up to eight, and an entry matches the file name of the template the session was initialized from, such as `scope.md`. A session created with `--from-stdin` has no template file and is refused;
+- each key in the leg's `inputs` names a variable the template declares, and unless that variable is `rebind: true`, the session's recorded value equals the input (`input_mismatch`, naming the key and both values);
+- the leg is unbound, or already bound to this session, in which case the call is a no-op with `"written": false` (`leg_bound_to_different_child` otherwise);
+- the session doesn't already answer another live leg. It moves to the new leg only when its old leg was abandoned or its old request closed (`child_bound_to_different_leg` otherwise).
+
+All refusals exit 2. On success the command prints the standard request envelope, and the leg shows `"attach": "self"` and a `bound_template` object with the template's `name`, `hash` and `source` file name. The session's leg pointer is written so its ticks know which leg they answer.
+
+On a self-attached leg, `koto request progress`, `koto request resolve` and `koto request abandon` are refused with `self_attached_leg` whatever `--dispatch-epoch` says: the leg's result arrives only when the session reaches a terminal state, including under `koto next --no-cleanup`, which keeps the session on disk. `koto request abandon-request` and `koto request close` stay available, and abandoning the request is how a newer run releases a session for re-attachment.
+
+A dispatched child (one `koto request bind` accepts) presented to `attach` is bound exactly as `bind` binds it. Any other child session is refused with `child_not_fenceable`.
 
 ## Typical agent workflow
 

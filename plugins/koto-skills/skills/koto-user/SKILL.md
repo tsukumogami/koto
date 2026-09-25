@@ -17,7 +17,8 @@ description: >-
   execution anchor is not a sandbox, so treating it as one tells a user
   something untrue about what a workflow can reach. Do NOT load it to design a state machine for a business domain -
   order lifecycles, request status models and the like are ordinary software
-  design with nothing to do with koto. To write a durable template or a
+  design with nothing to do with koto, so answer them directly without
+  mentioning koto, its commands, or this skill. To write a durable template or a
   workflow-backed skill use koto-author; to decompose a fresh one-off task
   that has no template yet use koto-adhoc, which hands the run loop back here
   once the session is started.
@@ -33,7 +34,7 @@ This skill is for koto-backed workflows only -- a session koto is already runnin
 
 ## Prerequisites
 
-- koto >= 0.12.3 must be installed and on PATH (`koto version` to verify)
+- koto >= 0.13.1 must be installed and on PATH (`koto version` to verify)
 - You need a compiled koto template (`.md` file with YAML frontmatter)
 
 If koto is not installed or the version is too old, install the latest release:
@@ -63,6 +64,7 @@ koto init <name> --template <path>
 - `<path>` is the path to the template file (e.g., `${CLAUDE_SKILL_DIR}/koto-templates/my-workflow.md`)
 - Supply template variables with `--var KEY=VALUE` (repeatable)
 - Returns `{"name": "<name>", "state": "<initial_state>"}` on success
+- To reopen a stably named session on every invocation, pass `--vars-file <file> --attach-live --replace-terminal` (plus `--koto-leg <request-id>:<leg>` when the run answers a request leg): koto creates, attaches to, or replaces the session and reports which as `outcome`, or refuses with a typed `code` (`var_mismatch`, `template_mismatch`, `origin_mismatch`, ...) and changes nothing
 - For a novel one-off task with no template, pipe a definition inline with `koto init <name> --from-stdin` (strict-only; mutually exclusive with `--template`). See the [command reference](references/command-reference.md#koto-init) for the full contract. The run loop below is identical once the session starts.
 
 **2. Execute the action loop**
@@ -118,6 +120,10 @@ Example: if `expects.fields` contains `{"outcome": {"type": "enum", "required": 
 koto next <name> --with-data '{"outcome": "success"}'
 ```
 
+**Fields with `value_descriptions`:** a field whose template declares a `decider` block also carries `description` (the question) and `value_descriptions` (what each value means). Read `value_descriptions` when choosing a value and pick the one whose description fits what you found, then submit it as usual. Submit only a value from `values`. The template's escape value (the decider's "can't tell" answer) isn't listed and isn't a valid submission; koto rejects it like any unknown value. If you genuinely can't tell, pick the value the directive says to use when in doubt, or ask the user.
+
+When the user has opted in to a decider, koto may already have consulted it for this state. You'll never see its answer, and it never overrides evidence you submit: if koto didn't apply the decider's answer, the state waits for you exactly as it would without a decider, and what you submit is what counts. If koto did apply it, you never see that state at all, and `koto next` returns the following stop with `advanced: true`. Either way, keep dispatching on `action`. See [response shapes](references/response-shapes.md#fields-with-a-question-and-value-descriptions).
+
 For large or pre-built JSON payloads, prefix the value with `@` to read from a file:
 
 ```bash
@@ -136,7 +142,7 @@ One or more gates failed, but the state still accepts evidence. You can either f
 
 Check each item in `blocking_conditions`:
 
-- Check `category`: `"temporal"` means the condition will resolve on its own (e.g., child workflows finishing) — retry later. `"corrective"` (the default) means you or the user must fix something.
+- Check `category`: `"temporal"` means the condition will resolve on its own (e.g., child workflows finishing, or an open request leg the `request-leg` gate is waiting on) — retry later. `"corrective"` (the default) means you or the user must fix something.
 - If `agent_actionable` is `true`: record an override (see [Override flow](#override-flow)), then re-query
 - If `agent_actionable` is `false`: you can't override this gate; submit evidence to bypass if the template allows it, or escalate to the user
 
@@ -171,7 +177,7 @@ The overridden gate is now treated as passed.
 
 For `children-complete` gates, the override pretends all children are done. The default value mirrors the extended gate output schema: all aggregate counters are zero, `all_complete` and `all_success` are `true`, the `any_*` and `needs_attention` booleans are `false`, and `children` is empty. Use this when you know children are finished but the gate hasn't picked it up, or when you need to proceed regardless.
 
-When `agent_actionable` is `false`, the gate has no override mechanism. Don't call `koto overrides record` for it — the command will fail. Escalate to the user instead.
+When `agent_actionable` is `false`, the gate has no override mechanism — either it has no default, or the template declares it `overridable: false`. Don't call `koto overrides record` for it — the command will fail (for a non-overridable gate, with exit 2 and `error.code: "gate_not_overridable"`, even with `--with-data`). Escalate to the user instead.
 
 ## When a default action fails
 
@@ -312,7 +318,7 @@ Check where a child is without side effects:
 koto status <child-name>
 ```
 
-Returns `name`, `current_state`, `template_path`, `template_hash`, and `is_terminal`, plus a `leg` object when the session is bound to a request leg. No gates are evaluated, no state changes happen.
+Returns `name`, `current_state`, `template_path`, `template_hash`, and `is_terminal`, plus a `leg` object when the session is bound to a request leg, and a `result` object (the recorded `status`, `summary`, and `payload`) when the session is in a terminal state. No gates are evaluated, no state changes happen.
 
 Read a child's stored results:
 
@@ -388,6 +394,8 @@ koto request bind <request-id> review --child review-443
 For a single leg there's a shorthand: `koto request create --role reviewer --template review.md --inputs '<json>' --requested-by ID --coordinator-of-record ID`. The leg is named after the role, so the role has to satisfy the leg-name grammar. `--with-data` and the `--role` / `--template` / `--inputs` triple are mutually exclusive.
 
 `bind` only accepts a child started with `--needs-agent` under a parent — that's what makes the dispatch fence meaningful — and a child fulfils at most one leg. Rebinding the same leg to the same child is a no-op success; rebinding it elsewhere is rejected.
+
+A root session (no `--parent`) answers a leg by attaching itself: `koto request attach <request-id> <leg> --session <name>`. koto admits it only if the session isn't finished, was started from a template file the leg names, and its non-`rebind` variables match the leg's `inputs`. On a self-attached leg, `progress`, `resolve` and `abandon` are refused with `self_attached_leg`, epoch or not: the result arrives when the session reaches its terminal state, even under `koto next --no-cleanup`.
 
 Output is JSON on stdout, always, with no format flag. Every verb prints the same envelope: `request_id`, `request_state`, `close_disposition`, `leg_counts`, `revision`, `legs`, and `cli_contract`. Full flags and the response shape are in the [command reference](references/command-reference.md#koto-request); the closed error-code set and its exit statuses are in [error handling](references/error-handling.md#request-command-errors).
 

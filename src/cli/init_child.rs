@@ -257,6 +257,20 @@ fn compile_with_cache(
     Ok(entry)
 }
 
+/// Compile `template_path` through `cache` ahead of an init, returning
+/// the compiled template and its hash.
+///
+/// `koto init`'s entry flags validate variables and compare template
+/// identities before deciding whether to create anything; compiling here
+/// fills the same cache the later [`init_child_from_parent_at`] call
+/// reads, so the template is still compiled once.
+pub(crate) fn compile_for_init(
+    template_path: &Path,
+    cache: &mut TemplateCompileCache,
+) -> Result<(CompiledTemplate, String), CompileErrorInfo> {
+    compile_with_cache(template_path, cache).map(|c| (c.compiled, c.hash))
+}
+
 /// Map a [`SessionError`] raised by `init_state_file` onto the
 /// appropriate [`SpawnErrorKind`].
 ///
@@ -437,7 +451,7 @@ pub fn init_child_as_skip_marker_from_parent(
 /// dropped: `koto next` then refuses with the unresolvable-anchor code
 /// and names the recorded directory, which is more useful than a
 /// session that silently re-adopts.
-fn canonical_or_verbatim(path: &Path) -> PathBuf {
+pub(crate) fn canonical_or_verbatim(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -473,6 +487,25 @@ fn resolve_execution_dir(
         .map(|cwd| canonical_or_verbatim(&cwd))
 }
 
+/// The origin record for a session about to be created: its execution
+/// anchor and the store's identity.
+///
+/// `None` when either is unknown -- no anchor could be resolved, or the
+/// backend has no store identity. Such a session is refused by `koto init
+/// --attach-live` like one created before origin records existed.
+///
+/// Call after the session directory exists, so the store's base
+/// directory canonicalizes the same way a later caller's will.
+pub(crate) fn origin_record(
+    backend: &dyn SessionBackend,
+    anchor: Option<&Path>,
+) -> Option<crate::engine::types::SessionOrigin> {
+    Some(crate::engine::types::SessionOrigin {
+        anchor: anchor?.to_path_buf(),
+        store: backend.store_identity()?,
+    })
+}
+
 /// Shared implementation. When `override_initial_state` is `Some`, the
 /// first `Transitioned` event routes to that state instead of the
 /// template's `initial_state`; this is the skip-marker spawn path.
@@ -505,7 +538,7 @@ fn init_child_core(
     })?;
 
     let variables =
-        crate::cli::resolve_variables(vars, &cached.compiled.variables).map_err(|msg| {
+        crate::cli::resolve_variables(vars, &cached.compiled.variables).map_err(|var_error| {
             // Variable resolution runs *after* a successful compile, so
             // the cache entry carries a valid resolved path. Plumb it
             // through to keep parity with other post-resolution failure
@@ -513,9 +546,10 @@ fn init_child_core(
             TaskSpawnError::new(
                 child_name,
                 SpawnErrorKind::TemplateCompileFailed,
-                format!("{}{}", VAR_RESOLUTION_MSG_PREFIX, msg),
+                format!("{}{}", VAR_RESOLUTION_MSG_PREFIX, var_error),
             )
             .with_path(cached.source_path.clone())
+            .with_var_error(var_error)
         })?;
 
     let initial_state = match override_initial_state {
@@ -552,13 +586,22 @@ fn init_child_core(
     // over both.
     let execution_dir = resolve_execution_dir(backend, parent_name, execution_dir_override);
 
-    let header = StateFileHeader {
+    let mut header = StateFileHeader {
         schema_version: 1,
         workflow: child_name.to_string(),
         template_hash: cached.hash.clone(),
         created_at: ts.clone(),
         parent_workflow: parent_name.map(|s| s.to_string()),
         template_source_dir,
+        // The source file's name, for the template identity a request
+        // leg attach compares against (DESIGN-request-lifecycle.md,
+        // root attach amendment).
+        template_source_file: template_path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned()),
+        // Filled in once the session directory exists, so the store's
+        // base canonicalizes to the same form a later caller computes.
+        origin: None,
         execution_dir,
         session_id: generate_session_id(),
         intent: None,
@@ -591,6 +634,7 @@ fn init_child_core(
         to: initial_state.clone(),
         condition_type: "auto".to_string(),
         skip_if_matched: None,
+        context_assignments: None,
     };
     let initial_events = vec![
         Event {
@@ -623,6 +667,7 @@ fn init_child_core(
         )
         .with_path(cached.source_path.clone())
     })?;
+    header.origin = origin_record(backend, header.execution_dir.as_deref());
 
     backend
         .init_state_file(child_name, header, initial_events)
@@ -701,8 +746,13 @@ pub fn init_inline_into_session(
         )
     })?;
 
-    let variables = crate::cli::resolve_variables(vars, &compiled.variables)
-        .map_err(|msg| anyhow::anyhow!("{}{}", VAR_RESOLUTION_MSG_PREFIX, msg))?;
+    // The typed refusal rides under the prefixed message so the caller can
+    // both classify it (by prefix) and read its code (by downcast).
+    let variables =
+        crate::cli::resolve_variables(vars, &compiled.variables).map_err(|var_error| {
+            let msg = format!("{}{}", VAR_RESOLUTION_MSG_PREFIX, var_error);
+            anyhow::Error::new(var_error).context(msg)
+        })?;
 
     // Record the artifact as a SESSION-RELATIVE path: just the filename.
     // derive_machine_state resolves it against the session dir at read
@@ -720,6 +770,8 @@ pub fn init_inline_into_session(
 
     let ts = now_iso8601();
     let initial_state = compiled.initial_state.clone();
+    let execution_dir = resolve_execution_dir(backend, None, execution_dir_override);
+    let origin = origin_record(backend, execution_dir.as_deref());
 
     let header = StateFileHeader {
         schema_version: 1,
@@ -730,9 +782,11 @@ pub fn init_inline_into_session(
         // The compiled artifact lives in the session dir, not a source
         // tree, so there is no parent source dir for the batch resolver.
         template_source_dir: None,
+        template_source_file: None,
+        origin,
         // An inline session is always top-level (`--from-stdin`
         // rejects `--parent`), so there is no parent anchor to copy.
-        execution_dir: resolve_execution_dir(backend, None, execution_dir_override),
+        execution_dir,
         session_id: generate_session_id(),
         intent: None,
         template_name: if compiled.name.is_empty() {
@@ -764,6 +818,7 @@ pub fn init_inline_into_session(
         to: initial_state.clone(),
         condition_type: "auto".to_string(),
         skip_if_matched: None,
+        context_assignments: None,
     };
     let initial_events = vec![
         Event {
@@ -966,6 +1021,8 @@ Done.
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir,
             session_id: String::new(),
             intent: None,

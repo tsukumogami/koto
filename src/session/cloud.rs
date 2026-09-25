@@ -683,6 +683,14 @@ impl SessionBackend for CloudBackend {
         self.local.session_dir(id)
     }
 
+    fn store_identity(&self) -> Option<crate::engine::types::SessionStoreIdentity> {
+        let base = self.local.base_dir();
+        Some(crate::engine::types::SessionStoreIdentity {
+            kind: "cloud".to_string(),
+            base: std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf()),
+        })
+    }
+
     fn exists(&self, id: &str) -> bool {
         if self.local.exists(id) {
             return true;
@@ -745,6 +753,19 @@ impl SessionBackend for CloudBackend {
         Vec<crate::engine::types::Event>,
     )> {
         self.sync_pull_state(id);
+        self.local.read_events(id)
+    }
+
+    /// Read the local state file only: no pull from S3. The decider reads
+    /// the log through this while it holds `decider.lock`, so the lock is
+    /// never held across a network round trip.
+    fn read_events_local(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<(
+        crate::engine::types::StateFileHeader,
+        Vec<crate::engine::types::Event>,
+    )> {
         self.local.read_events(id)
     }
 
@@ -1032,6 +1053,8 @@ mod tests {
             created_at: created_at.to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1135,6 +1158,8 @@ mod tests {
             created_at: "2026-04-13T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1188,6 +1213,8 @@ mod tests {
             created_at: "2026-04-13T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1244,6 +1271,8 @@ mod tests {
             created_at: "2026-04-13T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1484,6 +1513,54 @@ mod tests {
         );
         let data = backend.local.get("sess", "scope.md").unwrap();
         assert_eq!(data, b"local");
+    }
+
+    // -- read_events_local reads the local file with no pull --
+
+    #[test]
+    fn read_events_local_makes_no_s3_request() {
+        use std::net::TcpListener;
+
+        let tmp = TempDir::new().unwrap();
+        // An S3 endpoint that accepts connections but never answers: any
+        // pull attempt would show up as a pending connection.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let region = Region::Custom {
+            region: "us-east-1".to_string(),
+            endpoint: format!("http://{}", listener.local_addr().unwrap()),
+        };
+        let credentials =
+            Credentials::new(Some("test-key"), Some("test-secret"), None, None, None).unwrap();
+        let bucket = Bucket::new("test-bucket", region, credentials).unwrap();
+        let local = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        let backend = CloudBackend::with_parts(local, bucket, "test-prefix".to_string());
+
+        write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
+        backend
+            .local
+            .append_event(
+                "wf",
+                &crate::engine::types::EventPayload::Transitioned {
+                    from: None,
+                    to: "start".to_string(),
+                    condition_type: "auto".to_string(),
+                    skip_if_matched: None,
+                    context_assignments: None,
+                },
+                "2026-01-01T00:00:01Z",
+            )
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let (header, events) = backend.read_events_local("wf").unwrap();
+        assert_eq!(header.workflow, "wf");
+        assert_eq!(events.len(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("read_events_local contacted S3: {:?}", other.map(|_| ())),
+        }
     }
 
     // -- Sync: delete is non-fatal when S3 is unreachable --

@@ -28,7 +28,7 @@ use crate::template::types::VAR_REF_PATTERN;
 ///   stay a single shell argument (Issue #180).
 ///
 /// Empty strings are allowed for optional variables with no default (Issue #141).
-const VALUE_PATTERN: &str = r"^[a-zA-Z0-9._/:@ \-]*$";
+pub(crate) const VALUE_PATTERN: &str = r"^[a-zA-Z0-9._/:@ \-]*$";
 
 /// Holds resolved variable bindings for substitution.
 #[derive(Debug)]
@@ -231,7 +231,9 @@ impl std::fmt::Display for SubstitutionError {
 impl std::error::Error for SubstitutionError {}
 
 /// Fold a session's log into the variable bindings a tick starts from: the
-/// `WorkflowInitialized` block, then every value a `default_action` captured.
+/// `WorkflowInitialized` block, then every value a `default_action` captured
+/// and every `rebind: true` value an accepted attach re-applied
+/// (`variables_rebound`), in event order.
 ///
 /// Captures fold in event order, so re-entering a producing state means the
 /// later value wins. Nothing removes a binding: a rewind appends a `Rewound`
@@ -252,6 +254,9 @@ pub fn bindings_from_events(events: &[Event]) -> HashMap<String, String> {
             }
             EventPayload::VariableCaptured { key, value } => {
                 vars.insert(key.clone(), value.clone());
+            }
+            EventPayload::VariablesRebound { variables } => {
+                vars.extend(variables.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
             _ => {}
         }
@@ -1055,6 +1060,46 @@ mod tests {
                 .map(String::as_str),
             Some("second")
         );
+    }
+
+    fn rebound(pairs: &[(&str, &str)]) -> EventPayload {
+        EventPayload::VariablesRebound {
+            variables: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_rebind_overrides_the_initialized_value() {
+        let events = vec![
+            event(1, initialized(&[("MERGE", "false"), ("TOPIC", "x")])),
+            event(2, rebound(&[("MERGE", "true")])),
+        ];
+        let bindings = bindings_from_events(&events);
+        assert_eq!(bindings.get("MERGE").map(String::as_str), Some("true"));
+        assert_eq!(bindings.get("TOPIC").map(String::as_str), Some("x"));
+        // `Variables` reads the same fold, so substitution sees it too.
+        let vars = Variables::from_events(&events).unwrap();
+        assert_eq!(vars.substitute("{{MERGE}}"), "true");
+    }
+
+    #[test]
+    fn the_later_of_two_rebinds_wins_in_either_order() {
+        for (first, second) in [("true", "false"), ("false", "true")] {
+            let events = vec![
+                event(1, initialized(&[("MERGE", "false")])),
+                event(2, rebound(&[("MERGE", first)])),
+                event(3, rebound(&[("MERGE", second)])),
+            ];
+            assert_eq!(
+                bindings_from_events(&events)
+                    .get("MERGE")
+                    .map(String::as_str),
+                Some(second)
+            );
+        }
     }
 
     #[test]

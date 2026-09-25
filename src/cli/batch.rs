@@ -3229,6 +3229,7 @@ mod tests {
             failure: false,
             skipped_marker: false,
             skip_if: None,
+            result: None,
         };
         compiled.states.insert("s".to_string(), state.clone());
         assert!(!state_has_materialize_children(&compiled, "s"));
@@ -4004,6 +4005,7 @@ mod tests {
                 state: "plan".to_string(),
                 fields,
                 submitter_cwd: None,
+                source: None,
             },
             idempotency_hash: None,
         }
@@ -4174,6 +4176,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: Some("p".to_string()),
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -4299,6 +4303,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: Some("p".to_string()),
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -4456,6 +4462,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -4488,6 +4496,7 @@ mod tests {
                         serde_json::json!([{"name": "alpha", "waits_on": []}]),
                     )]),
                     submitter_cwd: None,
+                    source: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -4575,6 +4584,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: Some(parent.to_string()),
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -4647,6 +4658,7 @@ mod tests {
                         serde_json::json!([{"name": "alpha", "waits_on": []}]),
                     )]),
                     submitter_cwd: None,
+                    source: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -4781,6 +4793,7 @@ mod tests {
                         serde_json::json!([{"name": "alpha", "waits_on": []}]),
                     )]),
                     submitter_cwd: None,
+                    source: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -4902,6 +4915,7 @@ mod tests {
                         serde_json::json!([{"name": "alpha", "waits_on": []}]),
                     )]),
                     submitter_cwd: None,
+                    source: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -5024,6 +5038,7 @@ mod tests {
                         serde_json::Value::Array(tasks_json),
                     )]),
                     submitter_cwd: None,
+                    source: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -5583,7 +5598,7 @@ mod tests {
     fn augment_snapshots_adds_synthetic_entries_for_cleaned_children() {
         // No on-disk snapshots; one ChildCompleted event. The
         // augmentation must synthesize a terminal-success snapshot.
-        let tasks = vec![task("a", &[])];
+        let tasks = [task("a", &[])];
         let name_to_task: HashMap<&str, &TaskEntry> =
             tasks.iter().map(|t| (t.name.as_str(), t)).collect();
         let events = vec![child_completed_event(1, "a", "success", "done")];
@@ -5598,7 +5613,7 @@ mod tests {
 
     #[test]
     fn augment_snapshots_maps_failure_outcome() {
-        let tasks = vec![task("a", &[])];
+        let tasks = [task("a", &[])];
         let name_to_task: HashMap<&str, &TaskEntry> =
             tasks.iter().map(|t| (t.name.as_str(), t)).collect();
         let events = vec![child_completed_event(1, "a", "failure", "failed")];
@@ -5612,7 +5627,7 @@ mod tests {
 
     #[test]
     fn augment_snapshots_maps_skipped_outcome() {
-        let tasks = vec![task("a", &[])];
+        let tasks = [task("a", &[])];
         let name_to_task: HashMap<&str, &TaskEntry> =
             tasks.iter().map(|t| (t.name.as_str(), t)).collect();
         let events = vec![child_completed_event(1, "a", "skipped", "skipped")];
@@ -5629,7 +5644,7 @@ mod tests {
         // A ChildCompleted event for a task that is no longer in the
         // current submission should be ignored so renamed/dropped
         // tasks don't poison the classification.
-        let tasks = vec![task("b", &[])];
+        let tasks = [task("b", &[])];
         let name_to_task: HashMap<&str, &TaskEntry> =
             tasks.iter().map(|t| (t.name.as_str(), t)).collect();
         let events = vec![child_completed_event(1, "a", "success", "done")];
@@ -5646,7 +5661,7 @@ mod tests {
         // unchanged. Without this precedence, a fresh respawn would
         // appear as the stale event's outcome and retry semantics
         // would be invisible to the gate.
-        let tasks = vec![task("a", &[])];
+        let tasks = [task("a", &[])];
         let name_to_task: HashMap<&str, &TaskEntry> =
             tasks.iter().map(|t| (t.name.as_str(), t)).collect();
         let events = vec![child_completed_event(1, "a", "success", "done")];
@@ -5668,7 +5683,7 @@ mod tests {
         // the child was retried, completed again, and auto-cleaned
         // again). With no on-disk snapshot, the later event's outcome
         // must be what the scheduler sees.
-        let tasks = vec![task("a", &[])];
+        let tasks = [task("a", &[])];
         let name_to_task: HashMap<&str, &TaskEntry> =
             tasks.iter().map(|t| (t.name.as_str(), t)).collect();
         let events = vec![
@@ -5725,6 +5740,7 @@ mod tests {
                 to: "b".to_string(),
                 condition_type: "gate".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
             idempotency_hash: None,
         }];
@@ -5743,6 +5759,7 @@ mod tests {
                     to: "b".to_string(),
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
                 idempotency_hash: None,
             },
@@ -5766,6 +5783,7 @@ mod tests {
                     to: "b".to_string(),
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
                 idempotency_hash: None,
             },
@@ -5786,7 +5804,7 @@ mod tests {
 
     #[test]
     fn augment_snapshots_skips_events_before_epoch_boundary() {
-        let tasks = vec![task("a", &[])];
+        let tasks = [task("a", &[])];
         let name_to_task: HashMap<&str, &TaskEntry> =
             tasks.iter().map(|t| (t.name.as_str(), t)).collect();
         // ChildCompleted at seq=2, epoch boundary at seq=3.
@@ -5806,7 +5824,7 @@ mod tests {
 
     #[test]
     fn augment_snapshots_keeps_events_after_epoch_boundary() {
-        let tasks = vec![task("a", &[])];
+        let tasks = [task("a", &[])];
         let name_to_task: HashMap<&str, &TaskEntry> =
             tasks.iter().map(|t| (t.name.as_str(), t)).collect();
         // ChildCompleted at seq=5, epoch boundary at seq=3.
@@ -5822,5 +5840,32 @@ mod tests {
             snapshots.contains_key("a"),
             "ChildCompleted after boundary should be kept"
         );
+    }
+
+    #[test]
+    fn decider_evidence_does_not_shadow_a_real_submitter_cwd() {
+        // Decider-applied evidence carries no submitter_cwd. It must not
+        // hide the cwd an agent's earlier submission recorded.
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        let ev = |seq: u64, cwd: Option<&str>, source: Option<&str>| Event {
+            seq,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "evidence_submitted".to_string(),
+            payload: EventPayload::EvidenceSubmitted {
+                state: "plan".to_string(),
+                fields: HashMap::new(),
+                submitter_cwd: cwd.map(PathBuf::from),
+                source: source.map(str::to_string),
+            },
+            idempotency_hash: None,
+        };
+        let events = vec![
+            ev(1, Some("/work/tree"), None),
+            ev(2, None, Some("decider")),
+            ev(3, None, None),
+        ];
+        let (_, cwd) = resolution_context(&backend, "parent", &events);
+        assert_eq!(cwd, Some(PathBuf::from("/work/tree")));
     }
 }

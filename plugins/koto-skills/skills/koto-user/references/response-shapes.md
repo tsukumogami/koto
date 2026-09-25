@@ -117,6 +117,50 @@ Submit evidence with:
 koto next my-workflow --with-data '{"outcome": "approve"}'
 ```
 
+### Fields with a question and value descriptions
+
+A field whose template declares a `decider` block carries two more keys in its
+`expects.fields` entry, in both `koto next` and `koto status`:
+
+```json
+"verdict": {
+  "type": "enum",
+  "required": true,
+  "values": ["proceed", "exit"],
+  "description": "Is the plan outline item clear and scoped enough to implement?",
+  "value_descriptions": {
+    "proceed": "Names a concrete change with checkable criteria.",
+    "exit": "Vague, contradictory, or needs design first."
+  }
+}
+```
+
+- `description` is the question the field answers.
+- `value_descriptions` has one key per entry in `values`, saying what that value
+  means. On a `boolean` field its keys are `"true"` and `"false"`. Read it when
+  choosing a value.
+- Submit one of `values` as usual. Neither key adds a value you can submit. The
+  template's escape value (the decider's "can't tell" answer) never appears here,
+  and submitting it is rejected like any other value outside `values`.
+- Fields without a declaration are unchanged: both keys are absent, even when the
+  template gives the field a description, and the entry is exactly what it was
+  before declarations existed.
+
+When the user running koto has opted in to a decider, koto may answer a declared
+state itself instead of stopping there. You don't see a response for that state
+at all: the `koto next` you ran returns the next stop, with `advanced: true`, in
+the same shape as any other response. Nothing new appears in the response, so
+keep dispatching on `action`. If koto consulted the decider but didn't apply its
+answer, you get the ordinary `evidence_required` for the declared state and
+submit evidence as usual. The decider's answer is never shown to you, and your
+evidence always wins over it.
+
+koto records each consultation, and the declared fields of the evidence you
+then submit, in the user's decider ledger (`~/.koto/_decider_ledger.jsonl`), so
+the template's author can compare the decider's answers with yours. A
+`warning: decider ledger write failed (...)` line on stderr means that record
+was lost; the response and exit code are unaffected, so carry on.
+
 ---
 
 ## Scenario (b): evidence_required — gates failed, accepts block also present
@@ -332,7 +376,8 @@ The state has a failed gate that is not actionable. The agent cannot override it
 
 **Decision points:**
 - `agent_actionable: false` — the gate has no `override_default` and no built-in default
-  for its type. The agent cannot call `koto overrides record` to resolve this.
+  for its type, or the template declares it `overridable: false`. The agent cannot call
+  `koto overrides record` to resolve this.
 - The right action is to report the blocking condition to the user. The directive text
   typically explains what external action is required.
 - Do not retry `koto next` in a loop — the condition is externally controlled and will
@@ -416,11 +461,21 @@ agents encounter today for any state that uses `integration:`.
   "state": "complete",
   "advanced": true,
   "expects": null,
-  "error": null
+  "error": null,
+  "result": {
+    "status": "success",
+    "summary": "completed at complete",
+    "payload": {"outcome": "scoped", "pr": "https://example.test/pr/7"}
+  }
 }
 ```
 
 **Decision points:**
+- `result` is the workflow's recorded outcome: `status` (`success`, `failure`,
+  `skipped`), `summary`, and an optional `payload`. When the terminal state declares
+  a `result:` map, `payload` is exactly that map resolved; route on its keys. A
+  `payload.missing` array lists keys whose `${context.<key>}` reference did not
+  resolve. The same value is returned by `koto status` while the session exists.
 - `directive` is **absent** — the key is not written at all, not written as `null`.
   Do not attempt to read `response.directive` when `action == "done"`.
 - `details` is **absent** — the terminal variant has no `details` field.
@@ -639,12 +694,19 @@ Several fields are conditionally absent rather than `null`. When writing code to
   only for `"capture_failed"`.
 - `options` inside an `expects` object is omitted (not written) when empty, not written
   as `[]`.
+- `description` and `value_descriptions` on an `expects.fields` entry are present only
+  for a field whose template declares a `decider` block. Check for them before reading.
 - `leg` and `leg_abandoned` are absent unless the session is bound to a request leg (and,
   for the second, unless that leg was abandoned). Check for `leg` before reading it — its
   absence means this session has no leg, not that the request is unreachable.
 - In the JSONL event log, `skip_if_matched` is absent on `Transitioned` events whose
   `condition_type` is not `"skip_if"`. Don't assume this field is present — check
   `condition_type` first.
+- In the JSONL event log, `source` on an `evidence_submitted` event is absent for
+  evidence an agent submitted and `"decider"` for an answer koto applied from an
+  opted-in decider. A `decider_consulted` event before it records the
+  consultation. You can't set `source` yourself: a `source` key in `--with-data`
+  is ordinary evidence data.
 
 ---
 

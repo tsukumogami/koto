@@ -238,6 +238,20 @@ pub trait SessionBackend: Send + Sync {
         0
     }
 
+    /// # Stability: additive-only
+    ///
+    /// The identity of this session store -- backend kind and canonical
+    /// sessions directory -- recorded in a new session's origin record
+    /// (`StateFileHeader.origin`) and compared by `koto init
+    /// --attach-live`.
+    ///
+    /// The default returns `None` for backends with no stable identity;
+    /// sessions they create carry no origin record, and `--attach-live`
+    /// refuses them.
+    fn store_identity(&self) -> Option<crate::engine::types::SessionStoreIdentity> {
+        None
+    }
+
     /// # Stability: additive-only (Issue 19 / Decision 5)
     ///
     /// Not part of the Stage 1 frozen four; signature evolution is
@@ -306,6 +320,22 @@ pub trait SessionBackend: Send + Sync {
     ///
     /// Read all events from the state file.
     fn read_events(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)>;
+
+    /// # Stability: additive-only
+    ///
+    /// Read all events from the local copy of the state file, without any
+    /// remote sync first.
+    ///
+    /// For a backend with no remote half this is [`read_events`]. A
+    /// backend that pulls before reading (`CloudBackend`) overrides it to
+    /// read only the local file, so a caller holding a lock (the decider's
+    /// per-session `decider.lock`) never puts a network round trip inside
+    /// it.
+    ///
+    /// [`read_events`]: SessionBackend::read_events
+    fn read_events_local(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
+        self.read_events(id)
+    }
 
     /// # Stability: additive-only (Issue 19 / Decision 5)
     ///
@@ -496,6 +526,13 @@ impl SessionBackend for Backend {
         }
     }
 
+    fn store_identity(&self) -> Option<crate::engine::types::SessionStoreIdentity> {
+        match self {
+            Backend::Local(b) => b.store_identity(),
+            Backend::Cloud(b) => b.store_identity(),
+        }
+    }
+
     fn append_header(&self, id: &str, header: &StateFileHeader) -> anyhow::Result<()> {
         match self {
             Backend::Local(b) => b.append_header(id, header),
@@ -519,6 +556,13 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.read_events(id),
             Backend::Cloud(b) => b.read_events(id),
+        }
+    }
+
+    fn read_events_local(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
+        match self {
+            Backend::Local(b) => b.read_events_local(id),
+            Backend::Cloud(b) => b.read_events_local(id),
         }
     }
 

@@ -430,6 +430,7 @@ mod tests {
                 to: to.to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
             idempotency_hash: None,
         }
@@ -515,6 +516,7 @@ mod tests {
                     state: "gather".to_string(),
                     fields,
                     submitter_cwd: None,
+                    source: None,
                 },
                 idempotency_hash: None,
             },

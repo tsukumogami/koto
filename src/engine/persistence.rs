@@ -1136,7 +1136,17 @@ impl Boundary {
 /// what initialization needs and the safe direction for a log written before the
 /// field existed.
 fn entry_slice<'a>(events: &'a [Event], current_state: &str, boundary: Boundary) -> &'a [Event] {
-    let start = events.iter().enumerate().rev().find_map(|(idx, e)| {
+    match entry_index(events, current_state, boundary) {
+        Some(idx) => &events[idx + 1..],
+        None => events,
+    }
+}
+
+/// Index of the entry event that opens [`entry_slice`]'s window, or `None`
+/// when no entry event names `current_state`. The one scan both the slice
+/// and [`any_entry_index`] read, so the two can't disagree.
+fn entry_index(events: &[Event], current_state: &str, boundary: Boundary) -> Option<usize> {
+    events.iter().enumerate().rev().find_map(|(idx, e)| {
         let opens = match &e.payload {
             EventPayload::Transitioned { from, to, .. } => {
                 to == current_state
@@ -1153,11 +1163,27 @@ fn entry_slice<'a>(events: &'a [Event], current_state: &str, boundary: Boundary)
         } else {
             None
         }
-    });
-    match start {
-        Some(idx) => &events[idx + 1..],
-        None => events,
-    }
+    })
+}
+
+/// Index of the event that began `current_state`'s current epoch: the last
+/// state-entry event naming it, a self-entry included. The
+/// [`Boundary::AnyEntry`] boundary [`epoch_slice`] cuts at, exposed as a
+/// position so the decider's visit key (`visit_seq`) comes from the same
+/// rule rather than a second copy of it.
+///
+/// Like [`entry_slice`], only meaningful when `current_state` is the phase
+/// the workflow currently occupies; `engine::decider::visit_start_index`
+/// checks that before calling.
+pub(crate) fn any_entry_index(events: &[Event], current_state: &str) -> Option<usize> {
+    entry_index(events, current_state, Boundary::AnyEntry)
+}
+
+/// [`epoch_slice`], for tests outside this module that pin the visit
+/// boundary against it.
+#[cfg(test)]
+pub(crate) fn epoch_slice_for_test<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
+    epoch_slice(events, current_state)
 }
 
 /// The events since the workflow last entered `current_state` at all -- the
@@ -1281,6 +1307,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1446,6 +1474,7 @@ mod tests {
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
         ];
@@ -1484,6 +1513,7 @@ mod tests {
                 to: "gather".to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
         );
         let e4 = make_event(
@@ -1493,6 +1523,7 @@ mod tests {
                 to: "plan".to_string(),
                 condition_type: "gate".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
         );
 
@@ -1569,6 +1600,7 @@ mod tests {
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -1578,6 +1610,7 @@ mod tests {
                     to: "analyze".to_string(),
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
         ];
@@ -1602,6 +1635,7 @@ mod tests {
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -1611,6 +1645,7 @@ mod tests {
                     to: "analyze".to_string(),
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -1665,6 +1700,7 @@ mod tests {
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -1677,6 +1713,7 @@ mod tests {
                         m
                     },
                     submitter_cwd: None,
+                    source: None,
                 },
             ),
             make_event(
@@ -1686,6 +1723,7 @@ mod tests {
                     to: "analyze".to_string(),
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -1707,6 +1745,7 @@ mod tests {
                         m
                     },
                     submitter_cwd: None,
+                    source: None,
                 },
             ),
         ];
@@ -1736,6 +1775,7 @@ mod tests {
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -1748,6 +1788,7 @@ mod tests {
                         m
                     },
                     submitter_cwd: None,
+                    source: None,
                 },
             ),
             make_event(
@@ -1757,6 +1798,7 @@ mod tests {
                     to: "analyze".to_string(),
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -1808,6 +1850,7 @@ mod tests {
                 to: "gather".to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
             "2026-01-01T00:00:01Z",
         )
@@ -2018,6 +2061,7 @@ mod tests {
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
         ];
@@ -2052,6 +2096,7 @@ mod tests {
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
         ];
@@ -2086,6 +2131,7 @@ mod tests {
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
         ];
@@ -2136,6 +2182,7 @@ mod tests {
                     to: "implementation".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -2184,6 +2231,7 @@ mod tests {
                     to: "implementation".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -2203,6 +2251,7 @@ mod tests {
                     to: "review".to_string(),
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -2240,6 +2289,7 @@ mod tests {
                     to: "implementation".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             // A decision tagged with a different state name should be ignored.
@@ -2332,6 +2382,7 @@ mod tests {
                     to: "review".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_override_event(2, "review", "ci-passes"),
@@ -2355,6 +2406,7 @@ mod tests {
                     to: "review".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_override_event(2, "review", "ci-passes"),
@@ -2365,6 +2417,7 @@ mod tests {
                     to: "deploy".to_string(),
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -2396,6 +2449,7 @@ mod tests {
                     to: "other_state".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_override_event(2, "other_state", "some-gate"),
@@ -2406,6 +2460,7 @@ mod tests {
                     to: "review".to_string(),
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_override_event(4, "review", "ci-passes"),
@@ -2433,6 +2488,7 @@ mod tests {
                     to: "review".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             // Mismatched state field: should be excluded.
@@ -2460,6 +2516,7 @@ mod tests {
                     to: "review".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_override_event(2, "review", "ci-passes"),
@@ -2470,6 +2527,7 @@ mod tests {
                     to: "deploy".to_string(),
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_override_event(4, "deploy", "smoke-test"),
@@ -2505,6 +2563,7 @@ mod tests {
                     to: "review".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_gate_evaluated_event(
@@ -2536,6 +2595,7 @@ mod tests {
                 to: "review".to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
         )];
 
@@ -2554,6 +2614,7 @@ mod tests {
                     to: "review".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_gate_evaluated_event(
@@ -2569,6 +2630,7 @@ mod tests {
                     to: "deploy".to_string(),
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -2608,6 +2670,7 @@ mod tests {
                 to: "gather".to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
         )];
         let counts = derive_visit_counts(&events);
@@ -2625,6 +2688,7 @@ mod tests {
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -2634,6 +2698,7 @@ mod tests {
                     to: "analyze".to_string(),
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -2698,6 +2763,7 @@ mod tests {
                     to: "gather".to_string(),
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
             ),
             make_event(
@@ -2706,6 +2772,7 @@ mod tests {
                     state: "gather".to_string(),
                     fields: HashMap::new(),
                     submitter_cwd: None,
+                    source: None,
                 },
             ),
             make_event(
@@ -2756,6 +2823,7 @@ mod tests {
                     state: "gather".to_string(),
                     fields: HashMap::new(),
                     submitter_cwd: None,
+                    source: None,
                 },
             ),
             make_event(
@@ -2808,6 +2876,7 @@ mod tests {
                 to: to.to_string(),
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
+                context_assignments: None,
             },
         )
     }
@@ -2873,6 +2942,7 @@ mod tests {
                     state: "gather".to_string(),
                     fields: HashMap::new(),
                     submitter_cwd: None,
+                    source: None,
                 },
             ),
         ];

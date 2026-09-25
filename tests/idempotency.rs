@@ -36,6 +36,8 @@ fn write_session_file(dir: &Path, session_id: &str) -> PathBuf {
         created_at: "2026-05-24T00:00:00Z".into(),
         parent_workflow: None,
         template_source_dir: None,
+        template_source_file: None,
+        origin: None,
         execution_dir: None,
         session_id: session_id.to_string(),
         intent: None,
@@ -64,6 +66,7 @@ fn evidence_payload(state: &str, value: serde_json::Value) -> EventPayload {
         state: state.into(),
         fields,
         submitter_cwd: None,
+        source: None,
     }
 }
 
@@ -186,6 +189,7 @@ fn canonical_json_key_order_independence() {
         state: "s".into(),
         fields: fields_a,
         submitter_cwd: None,
+        source: None,
     };
 
     let mut fields_b: HashMap<String, serde_json::Value> = HashMap::new();
@@ -195,6 +199,7 @@ fn canonical_json_key_order_independence() {
         state: "s".into(),
         fields: fields_b,
         submitter_cwd: None,
+        source: None,
     };
 
     let h_a = idempotency_hash("s", &p_a);
@@ -486,6 +491,7 @@ fn hash_is_payload_value_independent_of_construction() {
         state: "s".into(),
         fields: fields_1,
         submitter_cwd: None,
+        source: None,
     };
     let mut fields_2 = HashMap::new();
     fields_2.insert("second".to_string(), serde_json::json!("beta"));
@@ -494,6 +500,7 @@ fn hash_is_payload_value_independent_of_construction() {
         state: "s".into(),
         fields: fields_2,
         submitter_cwd: None,
+        source: None,
     };
     assert_eq!(idempotency_hash("s", &p1), idempotency_hash("s", &p2));
 }

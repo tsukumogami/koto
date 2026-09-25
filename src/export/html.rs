@@ -46,6 +46,7 @@ mod tests {
                 required: true,
                 values: vec!["build".to_string(), "investigate".to_string()],
                 description: String::new(),
+                decider: None,
             },
         );
 
@@ -62,6 +63,7 @@ mod tests {
                             m.insert("route".to_string(), serde_json::json!("build"));
                             m
                         }),
+                        context_assignments: Default::default(),
                     },
                     Transition {
                         target: "investigate".to_string(),
@@ -70,6 +72,7 @@ mod tests {
                             m.insert("route".to_string(), serde_json::json!("investigate"));
                             m
                         }),
+                        context_assignments: Default::default(),
                     },
                 ],
                 terminal: false,
@@ -86,6 +89,10 @@ mod tests {
                             override_default: None,
                             completion: None,
                             name_filter: None,
+                            overridable: true,
+                            request: String::new(),
+                            leg: String::new(),
+                            expect: None,
                         },
                     );
                     g
@@ -97,6 +104,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -107,6 +115,7 @@ mod tests {
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 gates: BTreeMap::new(),
@@ -117,6 +126,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -127,6 +137,7 @@ mod tests {
                 transitions: vec![Transition {
                     target: "done".to_string(),
                     when: None,
+                    context_assignments: Default::default(),
                 }],
                 terminal: false,
                 gates: BTreeMap::new(),
@@ -137,6 +148,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         states.insert(
@@ -154,6 +166,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
 
@@ -251,6 +264,7 @@ mod tests {
                 failure: false,
                 skipped_marker: false,
                 skip_if: None,
+                result: None,
             },
         );
         let t = CompiledTemplate {

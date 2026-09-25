@@ -209,6 +209,7 @@ mod tests {
             required,
             values: values.into_iter().map(|s| s.to_string()).collect(),
             description: String::new(),
+            decider: None,
         }
     }
 

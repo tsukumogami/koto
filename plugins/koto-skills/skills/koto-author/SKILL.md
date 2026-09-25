@@ -44,7 +44,7 @@ If your skill is a single linear task with no decision points, koto adds unneces
 
 ## Prerequisites
 
-- koto >= 0.12.3 must be installed and on PATH (`koto version` to verify)
+- koto >= 0.13.1 must be installed and on PATH (`koto version` to verify)
 - This skill is installed via the koto-skills plugin
 
 If koto is not installed or the version is too old, install the latest release:
@@ -93,10 +93,10 @@ Each item in `blocking_conditions` has six fields:
 | Field | Type | Notes |
 |-------|------|-------|
 | `name` | string | Gate name as declared in the template, or the reserved `__action__` for a failed `default_action` |
-| `type` | string | Gate type (`command`, `context-exists`, `context-matches`, `children-complete`), or `action` |
+| `type` | string | Gate type (`command`, `context-exists`, `context-matches`, `children-complete`, `request-leg`), or `action` |
 | `status` | string | `failed`, `timed_out`, or `error` |
-| `category` | string | `"corrective"` (fix something) or `"temporal"` (retry later). `children-complete` gates are temporal; all others are corrective. |
-| `agent_actionable` | boolean | `true` when `koto overrides record` can unblock this gate. Always `false` for `__action__` -- an action failure has nothing to override |
+| `category` | string | `"corrective"` (fix something) or `"temporal"` (retry later). `children-complete` and `request-leg` gates are temporal; all others are corrective. |
+| `agent_actionable` | boolean | `true` when `koto overrides record` can unblock this gate. Always `false` for `__action__` -- an action failure has nothing to override -- and for a gate declared `overridable: false` |
 | `output` | object | Gate-type-specific structured result (e.g., `{"exit_code": 1, "error": ""}` for `command` gates). For `__action__`: `state`, `command`, `failure_kind`, `stdout`, `stderr`, `truncated`, and `exit_code` only when `failure_kind` is `nonzero_exit` |
 
 `__action__` is reserved: the compiler rejects a state that declares a gate by that name, so the condition can never be confused with one of yours. Route on `failure_kind` (`nonzero_exit`, `spawn_failed`, `timed_out`, `wait_failed`, `capture_failed`) rather than on `status` or on message wording. When an action fails, the state's gates are not evaluated at all -- the tick returns first -- so a state whose action failed reports exactly one condition.
@@ -136,6 +136,7 @@ The skill bundles reference material, loaded during specific states:
 
 - **Template format guide** (`${CLAUDE_SKILL_DIR}/references/template-format.md`) -- read during state_design and template_drafting. Covers structure (Layer 1), evidence routing (Layer 2), and advanced features (Layer 3). Read only the layers you need.
 - **`default_action` authoring guide** (`docs/guides/default-action-authoring.md` in the koto repository) -- read before declaring a state's `default_action`. Covers which commands the engine may run, the field schema, the failure path and its `failure_kind` vocabulary, `capture_stdout_as`, and execution anchoring.
+- **Decider declarations** (the "Decider declarations on accepts fields" section of the template format guide, and `docs/guides/decider-authoring.md` in the koto repository) -- read when a state stops only to ask the agent a closed question (an `enum` or `boolean` answer judged from stored inputs). Covers the `decider` block, the four modes, the escape, inputs and byte budgets, the one-question-per-state rule, the `E-DECIDER-FLOOR` rule, what the declaration hash covers, promotion through `koto decider report`, and which answers should never be promoted. Ship every answer in `shadow` or `never`. koto v0.12.2 ignores the block, so a template with declarations keeps working unchanged on older koto.
 - **Batch authoring guide** (`${CLAUDE_SKILL_DIR}/references/batch-authoring.md`) -- read when your workflow fans out a dynamic task list to child workers. Covers `materialize_children`, the `failure_reason` convention (W5), the `skipped_marker` child-template requirement (F5), aggregate-boolean routing (W4), and two-hat coordinators.
 - **Example templates** (`${CLAUDE_SKILL_DIR}/references/examples/`) -- read during state_design. Pick the one matching your complexity:
   - Branching workflows? `evidence-routing-workflow.md`

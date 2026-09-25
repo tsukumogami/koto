@@ -149,6 +149,13 @@ impl SessionBackend for LocalBackend {
         Ok(results)
     }
 
+    fn store_identity(&self) -> Option<crate::engine::types::SessionStoreIdentity> {
+        Some(crate::engine::types::SessionStoreIdentity {
+            kind: "local".to_string(),
+            base: fs::canonicalize(&self.base_dir).unwrap_or_else(|_| self.base_dir.clone()),
+        })
+    }
+
     fn count_unreadable(&self) -> usize {
         let entries = match fs::read_dir(&self.base_dir) {
             Ok(entries) => entries,
@@ -921,6 +928,8 @@ mod tests {
             created_at: created_at.to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -958,6 +967,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1518,6 +1529,8 @@ mod tests {
             created_at: "2026-04-13T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -1556,6 +1569,7 @@ mod tests {
                     to: "start".to_string(),
                     condition_type: "initial".to_string(),
                     skip_if_matched: None,
+                    context_assignments: None,
                 },
                 idempotency_hash: None,
             },
@@ -1618,6 +1632,8 @@ mod tests {
                     created_at: "2026-04-13T00:00:00Z".to_string(),
                     parent_workflow: None,
                     template_source_dir: None,
+                    template_source_file: None,
+                    origin: None,
                     execution_dir: None,
                     session_id: String::new(),
                     intent: None,
@@ -2065,6 +2081,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: parent.map(|s| s.to_string()),
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -2206,6 +2224,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: None,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: original_session_id.to_string(),
             intent: None,

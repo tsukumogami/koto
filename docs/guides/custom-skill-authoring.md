@@ -62,7 +62,35 @@ A few things to note about this template:
 - **Gates** are conditions that must be satisfied before a transition. The `context-exists` type checks whether a key exists in the content store. The `command` type runs a shell command and checks the exit code.
 - **Variables** are interpolated at runtime using `{{VARIABLE_NAME}}` syntax. The agent supplies them via `--var KEY=VALUE` on `koto init`.
 
-The supported gate types are `command`, `context-exists`, `context-matches`, and `children-complete`. For full template-authoring guidance, use the `koto-author` skill (in the koto-skills plugin), which compiles and validates templates interactively.
+The supported gate types are `command`, `context-exists`, `context-matches`, `children-complete`, and `request-leg` (see [Routing on another session's result](#routing-on-another-sessions-result-request-leg-gates)). For full template-authoring guidance, use the `koto-author` skill (in the koto-skills plugin), which compiles and validates templates interactively.
+
+### Constraining variables
+
+Every variable value already has to pass koto's character allowlist. When a variable should only ever hold a few specific values, or values of a known shape, say so in the declaration and let koto refuse anything else at `koto init`, before a gate command or directive ever sees it. That keeps argument checking out of your SKILL.md prose.
+
+```yaml
+variables:
+  INTENT_FLAG:
+    description: The caller's intent token, or empty
+    pattern: ^(continue|stop)?$
+  MERGE:
+    values: ["true", "false"]
+    default: "false"
+    rebind: true
+  MAX_ROUNDS:
+    pattern: "([1-9]|[1-4][0-9]|50)?"
+    rebind: true
+```
+
+- **`values:`** is a closed list. A value must equal one of the entries exactly. The list can't be empty, and every entry must itself pass the allowlist.
+- **`pattern:`** is a regular expression in the Rust `regex` crate's syntax. koto matches it against the whole value, applying it as `^(?:<pattern>)$`, so `pattern: "[a-z]+"` refuses `abc-1` even though you didn't write anchors. Anchors you do write are harmless. The crate has no lookaround or backreferences, and an expression it can't compile is a compile error.
+- A variable declares at most one of `values:` and `pattern:`.
+- A non-empty `default` must satisfy the constraint. An optional variable with no default resolves to the empty string when it isn't passed, so its constraint has to accept `""` (as `INTENT_FLAG` and `MAX_ROUNDS` above do); otherwise give it a default or mark it `required: true`.
+- Unknown keys in a variable declaration are compile errors, so a misspelled `valuez:` can't silently leave a variable unconstrained.
+
+At `koto init`, a value that fails its constraint (or the allowlist) exits with code 2, creates no session, and reports `"code": "invalid_var"` with the variable, the value, and the constraint. A repeated `--var` key reports `duplicate_var` and an undeclared one `unknown_var`. See [the error code reference](../reference/error-codes.md#init).
+
+**`rebind: true`** marks a per-invocation setting, such as whether this run may merge, as opposed to an identity variable like a topic or a document path. Variables are fixed when the session is created. A `rebind: true` variable is the exception: when a later invocation attaches to the same live session, koto re-applies it from that invocation, using the invocation's value or else the declared default, so the setting is never inherited from an earlier run. Rebinding happens only through an accepted `koto init --attach-live`; there's no standalone command that changes a variable, and a refused attach leaves every variable as it was. The session log records each rebind as a `variables_rebound` event. `rebind` must be a YAML boolean.
 
 ## Step 2: Validate the template
 
@@ -289,6 +317,23 @@ If the session is interrupted mid-workflow:
 
 The koto-skills plugin includes a Stop hook that reminds the agent about active workflows when a session ends.
 
+#### Entering the same session on every invocation
+
+A skill whose session has a stable name (`scope-<topic>`, say) can skip the read-then-decide dance by letting koto decide in one call:
+
+    koto init scope-<topic> --template <path>/scope.md --vars-file <file> --attach-live --replace-terminal
+
+Write the variables to `<file>` as a JSON list of `["KEY", "VALUE"]` pairs (with `jq`, never by string concatenation) and branch on the four outcomes:
+
+- `"outcome": "created"`: no session had the name, and koto made one.
+- `"outcome": "attached"`: a running session had it. koto checked that it was built from a template file of the same name, that its origin record (the directory it runs in and the session store holding it) matches this invocation's, and that every non-`rebind` variable you passed equals its recorded value. Your `rebind: true` variables were re-applied from this call, and `rebound` lists what changed.
+- `"outcome": "replaced"`: a finished session had it. koto removed it and started a fresh one; `replaced_result` holds the old session's result, which the skill may report.
+- A refusal: a non-zero exit (2 for everything the caller can fix) and a typed `code`. The ones a skill usually renders are `invalid_var`, `duplicate_var` and `unknown_var` (a bad argument, before any session exists), `var_mismatch` (a running session was started with a different fixed value; `var`, `recorded` and `requested` say which), `template_mismatch` (the running session was built from another template), and `origin_mismatch` (a session with this name belongs to another worktree or store, or predates origin records). A refusal changes nothing.
+
+Every new session records its origin record, so `origin_mismatch` is how a skill learns that the name is taken elsewhere on the machine; nothing else prints the record. Sessions started by a koto release older than the record have none and are refused at `--attach-live` until they finish or are removed with `koto session cleanup <name>`.
+
+When the run answers a request leg, add `--koto-leg <request-id>:<leg>`. koto attaches the session to the leg in the same step, with every check `koto request attach` makes, and all of them run before the session is created, replaced or rebound, so a stale invocation naming a leg it no longer owns can't change a rebind variable. Any refusal, argument errors included, is recorded on the leg as `result_source: refused` with a payload `{"outcome": "refused", "reason", "var", "recorded", "requested"}` whenever the leg is still open and unbound, so whoever waits on the leg reads the refusal instead of waiting. `reason` is `invalid-var:<V>`, `duplicate-var:<V>`, `unknown-var:<V>`, `var-mismatch:<V>`, `template-mismatch`, `origin-mismatch`, or another refusal's code in kebab case. The [CLI usage guide](cli-usage.md#entry-flags) has the full contract.
+
 ## Placing your skill
 
 There are two ways to deploy a skill, depending on who needs it.
@@ -447,6 +492,7 @@ Every gate type produces structured output, available under `gates.<gate_name>` 
 | `command` | `{"exit_code": number, "error": string}` |
 | `context-exists` | `{"exists": boolean, "error": string}` |
 | `context-matches` | `{"matches": boolean, "error": string}` |
+| `request-leg` | `{"found": boolean, "disposition": string, "bound": boolean, "source": string, "status": string, "final_state": string, "template": string, "outcome": string, "step": string, "reason": string, "valid": boolean, "payload": object, "error": string}` |
 
 For `command` gates, `error` is `""` on normal exit (pass or fail). On timeout it's `"timed_out"` with `exit_code: -1`. On spawn errors it's the error message with `exit_code: -1`.
 
@@ -474,9 +520,215 @@ transitions:
 
 Single-segment paths like `decision: proceed` still work for agent-submitted evidence. Dot-path traversal (`gates.ci_check.exit_code`) is for gate output fields injected by the engine.
 
+### Writing context from a transition
+
+A transition can write context keys itself when it fires, through `context_assignments`. It's a map of context key to a string value:
+
+```yaml
+states:
+  review:
+    accepts:
+      verdict:
+        type: enum
+        values: [approve, block]
+        required: true
+      detail:
+        type: string
+    gates:
+      ci:
+        type: command
+        command: "make test"
+    transitions:
+      - target: done
+        when:
+          verdict: approve
+          gates.ci.exit_code: 0
+        context_assignments:
+          outcome: landed
+          topic: "{{TOPIC}}"
+          ci_exit: "${gates.ci.exit_code}"
+      - target: done_blocked
+        when:
+          verdict: block
+        context_assignments:
+          outcome: blocked
+          failure_reason: "review blocked: ${evidence.detail}"
+```
+
+A value takes four forms, and references may sit inside a string literal as `failure_reason` does above:
+
+| Form | Resolves to |
+|------|-------------|
+| a literal (`landed`) | itself |
+| `{{VAR}}` | the session's variable, including a `capture_stdout_as` value delivered earlier in the same `koto next` |
+| `${evidence.<field>}` | the value submitted for `<field>` in the evidence that drove the transition |
+| `${gates.<gate>.<path>}` | a dot path into the gate's structured output for that tick; it walks any nesting, so it works for every gate type |
+
+The compiler checks every assignment. Each key must be a usable context key (letters, digits, `.`, `_`, `-`, and `/` between components). A value must be a string; numbers and booleans are written as text, and a mapping or a list is an error. `${evidence.<field>}` must name a field in the state's `accepts` block, `${gates.<gate>...}` must name a gate declared on the state, and `{{VAR}}` must name a declared variable or capture. Any other `${...}`, such as `${context.key}`, is refused. So is any key on a transition other than `target`, `when` and `context_assignments`: a typo like `context_assignment:` fails compilation instead of being ignored.
+
+At run time only the edge that fires writes anything. An evidence field that wasn't submitted, or a gate path that isn't in that tick's output, resolves to the empty string and the transition still happens. Resolved values are stored exactly as resolved: a submitted value that contains `{{X}}` or `${context.y}` is written literally, never expanded a second time. A later write to the same key, whether from another transition or `koto context add`, replaces the earlier value.
+
+The resolved values are recorded on the transition's own event in the session log, so a transition and its assignments can't be separated by a crash. If writing them to the context store fails after that, the next `koto context get`, `koto context exists`, or context gate restores them from the log.
+
+A command gate's output is only `exit_code` and `error`, so a gate path can't carry what a script printed. To get a script's output into context, have a `default_action` run `koto context add`.
+
+### Gates that refuse overrides
+
+By default an agent can force any gate with `koto overrides record`, which logs a rationale and substitutes the gate's output (from `--with-data`, the gate's `override_default`, or the gate type's built-in default) for the next `koto next`. That is the right escape hatch for most gates: a flaky check, a condition a human confirmed by hand.
+
+Some gates shouldn't have one. Declare `overridable: false` on a gate whose output decides something nothing downstream re-checks: whether to merge, whether a run counts as done, which report a parent receives. It works on every gate type:
+
+```yaml
+states:
+  merge_decide:
+    default_action:
+      command: "./merge-verdict.sh"   # writes merge.verdict to context
+    gates:
+      verdict:
+        type: context-matches
+        key: merge.verdict
+        pattern: "^ready$"
+        overridable: false
+    transitions:
+      - target: merge
+        when:
+          gates.verdict.matches: true
+      - target: wait
+        when:
+          gates.verdict.matches: false
+```
+
+With the flag set:
+
+- `koto overrides record` on the gate exits 2 with the typed code `gate_not_overridable`, whatever `--with-data` holds, and appends nothing to the state log.
+- The gate reports `agent_actionable: false` in `blocking_conditions`, so an agent reading the response isn't told to override it.
+- If the log already holds an override for the gate (written by an older koto, or by hand), `koto next` ignores it and evaluates the gate for real.
+
+A good rule: a gate that routes on a context key your own `default_action` script wrote should be `overridable: false`, because otherwise an override lets the agent supply the value the script exists to produce. Leave gates that only guard against a transient failure overridable, so a stuck run has a logged way forward.
+
+The compiler holds you to the declaration. `overridable` accepts only `true` or `false` (`"no"` is an error), `override_default` on a gate with `overridable: false` is an error because nothing could ever apply it, and an unknown key on a gate, such as the misspelling `overrideable`, fails `koto template compile` with an error naming the state, the gate, and the key.
+
+### The reachability check, and why non-overridable gates are exempt
+
+Strict compilation (`koto template compile` without `--allow-legacy-gates`) runs a reachability check on every state whose `when` clauses route only on gate output. It builds each gate's override value, its `override_default` or else its type's built-in default, and requires that at least one of those pure-gate transitions fires on it. The check exists because an override is the escape hatch for a stuck state: if forcing every gate still matches no arm, the override can't move the state, and the template has a dead end. The failure reads `no transition fires when all gates use override defaults`, and the fix is an `override_default` that selects an arm.
+
+That premise doesn't hold for a gate declared `overridable: false`, since no override can ever apply to it. So the check leaves out every pure-gate transition whose `when` clause references a non-overridable gate, and a state whose pure-gate transitions all reference one is exempt. The arms still have to be right; they're just reached by the gate's real output rather than by an override. Transitions that reference only overridable gates are checked exactly as before, including on a state that also has a non-overridable gate. Without the exemption, a state that routes a non-overridable gate on values its default can't produce (the `payload.outcome` of a `request-leg` gate, say, or a `context-matches` gate routed only on `matches: false`) could never compile strictly, because the `override_default` that would satisfy the check is itself a compile error on such a gate.
+
+### Routing on another session's result: `request-leg` gates
+
+A `request-leg` gate reads one leg of a koto request (`koto request create`) and reports what the session answering that leg recorded. It's how a coordinating workflow waits for, and then routes on, the result of a workflow it handed work to, without the agent relaying anything.
+
+```yaml
+variables:
+  REQ:
+    required: true
+states:
+  scope_run:
+    gates:
+      scope_leg:
+        type: request-leg
+        request: "{{REQ}}"
+        leg: scope
+        expect:
+          outcome: [scoped, declined]
+        overridable: false
+    transitions:
+      - target: scoped
+        when:
+          gates.scope_leg.disposition: resolved
+          gates.scope_leg.payload.outcome: scoped
+        context_assignments:
+          plan_path: "${gates.scope_leg.payload.plan_path}"
+      - target: declined
+        when:
+          gates.scope_leg.disposition: resolved
+          gates.scope_leg.payload.outcome: declined
+      - target: request_abandoned
+        when:
+          gates.scope_leg.disposition: abandoned
+```
+
+**Fields.** `request` (the request id) and `leg` (the leg name) are required. Both may use `{{VAR}}` references, which the tick substitutes. A literal value is checked at compile time against the same rules `koto request` applies to ids and leg names; a substituted value is checked when the gate is evaluated, and a bad one makes the gate report outcome `error` with the reason in `error`, without reading the store. `expect` is optional: a map from a payload key to the list of scalar values that key may carry. An empty map, an empty list, or a list element that is an object, an array, or null is a compile error.
+
+**Output.**
+
+| Field | Meaning |
+|-------|---------|
+| `found` | `true` when the request and leg exist and were read. |
+| `disposition` | `open`, `resolved`, `abandoned`, or `missing`; empty when the gate errored. |
+| `bound` | Whether a session is bound to the leg. |
+| `source` | For a resolved leg, how the result got there: `promoted` (from the bound session's terminal tick), `explicit` (`koto request resolve`), or `refused` (koto turned away the session that was to answer it). Empty otherwise. |
+| `status` | The result's `status`: `success`, `failure`, or `skipped`. Empty until resolved. |
+| `final_state` | The terminal state a promoted result came from. Empty for explicit and refused results. |
+| `template` | The bound session's template source file name, as the attach recorded it. Empty for explicit and refused results. |
+| `outcome`, `step`, `reason` | Copied from the payload's string keys of the same names; empty when absent or not a string. |
+| `valid` | `true` only for a resolved leg whose payload is an object carrying every `expect` key with a listed value. Keys `expect` doesn't name are ignored. With no `expect`, any resolved object payload is valid. |
+| `payload` | The result's payload object, or `{}` when it has none (or has one that isn't an object). |
+| `error` | Why the gate couldn't read the leg; empty on a normal read. |
+
+**Dispositions.** A `resolved` leg passes the gate. An `abandoned` leg passes too, as does an unresolved leg on a request that was abandoned or closed, because nothing can answer it any more; route it to a state that handles the abandonment. A `missing` request or leg fails the gate, and an arm keyed on `disposition: missing` can still fire, since gate output reaches `when` clauses whether or not the gate passed. An `open` leg fails the gate and is a temporal block: `koto next` stops with `gate_blocked` (or `evidence_required` on a state with `accepts`) and `category: "temporal"`, the same wait a `children-complete` gate gives. Don't write an arm for the open case; the stop is the wait. When no request store is reachable (no home directory, or a host where request records aren't available), the gate reports outcome `error` with `found: false` rather than passing.
+
+**Payload paths.** A `when` clause routes on a key inside the payload with `gates.<gate>.payload.<key>`, and deeper keys work too (`gates.<gate>.payload.detail.kind`). This is the one place a `gates.*` path may run past three segments; every other field and gate type still takes exactly `gates.<gate>.<field>`. A `when` clause on the whole `payload` object is a compile error, since a scalar can never equal an object. The same paths work in `context_assignments` (`${gates.scope_leg.payload.pr}`), which is how a coordinator copies what the child reported into its own context.
+
+**The gate only reads.** Evaluating it never appends to the request log, binds, resolves, or abandons the leg.
+
+**Make it non-overridable.** The built-in default an override would inject is a resolved, valid record with an empty payload, so it names no outcome, and an override on a leg gate would let an agent claim a child finished when it didn't. Declare `overridable: false` on any leg gate whose outcome decides what happens next; that also exempts the state from the reachability check, which its payload arms couldn't otherwise pass.
+
 ### Updating your SKILL.md
 
 When your template uses content-aware gates, update the SKILL.md to instruct the agent to submit content through `koto context add` rather than writing files to `{{SESSION_DIR}}`. The evidence keys section should document the expected content keys and their purpose.
+
+## Terminal results
+
+When a workflow finishes, koto records a result: a `status` (`success`, `failure` or `skipped`, from the terminal's `failure` and `skipped_marker` flags), a one-line `summary`, and an optional structured `payload`. A terminal state can declare what goes in that payload with a `result:` map, so the outcome a caller routes on comes from the template instead of from text the agent composes.
+
+```yaml
+states:
+  done_error:
+    terminal: true
+    failure: true
+    result:
+      outcome: error
+      step: "${context.step}"
+      pr: "${context.home_pr}"
+      topic: "{{TOPIC}}"
+      state: "merge-state:${context.state}"
+```
+
+Each value is a string built from three forms, which can be mixed within one value:
+
+| Form | Resolves to |
+|------|-------------|
+| literal text | itself |
+| `{{VAR}}` | the session's value for a declared variable (or a runtime name such as `SESSION_NAME`) |
+| `${context.<key>}` | the content stored under `<key>` with `koto context add`, read as UTF-8 |
+
+The rules the compiler enforces:
+
+- `result:` is only allowed on a terminal state.
+- A map holds at most 32 keys. Keys follow the context-key grammar (letters, digits, `.`, `_`, `-`, with `/` between components).
+- `missing` is reserved and can't be declared (see below).
+- Values must be strings. A number or boolean is taken as its text; a nested mapping or a list is an error.
+- A `{{VAR}}` must name a declared variable, and a `${context.<key>}` must name a valid context key. No other `${...}` form is allowed here: `${evidence.x}` or `${gates.g.x}` fails compilation. To report something a gate or evidence produced, write it to the context store first and reference it as `${context.<key>}`.
+
+**When it resolves.** koto resolves the map once, on the tick that lands the session in the terminal state, and records the result on the session's own log. Every later read returns that recorded value, so writing to a context key after the terminal doesn't change what the session reported. Resolution is single-pass: a value that itself contains `{{X}}` or `${context.y}` is copied literally, not expanded again.
+
+**Unresolved references.** A `${context.<key>}` whose key doesn't exist, or whose content isn't valid UTF-8, resolves to the empty string, and the result key it sits in is listed in a `missing` array inside the payload. `missing` is present only when something didn't resolve. The terminal tick still succeeds; check `missing` if a caller depends on a key.
+
+```json
+{"status": "failure", "summary": "failed at done_error",
+ "payload": {"outcome": "error", "step": "scope:push", "pr": "", "topic": "my-topic",
+             "state": "merge-state:open", "missing": ["pr"]}}
+```
+
+**It replaces the evidence-derived payload.** Without a `result:` map, the payload is the evidence fields submitted on the terminal state, as it always was. With one, the payload is exactly the resolved map; terminal evidence fields aren't merged in. `status` and `summary` are derived the same way either way.
+
+**Where the result appears.** The same value is carried everywhere a result goes:
+
+- the `result` field of the `koto next` response that reaches the terminal (`"action": "done"`), and of every later tick on a session kept with `--no-cleanup`;
+- the `result` field of `koto status` on a session standing in a terminal state (a non-terminal session's status has no `result`);
+- the result of a request leg the session is bound to (`koto request get`);
+- the `result` of the `ChildCompleted` event appended to a parent workflow's log when a child finishes.
 
 ## Testing your skill
 

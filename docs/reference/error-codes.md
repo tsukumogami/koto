@@ -30,6 +30,40 @@ Rename the workflow or delete the existing state file.
 
 Run `koto template compile <path>` to see the full compilation error.
 
+**Variable refused (exit code 2)** — a `--var` value, a default, or an omitted optional variable's empty value was refused. No session is created. Three refusals carry a machine-readable `code` beside `error` and `command`, so a caller can branch without matching the message:
+
+| Code | Meaning | Extra fields |
+|------|---------|--------------|
+| `invalid_var` | The value fails the variable's declared `values:` or `pattern:`, or the character allowlist every value must pass. | `var`, `value`, `constraint` (`values:[a,b]`, `pattern:<re>`, or `allowlist`) |
+| `duplicate_var` | The same key was passed twice. | `var` |
+| `unknown_var` | The key isn't declared in the template. | `var` |
+
+```json
+{"error":"variable \"INTENT_FLAG\" value \"maybe\": does not satisfy pattern:^(continue|stop)?$","command":"init","code":"invalid_var","var":"INTENT_FLAG","value":"maybe","constraint":"pattern:^(continue|stop)?$"}
+{"error":"duplicate --var key \"MERGE\"","command":"init","code":"duplicate_var","var":"MERGE"}
+{"error":"unknown variable \"NOPE\": not declared in template","command":"init","code":"unknown_var","var":"NOPE"}
+```
+
+The `error` text for duplicate and unknown keys, and for an allowlist failure, is unchanged from earlier releases. A malformed `--var` (no `=`, or an empty key) and a missing required variable are also exit 2, with no `code`.
+
+**Entry-flag refusals** — `--vars-file`, `--attach-live`, `--replace-terminal` and `--koto-leg` (see the [CLI usage guide](../guides/cli-usage.md#entry-flags)) add these codes, all exit 2 and all with nothing written:
+
+| Code | Meaning | Extra fields |
+|------|---------|--------------|
+| `invalid_usage` | An unusable flag combination (`--vars-file` with `--var`; an entry flag with `--from-stdin` or `--parent`) or a malformed `--koto-leg`. | |
+| `invalid_vars_file` | The vars file is missing, a symlink, not a regular file, over 64 KiB, or not a JSON list of string pairs. | |
+| `session_live` | `--replace-terminal` without `--attach-live` found a running session. | `state` |
+| `session_terminal` | `--attach-live` without `--replace-terminal` found a finished session. | `state` |
+| `template_mismatch` | `--attach-live` found a session built from another template file. | `recorded`, `requested` |
+| `origin_mismatch` | `--attach-live` found a session from another worktree or session store, or one with no origin record. | `recorded`, `requested` |
+| `var_mismatch` | An explicitly passed non-`rebind` variable differs from the session's recorded value. | `var`, `recorded`, `requested` |
+
+Under `--koto-leg`, the leg checks `koto request attach` makes refuse with the same codes as that verb (`request_closed`, `leg_abandoned`, `input_mismatch`, and the rest in [Request errors](#request-errors)), in this flat `init` envelope with an optional `details` list; a lost bind race can also end in `lock_contention` (exit 1). On the entry-flag path a template that doesn't resolve or compile carries its kind as a code too (`template_not_found`, `template_compile_failed`, exit 1).
+
+```json
+{"error":"variable \"INTENT_FLAG\" is fixed for this session: recorded \"stop\", requested \"continue\"","command":"init","code":"var_mismatch","var":"INTENT_FLAG","recorded":"stop","requested":"continue"}
+```
+
 ---
 
 ### next
@@ -251,6 +285,29 @@ field. Exits 0 and 1 print nothing; only this case produces a body.
 
 ---
 
+### overrides record
+
+Most `overrides record` errors use the flat format: an unknown gate, invalid
+`--with-data` JSON, a payload over the size limit, or a gate with no default to
+apply. One condition carries a typed code.
+
+**`gate_not_overridable` (exit code 2)** -- the gate is declared
+`overridable: false` in the template, so no override can force it. The refusal
+comes before `--with-data` is read or parsed, so it is the same with no payload,
+an inline payload, an `@file.json` payload, or one that wouldn't parse. Nothing is
+appended to the state log:
+
+```json
+{"error":{"code":"gate_not_overridable","message":"gate 'merge_route' in state 'merge_decide' is declared overridable: false and cannot be overridden; satisfy the gate itself, then run koto next","gate":"merge_route","state":"merge_decide"},"command":"overrides record"}
+```
+
+Satisfy the gate's real condition and call `koto next`; the gate is evaluated
+for real on every tick. The same gate reports `agent_actionable: false` in
+`blocking_conditions`. An override for such a gate that is already in the log
+(written by an older koto, or by hand) is ignored at evaluation time.
+
+---
+
 ### template compile
 
 **Compilation failed** — invalid YAML, missing required fields, or unknown gate type:
@@ -310,6 +367,109 @@ warning: W-SKIP-GATE-ABSENT: state "check": skip_if key "gates.ci.exit_code" ref
 
 Fix: add the referenced gate name to the state's `gates` block, or correct the `skip_if` key.
 
+#### decider diagnostic codes
+
+A `decider` block on an `accepts` field has these compile-time errors. Each fails compilation, and each message names the state, the field, and the value where one applies. None of them is relaxed by `--allow-legacy-gates`. A misspelled key inside the block isn't one of these codes: it fails as invalid YAML, and the message names the key (for example ``unknown field `thresold` ``).
+
+**E-DECIDER-FIELD-TYPE (error)**: the block sits on a `string`, `number`, or `tasks` field. Only `enum` and `boolean` fields can be declared.
+
+```
+E-DECIDER-FIELD-TYPE: state "review" field "verdict": a decider block is only allowed on enum and boolean fields, not on a string field
+  remedy: remove the decider block, or make the field an enum or boolean
+```
+
+Fix: remove the block, or change the field's type.
+
+**E-DECIDER-QUESTION (error)**: a declared field has an empty `description`. The description is the question the decider answers.
+
+```
+E-DECIDER-QUESTION: state "review" field "verdict": a declared field needs a description; it is the question the decider answers
+  remedy: add a description to the field
+```
+
+Fix: give the field a `description`.
+
+**E-DECIDER-ANSWERS (error)**: the `answers` keys differ from the field's `values`, or from `true` and `false` on a boolean field, or a value has two entries. The message names the missing or extra key.
+
+```
+E-DECIDER-ANSWERS: state "review" field "verdict": missing answers for ["exit"]; answers must have exactly one entry per value (["proceed", "exit"])
+  remedy: make the answers keys match the field's values
+```
+
+Fix: write exactly one `answers` entry per value.
+
+**E-DECIDER-VALUE-DESCRIPTION (error)**: an answer has an empty or missing `description`.
+
+```
+E-DECIDER-VALUE-DESCRIPTION: state "review" field "verdict" value "exit": the answer needs a description
+  remedy: say what this value means, for the agent and the decider
+```
+
+Fix: describe the value.
+
+**E-DECIDER-ESCAPE (error)**: on an enum field, the escape is missing, its `value` is empty, its `description` is missing, or its value is also in `values`. On a boolean field, any `escape` key is refused.
+
+```
+E-DECIDER-ESCAPE: state "review" field "verdict" value "exit": the escape value is also in values; it must not be a value evidence can carry
+  remedy: rename the escape, or remove it from values
+```
+
+Fix: give an enum field an escape `{value, description}` whose value isn't in `values`, and remove `escape` from a boolean field.
+
+**E-DECIDER-ESCAPE-ROUTED (error)**: a transition's `when` clause tests the field at the escape value. Evidence can never carry the escape, so the route could never fire. This code is reported instead of the general "not in allowed values" routing error.
+
+```
+E-DECIDER-ESCAPE-ROUTED: state "review" field "verdict" value "unclear": the transition to "stopped" routes on the escape value, which evidence can never carry
+  remedy: remove the transition, or route on a value in values
+```
+
+Fix: remove the transition, or route on one of `values`.
+
+**E-DECIDER-MODE (error)**: an answer's `mode` isn't one of `off`, `shadow`, `auto`, or `never`.
+
+```
+E-DECIDER-MODE: state "review" field "verdict" value "exit": unknown mode "sometimes"; a mode is one of off, shadow, auto, never
+  remedy: use one of those modes, or omit mode for shadow
+```
+
+Fix: use one of the four modes, or leave `mode` out.
+
+**E-DECIDER-THRESHOLD (error)**: an answer's `threshold` isn't a finite number from 0.5 to 1.0 inclusive.
+
+```
+E-DECIDER-THRESHOLD: state "review" field "verdict" value "proceed": threshold 1.1 is outside [0.5, 1.0]
+  remedy: use a threshold from 0.5 to 1.0, or omit it for 0.9
+```
+
+Fix: pick a threshold in range, or leave it out.
+
+**E-DECIDER-INPUT (error)**: an input is wrong. The declaration has no inputs, or an input names both or neither of `context` and `var`, or has an empty label, reuses a label within the field, or sets `max_bytes: 0`. A `var` that's neither a declared variable nor a `capture_stdout_as` name is also refused, including runtime names like `SESSION_DIR`. So is a `context` key that isn't a usable key, references an undeclared variable or a runtime name, or isn't checked by any `context-exists` or `context-matches` gate in the template. The last case is two declared fields on one state sharing a label with a different source or budget.
+
+```
+E-DECIDER-INPUT: state "review" field "verdict": input "outline_item" names context key "notes.md", which no context-exists or context-matches gate in the template checks
+  remedy: gate on the key in the state that produces it, so a run can't reach this state without it
+```
+
+Fix: follow the remedy line. For a context key, gate on it with `context-exists` in the state whose `default_action` writes it.
+
+**E-DECIDER-SIBLING-REQUIRED (error)**: the state has a declared field and another `required: true` field with no `decider` block.
+
+```
+E-DECIDER-SIBLING-REQUIRED: state "review" field "rationale": the state declares a decider on "verdict", but "rationale" is also required and has no decider, so a decider answer could never be complete
+  remedy: declare a decider on "rationale", or make it optional
+```
+
+Fix: make the sibling optional, or declare it too.
+
+**E-DECIDER-FLOOR (error)**: an answer in `auto` can take a transition that targets a terminal state, targets a state whose `default_action` has `requires_confirmation: true`, or has a `when` clause that also tests a `gates.*` key. Every transition whose `when` tests the field at that value is checked, and on a boolean field `"true"` and `true` count alike. The message names the target state and the rule, and the gate key in the gate case. Only `auto` answers are checked.
+
+```
+E-DECIDER-FLOOR: state "review" field "verdict" value "proceed": mode auto is not allowed on the transition to "done": the target is a terminal state
+  remedy: set this value's mode to shadow or never; an auto answer can't route to a terminal state, to a state whose default_action requires confirmation, or along a when clause that tests a gate
+```
+
+Fix: set the answer's mode to `shadow` or `never`. Nothing else in the template suppresses this error.
+
 ---
 
 ### template validate
@@ -360,7 +520,7 @@ All batch validation runs pre-append — rejected submissions leave no events on
 
 ## Request errors
 
-Every subcommand under `koto request` — `create`, `bind`, `get`, `wait`, `list`, `progress`, `resolve`, `abandon`, `abandon-request`, and `close` — reports failure through one nested envelope, the same shape `koto next`'s domain errors use:
+Every subcommand under `koto request` — `create`, `bind`, `attach`, `get`, `wait`, `list`, `progress`, `resolve`, `abandon`, `abandon-request`, and `close` — reports failure through one nested envelope, the same shape `koto next`'s domain errors use:
 
 ```json
 {
@@ -384,7 +544,7 @@ The code set is closed. A consumer that had to match on `message` to tell "this 
 | `request_not_found` | 2 | No request record exists at that identifier. |
 | `leg_not_found` | 2 | The request has no leg by that name. |
 | `invalid_identifier` | 2 | A request id, leg name, session id, or coordinator id failed its grammar. Never worth retrying. |
-| `invalid_submission` | 2 | A flag payload was malformed, or the flag combination was — `--with-data` together with the `--role`/`--template`/`--inputs` triple, a creation payload with no legs, a duplicate leg name, a value that isn't a JSON object. |
+| `invalid_submission` | 2 | A flag payload was malformed, or the flag combination was — `--with-data` together with the `--role`/`--template`/`--inputs` triple, a creation payload with no legs, a duplicate leg name, a leg `template` list that is empty, longer than eight, or carries an empty entry, a value that isn't a JSON object. |
 | `contract_mismatch` | 2 | `--cli-contract` named a contract this build doesn't serve. Checked before any read or write, so a mismatch has no side effect. |
 | `request_closed` | 2 | A leg mutation, or a second `close`, on a closed request. |
 | `leg_already_resolved` | 2 | A second result, or any mutation, on a leg that already answered. |
@@ -392,8 +552,12 @@ The code set is closed. A consumer that had to match on `message` to tell "this 
 | `leg_bound_to_different_child` | 2 | A rebind that would point an already-bound leg at a different child. Rebinding to the same child is an idempotent success, not this. |
 | `explicit_resolve_on_bound_leg` | 2 | `resolve` on a bound leg. A bound leg's result is promoted from its child's terminal tick; accepting an explicit one here would block the real one. |
 | `child_not_found` | 2 | `bind` named a child whose session could not be read. |
-| `child_not_fenceable` | 2 | `bind` named a child whose header does not satisfy the dispatch-fence predicate. Binding it would produce a leg that could never be fenced, so the bind is refused instead. |
-| `child_bound_to_different_leg` | 2 | `bind` named a child that already points at a different request-and-leg pair. A child fulfils at most one leg, and this is the only place that can be checked — the lock is per-request, so two binds in different requests never serialize against each other. |
+| `child_not_fenceable` | 2 | `bind` named a child whose header does not satisfy the dispatch-fence predicate, or `attach` named a session that is neither a dispatched child nor a root. Binding it would produce a leg that could never be fenced, so the bind is refused instead. A root session (no parent workflow) attaches through `attach`. |
+| `child_bound_to_different_leg` | 2 | `bind` or `attach` named a session that already points at a different request-and-leg pair. A child fulfils at most one leg, and this is the only place that can be checked — the lock is per-request, so two binds in different requests never serialize against each other. `attach` re-points a root session only when its old leg was abandoned or its old request closed. |
+| `template_mismatch` | 2 | `attach` named a root session built from a template the leg's `template` doesn't name, compared by the source template's file name. A session with no template file (`--from-stdin`) matches nothing. |
+| `input_mismatch` | 2 | `attach` named a root session whose recorded value for one of the leg's `inputs` differs, or whose template doesn't declare that input. `rebind: true` variables aren't compared. `details` names the key and both values. |
+| `session_terminal` | 2 | `attach` named a session at a terminal state, or a cancelled one. |
+| `self_attached_leg` | 2 | `progress`, `resolve`, or leg-scoped `abandon` on a leg a root session attached itself to. Refused whatever `--dispatch-epoch` says: the leg's result arrives only by promotion from that session's terminal tick. `abandon-request` and `close` still work. |
 | `request_id_collision` | 2 | The generated identifier already had a record on disk. |
 | `idempotency_conflict` | 2 | A retry presented a known idempotency hash with a different payload, so it isn't the same logical write. |
 | `bound_exceeded` | 2 | One of the bounds below rejected the call. `details` names the dimension. |

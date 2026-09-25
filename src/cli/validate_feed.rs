@@ -349,6 +349,31 @@ Body text.
         ));
         let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
         assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
+
+        // The decider's event, in each shape the engine writes: applied with
+        // every key, and an error with the optional keys absent or null.
+        let log = write_temp(&format!(
+            "{}\n{}\n{}\n{}\n",
+            anchored_header_line(),
+            DECIDER_CONSULTED,
+            r#"{"seq":2,"timestamp":"2024-01-01T00:00:01Z","type":"decider_consulted","payload":{"state":"review","visit_seq":1,"provider":"jev","model":"unknown","outcome":"error","error_class":"some_future_class","latency_ms":2000,"directive_bytes":10,"endpoint_origin":"env","fields":{}}}"#,
+            r#"{"seq":3,"timestamp":"2024-01-01T00:00:02Z","type":"decider_consulted","payload":{"state":"review","visit_seq":1,"provider":"jev","model":"unknown","input_sha256":null,"outcome":"input_unavailable","error_class":null,"latency_ms":0,"directive_bytes":10,"fields":{}}}"#,
+        ));
+        let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+        assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
+    }
+
+    /// A `variables_rebound` event, as the rebind primitive writes it,
+    /// validates clean against the shipped contract.
+    #[test]
+    fn shipped_spec_accepts_variables_rebound() {
+        let log = write_temp(&format!(
+            "{}\n{}\n",
+            anchored_header_line(),
+            r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"variables_rebound","payload":{"variables":{"MERGE":"true"}}}"#,
+        ));
+        let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+        assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
     }
 
     /// Acceptance alone would prove nothing: the validator skips event types it
@@ -367,8 +392,16 @@ Body text.
                 r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"variable_captured","payload":{"key":"BRANCH"}}"#,
             ),
             (
+                "variables_rebound",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"variables_rebound","payload":{}}"#,
+            ),
+            (
                 "execution_anchor_rebound",
                 r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"execution_anchor_rebound","payload":{"from":"/home/user/src/koto"}}"#,
+            ),
+            (
+                "decider_consulted",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"decider_consulted","payload":{"state":"review"}}"#,
             ),
         ] {
             let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), malformed));
@@ -380,6 +413,28 @@ Body text.
                  not acceptance",
                 event
             );
+        }
+    }
+
+    /// A well-formed `decider_consulted` line, as a consulting run writes it.
+    const DECIDER_CONSULTED: &str = r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"decider_consulted","payload":{"state":"review","visit_seq":1,"provider":"jev","model":"jev-1","input_sha256":"ab","outcome":"applied","latency_ms":12,"directive_bytes":300,"endpoint_origin":"default","fields":{"verdict":{"declaration_hash":"cd","modes":{"proceed":"auto"},"probabilities":{"proceed":0.95,"unclear":0.05},"winning":"proceed","confidence":0.95,"threshold":0.9,"at_threshold":true,"outcome":"qualified"}}}}"#;
+
+    /// Each required key and the closed `outcome` set are checked, not just
+    /// the event's presence.
+    #[test]
+    fn shipped_spec_rejects_a_decider_consulted_without_visit_seq_or_with_a_bogus_outcome() {
+        let base: Value = serde_json::from_str(DECIDER_CONSULTED).unwrap();
+        let mut missing = base.clone();
+        missing["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("visit_seq");
+        let mut bogus = base.clone();
+        bogus["payload"]["outcome"] = Value::from("bogus");
+        for (name, line) in [("missing visit_seq", missing), ("bogus outcome", bogus)] {
+            let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), line));
+            let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+            assert!(result.is_err(), "{} validated clean", name);
         }
     }
 

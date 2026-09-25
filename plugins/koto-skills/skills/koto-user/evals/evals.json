@@ -167,6 +167,45 @@
         "Response does NOT claim `details` will come back on a later lap of the loop",
         "Response names `koto status weekly-sweep` or `koto next weekly-sweep --full` as the way to retrieve the procedure"
       ]
+    },
+    {
+      "id": 14,
+      "name": "declared-field-value-descriptions-submit",
+      "prompt": "I'm running a koto workflow called 'triage-812'. `koto next triage-812` returned:\n```json\n{\"action\":\"evidence_required\",\"state\":\"classify\",\"directive\":\"Read issue 812 and classify it.\",\"advanced\":true,\"expects\":{\"fields\":{\"kind\":{\"type\":\"enum\",\"required\":true,\"values\":[\"bug\",\"feature\",\"chore\"],\"description\":\"What kind of change does this issue ask for?\",\"value_descriptions\":{\"bug\":\"Reports behavior that differs from what's documented or intended.\",\"feature\":\"Asks for behavior that doesn't exist yet.\",\"chore\":\"Maintenance with no user-visible change, such as dependencies, CI, or refactoring.\"}}}},\"blocking_conditions\":[],\"error\":null}\n```\nIssue 812 says: \"The docs say `sync --force` overwrites local changes, but it exits with an error instead.\" A teammate told me this template's decider has an escape value called `unclear`, and since I'm not 100% sure I'd rather submit `unclear`. What should I submit?",
+      "expected_output": "Agent reads `value_descriptions`, matches the issue (documented behavior that doesn't happen) to `bug`, and gives `koto next triage-812 --with-data '{\"kind\": \"bug\"}'`. It explains that `unclear` is the decider's escape, which is not in `values` and is not a valid submission (koto rejects it like any unknown value), so the agent must submit one of `bug`, `feature`, or `chore`.",
+      "files": [],
+      "assertions": [
+        "Response gives the command `koto next triage-812 --with-data` with the field `kind` set to `bug`",
+        "Response justifies `bug` by the `value_descriptions` entry (behavior that differs from what's documented)",
+        "Response does NOT submit `unclear`, and explains that the escape value is not in `values` and is rejected if submitted",
+        "Response does NOT add `description` or `value_descriptions` keys to the submitted evidence payload"
+      ]
+    },
+    {
+      "id": 15,
+      "name": "decider-settled-state-skipped",
+      "prompt": "I'm running the koto workflow 'triage-903'. The template goes `fetch` -> `classify` -> `scope`, and `classify` has an enum field with `value_descriptions`. I just ran `koto next triage-903` expecting to land on `classify`, but the response was `{\"action\":\"evidence_required\",\"state\":\"scope\",\"advanced\":true,...}`. I never submitted anything for `classify`. The user I'm working for has `KOTO_DECIDER=auto` and a decider API key set. Is the session broken? Should I rewind to `classify` and submit my own classification?",
+      "expected_output": "Agent explains this is expected: with the user opted in, koto consulted the decider for `classify` and applied its answer because it qualified, so the settled state was never returned and `koto next` returned the next stop with `advanced: true`. The session is not broken and there is no need to rewind; the agent should keep dispatching on `action` and handle `scope`. It can say the event log records a `decider_consulted` event and an `evidence_submitted` event with `source: \"decider\"` for that state if the user wants to check.",
+      "files": [],
+      "assertions": [
+        "Response states the skipped `classify` state is expected behavior when a decider applied an answer, not a broken session",
+        "Response explains that a decider-settled state is not returned and the next stop arrives with `advanced: true`",
+        "Response does NOT tell the agent to rewind to `classify` or resubmit the classification as a fix",
+        "Response tells the agent to continue with the `scope` state by dispatching on `action` as usual"
+      ]
+    },
+    {
+      "id": 16,
+      "name": "self-attached-leg-resolves-by-promotion",
+      "prompt": "I started a root koto session 'scope-auth' (no --parent) from scope.md and ran `koto request attach req-7d2e1c90-1b2a-4c3d-9e8f-0a1b2c3d4e5f scope --session scope-auth`, which succeeded; `koto request get` shows the leg with `\"attach\":\"self\"`. My workflow is done in all but name and I want the requester to see the answer now. `koto request resolve req-7d2e1c90-1b2a-4c3d-9e8f-0a1b2c3d4e5f scope --with-data '{\"status\":\"success\",\"summary\":\"scoped\"}'` failed with code `self_attached_leg`. Should I retry it with `--dispatch-epoch 0`?",
+      "expected_output": "Agent says no: on a leg a root session attached itself to, `progress`, `resolve` and leg-scoped `abandon` are refused outright with `self_attached_leg` whatever `--dispatch-epoch` is presented, because the leg has no dispatch epoch and its result arrives only by promotion. The way to report is to drive `scope-auth` to its terminal state with `koto next`; its terminal tick records the result on the leg as `result_source: promoted`, even under `--no-cleanup`, which keeps the session on disk. It may mention that `abandon-request` and `close` still work on the request.",
+      "files": [],
+      "assertions": [
+        "Response says retrying with `--dispatch-epoch` will not help because the refusal applies whatever epoch is presented",
+        "Response explains that a self-attached leg's result arrives only by promotion from the session's terminal tick",
+        "Response tells the agent to advance `scope-auth` to its terminal state with `koto next` instead of resolving the leg",
+        "Response does NOT suggest `koto request bind` or editing the request log as a workaround"
+      ]
     }
   ]
 }

@@ -472,6 +472,15 @@ fn a_moved_checkout_is_repaired_by_rebinding_and_ticks_from_the_new_tree() {
         })]
     );
 
+    // Anchor rebinding moves the anchor and nothing else: it never
+    // re-applies a template variable, which only an accepted attach does.
+    assert!(
+        !event_types(home.path(), "wf")
+            .iter()
+            .any(|t| t == "variables_rebound"),
+        "session rebind must not append variables_rebound"
+    );
+
     // The tick that was refused now runs, and it runs in the new tree.
     let tick = run_koto(home.path(), &moved, &["next", "wf"]);
     assert!(

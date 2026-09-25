@@ -6,7 +6,10 @@ pub mod dashboard;
 pub mod dashboard_data;
 pub mod dashboard_render;
 pub mod dashboard_state;
+pub mod decider;
+pub mod decider_port;
 pub mod init_child;
+pub mod init_entry;
 pub mod next;
 pub mod next_types;
 pub mod overrides;
@@ -28,7 +31,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::engine::substitute::validate_value;
+use crate::engine::variables::{check_value, VarError};
 use crate::template::types::VariableDecl;
 
 use crate::buildinfo;
@@ -125,6 +128,36 @@ pub enum Command {
         /// spaces.
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
+
+        /// Read template variables from a file holding a JSON list of
+        /// ["KEY", "VALUE"] string pairs (at most 64 KiB, a regular file,
+        /// not a symlink). A repeated key is refused as duplicate_var.
+        /// Variables are validated before the name is looked up. Can't be
+        /// combined with --var.
+        #[arg(long, value_name = "PATH")]
+        vars_file: Option<String>,
+
+        /// If a finished (terminal or cancelled) session already has this
+        /// name, remove it and start a fresh one, reporting the old
+        /// session's result as `replaced_result`. A running session is
+        /// refused with session_live unless --attach-live is also given.
+        #[arg(long)]
+        replace_terminal: bool,
+
+        /// If a running session already has this name, attach to it
+        /// instead of failing: its template file, origin record (worktree
+        /// and session store) and any explicitly passed non-rebind
+        /// variable must match, and its `rebind: true` variables are
+        /// re-applied from this invocation. A finished session is refused
+        /// with session_terminal unless --replace-terminal is also given.
+        #[arg(long)]
+        attach_live: bool,
+
+        /// Attach the created, attached or replacement session to leg LEG
+        /// of request REQ in the same step, with the checks `koto request
+        /// attach` makes. A refusal is recorded on the leg.
+        #[arg(long, value_name = "REQ:LEG")]
+        koto_leg: Option<String>,
 
         /// Name of an existing parent workflow (creates a child workflow)
         #[arg(long)]
@@ -266,6 +299,12 @@ pub enum Command {
     Config {
         #[command(subcommand)]
         subcommand: ConfigCommand,
+    },
+
+    /// Decider ledger report and promotion eligibility
+    Decider {
+        #[command(subcommand)]
+        subcommand: decider::DeciderCommand,
     },
 
     /// Workspace-level reclaim and maintenance verbs
@@ -819,37 +858,44 @@ pub(crate) fn build_local_backend() -> Result<LocalBackend> {
 /// Validate and resolve `--var KEY=VALUE` arguments against the template's
 /// variable declarations. Returns a map of resolved variable bindings ready
 /// for storage in the WorkflowInitialized event.
+///
+/// Every resolved value -- passed, defaulted, or materialized empty -- is
+/// checked against its declaration's `values:` or `pattern:` and against the
+/// allowlist. Refusals are typed ([`VarError`]); their `Display` text is the
+/// message callers have always matched on.
 pub(crate) fn resolve_variables(
     raw_vars: &[String],
     declarations: &BTreeMap<String, VariableDecl>,
-) -> std::result::Result<HashMap<String, String>, String> {
+) -> std::result::Result<HashMap<String, String>, VarError> {
     let mut provided: HashMap<String, String> = HashMap::new();
 
     // 1. Parse each --var string and reject duplicates.
     for entry in raw_vars {
-        let eq_pos = entry
-            .find('=')
-            .ok_or_else(|| format!("invalid --var format {:?}: expected KEY=VALUE", entry))?;
+        let eq_pos = entry.find('=').ok_or_else(|| VarError::Malformed {
+            entry: entry.clone(),
+            reason: "expected KEY=VALUE".to_string(),
+        })?;
         let key = &entry[..eq_pos];
         let value = &entry[eq_pos + 1..];
 
         if key.is_empty() {
-            return Err(format!(
-                "invalid --var format {:?}: key must not be empty",
-                entry
-            ));
+            return Err(VarError::Malformed {
+                entry: entry.clone(),
+                reason: "key must not be empty".to_string(),
+            });
         }
 
         if provided.contains_key(key) {
-            return Err(format!("duplicate --var key {:?}", key));
+            return Err(VarError::Duplicate {
+                var: key.to_string(),
+            });
         }
 
         // Reject keys not declared in the template.
         if !declarations.contains_key(key) {
-            return Err(format!(
-                "unknown variable {:?}: not declared in template",
-                key
-            ));
+            return Err(VarError::Unknown {
+                var: key.to_string(),
+            });
         }
 
         provided.insert(key.to_string(), value.to_string());
@@ -863,22 +909,20 @@ pub(crate) fn resolve_variables(
         } else if !decl.default.is_empty() {
             decl.default.clone()
         } else if decl.required {
-            return Err(format!(
-                "missing required variable {:?}: provide --var {}=VALUE",
-                key, key
-            ));
+            return Err(VarError::Missing { var: key.clone() });
         } else {
             // Optional, not provided, and either no default or an explicit empty
             // default: materialize an empty binding rather than skipping the
             // variable. Every declared variable then resolves at substitution
             // time, so a `{{KEY}}` reference yields "" instead of an undefined
             // reference (Issue #184). The empty value still passes through
-            // validate_value below, preserving the #180 allowlist guarantee.
+            // the checks below, preserving the #180 allowlist guarantee.
             String::new()
         };
 
-        // 3. Validate the value against the allowlist.
-        validate_value(key, &value).map_err(|e| e.to_string())?;
+        // 3. Validate the value against its declared constraint and the
+        //    allowlist.
+        check_value(key, decl, &value)?;
 
         resolved.insert(key.clone(), value);
     }
@@ -1165,10 +1209,47 @@ pub fn run(app: App) -> Result<()> {
             from_stdin,
             allow_legacy_gates,
             vars,
+            vars_file,
+            replace_terminal,
+            attach_live,
+            koto_leg,
             parent,
             intent,
             execution_dir,
         } => {
+            // Entry-flag usage errors come first, before any IO: they are
+            // caller mistakes, and there is no leg yet to record them on.
+            let entry_flags_used = attach_live || replace_terminal || koto_leg.is_some();
+            if vars_file.is_some() && !vars.is_empty() {
+                init_entry::usage_error("--vars-file and --var are mutually exclusive: pass one");
+            }
+            if entry_flags_used && from_stdin {
+                init_entry::usage_error(
+                    "--attach-live, --replace-terminal and --koto-leg can't be used with \
+                     --from-stdin",
+                );
+            }
+            if entry_flags_used && parent.is_some() {
+                init_entry::usage_error(
+                    "--attach-live, --replace-terminal and --koto-leg can't be used with --parent",
+                );
+            }
+            let koto_leg = koto_leg.map(|raw| {
+                request::InitLegTarget::parse(&raw).unwrap_or_else(|e| {
+                    init_entry::usage_error(format!("--koto-leg: {}", e.message))
+                })
+            });
+            let entry = init_entry::EntryFlags {
+                attach_live,
+                replace_terminal,
+                koto_leg,
+            };
+            let vars = match &vars_file {
+                Some(path) => init_entry::read_vars_file(path)
+                    .unwrap_or_else(|reason| init_entry::refuse_vars_file(&entry, reason)),
+                None => vars,
+            };
+
             let backend = build_backend()?;
             // Resolve `--execution-dir` once, before either init path:
             // a directory that does not resolve is a caller error, and
@@ -1242,6 +1323,19 @@ pub fn run(app: App) -> Result<()> {
                         2,
                     )
                 });
+                if parent.is_none() && (entry_flags_used || vars_file.is_some()) {
+                    return init_entry::run(
+                        &backend,
+                        &init_entry::InitArgs {
+                            name: &name,
+                            template: &template,
+                            vars: &vars,
+                            intent: intent.as_deref(),
+                            execution_dir: execution_dir.as_deref(),
+                        },
+                        &entry,
+                    );
+                }
                 handle_init(
                     &backend,
                     &name,
@@ -1454,6 +1548,7 @@ pub fn run(app: App) -> Result<()> {
                     key,
                     to_file,
                 } => {
+                    context::restore_assigned(store, &backend, &session, &key);
                     if let Err(e) = context::handle_get(store, &session, &key, to_file.as_deref()) {
                         exit_with_error_code(
                             serde_json::json!({
@@ -1470,6 +1565,7 @@ pub fn run(app: App) -> Result<()> {
                     // caller that branches on success-versus-failure is
                     // unaffected; exit 2 is "not a key at all", which koto
                     // already uses for input the caller must fix.
+                    context::restore_assigned(store, &backend, &session, &key);
                     match context::handle_exists(store, &session, &key) {
                         context::KeyPresence::Present => std::process::exit(0),
                         context::KeyPresence::Absent => std::process::exit(1),
@@ -1660,6 +1756,7 @@ pub fn run(app: App) -> Result<()> {
             }
         }
         Command::Config { subcommand } => handle_config(subcommand),
+        Command::Decider { subcommand } => decider::handle(subcommand),
         Command::Workspace { subcommand } => {
             let backend = build_backend()?;
             match subcommand {
@@ -1704,7 +1801,7 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
                 let mut doc = config::resolve::load_toml_value(&path)?;
                 config::set_value_in_toml(&mut doc, &key, &value)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
-                config::resolve::write_toml_value(&path, &doc)?;
+                config::resolve::write_user_toml_value(&path, &doc)?;
             } else {
                 config::validate::validate_project_key(&key)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1723,7 +1820,7 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
                 let mut doc = config::resolve::load_toml_value(&path)?;
                 config::unset_value_in_toml(&mut doc, &key)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
-                config::resolve::write_toml_value(&path, &doc)?;
+                config::resolve::write_user_toml_value(&path, &doc)?;
             } else {
                 let path = config::resolve::project_config_path();
                 let mut doc = config::resolve::load_toml_value(&path)?;
@@ -1972,7 +2069,7 @@ fn handle_init(
                     && err
                         .message
                         .starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "error": if is_var_error {
                         err.message
                             .strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
@@ -1983,6 +2080,11 @@ fn handle_init(
                     },
                     "command": "init"
                 });
+                // A typed refusal (`invalid_var`, `duplicate_var`,
+                // `unknown_var`) adds its code and fields beside `error`.
+                if let (Some(var_error), Some(obj)) = (&err.var_error, body.as_object_mut()) {
+                    obj.extend(var_error.fields());
+                }
                 if is_var_error {
                     exit_with_error_code(body, 2);
                 } else {
@@ -2092,7 +2194,7 @@ fn handle_init_inline(
         // the same way the file path does.
         let msg = e.to_string();
         let is_var_error = msg.starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "error": if is_var_error {
                 msg.strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
                     .unwrap_or(&msg)
@@ -2102,6 +2204,9 @@ fn handle_init_inline(
             },
             "command": "init"
         });
+        if let (Some(var_error), Some(obj)) = (e.downcast_ref::<VarError>(), body.as_object_mut()) {
+            obj.extend(var_error.fields());
+        }
         if is_var_error {
             exit_with_error_code(body, 2);
         } else {
@@ -2520,6 +2625,101 @@ fn synthesize_workflow_result(
     }
 }
 
+/// Resolve the result a session reports from the terminal it stands in.
+///
+/// `status` and `summary` come from [`synthesize_workflow_result`] either
+/// way. When the terminal declares a `result:` map, the resolved map *is*
+/// the payload -- terminal evidence fields are not merged into it -- so a
+/// reader routes on exactly the keys the template declared. Without a map
+/// the evidence-derived payload stands unchanged.
+///
+/// `{{VAR}}` resolves through the runtime names and the bindings folded
+/// from `events`; `${context.<key>}` reads the session's context store.
+/// See [`crate::engine::terminal_result::resolve_result_map`] for how an
+/// unresolved reference is reported.
+#[cfg(unix)]
+fn resolve_terminal_result(
+    backend: &dyn SessionBackend,
+    context_store: &dyn ContextStore,
+    name: &str,
+    compiled: &CompiledTemplate,
+    final_state: &str,
+    events: &[Event],
+) -> WorkflowResult {
+    let outcome = project_terminal_outcome(compiled, final_state);
+    let mut result = synthesize_workflow_result(outcome, final_state, events);
+    if let Some(declared) = compiled
+        .states
+        .get(final_state)
+        .and_then(|s| s.result.as_ref())
+    {
+        let mut runtime_vars = std::collections::HashMap::new();
+        runtime_vars.insert(
+            "SESSION_DIR".to_string(),
+            backend.session_dir(name).to_string_lossy().to_string(),
+        );
+        runtime_vars.insert("SESSION_NAME".to_string(), name.to_string());
+        let bindings = crate::engine::substitute::bindings_from_events(events);
+        result.payload = Some(crate::engine::terminal_result::resolve_result_map(
+            declared,
+            crate::engine::terminal_result::var_lookup(&runtime_vars, &bindings),
+            |key| context_store.get(name, key).ok(),
+        ));
+    }
+    result
+}
+
+/// The result a terminal tick reports, and whether the session's own log
+/// already records it.
+#[cfg(unix)]
+struct TerminalRecord {
+    result: WorkflowResult,
+    /// True when a `request_store.result` for this arrival at the terminal
+    /// is already on the log -- a parked session ticked again. The record
+    /// is then returned as-is and not appended a second time.
+    already_recorded: bool,
+}
+
+/// Find or resolve the result for a session standing in a terminal state.
+///
+/// Reads the log fresh, so a result resolved here reflects everything the
+/// current tick appended. When this arrival already carries a recorded
+/// result, that record wins: the map is resolved once, on the first
+/// terminal tick, and a context write after it changes nothing the session
+/// reports.
+#[cfg(unix)]
+fn terminal_record(
+    backend: &dyn SessionBackend,
+    context_store: &dyn ContextStore,
+    name: &str,
+    compiled: &CompiledTemplate,
+    final_state: &str,
+) -> TerminalRecord {
+    let events = backend
+        .read_events(name)
+        .map(|(_, ev)| ev)
+        .unwrap_or_default();
+    if let Some(result) =
+        crate::engine::terminal_result::recorded_result_for_current_arrival(&events)
+    {
+        return TerminalRecord {
+            result,
+            already_recorded: true,
+        };
+    }
+    TerminalRecord {
+        result: resolve_terminal_result(
+            backend,
+            context_store,
+            name,
+            compiled,
+            final_state,
+            &events,
+        ),
+        already_recorded: false,
+    }
+}
+
 /// Issue #134: append a `ChildCompleted` event to the parent's log just
 /// before a child session's auto-cleanup runs.
 ///
@@ -2657,9 +2857,12 @@ fn append_terminal_index_for_session(
 /// Everything a session does on the tick that lands it in a terminal
 /// state, in the order DESIGN-request-lifecycle.md Decision 6 fixes:
 ///
-/// 1. Synthesize the [`WorkflowResult`] envelope once, so the three
-///    writes below cannot disagree about what the child answered.
-/// 2. Append `request_store.result` to the child's own log.
+/// 1. Resolve the [`WorkflowResult`] envelope once, so the writes below
+///    cannot disagree about what the child answered. The caller does this
+///    through [`terminal_record`] before printing, because the terminal
+///    `koto next` response carries the same envelope.
+/// 2. Append `request_store.result` to the child's own log, once per
+///    arrival at the terminal.
 /// 3. **Promote** the envelope onto the bound leg's request log.
 /// 4. Write the terminal-index entry carrying the done-bit from 2.
 /// 5. Append `ChildCompleted` to the parent's log.
@@ -2678,20 +2881,19 @@ fn append_terminal_index_for_session(
 /// child's result, the index entry and the parent event, then deletes
 /// the session while the leg stays open forever.
 ///
-/// **Why it re-reads.** The directed path's caller holds a
-/// pre-transition event list. Synthesizing a result from it would
-/// compute the child's answer from a stale log, so the re-read happens
-/// here rather than at either call site.
-///
-/// **Why only step 3 is hoisted out of the cleanup guard.** An
-/// already-terminal session ticked again returns immediately from the
-/// advance loop, so under `--no-cleanup` this block runs on every tick.
-/// Hoisting all four writes would append another child-log result,
-/// another index entry and another parent event per tick, unbounded, on
-/// a deliberately parked session — and existing tests are built on a
-/// parked terminal child *not* emitting the parent event. So promotion
-/// alone is hoisted, gated on the leg having no result yet, which makes
-/// a repeat tick a silent no-op rather than a warning per tick.
+/// **Why steps 2 and 3 run under `--no-cleanup`.** An already-terminal
+/// session ticked again returns immediately from the advance loop, so
+/// under `--no-cleanup` this block runs on every tick. For a terminal that
+/// declares a `result:` map, the child-log record is what pins the
+/// resolved map for a parked session (`koto status`, a later tick), and it
+/// is keyed on the arrival: once [`terminal_record`] finds it on the log,
+/// `already_recorded` is set and nothing is appended again. A terminal
+/// without a map records nothing while parked, as before. Promotion is
+/// gated on the leg having no result yet, which makes a repeat tick a
+/// silent no-op. The index entry
+/// and the parent event stay under the cleanup guard -- appending those
+/// per tick would be unbounded, and existing tests are built on a parked
+/// terminal child *not* emitting the parent event.
 #[cfg(unix)]
 fn finish_terminal_tick(
     backend: &dyn SessionBackend,
@@ -2700,43 +2902,36 @@ fn finish_terminal_tick(
     compiled: &CompiledTemplate,
     final_state: &str,
     no_cleanup: bool,
+    record: &TerminalRecord,
 ) {
-    // One `open` on a path almost no session has. Reading it before the
-    // events keeps a parked `--no-cleanup` tick on an unbound session
-    // from paying for a log re-read it has no use for.
     let pointer = crate::engine::leg_pointer::read_pointer_best_effort(&backend.session_dir(name));
-    if no_cleanup && pointer.is_none() {
-        return;
-    }
+    let result = &record.result;
 
-    // Re-read so the synthesized result reflects everything this tick
-    // appended, and so the index classifier sees a mid-tick
-    // `WorkflowCancelled`.
-    let post_events = backend
-        .read_events(name)
-        .map(|(_, ev)| ev)
-        .unwrap_or_default();
-    let outcome = project_terminal_outcome(compiled, final_state);
-    let result = synthesize_workflow_result(outcome, final_state, &post_events);
+    // Step 2, the child's own log. The done-bit below means "a durable
+    // result is readable", which an earlier tick's record satisfies too.
+    //
+    // A parked session records only when its terminal declares a result
+    // map: that record is what pins the resolved map against later context
+    // writes. A terminal without one keeps its pre-existing behaviour of
+    // recording nothing while parked, because a recorded result is what
+    // the `children-complete` converge read treats as a finished child,
+    // and existing workflows park children on exactly that distinction.
+    let declares_result = compiled
+        .states
+        .get(final_state)
+        .is_some_and(|s| s.result.is_some());
+    let has_result = record.already_recorded
+        || ((!no_cleanup || declares_result)
+            && append_request_store_result_to_child(backend, name, result));
 
-    // Step 3, the child's own log. Stays under the cleanup guard: a
-    // parked session ticked repeatedly would otherwise append one of
-    // these per tick, unbounded.
-    let has_result = if no_cleanup {
-        false
-    } else {
-        append_request_store_result_to_child(backend, name, &result)
-    };
-
-    // Step 2 of the promotion ordering, and the one step hoisted out of
-    // the cleanup guard: a parked terminal session still resolves its
-    // leg, because the requester waiting on it has no way to know the
-    // session was parked. It sits after the child-log append so the
-    // result is already durable somewhere the child owns, and before the
-    // index write so a crash between them cannot leave a permanently
-    // skipped session with a forever-open leg.
+    // Step 3: a parked terminal session still resolves its leg, because
+    // the requester waiting on it has no way to know the session was
+    // parked. It sits after the child-log append so the result is already
+    // durable somewhere the child owns, and before the index write so a
+    // crash between them cannot leave a permanently skipped session with
+    // a forever-open leg.
     let defer_for_promotion = match &pointer {
-        Some(pointer) => promote_leg_result(pointer, &result),
+        Some(pointer) => promote_leg_result(pointer, result, final_state),
         None => false,
     };
 
@@ -2744,9 +2939,14 @@ fn finish_terminal_tick(
         return;
     }
 
+    // Re-read so the index classifier sees a mid-tick `WorkflowCancelled`.
+    let post_events = backend
+        .read_events(name)
+        .map(|(_, ev)| ev)
+        .unwrap_or_default();
     append_terminal_index_for_session(backend, name, &post_events, has_result);
     let append_result =
-        append_child_completed_to_parent(backend, name, header, compiled, final_state, &result);
+        append_child_completed_to_parent(backend, name, header, compiled, final_state, result);
     let defer_for_parent = matches!(append_result, ChildCompletedAppend::AppendFailed);
     if !defer_for_parent && !defer_for_promotion {
         if let Err(e) = backend.cleanup(name) {
@@ -2772,10 +2972,14 @@ fn finish_terminal_tick(
 /// **No surviving session directory is required.** The envelope rides by
 /// value and the leg identity came off a pointer already read, so
 /// promotion is unaffected by the cleanup that follows it.
+///
+/// `final_state` is recorded on the promotion so a `request-leg` gate can
+/// report which terminal state answered the leg.
 #[cfg(unix)]
 fn promote_leg_result(
     pointer: &crate::engine::leg_pointer::LegPointer,
     result: &crate::engine::types::WorkflowResult,
+    final_state: &str,
 ) -> bool {
     use crate::engine::request_store::{self, RequestStoreError};
 
@@ -2820,6 +3024,7 @@ fn promote_leg_result(
             source: crate::engine::types::LegResultSource::Promoted,
             issued_by: None,
             timestamp: now_iso8601(),
+            final_state: Some(final_state.to_string()),
         },
     );
     match promotion {
@@ -3021,6 +3226,7 @@ fn record_notice_delivery(backend: &dyn SessionBackend, name: &str, abandoned: &
             &timestamp,
         ),
         submitter_cwd: None,
+        source: None,
     };
     if let Err(e) = backend.append_event(name, &payload, &timestamp) {
         // Losing the audit costs an operator the ability to tell "never
@@ -3182,6 +3388,10 @@ fn substitute_gate_fields(
             g.command = substitute_shell_command(&g.command, runtime_vars, variables, overlay);
             g.key = substitute_plain(&g.key, runtime_vars, variables, overlay);
             g.pattern = substitute_regex_literal(&g.pattern, runtime_vars, variables, overlay);
+            // A request id and leg name are identifiers, not shell words or
+            // patterns; the evaluator validates what substitution produced.
+            g.request = substitute_plain(&g.request, runtime_vars, variables, overlay);
+            g.leg = substitute_plain(&g.leg, runtime_vars, variables, overlay);
             g.name_filter = gate
                 .name_filter
                 .as_deref()
@@ -3314,15 +3524,15 @@ fn handle_next(
         NextResponse, RECOVERY_POINTER,
     };
     use crate::engine::advance::{
-        advance_until_stop, merge_epoch_evidence, ActionResult, AdvanceError, IntegrationError,
-        StopReason,
+        advance_until_stop_with_decider, merge_epoch_evidence, ActionResult, AdvanceError,
+        IntegrationError, StopReason,
     };
     use crate::engine::evidence::validate_evidence;
     use crate::engine::persistence::{derive_evidence, instructions_delivered_this_window};
     use crate::engine::reentrancy;
     use crate::engine::substitute::Variables;
     use crate::engine::template_source_status::{check_execution_anchor, ExecutionAnchorCheck};
-    use crate::gate::evaluate_gates;
+    use crate::gate::evaluate_gates_with_request_store;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -3351,14 +3561,26 @@ fn handle_next(
     // any) on top of the file+env layers already merged by
     // load_config(). Emit the `[request_store.recursion]`
     // reserved-namespace warning at startup.
-    let request_store_cfg = {
+    //
+    // The decider settings come from the same load. Their warnings (an
+    // unrecognized `KOTO_DECIDER`, a key the project config may not set,
+    // and so on) are printed here, once per `koto next` invocation.
+    let (request_store_cfg, decider_settings) = {
         let base = crate::config::resolve::load_config().unwrap_or_default();
         crate::config::warn_if_request_store_recursion_reserved(&base);
         let cli_overrides = crate::config::resolve::RequestStoreOverrides {
             redelegation_cap,
             ..Default::default()
         };
-        crate::config::resolve::request_store_config(&base.request_store, &cli_overrides)
+        let (decider_settings, decider_warnings) =
+            crate::config::resolve::resolve_decider(&base.decider);
+        for w in &decider_warnings {
+            eprintln!("warning: {}", w);
+        }
+        (
+            crate::config::resolve::request_store_config(&base.request_store, &cli_overrides),
+            decider_settings,
+        )
     };
 
     // Issue 7: cursor GC fires on every coordinator tick boot so
@@ -3997,6 +4219,24 @@ fn handle_next(
                     }
                     None => resp,
                 };
+                // The terminal result rides the response, so it is found or
+                // resolved before printing and the same record is handed to
+                // the completion block below.
+                let terminal = if target_template_state.terminal {
+                    Some(terminal_record(
+                        backend,
+                        context_store,
+                        &name,
+                        &compiled,
+                        target,
+                    ))
+                } else {
+                    None
+                };
+                let resp = match &terminal {
+                    Some(record) => resp.with_terminal_result(record.result.clone()),
+                    None => resp,
+                };
                 println!("{}", serde_json::to_string(&resp)?);
                 // The delivery record is appended only after printing --
                 // see the natural-advancement path for the crash-
@@ -4015,9 +4255,12 @@ fn handle_next(
                     }
                 }
                 // Auto-cleanup after output when reaching a terminal state.
-                if let next_types::NextResponse::Terminal {
-                    state: final_state, ..
-                } = &resp
+                if let (
+                    next_types::NextResponse::Terminal {
+                        state: final_state, ..
+                    },
+                    Some(record),
+                ) = (&resp, &terminal)
                 {
                     finish_terminal_tick(
                         backend,
@@ -4026,6 +4269,7 @@ fn handle_next(
                         &compiled,
                         final_state,
                         no_cleanup,
+                        record,
                     );
                 }
                 std::process::exit(0);
@@ -4365,6 +4609,7 @@ fn handle_next(
                 state: current_state.clone(),
                 fields,
                 submitter_cwd,
+                source: None,
             };
             if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
                 let ne = NextError {
@@ -4374,6 +4619,26 @@ fn handle_next(
                 };
                 let json = serde_json::json!({"error": ne});
                 exit_with_error_code(json, ne.code.exit_code());
+            }
+
+            // The decider ledger's `answered` record: the agent's answer on
+            // a visit whose consultation wasn't applied, paired with it by
+            // `visit_seq`. Written whatever the decider mode is now, so a
+            // user who turned the decider off still completes the pair. A
+            // failed write is one warning and nothing more.
+            if let Some(record) = crate::cli::decider_port::answered_record(
+                &name,
+                Some(header.session_id.as_str()),
+                &events,
+                current_state,
+                accepts,
+                data.as_object()
+                    .expect("validate_evidence guarantees object input"),
+            ) {
+                crate::decider::ledger::append_or_warn(
+                    dirs::home_dir().map(|h| h.join(".koto")).as_deref(),
+                    &record,
+                );
             }
         }
     }
@@ -4451,11 +4716,42 @@ fn handle_next(
     let epoch_events = derive_evidence(&current_events);
     let evidence = merge_epoch_evidence(&epoch_events.into_iter().cloned().collect::<Vec<_>>());
 
+    // Repair any transition `context_assignments` an earlier tick recorded
+    // but did not get into the store, before a context gate reads it
+    // (koto#204). Non-fatal: the log still holds the value and the next read
+    // tries again.
+    if let Err(e) =
+        crate::engine::context_assign::reconcile(context_store, &name, &current_events, None)
+    {
+        eprintln!("warning: failed to restore assigned context values: {}", e);
+    }
+
     // 9. Set up I/O closures and run advancement loop.
+    //
+    // A `Transitioned` event carrying `context_assignments` is appended first
+    // and then projected into the context store. The append is the commit
+    // point; a store write that fails here is repaired from the log on the
+    // next read, so it is reported rather than failing the tick.
     let mut append_closure = |payload: &EventPayload| -> Result<(), String> {
         backend
             .append_event(&name, payload, &now_iso8601())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if let EventPayload::Transitioned {
+            context_assignments: Some(assignments),
+            ..
+        } = payload
+        {
+            if let Err(e) =
+                crate::engine::context_assign::write_assignments(context_store, &name, assignments)
+            {
+                eprintln!(
+                    "warning: transition recorded, but writing its context_assignments failed: {}; \
+                     the next read restores them from the log",
+                    e
+                );
+            }
+        }
+        Ok(())
     };
 
     // Build the children-complete gate evaluator closure. It captures the
@@ -4488,6 +4784,10 @@ fn handle_next(
     let capture_names = compiled.capture_names().unwrap_or_default();
 
     let session_name = &name;
+    // The request store `request-leg` gates read: the same `~/.koto` root the
+    // leg promotion above writes to. `None` without a home directory, which
+    // the gate reports as an error rather than a pass.
+    let request_root = dirs::home_dir().map(|home| home.join(".koto"));
     let gate_closure =
         |gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
             // Substitute runtime, overlay, and template variables in every
@@ -4496,12 +4796,13 @@ fn handle_next(
             // see what an earlier state in the same tick produced.
             let substituted =
                 substitute_gate_fields(gates, &runtime_vars, &variables, &overlay, &capture_names)?;
-            Ok(evaluate_gates(
+            Ok(evaluate_gates_with_request_store(
                 &substituted,
                 &execution_dir,
                 Some(context_store),
                 Some(session_name),
                 Some(&children_eval),
+                request_root.as_deref(),
             ))
         };
 
@@ -4647,12 +4948,13 @@ fn handle_next(
                 polling,
                 &state_gates,
                 &|gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
-                    crate::gate::evaluate_gates(
+                    evaluate_gates_with_request_store(
                         gates,
                         &execution_dir,
                         Some(context_store),
                         Some(&name),
                         None, // children-complete not needed in polling loop
+                        request_root.as_deref(),
                     )
                 },
                 &shutdown,
@@ -4718,7 +5020,32 @@ fn handle_next(
         }
     };
 
-    let result = advance_until_stop(
+    // The decider port. Built only when the user is opted in, and that is
+    // decided by `opted_in()` alone: no mode or key check here. Without a
+    // port the loop takes no lock, reads nothing extra, and makes no
+    // network call.
+    let render_for_decider =
+        |raw: &str| -> String { substitute_plain(raw, &runtime_vars, &variables, &overlay) };
+    let mut decider_port: Option<crate::cli::decider_port::CliDeciderPort<'_>> =
+        if decider_settings.opted_in() {
+            crate::decider::build_decider(&decider_settings).map(|provider| {
+                crate::cli::decider_port::CliDeciderPort::new(
+                    backend,
+                    context_store,
+                    &name,
+                    provider,
+                    crate::engine::decider::DeciderPolicy::from_settings(&decider_settings),
+                    decider_settings.endpoint_origin(),
+                    Box::new(render_for_decider),
+                    full,
+                )
+                .with_ledger_root(dirs::home_dir().map(|h| h.join(".koto")))
+            })
+        } else {
+            None
+        };
+
+    let result = advance_until_stop_with_decider(
         current_state,
         &compiled,
         &evidence,
@@ -4729,7 +5056,11 @@ fn handle_next(
         &action_closure,
         &overlay,
         &shutdown,
+        decider_port
+            .as_mut()
+            .map(|p| p as &mut dyn crate::engine::decider::DeciderPort),
     );
+    drop(decider_port);
 
     // 8. Map AdvanceResult/AdvanceError to NextResponse/NextError and exit.
     match result {
@@ -4803,6 +5134,7 @@ fn handle_next(
                     state: final_state.clone(),
                     advanced,
                     unassigned_children: unassigned_children.clone(),
+                    result: None,
                 },
                 StopReason::GateBlocked(gate_results) => {
                     let blocking =
@@ -5040,6 +5372,7 @@ fn handle_next(
                             state: final_state.clone(),
                             advanced,
                             unassigned_children: unassigned_children.clone(),
+                            result: None,
                         }
                     } else if let Some(ref es) = expects {
                         NextResponse::EvidenceRequired {
@@ -5333,6 +5666,25 @@ fn handle_next(
                 }
             }
 
+            // The terminal result rides the response, so it is found or
+            // resolved before printing and the same record is handed to
+            // the completion block after it.
+            let terminal = if matches!(resp, NextResponse::Terminal { .. }) {
+                Some(terminal_record(
+                    backend,
+                    context_store,
+                    &name,
+                    &compiled,
+                    final_state,
+                ))
+            } else {
+                None
+            };
+            let resp = match &terminal {
+                Some(record) => resp.with_terminal_result(record.result.clone()),
+                None => resp,
+            };
+
             // Emit the response JSON. When the scheduler ran, splice
             // a `scheduler` sibling key onto the envelope so callers
             // observe it alongside the advance-loop response. Issue
@@ -5470,11 +5822,22 @@ fn handle_next(
                 }
             }
             // Auto-cleanup after output when reaching a terminal state.
-            if let NextResponse::Terminal {
-                state: final_state, ..
-            } = &resp
+            if let (
+                NextResponse::Terminal {
+                    state: final_state, ..
+                },
+                Some(record),
+            ) = (&resp, &terminal)
             {
-                finish_terminal_tick(backend, &name, &header, &compiled, final_state, no_cleanup);
+                finish_terminal_tick(
+                    backend,
+                    &name,
+                    &header,
+                    &compiled,
+                    final_state,
+                    no_cleanup,
+                    record,
+                );
             }
             std::process::exit(0);
         }
@@ -5975,6 +6338,30 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
                 response["expects"] = serde_json::to_value(&expects)?;
             }
         }
+    }
+
+    // Optional `result` -- present exactly when the session stands in a
+    // terminal state. The recorded result for this arrival is what the
+    // terminal tick reported, so it is returned as-is: a context write
+    // after the terminal does not change it. A terminal session with no
+    // record -- a parked terminal that declares no `result:` map, or one
+    // that reached its terminal before results were recorded -- gets the
+    // result resolved now, read-only; nothing is appended.
+    #[cfg(unix)]
+    if is_terminal {
+        let result =
+            match crate::engine::terminal_result::recorded_result_for_current_arrival(&events) {
+                Some(r) => r,
+                None => resolve_terminal_result(
+                    backend,
+                    backend,
+                    name,
+                    &compiled,
+                    &machine_state.current_state,
+                    &events,
+                ),
+            };
+        response["result"] = serde_json::to_value(&result)?;
     }
 
     // Optional `batch` section — populated when the parent is
@@ -6725,6 +7112,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             parent_workflow: None,
             template_source_dir: dir,
+            template_source_file: None,
+            origin: None,
             execution_dir: None,
             session_id: String::new(),
             intent: None,
@@ -7319,6 +7708,7 @@ Done.
                     .map(|(k, v)| (k.to_string(), v.clone()))
                     .collect(),
                 submitter_cwd: None,
+                source: None,
             },
             idempotency_hash: None,
         }
@@ -7402,6 +7792,8 @@ Done.
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     parent_workflow: Some("parent".to_string()),
                     template_source_dir: None,
+                    template_source_file: None,
+                    origin: None,
                     execution_dir: None,
                     session_id: String::new(),
                     intent: None,
@@ -7490,6 +7882,7 @@ Done.
             description: String::new(),
             required,
             default: default.to_string(),
+            ..Default::default()
         }
     }
 
@@ -7547,10 +7940,115 @@ Done.
         let err = resolve_variables(&[], &decls).unwrap_err();
 
         assert!(
-            err.contains("missing required variable"),
+            err.to_string().contains("missing required variable"),
             "unexpected error: {}",
             err
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_variables: values:, pattern:, and typed refusals
+    // -----------------------------------------------------------------------
+
+    fn constrained(values: &[&str], pattern: &str, default: &str) -> VariableDecl {
+        VariableDecl {
+            default: default.to_string(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+            pattern: pattern.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn intent_decls() -> BTreeMap<String, VariableDecl> {
+        let mut decls = BTreeMap::new();
+        decls.insert(
+            "INTENT_FLAG".to_string(),
+            constrained(&[], "^(continue|stop)?$", ""),
+        );
+        decls
+    }
+
+    #[test]
+    fn resolve_variables_refuses_a_value_failing_its_pattern() {
+        let err =
+            resolve_variables(&["INTENT_FLAG=maybe".to_string()], &intent_decls()).unwrap_err();
+        assert_eq!(err.code(), Some("invalid_var"));
+        let fields = err.fields();
+        assert_eq!(fields["var"], "INTENT_FLAG");
+        assert_eq!(fields["value"], "maybe");
+        assert_eq!(fields["constraint"], "pattern:^(continue|stop)?$");
+    }
+
+    #[test]
+    fn resolve_variables_accepts_a_value_satisfying_its_pattern() {
+        let resolved =
+            resolve_variables(&["INTENT_FLAG=continue".to_string()], &intent_decls()).unwrap();
+        assert_eq!(resolved["INTENT_FLAG"], "continue");
+    }
+
+    #[test]
+    fn resolve_variables_defaults_a_constrained_variable_that_is_not_passed() {
+        let resolved = resolve_variables(&[], &intent_decls()).unwrap();
+        assert_eq!(resolved["INTENT_FLAG"], "");
+    }
+
+    #[test]
+    fn resolve_variables_refuses_a_value_outside_its_values() {
+        let mut decls = BTreeMap::new();
+        decls.insert(
+            "MERGE".to_string(),
+            constrained(&["true", "false"], "", "false"),
+        );
+        let err = resolve_variables(&["MERGE=yes".to_string()], &decls).unwrap_err();
+        assert_eq!(err.code(), Some("invalid_var"));
+        assert_eq!(err.fields()["constraint"], "values:[true,false]");
+        assert_eq!(
+            resolve_variables(&["MERGE=true".to_string()], &decls).unwrap()["MERGE"],
+            "true"
+        );
+    }
+
+    #[test]
+    fn resolve_variables_reports_an_allowlist_failure_as_invalid_var() {
+        let mut decls = BTreeMap::new();
+        decls.insert("TOPIC".to_string(), var_decl(false, ""));
+        let err = resolve_variables(&["TOPIC=a;b".to_string()], &decls).unwrap_err();
+        assert_eq!(err.code(), Some("invalid_var"));
+        assert_eq!(err.fields()["constraint"], "allowlist");
+        // The message is the allowlist wording callers already match on.
+        assert!(err.to_string().contains("not allowed by the value pattern"));
+    }
+
+    #[test]
+    fn resolve_variables_duplicate_and_unknown_keep_their_messages() {
+        let decls = intent_decls();
+        let dup = resolve_variables(
+            &[
+                "INTENT_FLAG=stop".to_string(),
+                "INTENT_FLAG=stop".to_string(),
+            ],
+            &decls,
+        )
+        .unwrap_err();
+        assert_eq!(dup.code(), Some("duplicate_var"));
+        assert_eq!(dup.fields()["var"], "INTENT_FLAG");
+        assert_eq!(dup.to_string(), "duplicate --var key \"INTENT_FLAG\"");
+
+        let unknown = resolve_variables(&["NOPE=1".to_string()], &decls).unwrap_err();
+        assert_eq!(unknown.code(), Some("unknown_var"));
+        assert_eq!(unknown.fields()["var"], "NOPE");
+        assert_eq!(
+            unknown.to_string(),
+            "unknown variable \"NOPE\": not declared in template"
+        );
+    }
+
+    #[test]
+    fn resolve_variables_malformed_and_missing_carry_no_code() {
+        let err = resolve_variables(&["NOEQUALS".to_string()], &intent_decls()).unwrap_err();
+        assert_eq!(err.code(), None);
+        assert!(err.fields().is_empty());
+        assert!(err.to_string().contains("expected KEY=VALUE"));
     }
 
     #[test]
@@ -7659,6 +8157,10 @@ Done.
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let substituted =
@@ -7721,6 +8223,10 @@ Done.
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -7789,6 +8295,11 @@ Done.
             // staleness check cannot catch that -- it only walks fields the
             // accessor names.
             name_filter: Some("{{TOKEN}}.research.".to_string()),
+            overridable: true,
+            // The request-leg identifiers substitute like the rest.
+            request: "req-{{TOKEN}}".to_string(),
+            leg: "{{TOKEN}}-leg".to_string(),
+            expect: None,
         };
         for (field, raw) in authored.substitutable_fields() {
             assert!(
@@ -7948,6 +8459,10 @@ Done.
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
 
@@ -8023,6 +8538,10 @@ Done.
                 override_default: None,
                 completion: None,
                 name_filter: None,
+                overridable: true,
+                request: String::new(),
+                leg: String::new(),
+                expect: None,
             },
         );
         let expected_command = {
