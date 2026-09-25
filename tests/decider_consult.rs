@@ -1,6 +1,6 @@
 //! `koto next` consulting an opted-in decider, against the `std::net` stub.
 //!
-//! docs/designs/DESIGN-jev-decision-offload.md, Decision 2. Every
+//! docs/designs/current/DESIGN-jev-decision-offload.md, Decision 2. Every
 //! opted-in command points `KOTO_DECIDER_ENDPOINT` at the stub and sets
 //! `KOTO_DECIDER` and the key explicitly, with HOME in a temp dir, so no
 //! test can reach a real provider or read a developer's config.

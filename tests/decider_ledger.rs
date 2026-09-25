@@ -1,7 +1,7 @@
 //! The decider ledger (`~/.koto/_decider_ledger.jsonl`), written by real
 //! `koto next` runs against the `std::net` stub.
 //!
-//! docs/designs/DESIGN-jev-decision-offload.md, Decision 4. Every opted-in
+//! docs/designs/current/DESIGN-jev-decision-offload.md, Decision 4. Every opted-in
 //! command points `KOTO_DECIDER_ENDPOINT` at the stub and sets
 //! `KOTO_DECIDER` and the key explicitly, and every harness sets `HOME` to
 //! a temp directory, so no test writes to a developer's real `~/.koto`.

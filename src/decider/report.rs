@@ -1,7 +1,7 @@
 //! `koto decider report`: read the ledger, join its records into per-question
 //! metrics, run golden fixtures, and judge promotion eligibility.
 //!
-//! See docs/designs/DESIGN-jev-decision-offload.md, Decision 4. Everything
+//! See docs/designs/current/DESIGN-jev-decision-offload.md, Decision 4. Everything
 //! here is read-only: the ledger is read, never written, and the fixture
 //! runner sends requests through the caller's [`Decider`] but records
 //! nothing. The only I/O is [`read_ledger`]; the CLI in `src/cli/decider.rs`

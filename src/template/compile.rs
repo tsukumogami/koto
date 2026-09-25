@@ -226,7 +226,7 @@ struct SourceFieldSchema {
 
 /// A field-level `decider` block in source YAML.
 ///
-/// See docs/designs/DESIGN-jev-decision-offload.md, Decision 1. Modes are
+/// See docs/designs/current/DESIGN-jev-decision-offload.md, Decision 1. Modes are
 /// read as strings and input sources as two optional keys, so that an unknown
 /// mode or an input naming both or neither source reaches lowering and fails
 /// with its own `E-DECIDER-*` code rather than a generic parse error.

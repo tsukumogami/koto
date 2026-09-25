@@ -5,7 +5,7 @@
 //! compiler (`src/template/compile.rs`) lowers that block into the types here
 //! with every default resolved, and `CompiledTemplate::validate` checks it
 //! with the `E-DECIDER-*` rules. See
-//! docs/designs/DESIGN-jev-decision-offload.md, Decision 1.
+//! docs/designs/current/DESIGN-jev-decision-offload.md, Decision 1.
 //!
 //! These types are the whole compiled contract: the request builder, the
 //! provider client, and the consultation arm of the advance loop read a
