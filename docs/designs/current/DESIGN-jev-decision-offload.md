@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 problem: |
   koto hands every unresolved branch to the agent as `evidence_required`, even
   when the decision is one closed-set value over inputs koto already stores.
@@ -36,7 +36,7 @@ user_visible_surface: true
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 

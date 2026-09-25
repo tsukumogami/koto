@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 problem: |
   Agents running koto workflows answer every branch decision themselves, even
   narrow closed-set ones over inputs koto already stores. Each costs a turn and
@@ -22,7 +22,7 @@ absorbed:
 
 ## Status
 
-In Progress
+Done
 
 Absorbed [BRIEF-jev-decision-offload](docs/briefs/BRIEF-jev-decision-offload.md); carried in Absorbed Brief.
 
