@@ -2,7 +2,7 @@
 //! `E-DECIDER-*` compile rules, the floor, the declaration hash, and the
 //! `expects` keys a declared field adds.
 //!
-//! docs/designs/DESIGN-jev-decision-offload.md, Decision 1.
+//! docs/designs/current/DESIGN-jev-decision-offload.md, Decision 1.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};

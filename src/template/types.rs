@@ -1606,7 +1606,7 @@ impl CompiledTemplate {
     /// Every transition out of `state` that an `auto` answer `answer` for
     /// `field` is forbidden to take, with the reason.
     ///
-    /// This is the floor from docs/designs/DESIGN-jev-decision-offload.md: an
+    /// This is the floor from docs/designs/current/DESIGN-jev-decision-offload.md: an
     /// answer in `auto` may never route to a terminal state, to a state whose
     /// `default_action` requires confirmation, or along a `when` clause that
     /// also tests a `gates.*` key. It considers every transition whose `when`

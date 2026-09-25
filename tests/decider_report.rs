@@ -1,7 +1,7 @@
 //! `koto decider report`: the ledger join, the metrics, the fixture runner,
 //! and promotion eligibility.
 //!
-//! docs/designs/DESIGN-jev-decision-offload.md, Decision 4. Every harness
+//! docs/designs/current/DESIGN-jev-decision-offload.md, Decision 4. Every harness
 //! sets `HOME` to a temp directory, so no test reads or writes a developer's
 //! real ledger. Only commands that run fixtures opt in, each on its own
 //! `Command`, and every one of them points the endpoint at the `std::net`
