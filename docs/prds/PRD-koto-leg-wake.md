@@ -1,5 +1,6 @@
 ---
 schema: prd/v1
+absorbed: docs/briefs/BRIEF-koto-leg-wake.md
 status: Accepted
 problem: |
   A coordinator session parked on a `request-leg` gate is never told that the
@@ -12,7 +13,6 @@ goals: |
   names are woken within a documented bound, through a signal any harness can
   subscribe to without koto knowing which harness it is. Lost and duplicate
   wakes cost nothing, and `koto request wait` stays as the documented fallback.
-upstream: docs/briefs/BRIEF-koto-leg-wake.md
 source_issue: 250
 ---
 
@@ -21,6 +21,34 @@ source_issue: 250
 ## Status
 
 Accepted
+
+Absorbed [BRIEF](docs/briefs/BRIEF-koto-leg-wake.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+**Why this exists.** koto's request legs let one session wait on another,
+and a coordinator workflow that dispatches several workers and waits on their
+legs is being built on them. A coordinator parked on a `request-leg` gate is
+never told the leg changed, so it waits on an unrelated cue or holds a turn
+open in `koto request wait`.
+
+**The outcome.** A coordinator author parks a session on a leg and stops
+thinking about it. When any leg it waits on resolves by any route, or is
+abandoned, the harness running the coordinator hears within a documented,
+short time and ticks it, with no koto configuration naming the harness. A
+missed signal is caught on the next tick and a repeated one finds nothing new.
+With no harness listening, `koto request wait` stays the way to wait.
+
+**The journeys.** A coordinator is woken by its worker finishing; a
+coordinator is woken by an abandonment no worker caused; a harness
+integrator wires the signal into their harness once, from koto's docs alone;
+a script with no subscriber keeps waiting with a timeout as it does today.
+
+**The boundary.** In: wakes on every route that resolves or abandons a leg,
+addressed to the request's named sessions on the same machine, a documented
+subscription, harmless lost and duplicate wakes, and retiring the
+logging-only waker. Out: cross-host wakes, harness-specific code, the
+consuming workflow, state in the wake, a daemon, and the cloud backend.
 
 ## Problem Statement
 
