@@ -568,18 +568,8 @@ fn lock_path(root: &Path, id: &ValidatedRequestId) -> PathBuf {
 /// directory's mode having been set correctly once.
 fn create_dir_0700(path: &Path) -> Result<(), RequestStoreError> {
     reject_if_symlink(path)?;
-    if path.is_dir() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(path)
-        .map_err(|e| RequestStoreError::io(format!("creating {}", path.display()), e))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| RequestStoreError::io(format!("chmod 0700 {}", path.display()), e))?;
-    }
-    Ok(())
+    crate::engine::atomic_fs::create_private_dir(path)
+        .map_err(|e| RequestStoreError::io(format!("creating {}", path.display()), e))
 }
 
 /// Refuse to read or write through a symlink.
@@ -590,13 +580,8 @@ fn create_dir_0700(path: &Path) -> Result<(), RequestStoreError> {
 /// symlinked root. The lock file gets the same treatment via
 /// `O_NOFOLLOW`.
 fn reject_if_symlink(path: &Path) -> Result<(), RequestStoreError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(md) if md.file_type().is_symlink() => Err(RequestStoreError::Other(format!(
-            "refusing to follow the symlink at {}",
-            path.display()
-        ))),
-        _ => Ok(()),
-    }
+    crate::engine::atomic_fs::reject_symlink(path)
+        .map_err(|e| RequestStoreError::Other(e.to_string()))
 }
 
 /// Best-effort fsync of a directory so a fresh entry survives a crash.
