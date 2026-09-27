@@ -215,14 +215,17 @@ fn no_answered_record_without_an_unapplied_consultation_or_a_declared_field() {
     // And with the declared field alongside, only the declared one lands.
     ok(&h.next_with(
         "shadow",
-        r#"{"note": "free text 9d1e", "verdict": "proceed"}"#,
+        r#"{"note": "free text zq-sentinel", "verdict": "proceed"}"#,
     ));
     let answered = of_kind(&ledger(&h), "answered");
     assert_eq!(answered.len(), 1);
     assert_eq!(answered[0]["values"], json!({"verdict": "proceed"}));
+    // The sentinel holds non-hex letters: every ledger line also carries a
+    // random session id and SHA-256 hashes, which a hex sentinel could
+    // match by chance.
     assert!(!std::fs::read_to_string(ledger_file(&h))
         .unwrap()
-        .contains("9d1e"));
+        .contains("zq-sentinel"));
 }
 
 #[test]
