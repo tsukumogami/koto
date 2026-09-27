@@ -178,9 +178,10 @@ pub fn handle_prune(
         );
     }
 
-    // 11. Reclaim. Descendants first so a partial failure leaves the
-    //     root visible in `koto workflows`.
-    for id in &descendants {
+    // 11. Reclaim. Descendants first, deepest first, so a partial failure
+    //     leaves every remaining session under a parent that still exists
+    //     and the root visible in `koto workflows`.
+    for id in descendants.iter().rev() {
         backend
             .cleanup(id)
             .with_context(|| format!("failed to remove descendant session '{}'", id))?;
@@ -292,13 +293,12 @@ fn derive_terminal_status(
     }
 }
 
-/// DFS over `SessionInfo.parent_workflow` to collect every transitive
-/// descendant of `root`. Removal safety depends on root-removed-last
-/// (the caller in `handle_prune` removes descendants first then the
-/// root), NOT on visit order — a failed removal mid-tree just leaves
-/// children rooted at a still-present parent until the next prune
-/// retry. The visit order is DFS as an implementation detail of
-/// `Vec::pop()`; BFS would be equally safe.
+/// Walk `SessionInfo.parent_workflow` to collect every transitive
+/// descendant of `root`. Each session is listed after its parent, so the
+/// caller in `handle_prune` removes the list in reverse, deepest first, and
+/// removes the root last: a failed removal then leaves every remaining
+/// session under a parent that still exists, reachable by the next prune
+/// from the same root.
 fn collect_descendants(root: &str, sessions: &[SessionInfo]) -> Vec<String> {
     let mut descendants = Vec::new();
     // A `parent_workflow` cycle (A -> B -> A) is constructible by removing a
@@ -331,6 +331,10 @@ fn collect_descendants(root: &str, sessions: &[SessionInfo]) -> Vec<String> {
 /// koto recognises a coordinator, or when its own log holds a
 /// `ChildCompleted` from a child created with `koto init --parent`. A leaf
 /// session, which is most terminal ticks, never lists sessions.
+///
+/// One case falls outside both triggers: a parent without a batch hook
+/// whose only child's `ChildCompleted` failed to write. That child is left
+/// behind, visible in `koto workflows --orphaned`.
 pub(crate) fn sweep_if_parent(
     backend: &dyn SessionBackend,
     name: &str,
@@ -352,7 +356,7 @@ pub(crate) fn sweep_if_parent(
 }
 
 /// Remove every descendant of `parent` that stands in a terminal state and
-/// has nothing live under it, deepest first. Returns how many were removed.
+/// has nothing live under it, deepest first.
 ///
 /// The removal is implicit -- nobody named these sessions -- so every rule
 /// fails toward keeping:
@@ -370,12 +374,12 @@ pub(crate) fn sweep_if_parent(
 ///   the window in which a concurrent `koto rewind` could bring it back;
 /// - a failed removal warns and the walk continues; the caller removes the
 ///   parent either way, and a leftover shows in `koto workflows --orphaned`.
-pub(crate) fn sweep_terminal_descendants(backend: &dyn SessionBackend, parent: &str) -> usize {
+pub(crate) fn sweep_terminal_descendants(backend: &dyn SessionBackend, parent: &str) {
     let sessions = match backend.list() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("warning: could not list sessions to remove {parent}'s kept children: {e}");
-            return 0;
+            return;
         }
     };
     let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -385,9 +389,7 @@ pub(crate) fn sweep_terminal_descendants(backend: &dyn SessionBackend, parent: &
         }
     }
     let mut visited: HashSet<String> = HashSet::from([parent.to_string()]);
-    let mut removed = 0;
-    sweep_children(backend, parent, &children, &mut visited, 0, &mut removed);
-    removed
+    sweep_children(backend, parent, &children, &mut visited, 0);
 }
 
 /// Deeper than any real fan-out; only a corrupted header graph reaches it.
@@ -400,7 +402,6 @@ fn sweep_children(
     children: &HashMap<&str, Vec<&str>>,
     visited: &mut HashSet<String>,
     depth: usize,
-    removed: &mut usize,
 ) -> bool {
     let Some(kids) = children.get(id) else {
         return true;
@@ -419,7 +420,7 @@ fn sweep_children(
             all_removed = false;
             continue;
         }
-        if !sweep_children(backend, child, children, visited, depth + 1, removed) {
+        if !sweep_children(backend, child, children, visited, depth + 1) {
             all_removed = false;
             continue;
         }
@@ -429,7 +430,7 @@ fn sweep_children(
             continue;
         }
         match backend.cleanup(child) {
-            Ok(()) => *removed += 1,
+            Ok(()) => {}
             Err(e) => {
                 eprintln!("warning: could not remove kept session {child}: {e}");
                 all_removed = false;
@@ -475,7 +476,9 @@ fn awaits_leg_promotion(backend: &dyn SessionBackend, id: &str) -> bool {
 
 /// True only when `id` reads and classifies as terminal (completed or
 /// abandoned). Any read or classification error is "not terminal", so the
-/// sweep leaves the session alone.
+/// sweep leaves the session alone. This is deliberately the opposite of
+/// `non_terminal_sessions`, which only warns before an operator-confirmed
+/// prune and so treats an unreadable session as nothing to warn about.
 fn is_terminal_session(backend: &dyn SessionBackend, id: &str) -> bool {
     let Ok((header, events)) = backend.read_events(id) else {
         return false;
@@ -743,6 +746,30 @@ mod tests {
             .unwrap();
         sweep_if_parent(&backend, "leaf", &leaf_template());
         assert_eq!(backend.lists.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Prune removes descendants in reverse, deepest first, which is only
+    /// correct if every session is listed after its parent.
+    #[test]
+    fn collect_descendants_lists_each_session_after_its_parent() {
+        let info = |id: &str, parent: Option<&str>| SessionInfo {
+            id: id.to_string(),
+            created_at: "t".to_string(),
+            template_hash: "h".to_string(),
+            parent_workflow: parent.map(str::to_string),
+            template_source_status: None,
+        };
+        // Listed out of order on purpose.
+        let sessions = vec![
+            info("gc", Some("c")),
+            info("c", Some("root")),
+            info("root", None),
+            info("c2", Some("root")),
+        ];
+        let order = collect_descendants("root", &sessions);
+        let pos = |id: &str| order.iter().position(|x| x == id).unwrap();
+        assert!(pos("c") < pos("gc"), "{order:?}");
+        assert_eq!(order.len(), 3);
     }
 
     #[test]

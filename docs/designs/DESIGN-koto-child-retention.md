@@ -391,8 +391,9 @@ path removes a finished session. It:
   every session under it was removed. A terminal child with a live grandchild
   stays, so the grandchild keeps its parent.
 - **fails toward keeping.** Any error reading or classifying a session (a
-  missing template, an unreadable log, a failed download on the cloud backend)
-  leaves that session and its subtree alone.
+  missing template, an unreadable log) leaves that session and its subtree
+  alone. On the cloud backend a failed download falls back to the local copy,
+  as every read there does, so the sweep sees what the local store holds.
 - **leaves a pending leg alone.** A descendant bound to a request leg that is
   still open hasn't delivered its result there, typically because its
   promotion failed and waits for a retry; removing it would leave the leg open
@@ -634,6 +635,18 @@ and a child that reaches a terminal after the sweep's listing can be left
 behind as an orphan. Both windows are milliseconds wide and need two processes
 driving the same tree at once; the orphan is recoverable with `koto session
 cleanup`. This is accepted residual risk.
+
+**Cloud backend.** The sweep issues the same per-session reads and cleanup
+the backend already exposes, so it adds no new kind of remote operation,
+though a sweep costs a list and reads for each descendant in the parent's
+subtree. Two limits follow from how the cloud backend reads. A failed
+download falls back to the local copy, so the re-check before a removal can
+pass on a stale local copy of a session another machine has rewound. And a
+session that exists only in the bucket is listed without its parent, so the
+sweep can't reach it: a kept child created on another machine can outlive its
+parent there, visible in `koto workflows --orphaned`. Both are accepted: the
+first needs two machines driving one tree at once, and the second fails
+toward keeping.
 
 **Name reuse.** `parent_workflow` holds a name, not a unique identity. Running
 the sweep in the replace path means a new run under a reused name starts

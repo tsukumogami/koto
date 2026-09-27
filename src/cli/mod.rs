@@ -352,13 +352,14 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         yes: bool,
 
-        /// DANGER: bypasses the terminal-state safety gate. Prunes a
-        /// session tree even if a descendant is currently being
-        /// dispatched. Use only when you know the tree is abandoned
-        /// (e.g., orphan from a crashed run that never reached
-        /// terminal). A force-prune of a live tree corrupts any
-        /// coordinator still holding a claim against it. Combined
-        /// with `--yes`, this flag still triggers a second
+        /// DANGER: bypasses the terminal-state safety gate on the root.
+        /// Without it, prune refuses a root that is not terminal; the
+        /// descendants are removed whatever their state either way (the
+        /// preview names any that are not terminal). Use only when you
+        /// know the tree is abandoned (e.g., orphan from a crashed run
+        /// that never reached terminal). A force-prune of a live tree
+        /// corrupts any coordinator still holding a claim against it.
+        /// Combined with `--yes`, this flag still triggers a second
         /// confirmation prompt requiring the literal string
         /// `force-prune` to proceed.
         #[arg(long)]
