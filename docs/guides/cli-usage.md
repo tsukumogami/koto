@@ -1069,6 +1069,46 @@ On a self-attached leg, `koto request progress`, `koto request resolve` and `kot
 
 A dispatched child (one `koto request bind` accepts) presented to `attach` is bound exactly as `bind` binds it. Any other child session is refused with `child_not_fenceable`.
 
+### Leg wakes and request watch
+
+A session parked on a `request-leg` gate learns that its leg changed when it next ticks. koto tells the harness running that session when to tick, through a per-session wake file.
+
+**What rings.** Every write that can change what a `request-leg` gate reads rings a wake: a leg's result (a worker's promoted terminal result, `koto request resolve`, or the refusal `koto init --koto-leg` records), a leg abandonment (`koto request abandon`, or each leg of `koto request abandon-request`), and `koto request close`. Creating a request, binding or attaching a leg, and appending progress do not ring. The wake is written by the process that made the change, after the change is durable and before that command returns, so a worker's terminal `koto next` has rung its coordinator by the time it exits.
+
+**Whom it addresses.** The request's coordinator of record and its requester, once each, or once when they name the same session. A name that is not a valid session identifier is skipped with a warning. A wake is delivered whether or not the session exists yet, so a subscriber that starts before its session is created still sees it. A wake never fails the write that caused it: if the file can't be written, the write succeeds and a warning goes to stderr. The wake-candidates pass in `koto next` rings the same file when it records `RequesterWoken`.
+
+**What it means.** Only "look again". A wake carries no state: the session's next tick reads the leg through its gate as it always does. A lost wake costs latency, and a duplicate costs one tick that finds nothing new.
+
+**Where it is.** `~/.koto/wakes/<session>`. The file is appended in place, one opaque line per wake, and never renamed, so a watcher registered on the path keeps working. It is truncated to empty once it reaches 32 KiB, so it stays small.
+
+**Subscribing without koto.** Watch the file with whatever the harness has. A native file watcher or `tail -F` sees each append. A poller should compare the file's size and modification time together: comparing size alone can miss a wake that followed a truncation.
+
+**Subscribing with koto.**
+
+```bash
+koto request watch --session <session-id> --timeout-secs <n> [--since <cursor>]
+```
+
+`watch` blocks until the session's wake file changes, or until `--timeout-secs` passes, and exits 0 either way with one JSON line:
+
+```json
+{"session": "coord", "woke": true, "cursor": "w1:66:1790000000000000000.4242.0", "cli_contract": {"major": 1, "minor": 2}}
+```
+
+`woke` is `true` on a wake and `false` at the timeout. `cursor` is opaque. Pass it as `--since` to the next `watch`: a wake delivered between the two returns at once instead of being missed. Without `--since`, `watch` starts from the file as it is when it starts. The loop a harness runs is: take a cursor first with `koto request watch --session <id> --timeout-secs 0`, then tick the session; start `watch --since <cursor>` in the background; when it exits, tick the session and start `watch` again with the cursor it printed. Taking the cursor before the tick is what makes a wake that lands between the tick and the watch return at once rather than be missed. A harness that reacts to a background command finishing needs nothing else. Any number of watches may run for one session, and each sees every wake.
+
+`--session` and `--timeout-secs` are required (exit 2 without them). An invalid session is `invalid_identifier` and an unparseable `--since` is `invalid_submission`, both exit 2 before anything is read. A wake file that can't be read is `persistence_error`, exit 3. An interrupt exits like an interrupted `wait`.
+
+**The bound.** A `watch` that was running before the change exits within 1 second of the command that made the change returning. It polls every 100 ms, which leaves room for a loaded machine. The harness's own reaction time after `watch` exits is outside this bound.
+
+**With no subscriber.** Nothing depends on the wake being read. Where no harness watches the file, wait on a leg with `koto request wait`, which polls the request itself and needs a timeout:
+
+```bash
+koto request wait <request-id> --leg <name> --timeout-secs <n>
+```
+
+**Local only.** The wake file, like the request store, lives on one machine. A leg resolved on one host never wakes a coordinator on another, and request records do not replicate under the cloud backend.
+
 ## Typical agent workflow
 
 The standard loop for an AI agent dispatches on the `action` field:
