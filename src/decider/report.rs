@@ -56,6 +56,10 @@ pub const MIN_CASES_TOTAL: u64 = 40;
 pub const MIN_LEDGER_PAIRS: u64 = 30;
 /// Most ledger disagreements where the decider chose a value.
 pub const MAX_DISAGREEMENTS: u64 = 1;
+/// Most ledger directed exits from visits where the decider chose a value.
+/// None allowed: a confident decision the agent walked away from with
+/// `koto next --to` is the strongest evidence against automating it.
+pub const MAX_DIRECTED_EXITS: u64 = 0;
 /// The `agent` a directed exit is listed with among the disagreements.
 pub const AGENT_DIRECTED_EXIT: &str = "directed_exit";
 /// Consultations in `auto` before a question can be flagged low-coverage.
@@ -1146,6 +1150,10 @@ pub fn judge(input: &JudgeInput<'_>, results: Vec<CaseResult>) -> FixtureReport 
                 .ledger
                 .and_then(|q| q.value(v))
                 .map_or(0, |r| r.counted_directed_exits);
+            // Written as a bound like its siblings, so changing the constant
+            // is the whole change; clippy objects only while it is zero.
+            #[allow(clippy::absurd_extreme_comparisons)]
+            let directed_exits_met = directed_exits <= MAX_DIRECTED_EXITS;
             let mut pairs_detail = format!(
                 "at least {} paired observations under the current declaration hash (has {})",
                 MIN_LEDGER_PAIRS, evidence.counted_paired
@@ -1215,13 +1223,11 @@ pub fn judge(input: &JudgeInput<'_>, results: Vec<CaseResult>) -> FixtureReport 
                 },
                 Condition {
                     name: "ledger_directed_exits".to_string(),
-                    // None allowed: a confident decision the agent walked away
-                    // from is the strongest evidence against automating it.
-                    met: directed_exits == 0,
+                    met: directed_exits_met,
                     detail: format!(
-                        "no ledger visit where the decider chose {} was left with koto next --to \
-                         instead of answered (has {})",
-                        v, directed_exits
+                        "at most {} ledger visits where the decider chose {} left with \
+                         koto next --to instead of answered (has {})",
+                        MAX_DIRECTED_EXITS, v, directed_exits
                     ),
                 },
                 Condition {

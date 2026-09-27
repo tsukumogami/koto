@@ -1560,8 +1560,8 @@ fn a_directed_exit_where_the_decider_chose_the_value_is_disqualifying() {
     assert_only_fails(
         &s,
         "ledger_directed_exits",
-        "no ledger visit where the decider chose proceed was left with koto next --to \
-         instead of answered (has 1)",
+        "at most 0 ledger visits where the decider chose proceed left with \
+         koto next --to instead of answered (has 1)",
     );
 
     // An exit from a visit where the decider wasn't confident says nothing

@@ -332,8 +332,12 @@ pub fn answered_record(
 /// record would pair with -- and the agent hasn't already answered a
 /// declared field in `accepts` on it. A visit that was answered and then
 /// left with `--to` (the answer matched no transition) is already a paired
-/// observation; an exit on top of it isn't an answer withheld. Like
-/// [`answered_record`], nothing here reads the decider settings.
+/// observation; an exit on top of it isn't an answer withheld. A `--to`
+/// naming the state the session is already in isn't one either: it begins a
+/// new visit to the same state (a hand-driven lap, which is consulted
+/// afresh) rather than choosing a route over the decider's, so it writes
+/// nothing. Like [`answered_record`], nothing here reads the decider
+/// settings.
 pub fn directed_exit_record(
     session: &str,
     session_id: Option<&str>,
@@ -342,6 +346,9 @@ pub fn directed_exit_record(
     accepts: Option<&BTreeMap<String, crate::template::types::FieldSchema>>,
     target: &str,
 ) -> Option<LedgerRecord> {
+    if target == state {
+        return None;
+    }
     let consultation = prior_consultation(events, state)?;
     if consultation.outcome == ConsultationOutcome::Applied {
         return None;

@@ -369,6 +369,29 @@ fn only_the_consulted_visit_records_an_exit_not_a_later_one() {
 }
 
 #[test]
+fn a_self_loop_directed_transition_is_a_lap_not_an_exit() {
+    // `review` gains an edge to itself, making `--to review` from `review` a
+    // valid directed transition: it begins a new visit without choosing a
+    // route over the decider's.
+    let tpl = standard("shadow", "shadow")
+        .replace(
+            "variables:\n  PLAN_DOC:",
+            "variables:\n  FLAG:\n    description: flag\n    default: \"\"\n  PLAN_DOC:",
+        )
+        .replace(
+            "      - target: work\n        when:\n          verdict: proceed\n",
+            "      - target: work\n        when:\n          verdict: proceed\n          vars.FLAG: {is_set: true}\n      - target: review\n        when:\n          verdict: proceed\n          vars.FLAG: {is_set: false}\n",
+        );
+    let h = ready(&tpl, vec![go()]);
+    ok(&h.next_mode("shadow"));
+    assert_eq!(of_kind(&ledger(&h), "consulted").len(), 1);
+    ok(&directed(&h, "review"));
+    let lines = ledger(&h);
+    assert!(of_kind(&lines, "directed_exit").is_empty(), "{:?}", lines);
+    assert_eq!(h.events_of("directed_transition").len(), 1);
+}
+
+#[test]
 fn an_answer_with_data_writes_no_directed_exit() {
     let h = ready(&standard("shadow", "shadow"), vec![go()]);
     ok(&h.next_mode("shadow"));
