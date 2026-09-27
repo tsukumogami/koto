@@ -172,7 +172,7 @@ state that produces the key gates on it, and a run can't reach the question
 without it.
 
 A `var` input can't carry free text. `koto init --var` accepts only letters,
-digits, spaces, and `._/:@-`, so a value with a comma or a newline is refused
+digits, spaces, and `._/:@+-`, so a value with a comma or a newline is refused
 before the session starts. Put prose, such as an issue body, in a context key.
 
 ### The boolean declaration

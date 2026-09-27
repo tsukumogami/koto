@@ -470,6 +470,30 @@ mod tests {
     }
 
     #[test]
+    fn a_plus_passes_the_allowlist_but_a_declared_constraint_still_decides() {
+        // The allowlist admits `+` (Issue #266); a variable's own `pattern:`
+        // or `values:` is still what decides whether it accepts one.
+        let open = VariableDecl::default();
+        check_value("ROOT", &open, "/ws/workspace+inst/checkout").unwrap();
+
+        let slug = VariableDecl {
+            pattern: "[a-z0-9-]+".into(),
+            ..VariableDecl::default()
+        };
+        check_value("SLUG", &slug, "abc-1").unwrap();
+        let err = check_value("SLUG", &slug, "abc+1").unwrap_err();
+        assert_eq!(err.code(), Some("invalid_var"));
+        assert_eq!(err.fields()["constraint"], "pattern:[a-z0-9-]+");
+
+        let merge = VariableDecl {
+            values: vec!["true".into(), "false".into()],
+            ..VariableDecl::default()
+        };
+        let err = check_value("MERGE", &merge, "true+").unwrap_err();
+        assert_eq!(err.fields()["constraint"], "values:[true,false]");
+    }
+
+    #[test]
     fn a_terminal_session_is_refused() {
         let err = validate_rebind(
             &template(),

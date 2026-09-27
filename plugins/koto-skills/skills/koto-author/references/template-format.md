@@ -75,10 +75,10 @@ A reference in a context gate's `key` is how you scope a context key to the sess
 
 | | Allowed |
 |---|---|
-| A variable value | letters, digits, `.`, `_`, `/`, `-`, and also a space, a `:` and an `@` |
+| A variable value | letters, digits, `.`, `_`, `/`, `-`, and also a space, a `:`, an `@` and a `+` |
 | A context key | `/`-separated components, each starting with a letter or digit and continuing in letters, digits, `.`, `_` and `-` |
 
-A value is content: it lands in a directive an agent reads, in a command argument, in a pattern, so it admits a space and a `:` and an `@` on purpose -- a calendar title or a filter like `from:user@example.com` is a legal value. A key is an address: it becomes a directory name under the session, a key in the store's manifest, and an argument in the `koto context add` and `koto context get` commands your own template runs, where a space would split it into two words.
+A value is content: it lands in a directive an agent reads, in a command argument, in a pattern, so it admits a space, a `:`, an `@` and a `+` on purpose -- a calendar title, a filter like `from:user@example.com`, or a path through a directory named like `workspace+instance` is a legal value. A key is an address: it becomes a directory name under the session, a key in the store's manifest, and an argument in the `koto context add` and `koto context get` commands your own template runs, where a space would split it into two words.
 
 So `key: "{{TITLE}}-note"` with a `TITLE` of `Weekly Planning` is a gate that cannot pass. koto tells you which character it refused and in which component rather than reporting the key absent, but the fix is yours: scope the key on a slug-shaped variable and keep the prose value for the directive.
 
@@ -516,7 +516,7 @@ gates:
 
 A value substituted into `pattern` is escaped, so it matches itself rather than acting as a regex fragment -- write the regex structure in the pattern and let the variable carry the value. That holds in a character class you opened and under `(?x)` too. An undeclared reference in either field is a compile error, the same as in a gate command.
 
-What the compiler cannot check is the value, since it does not exist yet. Two cases are caught at run time and reported as a gate `error` with the reason attached: a `key` that resolves to something the context store will not accept (empty, or breaking the key rules -- note a value may hold a space, `:` or `@`, and a key may not), and a `pattern` that resolves to empty, which would otherwise match every input and pass the gate on anything.
+What the compiler cannot check is the value, since it does not exist yet. Two cases are caught at run time and reported as a gate `error` with the reason attached: a `key` that resolves to something the context store will not accept (empty, or breaking the key rules -- note a value may hold a space, `:`, `@` or `+`, and a key may not), and a `pattern` that resolves to empty, which would otherwise match every input and pass the gate on anything.
 
 #### `children-complete` gate type
 
@@ -972,7 +972,7 @@ Read it anywhere a variable can be read: a later directive or details section, a
 
 Two bounds apply and they do different jobs. **64KB per stream** bounds what the response and event log carry. **4096 bytes** bounds what a capture may deliver, measured after trimming -- far smaller because a captured value is a token landing in prose and possibly a shell word, not a transcript.
 
-Delivery fails three ways, all of them action failures with `failure_kind: "capture_failed"` and a `capture_error` object naming the case: the trimmed output is `empty`, it is `too_large` (over 4096 bytes), or it holds a `disallowed_character` -- the same allowlist declared variables pass, `^[a-zA-Z0-9._/:@ \-]*$`, which forbids newlines and so makes multi-line capture unrepresentable. A skip would be a silent drop, and it would move the error to the reading state where the message names a variable instead of the command that failed to produce it.
+Delivery fails three ways, all of them action failures with `failure_kind: "capture_failed"` and a `capture_error` object naming the case: the trimmed output is `empty`, it is `too_large` (over 4096 bytes), or it holds a `disallowed_character` -- the same allowlist declared variables pass, `^[a-zA-Z0-9._/:@+ \-]*$`, which forbids newlines and so makes multi-line capture unrepresentable. A skip would be a silent drop, and it would move the error to the reading state where the message names a variable instead of the command that failed to produce it.
 
 Reading a name the run never delivered stops the tick with the `capture_unset` error code rather than rendering an empty string or a raw `{{NAME}}` token. That covers a state's own action: a `{{NAME}}` in `command` or in `working_dir` is checked before either is substituted, so the token never reaches `sh -c` and nothing is spawned. It is a stop and not an action failure, so `fallback` prose is not delivered for it.
 
@@ -1265,7 +1265,9 @@ For a template at `koto-templates/my-skill.md`, the preview goes at `koto-templa
 
 ## Security note
 
-Koto performs `{{VARIABLE}}` substitution in `command` gate strings before passing them to `sh -c`. Values supplied via `--var` are validated at init time against an allowlist (letters, digits, `. _ - /`, `:`, `@`, and spaces); shell metacharacters such as `;` `|` `&` `$` `(` `)` `<` `>` `*` `?`, quotes, backticks, and newlines are rejected, so a value cannot inject a command.
+Koto performs `{{VARIABLE}}` substitution in `command` gate strings before passing them to `sh -c`. Values supplied via `--var` are validated at init time against an allowlist (letters, digits, `. _ - /`, `:`, `@`, `+`, and spaces); shell metacharacters such as `;` `|` `&` `$` `(` `)` `<` `>` `*` `?`, quotes, backticks, and newlines are rejected, so a value cannot inject a command.
+
+The allowlist guarantees the shell reads the value as a word, not that the program receiving the word reads it as literal text: a `+` or `.` handed to `grep -E` as a pattern is regex syntax there, and a `+` in a URL query string decodes as a space.
 
 The allowlist blocks command injection, not word splitting. A value may contain spaces (for structured names like a calendar title), and an unquoted interpolation splits it into multiple shell arguments. Quote the reference when a value must stay a single argument:
 

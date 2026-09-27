@@ -231,6 +231,23 @@ to `0.9.x`).
 
 ### Fixed
 
+- **A variable value may contain `+` (koto#266).** The value allowlist now
+  accepts letters, digits, `.`, `_`, `-`, `/`, `:`, `@`, `+` and spaces
+  (`^[a-zA-Z0-9._/:@+ \-]*$`). A path such as a directory named
+  `workspace+instance`, or a version like `1.2.0+build`, used to be refused
+  with `invalid_var` at `koto init --var` and `--vars-file`. `+` is safe to
+  admit because no POSIX shell gives it a meaning inside a `sh -c` word, and
+  where a value lands in a `context-matches` pattern it is escaped to match
+  itself. Every other character stays refused, shell metacharacters included,
+  and a variable's own `values:` or `pattern:` still decides what it accepts.
+  The one allowlist is shared by every place a value is checked, so a rebind
+  through `--attach-live`, `--replace-terminal`, and a captured command output
+  accept the same values. A context key still may not contain `+`. A session
+  whose variables hold a `+` can't be advanced by an older koto, which
+  re-checks every recorded value on each tick: its `koto next` exits with
+  `persistence_error` and `variable re-validation failed`. A skill that passes
+  such a value should require this release.
+
 - **The `children-complete` gate no longer shows a retried child's old result.**
   It reads only the result a child recorded for its current arrival, and it no
   longer answers a child it can read from its own log with the parent's

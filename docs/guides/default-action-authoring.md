@@ -173,9 +173,12 @@ gates pass -- not for one long command. A single command that can't finish in 30
 something the engine can run; leave it with the agent.
 
 `{{VARIABLE}}` references in `command` are substituted before the shell sees the string, in the
-shell-safe form: values pass an allowlist (letters, digits, `. _ - / : @` and spaces) that
-excludes every character able to start a command, expansion, or redirection. The allowlist blocks
-injection, not word splitting -- quote the reference when a value must stay a single argument:
+shell-safe form: values pass an allowlist (letters, digits, `. _ - / : @ +` and spaces) that
+excludes every character able to start a command, expansion, or redirection. It guarantees the
+shell reads the value as a word, not that the program receiving the word reads it as literal text:
+a `+` or `.` handed to `grep -E` as a pattern is regex syntax there, and a `+` in a URL query
+string decodes as a space. The allowlist blocks injection, not word splitting -- quote the
+reference when a value must stay a single argument:
 
 ```yaml
 command: mytool --calendar "{{CALENDAR}}"
@@ -374,7 +377,7 @@ Against a capture, `is_set` answers "has the producing command run yet".
 
 Know the constraints before you pick the command, because they're what decides whether the
 command is usable here at all. The trimmed output must be non-empty, at most **4096 bytes**, and
-made only of characters the value allowlist accepts: `^[a-zA-Z0-9._/:@ \-]*$`. That forbids
+made only of characters the value allowlist accepts: `^[a-zA-Z0-9._/:@+ \-]*$`. That forbids
 newlines, so **a multi-line capture is not representable** -- pipe the command through something
 that yields one line. Output that breaks any of the three is a failure, not a warning, and the
 next two sections give the numbers and the failure shapes in full.
@@ -476,7 +479,7 @@ After the command exits zero, koto trims the output and then checks it, in this 
 1. **Empty.** Nothing, or nothing but whitespace.
 2. **Too large.** The trimmed value exceeds 4096 bytes.
 3. **A character the allowlist forbids.** The same allowlist every declared variable passes:
-   `^[a-zA-Z0-9._/:@ \-]*$`. It forbids newlines, which is why a multi-line capture isn't
+   `^[a-zA-Z0-9._/:@+ \-]*$`. It forbids newlines, which is why a multi-line capture isn't
    representable and why trimming is mandatory rather than a courtesy.
 
 All three are action failures, not skips -- the same stop, the same `__action__` condition, the

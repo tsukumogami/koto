@@ -121,8 +121,8 @@ pub fn validate_context_key(key: &str) -> anyhow::Result<()> {
 ///
 /// The asymmetry it describes is deliberate on both sides. A variable value is
 /// content -- it reaches a directive, a command argument, a pattern -- and it
-/// admits a space, a `:` and an `@` so it can hold a title or a filter
-/// expression. A context key is an address: it becomes a path component on disk,
+/// admits a space, a `:`, an `@` and a `+` so it can hold a title, a filter
+/// expression or a path. A context key is an address: it becomes a path component on disk,
 /// a key in the store's manifest, and an argument in the `koto context add` and
 /// `koto context get` commands templates run. Widening the key grammar to close
 /// the gap would legalize keys that word-split at that third use, so the two
@@ -132,8 +132,8 @@ pub fn unusable_context_key_reason(key: &str) -> Option<String> {
     let err = validate_context_key(key).err()?;
     Some(format!(
         "context key {:?} is not usable: {}\n  \
-         remedy: a variable value may hold a space, ':' or '@'; a context key \
-         may not. Where the key comes from a {{{{KEY}}}} reference, check what \
+         remedy: a variable value may hold a space, ':', '@' or '+'; a context \
+         key may not. Where the key comes from a {{{{KEY}}}} reference, check what \
          that reference resolved to -- an unset optional variable leaves nothing \
          behind",
         key, err
@@ -328,10 +328,17 @@ mod tests {
 
     // -- unusable_context_key_reason --
     //
-    // The three characters below are the whole of the gap between what a
+    // The four characters below are the whole of the gap between what a
     // variable value may hold and what a context key may hold, so each gets its
     // own case: a reason that stopped naming one of them would leave an operator
     // with the same silence the function exists to end.
+
+    /// The part of a reason before its remedy. The remedy lists every
+    /// character a value may hold and a key may not, so a check that the
+    /// reason names one must not look there.
+    fn before_remedy(reason: &str) -> &str {
+        reason.split("remedy:").next().unwrap_or_default()
+    }
 
     #[test]
     fn reason_is_none_for_a_usable_key() {
@@ -343,7 +350,7 @@ mod tests {
         let reason = unusable_context_key_reason("Weekly Planning-note")
             .expect("a space is not a legal context key character");
         assert!(
-            reason.contains("' '"),
+            before_remedy(&reason).contains("' '"),
             "the reason should quote the offending character; got {reason}"
         );
         assert!(
@@ -357,7 +364,7 @@ mod tests {
         let reason = unusable_context_key_reason("newer_than:90d-note")
             .expect("a colon is not a legal context key character");
         assert!(
-            reason.contains("':'"),
+            before_remedy(&reason).contains("':'"),
             "the reason should quote the colon; got {reason}"
         );
     }
@@ -367,8 +374,18 @@ mod tests {
         let reason = unusable_context_key_reason("user@example.com-note")
             .expect("an at-sign is not a legal context key character");
         assert!(
-            reason.contains("'@'"),
+            before_remedy(&reason).contains("'@'"),
             "the reason should quote the at-sign; got {reason}"
+        );
+    }
+
+    #[test]
+    fn reason_names_a_plus() {
+        let reason = unusable_context_key_reason("workspace+instance-note")
+            .expect("a plus is not a legal context key character");
+        assert!(
+            before_remedy(&reason).contains("'+'"),
+            "the reason should quote the plus; got {reason}"
         );
     }
 
@@ -398,7 +415,7 @@ mod tests {
     /// has no idea whether a reference produced the key and cannot add one.
     #[test]
     fn every_reason_carries_the_remedy() {
-        for key in ["Weekly Planning-note", "a:b", "a@b", "-note", ""] {
+        for key in ["Weekly Planning-note", "a:b", "a@b", "a+b", "-note", ""] {
             let reason = unusable_context_key_reason(key)
                 .unwrap_or_else(|| panic!("{key:?} should be unusable"));
             assert!(

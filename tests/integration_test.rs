@@ -3181,8 +3181,8 @@ fn context_exists_returns_exit_0_when_present() {
 ///
 /// All three outcomes are asserted against one session so the test fails if any
 /// pair of them ever collapses, rather than only if the new one is wrong. The
-/// three keys carry the three characters a variable value may hold and a context
-/// key may not -- `Weekly Planning-note` is the case the issue was filed about.
+/// unusable keys carry the four characters a variable value may hold and a
+/// context key may not -- `Weekly Planning-note` is the case the issue was filed about.
 #[test]
 fn context_exists_tells_an_unusable_key_from_an_absent_one() {
     let dir = TempDir::new().unwrap();
@@ -3213,6 +3213,7 @@ fn context_exists_tells_an_unusable_key_from_an_absent_one() {
         ("Weekly Planning-note", "' '"),
         ("newer_than:90d-note", "':'"),
         ("user@example.com-note", "'@'"),
+        ("workspace+instance-note", "'+'"),
     ] {
         let unusable = status_for(key);
 
@@ -3240,8 +3241,11 @@ fn context_exists_tells_an_unusable_key_from_an_absent_one() {
             });
         assert_eq!(body["command"], "context exists");
         let message = body["error"].as_str().unwrap_or_default();
+        // Look before the remedy: it lists every character a value may hold
+        // and a key may not, so it would satisfy this check on its own.
+        let reason = message.split("remedy:").next().unwrap_or_default();
         assert!(
-            message.contains(character),
+            reason.contains(character),
             "the error for {key} should name {character}; got {message}"
         );
         assert!(
