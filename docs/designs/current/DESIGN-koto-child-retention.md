@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 problem: |
   koto's terminal tick removes a session unconditionally, failure terminals
   included, and the only opt-out, --no-cleanup, also suppresses the two writes
@@ -36,7 +36,7 @@ user_visible_surface: true
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 

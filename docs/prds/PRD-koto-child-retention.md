@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 problem: |
   koto removes a session, context included, on the tick it reaches any
   terminal state. For a child that ended at a failure terminal, that removal
@@ -23,7 +23,7 @@ source_issue: 240
 
 ## Status
 
-In Progress
+Done
 
 Absorbed [BRIEF-koto-child-retention](docs/briefs/BRIEF-koto-child-retention.md); carried in Absorbed Brief.
 
