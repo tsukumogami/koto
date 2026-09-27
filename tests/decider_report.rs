@@ -1591,6 +1591,8 @@ fn directed_exits_are_counted_listed_and_kept_out_of_the_pairs() {
         &[
             consulted(Some("s"), 1, "h", "not_applied", Some("proceed"), true),
             directed_exit(Some("s"), 1, "rethink"),
+            // A repeated line is counted in the header but joined once.
+            directed_exit(Some("s"), 1, "rethink"),
             consulted(Some("s"), 2, "h", "not_applied", Some("exit"), false),
             directed_exit(Some("s"), 2, "work"),
             consulted(Some("s"), 3, "h", "not_applied", Some("exit"), true),
@@ -1600,7 +1602,7 @@ fn directed_exits_are_counted_listed_and_kept_out_of_the_pairs() {
         ],
     );
     let r = report_json(&h, &[]);
-    assert_eq!(r["header"]["directed_exits"], 4, "{}", r["header"]);
+    assert_eq!(r["header"]["directed_exits"], 5, "{}", r["header"]);
     assert_eq!(r["header"]["orphaned_directed_exits"], 2, "{}", r["header"]);
     assert_eq!(r["header"]["unknown_kind"], 0);
     assert_eq!(r["header"]["skipped_malformed"], 0);
@@ -1651,7 +1653,7 @@ fn directed_exits_are_counted_listed_and_kept_out_of_the_pairs() {
     assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
     let table = String::from_utf8_lossy(&out.stdout);
     for e in [
-        "4 directed exits (2 orphaned)",
+        "5 directed exits (2 orphaned)",
         "directed exits 2 (2 counted)",
         "s/1 (wf): agent left with --to rethink, decider proceed",
         "s/2 (wf): agent left with --to work, decider below_threshold",

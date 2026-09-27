@@ -4103,8 +4103,8 @@ fn handle_next(
             exit_with_error_code(json, ne.code.exit_code());
         }
 
-        // The decider ledger's `directed_exit` record: the agent left a
-        // visit whose consultation wasn't applied without answering it,
+        // The decider ledger's `directed_exit` record: this `--to` left a
+        // visit whose consultation wasn't applied, before the agent answered,
         // paired with that consultation by `visit_seq` (koto#254). Written
         // only once the transition is recorded, so a `--to` refused above
         // leaves no ledger record either. A failed write is one warning.

@@ -313,7 +313,7 @@ fn a_directed_exit_from_a_consulted_visit_is_recorded_against_its_visit_seq() {
 }
 
 #[test]
-fn a_directed_exit_with_no_consultation_writes_nothing() {
+fn a_directed_exit_from_an_unconsulted_visit_writes_nothing() {
     // Not opted in: no consultation, so nothing to pair with.
     let h = ready(&standard("shadow", "shadow"), vec![]);
     ok(&h.next_mode("off"));

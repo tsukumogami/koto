@@ -1,7 +1,8 @@
 //! The decider ledger: `<koto_root>/_decider_ledger.jsonl`.
 //!
-//! Every consultation and every agent answer to a consulted visit is
-//! appended here as one JSON line. Session logs are deleted on cleanup and
+//! Every consultation, every agent answer to a consulted visit, and every
+//! `koto next --to` that leaves such a visit unanswered is appended here as
+//! one JSON line. Session logs are deleted on cleanup and
 //! prune, and child sessions are always cleaned up, so the ledger is the
 //! only place the pairs that promotion is judged on survive. It is
 //! authoritative state: it can't be rebuilt, nothing in koto deletes or
@@ -17,8 +18,9 @@
 //! - `{"kind":"answered","v":1,"at":…,"session":…,"session_id":…,
 //!   "state":…,"visit_seq":…,"values":{field: value}}`;
 //! - `{"kind":"directed_exit","v":1,"at":…,"session":…,"session_id":…,
-//!   "state":…,"visit_seq":…,"target":…}`, written when the agent leaves a
-//!   visit whose consultation wasn't applied with `koto next --to`.
+//!   "state":…,"visit_seq":…,"target":…}`, written when `koto next --to`
+//!   leaves a visit whose consultation wasn't applied, before the agent
+//!   answered it.
 //!
 //! `at` is RFC 3339 UTC. `session_id` is the session header's UUID, or
 //! `null` for a header that has none; records with a null id can't be
@@ -113,8 +115,8 @@ pub struct AnsweredRecord {
     pub values: BTreeMap<String, serde_json::Value>,
 }
 
-/// The agent leaving a visit whose consultation wasn't applied with
-/// `koto next --to`, instead of answering it (koto#254).
+/// `koto next --to` leaving a visit whose consultation wasn't applied,
+/// before the agent answered it (koto#254).
 ///
 /// It is not an answer: the agent's value for the declared fields is
 /// unknown, so it never forms a paired observation. It is kept because

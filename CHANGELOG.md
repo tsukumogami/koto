@@ -194,14 +194,16 @@ to `0.9.x`).
   metric. Those are the visits where the agent most likely overrode the
   decider. `--to` now appends a `directed_exit` record, naming the state left,
   its `visit_seq`, and the target, when the visit being left holds a
-  consultation that wasn't applied. It's written after the
+  consultation that wasn't applied and the agent hasn't answered it (a visit
+  answered first is already a paired observation). It's written after the
   `directed_transition` event is recorded. `koto decider report` counts
   directed exits per question and per value, lists them with the disagreeing
   visits, and adds a promotion condition, `ledger_directed_exits`: a value
   isn't eligible while any visit where the decider chose it confidently was
   left with `--to`. Directed exits aren't paired observations, so recall and
   the confusion matrix don't change. An older koto reading the ledger counts
-  the new lines as an unknown kind and skips them.
+  the new lines as an unknown kind and skips them, so its report doesn't apply
+  the new condition: judge promotion with this version or later.
 
 - **`koto context add` and `koto context remove` refuse a session that has no
   state log, instead of creating a log koto can't read.** Both verbs append an

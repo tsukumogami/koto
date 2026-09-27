@@ -290,6 +290,8 @@ pub struct Disagreement {
     pub session_id: String,
     pub visit_seq: u64,
     /// The agent's value, or [`AGENT_DIRECTED_EXIT`] for a directed exit.
+    /// A declared value could share that spelling, so tell the two apart
+    /// by `directed_to`, not by this field.
     pub agent: String,
     /// The decider's column, whatever it was for a directed exit.
     pub decider: String,
@@ -354,7 +356,10 @@ pub struct QuestionReport {
     /// Directed exits from this question's consulted visits. Not paired
     /// observations: the agent's value is unknown.
     pub directed_exits: u64,
-    /// Directed exits that count toward eligibility.
+    /// Of those, the ones from consultations that count toward eligibility
+    /// (the default endpoint, unless `--include-custom-endpoints`). Only an
+    /// exit where the decider chose a value at or above threshold gates
+    /// that value; see [`ValueReport::counted_directed_exits`].
     pub counted_directed_exits: u64,
     /// Declared values, in the order the ledger's `modes` map lists them.
     pub values: Vec<ValueReport>,
@@ -481,15 +486,16 @@ pub fn analyze(read: &LedgerRead, opts: &ReportOptions) -> LedgerReport {
         }
     }
 
-    // Directed exits by visit, in file order.
-    let mut exits: HashMap<VisitKey, Vec<String>> = HashMap::new();
+    // Directed exits by visit. A visit ends at its exit, so it has at most
+    // one; a repeated line is counted in the header but joined once.
+    let mut exits: HashMap<VisitKey, String> = HashMap::new();
     let mut exit_keys: Vec<Option<VisitKey>> = Vec::new();
     for r in &read.records {
         if let LedgerRecord::DirectedExit(d) = r {
             header.directed_exits += 1;
             let key = directed_exit_key(d);
             if let Some(k) = &key {
-                exits.entry(k.clone()).or_default().push(d.target.clone());
+                exits.entry(k.clone()).or_insert_with(|| d.target.clone());
             }
             exit_keys.push(key);
         }
@@ -545,7 +551,7 @@ pub fn analyze(read: &LedgerRead, opts: &ReportOptions) -> LedgerReport {
             .session_id
             .as_ref()
             .and_then(|id| answers.get(&(id.clone(), rec.visit_seq)));
-        let visit_exits = c
+        let visit_exit = c
             .envelope
             .session_id
             .as_ref()
@@ -596,7 +602,7 @@ pub fn analyze(read: &LedgerRead, opts: &ReportOptions) -> LedgerReport {
                 }
             }
 
-            for target in visit_exits.into_iter().flatten() {
+            if let Some(target) = visit_exit {
                 q.directed.push((
                     column.clone(),
                     counted,
