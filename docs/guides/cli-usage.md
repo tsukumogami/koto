@@ -1079,7 +1079,7 @@ A session parked on a `request-leg` gate learns that its leg changed when it nex
 
 **What it means.** Only "look again". A wake carries no state: the session's next tick reads the leg through its gate as it always does. A lost wake costs latency, and a duplicate costs one tick that finds nothing new.
 
-**Where it is.** `~/.koto/wakes/<session>`. The file is appended in place, one opaque line per wake, and never renamed, so a watcher registered on the path keeps working. It is truncated to empty once it reaches 32 KiB, so it stays small.
+**Where it is.** `~/.koto/wakes/<session>`. The file is appended in place, one opaque line per wake, and never renamed, so a watcher registered on the path keeps working. Once it reaches 32 KiB, the next wake truncates it in place before appending its line, so it stays small.
 
 **Subscribing without koto.** Watch the file with whatever the harness has. A native file watcher or `tail -F` sees each append. A poller should compare the file's size and modification time together: comparing size alone can miss a wake that followed a truncation.
 
@@ -1092,12 +1092,12 @@ koto request watch --session <session-id> --timeout-secs <n> [--since <cursor>]
 `watch` blocks until the session's wake file changes, or until `--timeout-secs` passes, and exits 0 either way with one JSON line:
 
 ```json
-{"session": "coord", "woke": true, "cursor": "w1:66:1790000000000000000.4242.0", "cli_contract": {"major": 1, "minor": 2}}
+{"session":"coord","woke":true,"cursor":"w1:27:1790000000000000000.4242.0","cli_contract":{"major":1,"minor":2}}
 ```
 
-`woke` is `true` on a wake and `false` at the timeout. `cursor` is opaque. Pass it as `--since` to the next `watch`: a wake delivered between the two returns at once instead of being missed. Without `--since`, `watch` starts from the file as it is when it starts. The loop a harness runs is: take a cursor first with `koto request watch --session <id> --timeout-secs 0`, then tick the session; start `watch --since <cursor>` in the background; when it exits, tick the session and start `watch` again with the cursor it printed. Taking the cursor before the tick is what makes a wake that lands between the tick and the watch return at once rather than be missed. A harness that reacts to a background command finishing needs nothing else. Any number of watches may run for one session, and each sees every wake.
+`woke` is `true` on a wake and `false` at the timeout. `cursor` is opaque. Pass it as `--since` to the next `watch`: a wake delivered between the two returns at once instead of being missed. Without `--since`, `watch` starts from the file as it is when it starts. The loop a harness runs is: take a cursor first with `koto request watch --session <id> --timeout-secs 0`, then tick the session; start `watch --since <cursor>` in the background; when it exits, tick the session and start `watch` again with the cursor it printed. Taking the cursor before the tick is what makes a wake that lands between the tick and the watch return at once rather than be missed. A harness that reacts to a background command finishing needs nothing else. Any number of watches may run for one session; each exits on the first wake after its cursor, so several wakes between two watches come back as one `woke: true`.
 
-`--session` and `--timeout-secs` are required (exit 2 without them). An invalid session is `invalid_identifier` and an unparseable `--since` is `invalid_submission`, both exit 2 before anything is read. A wake file that can't be read is `persistence_error`, exit 3. An interrupt exits like an interrupted `wait`.
+`--session` and `--timeout-secs` are required: without them the command exits 2 with a usage message on stderr and no JSON. An invalid session is `invalid_identifier` and an unparseable `--since` is `invalid_submission`, both exit 2 before anything is read. A wake file that can't be read is `persistence_error`, exit 3. A signal while polling is `wait_interrupted`, exit 1.
 
 **The bound.** A `watch` that was running before the change exits within 1 second of the command that made the change returning. It polls every 100 ms, which leaves room for a loaded machine. The harness's own reaction time after `watch` exits is outside this bound.
 

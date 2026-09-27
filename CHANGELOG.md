@@ -19,7 +19,8 @@ to `0.9.x`).
   no state, only "look again", so a lost or duplicate wake is harmless. A
   harness subscribes by watching that file, or with the new `koto request
   watch --session <id> --timeout-secs <n> [--since <cursor>]`, which exits 0
-  with `woke` and a `cursor` within 1 second of the change, or at its timeout.
+  with `woke` and a `cursor` within 1 second of the changing command
+  returning, or at its timeout.
   The request group's `cli_contract` moves to 1.2. `koto request wait
   --timeout-secs` remains the way to wait with no subscriber. Wakes are local
   to one machine.

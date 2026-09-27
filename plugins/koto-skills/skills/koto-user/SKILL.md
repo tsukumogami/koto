@@ -442,7 +442,7 @@ koto request resolve <request-id> <leg> --with-data '{"status":"success","summar
 | `koto request abandon <request-id> <leg> --rationale TEXT` | Stop waiting on one leg. The others stay open. |
 | `koto request abandon-request <request-id> --rationale TEXT` | Abandon every open leg and close the request. A separate verb, so an unset shell variable can't escalate a leg abandonment into the whole request's. |
 | `koto request close <request-id>` | Close, recording a disposition derived from the legs. Closing twice is rejected. |
-| `koto request watch --session ID --timeout-secs N [--since CURSOR]` | Block until that session's wake file changes, or the timeout passes. Exits 0 either way with `woke` and a `cursor`. |
+| `koto request watch --session ID --timeout-secs N [--since CURSOR]` | Block until that session's wake file changes, or the timeout passes. Exits 0 either way with `woke` and a `cursor`; a signal while polling is `wait_interrupted`, exit 1. |
 
 `wait` is where readiness lives, so `get` can stay exit-zero. A satisfied predicate exits 0; a deadline with the predicate still unsatisfied exits 1 (transient, retry); a predicate that could never hold — five resolved legs on a three-leg request — exits 2 before polling starts; one that stopped being reachable while you waited exits 2 with a distinct code. `--timeout-secs` is required, and `--interval-secs` defaults to 2 with a floor of 1.
 
@@ -455,12 +455,12 @@ When a leg resolves by any route (its worker's terminal tick, an explicit resolv
 If you are parked on a `request-leg` gate and your harness can react to a background command finishing, don't hold your turn open in `koto request wait`. Take a cursor, tick, then watch in the background:
 
 ```bash
-koto request watch --session <you> --timeout-secs 0        # prints a cursor; woke: false
+koto request watch --session <you> --timeout-secs 0        # prints a cursor
 koto next <you>                                             # blocked on the leg
 koto request watch --session <you> --timeout-secs 1800 --since <cursor>   # run in the background
 ```
 
-When the watch exits, tick again (`woke: true` means something changed; `woke: false` is the timeout, tick anyway), and start the next watch with the cursor it printed. A watch that was running when the leg changed exits within 1 second of that change. A harness can instead watch the wake file itself. With nothing listening, `koto request wait --timeout-secs` is still the way to wait. Wakes are local to one machine. The full contract is in `docs/guides/cli-usage.md`, "Leg wakes and request watch".
+When the watch exits, tick again (`woke: true` means something changed; `woke: false` is the timeout, tick anyway), and start the next watch with the cursor it printed. A watch that was running when the leg changed exits within 1 second of the command that changed it returning. A harness can instead watch the wake file itself. With nothing listening, `koto request wait --timeout-secs` is still the way to wait. Wakes are local to one machine. The full contract is in `docs/guides/cli-usage.md`, "Leg wakes and request watch".
 
 ### Learning your own leg
 

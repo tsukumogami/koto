@@ -413,11 +413,11 @@ koto request close    <request-id> [--issued-by ID]
 
 Output is JSON on stdout unconditionally — there is no format flag.
 
-`watch` is the one verb that doesn't print the request envelope. It blocks until the session's wake file (`~/.koto/wakes/<session>`) changes or `--timeout-secs` passes, exits 0 either way, and prints `{"session", "woke", "cursor", "cli_contract"}`; `woke` is `false` at the timeout. Pass `cursor` back as `--since`. A bad `--session` is `invalid_identifier`, a bad `--since` is `invalid_submission` (both exit 2), and an unreadable wake file is `persistence_error` (exit 3).
+`watch` is the one verb that doesn't print the request envelope. It blocks until the session's wake file (`~/.koto/wakes/<session>`) changes or `--timeout-secs` passes, exits 0 either way, and prints `{"session", "woke", "cursor", "cli_contract"}`; `woke` is `false` at the timeout. Pass `cursor` back as `--since`. A bad `--session` is `invalid_identifier`, a bad `--since` is `invalid_submission` (both exit 2), an unreadable wake file is `persistence_error` (exit 3), and a signal while polling is `wait_interrupted` (exit 1).
 
 ### The response envelope
 
-Every subcommand except `list` prints the same object:
+Every subcommand except `list` and `watch` prints the same object:
 
 ```json
 {
@@ -446,7 +446,7 @@ Every subcommand except `list` prints the same object:
     }
   },
   "written": true,
-  "cli_contract": {"major": 1, "minor": 1}
+  "cli_contract": {"major": 1, "minor": 2}
 }
 ```
 

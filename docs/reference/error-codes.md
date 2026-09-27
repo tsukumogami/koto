@@ -539,7 +539,7 @@ The code set is closed. A consumer that had to match on `message` to tell "this 
 | Code | Exit | Meaning |
 |------|:----:|---------|
 | `wait_timeout` | 1 | `wait` hit its `--timeout-secs` deadline with the predicate still unsatisfied. |
-| `wait_interrupted` | 1 | A signal arrived while `wait` was polling. |
+| `wait_interrupted` | 1 | A signal arrived while `wait` or `watch` was polling. |
 | `lock_contention` | 1 | The per-request write lock wasn't acquired within its five-second deadline. Retryable after backoff. |
 | `request_not_found` | 2 | No request record exists at that identifier. |
 | `leg_not_found` | 2 | The request has no leg by that name. |
