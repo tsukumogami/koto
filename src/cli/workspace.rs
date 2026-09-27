@@ -21,6 +21,7 @@
 //! from `src/session/validate.rs` which already implements the same
 //! character allowlist; the refactor is type-signature only.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -300,16 +301,150 @@ fn derive_terminal_status(
 /// `Vec::pop()`; BFS would be equally safe.
 fn collect_descendants(root: &str, sessions: &[SessionInfo]) -> Vec<String> {
     let mut descendants = Vec::new();
+    // A `parent_workflow` cycle (A -> B -> A) is constructible by removing a
+    // parent and re-creating it under its own former child; the visited set
+    // is what ends the walk instead of looping forever.
+    let mut visited: HashSet<String> = HashSet::from([root.to_string()]);
     let mut frontier: Vec<String> = vec![root.to_string()];
     while let Some(parent) = frontier.pop() {
         for s in sessions {
-            if s.parent_workflow.as_deref() == Some(parent.as_str()) {
+            if s.parent_workflow.as_deref() == Some(parent.as_str()) && visited.insert(s.id.clone())
+            {
                 descendants.push(s.id.clone());
                 frontier.push(s.id.clone());
             }
         }
     }
     descendants
+}
+
+// ===========================================================
+// Removing a parent's retained descendants with it
+// ===========================================================
+
+/// Remove `name`'s terminal descendants, if `name` can have children at all.
+///
+/// Called just before koto removes a session at its own terminal, so a child
+/// kept on disk (a failure terminal, or `--no-cleanup`) doesn't outlive the
+/// parent that koto removed (koto issue 240). A session can have children
+/// when its template declares a `materialize_children` hook, which is how
+/// koto recognises a coordinator, or when its own log holds a
+/// `ChildCompleted` from a child created with `koto init --parent`. A leaf
+/// session, which is most terminal ticks, never lists sessions.
+pub(crate) fn sweep_if_parent(
+    backend: &dyn SessionBackend,
+    name: &str,
+    compiled: &CompiledTemplate,
+) {
+    let declares_children = compiled
+        .states
+        .values()
+        .any(|s| s.materialize_children.is_some());
+    let had_children = declares_children
+        || backend.read_events(name).is_ok_and(|(_, events)| {
+            events
+                .iter()
+                .any(|e| matches!(e.payload, EventPayload::ChildCompleted { .. }))
+        });
+    if had_children {
+        sweep_terminal_descendants(backend, name);
+    }
+}
+
+/// Remove every descendant of `parent` that stands in a terminal state and
+/// has nothing live under it, deepest first. Returns how many were removed.
+///
+/// The removal is implicit -- nobody named these sessions -- so every rule
+/// fails toward keeping:
+///
+/// - a descendant that isn't terminal is live work: it is not removed and
+///   the walk does not descend into it;
+/// - a descendant is removed only after every session under it was;
+/// - a descendant whose log or template can't be read or classified is left
+///   alone with its subtree;
+/// - a `parent_workflow` cycle ends the walk (visited set, depth cap);
+/// - each session's status is read again just before its removal, narrowing
+///   the window in which a concurrent `koto rewind` could bring it back;
+/// - a failed removal warns and the walk continues; the caller removes the
+///   parent either way, and a leftover shows in `koto workflows --orphaned`.
+pub(crate) fn sweep_terminal_descendants(backend: &dyn SessionBackend, parent: &str) -> usize {
+    let sessions = match backend.list() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warning: could not list sessions to remove {parent}'s kept children: {e}");
+            return 0;
+        }
+    };
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for s in &sessions {
+        if let Some(p) = s.parent_workflow.as_deref() {
+            children.entry(p).or_default().push(s.id.as_str());
+        }
+    }
+    let mut visited: HashSet<String> = HashSet::from([parent.to_string()]);
+    let mut removed = 0;
+    sweep_children(backend, parent, &children, &mut visited, 0, &mut removed);
+    removed
+}
+
+/// Deeper than any real fan-out; only a corrupted header graph reaches it.
+const MAX_SWEEP_DEPTH: usize = 1000;
+
+/// Sweep the children of `id`. Returns true when every child was removed.
+fn sweep_children(
+    backend: &dyn SessionBackend,
+    id: &str,
+    children: &HashMap<&str, Vec<&str>>,
+    visited: &mut HashSet<String>,
+    depth: usize,
+    removed: &mut usize,
+) -> bool {
+    let Some(kids) = children.get(id) else {
+        return true;
+    };
+    if depth >= MAX_SWEEP_DEPTH {
+        return false;
+    }
+    let mut all_removed = true;
+    for &child in kids {
+        if !visited.insert(child.to_string()) {
+            // A cycle back into the part of the tree already walked.
+            all_removed = false;
+            continue;
+        }
+        if !is_terminal_session(backend, child) {
+            all_removed = false;
+            continue;
+        }
+        if !sweep_children(backend, child, children, visited, depth + 1, removed) {
+            all_removed = false;
+            continue;
+        }
+        // Read it again: something may have rewound it since the walk began.
+        if !is_terminal_session(backend, child) {
+            all_removed = false;
+            continue;
+        }
+        match backend.cleanup(child) {
+            Ok(()) => *removed += 1,
+            Err(e) => {
+                eprintln!("warning: could not remove kept session {child}: {e}");
+                all_removed = false;
+            }
+        }
+    }
+    all_removed
+}
+
+/// True only when `id` reads and classifies as terminal (completed or
+/// abandoned). Any read or classification error is "not terminal", so the
+/// sweep leaves the session alone.
+fn is_terminal_session(backend: &dyn SessionBackend, id: &str) -> bool {
+    let Ok((header, events)) = backend.read_events(id) else {
+        return false;
+    };
+    derive_terminal_status(&header, &events, &backend.session_dir(id))
+        .is_ok_and(|status| status.is_terminal())
 }
 
 /// Filter the candidate set to sessions whose terminal status is
@@ -428,6 +563,150 @@ fn confirm_force_prune() -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- sweep_if_parent: a leaf tick never lists sessions -----
+
+    /// A backend that delegates to a local one and counts `list()` calls.
+    struct CountingBackend {
+        inner: crate::session::local::LocalBackend,
+        lists: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SessionBackend for CountingBackend {
+        fn create(&self, id: &str) -> anyhow::Result<std::path::PathBuf> {
+            self.inner.create(id)
+        }
+        fn session_dir(&self, id: &str) -> std::path::PathBuf {
+            self.inner.session_dir(id)
+        }
+        fn exists(&self, id: &str) -> bool {
+            self.inner.exists(id)
+        }
+        fn cleanup(&self, id: &str) -> anyhow::Result<()> {
+            self.inner.cleanup(id)
+        }
+        fn list(&self) -> anyhow::Result<Vec<SessionInfo>> {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list()
+        }
+        fn append_header(&self, id: &str, header: &StateFileHeader) -> anyhow::Result<()> {
+            self.inner.append_header(id, header)
+        }
+        fn append_event(
+            &self,
+            id: &str,
+            payload: &EventPayload,
+            timestamp: &str,
+        ) -> anyhow::Result<()> {
+            self.inner.append_event(id, payload, timestamp)
+        }
+        fn init_state_file(
+            &self,
+            id: &str,
+            header: StateFileHeader,
+            initial_events: Vec<crate::engine::types::Event>,
+        ) -> Result<(), crate::session::SessionError> {
+            self.inner.init_state_file(id, header, initial_events)
+        }
+        fn read_events(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<(StateFileHeader, Vec<crate::engine::types::Event>)> {
+            self.inner.read_events(id)
+        }
+        fn read_header(&self, id: &str) -> anyhow::Result<StateFileHeader> {
+            self.inner.read_header(id)
+        }
+        fn ensure_pushed(&self, id: &str) -> Result<(), crate::session::SessionError> {
+            self.inner.ensure_pushed(id)
+        }
+        fn relocate(&self, from: &str, to: &str) -> anyhow::Result<()> {
+            self.inner.relocate(from, to)
+        }
+        fn lock_state_file(
+            &self,
+            id: &str,
+        ) -> Result<crate::session::SessionLock, crate::session::SessionError> {
+            self.inner.lock_state_file(id)
+        }
+    }
+
+    fn header(name: &str) -> StateFileHeader {
+        StateFileHeader {
+            schema_version: 1,
+            workflow: name.to_string(),
+            template_hash: "h".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: None,
+            template_source_dir: None,
+            template_source_file: None,
+            origin: None,
+            execution_dir: None,
+            session_id: String::new(),
+            intent: None,
+            template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
+        }
+    }
+
+    fn leaf_template() -> CompiledTemplate {
+        CompiledTemplate {
+            format_version: 1,
+            name: "leaf".to_string(),
+            version: "1.0".to_string(),
+            description: String::new(),
+            initial_state: "work".to_string(),
+            variables: Default::default(),
+            states: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_leaf_tick_does_not_list_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = CountingBackend {
+            inner: crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf()),
+            lists: Default::default(),
+        };
+        backend
+            .init_state_file("leaf", header("leaf"), vec![])
+            .unwrap();
+
+        sweep_if_parent(&backend, "leaf", &leaf_template());
+        assert_eq!(
+            backend.lists.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a session with no batch hook and no reported child is not swept"
+        );
+
+        // A session a child reported to is swept, which lists once.
+        backend
+            .append_event(
+                "leaf",
+                &EventPayload::ChildCompleted {
+                    child_name: "leaf.c".to_string(),
+                    task_name: "c".to_string(),
+                    outcome: crate::engine::types::TerminalOutcome::Success,
+                    final_state: "done".to_string(),
+                    result: None,
+                },
+                "2026-01-01T00:00:01Z",
+            )
+            .unwrap();
+        sweep_if_parent(&backend, "leaf", &leaf_template());
+        assert_eq!(backend.lists.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn collect_descendants_finds_direct_and_transitive_children() {

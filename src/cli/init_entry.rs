@@ -626,6 +626,9 @@ fn create(
         (old.current_state.clone(), old.terminal.clone(), result)
     });
     if replaced.is_some() {
+        // A new run under this name must not inherit the old run's kept
+        // children; they go with the session they belonged to.
+        super::workspace::sweep_terminal_descendants(backend, name);
         if let Err(e) = backend.cleanup(name) {
             refuse(
                 entry,

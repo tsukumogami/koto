@@ -2959,6 +2959,8 @@ fn finish_terminal_tick(
         return;
     }
     if !defer_for_parent && !defer_for_promotion {
+        // A parent koto removes takes its kept terminal descendants with it.
+        workspace::sweep_if_parent(backend, name, compiled);
         if let Err(e) = backend.cleanup(name) {
             eprintln!("warning: session cleanup failed: {}", e);
         }
