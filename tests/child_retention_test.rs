@@ -376,6 +376,22 @@ fn a_rewound_child_reports_no_stale_result() {
     let leaf = gate_child(&output, "p.leaf");
     assert_eq!(leaf["outcome"], "pending", "{output}");
     assert!(leaf.get("result").is_none(), "no stale result: {leaf}");
+
+    // Its next terminal records the new arrival's result, which is what the
+    // parent then reads.
+    run_ok(
+        dir,
+        &[
+            "next",
+            "p.leaf",
+            "--with-data",
+            r#"{"marker":"done"}"#,
+            "--no-cleanup",
+        ],
+    );
+    assert_eq!(child_completed(dir, "p").len(), 2);
+    let resp = run_ok(dir, &["next", "p"]);
+    assert_eq!(resp["action"], "done", "the new result is in: {resp}");
 }
 
 /// A kept child that fails, is rewound, and lands in a terminal again has no

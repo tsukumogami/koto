@@ -2549,10 +2549,15 @@ pub fn build_children_complete_output(
     // `has_result` is gated on the child-log append succeeding, but a
     // result can still be readable from the parent copy when that append
     // failed (`has_result == false`). Keying on the flag alone would block
-    // a converge FOREVER for a child whose child-log append failed yet
-    // whose parent copy is present. The merge above is exactly that
-    // dual-source dereference, so `entry.result` is the correct authority.
-    // (`has_result` remains useful only as a cheap scan hint upstream.)
+    // a converge FOREVER for a child gone from disk whose child-log append
+    // failed yet whose parent copy is present. The merge above is exactly
+    // that dual-source dereference, so `entry.result` is the correct
+    // authority. (`has_result` remains useful only as a cheap scan hint
+    // upstream.) A child still on disk with a readable, classified log is
+    // read only from that log: if its own append failed it stays
+    // outstanding until its next tick, which is still an arrival and
+    // records the result, rather than being answered by a parent copy that
+    // may belong to an earlier arrival.
     //
     // A `Skipped` child never blocks: it carries a synthesized
     // skipped-status default-summary result (above) and is excluded here.
@@ -4799,6 +4804,11 @@ mod tests {
     /// followed by valid lines and `read_events` returns `Err`, is
     /// covered by
     /// `mid_log_malformed_child_result_still_falls_back_to_parent_copy`.)
+    ///
+    /// The fixture's template path does not resolve, so the child's state
+    /// cannot be classified either; that is what keeps the parent's copy
+    /// eligible. A child whose log reads and whose template classifies is
+    /// read only from its own log (see the inlining loop).
     #[test]
     fn gate_skips_malformed_child_result_and_falls_back_to_parent_copy() {
         let tmp = TempDir::new().unwrap();
