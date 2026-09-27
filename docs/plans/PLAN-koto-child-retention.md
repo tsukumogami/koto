@@ -231,7 +231,9 @@ below (`removes_terminal_descendants_with_the_parent`,
 `a_leaf_tick_does_not_list_sessions`,
 `replace_terminal_removes_retained_children`,
 `prune_and_session_cleanup_reclaim_retained_sessions`,
-`a_retained_child_with_a_lost_notice_is_still_swept`).
+`a_retained_child_with_a_lost_notice_is_still_swept`,
+`skips_a_descendant_whose_template_is_missing`,
+`keeps_a_descendant_whose_leg_is_still_open`).
 
 **Acceptance Criteria**:
 - [ ] A parent reaching a success terminal without the flag removes its

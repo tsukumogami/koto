@@ -393,6 +393,9 @@ path removes a finished session. It:
 - **fails toward keeping.** Any error reading or classifying a session (a
   missing template, an unreadable log, a failed download on the cloud backend)
   leaves that session and its subtree alone.
+- **leaves a pending leg alone.** A descendant bound to a request leg that is
+  still open was kept because its promotion failed and waits for a retry;
+  removing it would leave the leg open for good, so the sweep skips it.
 - **re-checks just before removing.** Each session's terminal status is read
   again immediately before `backend.cleanup`, narrowing the window in which a
   concurrent `koto rewind` could bring it back.

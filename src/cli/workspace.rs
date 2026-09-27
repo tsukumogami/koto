@@ -362,6 +362,9 @@ pub(crate) fn sweep_if_parent(
 /// - a descendant is removed only after every session under it was;
 /// - a descendant whose log or template can't be read or classified is left
 ///   alone with its subtree;
+/// - a descendant bound to a request leg that is still open is left alone:
+///   it was kept because its leg promotion failed and must be retried, and
+///   removing it would leave the leg open for good;
 /// - a `parent_workflow` cycle ends the walk (visited set, depth cap);
 /// - each session's status is read again just before its removal, narrowing
 ///   the window in which a concurrent `koto rewind` could bring it back;
@@ -412,7 +415,7 @@ fn sweep_children(
             all_removed = false;
             continue;
         }
-        if !is_terminal_session(backend, child) {
+        if !is_terminal_session(backend, child) || awaits_leg_promotion(backend, child) {
             all_removed = false;
             continue;
         }
@@ -434,6 +437,37 @@ fn sweep_children(
         }
     }
     all_removed
+}
+
+/// True when `id` is bound to a request leg that is still open, so its
+/// terminal result has not reached the leg yet. A request that can't be read
+/// because of an I/O error counts as open (keep the session); a request that
+/// is gone, closed, or whose leg is resolved or abandoned does not.
+fn awaits_leg_promotion(backend: &dyn SessionBackend, id: &str) -> bool {
+    use crate::engine::request_store::{self, RequestStoreError, ValidatedRequestId};
+    use crate::engine::types::{LegDisposition, RequestState};
+
+    let Some(pointer) =
+        crate::engine::leg_pointer::read_pointer_best_effort(&backend.session_dir(id))
+    else {
+        return false;
+    };
+    let (Some(home), Ok(request_id)) = (
+        dirs::home_dir(),
+        ValidatedRequestId::new(&pointer.request_id),
+    ) else {
+        return false;
+    };
+    match request_store::read_view(&home.join(".koto"), &request_id) {
+        Ok(view) => {
+            view.request_state == RequestState::Open
+                && view
+                    .leg(&pointer.leg_name)
+                    .is_ok_and(|leg| leg.disposition == LegDisposition::Open)
+        }
+        Err(RequestStoreError::Io { .. }) => true,
+        Err(_) => false,
+    }
 }
 
 /// True only when `id` reads and classifies as terminal (completed or

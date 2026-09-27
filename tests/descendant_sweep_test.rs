@@ -334,9 +334,53 @@ fn skips_an_unclassifiable_descendant() {
     assert!(!exists(dir, "p.failed"));
 }
 
+/// A descendant whose compiled template file is gone can't be classified,
+/// so it is left alone too.
+#[test]
+fn skips_a_descendant_whose_template_is_missing() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    init_root(dir, "p", PARENT);
+    // Its own template, so deleting its compiled copy touches nothing else.
+    let t = write(
+        dir,
+        "orphan-child.md",
+        &CHILD.replace("sweep-child", "orphan-child"),
+    );
+    run_ok(
+        dir,
+        &["init", "p.orphan", "--template", &t, "--parent", "p"],
+    );
+    init_child(dir, "p.failed", "p");
+    fail(dir, "p.orphan");
+    fail(dir, "p.failed");
+    let init = std::fs::read_to_string(state_path(dir, "p.orphan"))
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|e| e["type"] == "workflow_initialized")
+        .unwrap();
+    let compiled = init["payload"]["template_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::remove_file(&compiled).unwrap();
+
+    finish_parent(dir, "p");
+    assert!(!exists(dir, "p"), "the parent is still removed");
+    assert!(
+        exists(dir, "p.orphan"),
+        "an unclassifiable descendant is left alone"
+    );
+    assert!(!exists(dir, "p.failed"));
+}
+
 #[test]
 fn stops_on_a_parent_cycle() {
     // a -> b -> a: remove `a`, then re-create it under its former child.
+    // The sweep is driven through the replace path: a terminal tick would not
+    // sweep here (`a` has no batch hook and no reported child), and the walk
+    // is the same function either way.
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     init_root(dir, "a", CHILD);
@@ -467,4 +511,80 @@ fn a_retained_child_with_a_lost_notice_is_still_swept() {
     );
     assert!(!exists(dir, "p"));
     assert!(!exists(dir, "p.leaf"), "swept via the parent's batch hook");
+}
+
+/// A descendant bound to a request leg that is still open (its promotion
+/// failed and awaits a retry) is left alone, so the leg can still resolve.
+#[test]
+fn keeps_a_descendant_whose_leg_is_still_open() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    init_root(dir, "p", PARENT);
+    init_child(dir, "p.bound", "p");
+    init_child(dir, "p.failed", "p");
+    koto::engine::claim::rewrite_header_atomically(&state_path(dir, "p.bound"), |mut h| {
+        h.needs_agent = Some(true);
+        h.role = Some("scrutineer".into());
+        h.coordinator_of_record = Some("p".into());
+        h
+    })
+    .unwrap();
+    let legs = r#"{"legs":[{"name":"reviewer-a","role":"security","template":"review","inputs":{"pr":1}}],"inputs":{"pr":1}}"#;
+    let envelope = run_ok(
+        dir,
+        &[
+            "request",
+            "create",
+            "--with-data",
+            legs,
+            "--requested-by",
+            "p",
+            "--coordinator-of-record",
+            "p",
+        ],
+    );
+    let id = envelope["request_id"].as_str().unwrap().to_string();
+    run_ok(
+        dir,
+        &["request", "bind", &id, "reviewer-a", "--child", "p.bound"],
+    );
+
+    // The promotion fails because the request store can't be written.
+    let request_dir = dir.join(".koto").join("requests").join(&id);
+    set_dir_writable(&request_dir, false);
+    run(
+        dir,
+        &[
+            "next",
+            "p.bound",
+            "--dispatch-epoch",
+            "0",
+            "--with-data",
+            r#"{"marker":"fail"}"#,
+        ],
+    );
+    set_dir_writable(&request_dir, true);
+    let leg = run_ok(dir, &["request", "get", &id])["legs"]["reviewer-a"].clone();
+    assert_eq!(
+        leg["disposition"], "open",
+        "the promotion did not land: {leg}"
+    );
+    fail(dir, "p.failed");
+
+    finish_parent(dir, "p");
+    assert!(!exists(dir, "p.failed"));
+    assert!(
+        exists(dir, "p.bound"),
+        "a child whose leg is still open is kept"
+    );
+}
+
+fn set_dir_writable(path: &Path, writable: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if writable { 0o755 } else { 0o555 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    for entry in std::fs::read_dir(path).unwrap().flatten() {
+        let file_mode = if writable { 0o644 } else { 0o444 };
+        let _ = std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(file_mode));
+    }
 }
