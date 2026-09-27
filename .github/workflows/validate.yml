@@ -242,7 +242,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install tsuku
-        uses: tsukumogami/tsuku/.github/actions/setup-tsuku@9ca44882568a29f9208493695b1f7bdb61e30fee  # installs tsuku 0.14.0
+        uses: tsukumogami/tsuku/.github/actions/setup-tsuku@49b2d262f54c6c06f3f1936e344c85a9bba4ab57  # installs tsuku 0.14.0
 
       - name: Verify koto recipe syntax (PR)
         if: github.event_name == 'pull_request'
