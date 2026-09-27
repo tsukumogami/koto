@@ -2056,8 +2056,8 @@ fn a_config_parse_error_never_prints_the_file_content() {
                 assert!(!se.contains("sk-"), "{}: {}", case, se);
                 // `config set/unset` edit the raw TOML, so a well-formed
                 // file with a wrong-shaped value doesn't stop them.
-                if kind == "shape" && name.starts_with("config set")
-                    || kind == "shape" && name.starts_with("config unset")
+                if kind == "shape"
+                    && (name.starts_with("config set") || name.starts_with("config unset"))
                 {
                     assert_eq!(out.status.code(), Some(0), "{}: {}", case, describe(&out));
                     continue;

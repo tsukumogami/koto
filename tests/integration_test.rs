@@ -2810,7 +2810,7 @@ fn session_cleanup_removes_session() {
         .output()
         .unwrap();
     let json: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
     assert_eq!(json.as_array().unwrap().len(), 1);
 
     // Cleanup
@@ -2825,7 +2825,7 @@ fn session_cleanup_removes_session() {
         .output()
         .unwrap();
     let json: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
     assert_eq!(
         json.as_array().unwrap().len(),
         0,
@@ -2896,7 +2896,7 @@ fn session_full_lifecycle() {
         .output()
         .unwrap();
     let json: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
     assert_eq!(json.as_array().unwrap().len(), 1);
 
     // Cleanup
@@ -2917,7 +2917,7 @@ fn session_full_lifecycle() {
         .output()
         .unwrap();
     let json: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
     assert_eq!(
         json.as_array().unwrap().len(),
         0,
@@ -3387,7 +3387,7 @@ fn context_list_returns_json_array() {
         .unwrap();
     assert!(output.status.success());
     let json: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
     assert_eq!(json, serde_json::json!([]));
 
     // Add some keys
@@ -3408,7 +3408,7 @@ fn context_list_returns_json_array() {
         .unwrap();
     assert!(output.status.success());
     let json: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
     assert_eq!(json, serde_json::json!(["alpha.md", "beta.md"]));
 }
 
@@ -3439,7 +3439,7 @@ fn context_list_with_prefix_filter() {
         .unwrap();
     assert!(output.status.success());
     let json: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
     assert_eq!(
         json,
         serde_json::json!(["research/r1/a.md", "research/r1/b.md"])
@@ -6981,7 +6981,7 @@ fn gate_contract_regression_existing_templates_compile() {
     let entries: Vec<_> = std::fs::read_dir(fixtures_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
         .collect();
     if entries.is_empty() {
         return;
@@ -9392,9 +9392,7 @@ fn skip_if_chain_template(num_states: usize) -> String {
     // States s0 through s(num_states-2) each have skip_if and transition to the next state.
     let last = num_states - 1;
 
-    let mut yaml = format!(
-        "---\nname: skip-if-limit-test\nversion: \"1.0\"\ninitial_state: s0\nvariables:\n  CHAIN_STOP:\n    description: \"When set, stops chaining\"\n    required: false\n    default: \"\"\nstates:\n"
-    );
+    let mut yaml = "---\nname: skip-if-limit-test\nversion: \"1.0\"\ninitial_state: s0\nvariables:\n  CHAIN_STOP:\n    description: \"When set, stops chaining\"\n    required: false\n    default: \"\"\nstates:\n".to_string();
 
     for i in 0..num_states {
         if i == last {

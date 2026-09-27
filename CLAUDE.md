@@ -34,7 +34,7 @@ cargo test
 cargo test --test integration_test
 
 # Lint
-cargo clippy && cargo fmt --check
+cargo clippy --all-targets -- -D warnings && cargo fmt --check
 ```
 
 ## Key Points
