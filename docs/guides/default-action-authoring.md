@@ -174,8 +174,11 @@ something the engine can run; leave it with the agent.
 
 `{{VARIABLE}}` references in `command` are substituted before the shell sees the string, in the
 shell-safe form: values pass an allowlist (letters, digits, `. _ - / : @ +` and spaces) that
-excludes every character able to start a command, expansion, or redirection. The allowlist blocks
-injection, not word splitting -- quote the reference when a value must stay a single argument:
+excludes every character able to start a command, expansion, or redirection. It guarantees the
+shell reads the value as a word, not that the program receiving the word reads it as literal text:
+a `+` or `.` handed to `grep -E` as a pattern is regex syntax there, and a `+` in a URL query
+string decodes as a space. The allowlist blocks injection, not word splitting -- quote the
+reference when a value must stay a single argument:
 
 ```yaml
 command: mytool --calendar "{{CALENDAR}}"

@@ -244,8 +244,9 @@ to `0.9.x`).
   through `--attach-live`, `--replace-terminal`, and a captured command output
   accept the same values. A context key still may not contain `+`. A session
   whose variables hold a `+` can't be advanced by an older koto, which
-  re-checks every recorded value on each tick, so a skill that passes such a
-  value should require this release.
+  re-checks every recorded value on each tick: its `koto next` exits with
+  `persistence_error` and `variable re-validation failed`. A skill that passes
+  such a value should require this release.
 
 - **The `children-complete` gate no longer shows a retried child's old result.**
   It reads only the result a child recorded for its current arrival, and it no

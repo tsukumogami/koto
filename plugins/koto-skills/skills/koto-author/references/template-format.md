@@ -1267,6 +1267,8 @@ For a template at `koto-templates/my-skill.md`, the preview goes at `koto-templa
 
 Koto performs `{{VARIABLE}}` substitution in `command` gate strings before passing them to `sh -c`. Values supplied via `--var` are validated at init time against an allowlist (letters, digits, `. _ - /`, `:`, `@`, `+`, and spaces); shell metacharacters such as `;` `|` `&` `$` `(` `)` `<` `>` `*` `?`, quotes, backticks, and newlines are rejected, so a value cannot inject a command.
 
+The allowlist guarantees the shell reads the value as a word, not that the program receiving the word reads it as literal text: a `+` or `.` handed to `grep -E` as a pattern is regex syntax there, and a `+` in a URL query string decodes as a space.
+
 The allowlist blocks command injection, not word splitting. A value may contain spaces (for structured names like a calendar title), and an unquoted interpolation splits it into multiple shell arguments. Quote the reference when a value must stay a single argument:
 
 ```yaml
