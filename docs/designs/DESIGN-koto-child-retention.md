@@ -97,6 +97,19 @@ the index, and discovery and caps skip indexed sessions so they never re-offer
 a finished one. Both assumptions held while every terminal session was removed
 on the tick it arrived; a session that stays and can come back strains them.
 
+**The rule covers the terminal that ended the reported runs.** It keys on
+`failure: true`, so it fixes the incident only if the failure terminals in use
+declare it. In shirabe at `9e9c287` they do: `/work-on`'s `done_blocked`, the
+terminal the three children in issue 240 ended at, is `failure: true`, as are
+`/execute`'s `done_blocked` (both templates), `/execute`-coordinated's
+`done_error`, and `/scope`'s and `/deliver`'s `done_error` and `done_refused`.
+The terminals that are not failures are the ones that should be removed or are
+roots that already pass `--no-cleanup`: `/work-on`'s `done`,
+`done_already_complete`, `validation_exit` and the skip marker
+`skipped_due_to_dep_failure`; `/scope`'s `done_re_evaluation`,
+`done_abandonment` and `done_cancelled`; and the success and pause terminals of
+`/execute` and `/deliver`. No failure-ending terminal is missing the flag.
+
 The requirements are in `docs/prds/PRD-koto-child-retention.md` and the
 originating report is koto issue 240; this document cites requirements by
 number.
@@ -120,9 +133,10 @@ number.
    (the PRD's Out of Scope) don't touch `finish_terminal_tick`, its call sites,
    the converge or `init_entry`'s replace path; this design must not touch the
    wake reader.
-8. **Keep the storage cost small and stated** (R14). One busy host's 160
-   sessions measured a median of 28 KB, a 90th percentile of 80 KB and a
-   maximum of 104 KB each.
+8. **Keep the storage cost small and stated** (R14). Measured on 2026-09-27
+   with `du -sk` over every session directory on one developer workstation
+   that runs koto-driven skill workflows daily: 160 sessions, median 28 KB,
+   90th percentile 80 KB, maximum 104 KB.
 
 ## Considered Options
 
@@ -471,6 +485,26 @@ koto next <name>            (advance loop or --to)
 without a session (dispatch, unit tests) omit it, as they omit `result`.
 
 No event types, file layouts or other command outputs change.
+
+### How a consumer reads a retained child
+
+Every read goes through a koto command against the child's session name
+(`<parent>.<task>` for a batch child); nothing reads under the koto home.
+
+| Need | Command |
+|------|---------|
+| Why it failed | `koto context get <child> failure_reason` |
+| Any other key the child wrote (a running record, a plan) | `koto context get <child> <key>`, or `koto context list <child>` to see which exist |
+| Its final state and result | `koto status <child>` (`is_terminal`, the state, and `result`) |
+| Every child's outcome and result at once, from the parent | the parent's `children-complete` gate output on `koto next <parent>` or `koto status <parent>`: per child `outcome`, `result`, `reason_source` |
+| Whether it is still on disk | `koto workflows` lists it; the terminal response's `retention` said so on the tick it ended |
+| Retry it | `retry_failed` evidence on the parent: `koto next <parent> --with-data '{"retry_failed": {"children": ["<task>"]}}'` |
+| Rewind it one step | `koto rewind <child>` |
+
+A coordinator's reconcile step reads the gate output for the batch and then
+`koto context get` for the children it needs detail on. `/execute`'s
+`retry_failed` needs nothing new: the child it names is on disk, so validation
+finds it and the retry appends `Rewound` to its log.
 
 ### Test surface
 
