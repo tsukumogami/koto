@@ -160,8 +160,8 @@ pub struct RespawnRequest {
 /// concrete substrate implementation (Claude Code agent-membership
 /// poke, bunki BK2 hosted respawn) ships. Logs the respawn intent
 /// and returns Ok — the audit event on the requester's log is the
-/// source of truth for "respawn was emitted", same discipline as
-/// [`crate::engine::wake::LoggingWaker`].
+/// source of truth for "respawn was emitted". Wakes, by contrast, are
+/// delivered, through [`crate::engine::wake::SignalWaker`].
 pub struct LoggingRespawner;
 
 impl SubstrateRespawner for LoggingRespawner {

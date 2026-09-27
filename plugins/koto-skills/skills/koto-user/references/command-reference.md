@@ -390,7 +390,7 @@ The key is absent when the session isn't bound to a leg. It never carries `dispa
 
 ## koto request
 
-Eleven subcommands over the request store — the durable record of what a coordinator asked for and what came back. See the skill's "Requests and legs" section for when to use it; this section is the flag surface.
+Twelve subcommands over the request store — the durable record of what a coordinator asked for and what came back. See the skill's "Requests and legs" section for when to use it; this section is the flag surface.
 
 ```
 koto request create   [--with-data '{"legs":[…],"inputs":{…}}' | --role R --template T --inputs J]
@@ -400,6 +400,7 @@ koto request attach   <request-id> <leg> --session SESSION_ID [--issued-by ID]
 koto request get      <request-id>
 koto request wait     <request-id> (--leg NAME | --all-legs | --closed | --resolved-count N)
                       --timeout-secs N [--interval-secs N]
+koto request watch    --session SESSION_ID --timeout-secs N [--since CURSOR]
 koto request list     [--requested-by ID | --coordinator-of-record ID] [--state open|closed] [--unresolved-legs]
 koto request progress <request-id> <leg> --with-data J [--dispatch-epoch N] [--issued-by ID]
 koto request resolve  <request-id> <leg> --with-data J [--dispatch-epoch N] [--issued-by ID]
@@ -408,13 +409,15 @@ koto request abandon-request <request-id> --rationale TEXT [--issued-by ID]
 koto request close    <request-id> [--issued-by ID]
 ```
 
-`--cli-contract MAJOR.MINOR` is accepted on every subcommand and validated before any I/O, so a mismatch has no side effect. This build serves `1.1`; an older minor is served, a newer minor or a different major is refused.
+`--cli-contract MAJOR.MINOR` is accepted on every subcommand and validated before any I/O, so a mismatch has no side effect. This build serves `1.2`; an older minor is served, a newer minor or a different major is refused.
 
 Output is JSON on stdout unconditionally — there is no format flag.
 
+`watch`, like `list`, doesn't print the request envelope. It reads the session's wake file (`~/.koto/wakes/<session>`, described in `docs/guides/cli-usage.md`, "Leg wakes and request watch"): it blocks until the file changes or `--timeout-secs` passes, exits 0 either way, and prints `{"session", "woke", "cursor", "cli_contract"}`; `woke` is `false` at the timeout. Pass `cursor` back as `--since`. A bad `--session` is `invalid_identifier`, a bad `--since` is `invalid_submission` (both exit 2), an unreadable wake file is `persistence_error` (exit 3), and a signal while polling is `wait_interrupted` (exit 1).
+
 ### The response envelope
 
-Every subcommand except `list` prints the same object:
+Every subcommand except `list` and `watch` prints the same object:
 
 ```json
 {
@@ -443,7 +446,7 @@ Every subcommand except `list` prints the same object:
     }
   },
   "written": true,
-  "cli_contract": {"major": 1, "minor": 1}
+  "cli_contract": {"major": 1, "minor": 2}
 }
 ```
 

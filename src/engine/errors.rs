@@ -10,6 +10,12 @@ pub enum EngineError {
     #[error("state not found: {0}")]
     StateNotFound(String),
 
+    /// A [`crate::engine::wake::SignalWaker`] could not ring a wake file.
+    /// Wake callers treat it as a soft failure: the wake carries no
+    /// state, so a lost one costs latency only.
+    #[error("wake delivery failed: {0}")]
+    WakeDeliveryFailed(String),
+
     #[error("empty event log")]
     EmptyLog,
 

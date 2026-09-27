@@ -3645,8 +3645,8 @@ fn handle_next(
         // events whose corresponding child reached terminal AND has no
         // matching RequesterWoken yet; emits a RequesterWoken event
         // covering each batch, runs the 3-point fsync sequence, invokes
-        // the substrate-wake primitive (stubbed via LoggingWaker until
-        // a concrete substrate ships), and unlinks the child's claim
+        // the substrate-wake primitive (a SignalWaker ringing the
+        // requester's wake file), and unlinks the child's claim
         // sidecar. The pass is O(open-dispatches), not O(workspace).
         //
         // Order: cursor GC → compact-recovery → maybe-compact →
@@ -3662,7 +3662,9 @@ fn handle_next(
             let sessions_dir = koto_root.join("sessions");
             let stale_dispatch_timeout =
                 std::time::Duration::from_secs(request_store_cfg.stale_dispatch_timeout_seconds);
-            let waker = crate::engine::wake::LoggingWaker;
+            let waker = crate::engine::wake::SignalWaker {
+                koto_root: koto_root.clone(),
+            };
             match crate::engine::wake::wake_candidates_pass(
                 &koto_root,
                 &sessions_dir,

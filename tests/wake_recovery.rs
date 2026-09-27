@@ -794,3 +794,43 @@ fn candidate_skipped_when_requested_by_missing() {
 fn _link_assignment_claim(c: AssignmentClaim) -> String {
     c.coord_id
 }
+
+// ----- The pass delivers through the leg wake's own signal -----
+
+/// `handle_next` passes a `SignalWaker`, so a `RequesterWoken` rings the
+/// requester's wake file: the same file a request-leg change rings.
+#[test]
+fn a_signal_waker_rings_the_requesters_wake_file() {
+    use koto::engine::types::ValidatedSessionId;
+    use koto::engine::wake::SignalWaker;
+    use koto::engine::wake_signal::{read_cursor, WakeCursor};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    sessions_dir(root);
+    let coord_path = write_session_with_header(root, "coord", None);
+    write_session_with_header(root, "coord.child-a", Some("coord"));
+    let dispatched_ts = format_rfc3339_millis(now_minus(60));
+    append_child_dispatched_event(&coord_path, "coord.child-a", "coord", &dispatched_ts);
+    append_terminal_index_for(root, "coord.child-a");
+
+    let coord = ValidatedSessionId::new("coord").unwrap();
+    assert_eq!(read_cursor(root, &coord).unwrap(), WakeCursor::empty());
+
+    let waker = SignalWaker {
+        koto_root: root.to_path_buf(),
+    };
+    let outcome = wake_candidates_pass(
+        root,
+        &sessions_dir(root),
+        &coord_path,
+        &waker,
+        Duration::from_secs(600),
+        SystemTime::now(),
+    )
+    .unwrap();
+
+    assert_eq!(outcome.events_emitted, 1);
+    assert_eq!(outcome.wakes_invoked, 1);
+    assert_ne!(read_cursor(root, &coord).unwrap(), WakeCursor::empty());
+}

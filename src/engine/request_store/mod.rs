@@ -567,19 +567,8 @@ fn lock_path(root: &Path, id: &ValidatedRequestId) -> PathBuf {
 /// Create a directory with mode 0700, rather than relying on the home
 /// directory's mode having been set correctly once.
 fn create_dir_0700(path: &Path) -> Result<(), RequestStoreError> {
-    reject_if_symlink(path)?;
-    if path.is_dir() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(path)
-        .map_err(|e| RequestStoreError::io(format!("creating {}", path.display()), e))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| RequestStoreError::io(format!("chmod 0700 {}", path.display()), e))?;
-    }
-    Ok(())
+    crate::engine::atomic_fs::create_private_dir(path)
+        .map_err(|e| RequestStoreError::io(format!("creating {}", path.display()), e))
 }
 
 /// Refuse to read or write through a symlink.
@@ -590,13 +579,8 @@ fn create_dir_0700(path: &Path) -> Result<(), RequestStoreError> {
 /// symlinked root. The lock file gets the same treatment via
 /// `O_NOFOLLOW`.
 fn reject_if_symlink(path: &Path) -> Result<(), RequestStoreError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(md) if md.file_type().is_symlink() => Err(RequestStoreError::Other(format!(
-            "refusing to follow the symlink at {}",
-            path.display()
-        ))),
-        _ => Ok(()),
-    }
+    crate::engine::atomic_fs::reject_symlink(path)
+        .map_err(|e| RequestStoreError::Other(e.to_string()))
 }
 
 /// Best-effort fsync of a directory so a fresh entry survives a crash.
@@ -1319,15 +1303,47 @@ where
     F: FnOnce(&RequestView) -> Result<(), RequestStoreError>,
 {
     let timestamp = timestamp.to_string();
-    let result = append_under_lock(root, request_id, LOCK_WAIT_TIMEOUT, None, move |view| {
-        precondition(view)?;
-        Ok(Some(PendingAppend {
-            payload,
-            timestamp,
-            hash: None,
-        }))
-    })?;
+    let wake = Wake::for_payload(&payload);
+    let result = append_under_lock(
+        root,
+        request_id,
+        LOCK_WAIT_TIMEOUT,
+        None,
+        wake,
+        move |view| {
+            precondition(view)?;
+            Ok(Some(PendingAppend {
+                payload,
+                timestamp,
+                hash: None,
+            }))
+        },
+    )?;
     Ok(result.revision)
+}
+
+/// Whether a successful append rings the request's principals.
+///
+/// Only a write that can change what a `request-leg` gate reads rings: a
+/// leg result, a leg abandonment, a request close. Each typed writer
+/// passes the value for the event it writes; `validate_and_append`, which
+/// takes a caller's payload, derives it with [`Wake::for_payload`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Wake {
+    Ring,
+    Quiet,
+}
+
+impl Wake {
+    /// The setting a caller-built payload implies.
+    fn for_payload(payload: &EventPayload) -> Self {
+        match payload {
+            EventPayload::RequestLegResult { .. }
+            | EventPayload::RequestLegAbandoned { .. }
+            | EventPayload::RequestClosed { .. } => Wake::Ring,
+            _ => Wake::Quiet,
+        }
+    }
 }
 
 /// The lock-held body every mutating entry point funnels through.
@@ -1337,13 +1353,41 @@ where
 /// inside the lock rather than accepting it from outside is what lets
 /// `close` compute its disposition from state that cannot change under
 /// it.
+///
+/// With [`Wake::Ring`], every successful return (a write, a retry the
+/// idempotency probe recognised, or a no-op) rings the request's
+/// requester and coordinator of record after the lock is released. A
+/// retry rings again because the attempt it repeats may have stopped
+/// between its write and its ring. A ring never fails the call; see
+/// [`crate::engine::wake_signal::ring_principals`].
 fn append_under_lock<F>(
     root: &Path,
     request_id: &ValidatedRequestId,
     lock_timeout: Duration,
     probe: Option<IdempotencyProbe>,
+    wake: Wake,
     decide: F,
 ) -> Result<AppendResult, RequestStoreError>
+where
+    F: FnOnce(&RequestView) -> Result<Option<PendingAppend>, RequestStoreError>,
+{
+    let (result, principals) = append_locked(root, request_id, lock_timeout, probe, decide)?;
+    if wake == Wake::Ring {
+        crate::engine::wake_signal::ring_principals(root, &principals.0, &principals.1);
+    }
+    Ok(result)
+}
+
+/// [`append_under_lock`] without the ring: returns the result and the
+/// header's `(requested_by, coordinator_of_record)`, with the lock
+/// already released.
+fn append_locked<F>(
+    root: &Path,
+    request_id: &ValidatedRequestId,
+    lock_timeout: Duration,
+    probe: Option<IdempotencyProbe>,
+    decide: F,
+) -> Result<(AppendResult, (String, String)), RequestStoreError>
 where
     F: FnOnce(&RequestView) -> Result<Option<PendingAppend>, RequestStoreError>,
 {
@@ -1363,23 +1407,33 @@ where
     repair_torn_tail(&path)?;
 
     let view = read_view_at(&path, request_id)?;
+    let principals = (
+        view.header.requested_by.clone(),
+        view.header.coordinator_of_record.clone(),
+    );
 
     // Retry recognition comes before the precondition: see
     // [`IdempotencyProbe`].
     if let Some(probe) = &probe {
         if find_by_hash(&path, &probe.hash, &probe.payload, request_id)?.is_some() {
-            return Ok(AppendResult {
-                revision: view.revision,
-                written: false,
-            });
+            return Ok((
+                AppendResult {
+                    revision: view.revision,
+                    written: false,
+                },
+                principals,
+            ));
         }
     }
 
     let Some(pending) = decide(&view)? else {
-        return Ok(AppendResult {
-            revision: view.revision,
-            written: false,
-        });
+        return Ok((
+            AppendResult {
+                revision: view.revision,
+                written: false,
+            },
+            principals,
+        ));
     };
 
     // A request log's first line is a RequestHeader, not a session header,
@@ -1397,10 +1451,13 @@ where
         AppendOutcome::Written { seq } => seq,
         AppendOutcome::Idempotent { seq } => seq,
     };
-    Ok(AppendResult {
-        revision,
-        written: matches!(outcome, AppendOutcome::Written { .. }),
-    })
+    Ok((
+        AppendResult {
+            revision,
+            written: matches!(outcome, AppendOutcome::Written { .. }),
+        },
+        principals,
+    ))
 }
 
 /// Look for a prior event carrying `hash`.
@@ -1480,61 +1537,68 @@ pub fn bind_leg(
     bind: &BindLeg,
 ) -> Result<AppendResult, RequestStoreError> {
     validate_leg_name(&bind.leg_name)?;
-    append_under_lock(root, request_id, LOCK_WAIT_TIMEOUT, None, |view| {
-        require_open(view)?;
-        let leg = view.leg(&bind.leg_name)?;
-        reject_closed_leg(view, leg)?;
-        if let Some(bound) = &leg.bound_child {
-            if bound == &bind.child_session_id {
-                // Same child, same epoch: the caller asked for a state
-                // that already holds.
-                if leg.bound_epoch == bind.dispatch_epoch {
-                    return Ok(None);
+    append_under_lock(
+        root,
+        request_id,
+        LOCK_WAIT_TIMEOUT,
+        None,
+        Wake::Quiet,
+        |view| {
+            require_open(view)?;
+            let leg = view.leg(&bind.leg_name)?;
+            reject_closed_leg(view, leg)?;
+            if let Some(bound) = &leg.bound_child {
+                if bound == &bind.child_session_id {
+                    // Same child, same epoch: the caller asked for a state
+                    // that already holds.
+                    if leg.bound_epoch == bind.dispatch_epoch {
+                        return Ok(None);
+                    }
+                    // Same child, DIFFERENT epoch: a redelegation bumped the
+                    // child's epoch in place on the same session id, so the
+                    // recorded epoch is now stale. Re-record it.
+                    //
+                    // Treating this as a no-op would invert the fence: the
+                    // freshly-dispatched agent presents the new epoch and is
+                    // rejected forever, while the displaced agent still
+                    // holding the old one is admitted — the exact reversal
+                    // the fence exists to prevent, with no recovery path.
+                    return Ok(Some(PendingAppend {
+                        payload: EventPayload::RequestLegBound {
+                            request_id: view.header.request_id.clone(),
+                            leg_name: bind.leg_name.clone(),
+                            child_session_id: bind.child_session_id.clone(),
+                            dispatch_epoch: bind.dispatch_epoch,
+                            issued_by: bind.issued_by.clone(),
+                            attach: None,
+                            template: None,
+                        },
+                        timestamp: bind.timestamp.clone(),
+                        hash: None,
+                    }));
                 }
-                // Same child, DIFFERENT epoch: a redelegation bumped the
-                // child's epoch in place on the same session id, so the
-                // recorded epoch is now stale. Re-record it.
-                //
-                // Treating this as a no-op would invert the fence: the
-                // freshly-dispatched agent presents the new epoch and is
-                // rejected forever, while the displaced agent still
-                // holding the old one is admitted — the exact reversal
-                // the fence exists to prevent, with no recovery path.
-                return Ok(Some(PendingAppend {
-                    payload: EventPayload::RequestLegBound {
-                        request_id: view.header.request_id.clone(),
-                        leg_name: bind.leg_name.clone(),
-                        child_session_id: bind.child_session_id.clone(),
-                        dispatch_epoch: bind.dispatch_epoch,
-                        issued_by: bind.issued_by.clone(),
-                        attach: None,
-                        template: None,
-                    },
-                    timestamp: bind.timestamp.clone(),
-                    hash: None,
-                }));
+                return Err(RequestStoreError::LegBoundToDifferentChild {
+                    request_id: view.header.request_id.clone(),
+                    leg_name: bind.leg_name.clone(),
+                    bound_child: bound.clone(),
+                    requested_child: bind.child_session_id.clone(),
+                });
             }
-            return Err(RequestStoreError::LegBoundToDifferentChild {
-                request_id: view.header.request_id.clone(),
-                leg_name: bind.leg_name.clone(),
-                bound_child: bound.clone(),
-                requested_child: bind.child_session_id.clone(),
-            });
-        }
-        Ok(Some(PendingAppend {
-            payload: EventPayload::RequestLegBound {
-                request_id: view.header.request_id.clone(),
-                leg_name: bind.leg_name.clone(),
-                child_session_id: bind.child_session_id.clone(),
-                dispatch_epoch: bind.dispatch_epoch,
-                issued_by: bind.issued_by.clone(),
-                attach: None,
-                template: None,
-            },
-            timestamp: bind.timestamp.clone(),
-            hash: None,
-        }))
-    })
+            Ok(Some(PendingAppend {
+                payload: EventPayload::RequestLegBound {
+                    request_id: view.header.request_id.clone(),
+                    leg_name: bind.leg_name.clone(),
+                    child_session_id: bind.child_session_id.clone(),
+                    dispatch_epoch: bind.dispatch_epoch,
+                    issued_by: bind.issued_by.clone(),
+                    attach: None,
+                    template: None,
+                },
+                timestamp: bind.timestamp.clone(),
+                hash: None,
+            }))
+        },
+    )
 }
 
 /// A mid-flight progress append.
@@ -1572,40 +1636,47 @@ pub fn append_progress(
         payload: payload.clone(),
     };
 
-    append_under_lock(root, request_id, LOCK_WAIT_TIMEOUT, Some(probe), |view| {
-        require_open(view)?;
-        let leg = view.leg(&progress.leg_name)?;
-        reject_self_attached(view, leg, "progress")?;
-        reject_closed_leg(view, leg)?;
+    append_under_lock(
+        root,
+        request_id,
+        LOCK_WAIT_TIMEOUT,
+        Some(probe),
+        Wake::Quiet,
+        |view| {
+            require_open(view)?;
+            let leg = view.leg(&progress.leg_name)?;
+            reject_self_attached(view, leg, "progress")?;
+            reject_closed_leg(view, leg)?;
 
-        // Both bounds are checked here, inside the lock, so neither
-        // can be raced past by two writers reading the same count.
-        if leg.progress.len() >= bounds.progress_appends_per_leg {
-            return Err(RequestStoreError::BoundExceeded {
-                dimension: "progress_appends_per_leg",
-                limit: bounds.progress_appends_per_leg,
-                observed: leg.progress.len() + 1,
-            });
-        }
-        let content = serde_json::to_value(&progress.content)
-            .map_err(|e| RequestStoreError::Other(e.to_string()))?;
-        let encoded =
-            serde_json::to_string(&content).map_err(|e| RequestStoreError::Other(e.to_string()))?;
-        if encoded.len() > MAX_APPEND_BYTES {
-            return Err(RequestStoreError::BoundExceeded {
-                dimension: "append_bytes",
-                limit: MAX_APPEND_BYTES,
-                observed: encoded.len(),
-            });
-        }
-        guard_json_payload("progress_content_bytes", &content)?;
+            // Both bounds are checked here, inside the lock, so neither
+            // can be raced past by two writers reading the same count.
+            if leg.progress.len() >= bounds.progress_appends_per_leg {
+                return Err(RequestStoreError::BoundExceeded {
+                    dimension: "progress_appends_per_leg",
+                    limit: bounds.progress_appends_per_leg,
+                    observed: leg.progress.len() + 1,
+                });
+            }
+            let content = serde_json::to_value(&progress.content)
+                .map_err(|e| RequestStoreError::Other(e.to_string()))?;
+            let encoded = serde_json::to_string(&content)
+                .map_err(|e| RequestStoreError::Other(e.to_string()))?;
+            if encoded.len() > MAX_APPEND_BYTES {
+                return Err(RequestStoreError::BoundExceeded {
+                    dimension: "append_bytes",
+                    limit: MAX_APPEND_BYTES,
+                    observed: encoded.len(),
+                });
+            }
+            guard_json_payload("progress_content_bytes", &content)?;
 
-        Ok(Some(PendingAppend {
-            payload,
-            timestamp: progress.timestamp.clone(),
-            hash: Some(hash),
-        }))
-    })
+            Ok(Some(PendingAppend {
+                payload,
+                timestamp: progress.timestamp.clone(),
+                hash: Some(hash),
+            }))
+        },
+    )
 }
 
 /// A leg's terminal answer.
@@ -1666,56 +1737,63 @@ pub fn record_result(
         payload: payload.clone(),
     };
 
-    append_under_lock(root, request_id, LOCK_WAIT_TIMEOUT, Some(probe), |view| {
-        require_open(view)?;
-        let leg = view.leg(&result.leg_name)?;
-        // A self-attached leg's result arrives only by promotion from
-        // its own session's terminal tick.
-        if result.source == LegResultSource::Explicit {
-            reject_self_attached(view, leg, "resolve")?;
-        }
-        match leg.disposition {
-            LegDisposition::Resolved => {
-                return Err(RequestStoreError::LegAlreadyResolved {
+    append_under_lock(
+        root,
+        request_id,
+        LOCK_WAIT_TIMEOUT,
+        Some(probe),
+        Wake::Ring,
+        |view| {
+            require_open(view)?;
+            let leg = view.leg(&result.leg_name)?;
+            // A self-attached leg's result arrives only by promotion from
+            // its own session's terminal tick.
+            if result.source == LegResultSource::Explicit {
+                reject_self_attached(view, leg, "resolve")?;
+            }
+            match leg.disposition {
+                LegDisposition::Resolved => {
+                    return Err(RequestStoreError::LegAlreadyResolved {
+                        request_id: view.header.request_id.clone(),
+                        leg_name: result.leg_name.clone(),
+                    })
+                }
+                LegDisposition::Abandoned => {
+                    return Err(RequestStoreError::LegAbandoned {
+                        request_id: view.header.request_id.clone(),
+                        leg_name: result.leg_name.clone(),
+                    })
+                }
+                LegDisposition::Open => {}
+            }
+            // An explicit resolve is for legs nobody else is working on. A
+            // bound leg resolves by promotion from its child's terminal
+            // tick, so accepting one here would let a coordinator record an
+            // answer on a delegate's behalf and permanently block the real
+            // one — the promotion would then hit a leg that already has a
+            // result and be dropped.
+            //
+            // This check lives inside the lock rather than as a pre-read in
+            // the caller because the discriminator is a leg's binding, and a
+            // bind landing between an unlocked read and this append would
+            // slip through.
+            if result.source == LegResultSource::Explicit && leg.bound_child.is_some() {
+                return Err(RequestStoreError::LegBoundToChild {
                     request_id: view.header.request_id.clone(),
                     leg_name: result.leg_name.clone(),
-                })
+                    child_session_id: leg
+                        .bound_child
+                        .clone()
+                        .expect("bound_child is Some in this arm"),
+                });
             }
-            LegDisposition::Abandoned => {
-                return Err(RequestStoreError::LegAbandoned {
-                    request_id: view.header.request_id.clone(),
-                    leg_name: result.leg_name.clone(),
-                })
-            }
-            LegDisposition::Open => {}
-        }
-        // An explicit resolve is for legs nobody else is working on. A
-        // bound leg resolves by promotion from its child's terminal
-        // tick, so accepting one here would let a coordinator record an
-        // answer on a delegate's behalf and permanently block the real
-        // one — the promotion would then hit a leg that already has a
-        // result and be dropped.
-        //
-        // This check lives inside the lock rather than as a pre-read in
-        // the caller because the discriminator is a leg's binding, and a
-        // bind landing between an unlocked read and this append would
-        // slip through.
-        if result.source == LegResultSource::Explicit && leg.bound_child.is_some() {
-            return Err(RequestStoreError::LegBoundToChild {
-                request_id: view.header.request_id.clone(),
-                leg_name: result.leg_name.clone(),
-                child_session_id: leg
-                    .bound_child
-                    .clone()
-                    .expect("bound_child is Some in this arm"),
-            });
-        }
-        Ok(Some(PendingAppend {
-            payload,
-            timestamp: result.timestamp.clone(),
-            hash: Some(hash),
-        }))
-    })
+            Ok(Some(PendingAppend {
+                payload,
+                timestamp: result.timestamp.clone(),
+                hash: Some(hash),
+            }))
+        },
+    )
 }
 
 /// Stop waiting on one leg.
@@ -1768,33 +1846,40 @@ fn abandon_leg_inner(
 ) -> Result<AppendResult, RequestStoreError> {
     validate_leg_name(&abandon.leg_name)?;
     let rationale = sanitize_rationale(&abandon.rationale)?;
-    append_under_lock(root, request_id, LOCK_WAIT_TIMEOUT, None, |view| {
-        require_open(view)?;
-        let leg = view.leg(&abandon.leg_name)?;
-        if !request_scoped {
-            reject_self_attached(view, leg, "abandon")?;
-        }
-        match leg.disposition {
-            LegDisposition::Abandoned => return Ok(None),
-            LegDisposition::Resolved => {
-                return Err(RequestStoreError::LegAlreadyResolved {
+    append_under_lock(
+        root,
+        request_id,
+        LOCK_WAIT_TIMEOUT,
+        None,
+        Wake::Ring,
+        |view| {
+            require_open(view)?;
+            let leg = view.leg(&abandon.leg_name)?;
+            if !request_scoped {
+                reject_self_attached(view, leg, "abandon")?;
+            }
+            match leg.disposition {
+                LegDisposition::Abandoned => return Ok(None),
+                LegDisposition::Resolved => {
+                    return Err(RequestStoreError::LegAlreadyResolved {
+                        request_id: view.header.request_id.clone(),
+                        leg_name: abandon.leg_name.clone(),
+                    })
+                }
+                LegDisposition::Open => {}
+            }
+            Ok(Some(PendingAppend {
+                payload: EventPayload::RequestLegAbandoned {
                     request_id: view.header.request_id.clone(),
                     leg_name: abandon.leg_name.clone(),
-                })
-            }
-            LegDisposition::Open => {}
-        }
-        Ok(Some(PendingAppend {
-            payload: EventPayload::RequestLegAbandoned {
-                request_id: view.header.request_id.clone(),
-                leg_name: abandon.leg_name.clone(),
-                rationale: rationale.clone(),
-                issued_by: abandon.issued_by.clone(),
-            },
-            timestamp: abandon.timestamp.clone(),
-            hash: None,
-        }))
-    })
+                    rationale: rationale.clone(),
+                    issued_by: abandon.issued_by.clone(),
+                },
+                timestamp: abandon.timestamp.clone(),
+                hash: None,
+            }))
+        },
+    )
 }
 
 /// Close a request.
@@ -1819,25 +1904,32 @@ pub fn close_request(
     request_id: &ValidatedRequestId,
     close: &CloseRequest,
 ) -> Result<AppendResult, RequestStoreError> {
-    append_under_lock(root, request_id, LOCK_WAIT_TIMEOUT, None, |view| {
-        if view.request_state == RequestState::Closed {
-            return Err(RequestStoreError::RequestClosed {
-                request_id: view.header.request_id.clone(),
-            });
-        }
-        let disposition = close
-            .disposition
-            .unwrap_or_else(|| derive_disposition(view));
-        Ok(Some(PendingAppend {
-            payload: EventPayload::RequestClosed {
-                request_id: view.header.request_id.clone(),
-                disposition,
-                issued_by: close.issued_by.clone(),
-            },
-            timestamp: close.timestamp.clone(),
-            hash: None,
-        }))
-    })
+    append_under_lock(
+        root,
+        request_id,
+        LOCK_WAIT_TIMEOUT,
+        None,
+        Wake::Ring,
+        |view| {
+            if view.request_state == RequestState::Closed {
+                return Err(RequestStoreError::RequestClosed {
+                    request_id: view.header.request_id.clone(),
+                });
+            }
+            let disposition = close
+                .disposition
+                .unwrap_or_else(|| derive_disposition(view));
+            Ok(Some(PendingAppend {
+                payload: EventPayload::RequestClosed {
+                    request_id: view.header.request_id.clone(),
+                    disposition,
+                    issued_by: close.issued_by.clone(),
+                },
+                timestamp: close.timestamp.clone(),
+                hash: None,
+            }))
+        },
+    )
 }
 
 /// Derive a close disposition from the legs.
@@ -1897,23 +1989,30 @@ pub fn record_refusal(
         hash: hash.clone(),
         payload: payload.clone(),
     };
-    append_under_lock(root, request_id, LOCK_WAIT_TIMEOUT, Some(probe), |view| {
-        require_open(view)?;
-        let leg = view.leg(&refusal.leg_name)?;
-        reject_closed_leg(view, leg)?;
-        if let Some(bound) = &leg.bound_child {
-            return Err(RequestStoreError::LegBoundToChild {
-                request_id: view.header.request_id.clone(),
-                leg_name: refusal.leg_name.clone(),
-                child_session_id: bound.clone(),
-            });
-        }
-        Ok(Some(PendingAppend {
-            payload,
-            timestamp: refusal.timestamp.clone(),
-            hash: Some(hash),
-        }))
-    })
+    append_under_lock(
+        root,
+        request_id,
+        LOCK_WAIT_TIMEOUT,
+        Some(probe),
+        Wake::Ring,
+        |view| {
+            require_open(view)?;
+            let leg = view.leg(&refusal.leg_name)?;
+            reject_closed_leg(view, leg)?;
+            if let Some(bound) = &leg.bound_child {
+                return Err(RequestStoreError::LegBoundToChild {
+                    request_id: view.header.request_id.clone(),
+                    leg_name: refusal.leg_name.clone(),
+                    child_session_id: bound.clone(),
+                });
+            }
+            Ok(Some(PendingAppend {
+                payload,
+                timestamp: refusal.timestamp.clone(),
+                hash: Some(hash),
+            }))
+        },
+    )
 }
 
 /// Refuse a fenced verb on a leg a root session attached itself to.

@@ -249,7 +249,7 @@ Every subcommand under `koto request` reports failure through the nested envelop
 | `error.code` | Exit | Meaning | Agent action |
 |---|---|---|---|
 | `wait_timeout` | 1 | `wait` hit `--timeout-secs` with the predicate still unsatisfied | Retry the wait, or go do something else and come back |
-| `wait_interrupted` | 1 | A signal arrived while polling | Retry if you still want the answer |
+| `wait_interrupted` | 1 | A signal arrived while `wait` or `watch` was polling | Retry if you still want the answer |
 | `lock_contention` | 1 | The per-request write lock wasn't acquired within five seconds | Back off and retry the same call |
 | `request_not_found` | 2 | No request record at that identifier | Check the id; `koto request list` if you've lost it |
 | `leg_not_found` | 2 | The request has no leg by that name | Read the leg names from `koto request get` |

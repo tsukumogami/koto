@@ -30,7 +30,7 @@ use std::path::Path;
 
 use super::{
     append_under_lock, read_view, reject_closed_leg, require_open, validate_leg_name, AppendResult,
-    PendingAppend, RequestStoreError, RequestView, ValidatedRequestId, LOCK_WAIT_TIMEOUT,
+    PendingAppend, RequestStoreError, RequestView, ValidatedRequestId, Wake, LOCK_WAIT_TIMEOUT,
 };
 use crate::engine::leg_pointer::LegPointer;
 use crate::engine::persistence::derive_state_from_log;
@@ -251,9 +251,14 @@ pub fn attach_leg(
     attach: &AttachLeg,
 ) -> Result<AppendResult, RequestStoreError> {
     validate_leg_name(&attach.leg_name)?;
-    append_under_lock(root, request_id, LOCK_WAIT_TIMEOUT, None, |view| {
-        admit(root, view, attach)
-    })
+    append_under_lock(
+        root,
+        request_id,
+        LOCK_WAIT_TIMEOUT,
+        None,
+        Wake::Quiet,
+        |view| admit(root, view, attach),
+    )
 }
 
 /// Run every admission check [`attach_leg`] runs, against an unlocked

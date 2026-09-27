@@ -48,9 +48,9 @@ use crate::session::state_file_name;
 
 /// Pluggable substrate wake-delivery abstraction.
 ///
-/// Sibling to [`crate::engine::claim::SubstrateSpawner`]. The concrete
-/// implementation (Claude Code agent-membership poke, bunki BK2 hosted
-/// wake, etc.) lives outside this crate. Tests use a mock that records
+/// Sibling to [`crate::engine::claim::SubstrateSpawner`]. The crate's own
+/// implementation is [`SignalWaker`]; an external substrate may swap in
+/// another. Tests use a mock that records
 /// every wake invocation so the dispatch contract can be asserted
 /// without touching a real substrate.
 ///
@@ -69,27 +69,24 @@ pub trait SubstrateWaker {
     fn wake(&self, session_id: &ValidatedSessionId) -> Result<(), EngineError>;
 }
 
-/// Default [`SubstrateWaker`] used by `handle_next` until a concrete
-/// substrate implementation (Claude Code agent-membership poke, bunki
-/// BK2 hosted wake) ships. Every call emits an `eprintln!` so operators
-/// can observe wake intent during the transitional period; nothing
-/// else happens.
+/// The [`SubstrateWaker`] `handle_next` uses: it rings the woken
+/// session's wake file ([`crate::engine::wake_signal`]), the same signal
+/// the request store rings when a leg changes, so a harness subscribed to
+/// that file hears both.
 ///
-/// The durable `RequesterWoken` event on the coord's log is the
-/// source of truth for "wake intent recorded"; the substrate primitive
-/// invocation is the operational follow-through. Until that primitive
-/// exists, the audit trail stays correct and the requester resumes by
-/// other means (operator-triggered, polling, etc.).
-pub struct LoggingWaker;
+/// The durable `RequesterWoken` event on the coordinator's log remains the
+/// record that the wake was intended; the ring is the delivery. A wake
+/// carries no state, so the age-and-activity recovery rule re-ringing a
+/// session costs at most one tick that finds nothing new.
+pub struct SignalWaker {
+    /// The koto root the wake file lives under (`~/.koto`).
+    pub koto_root: std::path::PathBuf,
+}
 
-impl SubstrateWaker for LoggingWaker {
+impl SubstrateWaker for SignalWaker {
     fn wake(&self, session_id: &ValidatedSessionId) -> Result<(), EngineError> {
-        eprintln!(
-            "info: SubstrateWaker stub invoked for session '{}'; \
-             concrete wake-delivery primitive not yet wired",
-            session_id.as_str()
-        );
-        Ok(())
+        crate::engine::wake_signal::ring(&self.koto_root, session_id.as_str())
+            .map_err(|e| EngineError::WakeDeliveryFailed(e.to_string()))
     }
 }
 

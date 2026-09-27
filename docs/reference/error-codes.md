@@ -520,7 +520,7 @@ All batch validation runs pre-append — rejected submissions leave no events on
 
 ## Request errors
 
-Every subcommand under `koto request` — `create`, `bind`, `attach`, `get`, `wait`, `list`, `progress`, `resolve`, `abandon`, `abandon-request`, and `close` — reports failure through one nested envelope, the same shape `koto next`'s domain errors use:
+Every subcommand under `koto request` — `create`, `bind`, `attach`, `get`, `wait`, `watch`, `list`, `progress`, `resolve`, `abandon`, `abandon-request`, and `close` — reports failure through one nested envelope, the same shape `koto next`'s domain errors use:
 
 ```json
 {
@@ -539,12 +539,12 @@ The code set is closed. A consumer that had to match on `message` to tell "this 
 | Code | Exit | Meaning |
 |------|:----:|---------|
 | `wait_timeout` | 1 | `wait` hit its `--timeout-secs` deadline with the predicate still unsatisfied. |
-| `wait_interrupted` | 1 | A signal arrived while `wait` was polling. |
+| `wait_interrupted` | 1 | A signal arrived while `wait` or `watch` was polling. |
 | `lock_contention` | 1 | The per-request write lock wasn't acquired within its five-second deadline. Retryable after backoff. |
 | `request_not_found` | 2 | No request record exists at that identifier. |
 | `leg_not_found` | 2 | The request has no leg by that name. |
 | `invalid_identifier` | 2 | A request id, leg name, session id, or coordinator id failed its grammar. Never worth retrying. |
-| `invalid_submission` | 2 | A flag payload was malformed, or the flag combination was — `--with-data` together with the `--role`/`--template`/`--inputs` triple, a creation payload with no legs, a duplicate leg name, a leg `template` list that is empty, longer than eight, or carries an empty entry, a value that isn't a JSON object. |
+| `invalid_submission` | 2 | A flag payload was malformed, or the flag combination was — `--with-data` together with the `--role`/`--template`/`--inputs` triple, a creation payload with no legs, a duplicate leg name, a leg `template` list that is empty, longer than eight, or carries an empty entry, a value that isn't a JSON object, or an unparseable `watch --since` cursor. |
 | `contract_mismatch` | 2 | `--cli-contract` named a contract this build doesn't serve. Checked before any read or write, so a mismatch has no side effect. |
 | `request_closed` | 2 | A leg mutation, or a second `close`, on a closed request. |
 | `leg_already_resolved` | 2 | A second result, or any mutation, on a leg that already answered. |
@@ -564,7 +564,9 @@ The code set is closed. A consumer that had to match on `message` to tell "this 
 | `epoch_fence_violation` | 2 | The presented `--dispatch-epoch` doesn't match the epoch recorded on the leg's bind event, or was omitted on a leg that is bound. Equality is strict, so a future epoch rejects alongside a stale one. |
 | `predicate_impossible` | 2 | The `wait` predicate could never hold, caught before polling began — asking for five resolved legs on a three-leg request, for instance. |
 | `predicate_became_impossible` | 2 | The predicate stopped being reachable while the wait was running, through abandonment or close. Distinct from a timeout so a caller can tell "not yet" from "never". |
-| `persistence_error` | 3 | The filesystem refused, or the log disagrees with itself. |
+| `persistence_error` | 3 | The filesystem refused, or the log disagrees with itself, or the wake file `watch` reads could not be read. |
+
+`watch` never returns `wait_timeout`: reaching `--timeout-secs` is a success with `woke: false`, exit 0, because the caller ticks either way.
 
 An unsatisfiable predicate is a caller error rather than a transient one on purpose: telling a shell loop to retry forever on a condition that can never become true is worse than failing it.
 
