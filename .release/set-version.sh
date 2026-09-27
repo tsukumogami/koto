@@ -2,7 +2,8 @@
 # Set-version hook called by the reusable release workflow.
 # Receives the version without v prefix (e.g., 0.4.0 or 0.4.1-dev).
 #
-# Stamps the version in Cargo.toml, marketplace.json, and plugin.json.
+# Stamps the version in Cargo.toml, Cargo.lock, marketplace.json, and
+# plugin.json.
 
 set -euo pipefail
 
@@ -14,6 +15,19 @@ PLUGIN_JSON="plugins/koto-skills/.claude-plugin/plugin.json"
 # Stamp Cargo.toml
 sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
 echo "Stamped Cargo.toml to ${VERSION}"
+
+# Carry the new version into Cargo.lock. --workspace moves only the workspace
+# members' own entries; every dependency stays pinned. It needs the registry
+# index (not crate downloads), so it runs online: a release runner has no
+# cache for --offline to use. Without this the tagged tree fails
+# `cargo build --locked` and `cargo install --locked`.
+cargo update --workspace
+lock_entry="$(grep -A1 '^name = "koto"$' Cargo.lock)"
+if ! grep -qxF "version = \"${VERSION}\"" <<< "$lock_entry"; then
+  echo "Cargo.lock does not record koto ${VERSION} after cargo update" >&2
+  exit 1
+fi
+echo "Updated Cargo.lock to ${VERSION}"
 
 # Stamp marketplace.json plugins[0].version
 jq --arg v "$VERSION" '.plugins[0].version = $v' "$MARKETPLACE_JSON" > "$MARKETPLACE_JSON.tmp" \

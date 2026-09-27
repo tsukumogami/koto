@@ -51,7 +51,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build koto
-        run: cargo build --bin koto
+        run: cargo build --locked --bin koto
 
       - name: Run the synthetic fixtures against the live provider
         env:

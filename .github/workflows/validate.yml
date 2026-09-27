@@ -37,8 +37,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      # --locked fails the job when Cargo.lock no longer matches Cargo.toml, so a
+      # version bump that skips the lock file can't reach a tag.
       - name: Run tests
-        run: cargo test -- --test-threads=1
+        run: cargo test --locked -- --test-threads=1
 
   stability-tests:
     # Issue 20: external-consumer compile-check fixture for the

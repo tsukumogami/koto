@@ -43,7 +43,7 @@ Four of the checks `.github/workflows/validate.yml` runs on every PR, which poin
 change both together. Its other jobs (audit, coverage, the tsuku install, cloud integration,
 leftover-artifact checks) are left out on purpose.
 
-- `cargo test -- --test-threads=1`
+- `cargo test --locked -- --test-threads=1`
 - `cargo test -p koto-stability-tests -- --test-threads=1`
 - `cargo fmt --check`
 - `cargo clippy -- -D warnings`
