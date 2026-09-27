@@ -413,7 +413,7 @@ koto request close    <request-id> [--issued-by ID]
 
 Output is JSON on stdout unconditionally — there is no format flag.
 
-`watch` is the one verb that doesn't print the request envelope. It blocks until the session's wake file (`~/.koto/wakes/<session>`) changes or `--timeout-secs` passes, exits 0 either way, and prints `{"session", "woke", "cursor", "cli_contract"}`; `woke` is `false` at the timeout. Pass `cursor` back as `--since`. A bad `--session` is `invalid_identifier`, a bad `--since` is `invalid_submission` (both exit 2), an unreadable wake file is `persistence_error` (exit 3), and a signal while polling is `wait_interrupted` (exit 1).
+`watch`, like `list`, doesn't print the request envelope. It reads the session's wake file (`~/.koto/wakes/<session>`, described in `docs/guides/cli-usage.md`, "Leg wakes and request watch"): it blocks until the file changes or `--timeout-secs` passes, exits 0 either way, and prints `{"session", "woke", "cursor", "cli_contract"}`; `woke` is `false` at the timeout. Pass `cursor` back as `--since`. A bad `--session` is `invalid_identifier`, a bad `--since` is `invalid_submission` (both exit 2), an unreadable wake file is `persistence_error` (exit 3), and a signal while polling is `wait_interrupted` (exit 1).
 
 ### The response envelope
 

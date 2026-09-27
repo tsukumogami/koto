@@ -460,7 +460,7 @@ koto next <you>                                             # blocked on the leg
 koto request watch --session <you> --timeout-secs 1800 --since <cursor>   # run in the background
 ```
 
-When the watch exits, tick again (`woke: true` means something changed; `woke: false` is the timeout, tick anyway), and start the next watch with the cursor it printed. A watch that was running when the leg changed exits within 1 second of the command that changed it returning. A harness can instead watch the wake file itself. With nothing listening, `koto request wait --timeout-secs` is still the way to wait. Wakes are local to one machine. The full contract is in `docs/guides/cli-usage.md`, "Leg wakes and request watch".
+When the watch exits, tick again and watch from the cursor it printed. The loop, the 1 second bound, reading the wake file directly, and the no-subscriber fallback (`koto request wait --timeout-secs`) are written out once, in `docs/guides/cli-usage.md`, "Leg wakes and request watch". Wakes are local to one machine.
 
 ### Learning your own leg
 

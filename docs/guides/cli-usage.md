@@ -1071,7 +1071,7 @@ A dispatched child (one `koto request bind` accepts) presented to `attach` is bo
 
 ### Leg wakes and request watch
 
-A session parked on a `request-leg` gate learns that its leg changed when it next ticks. koto tells the harness running that session when to tick, through a per-session wake file.
+A session parked on a `request-leg` gate learns that its leg changed when it next ticks. koto tells the harness running that session when to tick. There is one contract: a per-session wake file, which the request store rings and every subscriber reads. `koto request watch` is koto's own reader over that file, with a cursor; a harness may read the file directly instead.
 
 **What rings.** Every write that can change what a `request-leg` gate reads rings a wake: a leg's result (a worker's promoted terminal result, `koto request resolve`, or the refusal `koto init --koto-leg` records), a leg abandonment (`koto request abandon`, or each leg of `koto request abandon-request`), and `koto request close`. Creating a request, binding or attaching a leg, and appending progress do not ring. The wake is written by the process that made the change, after the change is durable and before that command returns, so a worker's terminal `koto next` has rung its coordinator by the time it exits.
 
@@ -1079,17 +1079,15 @@ A session parked on a `request-leg` gate learns that its leg changed when it nex
 
 **What it means.** Only "look again". A wake carries no state: the session's next tick reads the leg through its gate as it always does. A lost wake costs latency, and a duplicate costs one tick that finds nothing new.
 
-**Where it is.** `~/.koto/wakes/<session>`. The file is appended in place, one opaque line per wake, and never renamed, so a watcher registered on the path keeps working. Once it reaches 32 KiB, the next wake truncates it in place before appending its line, so it stays small.
+**The wake file.** `~/.koto/wakes/<session>`. Each wake appends one opaque line; the file is never renamed, so a watcher registered on the path keeps working. Once it reaches 32 KiB, the next wake truncates it in place before appending its line, so it stays small. Any change to the file is a wake. A native file watcher or `tail -F` sees each append; a poller should compare the file's size and modification time together, because comparing size alone can miss a wake that followed a truncation.
 
-**Subscribing without koto.** Watch the file with whatever the harness has. A native file watcher or `tail -F` sees each append. A poller should compare the file's size and modification time together: comparing size alone can miss a wake that followed a truncation.
-
-**Subscribing with koto.**
+**Reading it with `koto request watch`.**
 
 ```bash
 koto request watch --session <session-id> --timeout-secs <n> [--since <cursor>]
 ```
 
-`watch` blocks until the session's wake file changes, or until `--timeout-secs` passes, and exits 0 either way with one JSON line:
+`watch` reads the wake file above: it blocks until the file changes, or until `--timeout-secs` passes, and exits 0 either way with one JSON line:
 
 ```json
 {"session":"coord","woke":true,"cursor":"w1:27:1790000000000000000.4242.0","cli_contract":{"major":1,"minor":2}}

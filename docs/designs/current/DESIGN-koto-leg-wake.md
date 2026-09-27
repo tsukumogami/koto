@@ -190,7 +190,11 @@ is refused unless `fstat` reports a regular file, so a FIFO or device planted
 at the path can neither block a worker's terminal tick nor receive the write.
 It then writes one line in a single `write`: an opaque token built from the
 writer's wall-clock nanoseconds, its pid and a per-process counter, and a
-newline, well under `PIPE_BUF`, so concurrent appends never interleave. The
+newline. The descriptor was opened with `O_APPEND`, which the kernel positions
+and writes as one operation on local filesystems, so concurrent appends never
+interleave. Two rings that both cross the cap can both truncate and drop one
+line; the survivor still changes the cursor, so nothing is lost but a
+duplicate. The
 counter matters because `abandon-request` rings one file several times from
 one process in quick succession. There is no lock and no `fsync`: R4 asks for
 the wake to be visible when the command returns, not durable across a crash,
@@ -303,9 +307,9 @@ modification time. Or it can run `koto request watch --session <id>
 exits zero with one JSON line carrying `cli_contract`, `session`, `woke`
 and `cursor`,
 when the file changes or the timeout passes. Passing the printed cursor as
-`--since` to the next watch closes the gap between the two, so the loop "watch
-in the background; when it exits, tick the coordinator; watch again from the
-cursor" never misses a wake. A harness that reacts to a background command
+`--since` to the next watch closes the gap between the two; the loop a harness
+runs is written out once, in "Leg wakes and request watch" in
+`docs/guides/cli-usage.md`. A harness that reacts to a background command
 finishing (a Claude Code session running the watch as a background task, for
 instance) needs nothing else.
 
