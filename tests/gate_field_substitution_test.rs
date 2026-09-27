@@ -824,6 +824,8 @@ fn a_legal_value_that_cannot_be_a_key_says_which_character() {
         ("Weekly Planning", "' '"),
         ("newer_than:90d", "':'"),
         ("user@example.com", "'@'"),
+        // Issue #266 made `+` a legal value; it is still not a key character.
+        ("workspace+instance", "'+'"),
     ];
 
     for (n, (title, character)) in cases.iter().enumerate() {

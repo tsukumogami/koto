@@ -42,6 +42,9 @@ koto init <name> --template <path>
 **Required flags:**
 - `--template` -- Path to the workflow template file.
 
+**Variables:**
+- `--var KEY=VALUE` -- Set a template variable (repeatable). A value may hold letters, digits, `.`, `_`, `-`, `/`, `:`, `@`, `+` and spaces, because it can land unquoted in a gate command run through `sh -c`. Every other character, including `;` `|` `&` `$` `(` `)` `<` `>` `*` `?`, quotes, backticks and newlines, is refused with `invalid_var` (`constraint: "allowlist"`). A variable that declares `values:` or `pattern:` narrows that set further. The same check runs wherever a value is set later: `--vars-file`, a rebind through `--attach-live`, and `--replace-terminal`.
+
 **Output (JSON):**
 
 ```json

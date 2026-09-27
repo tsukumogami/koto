@@ -36,7 +36,7 @@ pub struct Manifest {
 ///
 /// Note the asymmetry a caller has to live with: this grammar is narrower than
 /// the variable-value allowlist, so a legal `--var` value can hold a space, a
-/// `:` or an `@` and produce an illegal key. The two are not going to converge
+/// `:`, an `@` or a `+` and produce an illegal key. The two are not going to converge
 /// (Issue #227). A value is content and admits those three so it can hold a
 /// title or a filter expression; a key is an address, and one of its uses is as
 /// an argument in the `koto context add` and `koto context get` commands

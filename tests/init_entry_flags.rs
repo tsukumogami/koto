@@ -1408,3 +1408,180 @@ fn a_replaced_session_is_bound_to_the_leg() {
     assert_eq!(leg(dir, &id)["bound_child"], "scope-t1");
     assert!(pointer_path(dir, "scope-t1").exists());
 }
+
+// ===== values carrying `+` (Issue #266) =====
+
+/// A plugin-root-style variable, rebindable and unconstrained, read by a gate
+/// command that interpolates it unquoted so the shell sees the value as-is.
+const PLUS_TEMPLATE: &str = r#"---
+name: plus
+version: "1.0"
+initial_state: work
+variables:
+  TOPIC:
+    required: true
+  ROOT:
+    required: true
+    rebind: true
+states:
+  work:
+    gates:
+      probe:
+        type: command
+        command: printf '%s' {{ROOT}} > seen.txt
+    transitions:
+      - target: done
+        when:
+          gates.probe.exit_code: 0
+  done:
+    terminal: true
+---
+
+## work
+
+Work under {{ROOT}}.
+
+## done
+
+Done.
+"#;
+
+/// A path under a niwa instance directory, the case the issue was filed about.
+const PLUS_ROOT: &str = "/home/u/ws/workspace+instance-1a2b3c4d/checkout";
+
+/// `koto init <name> --template <dir>/plus.md --vars-file <pairs> <extra...>`.
+fn plus_init(dir: &Path, name: &str, pairs: &[(&str, &str)], extra: &[&str]) -> Vec<String> {
+    std::fs::write(dir.join("plus.md"), PLUS_TEMPLATE).unwrap();
+    let file = format!("{name}-{}.json", extra.join("").trim_start_matches('-'));
+    let vars = vars_file(dir, &file, pairs);
+    init_args(dir, name, "plus.md", &vars, extra)
+}
+
+#[test]
+fn a_var_value_with_plus_is_accepted() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    std::fs::write(dir.join("plus.md"), PLUS_TEMPLATE).unwrap();
+    let root = format!("ROOT={PLUS_ROOT}");
+    let out = run_ok(
+        dir,
+        &[
+            "init",
+            "p",
+            "--template",
+            dir.join("plus.md").to_str().unwrap(),
+            "--var",
+            "TOPIC=1.2.0+build",
+            "--var",
+            &root,
+        ],
+    );
+    assert_eq!(out["state"], "work", "{out}");
+    assert_eq!(binding(dir, "p", "ROOT"), PLUS_ROOT);
+    assert_eq!(binding(dir, "p", "TOPIC"), "1.2.0+build");
+}
+
+#[test]
+fn a_vars_file_pair_with_plus_is_accepted() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let out = run_ok(
+        dir,
+        &as_strs(&plus_init(
+            dir,
+            "p",
+            &[("TOPIC", "t+1"), ("ROOT", PLUS_ROOT)],
+            &[],
+        )),
+    );
+    assert_eq!(out["outcome"], "created", "{out}");
+    assert_eq!(binding(dir, "p", "ROOT"), PLUS_ROOT);
+    assert_eq!(binding(dir, "p", "TOPIC"), "t+1");
+}
+
+/// Every later path that re-checks a value accepts a `+` value too: an attach
+/// that re-sends a fixed variable, a rebind of a `rebind: true` one, and the
+/// replacement of a finished session.
+#[test]
+fn a_value_with_plus_is_not_refused_by_attach_rebind_or_replace() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    run_ok(
+        dir,
+        &as_strs(&plus_init(
+            dir,
+            "p",
+            &[("TOPIC", "t+1"), ("ROOT", "/a/b")],
+            &[],
+        )),
+    );
+
+    // Attach: TOPIC is fixed and re-sent equal; ROOT is rebound to a `+` path.
+    let out = run_ok(
+        dir,
+        &as_strs(&plus_init(
+            dir,
+            "p",
+            &[("TOPIC", "t+1"), ("ROOT", PLUS_ROOT)],
+            &["--attach-live"],
+        )),
+    );
+    assert_eq!(out["rebound"]["ROOT"], PLUS_ROOT, "{out}");
+    assert_eq!(binding(dir, "p", "ROOT"), PLUS_ROOT);
+
+    // Finish it (the gate passes), keeping it on disk, then replace it.
+    let out = run_ok(dir, &["next", "p", "--no-cleanup"]);
+    assert_eq!(out["action"], "done", "{out}");
+    let out = run_ok(
+        dir,
+        &as_strs(&plus_init(
+            dir,
+            "p",
+            &[("TOPIC", "t+2"), ("ROOT", "/x+y/z")],
+            &["--replace-terminal"],
+        )),
+    );
+    assert_eq!(out["outcome"], "replaced", "{out}");
+    assert_eq!(binding(dir, "p", "TOPIC"), "t+2");
+    assert_eq!(binding(dir, "p", "ROOT"), "/x+y/z");
+}
+
+/// The `+` reaches a `sh -c` gate command unchanged: the command interpolates
+/// the value unquoted and writes what the shell handed `printf` to a file.
+#[test]
+fn a_value_with_plus_reaches_a_gate_command_unchanged() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    run_ok(
+        dir,
+        &as_strs(&plus_init(
+            dir,
+            "p",
+            &[("TOPIC", "t"), ("ROOT", PLUS_ROOT)],
+            &[],
+        )),
+    );
+    let out = run_ok(dir, &["next", "p", "--no-cleanup"]);
+    assert_eq!(out["action"], "done", "the gate should pass: {out}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("seen.txt")).unwrap(),
+        PLUS_ROOT
+    );
+}
+
+/// Widening the set by `+` lets no shell metacharacter in alongside it.
+#[test]
+fn a_plus_value_carrying_a_metacharacter_is_still_invalid_var() {
+    for bad in ["t+1;true", "t+$(id)", "+(a|b)", "t+`id`", "t+1>f"] {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let (code, err) = run_err(
+            dir,
+            &as_strs(&plus_init(dir, "p", &[("TOPIC", bad), ("ROOT", "/a")], &[])),
+        );
+        assert_eq!(code, 2, "{bad}: {err}");
+        assert_eq!(err["code"], "invalid_var", "{bad}: {err}");
+        assert_eq!(err["constraint"], "allowlist", "{bad}: {err}");
+        assert!(!state_path(dir, "p").exists(), "{bad}: no session");
+    }
+}

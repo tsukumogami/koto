@@ -3213,6 +3213,7 @@ fn context_exists_tells_an_unusable_key_from_an_absent_one() {
         ("Weekly Planning-note", "' '"),
         ("newer_than:90d-note", "':'"),
         ("user@example.com-note", "'@'"),
+        ("workspace+instance-note", "'+'"),
     ] {
         let unusable = status_for(key);
 

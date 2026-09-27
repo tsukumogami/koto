@@ -132,8 +132,8 @@ pub fn unusable_context_key_reason(key: &str) -> Option<String> {
     let err = validate_context_key(key).err()?;
     Some(format!(
         "context key {:?} is not usable: {}\n  \
-         remedy: a variable value may hold a space, ':' or '@'; a context key \
-         may not. Where the key comes from a {{{{KEY}}}} reference, check what \
+         remedy: a variable value may hold a space, ':', '@' or '+'; a context \
+         key may not. Where the key comes from a {{{{KEY}}}} reference, check what \
          that reference resolved to -- an unset optional variable leaves nothing \
          behind",
         key, err

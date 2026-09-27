@@ -275,7 +275,7 @@ which means the key is usable and absent, and it is the one case that used to be
 indistinguishable from an ordinary absence:
 
 ```json
-{"error":"context key \"Weekly Planning-note\" is not usable: context key contains invalid character ' ' in component 'Weekly Planning-note'; allowed: letters, digits, '.', '_', '-'\n  remedy: a variable value may hold a space, ':' or '@'; a context key may not. Where the key comes from a {{KEY}} reference, check what that reference resolved to -- an unset optional variable leaves nothing behind","command":"context exists"}
+{"error":"context key \"Weekly Planning-note\" is not usable: context key contains invalid character ' ' in component 'Weekly Planning-note'; allowed: letters, digits, '.', '_', '-'\n  remedy: a variable value may hold a space, ':', '@' or '+'; a context key may not. Where the key comes from a {{KEY}} reference, check what that reference resolved to -- an unset optional variable leaves nothing behind","command":"context exists"}
 ```
 
 Exit 2 is the caller-must-fix-the-input class, the same one `invalid_submission`
