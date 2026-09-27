@@ -121,8 +121,8 @@ pub fn validate_context_key(key: &str) -> anyhow::Result<()> {
 ///
 /// The asymmetry it describes is deliberate on both sides. A variable value is
 /// content -- it reaches a directive, a command argument, a pattern -- and it
-/// admits a space, a `:` and an `@` so it can hold a title or a filter
-/// expression. A context key is an address: it becomes a path component on disk,
+/// admits a space, a `:`, an `@` and a `+` so it can hold a title, a filter
+/// expression or a path. A context key is an address: it becomes a path component on disk,
 /// a key in the store's manifest, and an argument in the `koto context add` and
 /// `koto context get` commands templates run. Widening the key grammar to close
 /// the gap would legalize keys that word-split at that third use, so the two

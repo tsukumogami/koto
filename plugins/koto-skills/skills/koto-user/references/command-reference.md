@@ -844,7 +844,7 @@ if koto context exists my-workflow scope.md; then
 fi
 ```
 
-Exit 2 is the case where the key is not a key. A context key is narrower than a variable value: each `/`-separated component starts with a letter or digit and continues in letters, digits, `.`, `_` and `-`, while a value may also hold a space, a `:` and an `@`. So a key composed from a variable can be something the store will not accept, and this is where you find out — with a JSON error naming the offending character and the component it sits in, in the same words a context gate uses for the same key.
+Exit 2 is the case where the key is not a key. A context key is narrower than a variable value: each `/`-separated component starts with a letter or digit and continues in letters, digits, `.`, `_` and `-`, while a value may also hold a space, a `:`, an `@` and a `+`. So a key composed from a variable can be something the store will not accept, and this is where you find out — with a JSON error naming the offending character and the component it sits in, in the same words a context gate uses for the same key.
 
 Exit 2 is non-zero, so the shell conditional above is unaffected: an unusable key does not run the `then` branch. What changes is that the reason is printed instead of absent. A caller that distinguishes "absent" from "unusable" reads the status rather than inferring it.
 

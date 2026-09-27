@@ -242,7 +242,10 @@ to `0.9.x`).
   and a variable's own `values:` or `pattern:` still decides what it accepts.
   The one allowlist is shared by every place a value is checked, so a rebind
   through `--attach-live`, `--replace-terminal`, and a captured command output
-  accept the same values. A context key still may not contain `+`.
+  accept the same values. A context key still may not contain `+`. A session
+  whose variables hold a `+` can't be advanced by an older koto, which
+  re-checks every recorded value on each tick, so a skill that passes such a
+  value should require this release.
 
 - **The `children-complete` gate no longer shows a retried child's old result.**
   It reads only the result a child recorded for its current arrival, and it no

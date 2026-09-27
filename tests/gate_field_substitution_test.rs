@@ -804,19 +804,19 @@ Done.
 /// This is the case Issue #227 was filed about and the one the tests above miss.
 /// They cover a key that resolved to nothing and a key left with a leading
 /// hyphen -- both reachable only from an unset optional variable. This one needs
-/// no mistake at all: `VALUE_PATTERN` admits a space, a `:` and an `@` on
-/// purpose, so a calendar title or a filter expression is a legal value, and
-/// `validate_context_key` admits none of the three. A template that scopes a key
+/// no mistake at all: `VALUE_PATTERN` admits a space, a `:`, an `@` and a `+`
+/// on purpose, so a calendar title, a filter expression or a path is a legal
+/// value, and `validate_context_key` admits none of the four. A template that scopes a key
 /// on such a value is doing the obvious thing.
 ///
 /// Left alone the store answers an unusable key exactly as it answers a missing
 /// one, so the gate would report `{"exists": false, "error": ""}` -- a gate that
 /// will not pass with nothing pointing at why.
 ///
-/// Each of the three characters gets its own case rather than one standing for
+/// Each of the four characters gets its own case rather than one standing for
 /// the family: they enter `validate_context_key` by two different routes (the
 /// first-character rule and the trailing-character rule), and a change that
-/// stopped reporting one of them would leave the other two passing.
+/// stopped reporting one of them would leave the others passing.
 #[test]
 fn a_legal_value_that_cannot_be_a_key_says_which_character() {
     // (value, the character the message must name)
