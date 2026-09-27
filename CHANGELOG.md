@@ -242,8 +242,9 @@ to `0.9.x`).
   are now written once per completed batch, decided against the batching
   state, whether the tick stays there, advances out of it (even if it then
   stops on an error in a later state), or leaves with `koto next --to`. A
-  `koto next` tick that completes the batch and lands on a terminal state now
-  also carries `batch_final_view` in its response. A consumer that read the
+  tick that completes the batch and advances onto a terminal state now also
+  carries `batch_final_view` in its response (a `--to` response still
+  doesn't). A consumer that read the
   key after such a batch and went on without it when it was missing now gets
   the view.
 
@@ -251,14 +252,15 @@ to `0.9.x`).
   batch was already recorded was decided across the whole log, so once one
   batch had a `BatchFinalized`, a later batch (a second `materialize_children`
   state, or the same state re-entered through an ordinary transition) never
-  got one, and `batch_final_view` kept the earlier batch's view. A state
-  arrived at before its task list was submitted could also be recorded at
-  once with the earlier batch's children. The decision is now made per
-  batching state and per visit: a batch starts when its task list is
-  submitted after the state is entered, and it is recorded once when it
-  completes. A retry or rewind still starts it over. With the fix above
-  alone, a parent with two batches in sequence would have read the first
-  batch's view after the second.
+  got one, and `batch_final_view` kept the earlier batch's view. A batching
+  state reached before its task list was submitted could also be recorded
+  at once, with the earlier batch's children. The decision is now made per
+  batching state: a state's batch exists once its task list is submitted,
+  and it is recorded when it completes, again after a retry or rewind, and
+  again whenever its per-child outcomes differ from the last record (a retry
+  routed back into the state, or a new task list on a later visit). With the
+  fix above alone, a parent with two batches in sequence would have read the
+  first batch's view after the second.
 
 - **A variable value may contain `+` (koto#266).** The value allowlist now
   accepts letters, digits, `.`, `_`, `-`, `/`, `:`, `@`, `+` and spaces

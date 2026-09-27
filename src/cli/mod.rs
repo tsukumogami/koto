@@ -4441,6 +4441,7 @@ fn handle_next(
                         &name,
                         &compiled,
                         current_state,
+                        None,
                     );
                 }
                 // The terminal result rides the response, so it is found or
@@ -5276,22 +5277,38 @@ fn handle_next(
     // capture refusal, an advance error) exit from inside that mapping, and
     // the transitions they made are already on disk. A record decided later
     // would be lost with them, and the next tick starts in a state that has
-    // no batch to look at. A batching state entered and left again within
-    // the same tick is not checked: its children could not have been
-    // spawned by a scheduler that only runs where a tick stops.
+    // no batch to look at.
+    //
+    // The batch is judged as it stood when the tick left it: the log up to
+    // the tick's first transition out of the state, so what the rest of the
+    // tick did (including coming back to the state and stopping on a cycle)
+    // doesn't change what is recorded.
+    //
+    // Only the start state is checked. A batching state entered and left
+    // again later in the same tick had no batch to record: its children are
+    // spawned by the scheduler, which runs only where a tick stops.
     if crate::cli::batch::state_has_materialize_children(&compiled, current_state) {
-        let left_start_state = backend
-            .read_events(&name)
-            .ok()
-            .and_then(|(_, events)| crate::engine::persistence::derive_state_from_log(&events))
-            .is_some_and(|now| now != *current_state);
-        if left_start_state {
+        let tick_start_seq = current_events.last().map(|e| e.seq).unwrap_or(0);
+        let left_at = backend.read_events(&name).ok().and_then(|(_, events)| {
+            events.iter().find_map(|e| match &e.payload {
+                EventPayload::Transitioned { from, to, .. }
+                    if e.seq > tick_start_seq
+                        && from.as_deref() == Some(current_state.as_str())
+                        && to != current_state =>
+                {
+                    Some(e.seq)
+                }
+                _ => None,
+            })
+        });
+        if let Some(left_at) = left_at {
             crate::cli::batch::finalize_batch_if_complete(
                 backend,
                 context_store,
                 &name,
                 &compiled,
                 current_state,
+                Some(left_at),
             );
         }
     }
@@ -5836,8 +5853,8 @@ fn handle_next(
             // event and the `batch_final_view` context key -- the first
             // time the batch's `children-complete` gate reports
             // `all_complete: true`. A retry (retry_failed evidence or a
-            // Rewound) or a fresh entry into the state starts a new batch,
-            // and its completion is recorded in turn. The view freezes the
+            // Rewound), or a batch whose outcome has changed since, is
+            // recorded again when it completes. The view freezes the
             // gate output so `koto status` and terminal `done` responses
             // can replay the final batch shape.
             //
@@ -5855,6 +5872,7 @@ fn handle_next(
                     &name,
                     &compiled,
                     final_state,
+                    None,
                 );
             }
 

@@ -590,3 +590,117 @@ fn a_batch_of_children_that_clean_up_is_recorded_when_the_tick_advances_out() {
     assert_eq!(key["total"], 2, "{key}");
     assert_eq!(key["any_failed"], true, "{key}");
 }
+
+/// The retry shape the authoring guide recommends: route out to
+/// `analyze_failures` when the batch needs attention, and let a
+/// `retry_failed` submitted there route back into the batching state. No
+/// new task list is submitted and the parent is not rewound.
+const RETRY_ROUTED_PARENT: &str = r#"---
+name: batch-parent-retry-routed
+version: "1.0"
+initial_state: plan_and_await
+states:
+  plan_and_await:
+    accepts:
+      tasks:
+        type: tasks
+        required: true
+    gates:
+      done:
+        type: children-complete
+    materialize_children:
+      from_field: tasks
+      default_template: child.md
+    transitions:
+      - target: summarize
+        when:
+          gates.done.all_complete: true
+          gates.done.needs_attention: false
+      - target: analyze_failures
+        when:
+          gates.done.all_complete: true
+          gates.done.needs_attention: true
+  analyze_failures:
+    accepts:
+      decision:
+        type: enum
+        values: [give_up]
+        required: false
+    transitions:
+      - target: plan_and_await
+        when:
+          evidence.retry_failed: present
+      - target: summarize
+  summarize:
+    accepts:
+      status:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: closed
+        when:
+          status: ok
+  closed:
+    terminal: true
+---
+
+## plan_and_await
+
+Plan and wait.
+
+## analyze_failures
+
+Retry or give up.
+
+## summarize
+
+Summarize the batch.
+
+## closed
+
+Closed.
+"#;
+
+/// A retry routed back into the batching state records the retried batch
+/// when it completes, and the key moves from the failed view to the new one.
+#[test]
+fn a_retry_routed_back_into_the_batching_state_is_recorded_again() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    std::fs::write(dir.join("child.md"), CHILD_TEMPLATE).unwrap();
+    let parent = dir.join("parent.md");
+    std::fs::write(&parent, RETRY_ROUTED_PARENT).unwrap();
+    run_ok(
+        dir,
+        &["init", "parent", "--template", parent.to_str().unwrap()],
+    );
+    let tasks = serde_json::json!({"tasks": [{"name": "A", "waits_on": [], "vars": {}}]});
+    run_ok(dir, &["next", "parent", "--with-data", &tasks.to_string()]);
+
+    // Round one fails and the parent routes out to analyze_failures.
+    drive_child(dir, "parent.A", "fail");
+    let json = run_ok(dir, &["next", "parent"]);
+    assert_eq!(json["state"], "analyze_failures", "{json}");
+    assert_eq!(batch_finalized_events(dir).len(), 1);
+    let failed = batch_final_view_key(dir).expect("round one is recorded");
+    assert_eq!(failed["any_failed"], true, "{failed}");
+
+    // Retry from analyze_failures routes back; the child is run again.
+    let retry = serde_json::json!({"retry_failed": {"children": ["A"]}});
+    let json = run_ok(dir, &["next", "parent", "--with-data", &retry.to_string()]);
+    assert_eq!(json["state"], "plan_and_await", "{json}");
+    drive_child(dir, "parent.A", "done");
+
+    let json = run_ok(dir, &["next", "parent"]);
+    assert_eq!(json["state"], "summarize", "{json}");
+    let events = batch_finalized_events(dir);
+    assert_eq!(events.len(), 2, "the retried batch is recorded: {events:?}");
+    let retried = batch_final_view_key(dir).expect("the key is there");
+    assert_eq!(retried["all_success"], true, "{retried}");
+    assert_eq!(&retried, &events[1]["payload"]["view"]);
+
+    // Nothing more on a later tick.
+    run_ok(dir, &["next", "parent"]);
+    assert_eq!(batch_finalized_events(dir).len(), 2);
+}
