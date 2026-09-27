@@ -404,8 +404,8 @@ coordinator's harness:   koto request watch --session <coordinator> --since <c> 
 ### Interfaces
 
 - `koto request watch --session <id> --timeout-secs <n> [--since <cursor>]`,
-  stdout: one JSON object `{"cli_contract": "<major.minor>", "session":
-  "<id>", "woke": <bool>, "cursor": "<opaque>"}`. Exit 0 for both a wake and a
+  stdout: one JSON object `{"session": "<id>", "woke": <bool>, "cursor":
+  "<opaque>", "cli_contract": {"major": 1, "minor": 2}}`. Exit 0 for both a wake and a
   timeout; 2 for a malformed session or cursor or a missing required flag; 3
   for an unreadable wake file; the transient class for an interrupt.
 - The file `~/.koto/wakes/<session>`: append-only, one opaque line per

@@ -239,10 +239,12 @@ fn parked(dir: &Path) -> String {
     let next = run_ok(dir, &["next", "coord", "--no-cleanup"]);
     assert_eq!(next["action"], "gate_blocked", "{next}");
     init(dir, "worker", "scope.md", WORKER, &[]);
+    let before = cursor_now(dir, "coord");
     run_ok(
         dir,
         &["request", "attach", &id, "scope", "--session", "worker"],
     );
+    assert_eq!(cursor_now(dir, "coord"), before, "attaching must not ring");
     id
 }
 
