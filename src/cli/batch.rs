@@ -2961,11 +2961,15 @@ pub fn find_most_recent_batch_finalized(events: &[Event]) -> Option<&Event> {
 /// The question is asked per batching state, not of the log as a whole
 /// (Issue #275). Judged log-wide, a second batching state's batch never
 /// appended, and `batch_final_view` kept the first batch's view. The
-/// outcome comparison is what records a batch that started over without
-/// a rewind: a retry submitted from another state that routes back into
-/// this one, or a new task list submitted on a later visit. Coming back
-/// to a state whose batch has not changed records nothing, since it is
-/// the same batch. `current_view` is the view this tick would record.
+/// outcome comparison records a batch that changed without a retry or a
+/// rewind -- a new task list submitted on a later visit. (A retry
+/// submitted from another state that routes back here is already caught
+/// by the `retry_failed` check, which does not look at which state the
+/// evidence names; it also means any retry in the session lets every
+/// batching state record once more.) Coming back to a state whose batch
+/// has not changed, with no retry or rewind since its record, records
+/// nothing, since it is the same batch. `current_view` is the view this
+/// tick would record.
 pub fn should_append_batch_finalized(
     events: &[Event],
     batch_state: &str,
@@ -4290,12 +4294,21 @@ mod tests {
     }
 
     #[test]
+    fn another_states_record_with_the_same_outcomes_does_not_count() {
+        // Per-state scoping on its own: the outcomes match, so only the
+        // state filter tells the two batches apart (Issue #275).
+        let view = view_of(&[("p.A", "success")]);
+        let events = vec![bf_event_for(5, "plan1", view.clone())];
+        assert!(should_append_batch_finalized(&events, "plan2", true, &view));
+    }
+
+    #[test]
     fn a_changed_outcome_records_the_batch_again() {
-        // A retry routed back into the state without a rewind: the same
-        // child now succeeds where it failed.
+        // A new task list on a later visit, with no retry or rewind in
+        // between: the batch now holds a different child.
         let before = view_of(&[("p.A", "failure")]);
         let events = vec![bf_event_for(5, "plan", before)];
-        let after = view_of(&[("p.A", "success")]);
+        let after = view_of(&[("p.C", "success")]);
         assert!(should_append_batch_finalized(&events, "plan", true, &after));
     }
 

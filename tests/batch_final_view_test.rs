@@ -663,6 +663,7 @@ Closed.
 "#;
 
 /// A retry routed back into the batching state records the retried batch
+/// (the `retry_failed` evidence counts wherever it was submitted)
 /// when it completes, and the key moves from the failed view to the new one.
 #[test]
 fn a_retry_routed_back_into_the_batching_state_is_recorded_again() {
