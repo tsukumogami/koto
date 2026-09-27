@@ -59,7 +59,8 @@ A kept session is removed later by:
   replaced with `koto init --attach-live --replace-terminal`, which
   first removes the parent's terminal descendants (never a running one,
   one with anything running under it, one it can't read, or one whose
-  request leg still waits for its result);
+  request leg still waits for its result; on the terminal tick only a
+  parent with a batch hook or a `ChildCompleted` in its log is swept);
 - `koto workspace prune --root <root>` on the finished root above it;
 - `koto session cleanup <name>`.
 

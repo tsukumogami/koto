@@ -130,7 +130,7 @@ Then koto decides whether to keep the session, and says so in the response's `re
 A kept session stays until one of these removes it:
 
 - it is retried or rewound and then reaches a success terminal without `--no-cleanup`, and is removed on that tick;
-- koto removes its parent at the parent's own terminal, or `koto init --attach-live --replace-terminal` replaces the parent; either removes the parent's terminal descendants first, including children kept with `--no-cleanup`. It never removes a descendant that is still running, one with anything running under it, one it can't read, or one whose request leg still waits for its result. A parent that is itself kept keeps its children;
+- koto removes its parent at the parent's own terminal, or `koto init --attach-live --replace-terminal` replaces the parent; either removes the parent's terminal descendants first, including children kept with `--no-cleanup`. (On the terminal tick this runs only for a parent whose template has a batch hook or whose log holds a `ChildCompleted`; a hook-less parent that never received a child's notice leaves that child for `koto workflows --orphaned`.) It never removes a descendant that is still running, one with anything running under it, one it can't read, or one whose request leg still waits for its result. A parent that is itself kept keeps its children;
 - `koto workspace prune --root <root>` removes a finished root and everything under it;
 - `koto session cleanup <name>` removes one session.
 
@@ -176,6 +176,8 @@ Every successful response is a JSON object with an `action` field and an `error`
 | `action_output` | -- | -- | -- | -- | object | -- |
 | `integration` | -- | -- | object | object | -- | -- |
 | `unassigned_children` | array | array | array | array | array | array |
+| `result` | -- | -- | -- | -- | -- | object |
+| `retention` | -- | -- | -- | -- | -- | object |
 | `error` | `null` | `null` | `null` | `null` | `null` | `null` |
 
 "yes" = always present. "--" = absent from the JSON (not `null`, just missing). "object or `null`" = present as an object when the state has an `accepts` block, `null` otherwise. "optional" = present when the workflow arrives at the state (or when `--full` is passed), absent on every later tick until it arrives again and when the state has no details content. Use `koto status <name>` to retrieve `directive`/`details`/`expects` unconditionally regardless of delivery state -- see the `status` command below.

@@ -587,9 +587,14 @@ fn a_terminal_without_a_map_keeps_the_evidence_derived_payload() {
         })
     );
     // A parked terminal without a map records its result once, like any
-    // other terminal: `--no-cleanup` keeps the session and withholds nothing.
+    // other terminal, and notifies its parent once: `--no-cleanup` keeps the
+    // session and withholds nothing.
     assert_eq!(
         recorded_results(dir, "child-1"),
+        vec![next["result"].clone()]
+    );
+    assert_eq!(
+        child_completed_results(dir, "coord-a"),
         vec![next["result"].clone()]
     );
     let status = run_ok(dir, &["status", "child-1"]);

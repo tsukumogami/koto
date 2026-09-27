@@ -235,7 +235,9 @@ a debugging aid. `CHANGELOG.md` records the change under Unreleased.
 ### Non-functional
 
 **R14. Bounded growth.** A repeat tick of a kept session at its terminal adds
-no event to its log, to its parent's log or to the terminal index. The DESIGN
+no event to its log, to its parent's log or to the terminal index, once its own
+log records the arrival (while that append keeps failing, each tick is an
+arrival again). The DESIGN
 states the per-session storage cost of retention and the conditions under
 which retained sessions accumulate.
 
@@ -394,6 +396,10 @@ Docs and suite
   leaves its retained children naming a parent no session holds; they show in
   `koto workflows --orphaned` and are removed one at a time with
   `koto session cleanup`, or by pruning the terminal root above them.
+- A parent without a batch hook whose log never received a child's
+  `ChildCompleted` (every notice failed to write) is not swept when koto
+  removes it, so that child is left behind, listed by
+  `koto workflows --orphaned`.
 - `koto workspace prune --root` refuses a root that is still live (without
   `--force`), so retained children under a running root wait for it to finish
   or are removed one at a time with `koto session cleanup`.

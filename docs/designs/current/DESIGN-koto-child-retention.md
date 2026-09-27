@@ -679,6 +679,11 @@ survives a replace and would be seen by the new run, as it is today.
   removed, which a caller might not expect.
 - A retained failed root now occupies its name, so re-running `koto init` with
   the same name meets the existing "already exists" refusal more often.
+- The sweep's trigger misses one case: a parent without a batch hook on whose
+  log no `ChildCompleted` landed (every child's notice failed to write) is not
+  swept when koto removes it, and its kept child is left for
+  `koto workflows --orphaned`. Triggering on the log alone would miss more, and
+  listing sessions on every removal would cost a full scan on leaf ticks.
 - `koto session cleanup` on a retained parent removes only that session, so
   its retained children are left naming a parent no session holds. They are
   listed by `koto workflows --orphaned` and removable one at a time with

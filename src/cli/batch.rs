@@ -4819,6 +4819,61 @@ mod tests {
     /// cannot be classified either; that is what keeps the parent's copy
     /// eligible. A child whose log reads and whose template classifies is
     /// read only from its own log (see the inlining loop).
+    /// A cleaned-up `<parent>.<task>` child of a parent WITHOUT a batch
+    /// hook, known only from the parent's `ChildCompleted`, keeps its full
+    /// name, so it matches the result copied under that name and is not
+    /// left outstanding. Before the fix it was listed as `<task>` and never
+    /// matched `result_by_child`, so the gate could never pass.
+    #[test]
+    fn a_cleaned_up_child_of_a_hookless_parent_matches_its_result() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        backend
+            .init_state_file("p", child_header_for("", "p"), vec![])
+            .unwrap();
+        backend
+            .append_event(
+                "p",
+                &EventPayload::ChildCompleted {
+                    child_name: "p.t".to_string(),
+                    task_name: "t".to_string(),
+                    outcome: TerminalOutcome::Success,
+                    final_state: "done".to_string(),
+                    result: Some(WorkflowResult {
+                        status: TerminalOutcome::Success,
+                        summary: "completed at done".to_string(),
+                        payload: None,
+                    }),
+                },
+                "2026-01-01T00:00:01Z",
+            )
+            .unwrap();
+        assert!(!backend.exists("p.t"), "the child is gone from disk");
+
+        // A parent template with no `materialize_children` hook.
+        let mut states = BTreeMap::new();
+        states.insert("wait".to_string(), TemplateState::default());
+        let template = CompiledTemplate {
+            format_version: 1,
+            name: "p".to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            initial_state: "wait".to_string(),
+            variables: BTreeMap::new(),
+            states,
+        };
+        let (_, parent_events) = backend.read_events("p").unwrap();
+        let (passes, output) =
+            build_children_complete_output(&backend, "p", &parent_events, &template, "wait", None);
+
+        let children = output["children"].as_array().expect("children array");
+        assert_eq!(children.len(), 1, "{output}");
+        assert_eq!(children[0]["name"], "p.t", "{output}");
+        assert_eq!(children[0]["result"]["summary"], "completed at done", "{output}");
+        assert_eq!(output["outstanding"], serde_json::json!([]), "{output}");
+        assert!(passes, "the gate passes once the result matches: {output}");
+    }
+
     #[test]
     fn gate_skips_malformed_child_result_and_falls_back_to_parent_copy() {
         let tmp = TempDir::new().unwrap();
