@@ -191,19 +191,14 @@ to `0.9.x`).
   gate (koto#251).** A directed transition skipped gate evaluation entirely,
   so one `--to` could bypass a gate that `koto overrides record` refuses to
   force. `--to` now evaluates the non-overridable gates the edge to its target
-  depends on, in the terms the advance loop uses: a `when` clause reading
-  `gates.<gate>.*` must match the gate's real output, and an unconditional edge,
-  or any edge of a state with no `accepts` that doesn't route on gates, needs
-  the gate to pass. If every edge to the target is blocked, `--to` exits 1 with
-  `gate_blocked`, names the gate, and appends nothing. Because a `gates.<gate>.*`
-  clause is matched on output rather than on pass or fail, an edge that routes
-  on the gate failing stays reachable while it fails, and an edge that needs a
-  different output is refused even while the gate passes, which is the edge
-  `koto next` wouldn't take either. A guarding gate that reads a
-  `capture_stdout_as` value the run hasn't produced refuses with
-  `capture_unset`. Overridable gates are still skipped, and a `--to` that
-  proceeds appends exactly what it did before, so `--to` remains the recovery
-  path for a stuck session.
+  depends on, the way `koto next` would route it, and when their result doesn't
+  satisfy the edge it exits 1 with `gate_blocked`, names the gate, and appends
+  nothing. An edge that routes on the gate failing stays reachable while it
+  fails, and an edge that needs an output the gate isn't producing is refused
+  even while the gate passes. Overridable gates are still skipped, so `--to`
+  remains the recovery path for a stuck session. The rule is in
+  `docs/guides/cli-usage.md`, under "Directed transitions and non-overridable
+  gates".
 
 - **`koto context add` and `koto context remove` refuse a session that has no
   state log, instead of creating a log koto can't read.** Both verbs append an

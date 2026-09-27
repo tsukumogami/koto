@@ -1607,12 +1607,17 @@ pub(crate) fn directed_target_blockers(
                         serde_json::Value::Object(gates),
                     );
                     let evidence = serde_json::Value::Object(evidence);
+                    // Only `gates.<name>.*` keys are checked, so no `vars.*`
+                    // matcher can reach the empty variable map.
+                    let no_variables = std::collections::HashMap::new();
                     transition
                         .when
                         .iter()
                         .flatten()
                         .filter(|(key, _)| key.starts_with(&prefix))
-                        .all(|(key, expected)| resolve_value(&evidence, key) == Some(expected))
+                        .all(|(key, expected)| {
+                            condition_holds(key, expected, &evidence, &no_variables)
+                        })
                 }
             };
             if !holds {
@@ -1675,44 +1680,58 @@ pub(crate) fn conditional_match_indices(
     variables: &std::collections::HashMap<String, String>,
 ) -> Vec<usize> {
     let mut matches: Vec<usize> = Vec::new();
-    let evidence_prefix = format!("{}.", EVIDENCE_NAMESPACE);
-    let vars_prefix = format!("{}.", VARS_NAMESPACE);
     for (index, transition) in template_state.transitions.iter().enumerate() {
         if let Some(conditions) = &transition.when {
-            let all_match = conditions.iter().all(|(field, expected)| {
-                // Issue #11: `evidence.<field>: present` matches when the
-                // agent-submitted evidence map contains `<field>` as a
-                // top-level key. The resolver's evidence map is built from
-                // the events since the last Transitioned event, so this
-                // reflects "any event since the last state transition".
-                if is_present_matcher(expected) && field.starts_with(&evidence_prefix) {
-                    let inner = &field[evidence_prefix.len()..];
-                    return !inner.is_empty()
-                        && evidence
-                            .as_object()
-                            .is_some_and(|obj| obj.contains_key(inner));
-                }
-                // Issue #141: `vars.<name>: {is_set: bool}` checks whether
-                // a template variable was provided at init time with a
-                // non-empty value.
-                if field.starts_with(&vars_prefix) {
-                    if let Some(expected_set) = is_is_set_matcher(expected) {
-                        let var_name = &field[vars_prefix.len()..];
-                        let is_set = variables
-                            .get(var_name)
-                            .map(|v| !v.is_empty())
-                            .unwrap_or(false);
-                        return is_set == expected_set;
-                    }
-                }
-                resolve_value(evidence, field) == Some(expected)
-            });
+            let all_match = conditions
+                .iter()
+                .all(|(field, expected)| condition_holds(field, expected, evidence, variables));
             if all_match {
                 matches.push(index);
             }
         }
     }
     matches
+}
+
+/// Whether one `when` entry holds against the resolver's merged evidence.
+///
+/// The single definition of a condition's match, shared by transition
+/// resolution and the `koto next --to` guard, so a matcher form added here
+/// applies to both.
+fn condition_holds(
+    field: &str,
+    expected: &serde_json::Value,
+    evidence: &serde_json::Value,
+    variables: &std::collections::HashMap<String, String>,
+) -> bool {
+    // Issue #11: `evidence.<field>: present` matches when the
+    // agent-submitted evidence map contains `<field>` as a
+    // top-level key. The resolver's evidence map is built from
+    // the events since the last Transitioned event, so this
+    // reflects "any event since the last state transition".
+    let evidence_prefix = format!("{}.", EVIDENCE_NAMESPACE);
+    if is_present_matcher(expected) && field.starts_with(&evidence_prefix) {
+        let inner = &field[evidence_prefix.len()..];
+        return !inner.is_empty()
+            && evidence
+                .as_object()
+                .is_some_and(|obj| obj.contains_key(inner));
+    }
+    // Issue #141: `vars.<name>: {is_set: bool}` checks whether
+    // a template variable was provided at init time with a
+    // non-empty value.
+    let vars_prefix = format!("{}.", VARS_NAMESPACE);
+    if field.starts_with(&vars_prefix) {
+        if let Some(expected_set) = is_is_set_matcher(expected) {
+            let var_name = &field[vars_prefix.len()..];
+            let is_set = variables
+                .get(var_name)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            return is_set == expected_set;
+        }
+    }
+    resolve_value(evidence, field) == Some(expected)
 }
 
 /// Merge evidence from the current epoch's `evidence_submitted` events.
