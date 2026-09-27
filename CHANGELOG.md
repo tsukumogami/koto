@@ -210,6 +210,19 @@ to `0.9.x`).
 
 ### Fixed
 
+- **`koto next --to` no longer walks past a failing `overridable: false`
+  gate (koto#251).** A directed transition skipped gate evaluation entirely,
+  so one `--to` could bypass a gate that `koto overrides record` refuses to
+  force. `--to` now evaluates the non-overridable gates the edge to its target
+  depends on, the way `koto next` would route it, and when their result doesn't
+  satisfy the edge it exits 1 with `gate_blocked`, names the gate, and appends
+  nothing. An edge that routes on the gate failing stays reachable while it
+  fails, and an edge that needs an output the gate isn't producing is refused
+  even while the gate passes. Overridable gates are still skipped, so `--to`
+  remains the recovery path for a stuck session. The rule is in
+  `docs/guides/cli-usage.md`, under "Directed transitions and non-overridable
+  gates".
+
 - **`koto context add` and `koto context remove` refuse a session that has no
   state log, instead of creating a log koto can't read.** Both verbs append an
   event to the session's log, and neither checked that the log existed. The

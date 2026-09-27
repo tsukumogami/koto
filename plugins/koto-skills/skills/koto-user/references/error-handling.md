@@ -72,7 +72,7 @@ All `koto next` error codes, their exit codes, and what to do:
 
 | `error.code` | Exit | Retryable | Meaning | Agent action |
 |---|---|---|---|---|
-| `gate_blocked` | 1 | Yes | One or more gates failed; state has no `accepts` block | Wait for the external condition to change, then retry |
+| `gate_blocked` | 1 | Yes | One or more gates failed; state has no `accepts` block. Also returned by `koto next --to` when the edge to the target depends on an `overridable: false` gate whose result doesn't satisfy that edge; nothing was recorded | Wait for the external condition to change, then retry. For a refused `--to`, satisfy the named gate or pick another target; don't try to force it |
 | `integration_unavailable` | 1 | Yes | Integration runner is not configured | Report to user; cannot be resolved by the agent alone |
 | `concurrent_access` | 1 | Yes | Another `koto next` call is already running | Wait briefly, then retry |
 | `invalid_submission` | 2 | No | Evidence failed schema validation | Check `error.details` for per-field reasons; fix the `--with-data` payload |

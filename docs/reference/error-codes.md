@@ -93,7 +93,7 @@ The `details` array is empty when the error isn't field-specific. The thirteen e
 
 | Code | Exit | Meaning |
 |------|:----:|---------|
-| `gate_blocked` | 1 | One or more command gates failed or timed out. Transient -- may resolve on retry. |
+| `gate_blocked` | 1 | One or more command gates failed or timed out, or `koto next --to` was refused because the edge to its target depends on an `overridable: false` gate whose current result doesn't satisfy that edge (the message and `details` name the gate; nothing is appended). Transient -- may resolve on retry. |
 | `integration_unavailable` | 1 | The state declares an integration but no runner is available. Transient. |
 | `concurrent_access` | 1 | Another `koto next` invocation is already running on this workflow. Transient -- wait and retry. |
 | `invalid_submission` | 2 | The `--with-data` payload is malformed, too large, or fails schema validation. Caller must fix the payload. |
@@ -104,7 +104,7 @@ The `details` array is empty when the error isn't field-specific. The thirteen e
 | `persistence_error` | 3 | A disk I/O failure while reading or writing the state file. |
 | `execution_anchor_mismatch` | 2 | The tick ran from a directory that is neither the session's execution anchor nor beneath it. The message names the bound directory. Run `koto next` from there, or rebind the session. |
 | `execution_anchor_unresolvable` | 3 | The session's recorded execution anchor names nothing on this machine -- the checkout was deleted or the session moved machines. Rebind the session to where the tree is now. |
-| `capture_unset` | 3 | A state's instruction text reads a `capture_stdout_as` name that no state delivered on this run. The message names the value and the state that produces it. |
+| `capture_unset` | 3 | A state's instruction text, or a field of one of its gates, reads a `capture_stdout_as` name that no state delivered on this run. That includes a non-overridable gate `koto next --to` evaluates. The message names the value and the state that produces it. |
 | `nested_invocation` | 2 | The tick was started from inside a command koto is running. Take the `koto next` call out of the command. |
 
 Exit code 1 means transient -- the agent can retry without changing its behavior. Exit code 2 means the agent must change something (fix the payload, pick a different target, etc.).

@@ -96,9 +96,22 @@ koto next <name> [--with-data <json>] [--to <target>] [--no-cleanup]
 
 **Optional flags:**
 - `--with-data <json>` -- Submit evidence as a JSON object, validated against the state's `accepts` schema. On success, appends an `evidence_submitted` event and sets `advanced: true` in the response.
-- `--to <target>` -- Directed transition to a named state. The target must be a valid transition from the current state. Appends a `directed_transition` event, then dispatches on the new state (skipping gate evaluation).
+- `--to <target>` -- Directed transition to a named state. The target must be a valid transition from the current state. Appends a `directed_transition` event, then dispatches on the new state. Gates are skipped, except a non-overridable gate the edge to the target depends on; see [Directed transitions and non-overridable gates](#directed-transitions-and-non-overridable-gates).
 
 The `--with-data` and `--to` flags are mutually exclusive. Passing both produces a `precondition_failed` error with exit code 2. The `--with-data` payload is capped at 1 MB.
+
+#### Directed transitions and non-overridable gates
+
+`--to` skips a state's gates, so it stays the way out of a stuck state, with one exception: a gate declared `overridable: false` that the edge to the target depends on is evaluated first. If its result doesn't satisfy that edge, `--to` exits 1 with `gate_blocked`, names the gate in the message and in `details`, and appends nothing. A `--to` that proceeds appends exactly the `directed_transition` event it always did.
+
+An edge depends on a gate the way `koto next` would route it:
+
+- An edge whose `when` clause reads `gates.<gate>.*` is checked against the gate's real output. An edge that routes on the gate failing stays open while it fails, and an edge that needs a particular output is refused while the gate produces a different one, even if the gate passed.
+- An unconditional edge needs the gate to pass.
+- In a state that has no `accepts` and doesn't route on gate output, every edge needs the gate to pass.
+- Any other edge, such as an evidence-conditioned edge in a state with `accepts`, doesn't depend on the gate.
+
+When several edges lead to the target, `--to` is refused only if every one is blocked. A gate that reads a `capture_stdout_as` value this run hasn't produced can't be evaluated, so `--to` refuses with `capture_unset`. Overridable gates are never evaluated on this path.
 
 The `--with-data` value can be either inline JSON or a file reference. Prefix a path with `@` to read the payload from disk — useful for batch task lists and any payload large enough to be awkward on the command line:
 
