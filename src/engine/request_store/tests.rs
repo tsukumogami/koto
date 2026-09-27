@@ -1153,9 +1153,14 @@ fn a_bounded_lock_wait_surfaces_contention_rather_than_hanging() {
     let _held = acquire_request_lock(root, &id, Duration::from_secs(1)).expect("hold the lock");
 
     let started = Instant::now();
-    let err = append_under_lock(root, &id, Duration::from_millis(100), None, |_| {
-        panic!("the precondition must never run without the lock")
-    })
+    let err = append_under_lock(
+        root,
+        &id,
+        Duration::from_millis(100),
+        None,
+        Wake::Quiet,
+        |_| panic!("the precondition must never run without the lock"),
+    )
     .expect_err("must time out");
     assert!(
         matches!(err, RequestStoreError::LockContention { .. }),
@@ -2294,4 +2299,219 @@ fn a_pre_attach_bind_event_replays_with_no_attach_or_identity() {
     assert_eq!(leg.attach, None);
     let json = serde_json::to_value(leg).expect("serialize");
     assert!(json.get("attach").is_none() && json.get("bound_template").is_none());
+}
+
+// ===== Leg wake: which writes ring the request's principals =====
+
+fn wake_cursor(root: &Path, session: &str) -> crate::engine::wake_signal::WakeCursor {
+    let id = crate::engine::types::ValidatedSessionId::new(session).expect("session id");
+    crate::engine::wake_signal::read_cursor(root, &id).expect("read cursor")
+}
+
+fn wake_lines(root: &Path, session: &str) -> usize {
+    let id = crate::engine::types::ValidatedSessionId::new(session).expect("session id");
+    std::fs::read_to_string(crate::engine::wake_signal::wake_path(root, &id))
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+fn seed_principals(root: &Path, requested_by: &str, coordinator: &str) -> ValidatedRequestId {
+    let spec = NewRequest {
+        requested_by: requested_by.to_string(),
+        coordinator_of_record: coordinator.to_string(),
+        ..two_leg_spec()
+    };
+    create_request(root, &spec, &RequestBounds::default()).expect("create")
+}
+
+fn abandon(root: &Path, id: &ValidatedRequestId, leg: &str) -> AppendResult {
+    abandon_leg(
+        root,
+        id,
+        &AbandonLeg {
+            leg_name: leg.to_string(),
+            rationale: "not needed".to_string(),
+            issued_by: None,
+            timestamp: ts(4),
+        },
+    )
+    .expect("abandon")
+}
+
+fn close(root: &Path, id: &ValidatedRequestId) {
+    close_request(
+        root,
+        id,
+        &CloseRequest {
+            disposition: None,
+            issued_by: None,
+            timestamp: ts(6),
+        },
+    )
+    .expect("close");
+}
+
+#[test]
+fn every_disposition_write_rings_before_it_returns() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed(root);
+
+    let mut last = wake_cursor(root, "coord-a");
+    let mut step = |label: &str, last: &mut crate::engine::wake_signal::WakeCursor| {
+        let now = wake_cursor(root, "coord-a");
+        assert_ne!(&now, last, "{label} did not ring");
+        *last = now;
+    };
+
+    record_result(
+        root,
+        &id,
+        &LegResult {
+            leg_name: "reviewer-a".to_string(),
+            result: result("done"),
+            source: LegResultSource::Promoted,
+            issued_by: None,
+            timestamp: ts(3),
+            final_state: Some("done".to_string()),
+        },
+    )
+    .expect("promoted result");
+    step("a promoted result", &mut last);
+
+    abandon(root, &id, "reviewer-b");
+    step("a leg abandonment", &mut last);
+
+    close(root, &id);
+    step("a close", &mut last);
+
+    let explicit = seed(root);
+    resolve(root, &explicit, "reviewer-a", "a");
+    step("an explicit resolve", &mut last);
+
+    let refused = seed_scope(root);
+    record_refusal(root, &refused, &refusal("template-mismatch")).expect("refusal");
+    step("a refusal", &mut last);
+
+    let whole = seed(root);
+    abandon_leg_for_request(
+        root,
+        &whole,
+        &AbandonLeg {
+            leg_name: "reviewer-a".to_string(),
+            rationale: "superseded".to_string(),
+            issued_by: None,
+            timestamp: ts(4),
+        },
+    )
+    .expect("request-scoped abandon");
+    step("a request abandonment", &mut last);
+}
+
+#[test]
+fn creating_binding_and_progress_do_not_ring() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed(root);
+    let before = wake_cursor(root, "coord-a");
+
+    bind_leg(
+        root,
+        &id,
+        &BindLeg {
+            leg_name: "reviewer-a".to_string(),
+            child_session_id: "child-1".to_string(),
+            dispatch_epoch: Some(1),
+            issued_by: None,
+            timestamp: ts(2),
+        },
+    )
+    .expect("bind");
+    append_progress(
+        root,
+        &id,
+        &LegProgress {
+            leg_name: "reviewer-a".to_string(),
+            content: progress_content("halfway"),
+            issued_by: None,
+            timestamp: ts(3),
+        },
+        &RequestBounds::default(),
+    )
+    .expect("progress");
+
+    assert_eq!(wake_cursor(root, "coord-a"), before);
+    assert_eq!(before, crate::engine::wake_signal::WakeCursor::empty());
+}
+
+#[test]
+fn distinct_principals_both_ring_and_a_bystander_does_not() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed_principals(root, "asker", "coord");
+    resolve(root, &id, "reviewer-a", "a");
+    assert_eq!(wake_lines(root, "asker"), 1);
+    assert_eq!(wake_lines(root, "coord"), 1);
+    assert_eq!(wake_lines(root, "bystander"), 0);
+}
+
+#[test]
+fn matching_principals_ring_once_per_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed(root);
+    resolve(root, &id, "reviewer-a", "a");
+    assert_eq!(wake_lines(root, "coord-a"), 1);
+}
+
+#[test]
+fn a_recognised_retry_and_a_repeated_abandon_ring_again() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed(root);
+    resolve(root, &id, "reviewer-a", "a");
+    let again = resolve(root, &id, "reviewer-a", "a");
+    assert!(!again.written, "the retry is recognised, not re-written");
+    assert_eq!(wake_lines(root, "coord-a"), 2);
+
+    abandon(root, &id, "reviewer-b");
+    let repeat = abandon(root, &id, "reviewer-b");
+    assert!(!repeat.written);
+    assert_eq!(wake_lines(root, "coord-a"), 4);
+}
+
+#[test]
+fn an_invalid_principal_is_skipped_and_the_other_still_rings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+
+    let bad_coord = seed_principals(root, "asker", "../not-a-session");
+    resolve(root, &bad_coord, "reviewer-a", "a");
+    assert_eq!(wake_lines(root, "asker"), 1);
+
+    let bad_asker = seed_principals(root, "../not-a-session", "coord");
+    resolve(root, &bad_asker, "reviewer-a", "a");
+    assert_eq!(wake_lines(root, "coord"), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unwritable_wakes_directory_does_not_fail_the_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed(root);
+    let wakes = crate::engine::wake_signal::wakes_dir(root);
+    std::fs::create_dir_all(&wakes).unwrap();
+    std::fs::set_permissions(&wakes, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let outcome = resolve(root, &id, "reviewer-a", "a");
+
+    std::fs::set_permissions(&wakes, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(outcome.written);
+    let view = read_view(root, &id).expect("read");
+    assert_eq!(
+        view.leg("reviewer-a").unwrap().disposition,
+        LegDisposition::Resolved
+    );
 }

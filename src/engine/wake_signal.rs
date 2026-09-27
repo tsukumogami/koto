@@ -85,7 +85,7 @@ static RING_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Error)]
 pub enum WakeSignalError {
     /// The principal is not a valid session id, so it names no wake file.
-    #[error("'{principal}' is not a valid session id: {reason}")]
+    #[error("{principal:?} is not a valid session id: {reason}")]
     InvalidPrincipal { principal: String, reason: String },
 
     /// Something other than a regular file sits at the wake path.
@@ -169,10 +169,10 @@ pub fn ring_principals(koto_root: &Path, requested_by: &str, coordinator_of_reco
         match ring(koto_root, principal) {
             Ok(()) => {}
             Err(WakeSignalError::InvalidPrincipal { principal, .. }) => {
-                eprintln!("warning: no wake delivered to '{principal}': not a valid session id");
+                eprintln!("warning: no wake delivered to {principal:?}: not a valid session id");
             }
             Err(e) => {
-                eprintln!("warning: could not deliver a wake to '{principal}': {e}");
+                eprintln!("warning: could not deliver a wake to {principal:?}: {e}");
             }
         }
     }
