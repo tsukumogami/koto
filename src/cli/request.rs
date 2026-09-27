@@ -48,6 +48,7 @@ use crate::engine::types::{
     now_iso8601, CloseDisposition, LegDeclaration, LegDisposition, LegResultSource, LegTemplates,
     RequestState, ValidatedCoordId, ValidatedSessionId, WorkflowResult,
 };
+use crate::engine::wake_signal;
 
 // ===== The contract =====
 
@@ -66,7 +67,10 @@ pub const CLI_CONTRACT_MAJOR: u32 = 1;
 /// `session_terminal` and `self_attached_leg` codes, the leg fields
 /// `attach` and `bound_template`, the `refused` result source, and a
 /// leg `template` that may be a list.
-pub const CLI_CONTRACT_MINOR: u32 = 1;
+///
+/// Minor 2 added `watch`, which blocks until a session's wake file
+/// changes and prints `session`, `woke` and `cursor`.
+pub const CLI_CONTRACT_MINOR: u32 = 2;
 
 /// The contract version, emitted on every response.
 ///
@@ -115,6 +119,15 @@ const MIN_WAIT_INTERVAL_SECS: u64 = 1;
 /// Granularity the wait sleeps at, so a signal is noticed promptly
 /// rather than after a whole interval.
 const WAIT_SLICE: Duration = Duration::from_millis(100);
+
+/// How often `watch` re-reads the wake file.
+///
+/// Deliberately under `wait`'s one-second floor. That floor guards
+/// against re-reading and re-projecting a whole request log; a watch
+/// reads one file's size and at most its last line, which is cheap enough
+/// to do ten times a second and is what keeps the documented wake bound
+/// at one second.
+const WATCH_POLL: Duration = Duration::from_millis(100);
 
 // ===== Errors =====
 
@@ -424,7 +437,7 @@ impl From<StateFilter> for RequestState {
     }
 }
 
-/// The eleven subcommands under `koto request`.
+/// The twelve subcommands under `koto request`.
 ///
 /// Leg-scoped `abandon` and request-scoped `abandon-request` are
 /// separate subcommands rather than one subcommand with an optional
@@ -534,6 +547,28 @@ pub enum RequestCommand {
         /// 1 so zero cannot spin.
         #[arg(long, value_name = "N")]
         interval_secs: Option<u64>,
+    },
+
+    /// Block until a session's wake file changes, or the timeout passes.
+    ///
+    /// Exits zero either way and prints `woke` (true on a wake, false at
+    /// the timeout) with a `cursor`; pass that cursor as `--since` to the
+    /// next watch so a wake between the two is not missed. A wake means
+    /// only "look again": tick the session and read its state.
+    Watch {
+        /// The session whose wake file to watch.
+        #[arg(long, value_name = "SESSION_ID")]
+        session: String,
+
+        /// Absolute budget for the watch, in seconds. Required: a watch
+        /// with no deadline is a hang.
+        #[arg(long, value_name = "N")]
+        timeout_secs: u64,
+
+        /// A cursor printed by an earlier watch. A wake delivered since
+        /// then returns at once.
+        #[arg(long, value_name = "CURSOR")]
+        since: Option<String>,
     },
 
     /// List requests. Cursor-free: advances no coordinator cursor and
@@ -1021,6 +1056,11 @@ fn run(command: RequestCommand) -> Result<String, RequestError> {
             let predicate = Predicate::from_flags(leg, all_legs, closed, resolved_count)?;
             wait(&id, predicate, timeout_secs, interval_secs)
         }
+        RequestCommand::Watch {
+            session,
+            timeout_secs,
+            since,
+        } => watch(&session, timeout_secs, since.as_deref()),
         RequestCommand::List {
             requested_by,
             coordinator_of_record,
@@ -1709,7 +1749,9 @@ pub(crate) fn init_attach_leg(
 /// is open and unbound; on any other leg, a closed or missing request, or
 /// an I/O failure it writes nothing, and the invocation refuses with its
 /// own error either way, so its output is the same with or without
-/// `--koto-leg`.
+/// `--koto-leg`. The one exception: when a recorded refusal cannot ring
+/// the request's wake files, the store adds a warning line naming the
+/// principal it could not wake.
 pub(crate) fn init_record_refusal(
     target: &InitLegTarget,
     reason: &str,
@@ -2144,6 +2186,85 @@ fn wait(
     }
 }
 
+// ===== watch =====
+
+/// What `watch` prints.
+#[derive(Serialize)]
+struct WatchEnvelope<'a> {
+    session: &'a str,
+    woke: bool,
+    cursor: String,
+    cli_contract: CliContract,
+}
+
+/// Poll `session`'s wake file until it differs from the starting cursor
+/// or the deadline passes.
+///
+/// The starting cursor is `--since` when given, else the file as it is
+/// now. Both a wake and a timeout exit zero: a timeout is a harness
+/// heartbeat, not a failure, and either way the caller ticks and watches
+/// again.
+fn watch(session: &str, timeout_secs: u64, since: Option<&str>) -> Result<String, RequestError> {
+    let session = ValidatedSessionId::new(session).map_err(|e| {
+        RequestError::new(RequestErrorCode::InvalidIdentifier, e.to_string())
+            .with_detail("--session", "not a valid session identifier")
+    })?;
+    let since = match since {
+        Some(raw) => Some(raw.parse::<wake_signal::WakeCursor>().map_err(|e| {
+            RequestError::new(RequestErrorCode::InvalidSubmission, e.to_string())
+                .with_detail("--since", "not a cursor printed by koto request watch")
+        })?),
+        None => None,
+    };
+    let root = koto_root()?;
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let interrupted = install_interrupt_flag();
+    let read = || {
+        wake_signal::read_cursor(&root, &session).map_err(|e| {
+            RequestError::new(
+                RequestErrorCode::PersistenceError,
+                format!("could not read the wake file: {e}"),
+            )
+        })
+    };
+
+    let baseline = match since {
+        Some(cursor) => cursor,
+        None => read()?,
+    };
+    loop {
+        let current = read()?;
+        if current != baseline {
+            return render_watch(&session, true, &current);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return render_watch(&session, false, &current);
+        }
+        sleep_until((now + WATCH_POLL).min(deadline), &interrupted)?;
+    }
+}
+
+fn render_watch(
+    session: &ValidatedSessionId,
+    woke: bool,
+    cursor: &wake_signal::WakeCursor,
+) -> Result<String, RequestError> {
+    let envelope = WatchEnvelope {
+        session: session.as_str(),
+        woke,
+        cursor: cursor.to_string(),
+        cli_contract: CliContract::current(),
+    };
+    serde_json::to_string(&envelope).map_err(|e| {
+        RequestError::new(
+            RequestErrorCode::PersistenceError,
+            format!("failed to serialize the response: {e}"),
+        )
+    })
+}
+
 /// Resolve `--interval-secs` against its default and its floor.
 ///
 /// The floor is the whole point: an interval of zero would spin,
@@ -2233,6 +2354,24 @@ mod tests {
         // and by `the_current_contract_is_accepted`.
     }
 
+    // -- watch --
+
+    #[test]
+    fn watch_refuses_an_invalid_session_before_any_io() {
+        let err = watch("../escape", 1, None).expect_err("must refuse");
+        assert_eq!(err.code, RequestErrorCode::InvalidIdentifier);
+        assert_eq!(err.code.exit_code(), 2);
+    }
+
+    #[test]
+    fn watch_refuses_an_unparseable_cursor_before_any_io() {
+        for bad in ["", "nope", "w1:5", "w2:0:", "w1:0:1.2"] {
+            let err = watch("coord", 1, Some(bad)).expect_err("must refuse");
+            assert_eq!(err.code, RequestErrorCode::InvalidSubmission, "{bad:?}");
+            assert_eq!(err.code.exit_code(), 2);
+        }
+    }
+
     #[test]
     fn a_malformed_pin_is_a_contract_mismatch_not_a_panic() {
         for raw in ["1", "1.0.0", "x.y", "", "-1.0"] {
@@ -2249,7 +2388,7 @@ mod tests {
     fn the_contract_serializes_as_two_integers() {
         let json = serde_json::to_value(CliContract::current()).expect("serialize");
         assert_eq!(json["major"], 1);
-        assert_eq!(json["minor"], 1);
+        assert_eq!(json["minor"], 2);
         assert!(
             json["major"].is_number() && json["minor"].is_number(),
             "a string would let a consumer compare 1.10 against 1.9 lexicographically and be wrong"

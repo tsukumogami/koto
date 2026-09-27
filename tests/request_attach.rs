@@ -250,7 +250,7 @@ fn a_root_session_attaches_and_the_leg_records_its_identity() {
         ],
     );
     assert_eq!(envelope["written"], true);
-    assert_eq!(envelope["cli_contract"]["minor"], 1);
+    assert_eq!(envelope["cli_contract"]["minor"], 2);
     let leg = &envelope["legs"]["scope"];
     assert_eq!(leg["bound_child"], "scope-t1");
     assert_eq!(leg["attach"], "self");
