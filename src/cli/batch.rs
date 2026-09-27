@@ -2220,11 +2220,11 @@ pub fn build_children_complete_output(
     // Live-child converge read: each on-disk child's auto-promoted
     // result, read from its OWN `request_store.result` event, keyed by
     // raw session id (DESIGN-request-store-converge.md Decision 3, AC2).
-    // This is the preferred dereference source while the child session
-    // still exists; the parent's `ChildCompleted.result` copy is the
-    // fallback once the child has been auto-cleaned. The targeted event
-    // is read directly — no working/session transcript is ever replayed
-    // (AC3).
+    // This is the only dereference source for a child still on disk with
+    // a readable, classified log; the parent's `ChildCompleted.result`
+    // copy is the fallback once the child has been auto-cleaned or when
+    // its log can't be read. The targeted event is read directly — no
+    // working/session transcript is ever replayed (AC3).
     let mut result_by_session: HashMap<String, WorkflowResult> = HashMap::new();
     // On-disk children whose own log is the authority for their result: a
     // readable log whose current state the child's template classifies.
@@ -2280,9 +2280,10 @@ pub fn build_children_complete_output(
                     _ => None,
                 });
                 // Dereference the live child's auto-promoted result from
-                // its OWN log: the `request_store.result` recorded for its
-                // current arrival (AC2). A malformed result event (e.g. one missing the
-                // required `result` field) is a serde DESERIALIZATION
+                // its OWN log: the `request_store.result` recorded for
+                // its current arrival (AC2). A malformed result event (e.g.
+                // one missing the required `result` field) is a serde
+                // DESERIALIZATION
                 // FAILURE, not the `Unknown` arm (which only catches
                 // unrecognized type STRINGS). Such a failure is absorbed
                 // here, not propagated: a corrupt child log makes

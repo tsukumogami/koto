@@ -301,13 +301,22 @@ failed parent append leaves the parent without the notice (the gate is still
 right, since it reads the child from disk). For a session koto removes, the
 removal tick re-sends the notice; the index entry is not re-written, because
 a session that is gone needs none. This is accepted residual risk: it needs a
-write failure between two appends to the same disk, and re-trying every tick
-would bring back the unbounded appends the gate exists to stop.
+write failure between two appends in the same sessions directory, and
+re-trying every tick would bring back the unbounded appends the gate exists
+to stop.
+
+The converse case is bounded only by the failure itself. While a session's
+own log refuses the step-2 append, every tick is an arrival and appends
+another index entry and parent notice; readers dedupe, so the gate stays
+correct, and the appends stop on the first tick whose step 2 lands. A kept
+child in that state also holds its parent's `results_in` at false until
+something ticks it after the fault clears: the gate lists it in
+`outstanding` with no result, which is the signal to tick it.
 
 If the step-2 append fails, `arrival` stays true on the next tick and steps 4
-and 5 run again, which can duplicate a `ChildCompleted` and an index entry. Both are harmless: the converge keeps the latest
-`ChildCompleted` per task and prefers the on-disk child, and the index reader
-keeps one entry per session.
+and 5 run again, which can duplicate a `ChildCompleted` and an index entry. Both are harmless for correctness: the converge keeps the
+latest `ChildCompleted` per task and prefers the on-disk child, and the index
+reader keeps one entry per session.
 
 #### Alternatives Considered
 

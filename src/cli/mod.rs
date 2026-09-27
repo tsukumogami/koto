@@ -2541,11 +2541,11 @@ fn project_terminal_outcome(compiled: &CompiledTemplate, final_state: &str) -> T
 /// This is the durable record of the child's result: it rides the same
 /// terminal tick — and the same atomic `O_APPEND` discipline
 /// ([`SessionBackend::append_event`]) — that the terminal evidence and
-/// the `ChildCompleted` notification already use. The result is
-/// synthesized once by [`finish_terminal_tick`] via
-/// [`synthesize_workflow_result`] and passed by reference here, so the
-/// child's log, the request leg's promotion, and the parent's
-/// `ChildCompleted` all carry the same envelope.
+/// the `ChildCompleted` notification already use. The result is resolved
+/// once, by the caller through [`terminal_record`] before the response is
+/// printed, and passed through [`finish_terminal_tick`] by reference, so
+/// the response, the child's log, the request leg's promotion, and the
+/// parent's `ChildCompleted` all carry the same envelope.
 ///
 /// Returns `true` when the event was durably appended, which is exactly
 /// the condition under which the terminal-index entry may set
@@ -2777,8 +2777,8 @@ fn append_child_completed_to_parent(
     // Carry a copy of the auto-promoted result on the parent's log so
     // the converge gate can read it after the child session is
     // auto-cleaned (DESIGN-request-store-converge.md Decision 3). The
-    // envelope is synthesized once by [`finish_terminal_tick`] and
-    // shared with the child-log append and the leg promotion.
+    // envelope is resolved once, through [`terminal_record`], and shared
+    // with the child-log append and the leg promotion.
     let payload = EventPayload::ChildCompleted {
         child_name: child_name.to_string(),
         task_name,
@@ -2895,12 +2895,13 @@ fn append_terminal_index_for_session(
 /// only step 6: whether the session stays on disk. It never withholds the
 /// result from the parent or the leg (koto issue 240).
 ///
-/// A tick that is not an arrival but is about to remove the session
-/// re-sends step 5 first. That is a tick after removal was deferred (a
-/// failed parent append or a retryable promotion failure), and the first
-/// flagless tick of a terminal an earlier tick kept with `--no-cleanup`. A removed child therefore always left
-/// its `ChildCompleted` behind; a duplicate is harmless, because the
-/// converge keeps the latest event per task and prefers an on-disk child.
+/// A tick that is not an arrival and runs without `--no-cleanup` re-sends
+/// step 5 before it tries to remove the session. That is a tick after
+/// removal was deferred (a failed parent append or a retryable promotion
+/// failure), and the first flagless tick of a terminal an earlier tick
+/// kept with `--no-cleanup`. A removed child therefore always left its
+/// `ChildCompleted` behind; a duplicate is harmless, because the converge
+/// keeps the latest event per task and prefers an on-disk child.
 #[cfg(unix)]
 fn finish_terminal_tick(
     backend: &dyn SessionBackend,
