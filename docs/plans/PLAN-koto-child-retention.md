@@ -63,7 +63,8 @@ R2, R3, R12, R14 and R15 and DESIGN Decision 2.
 - In `src/cli/batch.rs`, the live-child dereference uses
   `recorded_result_for_current_arrival` instead of the latest
   `request_store.result`, and the parent-copy fallback is skipped for a child
-  known to be live on disk (readable log, non-terminal current state).
+  whose own log is readable and whose current state classifies (terminal or
+  not).
 
 **Tests** (`tests/child_retention_test.rs` unless named):
 `a_kept_child_delivers_its_result_to_either_parent_shape`,
@@ -71,9 +72,10 @@ R2, R3, R12, R14 and R15 and DESIGN Decision 2.
 `repeat_ticks_of_a_kept_root_write_nothing`,
 `a_child_parked_without_a_result_delivers_on_its_next_tick`,
 `a_rewound_child_reports_no_stale_result`,
+`a_child_back_in_a_terminal_reports_no_stale_result`,
 `zero_one_or_two_parent_notices_give_the_same_gate`,
 `a_failed_parent_notice_keeps_the_child_until_it_is_delivered`,
-`a_kept_child_ticked_without_the_flag_is_removed_after_one_notice`; the
+`a_kept_child_ticked_without_the_flag_is_removed_and_renotifies_once`; the
 updated `tests/terminal_result_test.rs`, `tests/request_dispatch.rs`,
 `tests/batch_scheduler_test.rs` and `tests/gate_field_substitution_test.rs`;
 the existing fallback tests in `src/cli/batch.rs`

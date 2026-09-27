@@ -2720,12 +2720,12 @@ fn terminal_record(
     }
 }
 
-/// Issue #134: append a `ChildCompleted` event to the parent's log just
-/// before a child session's auto-cleanup runs.
+/// Issue #134: append a `ChildCompleted` event to the parent's log.
 ///
-/// Called from both terminal cleanup sites in [`handle_next`] (the `--to`
-/// path and the advance-loop path). The return value tells the caller
-/// whether cleanup is safe:
+/// Called from [`finish_terminal_tick`] on a child's arrival at a terminal,
+/// whether or not the session is then kept, and again on a later tick that
+/// removes a session it did not just land in. The return value tells the
+/// caller whether cleanup is safe:
 ///
 /// * [`ChildCompletedAppend::NoParent`] — no parent to notify (standalone
 ///   child, or the parent was already cleaned up). Cleanup proceeds.
@@ -2799,8 +2799,8 @@ fn append_child_completed_to_parent(
     }
 }
 
-/// Issue 8: append a workspace-wide terminal-index entry for `session_id`
-/// just before session cleanup.
+/// Issue 8: append a workspace-wide terminal-index entry for `session_id`,
+/// once per arrival at a terminal, whether or not the session is then kept.
 ///
 /// Classifies the terminal state as `"abandoned"` when the events log
 /// carries a `WorkflowCancelled` event, otherwise `"completed"`. Stats
@@ -2896,9 +2896,9 @@ fn append_terminal_index_for_session(
 /// result from the parent or the leg (koto issue 240).
 ///
 /// A tick that is not an arrival but is about to remove the session
-/// re-sends step 5 first. That is the tick after a failed parent append
-/// deferred removal, and the first flagless tick of a terminal an earlier
-/// tick kept with `--no-cleanup`. A removed child therefore always left
+/// re-sends step 5 first. That is a tick after removal was deferred (a
+/// failed parent append or a retryable promotion failure), and the first
+/// flagless tick of a terminal an earlier tick kept with `--no-cleanup`. A removed child therefore always left
 /// its `ChildCompleted` behind; a duplicate is harmless, because the
 /// converge keeps the latest event per task and prefers an on-disk child.
 #[cfg(unix)]
@@ -4259,7 +4259,7 @@ fn handle_next(
                         );
                     }
                 }
-                // Auto-cleanup after output when reaching a terminal state.
+                // Deliver the result, then clean up unless the session is kept.
                 if let (
                     next_types::NextResponse::Terminal {
                         state: final_state, ..
@@ -5826,7 +5826,7 @@ fn handle_next(
                     );
                 }
             }
-            // Auto-cleanup after output when reaching a terminal state.
+            // Deliver the result, then clean up unless the session is kept.
             if let (
                 NextResponse::Terminal {
                     state: final_state, ..
@@ -6349,9 +6349,10 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     // terminal state. The recorded result for this arrival is what the
     // terminal tick reported, so it is returned as-is: a context write
     // after the terminal does not change it. A terminal session with no
-    // record -- a parked terminal that declares no `result:` map, or one
-    // that reached its terminal before results were recorded -- gets the
-    // result resolved now, read-only; nothing is appended.
+    // record for its arrival -- one parked by a koto that did not record a
+    // result for a terminal without a `result:` map, or one whose record
+    // failed to append -- gets the result resolved now, read-only; nothing
+    // is appended.
     #[cfg(unix)]
     if is_terminal {
         let result =

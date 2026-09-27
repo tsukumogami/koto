@@ -2226,11 +2226,13 @@ pub fn build_children_complete_output(
     // is read directly — no working/session transcript is ever replayed
     // (AC3).
     let mut result_by_session: HashMap<String, WorkflowResult> = HashMap::new();
-    // On-disk children koto can positively classify as not terminal: a
-    // readable log whose current state the child's template marks
-    // non-terminal. An unreadable log or template is not in this set; for
-    // those the parent's copy stays a usable fallback.
-    let mut known_live: HashSet<String> = HashSet::new();
+    // On-disk children whose own log is the authority for their result: a
+    // readable log whose current state the child's template classifies.
+    // For these the parent's `ChildCompleted` copy is never read, because
+    // it may belong to an earlier arrival (see the inlining loop below). An
+    // unreadable log or template is not in this set, and for those the
+    // parent's copy stays a usable fallback.
+    let mut own_log_authoritative: HashSet<String> = HashSet::new();
     match backend.list() {
         Ok(sessions) => {
             let child_prefix = format!("{}.", parent_name);
@@ -2269,8 +2271,8 @@ pub fn build_children_complete_output(
                 };
                 let current = derive_state_from_log(&child_events).unwrap_or_default();
                 let flags = child_state_flags(&child_events, &current);
-                if matches!(flags, Some((false, _, _))) {
-                    known_live.insert(info.id.clone());
+                if flags.is_some() {
+                    own_log_authoritative.insert(info.id.clone());
                 }
                 let (terminal, failure, skipped_marker) = flags.unwrap_or((false, false, false));
                 let spawn_entry = child_events.iter().find_map(|e| match &e.payload {
@@ -2278,8 +2280,8 @@ pub fn build_children_complete_output(
                     _ => None,
                 });
                 // Dereference the live child's auto-promoted result from
-                // its OWN log: the latest `request_store.result` event
-                // (AC2). A malformed result event (e.g. one missing the
+                // its OWN log: the `request_store.result` recorded for its
+                // current arrival (AC2). A malformed result event (e.g. one missing the
                 // required `result` field) is a serde DESERIALIZATION
                 // FAILURE, not the `Unknown` arm (which only catches
                 // unrecognized type STRINGS). Such a failure is absorbed
@@ -2485,7 +2487,8 @@ pub fn build_children_complete_output(
     //     own log.
     //   * FALL BACK to the parent's `ChildCompleted.result`
     //     (`result_by_child`) when the child has been auto-cleaned and is
-    //     no longer on disk — the existing Issue 1 path.
+    //     no longer on disk — the existing Issue 1 path — or when its log
+    //     or template cannot be read, so its own record can't be trusted.
     //
     // Both maps are keyed by the child's full session id: `entry.name` is
     // the composed `<parent>.<task>` identity (the raw session id for
@@ -2493,15 +2496,18 @@ pub fn build_children_complete_output(
     // `result_by_session` is keyed by the on-disk `info.id` (the same
     // composed id) and `result_by_child` by `ChildCompleted.child_name`.
     //
-    // The parent's copy is not a fallback for a child koto knows is live
-    // on disk. A child retried or rewound out of a kept failure terminal
-    // has no result for its current arrival yet, and the parent's copy is
-    // the earlier arrival's; inlining it would report a stale failure for
-    // a running child (koto issue 240). A child gone from disk, standing
-    // in a terminal, or unreadable still falls back to the copy.
+    // The parent's copy is not a fallback for a child whose own log is
+    // readable and classified. A child retried or rewound out of a kept
+    // failure terminal has no result for its current arrival until its
+    // new terminal tick records one, and the parent's copy is the earlier
+    // arrival's; inlining it would report a stale answer, whether the
+    // child is running again or has just landed in a terminal (koto issue
+    // 240). Such a child reads as having no result yet, and its next tick
+    // records one. A child gone from disk, or unreadable, still falls back
+    // to the copy.
     for entry in &mut entries {
         if let Some(r) = result_by_session.get(&entry.name).or_else(|| {
-            if known_live.contains(&entry.name) {
+            if own_log_authoritative.contains(&entry.name) {
                 None
             } else {
                 result_by_child.get(&entry.name)

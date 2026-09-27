@@ -556,8 +556,9 @@ fn a_parked_terminal_session_promotes_once_and_then_says_nothing() {
     assert_eq!(after_first["legs"]["reviewer-a"]["disposition"], "resolved");
 
     // Ticking a parked terminal session again is a silent no-op on the
-    // request log: only the promotion is hoisted out of the cleanup
-    // guard, and it is gated on the leg having no result yet.
+    // request log: promotion is gated on the leg having no result yet,
+    // and the other delivery writes on the arrival already being
+    // recorded.
     for _ in 0..3 {
         let (code, _, stderr) = run(tmp.path(), &["next", "child-1", "--no-cleanup"]);
         assert_eq!(code, 0);

@@ -276,17 +276,21 @@ changing.
 `src/cli/batch.rs`. The live-child dereference changes from "latest
 `request_store.result`" to `recorded_result_for_current_arrival`. And the
 fallback to the parent's `ChildCompleted.result` no longer applies to a child
-the converge knows is live on disk: one whose log reads and whose template
-marks its current state non-terminal. A child that is gone from disk, standing
-in a terminal, or unreadable still falls back to the parent's copy, which keeps
-the case where the child-log append failed but the parent copy landed.
+whose own log is readable and whose template classifies its current state,
+terminal or not: that log is the authority, and the parent's copy may belong
+to an earlier arrival. A child that is gone from disk, or whose log or template
+can't be read, still falls back to the parent's copy. A child whose step-2
+append failed therefore reads as having no result until its next tick, which
+is still an arrival and records it.
 
 Without both, a child retried out of a failure terminal carries its old failure
 result into the gate output while it runs again: the gate can't pass (the child
 is not terminal, so `all_complete` is false), but its entry shows the stale
 result and it drops out of `outstanding`, which a coordinator reading the
-directive would take as the child's answer. With them, a retried child reports
-no result until its new arrival records one.
+directive would take as the child's answer. Once the child lands in a terminal
+again, and before that tick records its new result, the stale copy would let a
+gate-waiting parent pass on the old answer. With both changes, a retried child
+reports no result until its new arrival records one.
 
 The arrival gate trades one repair path away. Today a session whose index or
 parent append failed is re-tried on every later tick until it is removed.

@@ -300,10 +300,11 @@ fn expected_done_payload() -> Value {
 // ===== The five carriers =====
 
 /// One session, one template, every place a result is read from. The first
-/// tick parks the terminal (`--no-cleanup`), which is what makes the child's
-/// own log and `koto status` readable; the second tick lets cleanup run,
-/// which is what emits the parent's `ChildCompleted`. Both ticks report the
-/// value recorded on the first.
+/// tick parks the terminal (`--no-cleanup`), which keeps the child's own log
+/// and `koto status` readable, and already delivers the parent's
+/// `ChildCompleted`; the second tick lets cleanup run and re-sends the notice
+/// before removing the session. Both ticks report the value recorded on the
+/// first.
 #[test]
 fn the_declared_payload_rides_all_five_carriers() {
     let tmp = TempDir::new().unwrap();

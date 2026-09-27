@@ -378,6 +378,39 @@ fn a_rewound_child_reports_no_stale_result() {
     assert!(leaf.get("result").is_none(), "no stale result: {leaf}");
 }
 
+/// A kept child that fails, is rewound, and lands in a terminal again has no
+/// result for that new arrival until its terminal tick records one. In that
+/// window the gate must not read the parent's copy from the earlier
+/// arrival: the child reads as having no result yet.
+#[test]
+fn a_child_back_in_a_terminal_reports_no_stale_result() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    init_parent(dir, "p", PARENT_WAITS);
+    init_child(dir, "p.leaf", "p", CHILD);
+    run_ok(
+        dir,
+        &[
+            "next",
+            "p.leaf",
+            "--with-data",
+            r#"{"marker":"fail"}"#,
+            "--no-cleanup",
+        ],
+    );
+    run_ok(dir, &["rewind", "p.leaf"]);
+    // Land it in the terminal again without the tick that records the
+    // result: the state a crash between the two appends would leave.
+    repeat_last_transition_into(dir, "p.leaf", "done_blocked");
+
+    let resp = run_ok(dir, &["next", "p"]);
+    let output = gate_output(&resp);
+    let leaf = gate_child(&output, "p.leaf");
+    assert_eq!(leaf["outcome"], "failure", "{output}");
+    assert!(leaf.get("result").is_none(), "no stale result: {leaf}");
+    assert_eq!(output["results_in"], false, "{output}");
+}
+
 /// Whether the parent log holds no notice, one, or two for a child's
 /// arrival, a child still on disk is classified and dereferenced from its
 /// own log.
@@ -471,10 +504,10 @@ fn a_failed_parent_notice_keeps_the_child_until_it_is_delivered() {
 }
 
 /// A success terminal kept with `--no-cleanup` and ticked again without it
-/// is removed. Its own log and the index gain nothing; the parent gains at
-/// most one more notice, carrying the arrival's result.
+/// is removed. The index gains nothing; the parent gains exactly one more
+/// notice, carrying the arrival's result, sent before the removal.
 #[test]
-fn a_kept_child_ticked_without_the_flag_is_removed_after_one_notice() {
+fn a_kept_child_ticked_without_the_flag_is_removed_and_renotifies_once() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     init_parent(dir, "p", PARENT_KEYED);
@@ -499,7 +532,7 @@ fn a_kept_child_ticked_without_the_flag_is_removed_after_one_notice() {
     assert!(!session_dir(dir, "p.leaf").exists());
     assert_eq!(index_entries(dir, "p.leaf"), 1);
     let after = child_completed(dir, "p");
-    assert!(after.len() <= 2, "{after:?}");
+    assert_eq!(after.len(), 2, "{after:?}");
     assert!(after.iter().all(|n| n["result"] == first[0]["result"]));
 }
 
@@ -509,6 +542,34 @@ fn set_writable(path: &Path, writable: bool) {
     use std::os::unix::fs::PermissionsExt;
     let mode = if writable { 0o644 } else { 0o444 };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Append a copy of the session's last `transitioned` event into `target`
+/// under the next sequence number, as a tick that crashed right after the
+/// transition would leave the log.
+fn repeat_last_transition_into(dir: &Path, name: &str, target: &str) {
+    let path = state_path(dir, name);
+    let body = std::fs::read_to_string(&path).unwrap();
+    let evs: Vec<Value> = body
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|e| e.get("seq").is_some())
+        .collect();
+    let last_seq = evs.last().unwrap()["seq"].as_u64().unwrap();
+    let mut ev = evs
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "transitioned" && e["payload"]["to"] == target)
+        .unwrap()
+        .clone();
+    ev["seq"] = Value::from(last_seq + 1);
+    let mut body = body;
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&ev.to_string());
+    body.push('\n');
+    std::fs::write(&path, body).unwrap();
 }
 
 /// Append a copy of the parent's last `child_completed` event under the
