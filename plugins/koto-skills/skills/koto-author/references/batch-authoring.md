@@ -88,6 +88,8 @@ When a worker enters a terminal state with `failure: true`, the parent's batch v
 2. A `default_action` that writes `failure_reason`.
 3. A `context_assignments` entry on a transition into the terminal state.
 
+A child that reaches a `failure: true` terminal keeps its session, so the reason stays readable after the failure: a coordinator reads it with `koto context get <parent>.<task> failure_reason`, and the parent can `retry_failed` the child. The child's result reaches the parent on the terminal tick either way.
+
 Without any of these, the reason falls back to the state name, and the parent sees `reason_source: "state_name"` instead of `reason_source: "failure_reason"`. W5 warns at compile time when no path writing `failure_reason` is declared, so the author notices before the first failed run. It checks (1) and (3); for (3) every transition into the terminal must assign `failure_reason`, since one edge that doesn't reaches the terminal with no reason. A `default_action` write (2) isn't detected, so a template relying on it still sees W5.
 
 The assignment form looks like this:

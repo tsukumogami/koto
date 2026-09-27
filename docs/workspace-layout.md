@@ -41,6 +41,36 @@ of authority for this document).
 Sessions under `~/.koto/sessions/` ARE the authoritative state and
 must not be deleted manually except via `koto session cleanup`.
 
+### How long a session directory lives
+
+koto removes a session's directory on the tick that lands it in a
+terminal state, with two exceptions that keep it: a terminal declared
+`failure: true` is always kept, and any other terminal is kept when
+that tick passes `koto next --no-cleanup`. The terminal response's
+`retention` field says which applied. A kept session's log and `ctx/`
+stay exactly where they were, so `koto status`, `koto context get`,
+`koto rewind` and a parent's `retry_failed` all still work on it.
+
+A kept session is removed later by:
+
+- reaching a success terminal without `--no-cleanup` after a retry or
+  rewind;
+- its parent being removed by koto at the parent's own terminal, or
+  replaced with `koto init --attach-live --replace-terminal`, which
+  first removes the parent's terminal descendants (never a running one,
+  one with anything running under it, one it can't read, or one whose
+  request leg still waits for its result);
+- `koto workspace prune --root <root>` on the finished root above it;
+- `koto session cleanup <name>`.
+
+Storage cost: one session directory per kept session, the size it
+already had at its terminal. On one developer workstation on
+2026-09-27, `du -sk` over 160 session directories measured a median of
+28 KB and a maximum of 104 KB. Retrying a session reuses its directory.
+Kept sessions accumulate only under a root that is itself kept (a root
+at a failure terminal, or one driven with `--no-cleanup` on every
+tick), until that root is pruned.
+
 `sessions/.migration-conflicts/` is session state too, not a cache: it
 holds sessions the layout migration could not place because their name
 was already taken at the flat level. They are whole sessions with their
@@ -102,7 +132,8 @@ a file the operator never meant to write.
 ### Why this outlives the sessions it references
 
 A request names the child sessions bound to its legs, and those
-sessions are deleted on their terminal tick. The request record
+sessions are usually deleted on their terminal tick (one at a failure
+terminal is kept until something removes it). The request record
 survives that by construction, not by every deletion site remembering
 to spare it: nothing in koto walks `~/.koto/` outside `sessions/` and
 `coordinators/`, so neither `koto session cleanup` nor `koto workspace

@@ -77,7 +77,7 @@ Check the `action` field in the JSON response and act accordingly (see the [acti
 
 **3. Reach completion**
 
-When `action` is `"done"`, the workflow has reached a terminal state. No further `koto next` calls are needed.
+When `action` is `"done"`, the workflow has reached a terminal state. No further `koto next` calls are needed. The response's `retention` field says whether koto kept the session: a terminal declared `failure: true` is always kept (`"reason": "failure_terminal"`), so its context stays readable and its parent can `retry_failed` it; any other terminal is kept only when the tick passed `--no-cleanup` (`"reason": "no_cleanup"`). Keeping a session never withholds its result from the parent or a request leg.
 
 ## Action dispatch table
 
