@@ -572,12 +572,14 @@ fn a_parked_terminal_session_promotes_once_and_then_says_nothing() {
         "no further appends on the request log"
     );
 
-    // And the other three writes stay under the cleanup guard: a parked
-    // terminal child still does not emit the parent event.
+    // The parent notice is delivered once, on the arrival, and the repeat
+    // ticks add no more: `--no-cleanup` keeps the session without
+    // withholding the result from the parent.
     let parent_log = std::fs::read_to_string(state_path(tmp.path(), "coord-a")).unwrap();
-    assert!(
-        !parent_log.contains("child_completed"),
-        "hoisting the parent event would break a parked child's contract: {parent_log}"
+    assert_eq!(
+        parent_log.matches("\"type\":\"child_completed\"").count(),
+        1,
+        "one parent notice for one arrival: {parent_log}"
     );
 }
 

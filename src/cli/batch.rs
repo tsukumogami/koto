@@ -37,7 +37,7 @@
 //! issues extend the struct shapes (see design DESIGN-batch-child-
 //! spawning.md Decision 12) without breaking callers.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -2226,6 +2226,11 @@ pub fn build_children_complete_output(
     // is read directly — no working/session transcript is ever replayed
     // (AC3).
     let mut result_by_session: HashMap<String, WorkflowResult> = HashMap::new();
+    // On-disk children koto can positively classify as not terminal: a
+    // readable log whose current state the child's template marks
+    // non-terminal. An unreadable log or template is not in this set; for
+    // those the parent's copy stays a usable fallback.
+    let mut known_live: HashSet<String> = HashSet::new();
     match backend.list() {
         Ok(sessions) => {
             let child_prefix = format!("{}.", parent_name);
@@ -2263,8 +2268,11 @@ pub fn build_children_complete_output(
                     }
                 };
                 let current = derive_state_from_log(&child_events).unwrap_or_default();
-                let (terminal, failure, skipped_marker) =
-                    child_state_flags(&child_events, &current).unwrap_or((false, false, false));
+                let flags = child_state_flags(&child_events, &current);
+                if matches!(flags, Some((false, _, _))) {
+                    known_live.insert(info.id.clone());
+                }
+                let (terminal, failure, skipped_marker) = flags.unwrap_or((false, false, false));
                 let spawn_entry = child_events.iter().find_map(|e| match &e.payload {
                     EventPayload::WorkflowInitialized { spawn_entry, .. } => spawn_entry.clone(),
                     _ => None,
@@ -2282,10 +2290,15 @@ pub fn build_children_complete_output(
                 // (`result_by_child`, merged below) rather than aborting
                 // (AC4 / AC5). No transcript is replayed — only the
                 // targeted event is read (AC3).
-                if let Some(r) = child_events.iter().rev().find_map(|e| match &e.payload {
-                    EventPayload::RequestStoreResult { result } => Some(result.clone()),
-                    _ => None,
-                }) {
+                //
+                // Only a result recorded for the child's *current* arrival
+                // counts. A child kept on disk after a failure terminal and
+                // then retried or rewound still carries its earlier arrival's
+                // result; reading that would report a stale failure for a
+                // child that is running again (koto issue 240).
+                if let Some(r) = crate::engine::terminal_result::recorded_result_for_current_arrival(
+                    &child_events,
+                ) {
                     result_by_session.insert(info.id.clone(), r);
                 }
                 on_disk_order.push(task_name.clone());
@@ -2479,11 +2492,21 @@ pub fn build_children_complete_output(
     // legacy non-composed children) set by both entry builders;
     // `result_by_session` is keyed by the on-disk `info.id` (the same
     // composed id) and `result_by_child` by `ChildCompleted.child_name`.
+    //
+    // The parent's copy is not a fallback for a child koto knows is live
+    // on disk. A child retried or rewound out of a kept failure terminal
+    // has no result for its current arrival yet, and the parent's copy is
+    // the earlier arrival's; inlining it would report a stale failure for
+    // a running child (koto issue 240). A child gone from disk, standing
+    // in a terminal, or unreadable still falls back to the copy.
     for entry in &mut entries {
-        if let Some(r) = result_by_session
-            .get(&entry.name)
-            .or_else(|| result_by_child.get(&entry.name))
-        {
+        if let Some(r) = result_by_session.get(&entry.name).or_else(|| {
+            if known_live.contains(&entry.name) {
+                None
+            } else {
+                result_by_child.get(&entry.name)
+            }
+        }) {
             entry.result = Some(r.clone());
         }
         // A `Skipped` child with no evidence never produces an

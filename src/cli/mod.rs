@@ -2881,19 +2881,26 @@ fn append_terminal_index_for_session(
 /// child's result, the index entry and the parent event, then deletes
 /// the session while the leg stays open forever.
 ///
-/// **Why steps 2 and 3 run under `--no-cleanup`.** An already-terminal
-/// session ticked again returns immediately from the advance loop, so
-/// under `--no-cleanup` this block runs on every tick. For a terminal that
-/// declares a `result:` map, the child-log record is what pins the
-/// resolved map for a parked session (`koto status`, a later tick), and it
-/// is keyed on the arrival: once [`terminal_record`] finds it on the log,
-/// `already_recorded` is set and nothing is appended again. A terminal
-/// without a map records nothing while parked, as before. Promotion is
-/// gated on the leg having no result yet, which makes a repeat tick a
-/// silent no-op. The index entry
-/// and the parent event stay under the cleanup guard -- appending those
-/// per tick would be unbounded, and existing tests are built on a parked
-/// terminal child *not* emitting the parent event.
+/// **Delivery is keyed on the arrival, not on cleanup.** An
+/// already-terminal session ticked again returns immediately from the
+/// advance loop, so this block runs on every tick of a parked session.
+/// Steps 2, 4 and 5 therefore run once per *arrival* at the terminal:
+/// [`terminal_record`] reports `already_recorded` when the child's own
+/// log already holds a `request_store.result` for the current stay, and a
+/// repeat tick then writes nothing. Step 2 records for every terminal,
+/// with or without a `result:` map and with or without `--no-cleanup`,
+/// because that record is what makes the next tick see the arrival as
+/// delivered. Promotion is gated on the leg having no result yet, which
+/// makes a repeat tick a silent no-op there too. `--no-cleanup` decides
+/// only step 6: whether the session stays on disk. It never withholds the
+/// result from the parent or the leg (koto issue 240).
+///
+/// A tick that is not an arrival but is about to remove the session
+/// re-sends step 5 first. That is the tick after a failed parent append
+/// deferred removal, and the first flagless tick of a terminal an earlier
+/// tick kept with `--no-cleanup`. A removed child therefore always left
+/// its `ChildCompleted` behind; a duplicate is harmless, because the
+/// converge keeps the latest event per task and prefers an on-disk child.
 #[cfg(unix)]
 fn finish_terminal_tick(
     backend: &dyn SessionBackend,
@@ -2906,23 +2913,12 @@ fn finish_terminal_tick(
 ) {
     let pointer = crate::engine::leg_pointer::read_pointer_best_effort(&backend.session_dir(name));
     let result = &record.result;
+    let arrival = !record.already_recorded;
 
-    // Step 2, the child's own log. The done-bit below means "a durable
-    // result is readable", which an earlier tick's record satisfies too.
-    //
-    // A parked session records only when its terminal declares a result
-    // map: that record is what pins the resolved map against later context
-    // writes. A terminal without one keeps its pre-existing behaviour of
-    // recording nothing while parked, because a recorded result is what
-    // the `children-complete` converge read treats as a finished child,
-    // and existing workflows park children on exactly that distinction.
-    let declares_result = compiled
-        .states
-        .get(final_state)
-        .is_some_and(|s| s.result.is_some());
-    let has_result = record.already_recorded
-        || ((!no_cleanup || declares_result)
-            && append_request_store_result_to_child(backend, name, result));
+    // Step 2, the child's own log, once per arrival. The done-bit for the
+    // index entry below means "a durable result is readable", so it is set
+    // only when this append succeeded.
+    let has_result = arrival && append_request_store_result_to_child(backend, name, result);
 
     // Step 3: a parked terminal session still resolves its leg, because
     // the requester waiting on it has no way to know the session was
@@ -2935,19 +2931,28 @@ fn finish_terminal_tick(
         None => false,
     };
 
+    // Steps 4 and 5, once per arrival, whether or not the session is kept.
+    // The parent notice is also re-sent on a removal tick that is not an
+    // arrival (see the doc comment).
+    let mut defer_for_parent = false;
+    if arrival {
+        // Re-read so the index classifier sees a mid-tick `WorkflowCancelled`.
+        let post_events = backend
+            .read_events(name)
+            .map(|(_, ev)| ev)
+            .unwrap_or_default();
+        append_terminal_index_for_session(backend, name, &post_events, has_result);
+    }
+    if arrival || !no_cleanup {
+        let append_result =
+            append_child_completed_to_parent(backend, name, header, compiled, final_state, result);
+        defer_for_parent = matches!(append_result, ChildCompletedAppend::AppendFailed);
+    }
+
+    // Step 6.
     if no_cleanup {
         return;
     }
-
-    // Re-read so the index classifier sees a mid-tick `WorkflowCancelled`.
-    let post_events = backend
-        .read_events(name)
-        .map(|(_, ev)| ev)
-        .unwrap_or_default();
-    append_terminal_index_for_session(backend, name, &post_events, has_result);
-    let append_result =
-        append_child_completed_to_parent(backend, name, header, compiled, final_state, result);
-    let defer_for_parent = matches!(append_result, ChildCompletedAppend::AppendFailed);
     if !defer_for_parent && !defer_for_promotion {
         if let Err(e) = backend.cleanup(name) {
             eprintln!("warning: session cleanup failed: {}", e);

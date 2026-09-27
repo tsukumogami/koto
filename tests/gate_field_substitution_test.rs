@@ -1018,18 +1018,11 @@ fn child_template() -> &'static str {
     r#"---
 name: filter-child
 version: "1.0"
-initial_state: start
+initial_state: done
 states:
-  start:
-    transitions:
-      - target: done
   done:
     terminal: true
 ---
-
-## start
-
-Do the work.
 
 ## done
 
@@ -1063,18 +1056,11 @@ fn spawn_terminal_child(dir: &Path, name: &str, parent: &str, child_src: &Path) 
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    // `--no-cleanup` keeps the terminal child's session on disk, which is what
-    // the parent's gate reads.
-    let output = koto_cmd(dir)
-        .args(["next", name, "--no-cleanup"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "child advance failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // The child starts in its terminal state and is never ticked, so it is on
+    // disk and complete but has recorded no result. That keeps the parent's
+    // gate from passing on these children, so the gate reports its verdict
+    // as a blocking condition the tests can read. (A ticked terminal child
+    // records its result even under `--no-cleanup`.)
 }
 
 /// A `children-complete` gate's `name_filter` resolves `{{SESSION_NAME}}`, so a

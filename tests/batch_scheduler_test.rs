@@ -789,39 +789,18 @@ fn scenario_18_stale_skip_marker_respawns_as_real_child() {
         d_state_contents
     );
 
-    // 4. Simulate a successful retry of A: remove A's state file.
-    // `retry_failed` handling lands in Issue #14; here we simulate
-    // the post-retry state by deleting A directly.
-    let a_dir = sessions_base(tmp.path()).join("parent.A");
-    std::fs::remove_dir_all(&a_dir).unwrap();
+    // 4. Retry A. A kept its session at the failure terminal and has
+    // already told the parent it failed, so deleting its directory would
+    // leave the parent reading that record rather than respawning A.
+    // Rewind it back to `work` instead, which is what `retry_failed`
+    // does to a failed child.
+    let (ok, _, stderr) = run_koto(tmp.path(), &["rewind", "parent.A"]);
+    assert!(ok, "rewind parent.A failed: {}", stderr);
 
-    // 5. Tick: scheduler should respawn A (no child on disk, no deps).
-    // The resubmission needs the same task list to re-enter the
-    // scheduler; since the scheduler runs every tick regardless of
-    // whether new evidence arrived, a bare `koto next parent` tick
-    // suffices.
-    let (_, json, _) = run_koto(tmp.path(), &["next", "parent"]);
-    let sched = json.get("scheduler").expect("scheduler key present");
-    let spawned: Vec<String> = sched["spawned_this_tick"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    assert!(
-        spawned.contains(&"parent.A".to_string()),
-        "A must respawn as a real child after its state file was cleared. got: {:?}",
-        spawned
-    );
-    assert_eq!(
-        sched
-            .get("reclassified_this_tick")
-            .and_then(|v| v.as_bool()),
-        Some(true),
-        "reclassified_this_tick=true when A respawns"
-    );
+    // 5. Tick: A is live again, so its earlier failure no longer counts.
+    run_koto(tmp.path(), &["next", "parent"]);
+    let (_, status, _) = run_koto(tmp.path(), &["status", "parent.A"]);
+    assert_eq!(status["is_terminal"], false, "A is running again: {status}");
 
     // 6. Drive A to done.
     drive_skip_child_to_done(tmp.path(), "parent.A");
@@ -949,24 +928,11 @@ fn scenario_19_running_child_respawns_as_skip_marker_after_upstream_fails() {
         "B should start as a real child, not a skip marker"
     );
 
-    // 4. Retroactively fail A: remove its state file and drive a
-    // fresh A to failed. Issue #14's `rewind`/`retry_failed` will
-    // provide a typed path for this; Issue #13 only needs the
-    // end-state to exercise the reclassification path.
-    let a_dir = sessions_base(tmp.path()).join("parent.A");
-    std::fs::remove_dir_all(&a_dir).unwrap();
-    // Tick the parent so A respawns.
-    let (_, json, _) = run_koto(tmp.path(), &["next", "parent"]);
-    let sched = json.get("scheduler").expect("scheduler key present");
-    let spawned: Vec<String> = sched["spawned_this_tick"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    assert!(spawned.contains(&"parent.A".to_string()));
+    // 4. Retroactively fail A: A kept its session at `done`, so rewind
+    // it to `work` and drive it to failed. (Deleting its directory no
+    // longer simulates this: A already told the parent it succeeded.)
+    let (ok, _, stderr) = run_koto(tmp.path(), &["rewind", "parent.A"]);
+    assert!(ok, "rewind parent.A failed: {}", stderr);
     drive_skip_child_to_fail(tmp.path(), "parent.A");
 
     // 5. Tick: B is Running on disk but its upstream A is now
@@ -1452,17 +1418,19 @@ fn scheduler_ran_appended_on_reclassification_tick() {
         .filter(|l| l.contains("\"type\":\"scheduler_ran\""))
         .count();
 
-    // Simulate retry: remove A's directory so the next tick respawns
-    // A and flips `reclassified_this_tick` to true.
-    let a_dir = sessions_base(tmp.path()).join("parent.A");
-    std::fs::remove_dir_all(&a_dir).unwrap();
+    // Retry A the way `retry_failed` does, by rewinding its kept
+    // session, and drive it to done. The next tick finds D's skip marker
+    // stale and respawns D as a real child: a reclassification tick.
+    let (ok, _, stderr) = run_koto(tmp.path(), &["rewind", "parent.A"]);
+    assert!(ok, "rewind parent.A failed: {}", stderr);
+    drive_skip_child_to_done(tmp.path(), "parent.A");
 
     let (_, json, _) = run_koto(tmp.path(), &["next", "parent"]);
     let sched = json.get("scheduler").expect("scheduler key present");
     assert_eq!(
         sched["reclassified_this_tick"].as_bool(),
         Some(true),
-        "A respawn flips reclassified_this_tick=true"
+        "D's respawn flips reclassified_this_tick=true"
     );
     let spawned: Vec<String> = sched["spawned_this_tick"]
         .as_array()
@@ -1473,8 +1441,8 @@ fn scheduler_ran_appended_on_reclassification_tick() {
         })
         .unwrap_or_default();
     assert!(
-        spawned.contains(&"parent.A".to_string()),
-        "A must respawn. got: {:?}",
+        spawned.contains(&"parent.D".to_string()),
+        "D must respawn. got: {:?}",
         spawned
     );
 
