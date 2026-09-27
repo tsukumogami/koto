@@ -265,7 +265,8 @@ pub fn decode_response(
         let answer = match (&q.kind, ty) {
             (QuestionKind::Choice { .. }, Some("choice")) => {
                 // The quickstart's example answer omits `probabilities`; the
-                // API reference includes it. Live validation will settle it.
+                // API reference includes it. The live API sends it: the
+                // decider-live workflow fails if a choice answer lacks it.
                 let probs = obj
                     .get("probabilities")
                     .and_then(Value::as_object)
