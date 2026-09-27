@@ -415,7 +415,7 @@ mod tests {
     /// has no idea whether a reference produced the key and cannot add one.
     #[test]
     fn every_reason_carries_the_remedy() {
-        for key in ["Weekly Planning-note", "a:b", "a@b", "-note", ""] {
+        for key in ["Weekly Planning-note", "a:b", "a@b", "a+b", "-note", ""] {
             let reason = unusable_context_key_reason(key)
                 .unwrap_or_else(|| panic!("{key:?} should be unusable"));
             assert!(

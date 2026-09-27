@@ -111,8 +111,6 @@ fn context_add(dir: &Path, session: &str, key: &str, content: &str) {
     );
 }
 
-/// The named gate's entry in a `gate_blocked` response, or `None` when the
-/// response is not a block.
 /// The part of an unusable-key reason before its remedy. The remedy lists every
 /// character a value may hold and a key may not, so a check that the reason
 /// names one must not look there.
@@ -120,6 +118,8 @@ fn reason_before_remedy(message: &str) -> &str {
     message.split("remedy:").next().unwrap_or_default()
 }
 
+/// The named gate's entry in a `gate_blocked` response, or `None` when the
+/// response is not a block.
 fn blocking_condition<'a>(resp: &'a Value, gate: &str) -> Option<&'a Value> {
     resp.get("blocking_conditions")?
         .as_array()?
@@ -910,6 +910,10 @@ Done.
         assert!(
             !message.is_empty(),
             "an unusable key must not report as a bare absence; got {resp}"
+        );
+        assert!(
+            message.contains("remedy:"),
+            "the message for {title:?} should carry its remedy; got {message}"
         );
         assert!(
             reason_before_remedy(message).contains(character),
