@@ -1,7 +1,7 @@
 ---
 schema: prd/v1
 absorbed: docs/briefs/BRIEF-koto-leg-wake.md
-status: In Progress
+status: Done
 problem: |
   A coordinator session parked on a `request-leg` gate is never told that the
   leg changed. The worker's terminal tick records its result and exits, koto's
@@ -20,7 +20,7 @@ source_issue: 250
 
 ## Status
 
-In Progress
+Done
 
 Absorbed [BRIEF](docs/briefs/BRIEF-koto-leg-wake.md); carried in Absorbed Brief.
 

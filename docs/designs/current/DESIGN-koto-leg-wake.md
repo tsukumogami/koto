@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 upstream: docs/prds/PRD-koto-leg-wake.md
 problem: |
   A coordinator session parked on a `request-leg` gate is never told its leg
@@ -36,7 +36,7 @@ rationale: |
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 
