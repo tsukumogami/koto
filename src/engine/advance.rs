@@ -1507,7 +1507,8 @@ fn edge_gate_dependence(
 ) -> EdgeGateDependence {
     let transition = &template_state.transitions[index];
     let Some(when) = &transition.when else {
-        // The loop never fires an unconditional fallback past a failing gate.
+        // A failing gate keeps the loop's resolver from firing an
+        // unconditional fallback.
         return EdgeGateDependence::Outcome;
     };
     let prefix = format!("{}.{}.", GATES_EVIDENCE_NAMESPACE, gate);
@@ -1540,6 +1541,7 @@ pub(crate) fn directed_target_guard_gates(
         if transition.target != target {
             continue;
         }
+        let mut edge_guards = 0;
         for (name, gate) in &template_state.gates {
             if gate.overridable {
                 continue;
@@ -1549,7 +1551,14 @@ pub(crate) fn directed_target_guard_gates(
                 EdgeGateDependence::None
             ) {
                 guards.insert(name.clone(), gate.clone());
+                edge_guards += 1;
             }
+        }
+        // An edge to the target that depends on no such gate can never be
+        // blocked, so nothing needs to run: return before any gate is
+        // evaluated, and before one can refuse on an unset capture.
+        if edge_guards == 0 {
+            return BTreeMap::new();
         }
     }
     guards
@@ -5152,6 +5161,10 @@ mod tests {
         ]);
         state.accepts = make_accepts(vec!["decision"]);
         state.gates.insert("ci".into(), locked_gate());
+        assert!(
+            directed_target_guard_gates(&state, "done").is_empty(),
+            "an ungated edge to the target means no gate needs to run"
+        );
         assert!(directed_target_blockers(
             &state,
             "done",

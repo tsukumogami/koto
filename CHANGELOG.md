@@ -195,10 +195,15 @@ to `0.9.x`).
   `gates.<gate>.*` must match the gate's real output, and an unconditional edge,
   or any edge of a state with no `accepts` that doesn't route on gates, needs
   the gate to pass. If every edge to the target is blocked, `--to` exits 1 with
-  `gate_blocked`, names the gate, and appends nothing. An edge that routes on
-  the gate failing stays reachable while it fails, overridable gates are still
-  skipped, and a `--to` that passes appends exactly what it did before, so
-  `--to` remains the recovery path for a stuck session.
+  `gate_blocked`, names the gate, and appends nothing. Because a `gates.<gate>.*`
+  clause is matched on output rather than on pass or fail, an edge that routes
+  on the gate failing stays reachable while it fails, and an edge that needs a
+  different output is refused even while the gate passes, which is the edge
+  `koto next` wouldn't take either. A guarding gate that reads a
+  `capture_stdout_as` value the run hasn't produced refuses with
+  `capture_unset`. Overridable gates are still skipped, and a `--to` that
+  proceeds appends exactly what it did before, so `--to` remains the recovery
+  path for a stuck session.
 
 - **`koto context add` and `koto context remove` refuse a session that has no
   state log, instead of creating a log koto can't read.** Both verbs append an

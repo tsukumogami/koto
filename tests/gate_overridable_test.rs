@@ -470,11 +470,13 @@ fn directed_transition_refused_past_failing_non_overridable_gate() {
         "a refused --to must append nothing"
     );
 
-    // The session is still at `check` and advances normally once the gate
-    // passes.
+    // The session is still at `check`, and the same `--to` proceeds once the
+    // gate passes.
     let (code, status, stderr) = run(d, &["status", "wf"]);
     assert_eq!(code, 0, "{} {}", status, stderr);
     assert_eq!(status["current_state"], "check", "{}", status);
+    std::fs::write(d.join("ready"), "").unwrap();
+    assert_directed(d, "wf", "done");
 }
 
 #[test]

@@ -834,7 +834,7 @@ gates:
     overridable: false
 ```
 
-For such a gate, `koto overrides record` exits 2 with the typed code `gate_not_overridable` whatever `--with-data` holds, and appends nothing; `blocking_conditions[].agent_actionable` is `false`; `koto next` ignores any override already in the log for it and evaluates the gate for real; and `koto next --to <target>` evaluates it before a directed transition whose edge depends on it (a `when` clause reading `gates.<gate>.*`, an unconditional edge, or any edge of a state with no `accepts` that doesn't route on gates), refusing with `gate_blocked` when it doesn't pass. An edge that routes on the gate failing stays reachable while it fails.
+For such a gate, `koto overrides record` exits 2 with the typed code `gate_not_overridable` whatever `--with-data` holds, and appends nothing; `blocking_conditions[].agent_actionable` is `false`; `koto next` ignores any override already in the log for it and evaluates the gate for real; and `koto next --to <target>` evaluates it before a directed transition whose edge depends on it (a `when` clause reading `gates.<gate>.*`, an unconditional edge, or any edge of a state with no `accepts` that doesn't route on gates), refusing with `gate_blocked` when its result doesn't satisfy that edge. A `gates.<gate>.*` clause is matched against the gate's real output, so an edge that routes on the gate failing stays reachable while it fails. The protection covers only edges that depend on the gate: an evidence-conditioned edge in a state with `accepts` is still reachable with `--to`.
 
 The field defaults to `true` and is omitted from the compiled JSON when `true`. Compile errors:
 

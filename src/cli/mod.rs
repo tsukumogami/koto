@@ -4157,8 +4157,8 @@ fn handle_next(
                     code: NextErrorCode::GateBlocked,
                     message: format!(
                         "cannot take --to '{}': the transition from '{}' depends on gate {} \
-                         declared overridable: false, which does not currently pass; \
-                         nothing was recorded",
+                         declared overridable: false, and the gate's current result does not \
+                         satisfy that transition; nothing was recorded",
                         target,
                         current_state,
                         quoted.join(", ")
@@ -4167,7 +4167,9 @@ fn handle_next(
                         .iter()
                         .map(|g| ErrorDetail {
                             field: format!("gates.{}", g),
-                            reason: "overridable: false gate does not pass".to_string(),
+                            reason: "the overridable: false gate's current result does not \
+                                     satisfy the transition to the target"
+                                .to_string(),
                         })
                         .collect(),
                 };
