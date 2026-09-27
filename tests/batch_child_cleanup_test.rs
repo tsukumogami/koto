@@ -146,7 +146,7 @@ fn drive_child_to_done_with_cleanup(dir: &Path, name: &str) {
 /// its session by hand. A failure terminal is always kept (koto issue 240), so
 /// the removal these tests need -- a failed child known only from its parent's
 /// `ChildCompleted` record -- is an explicit `koto session cleanup` now.
-fn drive_child_to_fail_with_cleanup(dir: &Path, name: &str) {
+fn drive_child_to_fail_then_remove(dir: &Path, name: &str) {
     let (ok, json, stderr) = run_koto(dir, &["next", name, "--with-data", r#"{"marker": "fail"}"#]);
     assert!(
         ok,
@@ -381,8 +381,8 @@ fn cleaned_up_failure_preserved() {
         &["next", "parent", "--with-data", &payload.to_string()],
     );
 
-    // Drive A to failed with auto-cleanup.
-    drive_child_to_fail_with_cleanup(tmp.path(), "parent.A");
+    // Drive A to failed, then remove its kept session by hand.
+    drive_child_to_fail_then_remove(tmp.path(), "parent.A");
     assert!(!child_session_dir(tmp.path(), "parent.A").exists());
 
     // Pre-condition: ChildCompleted event has outcome=failure.
@@ -438,7 +438,7 @@ fn cleaned_up_failure_preserved() {
 ///
 /// Scenario construction:
 ///
-/// 1. Drive `parent.A` to `failed` with auto-cleanup. Parent's log now
+/// 1. Drive `parent.A` to `failed` and remove its kept session. Parent's log now
 ///    carries `ChildCompleted{task=A, outcome=failure}`. The child
 ///    session directory is gone.
 /// 2. Verify the scheduler observes the failure from the event replay
@@ -472,8 +472,8 @@ fn retry_respawn_shadows_stale_child_completed_event() {
     );
     assert!(ok, "parent init failed: {}", stderr);
 
-    // 1. Submit a single-task batch and drive A to `failed` with
-    //    auto-cleanup. This seeds the ChildCompleted{failure} event.
+    // 1. Submit a single-task batch, drive A to `failed` and remove its
+    //    kept session. This seeds the ChildCompleted{failure} event.
     let payload = serde_json::json!({
         "tasks": [
             {"name": "A", "waits_on": [], "vars": {}},
@@ -483,7 +483,7 @@ fn retry_respawn_shadows_stale_child_completed_event() {
         tmp.path(),
         &["next", "parent", "--with-data", &payload.to_string()],
     );
-    drive_child_to_fail_with_cleanup(tmp.path(), "parent.A");
+    drive_child_to_fail_then_remove(tmp.path(), "parent.A");
     assert!(
         !child_session_dir(tmp.path(), "parent.A").exists(),
         "pre-condition: child session directory must be cleaned up"

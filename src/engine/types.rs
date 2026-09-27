@@ -730,8 +730,11 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         superseded_by: Option<SupersededByRef>,
     },
-    /// Emitted on the PARENT'S log when a child workflow reaches a
-    /// terminal state and is about to be auto-cleaned.
+    /// Emitted on the PARENT'S log once per arrival of a child workflow at
+    /// a terminal state, whether the child's session is then removed or
+    /// kept (a failure terminal, or `--no-cleanup`; koto issue 240), and
+    /// again on a later tick that removes a session it did not just land
+    /// in.
     ///
     /// Issue #134: the `children-complete` gate enumerates children
     /// via `backend.list()`, but auto-cleanup on the child's own
@@ -742,7 +745,7 @@ pub enum EventPayload {
     /// the batch never satisfies `all_complete`.
     ///
     /// The event is appended to the parent's log (NOT the child's)
-    /// just before `backend.cleanup(child)` runs, so the parent can
+    /// before any `backend.cleanup(child)`, so the parent can
     /// synthesize a `ChildSnapshot` for any task whose on-disk state
     /// file has disappeared. On-disk snapshots always win over event
     /// replay (they are fresher — e.g., after a retry respawn), so
@@ -893,7 +896,8 @@ pub enum EventPayload {
     /// `dispatch_epoch` is captured from the child's header at bind time
     /// and is what the leg's mutating paths fence against. Recording it
     /// here rather than re-reading the child's header is deliberate: the
-    /// child's session is deleted on its terminal tick while this record
+    /// child's session may be deleted on its terminal tick (any terminal
+    /// but a failure one, unless `--no-cleanup` keeps it) while this record
     /// outlives it, so a header-based fence would go blind during exactly
     /// the window a displaced agent may still be running. `None` only for
     /// a child whose header carries no epoch, which `bind` rejects.

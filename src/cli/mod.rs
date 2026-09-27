@@ -2866,7 +2866,7 @@ fn append_terminal_index_for_session(
 /// 3. **Promote** the envelope onto the bound leg's request log.
 /// 4. Write the terminal-index entry carrying the done-bit from 2.
 /// 5. Append `ChildCompleted` to the parent's log.
-/// 6. Auto-clean the child session.
+/// 6. Remove the session, unless `retention` keeps it.
 ///
 /// Step 3 sits before 4 because a crash after the index write would
 /// leave a permanently-skipped session with a forever-open leg, and
@@ -2910,6 +2910,8 @@ fn finish_terminal_tick(
     header: &crate::engine::types::StateFileHeader,
     compiled: &CompiledTemplate,
     final_state: &str,
+    // `None` means koto removes the session after this tick; `Some` says why
+    // it is kept. It is the same value the response's `retention` reports.
     retention: Option<next_types::RetentionReason>,
     record: &TerminalRecord,
 ) {
@@ -4261,7 +4263,9 @@ fn handle_next(
                 } else {
                     None
                 };
-                let retention = terminal_retention(&compiled, target, no_cleanup);
+                let retention = terminal
+                    .as_ref()
+                    .and_then(|_| terminal_retention(&compiled, target, no_cleanup));
                 let resp = match &terminal {
                     Some(record) => resp
                         .with_terminal_result(record.result.clone())
@@ -5713,7 +5717,9 @@ fn handle_next(
             } else {
                 None
             };
-            let retention = terminal_retention(&compiled, final_state, no_cleanup);
+            let retention = terminal
+                .as_ref()
+                .and_then(|_| terminal_retention(&compiled, final_state, no_cleanup));
             let resp = match &terminal {
                 Some(record) => resp
                     .with_terminal_result(record.result.clone())

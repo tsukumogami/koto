@@ -4,7 +4,8 @@
 //! Delivery and retention are separate: every arrival at a terminal records
 //! the result on the session's own log, writes the terminal-index entry and
 //! notifies the parent, once, whether or not the session is then kept.
-//! `--no-cleanup` decides only whether the session stays on disk.
+//! Retention is separate: a failure terminal is always kept, and
+//! `--no-cleanup` keeps any other terminal.
 
 #![cfg(unix)]
 
