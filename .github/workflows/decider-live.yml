@@ -18,7 +18,7 @@ name: decider-live
 on:
   workflow_dispatch:
   push:
-    branches: [main, ci/decider-live-smoke]
+    branches: [main]
     paths:
       - 'src/decider/**'
       - 'src/cli/decider.rs'
