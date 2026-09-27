@@ -21,6 +21,13 @@ use crate::template::types::VAR_REF_PATTERN;
 /// - `:` `@` -- structured data values such as Gmail filters (`newer_than:90d`,
 ///   `from:user@example.com`). Neither is a shell metacharacter, so both are
 ///   literal inside a `sh -c` word (Issue #180).
+/// - `+` -- paths and versions that carry one, such as a directory named
+///   `workspace+instance` or a `1.2.0+build` version. `+` is not a shell
+///   metacharacter: no POSIX shell treats it as a command separator, an
+///   expansion, a redirection, a glob, or a quote, so it is literal inside a
+///   `sh -c` word. (bash's extended glob `+(...)` needs parentheses, which stay
+///   out.) Where a value lands in a regex it is escaped like every other
+///   character (Issue #266).
 /// - space -- structured names such as a calendar title. A space is not a
 ///   command-injection vector: it introduces no command, expansion, or
 ///   redirection. Its only effect in an unquoted interpolation is word
@@ -28,7 +35,7 @@ use crate::template::types::VAR_REF_PATTERN;
 ///   stay a single shell argument (Issue #180).
 ///
 /// Empty strings are allowed for optional variables with no default (Issue #141).
-pub(crate) const VALUE_PATTERN: &str = r"^[a-zA-Z0-9._/:@ \-]*$";
+pub(crate) const VALUE_PATTERN: &str = r"^[a-zA-Z0-9._/:@+ \-]*$";
 
 /// Holds resolved variable bindings for substitution.
 #[derive(Debug)]
@@ -145,10 +152,11 @@ enum ValueForm {
     /// `pattern` is the only one a tick substitutes (Issue #222).
     ///
     /// Escaping loses almost no expressive power, because [`VALUE_PATTERN`] has
-    /// already spent it. A value can carry no anchor, group, alternation or
-    /// quantifier into a pattern under either reading: not one of
-    /// `^ $ ( ) [ ] * + ? | \` is in the set. What it can carry is narrow, and
-    /// listing it is the whole of what the escape decides -- `.` as a wildcard,
+    /// already spent most of it. Of `^ $ ( ) [ ] * + ? | \`, only `+` is in
+    /// the set (Issue #266), and `regex::escape` turns it into a literal like
+    /// any other metacharacter, so no value carries an anchor, group,
+    /// alternation or quantifier into a pattern. What the escape decides beyond
+    /// that `+` is narrow, and listing it is the whole of it -- `.` as a wildcard,
     /// `-` as a range operator inside a class the author opened, `:` as the
     /// delimiter of a POSIX class name, whitespace under `(?x)`, and an
     /// alphanumeric as a range endpoint or the body of a class name. Every one
@@ -558,6 +566,41 @@ mod tests {
         // search filters (Issue #180).
         validate_value("SINCE", "newer_than:90d").unwrap();
         validate_value("FROM", "from:delta@delta.com").unwrap();
+    }
+
+    #[test]
+    fn validate_value_accepts_plus() {
+        // A `+` is not a shell metacharacter, and niwa instance directories
+        // carry one (`workspace+instance`), so a path under one must pass
+        // (Issue #266).
+        validate_value(
+            "PLUGIN_ROOT",
+            "/home/u/ws/workspace+instance-1a2b3c4d/checkout",
+        )
+        .unwrap();
+        validate_value("VERSION", "1.2.0+build.5").unwrap();
+    }
+
+    #[test]
+    fn validate_value_still_rejects_metacharacters_next_to_plus() {
+        // Admitting `+` widens the set by that one character only: a `+` does
+        // not carry any shell metacharacter in with it (Issue #266).
+        validate_value("KEY", "a+b;rm -rf").unwrap_err();
+        validate_value("KEY", "a+$(evil)").unwrap_err();
+        validate_value("KEY", "+(a|b)").unwrap_err(); // bash extglob needs parens
+        validate_value("KEY", "a+`evil`").unwrap_err();
+        validate_value("KEY", "a+\nb").unwrap_err();
+    }
+
+    #[test]
+    fn escape_value_for_pattern_escapes_plus() {
+        // `+` is the one regex quantifier the allowlist admits, so a value
+        // carrying it must still reach a pattern as a literal (Issue #266).
+        let escaped = escape_value_for_pattern("work+x");
+        assert_eq!(escaped, r"work\+x");
+        let re = Regex::new(&format!("^{}$", escaped)).unwrap();
+        assert!(re.is_match("work+x"));
+        assert!(!re.is_match("workkkx"));
     }
 
     #[test]

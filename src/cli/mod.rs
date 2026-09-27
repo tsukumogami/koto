@@ -123,7 +123,7 @@ pub enum Command {
         allow_legacy_gates: bool,
 
         /// Set a template variable (repeatable). VALUE accepts letters,
-        /// digits, and `. _ - / : @` plus spaces; shell metacharacters are
+        /// digits, and `. _ - / : @ +` plus spaces; shell metacharacters are
         /// rejected. Quote `{{KEY}}` in gate commands when a value may contain
         /// spaces.
         #[arg(long = "var", value_name = "KEY=VALUE")]

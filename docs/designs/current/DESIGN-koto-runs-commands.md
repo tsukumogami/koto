@@ -788,7 +788,7 @@ types.
 **A captured value can reach `sh -c`.** This is the sharpest new surface. A
 command's output becomes a `{{KEY}}` value, and a later state's gate command
 or action command may interpolate it. The existing allowlist
-(`src/engine/substitute.rs:29`: alphanumerics, `. _ - / : @`, and space) is
+(`src/engine/substitute.rs`: alphanumerics, `. _ - / : @ +`, and space) is
 the control, applied to captured values by the same `validate_value` function
 that guards init-time variables — reused deliberately rather than
 reimplemented, so a future widening of the allowlist is a single reviewed

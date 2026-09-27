@@ -3888,6 +3888,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prepare_capture_delivers_a_value_holding_a_plus() {
+        // Capture delivery checks the same allowlist as `--var`, so a path
+        // under a `workspace+instance` directory is delivered (Issue #266),
+        // and the position scan still finds a refused character after it.
+        assert_eq!(
+            prepare_capture("ROOT", "/ws/workspace+inst\n").unwrap(),
+            "/ws/workspace+inst"
+        );
+        assert_eq!(
+            prepare_capture("K", "a+b;c"),
+            Err(CaptureError::DisallowedCharacter {
+                key: "K".to_string(),
+                position: 3,
+                character: ";".to_string()
+            })
+        );
+    }
+
     /// A one-state template whose action declares a capture name.
     fn capturing_template(key: &str) -> CompiledTemplate {
         let mut action = make_action_decl("echo main");

@@ -111,6 +111,13 @@ fn context_add(dir: &Path, session: &str, key: &str, content: &str) {
     );
 }
 
+/// The part of an unusable-key reason before its remedy. The remedy lists every
+/// character a value may hold and a key may not, so a check that the reason
+/// names one must not look there.
+fn reason_before_remedy(message: &str) -> &str {
+    message.split("remedy:").next().unwrap_or_default()
+}
+
 /// The named gate's entry in a `gate_blocked` response, or `None` when the
 /// response is not a block.
 fn blocking_condition<'a>(resp: &'a Value, gate: &str) -> Option<&'a Value> {
@@ -804,19 +811,19 @@ Done.
 /// This is the case Issue #227 was filed about and the one the tests above miss.
 /// They cover a key that resolved to nothing and a key left with a leading
 /// hyphen -- both reachable only from an unset optional variable. This one needs
-/// no mistake at all: `VALUE_PATTERN` admits a space, a `:` and an `@` on
-/// purpose, so a calendar title or a filter expression is a legal value, and
-/// `validate_context_key` admits none of the three. A template that scopes a key
+/// no mistake at all: `VALUE_PATTERN` admits a space, a `:`, an `@` and a `+`
+/// on purpose, so a calendar title, a filter expression or a path is a legal
+/// value, and `validate_context_key` admits none of the four. A template that scopes a key
 /// on such a value is doing the obvious thing.
 ///
 /// Left alone the store answers an unusable key exactly as it answers a missing
 /// one, so the gate would report `{"exists": false, "error": ""}` -- a gate that
 /// will not pass with nothing pointing at why.
 ///
-/// Each of the three characters gets its own case rather than one standing for
-/// the family: they enter `validate_context_key` by two different routes (the
-/// first-character rule and the trailing-character rule), and a change that
-/// stopped reporting one of them would leave the other two passing.
+/// Each of the four characters gets its own case rather than one standing for
+/// the family: a change that stopped naming one of them would leave the others
+/// passing. The character is looked for before the remedy, which lists all four
+/// and would otherwise satisfy the check whatever the reason said.
 #[test]
 fn a_legal_value_that_cannot_be_a_key_says_which_character() {
     // (value, the character the message must name)
@@ -824,6 +831,8 @@ fn a_legal_value_that_cannot_be_a_key_says_which_character() {
         ("Weekly Planning", "' '"),
         ("newer_than:90d", "':'"),
         ("user@example.com", "'@'"),
+        // Issue #266 made `+` a legal value; it is still not a key character.
+        ("workspace+instance", "'+'"),
     ];
 
     for (n, (title, character)) in cases.iter().enumerate() {
@@ -903,7 +912,11 @@ Done.
             "an unusable key must not report as a bare absence; got {resp}"
         );
         assert!(
-            message.contains(character),
+            message.contains("remedy:"),
+            "the message for {title:?} should carry its remedy; got {message}"
+        );
+        assert!(
+            reason_before_remedy(message).contains(character),
             "the message for {title:?} should name {character}; got {message}"
         );
         assert!(

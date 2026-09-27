@@ -39,7 +39,9 @@ Current
 koto validates two kinds of user-supplied string against two grammars.
 
 `VALUE_PATTERN` in `src/engine/substitute.rs` admits `[a-zA-Z0-9._/:@ -]` for a
-variable value. `validate_context_key` in `src/session/validate.rs` admits a
+variable value. (Issue #266 later added `+`, so the gap to the key grammar
+below is four characters rather than three; the reasoning holds for the fourth
+unchanged.) `validate_context_key` in `src/session/validate.rs` admits a
 `/`-separated key whose components each begin with an alphanumeric and continue
 in alphanumerics, `.`, `_` and `-`, refusing `.` and `..` components and
 leading, trailing or doubled slashes.
@@ -292,7 +294,7 @@ two wordings in the tree or a documented behaviour that does not exist.
    for all three outcomes, asserting the unusable status is both non-zero and
    distinct.
 3. **Cover the motivating case end to end.** Add a test that drives a value
-   carrying a space, a `:` and an `@` through substitution into a context gate's
+   carrying a space, a `:`, an `@` or a `+` through substitution into a context gate's
    `key` and asserts the message names the character. This is the case
    koto#227 was filed about and it has no test today.
 4. **Assert the single wording.** A test that puts the gate's message and the
