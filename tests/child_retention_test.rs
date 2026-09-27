@@ -922,12 +922,15 @@ fn a_new_arrival_notifies_once() {
     init_child(dir, "p.busy", "p", CHILD);
     run_ok(dir, &["next", "p.leaf", "--with-data", FAIL]);
     run_ok(dir, &["rewind", "p.leaf"]);
-    run_ok(dir, &["next", "p.leaf", "--with-data", FAIL]);
+    run_ok(
+        dir,
+        &["next", "p.leaf", "--with-data", DONE, "--no-cleanup"],
+    );
     let notices = child_completed(dir, "p");
     assert_eq!(notices.len(), 2);
 
     let output = gate_output(&run_ok(dir, &["next", "p"]));
-    assert_eq!(gate_child(&output, "p.leaf")["result"]["status"], "failure");
+    assert_eq!(gate_child(&output, "p.leaf")["result"]["status"], "success");
 }
 
 /// A child whose failure terminal declares a way out: an operator can move
@@ -985,10 +988,26 @@ fn a_directed_move_between_terminals_notifies_once() {
 
     let resp = run_ok(dir, &["next", "p.leaf", "--to", "done", "--no-cleanup"]);
     assert_eq!(resp["state"], "done");
+    assert_eq!(
+        resp["retention"],
+        serde_json::json!({"retained": true, "reason": "no_cleanup"})
+    );
     let notices = child_completed(dir, "p");
     assert_eq!(notices.len(), 2);
     assert_eq!(notices[1]["final_state"], "done");
     assert_eq!(notices[1]["result"]["status"], "success");
+
+    // Without the flag, the same move lands in a success terminal and the
+    // session is removed after its notice.
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    init_parent(dir, "p", PARENT_KEYED);
+    init_child(dir, "p.leaf", "p", CHILD_WITH_RECOVERY);
+    run_ok(dir, &["next", "p.leaf", "--with-data", FAIL]);
+    let resp = run_ok(dir, &["next", "p.leaf", "--to", "done"]);
+    assert_eq!(resp["retention"], serde_json::json!({"retained": false}));
+    assert!(!session_dir(dir, "p.leaf").exists());
+    assert_eq!(child_completed(dir, "p").len(), 2);
 }
 
 #[test]
