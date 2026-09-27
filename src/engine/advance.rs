@@ -1488,16 +1488,16 @@ pub(crate) fn state_routes_on_gates(template_state: &TemplateState) -> bool {
         .is_some_and(|s| s.keys().any(|k| k.starts_with(&prefix)))
 }
 
-/// How the edge at `index` depends on the gate `gate`, in the terms the
-/// advance loop applies.
+/// How one edge of a state depends on one of its gates, in the terms the
+/// advance loop applies. Returned by `edge_gate_dependence`.
 enum EdgeGateDependence {
     /// The edge does not depend on the gate.
     None,
     /// The edge fires only when the gate's outcome is `passed`.
-    Outcome,
+    MustPass,
     /// The edge's `when` clause reads `gates.<gate>.*`; it fires only when
-    /// those entries match the gate's real output.
-    Output,
+    /// those entries match the gate's real output, whatever the outcome.
+    MustMatchOutput,
 }
 
 fn edge_gate_dependence(
@@ -1509,16 +1509,16 @@ fn edge_gate_dependence(
     let Some(when) = &transition.when else {
         // A failing gate keeps the loop's resolver from firing an
         // unconditional fallback.
-        return EdgeGateDependence::Outcome;
+        return EdgeGateDependence::MustPass;
     };
     let prefix = format!("{}.{}.", GATES_EVIDENCE_NAMESPACE, gate);
     if when.keys().any(|k| k.starts_with(&prefix)) {
-        return EdgeGateDependence::Output;
+        return EdgeGateDependence::MustMatchOutput;
     }
     if template_state.accepts.is_none() && !state_routes_on_gates(template_state) {
         // A legacy state with nothing to accept blocks on any failing gate
         // before transitions are looked at.
-        return EdgeGateDependence::Outcome;
+        return EdgeGateDependence::MustPass;
     }
     EdgeGateDependence::None
 }
@@ -1594,10 +1594,10 @@ pub(crate) fn directed_target_blockers(
             let holds = match (&dependence, results.get(name)) {
                 (EdgeGateDependence::None, _) => true,
                 (_, None) => false,
-                (EdgeGateDependence::Outcome, Some(result)) => {
+                (EdgeGateDependence::MustPass, Some(result)) => {
                     matches!(result.outcome, GateOutcome::Passed)
                 }
-                (EdgeGateDependence::Output, Some(result)) => {
+                (EdgeGateDependence::MustMatchOutput, Some(result)) => {
                     let prefix = format!("{}.{}.", GATES_EVIDENCE_NAMESPACE, name);
                     let mut gates = serde_json::Map::new();
                     gates.insert(name.clone(), result.output.clone());

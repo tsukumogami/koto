@@ -455,7 +455,9 @@ fn directed_transition_refused_past_failing_non_overridable_gate() {
     assert_eq!(json["error"]["code"], "gate_blocked", "{}", json);
     let msg = json["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        msg.contains("'locked'") && msg.contains("done") && msg.contains("overridable: false"),
+        msg.contains("'locked'")
+            && msg.contains("--to 'done'")
+            && msg.contains("overridable: false"),
         "message must name the gate and the target: {}",
         msg
     );

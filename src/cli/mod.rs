@@ -4156,11 +4156,12 @@ fn handle_next(
                 let err = NextError {
                     code: NextErrorCode::GateBlocked,
                     message: format!(
-                        "cannot take --to '{}': the transition from '{}' depends on gate {} \
-                         declared overridable: false, and the gate's current result does not \
+                        "cannot take --to '{}': the transition from '{}' depends on {} {} \
+                         declared overridable: false, and the current result does not \
                          satisfy that transition; nothing was recorded",
                         target,
                         current_state,
+                        if blockers.len() == 1 { "gate" } else { "gates" },
                         quoted.join(", ")
                     ),
                     details: blockers
