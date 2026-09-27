@@ -126,7 +126,7 @@ pub fn handle_prune(
     }
 
     // 6. Enumerate descendants via backend.list() + parent filter.
-    //    Includes transitive descendants (BFS).
+    //    Includes transitive descendants, each listed after its parent.
     let all_sessions = backend
         .list()
         .with_context(|| "failed to list sessions for descendant walk")?;
