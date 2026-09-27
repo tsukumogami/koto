@@ -288,10 +288,22 @@ result and it drops out of `outstanding`, which a coordinator reading the
 directive would take as the child's answer. With them, a retried child reports
 no result until its new arrival records one.
 
-If the step-2 append fails, `arrival` stays true on the next tick and step 5
-runs again, which can duplicate a `ChildCompleted`. That is harmless: the
-converge keeps the latest `ChildCompleted` per task and prefers the on-disk
-child anyway.
+The arrival gate trades one repair path away. Today a session whose index or
+parent append failed is re-tried on every later tick until it is removed.
+Under the gate, once step 2 has landed, a later tick of a *retained* session
+writes neither again: a failed index append (a full disk, say) leaves that
+session unindexed, so wake doesn't learn its dispatched child finished, and a
+failed parent append leaves the parent without the notice (the gate is still
+right, since it reads the child from disk). For a session koto removes, the
+removal tick re-sends the notice; the index entry is not re-written, because
+a session that is gone needs none. This is accepted residual risk: it needs a
+write failure between two appends to the same disk, and re-trying every tick
+would bring back the unbounded appends the gate exists to stop.
+
+If the step-2 append fails, `arrival` stays true on the next tick and steps 4
+and 5 run again, which can duplicate a `ChildCompleted` and an index entry. Both are harmless: the converge keeps the latest
+`ChildCompleted` per task and prefers the on-disk child, and the index reader
+keeps one entry per session.
 
 #### Alternatives Considered
 

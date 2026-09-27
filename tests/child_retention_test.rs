@@ -491,7 +491,8 @@ fn a_kept_child_ticked_without_the_flag_is_removed_after_one_notice() {
     );
     let first = child_completed(dir, "p");
     assert_eq!(first.len(), 1);
-    let child_lines = line_count(dir, "p.leaf");
+    let child_results = count(dir, "p.leaf", "request_store.result");
+    assert_eq!(child_results, 1);
 
     let resp = run_ok(dir, &["next", "p.leaf"]);
     assert_eq!(resp["action"], "done");
@@ -500,8 +501,6 @@ fn a_kept_child_ticked_without_the_flag_is_removed_after_one_notice() {
     let after = child_completed(dir, "p");
     assert!(after.len() <= 2, "{after:?}");
     assert!(after.iter().all(|n| n["result"] == first[0]["result"]));
-    // The child's log was not appended to before it was removed.
-    let _ = child_lines;
 }
 
 // ===== Helpers that change files =====

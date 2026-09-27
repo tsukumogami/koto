@@ -709,12 +709,9 @@ fn scenario_17_ready_to_drive_gates_worker_dispatch() {
 /// 3. Drive A → failed.
 /// 4. Tick 2: D spawns as skip marker (terminal, skipped_marker:
 ///    true); classification of D is Skipped.
-/// 5. Manually delete A's state file (simulates a retry clearing the
-///    failed A so the stale-skip reclassification path can fire;
-///    `retry_failed` lands in Issue #14).
-/// 6. Tick 3: scheduler reclassifies. A respawns as a real child
-///    (currently no A on disk + all deps resolved trivially);
-///    reclassified_this_tick is true.
+/// 5. Rewind A, which kept its session at the failure terminal, back to
+///    `work` (what `retry_failed` does to a failed child).
+/// 6. Tick 3: A is live again; its earlier failure no longer counts.
 /// 7. Drive A → done.
 /// 8. Tick 4: scheduler sees D as Skipped on disk but the ideal
 ///    classification is Ready (A succeeded, no other deps). Delete-
@@ -869,9 +866,8 @@ fn scenario_18_stale_skip_marker_respawns_as_real_child() {
 /// 2. Tick 1: A spawns.
 /// 3. Drive A → done (so B becomes Ready).
 /// 4. Tick 2: B spawns as a real child (Running, non-terminal).
-/// 5. Delete A's state file and replace it with a new one driven to
-///    failed state (simulates `rewind` + re-drive, which Issue #14
-///    will formalize).
+/// 5. Rewind A, which kept its session at `done`, and drive it to the
+///    failed state.
 /// 6. Tick 3: scheduler sees B as Running on disk but the ideal
 ///    classification is ShouldBeSkipped (A is now Failure under
 ///    skip_dependents). Respawn B as a skip marker.
