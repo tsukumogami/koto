@@ -242,10 +242,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install tsuku
-        run: |
-          curl -fsSL https://get.tsuku.dev/now | bash
-          echo "$HOME/.tsuku/bin" >> $GITHUB_PATH
-          echo "$HOME/.tsuku/tools/current" >> $GITHUB_PATH
+        uses: tsukumogami/tsuku/.github/actions/setup-tsuku@9ca44882568a29f9208493695b1f7bdb61e30fee  # installs tsuku 0.14.0
 
       - name: Verify koto recipe syntax (PR)
         if: github.event_name == 'pull_request'
