@@ -14,7 +14,8 @@ goals: |
   its parent on the tick it arrives at a terminal, whether or not it is kept.
   The terminal response says whether the session was kept, and every kept
   session has a stated way out.
-upstream: docs/briefs/BRIEF-koto-child-retention.md
+absorbed:
+  - docs/briefs/BRIEF-koto-child-retention.md
 source_issue: 240
 ---
 
@@ -24,9 +25,32 @@ source_issue: 240
 
 Accepted
 
+Absorbed [BRIEF-koto-child-retention](docs/briefs/BRIEF-koto-child-retention.md); carried in Absorbed Brief.
+
 Phase 4 jury: completeness and testability passed on re-review after the
 revision that named the `retention` field and added criteria for every
 requirement; clarity passed on the first round.
+
+## Absorbed Brief
+
+koto removes a session, context and all, on the tick it reaches any terminal
+state, and a failure terminal is treated like a success. For a child that
+failed, that removal lands at the worst moment: the failure is where the
+parent's recovery starts, and everything recovery needs is gone. The parent's
+retry can't find the child, nobody can rewind it one step, and the reason it
+failed was deleted on the tick that recorded it. The one way to keep a
+session, `--no-cleanup`, also keeps the child's result from its parent, so a
+child has no safe setting.
+
+What a coordinator or operator should get instead is a failed child they can
+still act on after its terminal: retried by its parent, rewound by hand, and
+read through `koto status` and `koto context get`, with the parent receiving
+the child's result on the same tick whether or not the record is kept. The
+terminal response says what happened to the session, and a kept record has a
+stated point where it's reclaimed. The work covers failure terminals and
+deliberate retention; keeping every successful session, moving context out of
+the session, a time-based sweeper and any change to shirabe's skills are
+outside it.
 
 ## Problem Statement
 
