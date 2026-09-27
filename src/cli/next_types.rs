@@ -106,6 +106,11 @@ pub enum NextResponse {
         /// `None` exists for response construction that has no session to
         /// read (dispatch, unit tests), and is omitted from the wire.
         result: Option<crate::engine::types::WorkflowResult>,
+        /// Whether koto keeps the session after this tick, and why. `koto
+        /// next` always fills it before printing; like `result`, `None`
+        /// exists for construction with no session and is omitted from the
+        /// wire.
+        retention: Option<Retention>,
     },
     ActionRequiresConfirmation {
         state: String,
@@ -199,12 +204,36 @@ impl NextResponse {
                 state,
                 advanced,
                 unassigned_children,
+                retention,
                 ..
             } => NextResponse::Terminal {
                 state,
                 advanced,
                 unassigned_children,
                 result: Some(value),
+                retention,
+            },
+            other => other,
+        }
+    }
+
+    /// Return a new `NextResponse` whose `Terminal` variant carries
+    /// `retention`, what koto does with the session after this tick. Other
+    /// variants are returned unchanged.
+    pub fn with_retention(self, value: Retention) -> Self {
+        match self {
+            NextResponse::Terminal {
+                state,
+                advanced,
+                unassigned_children,
+                result,
+                ..
+            } => NextResponse::Terminal {
+                state,
+                advanced,
+                unassigned_children,
+                result,
+                retention: Some(value),
             },
             other => other,
         }
@@ -545,6 +574,45 @@ impl NextResponse {
     }
 }
 
+/// Why koto keeps a session after the tick that lands it in a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionReason {
+    /// The terminal is declared `failure: true`; such a session is always
+    /// kept, so its record is there for a retry, a rewind, or a read.
+    FailureTerminal,
+    /// A non-failure terminal kept because the tick passed `--no-cleanup`.
+    NoCleanup,
+}
+
+impl RetentionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            RetentionReason::FailureTerminal => "failure_terminal",
+            RetentionReason::NoCleanup => "no_cleanup",
+        }
+    }
+}
+
+/// What koto does with a session after a terminal tick, as the `retention`
+/// field of the `koto next` response: `{"retained": false}` when the session
+/// is removed, `{"retained": true, "reason": "..."}` when it is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    /// `Some` when the session is kept, carrying why.
+    pub reason: Option<RetentionReason>,
+}
+
+impl Serialize for Retention {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1 + usize::from(self.reason.is_some())))?;
+        map.serialize_entry("retained", &self.reason.is_some())?;
+        if let Some(reason) = self.reason {
+            map.serialize_entry("reason", reason.as_str())?;
+        }
+        map.end()
+    }
+}
+
 impl Serialize for NextResponse {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
@@ -648,8 +716,10 @@ impl Serialize for NextResponse {
                 advanced,
                 unassigned_children,
                 result,
+                retention,
             } => {
-                let count = 6 + result.as_ref().map_or(0, |_| 1);
+                let count =
+                    6 + result.as_ref().map_or(0, |_| 1) + retention.as_ref().map_or(0, |_| 1);
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("action", "done")?;
                 map.serialize_entry("state", state)?;
@@ -659,6 +729,9 @@ impl Serialize for NextResponse {
                 map.serialize_entry("error", &None::<()>)?;
                 if let Some(r) = result {
                     map.serialize_entry("result", r)?;
+                }
+                if let Some(r) = retention {
+                    map.serialize_entry("retention", r)?;
                 }
                 map.end()
             }
@@ -1135,6 +1208,7 @@ mod tests {
             advanced: true,
             unassigned_children: vec![],
             result: None,
+            retention: None,
         };
         assert_eq!(
             terminal.clone().with_directive_prefix(RECOVERY_POINTER),
@@ -1458,6 +1532,7 @@ mod tests {
             advanced: true,
             unassigned_children: vec![],
             result: None,
+            retention: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -1485,6 +1560,7 @@ mod tests {
             advanced: false,
             unassigned_children: vec![],
             result: None,
+            retention: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -1562,6 +1638,7 @@ mod tests {
             advanced: true,
             unassigned_children: vec![],
             result: None,
+            retention: None,
         };
         assert_eq!(
             terminal
@@ -1607,6 +1684,7 @@ mod tests {
             advanced: true,
             unassigned_children: vec![],
             result: None,
+            retention: None,
         };
         assert!(!terminal.carries_details());
 
@@ -2817,6 +2895,7 @@ mod tests {
             advanced: true,
             unassigned_children: vec![],
             result: None,
+            retention: None,
         };
         let v: serde_json::Value = serde_json::to_value(&terminal).unwrap();
         assert_eq!(v["unassigned_children"], serde_json::json!([]));

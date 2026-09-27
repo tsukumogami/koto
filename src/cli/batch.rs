@@ -2381,6 +2381,15 @@ pub fn build_children_complete_output(
         } = &ev.payload
         {
             event_snapshots.insert(task_name.clone(), (*outcome, final_state.clone()));
+            // A child known only from this record keeps its full session
+            // name, so its entry and its `result_by_child` copy share a key.
+            // Without this a cleaned-up `<parent>.<task>` child without a
+            // batch hook was listed as `<task>`, never matched its result,
+            // and stayed outstanding. An on-disk child already put its own
+            // id here.
+            task_to_session_id
+                .entry(task_name.clone())
+                .or_insert_with(|| child_name.clone());
             if let Some(r) = result {
                 result_by_child.insert(child_name.clone(), r.clone());
             }

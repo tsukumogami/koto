@@ -188,7 +188,7 @@ pub enum Command {
         #[arg(long)]
         to: Option<String>,
 
-        /// Skip session cleanup when reaching a terminal state (useful for debugging)
+        /// Keep the session after it reaches a terminal state (a failure terminal is always kept)
         #[arg(long)]
         no_cleanup: bool,
 
@@ -2891,12 +2891,13 @@ fn append_terminal_index_for_session(
 /// with or without a `result:` map and with or without `--no-cleanup`,
 /// because that record is what makes the next tick see the arrival as
 /// delivered. Promotion is gated on the leg having no result yet, which
-/// makes a repeat tick a silent no-op there too. `--no-cleanup` decides
-/// only step 6: whether the session stays on disk. It never withholds the
-/// result from the parent or the leg (koto issue 240).
+/// makes a repeat tick a silent no-op there too. `retention` decides only
+/// step 6, whether the session stays on disk: a failure terminal is always
+/// kept, and `--no-cleanup` keeps any other. Keeping a session never
+/// withholds its result from the parent or the leg (koto issue 240).
 ///
-/// A tick that is not an arrival and runs without `--no-cleanup` re-sends
-/// step 5 before it tries to remove the session. That is a tick after
+/// A tick that is not an arrival and will remove the session re-sends
+/// step 5 before it tries to. That is a tick after
 /// removal was deferred (a failed parent append or a retryable promotion
 /// failure), and the first flagless tick of a terminal an earlier tick
 /// kept with `--no-cleanup`. A removed child therefore always left its
@@ -2909,12 +2910,13 @@ fn finish_terminal_tick(
     header: &crate::engine::types::StateFileHeader,
     compiled: &CompiledTemplate,
     final_state: &str,
-    no_cleanup: bool,
+    retention: Option<next_types::RetentionReason>,
     record: &TerminalRecord,
 ) {
     let pointer = crate::engine::leg_pointer::read_pointer_best_effort(&backend.session_dir(name));
     let result = &record.result;
     let arrival = !record.already_recorded;
+    let remove = retention.is_none();
 
     // Step 2, the child's own log, once per arrival. The done-bit for the
     // index entry below means "a durable result is readable", so it is set
@@ -2944,20 +2946,40 @@ fn finish_terminal_tick(
             .unwrap_or_default();
         append_terminal_index_for_session(backend, name, &post_events, has_result);
     }
-    if arrival || !no_cleanup {
+    if arrival || remove {
         let append_result =
             append_child_completed_to_parent(backend, name, header, compiled, final_state, result);
         defer_for_parent = matches!(append_result, ChildCompletedAppend::AppendFailed);
     }
 
     // Step 6.
-    if no_cleanup {
+    if !remove {
         return;
     }
     if !defer_for_parent && !defer_for_promotion {
         if let Err(e) = backend.cleanup(name) {
             eprintln!("warning: session cleanup failed: {}", e);
         }
+    }
+}
+
+/// Whether koto keeps a session that has just reached `final_state`, and
+/// why. A failure terminal is always kept, whatever the flag says, so its
+/// record survives for a retry, a rewind, or a read (koto issue 240); any
+/// other terminal is kept only under `--no-cleanup`. The failure case reads
+/// the same projection `ChildCompleted` carries, so the parent's view of the
+/// outcome and the retention rule can't disagree.
+fn terminal_retention(
+    compiled: &CompiledTemplate,
+    final_state: &str,
+    no_cleanup: bool,
+) -> Option<next_types::RetentionReason> {
+    if project_terminal_outcome(compiled, final_state) == TerminalOutcome::Failure {
+        Some(next_types::RetentionReason::FailureTerminal)
+    } else if no_cleanup {
+        Some(next_types::RetentionReason::NoCleanup)
+    } else {
+        None
     }
 }
 
@@ -4239,8 +4261,11 @@ fn handle_next(
                 } else {
                     None
                 };
+                let retention = terminal_retention(&compiled, target, no_cleanup);
                 let resp = match &terminal {
-                    Some(record) => resp.with_terminal_result(record.result.clone()),
+                    Some(record) => resp
+                        .with_terminal_result(record.result.clone())
+                        .with_retention(next_types::Retention { reason: retention }),
                     None => resp,
                 };
                 println!("{}", serde_json::to_string(&resp)?);
@@ -4274,7 +4299,7 @@ fn handle_next(
                         &header,
                         &compiled,
                         final_state,
-                        no_cleanup,
+                        retention,
                         record,
                     );
                 }
@@ -5141,6 +5166,7 @@ fn handle_next(
                     advanced,
                     unassigned_children: unassigned_children.clone(),
                     result: None,
+                    retention: None,
                 },
                 StopReason::GateBlocked(gate_results) => {
                     let blocking =
@@ -5379,6 +5405,7 @@ fn handle_next(
                             advanced,
                             unassigned_children: unassigned_children.clone(),
                             result: None,
+                            retention: None,
                         }
                     } else if let Some(ref es) = expects {
                         NextResponse::EvidenceRequired {
@@ -5686,8 +5713,11 @@ fn handle_next(
             } else {
                 None
             };
+            let retention = terminal_retention(&compiled, final_state, no_cleanup);
             let resp = match &terminal {
-                Some(record) => resp.with_terminal_result(record.result.clone()),
+                Some(record) => resp
+                    .with_terminal_result(record.result.clone())
+                    .with_retention(next_types::Retention { reason: retention }),
                 None => resp,
             };
 
@@ -5841,7 +5871,7 @@ fn handle_next(
                     &header,
                     &compiled,
                     final_state,
-                    no_cleanup,
+                    retention,
                     record,
                 );
             }

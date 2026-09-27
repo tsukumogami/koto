@@ -173,9 +173,9 @@ for what it asserts (`a_failure_terminal_keeps_a_root`,
   refused with `unknown_children`, and `koto rewind` on a removed session still
   fails with "workflow not found".
 - [ ] A retried child that reaches a terminal again appends exactly one new
-  `ChildCompleted`, and the gate reports the new result; a `koto next --to`
-  from one terminal to another appends exactly one, carrying the new
-  `final_state`.
+  `ChildCompleted`, and the gate reports the new result; a rewound child
+  moved with `koto next --to` into a terminal appends exactly one, carrying
+  that terminal as `final_state`.
 - [ ] A retained failed child that is retried and reaches a success terminal
   without `--no-cleanup` no longer exists after that tick, and the parent's
   gate lists it as `success` with the new result (read from the parent's

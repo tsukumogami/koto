@@ -614,3 +614,500 @@ fn duplicate_last_child_completed(dir: &Path, parent: &str) {
     body.push('\n');
     std::fs::write(&path, body).unwrap();
 }
+
+// ===== Failure terminals are kept =====
+
+/// A batch parent that materializes children from `tasks` and accepts
+/// `retry_failed`, holding in `plan` until told to finish.
+const BATCH_PARENT: &str = r#"---
+name: retention-batch
+version: "1.0"
+initial_state: plan
+states:
+  plan:
+    accepts:
+      tasks:
+        type: tasks
+        required: true
+      finalize:
+        type: enum
+        required: false
+        values: [yes]
+    gates:
+      batch_done:
+        type: children-complete
+    materialize_children:
+      from_field: tasks
+      default_template: child.md
+    transitions:
+      - target: summarize
+        when:
+          finalize: yes
+  summarize:
+    terminal: true
+---
+
+## plan
+
+Plan the batch.
+
+## summarize
+
+Summarize.
+"#;
+
+/// A batch parent with two materialized children from [`CHILD`]: `p.leaf`,
+/// the one under test, and `p.busy`, left working so the parent's gate keeps
+/// reporting its per-child view.
+fn batch_with_leaf(dir: &Path) {
+    write(dir, "child.md", CHILD);
+    init_parent(dir, "p", BATCH_PARENT);
+    run_ok(
+        dir,
+        &[
+            "next",
+            "p",
+            "--with-data",
+            r#"{"tasks":[{"name":"leaf","waits_on":[]},{"name":"busy","waits_on":[]}]}"#,
+        ],
+    );
+    assert!(
+        session_dir(dir, "p.leaf").exists(),
+        "the batch spawned the leaf"
+    );
+}
+
+fn context_add(dir: &Path, session: &str, key: &str, content: &str) {
+    let file = dir.join("ctx-input.txt");
+    std::fs::write(&file, content).unwrap();
+    run(
+        dir,
+        &[
+            "context",
+            "add",
+            session,
+            key,
+            "--from-file",
+            file.to_str().unwrap(),
+        ],
+    );
+}
+
+fn context_get(dir: &Path, session: &str, key: &str) -> String {
+    let (code, out, err) = run(dir, &["context", "get", session, key]);
+    assert_eq!(code, 0, "context get {session} {key}: {err}");
+    out
+}
+
+const FAIL: &str = r#"{"marker":"fail"}"#;
+const DONE: &str = r#"{"marker":"done"}"#;
+
+#[test]
+fn a_failure_terminal_keeps_a_root() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let t = write(dir, "root.md", CHILD);
+    run_ok(dir, &["init", "r", "--template", &t]);
+    context_add(dir, "r", "plan.md", "the running record");
+
+    let resp = run_ok(dir, &["next", "r", "--with-data", FAIL]);
+    assert_eq!(resp["action"], "done");
+    assert!(
+        session_dir(dir, "r").exists(),
+        "a failure terminal keeps the root"
+    );
+    assert_eq!(context_get(dir, "r", "plan.md"), "the running record");
+    let status = run_ok(dir, &["status", "r"]);
+    assert_eq!(status["is_terminal"], true);
+    assert_eq!(status["result"]["status"], "failure");
+}
+
+#[test]
+fn a_failure_terminal_keeps_a_child() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    batch_with_leaf(dir);
+    context_add(dir, "p.leaf", "failure_reason", "the evidence came first");
+
+    run_ok(dir, &["next", "p.leaf", "--with-data", FAIL]);
+    assert!(
+        session_dir(dir, "p.leaf").exists(),
+        "a failure terminal keeps the child"
+    );
+    assert_eq!(
+        context_get(dir, "p.leaf", "failure_reason"),
+        "the evidence came first"
+    );
+    let status = run_ok(dir, &["status", "p.leaf"]);
+    assert_eq!(status["is_terminal"], true);
+    assert_eq!(status["current_state"], "done_blocked");
+    assert_eq!(status["result"]["status"], "failure");
+    let (_, workflows, _) = run(dir, &["workflows"]);
+    assert!(
+        workflows.contains("p.leaf"),
+        "koto workflows lists it: {workflows}"
+    );
+}
+
+#[test]
+fn a_directed_failure_terminal_keeps_the_session() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    batch_with_leaf(dir);
+    context_add(dir, "p.leaf", "failure_reason", "directed");
+
+    let resp = run_ok(dir, &["next", "p.leaf", "--to", "done_blocked"]);
+    assert_eq!(resp["state"], "done_blocked");
+    assert!(session_dir(dir, "p.leaf").exists());
+    assert_eq!(context_get(dir, "p.leaf", "failure_reason"), "directed");
+    assert_eq!(child_completed(dir, "p").len(), 1);
+}
+
+#[test]
+fn a_retained_failure_stays_on_a_flagless_tick() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    batch_with_leaf(dir);
+    run_ok(dir, &["next", "p.leaf", "--with-data", FAIL]);
+    run_ok(dir, &["next", "p.leaf"]);
+    assert!(session_dir(dir, "p.leaf").exists());
+}
+
+#[test]
+fn the_gate_reads_a_retained_failure_for_either_parent_shape() {
+    for template in [PARENT_WAITS, PARENT_KEYED] {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        init_parent(dir, "p", template);
+        init_child(dir, "p.leaf", "p", CHILD);
+        // A second child still working holds the gate open, so it reports
+        // its per-child view for either parent shape.
+        init_child(dir, "p.busy", "p", CHILD);
+        run_ok(dir, &["next", "p.leaf", "--with-data", FAIL]);
+
+        let output = gate_output(&run_ok(dir, &["next", "p"]));
+        let leaf = gate_child(&output, "p.leaf");
+        assert_eq!(leaf["outcome"], "failure", "{output}");
+        assert_eq!(leaf["result"]["status"], "failure", "{output}");
+        assert!(
+            !output["outstanding"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o == "p.leaf"),
+            "the failed child's result is in: {output}"
+        );
+
+        // With the busy child finished too, every result is in.
+        run_ok(dir, &["next", "p.busy", "--with-data", DONE]);
+        let resp = run_ok(dir, &["next", "p"]);
+        assert_eq!(
+            resp["action"], "done",
+            "results_in lets the gate pass: {resp}"
+        );
+    }
+}
+
+#[test]
+fn retry_failed_reaches_a_retained_child() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    batch_with_leaf(dir);
+    run_ok(dir, &["next", "p.leaf", "--with-data", FAIL]);
+
+    let (code, out, err) = run(
+        dir,
+        &[
+            "next",
+            "p",
+            "--with-data",
+            r#"{"retry_failed":{"children":["leaf"]}}"#,
+        ],
+    );
+    assert_eq!(code, 0, "retry_failed is accepted: {out} {err}");
+    assert!(!out.contains("unknown_children"), "{out}");
+
+    let status = run_ok(dir, &["status", "p.leaf"]);
+    assert_eq!(
+        status["current_state"], "work",
+        "rewound to its initial state"
+    );
+    let output = gate_output(&run_ok(dir, &["next", "p"]));
+    assert_eq!(
+        gate_child(&output, "p.leaf")["outcome"],
+        "pending",
+        "{output}"
+    );
+}
+
+#[test]
+fn rewind_reaches_a_retained_session() {
+    for (parented, name) in [(true, "p.leaf"), (false, "r")] {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        if parented {
+            batch_with_leaf(dir);
+        } else {
+            let t = write(dir, "root.md", CHILD);
+            run_ok(dir, &["init", "r", "--template", &t]);
+        }
+        run_ok(dir, &["next", name, "--with-data", FAIL]);
+        run_ok(dir, &["rewind", name]);
+        let status = run_ok(dir, &["status", name]);
+        assert_eq!(status["current_state"], "work", "{name}");
+        assert_eq!(status["is_terminal"], false, "{name}");
+    }
+}
+
+#[test]
+fn a_removed_session_is_still_refused() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    batch_with_leaf(dir);
+    run_ok(dir, &["next", "p.leaf", "--with-data", DONE]);
+    assert!(
+        !session_dir(dir, "p.leaf").exists(),
+        "a success terminal is removed"
+    );
+
+    let (_, out, _) = run(
+        dir,
+        &[
+            "next",
+            "p",
+            "--with-data",
+            r#"{"retry_failed":{"children":["leaf"]}}"#,
+        ],
+    );
+    assert!(out.contains("unknown_children"), "{out}");
+    let (code, out, err) = run(dir, &["rewind", "p.leaf"]);
+    assert_ne!(code, 0);
+    assert!(
+        format!("{out}{err}").contains("not found"),
+        "rewind names the missing workflow: {out} {err}"
+    );
+}
+
+#[test]
+fn a_new_arrival_notifies_once() {
+    // A retried child that reaches a terminal again sends one new notice,
+    // and the gate reports the new result.
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    init_parent(dir, "p", PARENT_KEYED);
+    init_child(dir, "p.leaf", "p", CHILD);
+    init_child(dir, "p.busy", "p", CHILD);
+    run_ok(dir, &["next", "p.leaf", "--with-data", FAIL]);
+    run_ok(dir, &["rewind", "p.leaf"]);
+    run_ok(dir, &["next", "p.leaf", "--with-data", FAIL]);
+    let notices = child_completed(dir, "p");
+    assert_eq!(notices.len(), 2);
+
+    // A directed transition into a terminal is a new arrival too. (koto has
+    // no directed move from one terminal to another: a terminal declares no
+    // transitions.)
+    run_ok(dir, &["rewind", "p.leaf"]);
+    run_ok(dir, &["next", "p.leaf", "--to", "done", "--no-cleanup"]);
+    let notices = child_completed(dir, "p");
+    assert_eq!(notices.len(), 3);
+    assert_eq!(notices[2]["final_state"], "done");
+    let output = gate_output(&run_ok(dir, &["next", "p"]));
+    assert_eq!(gate_child(&output, "p.leaf")["result"]["status"], "success");
+}
+
+#[test]
+fn a_retried_child_that_succeeds_is_removed() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    batch_with_leaf(dir);
+    run_ok(dir, &["next", "p.leaf", "--with-data", FAIL]);
+    run_ok(
+        dir,
+        &[
+            "next",
+            "p",
+            "--with-data",
+            r#"{"retry_failed":{"children":["leaf"]}}"#,
+        ],
+    );
+    run_ok(dir, &["next", "p.leaf", "--with-data", DONE]);
+    assert!(
+        !session_dir(dir, "p.leaf").exists(),
+        "a success terminal is removed"
+    );
+
+    let output = gate_output(&run_ok(dir, &["next", "p"]));
+    let leaf = gate_child(&output, "p.leaf");
+    assert_eq!(leaf["outcome"], "success", "{output}");
+    assert_eq!(leaf["result"]["status"], "success", "{output}");
+}
+
+#[test]
+fn the_response_states_retention() {
+    let cases = [
+        (
+            FAIL,
+            false,
+            serde_json::json!({"retained": true, "reason": "failure_terminal"}),
+        ),
+        (
+            FAIL,
+            true,
+            serde_json::json!({"retained": true, "reason": "failure_terminal"}),
+        ),
+        (
+            DONE,
+            true,
+            serde_json::json!({"retained": true, "reason": "no_cleanup"}),
+        ),
+        (DONE, false, serde_json::json!({"retained": false})),
+    ];
+    for (evidence, flag, expected) in cases {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let t = write(dir, "root.md", CHILD);
+        run_ok(dir, &["init", "r", "--template", &t]);
+        let mut args = vec!["next", "r", "--with-data", evidence];
+        if flag {
+            args.push("--no-cleanup");
+        }
+        let resp = run_ok(dir, &args);
+        assert_eq!(resp["retention"], expected, "{evidence} flag={flag}");
+    }
+
+    // A second tick of a kept failure terminal reports the same.
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let t = write(dir, "root.md", CHILD);
+    run_ok(dir, &["init", "r", "--template", &t]);
+    let first = run_ok(dir, &["next", "r", "--with-data", FAIL]);
+    let second = run_ok(dir, &["next", "r"]);
+    assert_eq!(first["retention"], second["retention"]);
+}
+
+#[test]
+fn the_help_text_describes_retention() {
+    let tmp = TempDir::new().unwrap();
+    let (_, out, _) = run(tmp.path(), &["next", "--help"]);
+    assert!(
+        out.contains("Keep the session after it reaches a terminal state (a failure terminal is always kept)"),
+        "{out}"
+    );
+    assert!(!out.contains("useful for debugging"), "{out}");
+}
+
+#[test]
+fn init_on_a_retained_root_name_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let t = write(dir, "root.md", CHILD);
+    run_ok(dir, &["init", "r", "--template", &t]);
+    run_ok(dir, &["next", "r", "--with-data", FAIL]);
+    let (code, out, err) = run(dir, &["init", "r", "--template", &t]);
+    assert_ne!(code, 0);
+    assert!(
+        format!("{out}{err}").contains("koto session cleanup"),
+        "the refusal names the remedy: {out} {err}"
+    );
+}
+
+// ===== A bound leg =====
+
+const LEG_PARENT: &str = r#"---
+name: leg-coord
+version: "1.0"
+initial_state: gather
+states:
+  gather:
+    accepts:
+      result:
+        type: string
+        required: true
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## gather
+
+Gather.
+
+## done
+
+Done.
+"#;
+
+const ONE_LEG: &str = r#"{"legs":[
+    {"name":"reviewer-a","role":"security","template":"review","inputs":{"pr":42}}
+],"inputs":{"pr":42}}"#;
+
+#[test]
+fn a_bound_failed_child_resolves_its_leg_once() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    init_parent(dir, "coord-a", LEG_PARENT);
+    init_child(dir, "child-1", "coord-a", CHILD);
+    koto::engine::claim::rewrite_header_atomically(&state_path(dir, "child-1"), |mut h| {
+        h.needs_agent = Some(true);
+        h.role = Some("scrutineer".into());
+        h.coordinator_of_record = Some("coord-a".into());
+        h
+    })
+    .unwrap();
+    let envelope = run_ok(
+        dir,
+        &[
+            "request",
+            "create",
+            "--with-data",
+            ONE_LEG,
+            "--requested-by",
+            "coord-a",
+            "--coordinator-of-record",
+            "coord-a",
+        ],
+    );
+    let id = envelope["request_id"].as_str().unwrap().to_string();
+    run_ok(
+        dir,
+        &["request", "bind", &id, "reviewer-a", "--child", "child-1"],
+    );
+
+    run_ok(
+        dir,
+        &[
+            "next",
+            "child-1",
+            "--dispatch-epoch",
+            "0",
+            "--with-data",
+            FAIL,
+        ],
+    );
+    assert!(
+        session_dir(dir, "child-1").exists(),
+        "the failed child is kept"
+    );
+    let leg = |dir: &Path| run_ok(dir, &["request", "get", &id])["legs"]["reviewer-a"].clone();
+    let first = leg(dir);
+    assert_eq!(first["disposition"], "resolved", "{first}");
+    assert_eq!(first["result_source"], "promoted", "{first}");
+    assert_eq!(first["result"]["status"], "failure", "{first}");
+
+    // A later arrival (rewound, then done) leaves the resolved leg alone.
+    run_ok(dir, &["rewind", "child-1"]);
+    run_ok(
+        dir,
+        &[
+            "next",
+            "child-1",
+            "--dispatch-epoch",
+            "0",
+            "--with-data",
+            DONE,
+            "--no-cleanup",
+        ],
+    );
+    assert_eq!(leg(dir), first, "the first result stands");
+}

@@ -143,15 +143,26 @@ fn drive_child_to_done_with_cleanup(dir: &Path, name: &str) {
 }
 
 /// Drive a child to its `failed` terminal state WITHOUT `--no-cleanup`.
+/// Drive a child to its `failed` terminal WITHOUT `--no-cleanup`, then remove
+/// its session by hand. A failure terminal is always kept (koto issue 240), so
+/// the removal these tests need -- a failed child known only from its parent's
+/// `ChildCompleted` record -- is an explicit `koto session cleanup` now.
 fn drive_child_to_fail_with_cleanup(dir: &Path, name: &str) {
     let (ok, json, stderr) = run_koto(dir, &["next", name, "--with-data", r#"{"marker": "fail"}"#]);
     assert!(
         ok,
-        "drive child {} to fail (with cleanup) failed. stderr={} json={}",
+        "drive child {} to fail failed. stderr={} json={}",
         name,
         stderr,
         serde_json::to_string_pretty(&json).unwrap_or_default()
     );
+    assert_eq!(
+        json["retention"],
+        serde_json::json!({"retained": true, "reason": "failure_terminal"}),
+        "a failure terminal is kept"
+    );
+    let (ok, _, stderr) = run_koto(dir, &["session", "cleanup", name]);
+    assert!(ok, "session cleanup {} failed: {}", name, stderr);
 }
 
 fn parent_state_path(dir: &Path, name: &str) -> PathBuf {

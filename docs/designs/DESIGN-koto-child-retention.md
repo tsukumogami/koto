@@ -254,9 +254,9 @@ when the session is not retained (Decision 1's rule, or the flag). Then:
   promotion asked to defer, as today.
 
 A repeat tick of a kept session finds its arrival recorded and writes nothing.
-A session that leaves the terminal through `retry_failed`, `koto rewind` or a
-`--to` to another terminal starts a new arrival, because each of those appends
-a state-changing event, and gets its writes again. A session parked by an
+A session that leaves the terminal through `retry_failed` or `koto rewind` and
+reaches a terminal again, by a tick or a `--to`, starts a new arrival, because
+each of those appends a state-changing event, and gets its writes again. A session parked by an
 earlier koto version has no record for its arrival, so its next tick delivers,
 which repairs a batch stuck on a flagged child.
 
