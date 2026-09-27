@@ -374,3 +374,219 @@ fn a_directed_exit_from_an_incomplete_batch_records_nothing() {
     assert!(batch_finalized_events(dir).is_empty());
     assert!(batch_final_view_key(dir).is_none());
 }
+
+/// Two batching states in sequence, each leaving on `all_complete`. Each
+/// gate watches its own fan-out through `name_filter`; without one, the
+/// second gate would count the first batch's children as its own.
+const TWO_BATCH_PARENT: &str = r#"---
+name: batch-parent-two
+version: "1.0"
+initial_state: plan1
+states:
+  plan1:
+    accepts:
+      tasks1:
+        type: tasks
+        required: true
+    gates:
+      done:
+        type: children-complete
+        name_filter: "parent.b1-"
+    materialize_children:
+      from_field: tasks1
+      default_template: child.md
+    transitions:
+      - target: plan2
+        when:
+          gates.done.all_complete: true
+  plan2:
+    accepts:
+      tasks2:
+        type: tasks
+        required: true
+    gates:
+      done:
+        type: children-complete
+        name_filter: "parent.b2-"
+    materialize_children:
+      from_field: tasks2
+      default_template: child.md
+    transitions:
+      - target: summarize
+        when:
+          gates.done.all_complete: true
+  summarize:
+    accepts:
+      status:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: closed
+        when:
+          status: ok
+  closed:
+    terminal: true
+---
+
+## plan1
+
+First batch.
+
+## plan2
+
+Second batch.
+
+## summarize
+
+Summarize the second batch.
+
+## closed
+
+Closed.
+"#;
+
+/// Each batch in a session is recorded as its own, and the key holds the
+/// latest one (Issue #275). Judged log-wide, the first batch's event
+/// suppressed the second's, so the key kept the first batch's view.
+#[test]
+fn a_second_batch_in_the_same_session_is_recorded_with_its_own_view() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    std::fs::write(dir.join("child.md"), CHILD_TEMPLATE).unwrap();
+    let parent = dir.join("parent.md");
+    std::fs::write(&parent, TWO_BATCH_PARENT).unwrap();
+    run_ok(
+        dir,
+        &["init", "parent", "--template", parent.to_str().unwrap()],
+    );
+
+    // First batch: one task, finished; the tick leaves plan1 for plan2.
+    let first = serde_json::json!({"tasks1": [{"name": "b1-A", "waits_on": [], "vars": {}}]});
+    run_ok(dir, &["next", "parent", "--with-data", &first.to_string()]);
+    drive_child(dir, "parent.b1-A", "done");
+    let json = run_ok(dir, &["next", "parent"]);
+    assert_eq!(json["state"], "plan2", "{json}");
+    let events = batch_finalized_events(dir);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["payload"]["state"], "plan1");
+    let first_view = batch_final_view_key(dir).expect("the first batch is recorded");
+    assert_eq!(first_view["all_success"], true, "{first_view}");
+
+    // Second batch: its own task, which fails; the tick leaves plan2.
+    let second = serde_json::json!({"tasks2": [{"name": "b2-B", "waits_on": [], "vars": {}}]});
+    run_ok(dir, &["next", "parent", "--with-data", &second.to_string()]);
+    drive_child(dir, "parent.b2-B", "fail");
+    let json = run_ok(dir, &["next", "parent"]);
+    assert_eq!(json["state"], "summarize", "{json}");
+
+    let events = batch_finalized_events(dir);
+    assert_eq!(events.len(), 2, "one event per batch: {events:?}");
+    assert_eq!(events[1]["payload"]["state"], "plan2");
+    let second_view = batch_final_view_key(dir).expect("the key is still there");
+    assert_eq!(
+        &second_view, &events[1]["payload"]["view"],
+        "the key holds the second batch's view, not the first's"
+    );
+    assert_eq!(second_view["any_failed"], true, "{second_view}");
+}
+
+/// A parent whose next state stops the tick with an error: its gate reads a
+/// capture the run has not delivered, which koto refuses before running it.
+const ERRORING_NEXT_PARENT: &str = r#"---
+name: batch-parent-erroring-next
+version: "1.0"
+initial_state: plan
+states:
+  plan:
+    accepts:
+      tasks:
+        type: tasks
+        required: true
+    gates:
+      done:
+        type: children-complete
+    materialize_children:
+      from_field: tasks
+      default_template: child.md
+    transitions:
+      - target: summarize
+        when:
+          gates.done.all_complete: true
+  summarize:
+    gates:
+      probe:
+        type: command
+        command: 'test "{{TOKEN}}" = "x"'
+    transitions:
+      - target: producer
+        when:
+          gates.probe.exit_code: 0
+  producer:
+    default_action:
+      command: 'echo x'
+      capture_stdout_as: TOKEN
+    transitions:
+      - target: closed
+  closed:
+    terminal: true
+---
+
+## plan
+
+Plan the batch.
+
+## summarize
+
+Summarize.
+
+## producer
+
+Produce.
+
+## closed
+
+Closed.
+"#;
+
+/// A tick that leaves the batching state and then stops on an error still
+/// records the batch: the transitions it made are on disk, and the next
+/// tick starts past the batching state.
+#[test]
+fn a_tick_that_leaves_the_batch_and_then_errors_still_records_it() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    start_batch(dir, ERRORING_NEXT_PARENT);
+    drive_child(dir, "parent.A", "done");
+    drive_child(dir, "parent.B", "done");
+
+    let (ok, json, _) = run_koto(dir, &["next", "parent"]);
+    assert!(!ok, "the tick should stop on the capture refusal: {json}");
+
+    let events = batch_finalized_events(dir);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["payload"]["state"], "plan");
+    assert!(batch_final_view_key(dir).is_some());
+}
+
+/// Children that finish without `--no-cleanup` are removed at their
+/// terminal, and the parent reads their results from its own log. The
+/// batch they complete is recorded the same way.
+#[test]
+fn a_batch_of_children_that_clean_up_is_recorded_when_the_tick_advances_out() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    start_batch(dir, &advancing_parent("summarize"));
+    for (child, marker) in [("parent.A", "done"), ("parent.B", "fail")] {
+        let data = serde_json::json!({ "marker": marker }).to_string();
+        run_ok(dir, &["next", child, "--with-data", &data]);
+    }
+
+    let json = run_ok(dir, &["next", "parent"]);
+    assert_eq!(json["state"], "summarize", "{json}");
+    let events = batch_finalized_events(dir);
+    assert_eq!(events.len(), 1, "{events:?}");
+    let key = batch_final_view_key(dir).expect("the key is written");
+    assert_eq!(key["total"], 2, "{key}");
+    assert_eq!(key["any_failed"], true, "{key}");
+}

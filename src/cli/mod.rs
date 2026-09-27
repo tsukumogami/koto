@@ -5269,6 +5269,33 @@ fn handle_next(
     );
     drop(decider_port);
 
+    // Issue #263: a tick that leaves a batching state records the batch it
+    // leaves, if that batch is complete. This is decided here, against the
+    // log the loop just wrote, rather than after the stop reason is mapped:
+    // several stops (an unresolvable transition, a cycle, a chain limit, a
+    // capture refusal, an advance error) exit from inside that mapping, and
+    // the transitions they made are already on disk. A record decided later
+    // would be lost with them, and the next tick starts in a state that has
+    // no batch to look at. A batching state entered and left again within
+    // the same tick is not checked: its children could not have been
+    // spawned by a scheduler that only runs where a tick stops.
+    if crate::cli::batch::state_has_materialize_children(&compiled, current_state) {
+        let left_start_state = backend
+            .read_events(&name)
+            .ok()
+            .and_then(|(_, events)| crate::engine::persistence::derive_state_from_log(&events))
+            .is_some_and(|now| now != *current_state);
+        if left_start_state {
+            crate::cli::batch::finalize_batch_if_complete(
+                backend,
+                context_store,
+                &name,
+                &compiled,
+                current_state,
+            );
+        }
+    }
+
     // 8. Map AdvanceResult/AdvanceError to NextResponse/NextError and exit.
     match result {
         Ok(advance_result) => {
@@ -5809,37 +5836,16 @@ fn handle_next(
             // event and the `batch_final_view` context key -- the first
             // time the batch's `children-complete` gate reports
             // `all_complete: true`. A retry (retry_failed evidence or a
-            // Rewound) invalidates the prior event and the next
-            // all-complete tick records a fresh one. The view freezes the
+            // Rewound) or a fresh entry into the state starts a new batch,
+            // and its completion is recorded in turn. The view freezes the
             // gate output so `koto status` and terminal `done` responses
             // can replay the final batch shape.
             //
-            // The decision is made against the state that owns the batch,
-            // not the state the tick stopped in (Issue #263). A tick that
-            // completes the batch and advances out of it in the same call
-            // -- a transition routed on `all_complete` -- stops in a state
-            // without `materialize_children`, and no later tick looks at
-            // the batching state again, so the start state is checked
-            // whenever the tick left it. It goes first, so a tick that
-            // finishes one batch and lands in another batching state
-            // records the first. The final state is checked only when the
-            // scheduler ran there, as before. Both calls can name the same
-            // completed batch; `should_append_batch_finalized` keeps it to
-            // one write. Everything below that reads the log (the
+            // This call covers a tick that stops in its batching state.
+            // A tick that left one was recorded right after the advance
+            // loop (Issue #263). Everything below that reads the log (the
             // terminal result, `batch.phase`, the terminal
-            // `batch_final_view`) runs after this, so it sees the event.
-            let tick_start_state = machine_state.current_state.as_str();
-            if final_state.as_str() != tick_start_state
-                && crate::cli::batch::state_has_materialize_children(&compiled, tick_start_state)
-            {
-                crate::cli::batch::finalize_batch_if_complete(
-                    backend,
-                    context_store,
-                    &name,
-                    &compiled,
-                    tick_start_state,
-                );
-            }
+            // `batch_final_view`) runs after both, so it sees the event.
             if scheduler_outcome.is_some()
                 && crate::cli::batch::state_has_materialize_children(&compiled, final_state)
             {

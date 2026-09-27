@@ -2942,38 +2942,88 @@ pub fn find_most_recent_batch_finalized(events: &[Event]) -> Option<&Event> {
         .find(|e| matches!(e.payload, EventPayload::BatchFinalized { .. }))
 }
 
-/// Decide whether a fresh `BatchFinalized` event should append for the
-/// current tick (Issue #17 acceptance criterion 2).
+/// Decide whether a fresh `BatchFinalized` event should append for
+/// `batch_state`'s batch on the current tick (Issue #17 acceptance
+/// criterion 2).
 ///
 /// Returns `true` only when:
 ///   - the `children-complete` gate output reports `all_complete: true`,
-///   - AND either no prior `BatchFinalized` event exists, OR the last
-///     `BatchFinalized` has been invalidated by a later event that
-///     re-entered the batched state (a retry `EvidenceSubmitted` with
-///     `retry_failed`, or a `Rewound` event on the parent).
+///   - AND either no prior `BatchFinalized` for `batch_state` exists, OR
+///     the last one has been invalidated by a later event that started a
+///     new batch in that state: a retry `EvidenceSubmitted` with
+///     `retry_failed`, a `Rewound` event on the parent, or a transition
+///     (evidence-driven or directed) into `batch_state` from another
+///     state.
 ///
 /// The append-once-per-finalization guarantee falls out of this
 /// predicate: a no-op re-tick observes the prior `BatchFinalized` with
-/// no intervening retry event, so no new event appends.
-pub fn should_append_batch_finalized(events: &[Event], all_complete: bool) -> bool {
+/// no intervening invalidator, so no new event appends.
+///
+/// The question is asked per batching state and per entry, not of the
+/// log as a whole (Issue #275). A session can run more than one batch:
+/// two `materialize_children` states in sequence, or one state re-entered
+/// through an ordinary transition. Judged log-wide, the first batch's
+/// event suppressed every later one, and `batch_final_view` kept the
+/// first batch's view. A self-loop is not a re-entry: it stays in the
+/// batch it was already in.
+pub fn should_append_batch_finalized(
+    events: &[Event],
+    batch_state: &str,
+    all_complete: bool,
+) -> bool {
     if !all_complete {
         return false;
     }
-    // Find the seq of the most recent BatchFinalized, if any.
+    // Find the seq of the most recent BatchFinalized for this state, if any.
     let last_bf_seq: Option<u64> = events.iter().rev().find_map(|e| match &e.payload {
-        EventPayload::BatchFinalized { .. } => Some(e.seq),
+        EventPayload::BatchFinalized { state, .. } if state == batch_state => Some(e.seq),
         _ => None,
     });
     match last_bf_seq {
         None => true, // no prior finalization — append fresh.
         Some(seq) => {
             // Append only if something after the prior BatchFinalized
-            // invalidated it (a retry_failed evidence or a Rewound).
+            // started a new batch in this state.
             events
                 .iter()
                 .filter(|e| e.seq > seq)
-                .any(is_batch_invalidator)
+                .any(|e| is_batch_invalidator(e) || enters_state(e, batch_state))
         }
+    }
+}
+
+/// Whether `state`'s task list (`field`) was submitted after the parent
+/// last entered `state`, which is when that state's current batch began.
+/// An entry is any transition, directed transition or rewind into the
+/// state from elsewhere, or the session's first transition into it.
+fn tasks_submitted_since_entry(events: &[Event], state: &str, field: &str) -> bool {
+    let entered_at = events
+        .iter()
+        .rev()
+        .find(|e| {
+            enters_state(e, state)
+                || matches!(&e.payload, EventPayload::Rewound { to, .. } if to == state)
+        })
+        .map(|e| e.seq)
+        .unwrap_or(0);
+    events.iter().any(|e| {
+        e.seq > entered_at
+            && matches!(
+                &e.payload,
+                EventPayload::EvidenceSubmitted { state: s, fields, .. }
+                    if s == state && fields.contains_key(field)
+            )
+    })
+}
+
+/// Whether `e` moves the parent into `state` from a different state.
+fn enters_state(e: &Event, state: &str) -> bool {
+    match &e.payload {
+        EventPayload::Transitioned { from, to, .. } => {
+            to == state && from.as_deref() != Some(state)
+        }
+        EventPayload::DirectedTransition { from, to, .. } => to == state && from != state,
+        _ => false,
     }
 }
 
@@ -3015,6 +3065,22 @@ pub(crate) fn finalize_batch_if_complete(
             return;
         }
     };
+    // A batch exists only once its task list has been submitted on this
+    // visit to the state. Before that, the view below would fall back to
+    // every child the parent has on record, which on a second batching
+    // state is the earlier batch's children -- all complete, so they would
+    // be recorded as this state's batch the moment the tick arrived
+    // (Issue #275).
+    let Some(hook) = template
+        .states
+        .get(batch_state)
+        .and_then(|s| s.materialize_children.as_ref())
+    else {
+        return;
+    };
+    if !tasks_submitted_since_entry(&post_events, batch_state, hook.from_field.as_str()) {
+        return;
+    }
     let (_converge_passes, gate_output) = build_children_complete_output(
         backend,
         parent_name,
@@ -3033,7 +3099,7 @@ pub(crate) fn finalize_batch_if_complete(
         .get("all_complete")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if !should_append_batch_finalized(&post_events, all_complete) {
+    if !should_append_batch_finalized(&post_events, batch_state, all_complete) {
         return;
     }
     let Some(view) = BatchFinalView::from_gate_output(&gate_output) else {
@@ -4144,15 +4210,15 @@ mod tests {
     #[test]
     fn should_append_batch_finalized_when_no_prior_event() {
         let events: Vec<Event> = vec![];
-        assert!(should_append_batch_finalized(&events, true));
+        assert!(should_append_batch_finalized(&events, "plan", true));
         // all_complete false short-circuits.
-        assert!(!should_append_batch_finalized(&events, false));
+        assert!(!should_append_batch_finalized(&events, "plan", false));
     }
 
     #[test]
     fn should_not_append_batch_finalized_when_prior_not_invalidated() {
         let events = vec![bf_event(5, "2026-04-14T10:00:00Z")];
-        assert!(!should_append_batch_finalized(&events, true));
+        assert!(!should_append_batch_finalized(&events, "plan", true));
     }
 
     #[test]
@@ -4161,7 +4227,61 @@ mod tests {
             bf_event(5, "2026-04-14T10:00:00Z"),
             retry_evidence_event(7, "2026-04-14T10:05:00Z"),
         ];
-        assert!(should_append_batch_finalized(&events, true));
+        assert!(should_append_batch_finalized(&events, "plan", true));
+    }
+
+    fn bf_event_for(seq: u64, state: &str) -> Event {
+        let mut e = bf_event(seq, "2026-04-14T10:00:00Z");
+        if let EventPayload::BatchFinalized { state: s, .. } = &mut e.payload {
+            *s = state.to_string();
+        }
+        e
+    }
+
+    fn transitioned_event(seq: u64, from: &str, to: &str) -> Event {
+        Event {
+            seq,
+            timestamp: "2026-04-14T10:05:00Z".to_string(),
+            event_type: "transitioned".to_string(),
+            payload: EventPayload::Transitioned {
+                from: Some(from.to_string()),
+                to: to.to_string(),
+                condition_type: "gate".to_string(),
+                skip_if_matched: None,
+                context_assignments: None,
+            },
+            idempotency_hash: None,
+        }
+    }
+
+    #[test]
+    fn another_states_batch_finalized_does_not_suppress_this_one() {
+        // Issue #275: a second batching state's batch is its own.
+        let events = vec![
+            bf_event_for(5, "plan1"),
+            transitioned_event(6, "plan1", "plan2"),
+        ];
+        assert!(should_append_batch_finalized(&events, "plan2", true));
+        assert!(!should_append_batch_finalized(&events, "plan1", true));
+    }
+
+    #[test]
+    fn re_entering_the_batching_state_starts_a_new_batch() {
+        let events = vec![
+            bf_event_for(5, "plan"),
+            transitioned_event(6, "plan", "review"),
+            transitioned_event(7, "review", "plan"),
+        ];
+        assert!(should_append_batch_finalized(&events, "plan", true));
+    }
+
+    #[test]
+    fn a_self_loop_does_not_start_a_new_batch() {
+        let events = vec![
+            bf_event_for(5, "plan"),
+            transitioned_event(6, "plan", "plan"),
+        ];
+        assert!(!should_append_batch_finalized(&events, "plan", true));
     }
 
     #[test]

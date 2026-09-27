@@ -240,11 +240,25 @@ to `0.9.x`).
   left in the same tick and got neither: `koto context get <parent>
   batch_final_view` exited 3 and the event log had no `BatchFinalized`. Both
   are now written once per completed batch, decided against the batching
-  state, whether the tick stays there, advances out of it, or leaves with
-  `koto next --to`. A completing tick that lands on a terminal state now also
-  carries `batch_final_view` in its response. A consumer that read the key
-  after such a batch and went on without it when it was missing now gets the
-  view.
+  state, whether the tick stays there, advances out of it (even if it then
+  stops on an error in a later state), or leaves with `koto next --to`. A
+  `koto next` tick that completes the batch and lands on a terminal state now
+  also carries `batch_final_view` in its response. A consumer that read the
+  key after such a batch and went on without it when it was missing now gets
+  the view.
+
+- **Each batch in a session is recorded as its own (koto#275).** Whether a
+  batch was already recorded was decided across the whole log, so once one
+  batch had a `BatchFinalized`, a later batch (a second `materialize_children`
+  state, or the same state re-entered through an ordinary transition) never
+  got one, and `batch_final_view` kept the earlier batch's view. A state
+  arrived at before its task list was submitted could also be recorded at
+  once with the earlier batch's children. The decision is now made per
+  batching state and per visit: a batch starts when its task list is
+  submitted after the state is entered, and it is recorded once when it
+  completes. A retry or rewind still starts it over. With the fix above
+  alone, a parent with two batches in sequence would have read the first
+  batch's view after the second.
 
 - **The `children-complete` gate no longer shows a retried child's old result.**
   It reads only the result a child recorded for its current arrival, and it no
