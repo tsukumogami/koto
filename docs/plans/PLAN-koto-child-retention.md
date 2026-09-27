@@ -291,17 +291,17 @@ session lifecycle and cleanup are described. Covers PRD R13.
 - `CHANGELOG.md`: an Unreleased entry.
 
 **Acceptance Criteria**:
-- [ ] `docs/guides/cli-usage.md` and `docs/workspace-layout.md` state that a
+- [x] `docs/guides/cli-usage.md` and `docs/workspace-layout.md` state that a
   failure terminal is kept, name the `retention` field and its three values,
   list each reclaim path, and note that a retained failure is now the common
   case for the name-reuse refusal.
-- [ ] The three koto-user files name the `retention` field, and none of the
+- [x] The three koto-user files name the `retention` field, and none of the
   files in `src/`, `docs/` or `plugins/` describes `--no-cleanup` as a
   debugging aid or as keeping a child's result from its parent.
-- [ ] `CHANGELOG.md` has an Unreleased entry covering retention, delivery
+- [x] `CHANGELOG.md` has an Unreleased entry covering retention, delivery
   under `--no-cleanup`, the response field and the sweep.
-- [ ] `cargo test --test doc_names` passes.
-- [ ] A full `cargo test -- --test-threads=1` passes before the PR is marked
+- [x] `cargo test --test doc_names` passes.
+- [x] A full `cargo test -- --test-threads=1` passes before the PR is marked
   ready, and the PR body maps each PRD acceptance criterion to the test that
   exercises it.
 
