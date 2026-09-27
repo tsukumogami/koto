@@ -329,6 +329,43 @@ fn a_directed_exit_with_no_consultation_writes_nothing() {
 }
 
 #[test]
+fn a_directed_exit_after_an_answer_in_the_same_visit_writes_nothing() {
+    // `proceed` also needs FLAG set, and FLAG is empty, so the answer
+    // matches no transition and the agent leaves with `--to` instead.
+    let tpl = standard("shadow", "shadow")
+        .replace(
+            "variables:\n  PLAN_DOC:",
+            "variables:\n  FLAG:\n    description: flag\n    default: \"\"\n  PLAN_DOC:",
+        )
+        .replace(
+            "      - target: work\n        when:\n          verdict: proceed\n",
+            "      - target: work\n        when:\n          verdict: proceed\n          vars.FLAG: {is_set: true}\n",
+        );
+    let h = ready(&tpl, vec![go()]);
+    ok(&h.next_mode("shadow"));
+    ok(&h.next_with("shadow", r#"{"verdict": "proceed"}"#));
+    ok(&directed(&h, "work"));
+    let lines = ledger(&h);
+    assert_eq!(of_kind(&lines, "answered").len(), 1, "{:?}", lines);
+    assert!(of_kind(&lines, "directed_exit").is_empty(), "{:?}", lines);
+}
+
+#[test]
+fn only_the_consulted_visit_records_an_exit_not_a_later_one() {
+    let h = ready(&standard("shadow", "shadow"), vec![go()]);
+    ok(&h.next_mode("shadow"));
+    ok(&directed(&h, "rethink"));
+    // Back into `review` by `--to`, which consults nothing: the new visit
+    // has no consultation, so leaving it again has nothing to pair with.
+    ok(&directed(&h, "review"));
+    ok(&directed(&h, "rethink"));
+    let exits = of_kind(&ledger(&h), "directed_exit");
+    assert_eq!(exits.len(), 1, "{:?}", exits);
+    assert_eq!(exits[0]["target"], "rethink");
+    assert_eq!(h.stub.request_count(), 1);
+}
+
+#[test]
 fn an_answer_with_data_writes_no_directed_exit() {
     let h = ready(&standard("shadow", "shadow"), vec![go()]);
     ok(&h.next_mode("shadow"));

@@ -4113,6 +4113,7 @@ fn handle_next(
             Some(header.session_id.as_str()),
             &events,
             current_state,
+            current_template_state.accepts.as_ref(),
             target,
         ) {
             crate::decider::ledger::append_or_warn(

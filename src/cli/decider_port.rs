@@ -329,17 +329,27 @@ pub fn answered_record(
 /// `events` is the log before the `directed_transition` was appended. A
 /// record is due when the visit being left holds a `decider_consulted`
 /// event whose outcome isn't `applied` -- the same visits an `answered`
-/// record would pair with. Like [`answered_record`], nothing here reads the
-/// decider settings.
+/// record would pair with -- and the agent hasn't already answered a
+/// declared field in `accepts` on it. A visit that was answered and then
+/// left with `--to` (the answer matched no transition) is already a paired
+/// observation; an exit on top of it isn't an answer withheld. Like
+/// [`answered_record`], nothing here reads the decider settings.
 pub fn directed_exit_record(
     session: &str,
     session_id: Option<&str>,
     events: &[Event],
     state: &str,
+    accepts: Option<&BTreeMap<String, crate::template::types::FieldSchema>>,
     target: &str,
 ) -> Option<LedgerRecord> {
     let consultation = prior_consultation(events, state)?;
     if consultation.outcome == ConsultationOutcome::Applied {
+        return None;
+    }
+    let declared = accepts
+        .map(crate::decider::declared_fields)
+        .unwrap_or_default();
+    if !visit_still_open(events, state, consultation.visit_seq, &declared) {
         return None;
     }
     Some(LedgerRecord::directed_exit(
