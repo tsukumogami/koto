@@ -705,3 +705,179 @@ fn a_retry_routed_back_into_the_batching_state_is_recorded_again() {
     run_ok(dir, &["next", "parent"]);
     assert_eq!(batch_finalized_events(dir).len(), 2);
 }
+
+/// A parent that can leave its batching state for `review` and come back to
+/// it, submitting a new task list on the second visit.
+const REVISITING_PARENT: &str = r#"---
+name: batch-parent-revisit
+version: "1.0"
+initial_state: plan
+states:
+  plan:
+    accepts:
+      tasks:
+        type: tasks
+        required: true
+      finalize:
+        type: enum
+        required: false
+        values: [yes]
+    gates:
+      done:
+        type: children-complete
+    materialize_children:
+      from_field: tasks
+      default_template: child.md
+    transitions:
+      - target: review
+        when:
+          finalize: yes
+  review:
+    accepts:
+      again:
+        type: enum
+        required: true
+        values: [yes]
+    transitions:
+      - target: plan
+        when:
+          again: yes
+---
+
+## plan
+
+Plan the batch.
+
+## review
+
+Review, and go again if needed.
+"#;
+
+/// The names a view lists, sorted.
+fn view_names(view: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = view["children"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no children in {view}"))
+        .iter()
+        .filter_map(|c| c["name"].as_str().map(String::from))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A batching state visited again runs a new batch when a new task list is
+/// submitted, with no retry or rewind in between. Arriving back records
+/// nothing (the batch there is still the old, recorded one); the new batch
+/// is recorded when it completes.
+#[test]
+fn a_new_task_list_on_a_later_visit_is_recorded_as_a_new_batch() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    std::fs::write(dir.join("child.md"), CHILD_TEMPLATE).unwrap();
+    let parent = dir.join("parent.md");
+    std::fs::write(&parent, REVISITING_PARENT).unwrap();
+    run_ok(
+        dir,
+        &["init", "parent", "--template", parent.to_str().unwrap()],
+    );
+
+    let first = serde_json::json!({"tasks": [{"name": "A", "waits_on": [], "vars": {}}]});
+    run_ok(dir, &["next", "parent", "--with-data", &first.to_string()]);
+    drive_child(dir, "parent.A", "done");
+    run_ok(dir, &["next", "parent"]);
+    assert_eq!(batch_finalized_events(dir).len(), 1);
+
+    let leave = serde_json::json!({
+        "tasks": [{"name": "A", "waits_on": [], "vars": {}}],
+        "finalize": "yes"
+    });
+    let json = run_ok(dir, &["next", "parent", "--with-data", &leave.to_string()]);
+    assert_eq!(json["state"], "review", "{json}");
+    let json = run_ok(
+        dir,
+        &["next", "parent", "--with-data", r#"{"again": "yes"}"#],
+    );
+    assert_eq!(json["state"], "plan", "{json}");
+    assert_eq!(
+        batch_finalized_events(dir).len(),
+        1,
+        "arriving back at an unchanged, recorded batch records nothing"
+    );
+
+    let second = serde_json::json!({"tasks": [{"name": "C", "waits_on": [], "vars": {}}]});
+    run_ok(dir, &["next", "parent", "--with-data", &second.to_string()]);
+    drive_child(dir, "parent.C", "fail");
+    run_ok(dir, &["next", "parent"]);
+
+    let events = batch_finalized_events(dir);
+    assert_eq!(events.len(), 2, "{events:?}");
+    let key = batch_final_view_key(dir).expect("the key is there");
+    assert_eq!(view_names(&key), vec!["parent.C"], "{key}");
+    assert_eq!(key["any_failed"], true, "{key}");
+}
+
+/// A retry submitted in the batching state itself: the record waits for the
+/// retried child and is then made again with the new outcome.
+#[test]
+fn a_retry_inside_the_batching_state_is_recorded_when_it_completes() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    start_batch(dir, STAYING_PARENT);
+    drive_child(dir, "parent.A", "fail");
+    drive_child(dir, "parent.B", "done");
+    run_ok(dir, &["next", "parent"]);
+    assert_eq!(batch_finalized_events(dir).len(), 1);
+
+    let retry = serde_json::json!({"retry_failed": {"children": ["A"]}});
+    run_ok(dir, &["next", "parent", "--with-data", &retry.to_string()]);
+    assert_eq!(
+        batch_finalized_events(dir).len(),
+        1,
+        "nothing is recorded while the retried child runs"
+    );
+
+    drive_child(dir, "parent.A", "done");
+    run_ok(dir, &["next", "parent"]);
+    let events = batch_finalized_events(dir);
+    assert_eq!(events.len(), 2, "{events:?}");
+    let key = batch_final_view_key(dir).expect("the key is there");
+    assert_eq!(key["all_success"], true, "{key}");
+}
+
+/// A directed exit from a batching state takes the batch lock the advance
+/// path takes: while another tick holds it, `--to` refuses and writes
+/// nothing; once it is free, the exit records the batch.
+#[test]
+fn a_directed_exit_waits_for_the_batch_lock() {
+    use std::os::unix::io::AsRawFd;
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    start_batch(dir, STAYING_PARENT);
+    drive_child(dir, "parent.A", "done");
+    drive_child(dir, "parent.B", "done");
+
+    let state_file = sessions_base(dir)
+        .join("parent")
+        .join("koto-parent.state.jsonl");
+    let before = std::fs::read(&state_file).unwrap();
+    let holder = std::fs::File::open(&state_file).unwrap();
+    // SAFETY: `holder` outlives the call; the flag pair is a plain
+    // non-blocking exclusive lock, the one koto itself takes.
+    let ret = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(ret, 0, "the test takes the lock first");
+
+    let (ok, json, _) = run_koto(dir, &["next", "parent", "--to", "summarize"]);
+    assert!(!ok, "--to must refuse while the lock is held: {json}");
+    assert_eq!(json["batch"]["kind"], "concurrent_tick", "{json}");
+    assert_eq!(
+        std::fs::read(&state_file).unwrap(),
+        before,
+        "a refused --to writes nothing"
+    );
+
+    drop(holder);
+    let json = run_ok(dir, &["next", "parent", "--to", "summarize"]);
+    assert_eq!(json["state"], "summarize", "{json}");
+    assert_eq!(batch_finalized_events(dir).len(), 1);
+}

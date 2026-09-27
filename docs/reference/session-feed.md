@@ -690,9 +690,8 @@ on the tick that completes it, whether that tick stays in the state, advances
 out of it, or leaves it with `koto next --to`. `state` names the batching state,
 not the state the tick stopped in. A log can hold several: one per batching
 state that ran a batch, and another whenever a batch completes again after a
-retry or a rewind, or with different per-child outcomes than its last record.
-A retry anywhere in the session lets every batching state record once more, so
-two consecutive records for one state can carry the same view.
+retry of one of its children or a rewind, or with different per-child outcomes
+than its last record.
 The most recent `batch_finalized` event drives `koto status` batch display after
 children are auto-cleaned, and its `view` is what the `batch_final_view`
 context key holds.

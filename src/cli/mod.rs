@@ -2434,6 +2434,35 @@ fn rewind_relocate_children(
     (Some(branch_prefix), relocated)
 }
 
+/// Take the parent's state-file lock for a tick on a batching state, or exit
+/// with the error a caller can act on: `BatchError::ConcurrentTick` when
+/// another tick holds it, a persistence error otherwise. Every path that
+/// reads, decides and writes a batch record holds this lock, which is what
+/// keeps that record to one per completed batch.
+#[cfg(unix)]
+fn lock_batch_parent_or_exit(
+    backend: &dyn SessionBackend,
+    name: &str,
+) -> crate::session::SessionLock {
+    match backend.lock_state_file(name) {
+        Ok(guard) => guard,
+        Err(SessionError::Locked { holder_pid }) => {
+            let err = crate::cli::batch_error::BatchError::ConcurrentTick { holder_pid };
+            let code = err.exit_code();
+            exit_with_error_code(err.to_envelope(), code);
+        }
+        Err(e) => {
+            let ne = crate::cli::next_types::NextError {
+                code: crate::cli::next_types::NextErrorCode::PersistenceError,
+                message: format!("failed to acquire state file lock: {}", e),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
+        }
+    }
+}
+
 /// Decide whether a workflow state's entry into `handle_next` must be
 /// serialized behind an advisory flock on the parent state file.
 ///
@@ -4272,6 +4301,15 @@ fn handle_next(
             }
         }
 
+        // A directed exit from a batching state may record its batch below,
+        // so it takes the same lock the advance path holds before it writes
+        // anything (Issue #263). Contention refuses with nothing written.
+        let _batch_lock = if state_is_batch_scoped(&compiled, current_state, &events) {
+            Some(lock_batch_parent_or_exit(backend, &name))
+        } else {
+            None
+        };
+
         // Append directed_transition event.
         let payload = EventPayload::DirectedTransition {
             from: current_state.clone(),
@@ -4897,23 +4935,7 @@ fn handle_next(
     // loop; its field is intentionally unused.
     let _batch_lock: Option<crate::session::SessionLock> =
         if state_is_batch_scoped(&compiled, current_state, &events) {
-            match backend.lock_state_file(&name) {
-                Ok(guard) => Some(guard),
-                Err(SessionError::Locked { holder_pid }) => {
-                    let err = crate::cli::batch_error::BatchError::ConcurrentTick { holder_pid };
-                    let code = err.exit_code();
-                    exit_with_error_code(err.to_envelope(), code);
-                }
-                Err(e) => {
-                    let ne = NextError {
-                        code: NextErrorCode::PersistenceError,
-                        message: format!("failed to acquire state file lock: {}", e),
-                        details: vec![],
-                    };
-                    let json = serde_json::json!({"error": ne});
-                    exit_with_error_code(json, ne.code.exit_code());
-                }
-            }
+            Some(lock_batch_parent_or_exit(backend, &name))
         } else {
             None
         };
@@ -5279,10 +5301,10 @@ fn handle_next(
     // would be lost with them, and the next tick starts in a state that has
     // no batch to look at.
     //
-    // The batch is judged as it stood when the tick left it: the log up to
-    // the tick's first transition out of the state, so what the rest of the
-    // tick did (including coming back to the state and stopping on a cycle)
-    // doesn't change what is recorded.
+    // The parent's log is read up to the tick's first transition out of the
+    // state, so what the rest of the tick wrote (including coming back to the
+    // state and stopping on a cycle) doesn't change what is recorded. The
+    // children are read as they are now.
     //
     // Only the start state is checked. A batching state entered and left
     // again later in the same tick had no batch to record: its children are

@@ -256,13 +256,13 @@ to `0.9.x`).
   state reached before its task list was submitted could also be recorded
   at once, with the earlier batch's children. The decision is now made per
   batching state: a state's batch exists once its task list is submitted,
-  and it is recorded when it completes, again after a retry or rewind
-  (including a retry submitted in another state that routes back), and again
-  whenever its per-child outcomes differ from the last record (a new task
-  list on a later visit); a visit that finds the same children and outcomes,
-  with no retry or rewind since, records nothing. With the
-  fix above alone, a parent with two batches in sequence would have read the
-  first batch's view after the second.
+  and it is recorded when it completes, again after a retry of one of its
+  own children (including one submitted in another state that routes back)
+  or a rewind, and again whenever its per-child outcomes differ from the last
+  record (a new task list on a later visit); a visit that finds the same
+  children and outcomes, with no retry of them or rewind since, records
+  nothing. With the fix above alone, a parent with two batches in sequence
+  would have read the first batch's view after the second.
 
 - **A variable value may contain `+` (koto#266).** The value allowlist now
   accepts letters, digits, `.`, `_`, `-`, `/`, `:`, `@`, `+` and spaces

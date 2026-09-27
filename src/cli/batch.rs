@@ -2949,8 +2949,9 @@ pub fn find_most_recent_batch_finalized(events: &[Event]) -> Option<&Event> {
 /// Returns `true` only when the `children-complete` gate output reports
 /// `all_complete: true` and one of these holds:
 ///   - no `BatchFinalized` for `batch_state` exists yet;
-///   - a later event started the batch over: a retry `EvidenceSubmitted`
-///     with `retry_failed`, or a `Rewound` event on the parent;
+///   - a later event started the batch over: a `retry_failed` submission
+///     naming at least one of `batch_tasks` (the batch's task names), or
+///     a `Rewound` event on the parent;
 ///   - the batch's outcome differs from the last one recorded for this
 ///     state -- a child the view lists, or an outcome, changed.
 ///
@@ -2962,17 +2963,17 @@ pub fn find_most_recent_batch_finalized(events: &[Event]) -> Option<&Event> {
 /// (Issue #275). Judged log-wide, a second batching state's batch never
 /// appended, and `batch_final_view` kept the first batch's view. The
 /// outcome comparison records a batch that changed without a retry or a
-/// rewind -- a new task list submitted on a later visit. (A retry
-/// submitted from another state that routes back here is already caught
-/// by the `retry_failed` check, which does not look at which state the
-/// evidence names; it also means any retry in the session lets every
-/// batching state record once more.) Coming back to a state whose batch
-/// has not changed, with no retry or rewind since its record, records
-/// nothing, since it is the same batch. `current_view` is the view this
-/// tick would record.
+/// rewind -- a new task list submitted on a later visit. A retry is matched
+/// to a batch by the children it names, not by the state it was submitted
+/// in: the recommended shape submits it from a later state that routes
+/// back, and a retry of another batch's children must not reopen this one.
+/// Coming back to a state whose batch has not changed, with no retry of it
+/// or rewind since its record, records nothing, since it is the same
+/// batch. `current_view` is the view this tick would record.
 pub fn should_append_batch_finalized(
     events: &[Event],
     batch_state: &str,
+    batch_tasks: &[String],
     all_complete: bool,
     current_view: &serde_json::Value,
 ) -> bool {
@@ -2992,7 +2993,7 @@ pub fn should_append_batch_finalized(
             events
                 .iter()
                 .filter(|e| e.seq > seq)
-                .any(is_batch_invalidator)
+                .any(|e| restarts_batch(e, batch_tasks))
                 || batch_outcomes(prior_view) != batch_outcomes(current_view)
         }
     }
@@ -3043,9 +3044,15 @@ fn batch_outcomes(view: &serde_json::Value) -> Vec<(String, String)> {
 /// Callers may ask about the same batch on consecutive ticks:
 /// [`should_append_batch_finalized`] keeps it to one write per completed
 /// batch. The view is built from the log, so it freezes the batch's final
-/// shape (Issue #17). `before_seq`, when given, limits that log to the
-/// events before it -- the batch as it stood when a tick left its state,
-/// ignoring anything the rest of the tick did (Issue #263).
+/// shape (Issue #17). `before_seq`, when given, limits the parent's log to
+/// the events before it, so what the rest of a tick wrote after leaving the
+/// state is not read (Issue #263). The children are still read as they are
+/// now: their logs are separate, and this call does not freeze them.
+///
+/// Callers hold the parent's state-file lock (`lock_state_file`), as every
+/// path in `handle_next` that calls this does: the read, the decision and
+/// the append must not interleave with another tick's, or one completed
+/// batch could be recorded twice.
 ///
 /// Failures to append or write are warnings, as they were when this
 /// lived inline in `handle_next`: the tick itself has already been
@@ -3084,11 +3091,11 @@ pub(crate) fn finalize_batch_if_complete(
     else {
         return;
     };
-    if extract_tasks(&post_events, batch_state, hook.from_field.as_str())
-        .is_none_or(|tasks| tasks.is_empty())
-    {
-        return;
-    }
+    let batch_tasks: Vec<String> =
+        match extract_tasks(&post_events, batch_state, hook.from_field.as_str()) {
+            Some(tasks) if !tasks.is_empty() => tasks.into_iter().map(|t| t.name).collect(),
+            _ => return,
+        };
     let (_converge_passes, gate_output) = build_children_complete_output(
         backend,
         parent_name,
@@ -3111,7 +3118,13 @@ pub(crate) fn finalize_batch_if_complete(
         return;
     };
     let view_json = serde_json::to_value(&view).unwrap_or(serde_json::Value::Null);
-    if !should_append_batch_finalized(&post_events, batch_state, all_complete, &view_json) {
+    if !should_append_batch_finalized(
+        &post_events,
+        batch_state,
+        &batch_tasks,
+        all_complete,
+        &view_json,
+    ) {
         return;
     }
     let ts = crate::engine::types::now_iso8601();
@@ -3143,6 +3156,26 @@ pub(crate) fn finalize_batch_if_complete(
 fn is_batch_invalidator(e: &Event) -> bool {
     match &e.payload {
         EventPayload::EvidenceSubmitted { fields, .. } => fields.contains_key("retry_failed"),
+        EventPayload::Rewound { .. } => true,
+        _ => false,
+    }
+}
+
+/// Whether `e` starts over the batch whose task names are `batch_tasks`: a
+/// `retry_failed` submission naming at least one of them, or any `Rewound`
+/// on the parent (a rewind resets the epoch for every state).
+fn restarts_batch(e: &Event, batch_tasks: &[String]) -> bool {
+    match &e.payload {
+        EventPayload::EvidenceSubmitted { fields, .. } => fields
+            .get("retry_failed")
+            .and_then(|r| r.get("children"))
+            .and_then(|c| c.as_array())
+            .is_some_and(|children| {
+                children
+                    .iter()
+                    .filter_map(|c| c.as_str())
+                    .any(|name| batch_tasks.iter().any(|t| t == name))
+            }),
         EventPayload::Rewound { .. } => true,
         _ => false,
     }
@@ -4180,6 +4213,11 @@ mod tests {
 
     // --------- Issue #17: BatchFinalized helpers ---------------------
 
+    /// The task names of the batch the retry fixtures name (`A`).
+    fn tasks_a() -> Vec<String> {
+        vec!["A".to_string()]
+    }
+
     fn bf_event(seq: u64, ts: &str) -> Event {
         Event {
             seq,
@@ -4221,6 +4259,7 @@ mod tests {
         assert!(should_append_batch_finalized(
             &events,
             "plan",
+            &tasks_a(),
             true,
             &serde_json::json!({})
         ));
@@ -4228,6 +4267,7 @@ mod tests {
         assert!(!should_append_batch_finalized(
             &events,
             "plan",
+            &tasks_a(),
             false,
             &serde_json::json!({})
         ));
@@ -4239,6 +4279,7 @@ mod tests {
         assert!(!should_append_batch_finalized(
             &events,
             "plan",
+            &tasks_a(),
             true,
             &serde_json::json!({})
         ));
@@ -4253,6 +4294,7 @@ mod tests {
         assert!(should_append_batch_finalized(
             &events,
             "plan",
+            &tasks_a(),
             true,
             &serde_json::json!({})
         ));
@@ -4286,10 +4328,18 @@ mod tests {
         let events = vec![bf_event_for(5, "plan1", first.clone())];
         let second = view_of(&[("p.b2-B", "failure")]);
         assert!(should_append_batch_finalized(
-            &events, "plan2", true, &second
+            &events,
+            "plan2",
+            &tasks_a(),
+            true,
+            &second
         ));
         assert!(!should_append_batch_finalized(
-            &events, "plan1", true, &first
+            &events,
+            "plan1",
+            &tasks_a(),
+            true,
+            &first
         ));
     }
 
@@ -4299,7 +4349,35 @@ mod tests {
         // state filter tells the two batches apart (Issue #275).
         let view = view_of(&[("p.A", "success")]);
         let events = vec![bf_event_for(5, "plan1", view.clone())];
-        assert!(should_append_batch_finalized(&events, "plan2", true, &view));
+        assert!(should_append_batch_finalized(
+            &events,
+            "plan2",
+            &tasks_a(),
+            true,
+            &view
+        ));
+    }
+
+    #[test]
+    fn a_retry_of_another_batchs_children_does_not_reopen_this_one() {
+        // The retry fixture names child `A`. A batch of `B` is not retried
+        // by it; a batch that holds `A` is.
+        let view = view_of(&[("p.B", "success")]);
+        let events = vec![
+            bf_event_for(5, "plan", view.clone()),
+            retry_evidence_event(7, "2026-04-14T10:05:00Z"),
+        ];
+        let tasks_b = vec!["B".to_string()];
+        assert!(!should_append_batch_finalized(
+            &events, "plan", &tasks_b, true, &view
+        ));
+        assert!(should_append_batch_finalized(
+            &events,
+            "plan",
+            &tasks_a(),
+            true,
+            &view
+        ));
     }
 
     #[test]
@@ -4309,7 +4387,13 @@ mod tests {
         let before = view_of(&[("p.A", "failure")]);
         let events = vec![bf_event_for(5, "plan", before)];
         let after = view_of(&[("p.C", "success")]);
-        assert!(should_append_batch_finalized(&events, "plan", true, &after));
+        assert!(should_append_batch_finalized(
+            &events,
+            "plan",
+            &tasks_a(),
+            true,
+            &after
+        ));
     }
 
     #[test]
@@ -4321,7 +4405,11 @@ mod tests {
         let mut rebuilt = view_of(&[("p.A", "failure"), ("p.B", "success")]);
         rebuilt["children"][0]["state"] = serde_json::json!("failed");
         assert!(!should_append_batch_finalized(
-            &events, "plan", true, &rebuilt
+            &events,
+            "plan",
+            &tasks_a(),
+            true,
+            &rebuilt
         ));
     }
 
