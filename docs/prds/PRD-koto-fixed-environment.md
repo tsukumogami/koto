@@ -1,7 +1,7 @@
 ---
 schema: prd/v1
 status: Accepted
-upstream: docs/briefs/BRIEF-koto-fixed-environment.md
+absorbed: docs/briefs/BRIEF-koto-fixed-environment.md
 source_issue: 261
 problem: |
   Every command gate and default action runs as `sh -c` with the whole
@@ -24,6 +24,41 @@ goals: |
 ## Status
 
 Accepted
+
+Absorbed [BRIEF](docs/briefs/BRIEF-koto-fixed-environment.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+**Why this exists.** A koto session binds its template, variables and
+starting directory at `koto init` but not the environment its commands run
+with, so every gate and default action reads whatever tools and shell state
+the ticking process carries. A shim first on `PATH` is read silently, an
+exported function replaces a tool where `/bin/sh` is bash, and one session
+gives different verdicts from different shells. The same gap lets a caller
+pass a gate marked `overridable: false` by changing the environment of one
+tick. Commands still need part of the environment, much of it secret, and
+every session in flight was started by a koto that recorded nothing.
+
+**The outcome.** Whoever ticks a session gets the verdict it would give from
+any shell. Its commands find the tools they found at start, a shim or
+function in the ticking shell changes nothing, a move onto different tools is
+refused by name, and credentials still come from the live environment without
+being written into the session. A template author can rely on a
+non-overridable gate at least as far as the environment goes and knows which
+channels stay open; a user upgrading mid-run finds sessions still advance.
+
+**The journeys.** An eval author's stand-in tool stops leaking between ticks;
+an agent can't pass a non-overridable gate by prefixing `PATH` or exporting a
+function; a developer resuming from a shell whose tools moved gets a named
+failure or refusal instead of silent drift; a shirabe user upgrades koto with
+runs in flight and they keep advancing; an operator shares a session log
+without scrubbing secrets.
+
+**The boundary.** In: the environment of every command koto runs for a
+session, what the session records at init, the variables read live, removing
+shell-injected behaviour, attach and rebind, older sessions, and stating the
+limit. Out: file, session-directory, repository and binary tampering;
+`koto next --to` and overrides; sandboxing; and changes to shirabe itself.
 
 ## Problem Statement
 
