@@ -86,34 +86,34 @@ the existing fallback tests in `src/cli/batch.rs`
   contract, stating each change in the commit.
 
 **Acceptance Criteria**:
-- [ ] A child ticked to a success terminal with no `result:` map and with
+- [x] A child ticked to a success terminal with no `result:` map and with
   `--no-cleanup` has exactly one `request_store.result` on its own log and one
   `ChildCompleted` on its parent's, and its parent's gate reports
   `results_in: true` and passes, for a parent with an unconditional exit and
   for one keyed on `gates.<gate>.all_complete: true`.
-- [ ] That parked child has exactly one terminal-index entry after its
+- [x] That parked child has exactly one terminal-index entry after its
   arrival tick, and ticking it three more times leaves its log, its parent's
   log and its terminal-index entry count unchanged.
-- [ ] A root kept with `--no-cleanup` at a terminal has exactly one
+- [x] A root kept with `--no-cleanup` at a terminal has exactly one
   terminal-index entry, and three more ticks leave its log and its index entry
   count unchanged.
-- [ ] A child parked at a terminal by an earlier version (no
+- [x] A child parked at a terminal by an earlier version (no
   `request_store.result` after its last transition) gets one
   `request_store.result`, one index entry and one `ChildCompleted` on its next
   tick, and its parent's gate then reports `results_in: true`.
-- [ ] A child retried out of a terminal that holds an earlier arrival's
+- [x] A child retried out of a terminal that holds an earlier arrival's
   failure result is reported by the gate as `pending`, with no result, until
   its new arrival records one.
-- [ ] A parent log carrying zero, one or two `ChildCompleted` events for one
+- [x] A parent log carrying zero, one or two `ChildCompleted` events for one
   on-disk failed child's arrival yields, each time, that child listed with
   `outcome: "failure"` and the result from the child's own log.
-- [ ] With the parent log unwritable on a child's terminal tick, the tick
+- [x] With the parent log unwritable on a child's terminal tick, the tick
   exits 0, warns on stderr and keeps the child; the next tick with the parent
   writable appends the notice and removes the child.
-- [ ] A success terminal kept with `--no-cleanup` and ticked again without the
+- [x] A success terminal kept with `--no-cleanup` and ticked again without the
   flag is removed, its own log and the index gain nothing, and the parent gains
   at most one `ChildCompleted` matching the arrival's result.
-- [ ] `cargo test` for the touched modules passes; `cargo fmt --check` and
+- [x] `cargo test` for the touched modules passes; `cargo fmt --check` and
   `cargo clippy` are clean.
 
 **Dependencies**: None
