@@ -95,7 +95,7 @@ jobs:
 
       # One of the four default checks in .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
   decider-checks:
     # The decider must not pull an async HTTP stack or a second attohttpc

@@ -46,4 +46,4 @@ leftover-artifact checks) are left out on purpose.
 - `cargo test --locked -- --test-threads=1`
 - `cargo test -p koto-stability-tests -- --test-threads=1`
 - `cargo fmt --check`
-- `cargo clippy -- -D warnings`
+- `cargo clippy --all-targets -- -D warnings`

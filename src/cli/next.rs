@@ -343,11 +343,9 @@ mod tests {
         let result = dispatch_next("deploy", &ts, false, &gates);
         let resp = result.unwrap();
         // Should not be GateBlocked since all gates passed
-        match resp {
-            NextResponse::GateBlocked { .. } => {
-                panic!("should not be GateBlocked when all gates pass")
-            }
-            _ => {} // any other variant is fine
+        // Any other variant is fine.
+        if let NextResponse::GateBlocked { .. } = resp {
+            panic!("should not be GateBlocked when all gates pass")
         }
     }
 

@@ -140,7 +140,7 @@ fn crash_mid_compaction_recovery_removes_lock_and_tmp_preserves_original() {
         .unwrap();
     }
     let original_contents = std::fs::read_to_string(terminal_index_path(root)).unwrap();
-    let original_byte_count = original_contents.as_bytes().len();
+    let original_byte_count = original_contents.len();
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -172,7 +172,7 @@ fn crash_mid_compaction_recovery_removes_lock_and_tmp_preserves_original() {
     // The original index file is untouched.
     let post_contents = std::fs::read_to_string(terminal_index_path(root)).unwrap();
     assert_eq!(post_contents, original_contents);
-    assert_eq!(post_contents.as_bytes().len(), original_byte_count);
+    assert_eq!(post_contents.len(), original_byte_count);
 
     // A subsequent compaction (above threshold) acquires a fresh lease
     // and runs to completion.

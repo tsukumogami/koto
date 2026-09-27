@@ -436,7 +436,7 @@ fn epoch_filter_stale_child_completed_ignored_after_rewind() {
         json.get("scheduler").is_none()
             || json["scheduler"]["materialized_children"]
                 .as_array()
-                .map_or(true, |a| a.is_empty()),
+                .is_none_or(|a| a.is_empty()),
         "scheduler should see NoBatch (stale evidence filtered): {}",
         serde_json::to_string_pretty(&json).unwrap_or_default()
     );

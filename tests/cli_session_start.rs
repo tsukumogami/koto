@@ -268,7 +268,7 @@ fn overnested_inputs_json_rejects() {
     for _ in 0..depth {
         s.push('[');
     }
-    s.push_str("0");
+    s.push('0');
     for _ in 0..depth {
         s.push(']');
     }

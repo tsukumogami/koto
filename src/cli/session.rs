@@ -412,9 +412,9 @@ mod tests {
     fn parse_inputs_rejects_oversized_payload() {
         // 1 MiB + 1 byte of valid JSON ("a" repeated inside a string)
         let mut s = String::with_capacity(INPUTS_MAX_BYTES + 16);
-        s.push_str("\"");
+        s.push('"');
         s.push_str(&"a".repeat(INPUTS_MAX_BYTES));
-        s.push_str("\"");
+        s.push('"');
         let err = parse_inputs(&s).expect_err("must reject oversize");
         assert!(err.to_string().contains("too large"), "got {}", err);
     }
@@ -427,7 +427,7 @@ mod tests {
         for _ in 0..depth {
             s.push('[');
         }
-        s.push_str("0");
+        s.push('0');
         for _ in 0..depth {
             s.push(']');
         }
@@ -452,7 +452,7 @@ mod tests {
         for _ in 0..(depth - 1) {
             s.push('[');
         }
-        s.push_str("0");
+        s.push('0');
         for _ in 0..(depth - 1) {
             s.push(']');
         }

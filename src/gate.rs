@@ -899,7 +899,7 @@ mod tests {
             let entries = self.entries.lock().unwrap();
             let keys: Vec<String> = entries
                 .keys()
-                .filter(|(s, k)| s == session && prefix.map_or(true, |p| k.starts_with(p)))
+                .filter(|(s, k)| s == session && prefix.is_none_or(|p| k.starts_with(p)))
                 .map(|(_, k)| k.clone())
                 .collect();
             Ok(keys)

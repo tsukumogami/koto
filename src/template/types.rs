@@ -4252,12 +4252,20 @@ mod tests {
         // A character-class range: the stand-in is ordered, so this compiles
         // here, and a value of "A" would not at run time.
         assert!(regex::Regex::new(&pattern_with_refs_as_literals("[a-{{V}}]")).is_ok());
-        assert!(regex::Regex::new("[a-A]").is_err());
+        // Deliberately invalid: the assertion pins that the raw pattern is refused.
+        #[allow(clippy::invalid_regex)]
+        {
+            assert!(regex::Regex::new("[a-A]").is_err());
+        }
         // A repetition bound: the stand-in is not a decimal, so this is refused
         // here even though a MAX of "5" would have run. It was refused before
         // Issue #222 too -- a raw `{{MAX}}` is not a valid regex either.
         assert!(regex::Regex::new(&pattern_with_refs_as_literals("a{2,{{MAX}}}")).is_err());
-        assert!(regex::Regex::new("a{2,{{MAX}}}").is_err());
+        // Deliberately invalid: the assertion pins that the raw pattern is refused.
+        #[allow(clippy::invalid_regex)]
+        {
+            assert!(regex::Regex::new("a{2,{{MAX}}}").is_err());
+        }
         assert!(regex::Regex::new("a{2,5}").is_ok());
     }
 
