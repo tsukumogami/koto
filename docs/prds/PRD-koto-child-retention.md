@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   koto removes a session, context included, on the tick it reaches any
   terminal state. For a child that ended at a failure terminal, that removal
@@ -23,7 +23,7 @@ source_issue: 240
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-koto-child-retention](docs/briefs/BRIEF-koto-child-retention.md); carried in Absorbed Brief.
 
@@ -141,7 +141,10 @@ that put the session in its current terminal state; `koto next --to` from one
 terminal to another is therefore a new arrival. Ticking a session that is
 already standing in a terminal state, and whose log already records a result
 for this arrival, adds no result event, no terminal-index entry and no parent
-notice. A session parked at a terminal by an earlier koto version, with no
+notice. The one exception is a tick that removes a session after an earlier
+tick kept it: that tick re-sends the parent notice before removing, so a notice
+lost to a failed write is never lost for good; a duplicate is harmless under
+R12. A session parked at a terminal by an earlier koto version, with no
 result recorded for its arrival, gets the R2 writes on its next tick.
 
 **R4. `--no-cleanup` controls retention only.** `koto next --no-cleanup` keeps
@@ -193,7 +196,10 @@ sessions:
 - `koto workspace prune --root <id>` removes a terminal root and every session
   under it, live or not (existing behaviour, unchanged);
 - `koto session cleanup <name>` removes one session (existing command,
-  unchanged).
+  unchanged);
+- `koto init --attach-live --replace-terminal` on a finished session removes
+  that session's terminal descendants the same way before replacing it, so a
+  new run under a reused name never inherits the old run's retained children.
 
 A parent that is itself kept keeps its retained descendants in place.
 
@@ -272,15 +278,20 @@ Once per arrival
 
 - [ ] Ticking a retained terminal child three more times leaves its log's event
   count, its parent's log event count and the terminal-index entry count for
-  it unchanged; the same holds for a retained root.
+  it unchanged, and the index holds exactly one entry for it; the same holds
+  for a retained root.
+- [ ] A retried child whose log holds a failure result from its earlier
+  arrival is reported by its parent's gate as `pending`, never with that old
+  result, until it records a result for its new arrival.
 - [ ] A retried child that reaches a terminal again appends exactly one new
   `ChildCompleted` to its parent, and the gate reports the new result.
 - [ ] A retained failed child moved with `koto next <child> --to <other
   terminal>` appends exactly one new `ChildCompleted` to its parent, carrying
   the new terminal's name as `final_state`.
 - [ ] A success terminal kept with `--no-cleanup`, ticked again without the
-  flag, no longer exists after that tick, and its own log, its parent's log
-  and the terminal index gained no events on that tick.
+  flag, no longer exists after that tick; its own log and the terminal index
+  gained no events, and its parent's log gained at most one `ChildCompleted`
+  carrying the same result as the arrival's.
 
 Retry and rewind
 
@@ -323,7 +334,7 @@ Reclaim
   siblings and parent in place.
 - [ ] `koto init <name>` on a retained root's name is refused with a message
   naming `koto session cleanup`, and `koto init <name> --attach-live
-  --replace-terminal` replaces it.
+  --replace-terminal` replaces it and removes its retained terminal children.
 
 Legs and robustness
 
