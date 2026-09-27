@@ -39,18 +39,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The installer is fetched at a fixed commit and checked against a
+      # recorded SHA-256 before it runs, the same way validate.yml installs
+      # its floor koto, rather than piping install.sh from main into bash.
+      # The installer then checks the koto binary against the release's
+      # checksums.txt. To move the installer, change both values together.
       - name: Install koto
         env:
           KOTO_VERSION: ${{ inputs.koto-version }}
+          # Commit the v0.13.0 tag points to, and the SHA-256 of its install.sh.
+          KOTO_INSTALLER_COMMIT: b4db4518a841b683910cde7072bf541d8c2e659f
+          KOTO_INSTALLER_SHA256: 5f8c62f618f8181fa4b48e0e600e1208dddd1f0dab668a73e1b52ae7b52ba319
         run: |
-          INSTALL_ARGS="--no-modify-path"
-          if [ "$KOTO_VERSION" != "latest" ]; then
-            INSTALL_ARGS="$INSTALL_ARGS --version=$KOTO_VERSION"
+          set -euo pipefail
+          installer="$RUNNER_TEMP/koto-install.sh"
+          curl -fsSL -o "$installer" \
+            "https://raw.githubusercontent.com/tsukumogami/koto/${KOTO_INSTALLER_COMMIT}/install.sh"
+          if ! echo "${KOTO_INSTALLER_SHA256}  ${installer}" | sha256sum -c -; then
+            echo "::error::install.sh at ${KOTO_INSTALLER_COMMIT} does not match the recorded SHA-256"
+            exit 1
           fi
-          curl -fsSL https://raw.githubusercontent.com/tsukumogami/koto/main/install.sh | bash -s -- $INSTALL_ARGS
+          install_args=(--no-modify-path)
+          if [ "$KOTO_VERSION" != "latest" ]; then
+            install_args+=("--version=$KOTO_VERSION")
+          fi
+          bash "$installer" "${install_args[@]}"
           echo "$HOME/.koto/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.koto/bin:$PATH"
-          koto version
+          reported="$("$HOME/.koto/bin/koto" version)"
+          echo "$reported"
+          if [ "$KOTO_VERSION" != "latest" ]; then
+            case "$reported" in
+              "koto ${KOTO_VERSION#v} "*|"koto ${KOTO_VERSION#v}") ;;
+              *)
+                echo "::error::koto reports '$reported', expected koto ${KOTO_VERSION#v}"
+                exit 1
+                ;;
+            esac
+          fi
 
       - name: Check Mermaid freshness
         run: |
