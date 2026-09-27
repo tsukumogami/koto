@@ -4869,7 +4869,10 @@ mod tests {
         let children = output["children"].as_array().expect("children array");
         assert_eq!(children.len(), 1, "{output}");
         assert_eq!(children[0]["name"], "p.t", "{output}");
-        assert_eq!(children[0]["result"]["summary"], "completed at done", "{output}");
+        assert_eq!(
+            children[0]["result"]["summary"], "completed at done",
+            "{output}"
+        );
         assert_eq!(output["outstanding"], serde_json::json!([]), "{output}");
         assert!(passes, "the gate passes once the result matches: {output}");
     }
