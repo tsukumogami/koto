@@ -1,6 +1,7 @@
 //! `koto request` — the CLI noun group over the request store.
 //!
-//! Eleven subcommands, one response envelope, four exit classes
+//! Twelve subcommands, one response envelope for the request-scoped verbs
+//! (`list` and `watch` print their own), four exit classes
 //! (DESIGN-request-lifecycle.md Decision 5). This module is a thin
 //! shell over [`crate::engine::request_store`]: it parses flags,
 //! validates identifiers, maps the store's typed errors onto the exit

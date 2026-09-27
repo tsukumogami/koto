@@ -1,5 +1,7 @@
 //! One bounded, atomic JSONL append.
 //!
+//! For a non-durable signal file see [`crate::engine::wake_signal::ring`].
+//!
 //! [`append_bounded_line`] is the append discipline the workspace-wide
 //! JSONL files share: the terminal index (`_terminal_index.jsonl`) and the
 //! decider ledger (`_decider_ledger.jsonl`).

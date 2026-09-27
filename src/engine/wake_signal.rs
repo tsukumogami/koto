@@ -28,17 +28,20 @@
 //! Subscribers watch the path: `koto request watch` polls it, a harness
 //! may put a native file watcher on it or run `tail -F`. Replacing the
 //! file by rename would give the path a new inode and silence a watcher
-//! registered on the old one, so a ring opens the one file with
-//! `O_APPEND` and writes one short line in a single `write`, well under
-//! `PIPE_BUF`, so concurrent rings never interleave. There is no lock and
-//! no fsync: the wake has to be visible when the ringing command returns,
-//! not durable across a crash.
+//! registered on the old one, so a ring writes one short line in a single
+//! `write` on a descriptor opened with `O_APPEND`, which the kernel
+//! positions and writes as one operation on local filesystems, so
+//! concurrent rings never interleave. There is no lock and no fsync: the
+//! wake has to be visible when the ringing command returns, not durable
+//! across a crash.
 //!
 //! Once the file reaches [`TRUNCATE_AT`] bytes, a ring truncates it in
-//! place before appending, so it stays far under [`MAX_WAKE_FILE_BYTES`]
-//! whatever the wake volume. A poller comparing sizes can miss a wake
-//! across a truncation, which is why the cursor also carries the last
-//! token.
+//! place before appending, so it stays small whatever the wake volume.
+//! Two rings that both cross the cap can both truncate, dropping one
+//! line; the survivor still changes the cursor, and a wake carries no
+//! state, so nothing is lost but a duplicate. A poller comparing sizes can
+//! miss a wake across a truncation, which is why the cursor also carries
+//! the last token.
 //!
 //! # Hostile paths
 //!
@@ -64,12 +67,12 @@ use crate::engine::types::ValidatedSessionId;
 pub const WAKES_DIR: &str = "wakes";
 
 /// Size at which a ring truncates the file before appending.
+///
+/// A soft cap chosen to keep the file trivially small; any value in the
+/// tens of KiB would do. A file only grows past it by the few lines that
+/// concurrent rings append before one of them truncates, so it stays well
+/// under twice this size.
 pub const TRUNCATE_AT: u64 = 32 * 1024;
-
-/// The bound a wake file stays under. Reaching it would take hundreds of
-/// concurrent rings that all read a size under [`TRUNCATE_AT`] before any
-/// of them truncated.
-pub const MAX_WAKE_FILE_BYTES: u64 = 64 * 1024;
 
 /// How far back from the end a cursor read looks for the last line.
 const TAIL_WINDOW: u64 = 256;
@@ -121,6 +124,10 @@ pub fn wake_path(koto_root: &Path, session: &ValidatedSessionId) -> PathBuf {
 }
 
 /// Append one wake line to `principal`'s wake file.
+///
+/// Sibling of [`crate::engine::jsonl_append::append_bounded_line`], without
+/// its fsync and with the symlink, file-type and cap checks a signal file
+/// needs.
 ///
 /// Refuses a principal that is not a valid session id before any path is
 /// built. Every other failure is an I/O error the caller reports; nothing
@@ -207,7 +214,7 @@ impl fmt::Display for WakeCursor {
 }
 
 /// A `--since` value that is not a cursor this build wrote.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error)]
 #[error("not a wake cursor: expected w1:<length>:<token>")]
 pub struct WakeCursorParseError;
 
@@ -237,17 +244,8 @@ impl FromStr for WakeCursor {
 /// non-regular file at the path is an error, as for a ring.
 pub fn read_cursor(koto_root: &Path, session: &ValidatedSessionId) -> std::io::Result<WakeCursor> {
     let path = wake_path(koto_root, session);
-    match std::fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(WakeCursor::empty()),
-        Err(e) => return Err(e),
-        Ok(md) if !md.file_type().is_file() => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{} is not a regular file", path.display()),
-            ))
-        }
-        Ok(_) => {}
-    }
+    // `O_NOFOLLOW` refuses a symlink at the path; the check after the open
+    // refuses anything else that is not a regular file.
     let mut file = match open_for_read(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(WakeCursor::empty()),
         other => other?,
@@ -263,6 +261,9 @@ pub fn read_cursor(koto_root: &Path, session: &ValidatedSessionId) -> std::io::R
     if len == 0 {
         return Ok(WakeCursor::empty());
     }
+    // A ring may truncate between the fstat above and this read; the short
+    // tail then digests to a cursor no ring produces, which a watch reports
+    // as one spurious wake. Harmless: the next read is real.
     let start = len.saturating_sub(TAIL_WINDOW);
     file.seek(SeekFrom::Start(start))?;
     let mut tail = Vec::with_capacity((len - start) as usize);
@@ -274,8 +275,11 @@ pub fn read_cursor(koto_root: &Path, session: &ValidatedSessionId) -> std::io::R
 }
 
 /// The token of the last complete line in `tail`, normalised so it always
-/// satisfies [`is_token`]. A line koto did not write is replaced by a
-/// digest of itself, so the cursor still changes when the file does.
+/// satisfies [`is_token`]. Anything that is not a token koto wrote (the
+/// short tail of a read that raced a truncation, or a hand-edited file) is
+/// replaced by a digest of itself, so `read_cursor` never emits a cursor
+/// that `watch --since` would refuse, and the cursor still changes when
+/// the file does.
 fn last_token(tail: &[u8]) -> String {
     let body = match tail.iter().rposition(|&b| b == b'\n') {
         Some(end) => &tail[..end],
@@ -477,7 +481,7 @@ mod tests {
             ring(tmp.path(), "coord").unwrap();
             max = max.max(std::fs::metadata(&path).unwrap().len());
         }
-        assert!(max <= MAX_WAKE_FILE_BYTES, "grew to {max}");
+        assert!(max <= 2 * TRUNCATE_AT, "grew to {max}");
         assert!(
             max >= TRUNCATE_AT,
             "never reached the cap, so never truncated"

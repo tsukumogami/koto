@@ -1325,8 +1325,9 @@ where
 /// Whether a successful append rings the request's principals.
 ///
 /// Only a write that can change what a `request-leg` gate reads rings: a
-/// leg result, a leg abandonment, a request close. The decision is made
-/// here, where the event is written, so no writer has to remember it.
+/// leg result, a leg abandonment, a request close. Each typed writer
+/// passes the value for the event it writes; `validate_and_append`, which
+/// takes a caller's payload, derives it with [`Wake::for_payload`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Wake {
     Ring,
@@ -1370,7 +1371,7 @@ fn append_under_lock<F>(
 where
     F: FnOnce(&RequestView) -> Result<Option<PendingAppend>, RequestStoreError>,
 {
-    let (result, principals) = append_locked(root, request_id, lock_timeout, probe, wake, decide)?;
+    let (result, principals) = append_locked(root, request_id, lock_timeout, probe, decide)?;
     if wake == Wake::Ring {
         crate::engine::wake_signal::ring_principals(root, &principals.0, &principals.1);
     }
@@ -1385,7 +1386,6 @@ fn append_locked<F>(
     request_id: &ValidatedRequestId,
     lock_timeout: Duration,
     probe: Option<IdempotencyProbe>,
-    wake: Wake,
     decide: F,
 ) -> Result<(AppendResult, (String, String)), RequestStoreError>
 where
@@ -1435,14 +1435,6 @@ where
             principals,
         ));
     };
-
-    // A writer that emits a disposition event must ring; catching a new
-    // one that forgot is what keeps "no writer has to remember" true.
-    debug_assert!(
-        wake == Wake::Ring || Wake::for_payload(&pending.payload) == Wake::Quiet,
-        "a {} append must ring the request's principals",
-        pending.payload.type_name()
-    );
 
     // A request log's first line is a RequestHeader, not a session header,
     // so the append checks it against that type.

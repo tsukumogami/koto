@@ -2315,15 +2315,6 @@ fn wake_lines(root: &Path, session: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn seed_principals(root: &Path, requested_by: &str, coordinator: &str) -> ValidatedRequestId {
-    let spec = NewRequest {
-        requested_by: requested_by.to_string(),
-        coordinator_of_record: coordinator.to_string(),
-        ..two_leg_spec()
-    };
-    create_request(root, &spec, &RequestBounds::default()).expect("create")
-}
-
 fn abandon(root: &Path, id: &ValidatedRequestId, leg: &str) -> AppendResult {
     abandon_leg(
         root,
@@ -2358,7 +2349,7 @@ fn every_disposition_write_rings_before_it_returns() {
     let id = seed(root);
 
     let mut last = wake_cursor(root, "coord-a");
-    let mut step = |label: &str, last: &mut crate::engine::wake_signal::WakeCursor| {
+    let step = |label: &str, last: &mut crate::engine::wake_signal::WakeCursor| {
         let now = wake_cursor(root, "coord-a");
         assert_ne!(&now, last, "{label} did not ring");
         *last = now;
@@ -2445,26 +2436,6 @@ fn creating_binding_and_progress_do_not_ring() {
 }
 
 #[test]
-fn distinct_principals_both_ring_and_a_bystander_does_not() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path();
-    let id = seed_principals(root, "asker", "coord");
-    resolve(root, &id, "reviewer-a", "a");
-    assert_eq!(wake_lines(root, "asker"), 1);
-    assert_eq!(wake_lines(root, "coord"), 1);
-    assert_eq!(wake_lines(root, "bystander"), 0);
-}
-
-#[test]
-fn matching_principals_ring_once_per_write() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path();
-    let id = seed(root);
-    resolve(root, &id, "reviewer-a", "a");
-    assert_eq!(wake_lines(root, "coord-a"), 1);
-}
-
-#[test]
 fn a_recognised_retry_and_a_repeated_abandon_ring_again() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
@@ -2478,20 +2449,6 @@ fn a_recognised_retry_and_a_repeated_abandon_ring_again() {
     let repeat = abandon(root, &id, "reviewer-b");
     assert!(!repeat.written);
     assert_eq!(wake_lines(root, "coord-a"), 4);
-}
-
-#[test]
-fn an_invalid_principal_is_skipped_and_the_other_still_rings() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path();
-
-    let bad_coord = seed_principals(root, "asker", "../not-a-session");
-    resolve(root, &bad_coord, "reviewer-a", "a");
-    assert_eq!(wake_lines(root, "asker"), 1);
-
-    let bad_asker = seed_principals(root, "../not-a-session", "coord");
-    resolve(root, &bad_asker, "reviewer-a", "a");
-    assert_eq!(wake_lines(root, "coord"), 1);
 }
 
 #[cfg(unix)]

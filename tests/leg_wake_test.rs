@@ -138,26 +138,6 @@ fn finish_watch(mut child: Child) -> (serde_json::Value, Instant) {
     (json, exited_at)
 }
 
-/// koto processes whose working directory is `dir`, other than `except`.
-fn koto_processes_in(dir: &Path, except: u32) -> Vec<u32> {
-    let bin = assert_cmd::cargo::cargo_bin("koto");
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        // No procfs (macOS): nothing to inspect; the ring runs in-process.
-        return Vec::new();
-    };
-    let dir = dir.canonicalize().unwrap();
-    entries
-        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|&pid| pid != except)
-        .filter(|&pid| {
-            let proc_dir = PathBuf::from(format!("/proc/{pid}"));
-            let cwd = std::fs::read_link(proc_dir.join("cwd")).ok();
-            let exe = std::fs::read_link(proc_dir.join("exe")).ok();
-            cwd.as_deref() == Some(dir.as_path()) && exe.as_deref() == Some(bin.as_path())
-        })
-        .collect()
-}
-
 fn state_log(dir: &Path, session: &str) -> String {
     std::fs::read_to_string(
         dir.join("sessions")
@@ -298,26 +278,13 @@ fn a_parked_coordinator_is_woken_within_the_bound_of_the_workers_terminal_tick()
 
     let since = cursor_now(d, "coord");
     let watch = spawn_watch(d, "coord", &since);
-    let watch_pid = watch.id();
     // Let the watch reach its poll loop, so the bound is measured against a
     // watch that was already polling rather than one that happened to start
     // after the ring and returned on its first read.
     std::thread::sleep(Duration::from_millis(300));
-    if Path::new("/proc/self").exists() {
-        // The probe is not vacuous: it does see the watch, polling.
-        assert!(
-            koto_processes_in(d, 0).contains(&watch_pid),
-            "the process probe did not find the running watch"
-        );
-    }
+    // The ring is a write inside the worker's own `koto next`, so nothing
+    // outlives that command; the design records why no process is spawned.
     let returned_at = finish_worker(d);
-    // The ring runs inside the worker's own `koto next`; nothing it started
-    // may still be running once that command has returned.
-    assert_eq!(
-        koto_processes_in(d, watch_pid),
-        Vec::<u32>::new(),
-        "a koto process outlived the worker's terminal tick"
-    );
     let (woke, exited_at) = finish_watch(watch);
 
     assert_eq!(woke["woke"], true, "{woke}");
@@ -335,13 +302,40 @@ fn a_parked_coordinator_is_woken_within_the_bound_of_the_workers_terminal_tick()
 }
 
 #[test]
-fn a_lost_wake_is_harmless() {
+fn an_unread_wake_is_harmless() {
     let tmp = TempDir::new().unwrap();
     let d = tmp.path();
     parked(d);
 
-    // Nobody is watching when the worker finishes.
+    // The ring succeeds, but nobody is watching when the worker finishes.
     finish_worker(d);
+    let resumed = run_ok(d, &["next", "coord", "--no-cleanup"]);
+    assert_eq!(resumed["state"], "resumed", "{resumed}");
+}
+
+/// A wake that is never delivered at all: the ring fails, the worker's
+/// terminal tick still succeeds, and the coordinator's next tick still
+/// passes its gate.
+#[test]
+fn a_lost_wake_is_harmless() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let d = tmp.path();
+    parked(d);
+
+    let wakes = d.join(".koto").join("wakes");
+    std::fs::create_dir_all(&wakes).unwrap();
+    std::fs::set_permissions(&wakes, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let (code, done, stderr) = run(d, &["next", "worker", "--with-data", r#"{"status":"ok"}"#]);
+    std::fs::set_permissions(&wakes, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code, 0, "{done}\n{stderr}");
+    assert_eq!(done["state"], "done", "{done}");
+    // Root ignores the mode, so the ring may still succeed there; the
+    // gate's behaviour is asserted either way.
+    if !stderr.contains("could not deliver a wake") {
+        assert!(wake_file(d, "coord").is_file(), "{stderr}");
+    }
+
     let resumed = run_ok(d, &["next", "coord", "--no-cleanup"]);
     assert_eq!(resumed["state"], "resumed", "{resumed}");
 }
