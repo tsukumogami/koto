@@ -481,7 +481,7 @@ gates:
     pattern: "^## Step \\d+"
 ```
 
-These gates are evaluated automatically when the agent calls `koto next` (including directed transitions via `koto next <name> --to <state>`). They replace the older pattern of using `command` gates with `test -f` checks against the session directory.
+These gates are evaluated automatically when the agent calls `koto next`. A directed transition (`koto next <name> --to <state>`) skips them unless one is declared `overridable: false` and the edge to the target depends on it. They replace the older pattern of using `command` gates with `test -f` checks against the session directory.
 
 ### Gate output schemas
 
