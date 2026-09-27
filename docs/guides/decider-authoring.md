@@ -25,11 +25,17 @@ The only decider koto ships is Jev, from TypeSafe
 ([docs.typesafe.ai](https://docs.typesafe.ai/)). Its default endpoint is
 Jev's decision URL, `https://api.typesafe.ai/v1/systemone`.
 
-So far the Jev client has been verified only against a local stub built from
-Jev's published API documentation. It hasn't been run against the live API.
-Live validation is a pending follow-up. Until it's done, treat a consultation
-against the real endpoint as untested, and expect the promotion data you
-gather to be the first real test of the client.
+The client has been run against the live API. On 2026-09-26, koto 0.13.0
+answered every case of a synthetic fixture set, both `choice` and `noul`
+questions, on the default endpoint, with a p95 latency under 400 ms against
+the 2000 ms default timeout. Jev's `choice` answers carry `probabilities`,
+which the client requires. The `decider-live` workflow repeats that check on
+demand and on every push to `main` that touches the decider. It sends only the
+synthetic sentences in `test/decider-live/` and checks the transport and the
+answer schema, not which value won. So a passing run says the client and the
+API still agree, not that Jev judges any particular question well. That is
+what the fixture and ledger evidence in [Promoting a value to
+`auto`](#promoting-a-value-to-auto) is for.
 
 ## When a decision qualifies
 
@@ -164,6 +170,10 @@ A `context` input has to be a key that some `context-exists` or
 `default_action` writes, so the usual pattern is the one in `fetch` above: the
 state that produces the key gates on it, and a run can't reach the question
 without it.
+
+A `var` input can't carry free text. `koto init --var` accepts only letters,
+digits, spaces, and `._/:@-`, so a value with a comma or a newline is refused
+before the session starts. Put prose, such as an issue body, in a context key.
 
 ### The boolean declaration
 

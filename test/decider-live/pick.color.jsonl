@@ -1,0 +1,3 @@
+{"id":"red","inputs":{"text":"The apple on the table is bright red."},"expected":"red"}
+{"id":"blue","inputs":{"text":"The sky over the ocean was a deep blue."},"expected":"blue"}
+{"id":"none","inputs":{"text":"The train leaves at noon."},"expected":"unclear"}

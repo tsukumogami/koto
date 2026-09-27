@@ -1,0 +1,2 @@
+{"id":"even","inputs":{"text":"There are 42 chairs in the room."},"expected":true}
+{"id":"odd","inputs":{"text":"She counted 17 birds on the wire."},"expected":false}
