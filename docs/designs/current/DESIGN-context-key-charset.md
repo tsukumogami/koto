@@ -39,7 +39,8 @@ Current
 koto validates two kinds of user-supplied string against two grammars.
 
 `VALUE_PATTERN` in `src/engine/substitute.rs` admits `[a-zA-Z0-9._/:@ -]` for a
-variable value. `validate_context_key` in `src/session/validate.rs` admits a
+variable value. (Issue #266 later added `+`, so the value set is now wider by
+four characters; the reasoning below holds for the fourth unchanged.) `validate_context_key` in `src/session/validate.rs` admits a
 `/`-separated key whose components each begin with an alphanumeric and continue
 in alphanumerics, `.`, `_` and `-`, refusing `.` and `..` components and
 leading, trailing or doubled slashes.
