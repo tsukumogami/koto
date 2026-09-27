@@ -177,7 +177,7 @@ The overridden gate is now treated as passed.
 
 For `children-complete` gates, the override pretends all children are done. The default value mirrors the extended gate output schema: all aggregate counters are zero, `all_complete` and `all_success` are `true`, the `any_*` and `needs_attention` booleans are `false`, and `children` is empty. Use this when you know children are finished but the gate hasn't picked it up, or when you need to proceed regardless.
 
-When `agent_actionable` is `false`, the gate has no override mechanism — either it has no default, or the template declares it `overridable: false`. Don't call `koto overrides record` for it — the command will fail (for a non-overridable gate, with exit 2 and `error.code: "gate_not_overridable"`, even with `--with-data`). Escalate to the user instead.
+When `agent_actionable` is `false`, the gate has no override mechanism — either it has no default, or the template declares it `overridable: false`. Don't call `koto overrides record` for it — the command will fail (for a non-overridable gate, with exit 2 and `error.code: "gate_not_overridable"`, even with `--with-data`). `koto next --to` won't get past it either: a directed transition whose edge depends on a non-overridable gate whose result doesn't satisfy that edge exits 1 with `gate_blocked` and records nothing. Escalate to the user instead.
 
 ## When a default action fails
 
@@ -442,10 +442,25 @@ koto request resolve <request-id> <leg> --with-data '{"status":"success","summar
 | `koto request abandon <request-id> <leg> --rationale TEXT` | Stop waiting on one leg. The others stay open. |
 | `koto request abandon-request <request-id> --rationale TEXT` | Abandon every open leg and close the request. A separate verb, so an unset shell variable can't escalate a leg abandonment into the whole request's. |
 | `koto request close <request-id>` | Close, recording a disposition derived from the legs. Closing twice is rejected. |
+| `koto request watch --session ID --timeout-secs N [--since CURSOR]` | Block until that session's wake file changes, or the timeout passes. Exits 0 either way with `woke` and a `cursor`; a signal while polling is `wait_interrupted`, exit 1. |
 
 `wait` is where readiness lives, so `get` can stay exit-zero. A satisfied predicate exits 0; a deadline with the predicate still unsatisfied exits 1 (transient, retry); a predicate that could never hold — five resolved legs on a three-leg request — exits 2 before polling starts; one that stopped being reachable while you waited exits 2 with a distinct code. `--timeout-secs` is required, and `--interval-secs` defaults to 2 with a floor of 1.
 
-`--issued-by ID` is accepted on the six mutating verbs — `bind`, `progress`, `resolve`, `abandon`, `abandon-request`, `close` — and recorded for audit; `create` carries the same attribution as `--requested-by`. `--cli-contract MAJOR.MINOR` is accepted on every subcommand and checked before any read or write; this build serves `1.0`.
+`--issued-by ID` is accepted on the six mutating verbs — `bind`, `progress`, `resolve`, `abandon`, `abandon-request`, `close` — and recorded for audit; `create` carries the same attribution as `--requested-by`. `--cli-contract MAJOR.MINOR` is accepted on every subcommand and checked before any read or write; this build serves `1.2`.
+
+### Being woken when a leg you wait on changes
+
+When a leg resolves by any route (its worker's terminal tick, an explicit resolve, a refusal) or is abandoned, or its request is closed, koto rings a wake for the request's coordinator of record and requester: it appends a line to `~/.koto/wakes/<session>` before the command that changed the leg returns. The wake means only "look again" — it carries no state — so a missed one costs you latency and a duplicate costs one tick that finds nothing new.
+
+If you are parked on a `request-leg` gate and your harness can react to a background command finishing, don't hold your turn open in `koto request wait`. Take a cursor, tick, then watch in the background:
+
+```bash
+koto request watch --session <you> --timeout-secs 0        # prints a cursor
+koto next <you>                                             # blocked on the leg
+koto request watch --session <you> --timeout-secs 1800 --since <cursor>   # run in the background
+```
+
+When the watch exits, tick again and watch from the cursor it printed. The loop, the 1 second bound, reading the wake file directly, and the no-subscriber fallback (`koto request wait --timeout-secs`) are written out once, in `docs/guides/cli-usage.md`, "Leg wakes and request watch". Wakes are local to one machine.
 
 ### Learning your own leg
 
