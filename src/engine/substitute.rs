@@ -152,12 +152,11 @@ enum ValueForm {
     /// `pattern` is the only one a tick substitutes (Issue #222).
     ///
     /// Escaping loses almost no expressive power, because [`VALUE_PATTERN`] has
-    /// already spent it. A value can carry no anchor, group, alternation or
-    /// quantifier into a pattern under either reading: not one of
-    /// `^ $ ( ) [ ] * ? | \` is in the set, and `+`, the one quantifier it
-    /// admits (Issue #266), is escaped by `regex::escape` like any other
-    /// metacharacter. What it can carry is narrow, and
-    /// listing it is the whole of what the escape decides -- `.` as a wildcard,
+    /// already spent most of it. Of `^ $ ( ) [ ] * + ? | \`, only `+` is in
+    /// the set (Issue #266), and `regex::escape` turns it into a literal like
+    /// any other metacharacter, so no value carries an anchor, group,
+    /// alternation or quantifier into a pattern. What the escape decides beyond
+    /// that `+` is narrow, and listing it is the whole of it -- `.` as a wildcard,
     /// `-` as a range operator inside a class the author opened, `:` as the
     /// delimiter of a POSIX class name, whitespace under `(?x)`, and an
     /// alphanumeric as a range endpoint or the body of a class name. Every one

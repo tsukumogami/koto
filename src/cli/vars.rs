@@ -44,8 +44,8 @@ pub fn substitute_vars(input: &str, vars: &HashMap<String, String>) -> String {
 /// name may contain a dot (`validate_workflow_name`), and `SESSION_DIR` is a
 /// filesystem path built from the user's koto root, so it can hold characters
 /// the declared-variable allowlist refuses -- a paren in a home directory would
-/// otherwise be read as a group, and a `+` (which the allowlist does admit) as
-/// a quantifier (Issue #222).
+/// otherwise be read as a group (Issue #222). A `+` needs the escape just as
+/// much: the allowlist admits it (Issue #266), and unescaped it is a quantifier.
 pub fn substitute_vars_regex_literal(input: &str, vars: &HashMap<String, String>) -> String {
     let mut result = input.to_string();
     for (key, value) in vars {

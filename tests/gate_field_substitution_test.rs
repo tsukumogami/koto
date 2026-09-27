@@ -113,6 +113,13 @@ fn context_add(dir: &Path, session: &str, key: &str, content: &str) {
 
 /// The named gate's entry in a `gate_blocked` response, or `None` when the
 /// response is not a block.
+/// The part of an unusable-key reason before its remedy. The remedy lists every
+/// character a value may hold and a key may not, so a check that the reason
+/// names one must not look there.
+fn reason_before_remedy(message: &str) -> &str {
+    message.split("remedy:").next().unwrap_or_default()
+}
+
 fn blocking_condition<'a>(resp: &'a Value, gate: &str) -> Option<&'a Value> {
     resp.get("blocking_conditions")?
         .as_array()?
@@ -814,9 +821,9 @@ Done.
 /// will not pass with nothing pointing at why.
 ///
 /// Each of the four characters gets its own case rather than one standing for
-/// the family: they enter `validate_context_key` by two different routes (the
-/// first-character rule and the trailing-character rule), and a change that
-/// stopped reporting one of them would leave the others passing.
+/// the family: a change that stopped naming one of them would leave the others
+/// passing. The character is looked for before the remedy, which lists all four
+/// and would otherwise satisfy the check whatever the reason said.
 #[test]
 fn a_legal_value_that_cannot_be_a_key_says_which_character() {
     // (value, the character the message must name)
@@ -905,7 +912,7 @@ Done.
             "an unusable key must not report as a bare absence; got {resp}"
         );
         assert!(
-            message.contains(character),
+            reason_before_remedy(message).contains(character),
             "the message for {title:?} should name {character}; got {message}"
         );
         assert!(

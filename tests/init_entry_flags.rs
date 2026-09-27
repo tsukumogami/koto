@@ -1450,6 +1450,8 @@ Done.
 const PLUS_ROOT: &str = "/home/u/ws/workspace+instance-1a2b3c4d/checkout";
 
 /// `koto init <name> --template <dir>/plus.md --vars-file <pairs> <extra...>`.
+/// Each call writes its own vars file, named for the session and the flags, so
+/// a later call in the same test never rewrites a file an earlier one read.
 fn plus_init(dir: &Path, name: &str, pairs: &[(&str, &str)], extra: &[&str]) -> Vec<String> {
     std::fs::write(dir.join("plus.md"), PLUS_TEMPLATE).unwrap();
     let file = format!("{name}-{}.json", extra.join("").trim_start_matches('-'));

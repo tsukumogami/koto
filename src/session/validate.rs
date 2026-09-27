@@ -333,6 +333,13 @@ mod tests {
     // own case: a reason that stopped naming one of them would leave an operator
     // with the same silence the function exists to end.
 
+    /// The part of a reason before its remedy. The remedy lists every
+    /// character a value may hold and a key may not, so a check that the
+    /// reason names one must not look there.
+    fn before_remedy(reason: &str) -> &str {
+        reason.split("remedy:").next().unwrap_or_default()
+    }
+
     #[test]
     fn reason_is_none_for_a_usable_key() {
         assert_eq!(unusable_context_key_reason("research/r1/lead.md"), None);
@@ -343,7 +350,7 @@ mod tests {
         let reason = unusable_context_key_reason("Weekly Planning-note")
             .expect("a space is not a legal context key character");
         assert!(
-            reason.contains("' '"),
+            before_remedy(&reason).contains("' '"),
             "the reason should quote the offending character; got {reason}"
         );
         assert!(
@@ -357,7 +364,7 @@ mod tests {
         let reason = unusable_context_key_reason("newer_than:90d-note")
             .expect("a colon is not a legal context key character");
         assert!(
-            reason.contains("':'"),
+            before_remedy(&reason).contains("':'"),
             "the reason should quote the colon; got {reason}"
         );
     }
@@ -367,7 +374,7 @@ mod tests {
         let reason = unusable_context_key_reason("user@example.com-note")
             .expect("an at-sign is not a legal context key character");
         assert!(
-            reason.contains("'@'"),
+            before_remedy(&reason).contains("'@'"),
             "the reason should quote the at-sign; got {reason}"
         );
     }
@@ -377,7 +384,7 @@ mod tests {
         let reason = unusable_context_key_reason("workspace+instance-note")
             .expect("a plus is not a legal context key character");
         assert!(
-            reason.contains("'+'"),
+            before_remedy(&reason).contains("'+'"),
             "the reason should quote the plus; got {reason}"
         );
     }

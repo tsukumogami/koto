@@ -3241,8 +3241,11 @@ fn context_exists_tells_an_unusable_key_from_an_absent_one() {
             });
         assert_eq!(body["command"], "context exists");
         let message = body["error"].as_str().unwrap_or_default();
+        // Look before the remedy: it lists every character a value may hold
+        // and a key may not, so it would satisfy this check on its own.
+        let reason = message.split("remedy:").next().unwrap_or_default();
         assert!(
-            message.contains(character),
+            reason.contains(character),
             "the error for {key} should name {character}; got {message}"
         );
         assert!(
