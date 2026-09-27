@@ -237,30 +237,30 @@ below (`removes_terminal_descendants_with_the_parent`,
 `keeps_a_descendant_whose_leg_is_still_open`).
 
 **Acceptance Criteria**:
-- [ ] A parent reaching a success terminal without the flag removes its
+- [x] A parent reaching a success terminal without the flag removes its
   retained failed child, a child it kept with `--no-cleanup` at success, and a
   terminal grandchild under that child, in the same tick.
-- [ ] A non-terminal child of that parent, and a terminal child under the
+- [x] A non-terminal child of that parent, and a terminal child under the
   non-terminal child, are left in place.
-- [ ] A terminal child with a live grandchild is left in place.
-- [ ] A parent at a failure terminal, or at a success terminal with the flag,
+- [x] A terminal child with a live grandchild is left in place.
+- [x] A parent at a failure terminal, or at a success terminal with the flag,
   keeps its retained children.
-- [ ] A descendant whose template file is missing is left in place and the
+- [x] A descendant whose template file is missing is left in place and the
   parent is still removed.
-- [ ] A `parent_workflow` cycle among descendants ends the sweep and the tick
+- [x] A `parent_workflow` cycle among descendants ends the sweep and the tick
   exits 0; `koto workspace prune --root` on a tree with a cycle terminates.
-- [ ] A leaf session's terminal tick does not list sessions (asserted through
+- [x] A leaf session's terminal tick does not list sessions (asserted through
   a test backend that counts `list()` calls, or equivalent).
-- [ ] A batch parent whose retained failed child never got its
+- [x] A batch parent whose retained failed child never got its
   `ChildCompleted` through still sweeps that child when the parent is
   removed.
-- [ ] `koto init <name> --attach-live --replace-terminal` on a retained root
+- [x] `koto init <name> --attach-live --replace-terminal` on a retained root
   removes its retained terminal children and replaces it.
-- [ ] `koto workspace prune --root <root> --yes` removes a retained root and
+- [x] `koto workspace prune --root <root> --yes` removes a retained root and
   every session under it and leaves another root's sessions untouched;
   `koto session cleanup <child>` removes one retained child and leaves its
   siblings and parent.
-- [ ] `cargo test` for the touched modules passes; fmt and clippy clean.
+- [x] `cargo test` for the touched modules passes; fmt and clippy clean.
 
 **Dependencies**: <<ISSUE:2>>
 
