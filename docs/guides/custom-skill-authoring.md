@@ -481,7 +481,7 @@ gates:
     pattern: "^## Step \\d+"
 ```
 
-These gates are evaluated automatically when the agent calls `koto next` (including directed transitions via `koto next <name> --to <state>`). They replace the older pattern of using `command` gates with `test -f` checks against the session directory.
+These gates are evaluated automatically when the agent calls `koto next`. A directed transition (`koto next <name> --to <state>`) skips them, except a non-overridable gate the edge to the target depends on; see [cli-usage.md](cli-usage.md#directed-transitions-and-non-overridable-gates). They replace the older pattern of using `command` gates with `test -f` checks against the session directory.
 
 ### Gate output schemas
 
@@ -603,6 +603,7 @@ With the flag set:
 - `koto overrides record` on the gate exits 2 with the typed code `gate_not_overridable`, whatever `--with-data` holds, and appends nothing to the state log.
 - The gate reports `agent_actionable: false` in `blocking_conditions`, so an agent reading the response isn't told to override it.
 - If the log already holds an override for the gate (written by an older koto, or by hand), `koto next` ignores it and evaluates the gate for real.
+- `koto next --to <target>` evaluates it when the edge to the target depends on it, and refuses with `gate_blocked` when its result doesn't satisfy that edge. In the example, `--to merge` is refused until the verdict matches, while `--to wait` is allowed. The rule is in [cli-usage.md](cli-usage.md#directed-transitions-and-non-overridable-gates).
 
 A good rule: a gate that routes on a context key your own `default_action` script wrote should be `overridable: false`, because otherwise an override lets the agent supply the value the script exists to produce. Leave gates that only guard against a transient failure overridable, so a stuck run has a logged way forward.
 

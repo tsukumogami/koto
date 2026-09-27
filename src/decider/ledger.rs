@@ -1,9 +1,12 @@
 //! The decider ledger: `<koto_root>/_decider_ledger.jsonl`.
 //!
-//! Every consultation and every agent answer to a consulted visit is
-//! appended here as one JSON line. Session logs are deleted on cleanup and
-//! prune, and child sessions are always cleaned up, so the ledger is the
-//! only place the pairs that promotion is judged on survive. It is
+//! Every consultation, every agent answer to a consulted visit, and every
+//! `koto next --to` that leaves such a visit unanswered is appended here as
+//! one JSON line. Session logs are deleted on cleanup and prune, and most
+//! sessions are cleaned up on their terminal tick (only a failure terminal,
+//! or one kept with `--no-cleanup`, stays until something removes it), so
+//! the ledger is the only place the pairs that promotion is judged on
+//! survive. It is
 //! authoritative state: it can't be rebuilt, nothing in koto deletes or
 //! compacts it, and it is created mode 0600.
 //!
@@ -15,7 +18,11 @@
 //!   …every DeciderConsultation field…}` with `"trimmed":true` when the
 //!   probabilities were dropped to fit the line bound;
 //! - `{"kind":"answered","v":1,"at":…,"session":…,"session_id":…,
-//!   "state":…,"visit_seq":…,"values":{field: value}}`.
+//!   "state":…,"visit_seq":…,"values":{field: value}}`;
+//! - `{"kind":"directed_exit","v":1,"at":…,"session":…,"session_id":…,
+//!   "state":…,"visit_seq":…,"target":…}`, written when `koto next --to`
+//!   leaves a visit whose consultation wasn't applied, before the agent
+//!   answered it.
 //!
 //! `at` is RFC 3339 UTC. `session_id` is the session header's UUID, or
 //! `null` for a header that has none; records with a null id can't be
@@ -28,8 +35,9 @@
 //! over it is not written.
 //!
 //! No record carries input content, the API key, a response body, or error
-//! text: [`DeciderConsultation`] holds none, and an `answered` record
-//! holds only the values the agent submitted for declared fields.
+//! text: [`DeciderConsultation`] holds none, an `answered` record holds
+//! only the values the agent submitted for declared fields, and a
+//! `directed_exit` record holds only state names.
 //!
 //! This module holds the writers. Reading the ledger belongs to
 //! [`super::report`], behind `koto decider report`.
@@ -57,7 +65,7 @@ pub fn ledger_path(koto_root: &Path) -> PathBuf {
     koto_root.join(LEDGER_FILE_NAME)
 }
 
-/// The keys both record kinds carry after `kind`.
+/// The keys every record kind carries after `kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordEnvelope {
     /// Always [`LEDGER_VERSION`].
@@ -109,12 +117,32 @@ pub struct AnsweredRecord {
     pub values: BTreeMap<String, serde_json::Value>,
 }
 
+/// `koto next --to` leaving a visit whose consultation wasn't applied,
+/// before the agent answered it (koto#254).
+///
+/// It is not an answer: the agent's value for the declared fields is
+/// unknown, so it never forms a paired observation. It is kept because
+/// `--to` is how an agent overrides a routing decision, so these are the
+/// visits where it most likely disagreed with the decider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DirectedExitRecord {
+    #[serde(flatten)]
+    pub envelope: RecordEnvelope,
+    /// The state the agent left.
+    pub state: String,
+    /// The consultation's `visit_seq`, which this exit pairs with.
+    pub visit_seq: u64,
+    /// The state `--to` named.
+    pub target: String,
+}
+
 /// One ledger line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LedgerRecord {
     Consulted(ConsultedRecord),
     Answered(AnsweredRecord),
+    DirectedExit(DirectedExitRecord),
 }
 
 impl LedgerRecord {
@@ -123,6 +151,7 @@ impl LedgerRecord {
         match self {
             LedgerRecord::Consulted(_) => "consulted",
             LedgerRecord::Answered(_) => "answered",
+            LedgerRecord::DirectedExit(_) => "directed_exit",
         }
     }
 
@@ -152,6 +181,22 @@ impl LedgerRecord {
             state: state.to_string(),
             visit_seq,
             values,
+        })
+    }
+
+    /// A `directed_exit` record stamped now.
+    pub fn directed_exit(
+        session: &str,
+        session_id: Option<&str>,
+        state: &str,
+        visit_seq: u64,
+        target: &str,
+    ) -> Self {
+        LedgerRecord::DirectedExit(DirectedExitRecord {
+            envelope: RecordEnvelope::now(session, session_id),
+            state: state.to_string(),
+            visit_seq,
+            target: target.to_string(),
         })
     }
 }
@@ -484,7 +529,7 @@ mod tests {
             .lines()
             .map(|l| match serde_json::from_str::<LedgerRecord>(l).unwrap() {
                 LedgerRecord::Consulted(c) => c.consultation.visit_seq,
-                LedgerRecord::Answered(_) => panic!("kind"),
+                LedgerRecord::Answered(_) | LedgerRecord::DirectedExit(_) => panic!("kind"),
             })
             .collect();
         assert_eq!(seqs.len(), n);

@@ -104,7 +104,7 @@ Gets the current state directive. Submits evidence when `--with-data` is provide
 | Flag | Description |
 |---|---|
 | `--with-data <json>` | Submit evidence as a JSON object. Must conform to the state's `accepts` schema. Max 1 MB. The `"gates"` key is reserved and rejected. Mutually exclusive with `--to`. Prefix with `@` to read the payload from a file (e.g. `--with-data @evidence.json`); the file is also capped at 1 MB. |
-| `--to <state>` | Force a directed transition to a named state. Must be a valid transition target from the current state. Mutually exclusive with `--with-data`. |
+| `--to <state>` | Force a directed transition to a named state. Must be a valid transition target from the current state. Skips gates, except an `overridable: false` gate the edge to the target depends on: if that gate's result doesn't satisfy the edge, the call exits 1 with `gate_blocked` naming it and records nothing. Mutually exclusive with `--with-data`. |
 | `--no-cleanup` | Keep the session after it reaches a terminal state. A terminal declared `failure: true` is always kept anyway. The result still reaches the parent and any bound leg; the response's `retention` field says whether the session was kept and why. |
 | `--full` | Always include the `details` field, even if it was already delivered since you last arrived at the state. By default `details` is omitted once delivered, until the workflow arrives at the state again — from a different state, or via `koto rewind`. A self-transition is a lap rather than an arrival and does not bring it back; a tick that leaves and comes back through another state does. |
 | `--dispatch-epoch <n>` | The epoch this writer was dispatched with. Required for `--with-data` writes against a child workflow's log; validated before any persistence call and rejected with `epoch_fence_violation` (exit 65) on a mismatch. Parent-workflow ticks don't need it. The same value goes on `koto request progress` / `resolve` / `abandon` for a bound leg. |
@@ -390,7 +390,7 @@ The key is absent when the session isn't bound to a leg. It never carries `dispa
 
 ## koto request
 
-Eleven subcommands over the request store — the durable record of what a coordinator asked for and what came back. See the skill's "Requests and legs" section for when to use it; this section is the flag surface.
+Twelve subcommands over the request store — the durable record of what a coordinator asked for and what came back. See the skill's "Requests and legs" section for when to use it; this section is the flag surface.
 
 ```
 koto request create   [--with-data '{"legs":[…],"inputs":{…}}' | --role R --template T --inputs J]
@@ -400,6 +400,7 @@ koto request attach   <request-id> <leg> --session SESSION_ID [--issued-by ID]
 koto request get      <request-id>
 koto request wait     <request-id> (--leg NAME | --all-legs | --closed | --resolved-count N)
                       --timeout-secs N [--interval-secs N]
+koto request watch    --session SESSION_ID --timeout-secs N [--since CURSOR]
 koto request list     [--requested-by ID | --coordinator-of-record ID] [--state open|closed] [--unresolved-legs]
 koto request progress <request-id> <leg> --with-data J [--dispatch-epoch N] [--issued-by ID]
 koto request resolve  <request-id> <leg> --with-data J [--dispatch-epoch N] [--issued-by ID]
@@ -408,13 +409,15 @@ koto request abandon-request <request-id> --rationale TEXT [--issued-by ID]
 koto request close    <request-id> [--issued-by ID]
 ```
 
-`--cli-contract MAJOR.MINOR` is accepted on every subcommand and validated before any I/O, so a mismatch has no side effect. This build serves `1.1`; an older minor is served, a newer minor or a different major is refused.
+`--cli-contract MAJOR.MINOR` is accepted on every subcommand and validated before any I/O, so a mismatch has no side effect. This build serves `1.2`; an older minor is served, a newer minor or a different major is refused.
 
 Output is JSON on stdout unconditionally — there is no format flag.
 
+`watch`, like `list`, doesn't print the request envelope. It reads the session's wake file (`~/.koto/wakes/<session>`, described in `docs/guides/cli-usage.md`, "Leg wakes and request watch"): it blocks until the file changes or `--timeout-secs` passes, exits 0 either way, and prints `{"session", "woke", "cursor", "cli_contract"}`; `woke` is `false` at the timeout. Pass `cursor` back as `--since`. A bad `--session` is `invalid_identifier`, a bad `--since` is `invalid_submission` (both exit 2), an unreadable wake file is `persistence_error` (exit 3), and a signal while polling is `wait_interrupted` (exit 1).
+
 ### The response envelope
 
-Every subcommand except `list` prints the same object:
+Every subcommand except `list` and `watch` prints the same object:
 
 ```json
 {
@@ -443,7 +446,7 @@ Every subcommand except `list` prints the same object:
     }
   },
   "written": true,
-  "cli_contract": {"major": 1, "minor": 1}
+  "cli_contract": {"major": 1, "minor": 2}
 }
 ```
 
@@ -943,9 +946,9 @@ koto decider report --fixtures <path> --template <path> --state <state> [--field
 
 Read-only. Reports how often the decider agreed with agents, read from the decider ledger (`~/.koto/_decider_ledger.jsonl` unless `--ledger` names another file; a missing ledger is an empty report). An agent running a workflow doesn't need it; a maintainer uses it to decide whether a value can move from `shadow` to `auto`. It never changes a mode.
 
-Per question (state, field, and declaration hash) it prints consultations by outcome, paired observations, per-value recall, coverage, and disagreements, a confusion matrix, fallback and error rates, latency p50/p95, agent stops removed, and directive bytes not delivered. `--state` limits the output to one state.
+Per question (state, field, and declaration hash) it prints consultations by outcome, paired observations, directed exits (visits the agent left with `koto next --to` instead of answering), per-value recall, coverage, and disagreements, a confusion matrix, fallback and error rates, latency p50/p95, agent stops removed, and directive bytes not delivered. `--state` limits the output to one state.
 
-With `--fixtures` it runs a JSON Lines golden set (`{"id", "inputs": {label: text}, "expected"}` per line) through the runtime's own request and evaluation code and marks each value `eligible` or `ineligible`, naming every condition that failed: at least 10 cases per value and 40 in total, every case answered, no confident false positive, macro recall above the majority baseline, at least 30 paired ledger observations under the current declaration hash, and at most one disagreement where the decider chose the value. A fixture run needs an opted-in decider and network access. Runs and consultations against a custom endpoint (user config or `KOTO_DECIDER_ENDPOINT`) count toward eligibility only with `--include-custom-endpoints`.
+With `--fixtures` it runs a JSON Lines golden set (`{"id", "inputs": {label: text}, "expected"}` per line) through the runtime's own request and evaluation code and marks each value `eligible` or `ineligible`, naming every condition that failed: at least 10 cases per value and 40 in total, every case answered, no confident false positive, macro recall above the majority baseline, at least 30 paired ledger observations under the current declaration hash, at most one disagreement where the decider chose the value, and no directed exit from a visit where the decider chose it. A fixture run needs an opted-in decider and network access. Runs and consultations against a custom endpoint (user config or `KOTO_DECIDER_ENDPOINT`) count toward eligibility only with `--include-custom-endpoints`.
 
 Flags:
 

@@ -451,7 +451,11 @@ with a null id, and those records are excluded from pairing.
 The `answered` record is written in `handle_next`'s `--with-data` path, right
 after the `EvidenceSubmitted` append, when the current visit holds a
 `decider_consulted` event whose outcome isn't `applied`. It carries only the
-declared fields. Prune and session cleanup only remove session directories,
+declared fields. A `directed_exit` record (koto#254) is written in the `--to`
+path, after the `directed_transition` append, when the visit being left holds
+such a consultation and no answer to a declared field: it carries the state,
+`visit_seq`, and target, and the report counts it without pairing it. Prune
+and session cleanup only remove session directories,
 so the ledger survives with no change to prune. A test pins that, and
 `docs/workspace-layout.md` lists the ledger as authoritative.
 
@@ -681,8 +685,9 @@ pub trait Decider {
   `.value_descriptions` for declared fields only.
 - Event: `decider_consulted` (tier 2), and `evidence_submitted.source =
   "decider"`.
-- Ledger lines: `{"kind":"consulted", ...DeciderConsultation, "session_id"}`
-  and `{"kind":"answered","session_id","visit_seq","state","values"}`.
+- Ledger lines: `{"kind":"consulted", ...DeciderConsultation, "session_id"}`,
+  `{"kind":"answered","session_id","visit_seq","state","values"}`, and
+  `{"kind":"directed_exit","session_id","visit_seq","state","target"}`.
 - CLI: `koto decider report [--ledger] [--state] [--json] [--fixtures
   --template --state --field]`.
 - Config: `decider.mode | api_key | endpoint | timeout_ms`, plus

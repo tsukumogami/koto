@@ -10,6 +10,21 @@ to `0.9.x`).
 
 ### Added
 
+- **A session waiting on a request leg is woken when the leg changes.** Every
+  write that records a leg's result (a promoted worker result, `koto request
+  resolve`, or a refusal `koto init --koto-leg` records), abandons a leg or a
+  whole request, or closes a request now appends one line to
+  `~/.koto/wakes/<session>` for the request's coordinator of record and its
+  requester, before the command that made the change returns. The wake carries
+  no state, only "look again", so a lost or duplicate wake is harmless. A
+  harness subscribes by watching that file, or with the new `koto request
+  watch --session <id> --timeout-secs <n> [--since <cursor>]`, which exits 0
+  with `woke` and a `cursor` within 1 second of the changing command
+  returning, or at its timeout.
+  The request group's `cli_contract` moves to 1.2. `koto request wait
+  --timeout-secs` remains the way to wait with no subscriber. Wakes are local
+  to one machine.
+
 - **A `request-leg` gate routes on what another session reported.** A gate of
   type `request-leg` names a `request` and a `leg` (both may use `{{VAR}}`) and
   reads that leg from the request store: its `disposition` (`open`,
@@ -208,19 +223,60 @@ to `0.9.x`).
   sessions otherwise stay until `koto workspace prune` or `koto session
   cleanup` removes them.
 
+- **`RequesterWoken` is now delivered.** The wake-candidates pass in `koto
+  next` still records `RequesterWoken` with the same fields and the same
+  `(child, epoch)` deduplication, but instead of printing a "not yet wired"
+  line it rings the requester's wake file, through a new `SignalWaker`.
+  `LoggingWaker` is removed.
+
 ### Fixed
 
 - **The `children-complete` gate no longer shows a retried child's old result.**
   It reads only the result a child recorded for its current arrival, and it no
   longer answers a child it can read from its own log with the parent's
   `ChildCompleted` copy, which could belong to an earlier arrival.
+
 - **A cleaned-up `<parent>.<task>` child of a parent without a batch hook is
   no longer outstanding forever.** The gate listed it as `<task>`, so it never
   matched the result the parent held under its full name.
+
 - **`koto workspace prune` removes a tree deepest first.** It used to remove a
   parent before its children and stop at the first failure, which could leave a
   grandchild whose parent was already gone, out of reach of the next prune. A
   `parent_workflow` cycle no longer hangs its walk.
+
+- **`koto next --to` no longer walks past a failing `overridable: false`
+  gate (koto#251).** A directed transition skipped gate evaluation entirely,
+  so one `--to` could bypass a gate that `koto overrides record` refuses to
+  force. `--to` now evaluates the non-overridable gates the edge to its target
+  depends on, the way `koto next` would route it, and when their result doesn't
+  satisfy the edge it exits 1 with `gate_blocked`, names the gate, and appends
+  nothing. An edge that routes on the gate failing stays reachable while it
+  fails, and an edge that needs an output the gate isn't producing is refused
+  even while the gate passes. Overridable gates are still skipped, so `--to`
+  remains the recovery path for a stuck session. The rule is in
+  `docs/guides/cli-usage.md`, under "Directed transitions and non-overridable
+  gates".
+
+- **The decider ledger records `koto next --to` exits from consulted visits
+  (koto#254).** The ledger paired a consultation only with an `answered`
+  record, which only `--with-data` writes, so a visit the agent left with
+  `--to` was counted as a consultation and then dropped from every paired
+  metric. Those are the visits where the agent most likely overrode the
+  decider. `--to` now appends a `directed_exit` record, naming the state left,
+  its `visit_seq`, and the target, when the visit being left holds a
+  consultation that wasn't applied and the agent hasn't answered it (a visit
+  answered first is already a paired observation). It's written after the
+  `directed_transition` event is recorded, so a `--to` the non-overridable
+  gate check refuses (koto#251) writes no record. `koto decider report` counts
+  directed exits per question and per value, lists them with the disagreeing
+  visits, and adds a promotion condition, `ledger_directed_exits`: a value
+  isn't eligible while any visit where the decider chose it confidently was
+  left with `--to`. Directed exits aren't paired observations, so recall and
+  the confusion matrix don't change. An older koto reading the ledger counts
+  the new lines as an unknown kind and skips them, so its report doesn't apply
+  the new condition: judge promotion with this version or later.
+
 - **`koto context add` and `koto context remove` refuse a session that has no
   state log, instead of creating a log koto can't read.** Both verbs append an
   event to the session's log, and neither checked that the log existed. The
@@ -356,6 +412,7 @@ to `0.9.x`).
   entered, because the run is standing in that state and the fix is not
   a routing one.
   Closes koto#221.
+
 - **A context gate's `key` and `pattern` now resolve `{{KEY}}`
   references.** Substitution rewrote a gate's `command` and nothing else,
   so a state whose action stored `{{SESSION_NAME}}-note` and whose gate

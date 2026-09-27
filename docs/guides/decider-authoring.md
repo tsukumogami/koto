@@ -25,11 +25,17 @@ The only decider koto ships is Jev, from TypeSafe
 ([docs.typesafe.ai](https://docs.typesafe.ai/)). Its default endpoint is
 Jev's decision URL, `https://api.typesafe.ai/v1/systemone`.
 
-So far the Jev client has been verified only against a local stub built from
-Jev's published API documentation. It hasn't been run against the live API.
-Live validation is a pending follow-up. Until it's done, treat a consultation
-against the real endpoint as untested, and expect the promotion data you
-gather to be the first real test of the client.
+The client has been run against the live API. On 2026-09-26, koto 0.13.0
+answered every case of a synthetic fixture set, both `choice` and `noul`
+questions, on the default endpoint, with a p95 latency under 400 ms against
+the 2000 ms default timeout. Jev's `choice` answers carry `probabilities`,
+which the client requires. The `decider-live` workflow repeats that check on
+demand and on every push to `main` that touches the decider. It sends only the
+synthetic sentences in `test/decider-live/` and checks the transport and the
+answer schema, not which value won. So a passing run says the client and the
+API still agree, not that Jev judges any particular question well. That is
+what the fixture and ledger evidence in [Promoting a value to
+`auto`](#promoting-a-value-to-auto) is for.
 
 ## When a decision qualifies
 
@@ -164,6 +170,10 @@ A `context` input has to be a key that some `context-exists` or
 `default_action` writes, so the usual pattern is the one in `fetch` above: the
 state that produces the key gates on it, and a run can't reach the question
 without it.
+
+A `var` input can't carry free text. `koto init --var` accepts only letters,
+digits, spaces, and `._/:@-`, so a value with a comma or a newline is refused
+before the session starts. Put prose, such as an issue body, in a context key.
 
 ### The boolean declaration
 
@@ -354,7 +364,13 @@ and where the endpoint came from. An applied answer is followed by an
 
 koto also appends a `consulted` record to `~/.koto/_decider_ledger.jsonl`,
 and, when the agent later answers a visit koto didn't settle, an `answered`
-record with the agent's declared values. The ledger is created with mode
+record with the agent's declared values. When the agent leaves such a visit
+with `koto next --to` instead of answering, koto appends a `directed_exit`
+record naming the target state. A `--to` back into the same state is a lap,
+not an exit, and records nothing. A directed exit isn't an answer, so it never
+counts as a paired observation, but it is the evidence that matters most:
+`--to` is how an agent overrides a routing decision, so these are the visits
+where it most likely disagreed with the decider. The ledger is created with mode
 0600, is never synced to the cloud backend, and survives session cleanup and
 `koto workspace prune`; see `docs/workspace-layout.md`. If a ledger write
 fails, koto prints a warning and carries on.
@@ -409,9 +425,21 @@ A value is eligible when all of these hold:
 - the ledger holds at least 30 paired observations under the current
   declaration hash, with at most one disagreement where the decider chose
   this value;
+- no ledger visit where the decider chose this value at or above its
+  threshold was left with `koto next --to` instead of answered (see below:
+  this one only resets with the declaration);
 - the fixture run and the counted consultations used the default endpoint
   (pass `--include-custom-endpoints` to count others, for example when you're
   testing against a stub).
+
+The ledger is append-only and every count is kept per declaration hash, so
+the directed-exit condition is a one-way ratchet: once a `--to` has left a
+visit where the decider confidently chose a value, that value stays
+ineligible until the declaration changes and its counts start over under a
+new hash. An agent that used `--to` to route around an unrelated failure
+counts the same as one that overruled the decider, so read the report's
+`directed_to` for each listed exit before deciding whether the declaration
+needs to change.
 
 The full report, its JSON shape, and its exit codes are in
 [cli-usage.md](cli-usage.md#decider-report).

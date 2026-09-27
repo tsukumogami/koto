@@ -107,6 +107,20 @@ fn answered(sid: Option<&str>, seq: u64, value: Value) -> Value {
     })
 }
 
+/// A `directed_exit` line: the agent left visit `seq` with `--to target`.
+fn directed_exit(sid: Option<&str>, seq: u64, target: &str) -> Value {
+    json!({
+        "kind": "directed_exit",
+        "v": 1,
+        "at": "2026-01-01T00:00:01Z",
+        "session": "wf",
+        "session_id": sid,
+        "state": "review",
+        "visit_seq": seq,
+        "target": target,
+    })
+}
+
 /// A paired visit: the decider chose `decider` at threshold, the agent
 /// `agent`.
 fn pair(sid: &str, seq: u64, hash: &str, decider: &str, agent: &str) -> Vec<Value> {
@@ -709,18 +723,23 @@ fn the_table_shows_the_same_numbers_as_json() {
                     pct(&v["coverage"]["well_formed"]).as_str(),
                     pct(&v["coverage"]["all"]).as_str(),
                     v["disagreements"].to_string().as_str(),
+                    v["directed_exits"].to_string().as_str(),
                 ],
                 "{}",
                 line
             );
         }
         for d in q["disagreements"].as_array().unwrap() {
+            let agent = match d["directed_to"].as_str() {
+                Some(target) => format!("left with --to {}", target),
+                None => d["agent"].as_str().unwrap().to_string(),
+            };
             let e = format!(
                 "{}/{} ({}): agent {}, decider {}",
                 d["session_id"].as_str().unwrap(),
                 d["visit_seq"],
                 d["session"].as_str().unwrap(),
-                d["agent"].as_str().unwrap(),
+                agent,
                 d["decider"].as_str().unwrap()
             );
             assert!(section.contains(&e), "missing {:?} in:\n{}", e, section);
@@ -1523,6 +1542,124 @@ fn two_disagreements_where_the_decider_chose_the_value_are_too_many() {
         .extend(pair("s-elig", 31, &hash, "proceed", "exit"));
     let fx = run_scenario(&one, INCLUDE);
     assert_eq!(fx_value(&fx, "proceed")["eligible"], true);
+}
+
+#[test]
+fn a_directed_exit_where_the_decider_chose_the_value_is_disqualifying() {
+    let hash = std_hash();
+    let mut s = baseline(&hash);
+    s.ledger.push(consulted(
+        Some("s-elig"),
+        31,
+        &hash,
+        "not_applied",
+        Some("proceed"),
+        true,
+    ));
+    s.ledger.push(directed_exit(Some("s-elig"), 31, "rethink"));
+    assert_only_fails(
+        &s,
+        "ledger_directed_exits",
+        "at most 0 ledger visits where the decider chose proceed left with \
+         koto next --to instead of answered (has 1)",
+    );
+
+    // An exit from a visit where the decider wasn't confident says nothing
+    // about any value's precision.
+    let mut below = baseline(&hash);
+    below.ledger.push(consulted(
+        Some("s-elig"),
+        31,
+        &hash,
+        "not_applied",
+        Some("proceed"),
+        false,
+    ));
+    below
+        .ledger
+        .push(directed_exit(Some("s-elig"), 31, "rethink"));
+    let fx = run_scenario(&below, INCLUDE);
+    assert_eq!(fx_value(&fx, "proceed")["eligible"], true);
+    assert_eq!(fx_value(&fx, "exit")["eligible"], true);
+}
+
+#[test]
+fn directed_exits_are_counted_listed_and_kept_out_of_the_pairs() {
+    let h = Harness::new(&standard("shadow", "shadow"));
+    write_ledger(
+        &h,
+        &[
+            consulted(Some("s"), 1, "h", "not_applied", Some("proceed"), true),
+            directed_exit(Some("s"), 1, "rethink"),
+            // A repeated line is counted in the header but joined once.
+            directed_exit(Some("s"), 1, "rethink"),
+            consulted(Some("s"), 2, "h", "not_applied", Some("exit"), false),
+            directed_exit(Some("s"), 2, "work"),
+            consulted(Some("s"), 3, "h", "not_applied", Some("exit"), true),
+            answered(Some("s"), 3, json!("exit")),
+            directed_exit(Some("s"), 99, "work"),
+            directed_exit(None, 1, "work"),
+        ],
+    );
+    let r = report_json(&h, &[]);
+    assert_eq!(r["header"]["directed_exits"], 5, "{}", r["header"]);
+    assert_eq!(r["header"]["orphaned_directed_exits"], 2, "{}", r["header"]);
+    assert_eq!(r["header"]["unknown_kind"], 0);
+    assert_eq!(r["header"]["skipped_malformed"], 0);
+
+    let q = question(&r, "h");
+    assert_eq!(q["directed_exits"], 2, "{}", q);
+    assert_eq!(q["counted_directed_exits"], 2);
+    // Only the answered visit is a pair.
+    assert_eq!(q["paired"], 1);
+    assert_eq!(q["confusion"]["rows"]["exit"]["exit"], 1);
+    assert_eq!(value(q, "proceed")["directed_exits"], 1);
+    assert_eq!(value(q, "proceed")["paired"], 0);
+    assert_eq!(value(q, "exit")["directed_exits"], 0);
+    assert_eq!(value(q, "proceed")["disagreements"], 0);
+
+    let listed: Vec<(u64, String, String, String)> = q["disagreements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["visit_seq"].as_u64().unwrap(),
+                d["agent"].as_str().unwrap().to_string(),
+                d["decider"].as_str().unwrap().to_string(),
+                d["directed_to"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            (
+                1,
+                "directed_exit".into(),
+                "proceed".into(),
+                "rethink".into()
+            ),
+            (
+                2,
+                "directed_exit".into(),
+                "below_threshold".into(),
+                "work".into()
+            ),
+        ]
+    );
+
+    let out = report(&h, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+    let table = String::from_utf8_lossy(&out.stdout);
+    for e in [
+        "5 directed exits (2 orphaned)",
+        "directed exits 2 (2 counted)",
+        "s/1 (wf): agent left with --to rethink, decider proceed",
+        "s/2 (wf): agent left with --to work, decider below_threshold",
+    ] {
+        assert!(table.contains(e), "missing {:?} in:\n{}", e, table);
+    }
 }
 
 #[test]

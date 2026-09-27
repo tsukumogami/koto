@@ -33,6 +33,8 @@ of authority for this document).
 ├── coordinators/                              # derived (request-store cursor state)
 │   └── <coord_id>/
 │       └── scan_cursor.toml
+├── wakes/                                     # derived (per-session wake signal)
+│   └── <session-id>                           # one opaque line per wake
 ├── _decider_ledger.jsonl                      # AUTHORITATIVE state (decider consultations and answers)
 ├── _terminal_index.jsonl                      # derived (request-store skip-list)
 └── _terminal_index.compact.lock               # derived (request-store compaction lease)
@@ -166,6 +168,18 @@ rather than merely stale. Point `~/.koto/` at local storage.
 
 Both are documented limitations rather than silent gaps.
 
+## Derived state: `~/.koto/wakes/`
+
+One file per session name, rung whenever a leg that session may be
+waiting on changes, and read by `koto request watch` or any file
+watcher. Each wake appends one opaque line; the file is never renamed,
+is truncated in place once it reaches 32 KiB, and carries no state, so
+deleting it loses nothing but a pending wake. A native file watcher
+registered on a deleted file goes quiet, though: re-register it after a
+delete. The directory is 0700
+and each file 0600. See "Leg wakes and request watch" in
+`docs/guides/cli-usage.md`.
+
 ## Authoritative state: `~/.koto/_decider_ledger.jsonl`
 
 When a user opts in to a decider, koto records each consultation, and
@@ -185,11 +199,14 @@ Each line is a JSON object tagged by `kind`:
 - `answered`: written when the agent submits evidence on a visit whose
   consultation wasn't applied. It carries the submitted values of the
   declared fields only.
+- `directed_exit`: written when the agent leaves such a visit with
+  `koto next --to` instead of answering. It carries the state left,
+  `visit_seq`, and the `target` state.
 
-Both kinds also carry `v` (always 1), `at` (RFC 3339 UTC), `session`
+Every kind also carries `v` (always 1), `at` (RFC 3339 UTC), `session`
 (the session name), and `session_id` (the session header's UUID, or
-`null` for a header without one). A consultation and its answer pair
-on `session_id` plus `visit_seq`; session names are reused across
+`null` for a header without one). A consultation and its answer (or
+directed exit) pair on `session_id` plus `visit_seq`; session names are reused across
 runs, so the name is never the join key. No line carries input
 content, the API key, a response body, or error text.
 
@@ -200,8 +217,10 @@ without its probability maps and with `"trimmed": true`; one still
 over it is skipped with a warning.
 
 - **Derivability:** none. The session logs the records came from are
-  deleted when a session is cleaned up, and child sessions are always
-  cleaned up on their terminal tick. The ledger can't be rebuilt.
+  deleted when a session is cleaned up, and most sessions are cleaned up
+  on their terminal tick; one kept at a failure terminal or with
+  `--no-cleanup` is removed later, by its parent's removal, prune or
+  `koto session cleanup`. The ledger can't be rebuilt.
 - **Deletion:** nothing in koto deletes it. `koto session cleanup` and
   `koto workspace prune` remove session directories only, so the
   ledger outlives every session it describes. Deleting it by hand

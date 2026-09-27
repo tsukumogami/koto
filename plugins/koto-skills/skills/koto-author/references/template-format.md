@@ -465,6 +465,7 @@ A value is eligible when all of these hold:
 - no false positives: no case labelled with another value was answered with this value at or above its threshold;
 - macro recall across the values beats always guessing the most frequent label (the majority baseline);
 - the ledger holds at least 30 paired observations under the current declaration hash, with at most one disagreement where the decider chose this value;
+- no ledger visit where the decider chose this value at or above its threshold was left with `koto next --to` instead of answered;
 - the run and the counted consultations used the default endpoint, unless `--include-custom-endpoints` is passed.
 
 The report never changes a mode. It reads the ledger and prints; the edit to `mode` is always yours. `docs/guides/decider-authoring.md` walks the same workflow for a human reader, and `docs/guides/cli-usage.md` has the report's full output and exit codes.
@@ -834,7 +835,7 @@ gates:
     overridable: false
 ```
 
-For such a gate, `koto overrides record` exits 2 with the typed code `gate_not_overridable` whatever `--with-data` holds, and appends nothing; `blocking_conditions[].agent_actionable` is `false`; and `koto next` ignores any override already in the log for it and evaluates the gate for real.
+For such a gate, `koto overrides record` exits 2 with the typed code `gate_not_overridable` whatever `--with-data` holds, and appends nothing; `blocking_conditions[].agent_actionable` is `false`; `koto next` ignores any override already in the log for it and evaluates the gate for real; and `koto next --to <target>` evaluates it when the edge to the target depends on it, refusing with `gate_blocked` when its result doesn't satisfy that edge (the full rule is under "Directed transitions and non-overridable gates" in koto's CLI usage guide).
 
 The field defaults to `true` and is omitted from the compiled JSON when `true`. Compile errors:
 

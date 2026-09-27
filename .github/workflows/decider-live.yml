@@ -1,0 +1,59 @@
+name: decider-live
+
+# Checks koto's Jev client against the live API: synthetic fixtures go through
+# `koto decider report --fixtures` on the default endpoint, and
+# scripts/decider-live-smoke.sh asserts on the transport and the answer schema,
+# never on which value won.
+#
+# Every run spends provider quota and sends text to a third party, so it runs
+# only on demand and on pushes to main that touch the decider or its
+# dependencies, never on pull requests. A fork's pull request therefore can't
+# spend the key. Inputs are the synthetic sentences in test/decider-live/;
+# nothing from the repository is sent.
+#
+# The key is the KOTO_DECIDER_API_KEY repository secret. It reaches koto only
+# through the environment of the one step that needs it, and GitHub masks it in
+# logs. A missing secret fails the job rather than passing with nothing sent.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/decider/**'
+      - 'src/cli/decider.rs'
+      - 'src/cli/decider_port.rs'
+      - 'src/engine/decider.rs'
+      - 'src/template/decider.rs'
+      - 'src/config/**'
+      - 'Cargo.lock'
+      - 'test/decider-live/**'
+      - 'scripts/decider-live-smoke.sh'
+      - '.github/workflows/decider-live.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: decider-live
+  cancel-in-progress: false
+
+jobs:
+  live:
+    name: Decider Live Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build koto
+        run: cargo build --bin koto
+
+      - name: Run the synthetic fixtures against the live provider
+        env:
+          KOTO_DECIDER_API_KEY: ${{ secrets.KOTO_DECIDER_API_KEY }}
+        run: bash scripts/decider-live-smoke.sh target/debug/koto
