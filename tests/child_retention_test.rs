@@ -719,7 +719,25 @@ fn a_failure_terminal_keeps_a_root() {
     assert_eq!(context_get(dir, "r", "plan.md"), "the running record");
     let status = run_ok(dir, &["status", "r"]);
     assert_eq!(status["is_terminal"], true);
+    assert_eq!(status["current_state"], "done_blocked");
     assert_eq!(status["result"]["status"], "failure");
+    let (_, workflows, _) = run(dir, &["workflows"]);
+    assert!(
+        workflows.contains("\"r\""),
+        "koto workflows lists it: {workflows}"
+    );
+
+    // A root sent to its failure terminal with `--to` is kept too.
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let t = write(dir, "root.md", CHILD);
+    run_ok(dir, &["init", "r", "--template", &t]);
+    run_ok(dir, &["next", "r", "--to", "done_blocked"]);
+    assert!(session_dir(dir, "r").exists());
+    assert_eq!(
+        run_ok(dir, &["status", "r"])["current_state"],
+        "done_blocked"
+    );
 }
 
 #[test]
@@ -838,6 +856,11 @@ fn retry_failed_reaches_a_retained_child() {
         "pending",
         "{output}"
     );
+
+    // Its next terminal is a new arrival: exactly one new notice.
+    let before = child_completed(dir, "p").len();
+    run_ok(dir, &["next", "p.leaf", "--with-data", FAIL]);
+    assert_eq!(child_completed(dir, "p").len(), before + 1);
 }
 
 #[test]
@@ -903,16 +926,69 @@ fn a_new_arrival_notifies_once() {
     let notices = child_completed(dir, "p");
     assert_eq!(notices.len(), 2);
 
-    // A directed transition into a terminal is a new arrival too. (koto has
-    // no directed move from one terminal to another: a terminal declares no
-    // transitions.)
-    run_ok(dir, &["rewind", "p.leaf"]);
-    run_ok(dir, &["next", "p.leaf", "--to", "done", "--no-cleanup"]);
-    let notices = child_completed(dir, "p");
-    assert_eq!(notices.len(), 3);
-    assert_eq!(notices[2]["final_state"], "done");
     let output = gate_output(&run_ok(dir, &["next", "p"]));
-    assert_eq!(gate_child(&output, "p.leaf")["result"]["status"], "success");
+    assert_eq!(gate_child(&output, "p.leaf")["result"]["status"], "failure");
+}
+
+/// A child whose failure terminal declares a way out: an operator can move
+/// it straight to the success terminal with `--to`.
+const CHILD_WITH_RECOVERY: &str = r#"---
+name: retention-recoverable
+version: "1.0"
+initial_state: work
+states:
+  work:
+    accepts:
+      marker:
+        type: enum
+        required: true
+        values: [done, fail]
+    transitions:
+      - target: done
+        when:
+          marker: done
+      - target: done_blocked
+        when:
+          marker: fail
+  done:
+    terminal: true
+  done_blocked:
+    terminal: true
+    failure: true
+    transitions:
+      - target: done
+---
+
+## work
+
+Do the work.
+
+## done
+
+Done.
+
+## done_blocked
+
+Blocked.
+"#;
+
+/// A directed move from one terminal to another is a new arrival: one new
+/// notice, carrying the new terminal.
+#[test]
+fn a_directed_move_between_terminals_notifies_once() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    init_parent(dir, "p", PARENT_KEYED);
+    init_child(dir, "p.leaf", "p", CHILD_WITH_RECOVERY);
+    run_ok(dir, &["next", "p.leaf", "--with-data", FAIL]);
+    assert_eq!(child_completed(dir, "p").len(), 1);
+
+    let resp = run_ok(dir, &["next", "p.leaf", "--to", "done", "--no-cleanup"]);
+    assert_eq!(resp["state"], "done");
+    let notices = child_completed(dir, "p");
+    assert_eq!(notices.len(), 2);
+    assert_eq!(notices[1]["final_state"], "done");
+    assert_eq!(notices[1]["result"]["status"], "success");
 }
 
 #[test]
@@ -982,7 +1058,9 @@ fn the_response_states_retention() {
     run_ok(dir, &["init", "r", "--template", &t]);
     let first = run_ok(dir, &["next", "r", "--with-data", FAIL]);
     let second = run_ok(dir, &["next", "r"]);
-    assert_eq!(first["retention"], second["retention"]);
+    let kept = serde_json::json!({"retained": true, "reason": "failure_terminal"});
+    assert_eq!(first["retention"], kept);
+    assert_eq!(second["retention"], kept);
 }
 
 #[test]
@@ -1094,6 +1172,7 @@ fn a_bound_failed_child_resolves_its_leg_once() {
     assert_eq!(first["disposition"], "resolved", "{first}");
     assert_eq!(first["result_source"], "promoted", "{first}");
     assert_eq!(first["result"]["status"], "failure", "{first}");
+    assert_eq!(first["result_final_state"], "done_blocked", "{first}");
 
     // A later arrival (rewound, then done) leaves the resolved leg alone.
     run_ok(dir, &["rewind", "child-1"]);

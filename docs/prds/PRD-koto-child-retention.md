@@ -137,10 +137,9 @@ or `completed at <state>`, and the terminal evidence as `payload`).
 
 **R3. Once per arrival.** The writes in R2 happen once per arrival at a
 terminal. An arrival begins at the transition, directed transition or rewind
-that put the session in its current terminal state, so a `koto next --to`
-into a terminal is an arrival like any other. (koto has no directed move out of
-a terminal, which declares no transitions; a session leaves one only by a
-rewind or a retry.) Ticking a session that is
+that put the session in its current terminal state; `koto next --to` from one
+terminal to another (where the template declares that transition) is therefore
+a new arrival. Ticking a session that is
 already standing in a terminal state, and whose log already records a result
 for this arrival, adds no result event, no terminal-index entry and no parent
 notice. The one exception is a tick that removes a session after an earlier
@@ -289,9 +288,9 @@ Once per arrival
   result, until it records a result for its new arrival.
 - [ ] A retried child that reaches a terminal again appends exactly one new
   `ChildCompleted` to its parent, and the gate reports the new result.
-- [ ] A retained failed child that is rewound and moved with `koto next
-  <child> --to <terminal>` appends exactly one new `ChildCompleted` to its
-  parent, carrying that terminal's name as `final_state`.
+- [ ] A retained failed child moved with `koto next <child> --to <other
+  terminal>` appends exactly one new `ChildCompleted` to its parent, carrying
+  the new terminal's name as `final_state`.
 - [ ] A success terminal kept with `--no-cleanup`, ticked again without the
   flag, no longer exists after that tick; its own log and the terminal index
   gained no events, and its parent's log gained at most one `ChildCompleted`

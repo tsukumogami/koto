@@ -142,7 +142,6 @@ fn drive_child_to_done_with_cleanup(dir: &Path, name: &str) {
     );
 }
 
-/// Drive a child to its `failed` terminal state WITHOUT `--no-cleanup`.
 /// Drive a child to its `failed` terminal WITHOUT `--no-cleanup`, then remove
 /// its session by hand. A failure terminal is always kept (koto issue 240), so
 /// the removal these tests need -- a failed child known only from its parent's

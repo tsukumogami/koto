@@ -146,6 +146,7 @@ Covers PRD R1, R4, R5, R6, R7, R8, R10 and R11 and DESIGN Decision 1.
 for what it asserts (`a_failure_terminal_keeps_a_root`,
 `a_failure_terminal_keeps_a_child`, `a_directed_failure_terminal_keeps_the_session`,
 `a_retained_failure_stays_on_a_flagless_tick`,
+`a_directed_move_between_terminals_notifies_once`,
 `the_gate_reads_a_retained_failure_for_either_parent_shape`,
 `retry_failed_reaches_a_retained_child`, `rewind_reaches_a_retained_session`,
 `a_removed_session_is_still_refused`, `a_new_arrival_notifies_once`,
@@ -173,9 +174,9 @@ for what it asserts (`a_failure_terminal_keeps_a_root`,
   refused with `unknown_children`, and `koto rewind` on a removed session still
   fails with "workflow not found".
 - [ ] A retried child that reaches a terminal again appends exactly one new
-  `ChildCompleted`, and the gate reports the new result; a rewound child
-  moved with `koto next --to` into a terminal appends exactly one, carrying
-  that terminal as `final_state`.
+  `ChildCompleted`, and the gate reports the new result; a `koto next --to`
+  from one terminal to another appends exactly one, carrying the new
+  `final_state`.
 - [ ] A retained failed child that is retried and reaches a success terminal
   without `--no-cleanup` no longer exists after that tick, and the parent's
   gate lists it as `success` with the new result (read from the parent's

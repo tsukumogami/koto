@@ -254,9 +254,10 @@ when the session is not retained (Decision 1's rule, or the flag). Then:
   promotion asked to defer, as today.
 
 A repeat tick of a kept session finds its arrival recorded and writes nothing.
-A session that leaves the terminal through `retry_failed` or `koto rewind` and
-reaches a terminal again, by a tick or a `--to`, starts a new arrival, because
-each of those appends a state-changing event, and gets its writes again. A session parked by an
+A session that leaves the terminal through `retry_failed`, `koto rewind` or a
+`--to` to another terminal (where the template declares that transition)
+starts a new arrival, because each of those appends a state-changing event,
+and gets its writes again. A session parked by an
 earlier koto version has no record for its arrival, so its next tick delivers,
 which repairs a batch stuck on a flagged child.
 
@@ -490,7 +491,7 @@ result is recorded.
 | `src/cli/mod.rs`, both terminal call sites | Attach `retention` to the response before printing. |
 | `src/cli/mod.rs`, `Next` clap args | `--no-cleanup` help text. |
 | `src/cli/next_types.rs`, `NextResponse::Terminal` | New `retention: Option<Retention>` field, serialized as `retention` when present, set through a `with_retention` builder beside `with_terminal_result`; every construction site gains `retention: None`. |
-| `src/cli/batch.rs`, converge | Live-child dereference uses `recorded_result_for_current_arrival`. |
+| `src/cli/batch.rs`, converge | Live-child dereference uses `recorded_result_for_current_arrival`; the parent-copy fallback is skipped for a readable, classified on-disk child. A child known only from its parent's `ChildCompleted` keeps its full session name, so a cleaned-up `<parent>.<task>` child of a parent without a batch hook matches its result (before, it was listed as `<task>` and stayed outstanding). |
 | New `sweep_terminal_descendants` (in `src/cli/workspace.rs`) | The guarded post-order walk. |
 | `src/cli/workspace.rs` | `derive_terminal_status` and `TerminalStatus` become `pub(crate)`; `collect_descendants` gains a visited set. |
 | `src/cli/init_entry.rs`, replace path | Calls the sweep before replacing a finished session. |
