@@ -4427,6 +4427,22 @@ fn handle_next(
                     }
                     None => resp,
                 };
+                // A directed exit from a batching state whose batch is
+                // complete records it, as the advance path does when a
+                // tick leaves one (Issue #263): a consumer in the target
+                // state reads `batch_final_view` whichever way the parent
+                // left. An incomplete batch records nothing.
+                if target != current_state
+                    && crate::cli::batch::state_has_materialize_children(&compiled, current_state)
+                {
+                    crate::cli::batch::finalize_batch_if_complete(
+                        backend,
+                        context_store,
+                        &name,
+                        &compiled,
+                        current_state,
+                    );
+                }
                 // The terminal result rides the response, so it is found or
                 // resolved before printing and the same record is handed to
                 // the completion block below.
@@ -5789,74 +5805,51 @@ fn handle_next(
                 }
             }
 
-            // Issue #17: append a `BatchFinalized` event when the
-            // `children-complete` gate on the current state first
-            // reports `all_complete: true`. The predicate in
-            // `should_append_batch_finalized` ensures the event
-            // appends at most once per finalization pass; a retry
-            // (retry_failed evidence / Rewound) invalidates the prior
-            // event and the next all-complete tick appends a fresh
-            // BatchFinalized. The view freezes the current gate output
-            // so subsequent `koto status` and terminal `done`
-            // responses can replay the final batch shape.
+            // Issue #17: record a completed batch -- one `BatchFinalized`
+            // event and the `batch_final_view` context key -- the first
+            // time the batch's `children-complete` gate reports
+            // `all_complete: true`. A retry (retry_failed evidence or a
+            // Rewound) invalidates the prior event and the next
+            // all-complete tick records a fresh one. The view freezes the
+            // gate output so `koto status` and terminal `done` responses
+            // can replay the final batch shape.
+            //
+            // The decision is made against the state that owns the batch,
+            // not the state the tick stopped in (Issue #263). A tick that
+            // completes the batch and advances out of it in the same call
+            // -- a transition routed on `all_complete` -- stops in a state
+            // without `materialize_children`, and no later tick looks at
+            // the batching state again, so the start state is checked
+            // whenever the tick left it. It goes first, so a tick that
+            // finishes one batch and lands in another batching state
+            // records the first. The final state is checked only when the
+            // scheduler ran there, as before. Both calls can name the same
+            // completed batch; `should_append_batch_finalized` keeps it to
+            // one write. Everything below that reads the log (the
+            // terminal result, `batch.phase`, the terminal
+            // `batch_final_view`) runs after this, so it sees the event.
+            let tick_start_state = machine_state.current_state.as_str();
+            if final_state.as_str() != tick_start_state
+                && crate::cli::batch::state_has_materialize_children(&compiled, tick_start_state)
+            {
+                crate::cli::batch::finalize_batch_if_complete(
+                    backend,
+                    context_store,
+                    &name,
+                    &compiled,
+                    tick_start_state,
+                );
+            }
             if scheduler_outcome.is_some()
                 && crate::cli::batch::state_has_materialize_children(&compiled, final_state)
             {
-                let (_, post_events) = backend
-                    .read_events(&name)
-                    .unwrap_or((header.clone(), Vec::new()));
-                let (_converge_passes, gate_output) =
-                    crate::cli::batch::build_children_complete_output(
-                        backend,
-                        &name,
-                        &post_events,
-                        &compiled,
-                        final_state,
-                        None,
-                    );
-                // Finalization tracks terminal completion, not the
-                // converge pass-predicate: a batch is "finalized" once
-                // every child reached a terminal outcome, independent of
-                // whether the converge gate has cleared its results-in
-                // conjunct. Read the `all_complete` field from the gate
-                // output rather than the returned converge bool
-                // (DESIGN-request-store-converge.md Decision 4).
-                let all_complete = gate_output
-                    .get("all_complete")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if crate::cli::batch::should_append_batch_finalized(&post_events, all_complete) {
-                    if let Some(view) =
-                        crate::cli::batch::BatchFinalView::from_gate_output(&gate_output)
-                    {
-                        let ts = crate::engine::types::now_iso8601();
-                        let payload = crate::engine::types::EventPayload::BatchFinalized {
-                            state: final_state.to_string(),
-                            view: serde_json::to_value(&view).unwrap_or(serde_json::Value::Null),
-                            timestamp: ts.clone(),
-                            superseded_by: None,
-                        };
-                        if let Err(e) = backend.append_event(&name, &payload, &ts) {
-                            eprintln!("warning: failed to append BatchFinalized event: {}", e);
-                        }
-                        // Persist batch_final_view to the context store
-                        // so agents can retrieve it via `koto context get
-                        // <wf> batch_final_view` without parsing the
-                        // event log or terminal response.
-                        let view_json =
-                            serde_json::to_value(&view).unwrap_or(serde_json::Value::Null);
-                        if let Ok(serialized) = serde_json::to_string_pretty(&view_json) {
-                            if let Err(e) =
-                                context_store.add(&name, "batch_final_view", serialized.as_bytes())
-                            {
-                                eprintln!(
-                                    "warning: failed to write batch_final_view to context: {}",
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
+                crate::cli::batch::finalize_batch_if_complete(
+                    backend,
+                    context_store,
+                    &name,
+                    &compiled,
+                    final_state,
+                );
             }
 
             // The terminal result rides the response, so it is found or

@@ -287,6 +287,8 @@ When the parent reaches a terminal state, the response carries `batch_final_view
 
 The view is frozen the first time the gate reported `all_complete: true` on a `materialize_children` state. Agents writing a summary directive read `batch_final_view` directly — no second `koto status` call.
 
+The same view is written once per completed batch to the context key `batch_final_view`, so a non-terminal state after the batch reads it with `koto context get <parent> batch_final_view`. It is written on the tick that completes the batch whichever state that tick ends in: staying in the batching state, advancing out of it on a transition routed on `gates.<gate>.all_complete: true`, or leaving it with `koto next --to`. A batch that is left incomplete writes nothing, so a missing key means the batch never completed.
+
 ## Canonical source per question
 
 Multiple surfaces expose batch state. Use the right one for the question you're asking:

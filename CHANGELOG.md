@@ -231,6 +231,21 @@ to `0.9.x`).
 
 ### Fixed
 
+- **A completed batch is recorded even when the completing tick leaves the
+  batching state (koto#263).** The `BatchFinalized` event and the
+  `batch_final_view` context key were written only when the tick that saw the
+  batch complete also stopped in the state that declares
+  `materialize_children`. A parent that routes out of that state on
+  `gates.<gate>.all_complete: true`, the usual way to reach a summary state,
+  left in the same tick and got neither: `koto context get <parent>
+  batch_final_view` exited 3 and the event log had no `BatchFinalized`. Both
+  are now written once per completed batch, decided against the batching
+  state, whether the tick stays there, advances out of it, or leaves with
+  `koto next --to`. A completing tick that lands on a terminal state now also
+  carries `batch_final_view` in its response. A consumer that read the key
+  after such a batch and went on without it when it was missing now gets the
+  view.
+
 - **The `children-complete` gate no longer shows a retried child's old result.**
   It reads only the result a child recorded for its current arrival, and it no
   longer answers a child it can read from its own log with the parent's

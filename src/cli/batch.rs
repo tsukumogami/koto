@@ -2977,6 +2977,92 @@ pub fn should_append_batch_finalized(events: &[Event], all_complete: bool) -> bo
     }
 }
 
+/// Record a completed batch: append `BatchFinalized` and write the
+/// `batch_final_view` context key, when `batch_state`'s batch is complete
+/// and has not been finalized since it last (re-)entered.
+///
+/// `batch_state` is the state that owns the batch -- the one carrying
+/// `materialize_children` -- not the state the tick happens to stop in.
+/// The two differ whenever the tick that completes the batch also
+/// advances out of it (a transition routed on
+/// `gates.<gate>.all_complete: true`), which is the usual shape of a
+/// parent that summarizes its batch in a later state. Deciding on the
+/// stopping state there wrote nothing, and no later tick looks at the
+/// batching state again (Issue #263).
+///
+/// Callers may pass the same batch state more than once in a tick, or on
+/// consecutive ticks: [`should_append_batch_finalized`] keeps it to one
+/// write per completed batch. The view is built from the log as it
+/// stands now, so it freezes the batch's final shape (Issue #17).
+///
+/// Failures to append or write are warnings, as they were when this
+/// lived inline in `handle_next`: the tick itself has already been
+/// recorded, and the event log remains the durable record.
+pub(crate) fn finalize_batch_if_complete(
+    backend: &dyn SessionBackend,
+    context_store: &dyn crate::session::context::ContextStore,
+    parent_name: &str,
+    template: &CompiledTemplate,
+    batch_state: &str,
+) {
+    let post_events = match backend.read_events(parent_name) {
+        Ok((_, events)) => events,
+        Err(e) => {
+            eprintln!(
+                "warning: could not read the log to finalize the batch in '{}': {}",
+                batch_state, e
+            );
+            return;
+        }
+    };
+    let (_converge_passes, gate_output) = build_children_complete_output(
+        backend,
+        parent_name,
+        &post_events,
+        template,
+        batch_state,
+        None,
+    );
+    // Finalization tracks terminal completion, not the converge
+    // pass-predicate: a batch is "finalized" once every child reached a
+    // terminal outcome, independent of whether the converge gate has
+    // cleared its results-in conjunct. Read the `all_complete` field from
+    // the gate output rather than the returned converge bool
+    // (DESIGN-request-store-converge.md Decision 4).
+    let all_complete = gate_output
+        .get("all_complete")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !should_append_batch_finalized(&post_events, all_complete) {
+        return;
+    }
+    let Some(view) = BatchFinalView::from_gate_output(&gate_output) else {
+        return;
+    };
+    let view_json = serde_json::to_value(&view).unwrap_or(serde_json::Value::Null);
+    let ts = crate::engine::types::now_iso8601();
+    let payload = EventPayload::BatchFinalized {
+        state: batch_state.to_string(),
+        view: view_json.clone(),
+        timestamp: ts.clone(),
+        superseded_by: None,
+    };
+    if let Err(e) = backend.append_event(parent_name, &payload, &ts) {
+        eprintln!("warning: failed to append BatchFinalized event: {}", e);
+    }
+    // Persist batch_final_view to the context store so agents can retrieve
+    // it via `koto context get <wf> batch_final_view` without parsing the
+    // event log or terminal response.
+    if let Ok(serialized) = serde_json::to_string_pretty(&view_json) {
+        if let Err(e) = context_store.add(parent_name, "batch_final_view", serialized.as_bytes()) {
+            eprintln!(
+                "warning: failed to write batch_final_view to context: {}",
+                e
+            );
+        }
+    }
+}
+
 /// An event counts as a batch invalidator when it re-enters the
 /// batched state: either a retry_failed evidence submission on the
 /// parent or any `Rewound` event (e.g., retry fast-path).
