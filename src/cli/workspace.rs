@@ -332,8 +332,9 @@ fn collect_descendants(root: &str, sessions: &[SessionInfo]) -> Vec<String> {
 /// `ChildCompleted` from a child created with `koto init --parent`. A leaf
 /// session, which is most terminal ticks, never lists sessions.
 ///
-/// One case falls outside both triggers: a parent without a batch hook
-/// whose only child's `ChildCompleted` failed to write. That child is left
+/// One case falls outside both triggers: a parent without a batch hook on
+/// whose log no `ChildCompleted` landed (every child's notice failed to
+/// write). That child is left
 /// behind, visible in `koto workflows --orphaned`.
 pub(crate) fn sweep_if_parent(
     backend: &dyn SessionBackend,
@@ -713,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn a_leaf_tick_does_not_list_sessions() {
+    fn sweep_lists_sessions_only_for_a_session_that_had_children() {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend = CountingBackend {
             inner: crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf()),
