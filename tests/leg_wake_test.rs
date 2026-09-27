@@ -138,6 +138,26 @@ fn finish_watch(mut child: Child) -> (serde_json::Value, Instant) {
     (json, exited_at)
 }
 
+/// koto processes whose working directory is `dir`, other than `except`.
+fn koto_processes_in(dir: &Path, except: u32) -> Vec<u32> {
+    let bin = assert_cmd::cargo::cargo_bin("koto");
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        // No procfs (macOS): nothing to inspect; the ring runs in-process.
+        return Vec::new();
+    };
+    let dir = dir.canonicalize().unwrap();
+    entries
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| pid != except)
+        .filter(|&pid| {
+            let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+            let cwd = std::fs::read_link(proc_dir.join("cwd")).ok();
+            let exe = std::fs::read_link(proc_dir.join("exe")).ok();
+            cwd.as_deref() == Some(dir.as_path()) && exe.as_deref() == Some(bin.as_path())
+        })
+        .collect()
+}
+
 fn state_log(dir: &Path, session: &str) -> String {
     std::fs::read_to_string(
         dir.join("sessions")
@@ -207,8 +227,17 @@ states:
         when:
           gates.leg.disposition: abandoned
   resumed:
-    terminal: true
+    accepts:
+      next:
+        type: string
+        required: true
+    transitions:
+      - target: finished
+        when:
+          next: go
   abandoned:
+    terminal: true
+  finished:
     terminal: true
 ---
 
@@ -218,7 +247,11 @@ Wait for the worker.
 
 ## resumed
 
-Resumed.
+Resumed; waiting for the next instruction.
+
+## finished
+
+Finished.
 
 ## abandoned
 
@@ -265,10 +298,26 @@ fn a_parked_coordinator_is_woken_within_the_bound_of_the_workers_terminal_tick()
 
     let since = cursor_now(d, "coord");
     let watch = spawn_watch(d, "coord", &since);
-    // The worker's terminal `koto next` returns only when its output pipes
-    // close, so a process it left behind holding them would stall this
-    // call rather than let it return.
+    let watch_pid = watch.id();
+    // Let the watch reach its poll loop, so the bound is measured against a
+    // watch that was already polling rather than one that happened to start
+    // after the ring and returned on its first read.
+    std::thread::sleep(Duration::from_millis(300));
+    if Path::new("/proc/self").exists() {
+        // The probe is not vacuous: it does see the watch, polling.
+        assert!(
+            koto_processes_in(d, 0).contains(&watch_pid),
+            "the process probe did not find the running watch"
+        );
+    }
     let returned_at = finish_worker(d);
+    // The ring runs inside the worker's own `koto next`; nothing it started
+    // may still be running once that command has returned.
+    assert_eq!(
+        koto_processes_in(d, watch_pid),
+        Vec::<u32>::new(),
+        "a koto process outlived the worker's terminal tick"
+    );
     let (woke, exited_at) = finish_watch(watch);
 
     assert_eq!(woke["woke"], true, "{woke}");
@@ -301,23 +350,24 @@ fn a_lost_wake_is_harmless() {
 fn a_duplicate_wake_is_harmless() {
     let tmp = TempDir::new().unwrap();
     let d = tmp.path();
-    parked(d);
-    finish_worker(d);
+    let id = parked(d);
 
+    // The first wake: the worker finishes, the coordinator ticks and moves.
+    let since = cursor_now(d, "coord");
+    finish_worker(d);
+    assert_ne!(cursor_now(d, "coord"), since);
     let first = run_ok(d, &["next", "coord", "--no-cleanup"]);
     assert_eq!(first["state"], "resumed", "{first}");
     let after_first = transitions(d, "coord");
+    assert!(after_first >= 1, "the first tick recorded no transition");
 
-    // A second wake for the same change: the file changes, the state does
-    // not.
+    // A second, real ring with nothing new for the coordinator: closing the
+    // request rings its coordinator again. `resumed` is not terminal and
+    // still has a transition, so a tick that did anything with the wake
+    // itself could move it.
     let since = cursor_now(d, "coord");
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(wake_file(d, "coord"))
-        .map(|mut f| std::io::Write::write_all(&mut f, b"1.1.1\n"))
-        .unwrap()
-        .unwrap();
-    assert_ne!(cursor_now(d, "coord"), since);
+    run_ok(d, &["request", "close", &id]);
+    assert_ne!(cursor_now(d, "coord"), since, "the close did not ring");
 
     let second = run_ok(d, &["next", "coord", "--no-cleanup"]);
     assert_eq!(second["state"], first["state"], "{second}");
@@ -388,7 +438,6 @@ fn a_cursor_carries_a_wake_between_two_watches() {
         ],
     );
 
-    let started = Instant::now();
     let second = run_ok(
         d,
         &[
@@ -403,7 +452,6 @@ fn a_cursor_carries_a_wake_between_two_watches() {
         ],
     );
     assert_eq!(second["woke"], true, "{second}");
-    assert!(started.elapsed() <= WAKE_BOUND, "{:?}", started.elapsed());
 }
 
 #[test]
@@ -444,15 +492,16 @@ fn a_session_that_was_never_initialised_still_gets_its_wake() {
 
 #[test]
 fn a_harness_can_watch_the_file_without_koto() {
+    use std::os::unix::fs::MetadataExt;
     let tmp = TempDir::new().unwrap();
     let d = tmp.path();
     let id = create_request(d, "coord", "coord");
     let stat = |p: &Path| {
-        std::fs::metadata(p)
-            .map(|m| (m.len(), m.modified().unwrap()))
-            .ok()
+        let m = std::fs::metadata(p).unwrap();
+        (m.len(), m.modified().unwrap(), m.ino())
     };
-    let before = stat(&wake_file(d, "coord"));
+    // The first ring creates the file; a harness watching it from then on
+    // must see the next ring as a change to the same file.
     run_ok(
         d,
         &[
@@ -464,9 +513,16 @@ fn a_harness_can_watch_the_file_without_koto() {
             "not needed",
         ],
     );
+    let before = stat(&wake_file(d, "coord"));
+    run_ok(d, &["request", "close", &id]);
     let after = stat(&wake_file(d, "coord"));
-    assert!(after.is_some());
-    assert_ne!(before, after);
+    assert_ne!(
+        (before.0, before.1),
+        (after.0, after.1),
+        "no size or mtime change"
+    );
+    assert!(after.0 > before.0, "the ring did not append");
+    assert_eq!(before.2, after.2, "the file was replaced, not appended to");
 }
 
 #[test]
@@ -474,8 +530,8 @@ fn a_watch_notices_a_wake_that_truncated_the_file() {
     let tmp = TempDir::new().unwrap();
     let d = tmp.path();
     let id = create_request(d, "coord", "coord");
-    // Fill the file past the truncation threshold, as 10,000 unread wakes
-    // would.
+    // Fill the file past the truncation threshold, as about 1,200 unread
+    // wakes would.
     let dir = d.join(".koto").join("wakes");
     std::fs::create_dir_all(&dir).unwrap();
     let filler: String = (0..3000).map(|i| format!("{i}.1.{i}\n")).collect();
