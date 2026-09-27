@@ -328,7 +328,7 @@ mod tests {
 
     // -- unusable_context_key_reason --
     //
-    // The three characters below are the whole of the gap between what a
+    // The four characters below are the whole of the gap between what a
     // variable value may hold and what a context key may hold, so each gets its
     // own case: a reason that stopped naming one of them would leave an operator
     // with the same silence the function exists to end.
@@ -369,6 +369,16 @@ mod tests {
         assert!(
             reason.contains("'@'"),
             "the reason should quote the at-sign; got {reason}"
+        );
+    }
+
+    #[test]
+    fn reason_names_a_plus() {
+        let reason = unusable_context_key_reason("workspace+instance-note")
+            .expect("a plus is not a legal context key character");
+        assert!(
+            reason.contains("'+'"),
+            "the reason should quote the plus; got {reason}"
         );
     }
 

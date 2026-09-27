@@ -78,7 +78,7 @@ A reference in a context gate's `key` is how you scope a context key to the sess
 | A variable value | letters, digits, `.`, `_`, `/`, `-`, and also a space, a `:`, an `@` and a `+` |
 | A context key | `/`-separated components, each starting with a letter or digit and continuing in letters, digits, `.`, `_` and `-` |
 
-A value is content: it lands in a directive an agent reads, in a command argument, in a pattern, so it admits a space and a `:` and an `@` on purpose -- a calendar title or a filter like `from:user@example.com` is a legal value. A key is an address: it becomes a directory name under the session, a key in the store's manifest, and an argument in the `koto context add` and `koto context get` commands your own template runs, where a space would split it into two words.
+A value is content: it lands in a directive an agent reads, in a command argument, in a pattern, so it admits a space, a `:`, an `@` and a `+` on purpose -- a calendar title, a filter like `from:user@example.com`, or a path through a directory named like `workspace+instance` is a legal value. A key is an address: it becomes a directory name under the session, a key in the store's manifest, and an argument in the `koto context add` and `koto context get` commands your own template runs, where a space would split it into two words.
 
 So `key: "{{TITLE}}-note"` with a `TITLE` of `Weekly Planning` is a gate that cannot pass. koto tells you which character it refused and in which component rather than reporting the key absent, but the fix is yours: scope the key on a slug-shaped variable and keep the prose value for the directive.
 
