@@ -2182,6 +2182,79 @@ fn an_interrupted_wait_exits_transient_with_its_own_code() {
 }
 
 #[test]
+fn an_interrupted_watch_names_the_watch() {
+    let tmp = TempDir::new().unwrap();
+    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("koto"))
+        .args([
+            "request",
+            "watch",
+            "--session",
+            "coord",
+            "--timeout-secs",
+            "60",
+        ])
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    std::thread::sleep(Duration::from_millis(600));
+    // SAFETY: `child` is alive and owned by this test.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    let output = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(json["error"]["code"], "wait_interrupted");
+    assert_eq!(
+        json["error"]["message"],
+        "the watch was interrupted by a signal"
+    );
+}
+
+#[test]
+fn a_timeout_too_large_for_the_clock_is_a_caller_error_not_a_panic() {
+    let tmp = TempDir::new().unwrap();
+    let id = create(tmp.path(), TWO_LEGS);
+    let huge = u64::MAX.to_string();
+
+    for args in [
+        vec!["request", "wait", &id, "--closed", "--timeout-secs", &huge],
+        vec![
+            "request",
+            "watch",
+            "--session",
+            "coord",
+            "--timeout-secs",
+            &huge,
+        ],
+    ] {
+        let (code, stdout, stderr) = run(tmp.path(), &args);
+        assert_eq!(
+            code, 2,
+            "{args:?} must exit as a caller error, not panic\n{stdout}\n{stderr}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("stdout is not JSON: {e}\n{stdout}\n{stderr}"));
+        assert_eq!(json["error"]["code"], "invalid_submission", "{json}");
+        assert_eq!(
+            json["error"]["message"],
+            format!("--timeout-secs {huge} is too large to set a deadline"),
+            "{json}"
+        );
+        assert_eq!(
+            json["error"]["details"][0]["field"], "--timeout-secs",
+            "{json}"
+        );
+    }
+}
+
+#[test]
 fn the_deadline_is_absolute_and_the_interval_cannot_spin() {
     let tmp = TempDir::new().unwrap();
     let id = create(tmp.path(), TWO_LEGS);

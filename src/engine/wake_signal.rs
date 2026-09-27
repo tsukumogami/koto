@@ -60,7 +60,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::engine::atomic_fs::create_private_dir;
+use crate::engine::atomic_fs::{create_private_dir, reject_symlink};
 use crate::engine::types::ValidatedSessionId;
 
 /// Directory under the koto root holding every wake file.
@@ -240,9 +240,13 @@ impl FromStr for WakeCursor {
 
 /// Read the current cursor of `session`'s wake file.
 ///
-/// An absent file reads as [`WakeCursor::empty`]. A symlink or any other
-/// non-regular file at the path is an error, as for a ring.
+/// An absent file reads as [`WakeCursor::empty`]. A symlinked `wakes/`
+/// directory, or a symlink or any other non-regular file at the path, is
+/// an error, as for a ring.
 pub fn read_cursor(koto_root: &Path, session: &ValidatedSessionId) -> std::io::Result<WakeCursor> {
+    // `O_NOFOLLOW` below covers only the final component, so the
+    // directory gets the same check `ring` gives it.
+    reject_symlink(&wakes_dir(koto_root))?;
     let path = wake_path(koto_root, session);
     // `O_NOFOLLOW` refuses a symlink at the path; the check after the open
     // refuses anything else that is not a regular file.
@@ -454,6 +458,19 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, wakes_dir(tmp.path())).unwrap();
         assert!(ring(tmp.path(), "coord").is_err());
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_wakes_directory_is_refused_on_read_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        // A wake file behind the link, so a read that followed it would
+        // succeed with a non-empty cursor rather than fail.
+        std::fs::write(elsewhere.join("coord"), b"t1\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, wakes_dir(tmp.path())).unwrap();
+        assert!(read_cursor(tmp.path(), &sid("coord")).is_err());
     }
 
     #[cfg(unix)]

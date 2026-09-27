@@ -2144,12 +2144,12 @@ fn wait(
     timeout_secs: u64,
     interval_secs: Option<u64>,
 ) -> Result<String, RequestError> {
+    // Absolute and computed once, so a slow read cannot extend the
+    // budget a caller asked for.
+    let deadline = deadline_after(timeout_secs)?;
     let id = request_id(id)?;
     let root = koto_root()?;
 
-    // Absolute and computed once, so a slow read cannot extend the
-    // budget a caller asked for.
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let interval = wait_interval(interval_secs);
     let interrupted = install_interrupt_flag();
 
@@ -2183,7 +2183,7 @@ fn wait(
             ));
         }
         let next = (now + interval).min(deadline);
-        sleep_until(next, &interrupted)?;
+        sleep_until(next, &interrupted, "wait")?;
     }
 }
 
@@ -2206,6 +2206,7 @@ struct WatchEnvelope<'a> {
 /// heartbeat, not a failure, and either way the caller ticks and watches
 /// again.
 fn watch(session: &str, timeout_secs: u64, since: Option<&str>) -> Result<String, RequestError> {
+    let deadline = deadline_after(timeout_secs)?;
     let session = ValidatedSessionId::new(session).map_err(|e| {
         RequestError::new(RequestErrorCode::InvalidIdentifier, e.to_string())
             .with_detail("--session", "not a valid session identifier")
@@ -2219,7 +2220,6 @@ fn watch(session: &str, timeout_secs: u64, since: Option<&str>) -> Result<String
     };
     let root = koto_root()?;
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let interrupted = install_interrupt_flag();
     let read = || {
         wake_signal::read_cursor(&root, &session).map_err(|e| {
@@ -2243,7 +2243,7 @@ fn watch(session: &str, timeout_secs: u64, since: Option<&str>) -> Result<String
         if now >= deadline {
             return render_watch(&session, false, &current);
         }
-        sleep_until((now + WATCH_POLL).min(deadline), &interrupted)?;
+        sleep_until((now + WATCH_POLL).min(deadline), &interrupted, "watch")?;
     }
 }
 
@@ -2266,6 +2266,22 @@ fn render_watch(
     })
 }
 
+/// The instant `timeout_secs` from now.
+///
+/// A budget too large to add to the clock is a caller error, refused
+/// before any I/O, rather than an overflow panic.
+fn deadline_after(timeout_secs: u64) -> Result<Instant, RequestError> {
+    Instant::now()
+        .checked_add(Duration::from_secs(timeout_secs))
+        .ok_or_else(|| {
+            RequestError::new(
+                RequestErrorCode::InvalidSubmission,
+                format!("--timeout-secs {timeout_secs} is too large to set a deadline"),
+            )
+            .with_detail("--timeout-secs", "too large to set a deadline")
+        })
+}
+
 /// Resolve `--interval-secs` against its default and its floor.
 ///
 /// The floor is the whole point: an interval of zero would spin,
@@ -2277,17 +2293,19 @@ fn wait_interval(interval_secs: Option<u64>) -> Duration {
 }
 
 /// Sleep to `target` in slices, so a signal is noticed within one
-/// slice rather than after a whole poll interval.
+/// slice rather than after a whole poll interval. `verb` names the
+/// command in the interruption message.
 fn sleep_until(
     target: Instant,
     interrupted: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    verb: &str,
 ) -> Result<(), RequestError> {
     use std::sync::atomic::Ordering;
     loop {
         if interrupted.load(Ordering::Relaxed) {
             return Err(RequestError::new(
                 RequestErrorCode::WaitInterrupted,
-                "the wait was interrupted by a signal",
+                format!("the {verb} was interrupted by a signal"),
             ));
         }
         let now = Instant::now();
@@ -2338,6 +2356,15 @@ mod tests {
     }
 
     #[test]
+    fn the_minor_this_build_serves_is_accepted() {
+        let pin = format!("{CLI_CONTRACT_MAJOR}.{CLI_CONTRACT_MINOR}");
+        assert!(
+            validate_contract(Some(&pin)).is_ok(),
+            "a caller pinning exactly this build's contract must be served"
+        );
+    }
+
+    #[test]
     fn a_different_major_is_a_caller_error() {
         let err = validate_contract(Some("2.0")).expect_err("a major bump must be refused");
         assert_eq!(err.code, RequestErrorCode::ContractMismatch);
@@ -2362,6 +2389,31 @@ mod tests {
         let err = watch("../escape", 1, None).expect_err("must refuse");
         assert_eq!(err.code, RequestErrorCode::InvalidIdentifier);
         assert_eq!(err.code.exit_code(), 2);
+    }
+
+    #[test]
+    fn an_unrepresentable_timeout_is_a_caller_error_not_a_panic() {
+        let err = watch("coord", u64::MAX, None).expect_err("watch must refuse");
+        assert_eq!(err.code, RequestErrorCode::InvalidSubmission);
+        assert_eq!(err.code.exit_code(), 2);
+        let err =
+            wait("rq-anything", Predicate::Closed, u64::MAX, None).expect_err("wait must refuse");
+        assert_eq!(err.code, RequestErrorCode::InvalidSubmission);
+        assert_eq!(err.code.exit_code(), 2);
+    }
+
+    #[test]
+    fn an_interrupted_sleep_names_the_verb_that_was_interrupted() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let far = Instant::now() + Duration::from_secs(60);
+        for verb in ["wait", "watch"] {
+            let err = sleep_until(far, &flag, verb).expect_err("a raised flag interrupts");
+            assert_eq!(err.code, RequestErrorCode::WaitInterrupted);
+            assert_eq!(
+                err.message,
+                format!("the {verb} was interrupted by a signal")
+            );
+        }
     }
 
     #[test]
