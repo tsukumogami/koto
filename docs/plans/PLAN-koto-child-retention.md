@@ -156,43 +156,43 @@ for what it asserts (`a_failure_terminal_keeps_a_root`,
 `init_on_a_retained_root_name_is_refused`).
 
 **Acceptance Criteria**:
-- [ ] A root and a child each driven to a `failure: true` terminal without
+- [x] A root and a child each driven to a `failure: true` terminal without
   `--no-cleanup`, through the advance loop and through `--to`, still exist;
   `koto context get` returns a key written before the terminal (the child's
   `failure_reason` included); `koto status` reports `is_terminal: true`, the
   state and a `result` with `status: "failure"`; `koto workflows` lists them.
-- [ ] Ticking the retained child again without the flag leaves it on disk.
-- [ ] The parent's gate lists the retained failed child as `failure` with its
+- [x] Ticking the retained child again without the flag leaves it on disk.
+- [x] The parent's gate lists the retained failed child as `failure` with its
   result and `results_in: true`, for a parent with an unconditional exit and
   for one keyed on `gates.<gate>.all_complete: true`.
-- [ ] `retry_failed` naming the retained child is accepted; the child's status
+- [x] `retry_failed` naming the retained child is accepted; the child's status
   shows its initial state and the gate lists it as `pending`.
-- [ ] `koto rewind` on a freshly retained failed child and on a retained failed
+- [x] `koto rewind` on a freshly retained failed child and on a retained failed
   root moves each back to its pre-terminal state and `koto status` reports
   `is_terminal: false`.
-- [ ] `retry_failed` naming a child removed at a success terminal is still
+- [x] `retry_failed` naming a child removed at a success terminal is still
   refused with `unknown_children`, and `koto rewind` on a removed session still
   fails with "workflow not found".
-- [ ] A retried child that reaches a terminal again appends exactly one new
+- [x] A retried child that reaches a terminal again appends exactly one new
   `ChildCompleted`, and the gate reports the new result; a `koto next --to`
   from one terminal to another appends exactly one, carrying the new
   `final_state`.
-- [ ] A retained failed child that is retried and reaches a success terminal
+- [x] A retained failed child that is retried and reaches a success terminal
   without `--no-cleanup` no longer exists after that tick, and the parent's
   gate lists it as `success` with the new result (read from the parent's
   `ChildCompleted`).
-- [ ] The `action: "done"` response carries
+- [x] The `action: "done"` response carries
   `{"retained": true, "reason": "failure_terminal"}` for a failure terminal with
   or without the flag, `{"retained": true, "reason": "no_cleanup"}` for a success
   terminal with the flag, and `{"retained": false}` without it; a second tick
   of a retained failure terminal carries the same object.
-- [ ] `koto next --help` shows the new `--no-cleanup` text.
-- [ ] A leg-bound child that fails has its leg resolved once with
+- [x] `koto next --help` shows the new `--no-cleanup` text.
+- [x] A leg-bound child that fails has its leg resolved once with
   `source: promoted` and the terminal as `final_state`, stays on disk, and a
   later arrival leaves the leg unchanged.
-- [ ] `koto init <name>` on a retained root's name is refused naming
+- [x] `koto init <name>` on a retained root's name is refused naming
   `koto session cleanup`.
-- [ ] `cargo test` for the touched modules passes; fmt and clippy clean.
+- [x] `cargo test` for the touched modules passes; fmt and clippy clean.
 
 **Dependencies**: <<ISSUE:1>>
 
