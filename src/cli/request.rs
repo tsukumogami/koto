@@ -875,8 +875,8 @@ fn parse_object_flag(
 /// Compare a presented `--dispatch-epoch` against the epoch recorded
 /// on the leg's bind event.
 ///
-/// **Against the bind event, not the child's header.** The header
-/// disappears on the child's terminal tick while the request record
+/// **Against the bind event, not the child's header.** The header can
+/// disappear on the child's terminal tick while the request record
 /// outlives it, so comparing against the header would leave the leg
 /// permanently unfenceable during exactly the window a displaced agent
 /// may still be alive (DESIGN-request-lifecycle.md Decision 3).
