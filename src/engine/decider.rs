@@ -270,6 +270,8 @@ pub fn prior_consultation<'a>(events: &'a [Event], state: &str) -> Option<&'a De
 /// visit, or when an `evidence_submitted` event in the visit carries any
 /// of `fields`. The port asks this after the provider call returns, so an
 /// answer never lands on top of a submission made while it was in flight.
+/// The `koto next --to` ledger write asks it too, to tell a visit left
+/// unanswered from one already answered.
 pub fn visit_still_open(
     events: &[Event],
     state: &str,

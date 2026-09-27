@@ -364,7 +364,13 @@ and where the endpoint came from. An applied answer is followed by an
 
 koto also appends a `consulted` record to `~/.koto/_decider_ledger.jsonl`,
 and, when the agent later answers a visit koto didn't settle, an `answered`
-record with the agent's declared values. The ledger is created with mode
+record with the agent's declared values. When the agent leaves such a visit
+with `koto next --to` instead of answering, koto appends a `directed_exit`
+record naming the target state. A `--to` back into the same state is a lap,
+not an exit, and records nothing. A directed exit isn't an answer, so it never
+counts as a paired observation, but it is the evidence that matters most:
+`--to` is how an agent overrides a routing decision, so these are the visits
+where it most likely disagreed with the decider. The ledger is created with mode
 0600, is never synced to the cloud backend, and survives session cleanup and
 `koto workspace prune`; see `docs/workspace-layout.md`. If a ledger write
 fails, koto prints a warning and carries on.
@@ -419,9 +425,21 @@ A value is eligible when all of these hold:
 - the ledger holds at least 30 paired observations under the current
   declaration hash, with at most one disagreement where the decider chose
   this value;
+- no ledger visit where the decider chose this value at or above its
+  threshold was left with `koto next --to` instead of answered (see below:
+  this one only resets with the declaration);
 - the fixture run and the counted consultations used the default endpoint
   (pass `--include-custom-endpoints` to count others, for example when you're
   testing against a stub).
+
+The ledger is append-only and every count is kept per declaration hash, so
+the directed-exit condition is a one-way ratchet: once a `--to` has left a
+visit where the decider confidently chose a value, that value stays
+ineligible until the declaration changes and its counts start over under a
+new hash. An agent that used `--to` to route around an unrelated failure
+counts the same as one that overruled the decider, so read the report's
+`directed_to` for each listed exit before deciding whether the declaration
+needs to change.
 
 The full report, its JSON shape, and its exit codes are in
 [cli-usage.md](cli-usage.md#decider-report).
