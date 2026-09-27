@@ -258,7 +258,8 @@ to `0.9.x`).
   batching state: a state's batch exists once its task list is submitted,
   and it is recorded when it completes, again after a retry or rewind, and
   again whenever its per-child outcomes differ from the last record (a retry
-  routed back into the state, or a new task list on a later visit). With the
+  routed back into the state, or a new task list on a later visit); a visit
+  that finds the same children and outcomes records nothing. With the
   fix above alone, a parent with two batches in sequence would have read the
   first batch's view after the second.
 

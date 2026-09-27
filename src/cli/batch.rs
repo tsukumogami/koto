@@ -3024,7 +3024,8 @@ fn batch_outcomes(view: &serde_json::Value) -> Vec<(String, String)> {
 
 /// Record a completed batch: append `BatchFinalized` and write the
 /// `batch_final_view` context key, when `batch_state`'s batch is complete
-/// and has not been finalized since it last (re-)entered.
+/// and [`should_append_batch_finalized`] says it has not been recorded as it
+/// stands.
 ///
 /// `batch_state` is the state that owns the batch -- the one carrying
 /// `materialize_children` -- not the state the tick happens to stop in.
