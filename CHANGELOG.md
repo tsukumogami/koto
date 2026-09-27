@@ -10,6 +10,21 @@ to `0.9.x`).
 
 ### Added
 
+- **A session waiting on a request leg is woken when the leg changes.** Every
+  write that records a leg's result (a promoted worker result, `koto request
+  resolve`, or a refusal `koto init --koto-leg` records), abandons a leg or a
+  whole request, or closes a request now appends one line to
+  `~/.koto/wakes/<session>` for the request's coordinator of record and its
+  requester, before the command that made the change returns. The wake carries
+  no state, only "look again", so a lost or duplicate wake is harmless. A
+  harness subscribes by watching that file, or with the new `koto request
+  watch --session <id> --timeout-secs <n> [--since <cursor>]`, which exits 0
+  with `woke` and a `cursor` within 1 second of the changing command
+  returning, or at its timeout.
+  The request group's `cli_contract` moves to 1.2. `koto request wait
+  --timeout-secs` remains the way to wait with no subscriber. Wakes are local
+  to one machine.
+
 - **A `request-leg` gate routes on what another session reported.** A gate of
   type `request-leg` names a `request` and a `leg` (both may use `{{VAR}}`) and
   reads that leg from the request store: its `disposition` (`open`,
@@ -185,7 +200,28 @@ to `0.9.x`).
   deletes, never writes over an existing session, and is safe to re-run. The
   migration now closes with one line naming the command.
 
+### Changed
+
+- **`RequesterWoken` is now delivered.** The wake-candidates pass in `koto
+  next` still records `RequesterWoken` with the same fields and the same
+  `(child, epoch)` deduplication, but instead of printing a "not yet wired"
+  line it rings the requester's wake file, through a new `SignalWaker`.
+  `LoggingWaker` is removed.
+
 ### Fixed
+
+- **`koto next --to` no longer walks past a failing `overridable: false`
+  gate (koto#251).** A directed transition skipped gate evaluation entirely,
+  so one `--to` could bypass a gate that `koto overrides record` refuses to
+  force. `--to` now evaluates the non-overridable gates the edge to its target
+  depends on, the way `koto next` would route it, and when their result doesn't
+  satisfy the edge it exits 1 with `gate_blocked`, names the gate, and appends
+  nothing. An edge that routes on the gate failing stays reachable while it
+  fails, and an edge that needs an output the gate isn't producing is refused
+  even while the gate passes. Overridable gates are still skipped, so `--to`
+  remains the recovery path for a stuck session. The rule is in
+  `docs/guides/cli-usage.md`, under "Directed transitions and non-overridable
+  gates".
 
 - **`koto context add` and `koto context remove` refuse a session that has no
   state log, instead of creating a log koto can't read.** Both verbs append an

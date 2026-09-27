@@ -3401,6 +3401,60 @@ fn substitute_gate_fields(
         .collect())
 }
 
+/// What a tick evaluates its gates against, fixed for the whole tick.
+///
+/// Both positions that evaluate gates in `handle_next` -- the advancement
+/// loop's gate closure and the `koto next --to` guard (Issue #251) -- build
+/// one of these and call [`TickGates::evaluate`], so a gate resolves and
+/// evaluates identically on both by construction. The children-complete
+/// evaluator is the one input they don't share: each passes one reading
+/// the event log as it stands at its own position.
+#[cfg(unix)]
+struct TickGates<'a> {
+    runtime_vars: &'a std::collections::HashMap<String, String>,
+    variables: &'a crate::engine::substitute::Variables,
+    overlay: &'a crate::engine::substitute::VariableOverlay,
+    capture_names: &'a std::collections::BTreeMap<String, String>,
+    execution_dir: &'a std::path::Path,
+    context_store: &'a dyn ContextStore,
+    session: &'a str,
+    /// The request store `request-leg` gates read: the `~/.koto` root leg
+    /// promotion writes to. `None` without a home directory, which the gate
+    /// reports as an error rather than a pass.
+    request_root: Option<std::path::PathBuf>,
+}
+
+#[cfg(unix)]
+impl TickGates<'_> {
+    /// Substitute every field of `gates` ([`substitute_gate_fields`]), then
+    /// evaluate them. A reference to an undelivered capture is refused
+    /// before anything runs.
+    fn evaluate(
+        &self,
+        gates: &std::collections::BTreeMap<String, crate::template::types::Gate>,
+        children_eval: &dyn Fn(&crate::template::types::Gate) -> crate::gate::StructuredGateResult,
+    ) -> std::result::Result<
+        std::collections::BTreeMap<String, crate::gate::StructuredGateResult>,
+        crate::engine::substitute::GateCaptureRefusal,
+    > {
+        let substituted = substitute_gate_fields(
+            gates,
+            self.runtime_vars,
+            self.variables,
+            self.overlay,
+            self.capture_names,
+        )?;
+        Ok(crate::gate::evaluate_gates_with_request_store(
+            &substituted,
+            self.execution_dir,
+            Some(self.context_store),
+            Some(self.session),
+            Some(children_eval),
+            self.request_root.as_deref(),
+        ))
+    }
+}
+
 /// Resolve an action's substituted `working_dir` against the session's
 /// execution anchor.
 ///
@@ -3645,8 +3699,8 @@ fn handle_next(
         // events whose corresponding child reached terminal AND has no
         // matching RequesterWoken yet; emits a RequesterWoken event
         // covering each batch, runs the 3-point fsync sequence, invokes
-        // the substrate-wake primitive (stubbed via LoggingWaker until
-        // a concrete substrate ships), and unlinks the child's claim
+        // the substrate-wake primitive (a SignalWaker ringing the
+        // requester's wake file), and unlinks the child's claim
         // sidecar. The pass is O(open-dispatches), not O(workspace).
         //
         // Order: cursor GC → compact-recovery → maybe-compact →
@@ -3662,7 +3716,9 @@ fn handle_next(
             let sessions_dir = koto_root.join("sessions");
             let stale_dispatch_timeout =
                 std::time::Duration::from_secs(request_store_cfg.stale_dispatch_timeout_seconds);
-            let waker = crate::engine::wake::LoggingWaker;
+            let waker = crate::engine::wake::SignalWaker {
+                koto_root: koto_root.clone(),
+            };
             match crate::engine::wake::wake_candidates_pass(
                 &koto_root,
                 &sessions_dir,
@@ -4034,6 +4090,27 @@ fn handle_next(
     let leg_pointer =
         crate::engine::leg_pointer::read_pointer_best_effort(&backend.session_dir(&name));
 
+    // Every `capture_stdout_as` name in the template, mapped to the state that
+    // delivers it. Read once per tick and shared by every position that
+    // refuses an undelivered name: gate evaluation (the `--to` guard and the
+    // advancement loop), the action closure before it hands a command to
+    // `sh -c`, and the final directive substitution after the loop. The
+    // template compiled, so the map is available; an error building it is
+    // unreachable and costs the check nothing.
+    let capture_names = compiled.capture_names().unwrap_or_default();
+
+    // The one gate evaluator this tick uses, wherever it evaluates gates.
+    let tick_gates = TickGates {
+        runtime_vars: &runtime_vars,
+        variables: &variables,
+        overlay: &overlay,
+        capture_names: &capture_names,
+        execution_dir: &execution_dir,
+        context_store,
+        session: &name,
+        request_root: dirs::home_dir().map(|home| home.join(".koto")),
+    };
+
     // 4. Handle --to (directed transition) -- single-shot, no advancement loop
     if let Some(ref target) = to {
         let current_state = &machine_state.current_state;
@@ -4081,6 +4158,85 @@ fn handle_next(
             };
             let json = serde_json::json!({"error": ne});
             exit_with_error_code(json, ne.code.exit_code());
+        }
+
+        // A gate declared `overridable: false` holds against `--to` too
+        // (Issue #251). Only the non-overridable gates the edge to the target
+        // depends on are evaluated -- overridable gates are still skipped, so
+        // `--to` stays the recovery path for a stuck session -- and the
+        // refusal comes before the append, so a refused `--to` leaves the log
+        // untouched. The evaluation is not recorded as `GateEvaluated`: a
+        // passing `--to` appends exactly what it did before this check.
+        let guard_gates =
+            crate::engine::advance::directed_target_guard_gates(current_template_state, target);
+        if !guard_gates.is_empty() {
+            // The children-complete evaluator reads the log as the tick found
+            // it: nothing has been appended yet on this path.
+            let children_eval =
+                |gate: &crate::template::types::Gate| -> crate::gate::StructuredGateResult {
+                    evaluate_children_complete(
+                        backend,
+                        &name,
+                        &events,
+                        &compiled,
+                        current_state,
+                        gate,
+                    )
+                };
+            let results = match tick_gates.evaluate(&guard_gates, &children_eval) {
+                Ok(results) => results,
+                Err(refusal) => {
+                    let err = NextError {
+                        code: NextErrorCode::CaptureUnset,
+                        message: format!(
+                            "cannot take --to '{}': gate '{}' in state '{}' is declared \
+                             overridable: false, and its {} reads {{{{{}}}}}, which state '{}' \
+                             delivers with capture_stdout_as and this run has not produced; \
+                             the gate did not run",
+                            target,
+                            refusal.gate,
+                            current_state,
+                            refusal.field,
+                            refusal.key,
+                            refusal.producer
+                        ),
+                        details: vec![],
+                    };
+                    let json = serde_json::json!({"error": err});
+                    exit_with_error_code(json, err.code.exit_code());
+                }
+            };
+            let blockers = crate::engine::advance::directed_target_blockers(
+                current_template_state,
+                target,
+                &results,
+            );
+            if !blockers.is_empty() {
+                let quoted: Vec<String> = blockers.iter().map(|g| format!("'{}'", g)).collect();
+                let err = NextError {
+                    code: NextErrorCode::GateBlocked,
+                    message: format!(
+                        "cannot take --to '{}': the transition from '{}' depends on {} {} \
+                         declared overridable: false, and the current result does not \
+                         satisfy that transition; nothing was recorded",
+                        target,
+                        current_state,
+                        if blockers.len() == 1 { "gate" } else { "gates" },
+                        quoted.join(", ")
+                    ),
+                    details: blockers
+                        .iter()
+                        .map(|g| ErrorDetail {
+                            field: format!("gates.{}", g),
+                            reason: "the overridable: false gate's current result does not \
+                                     satisfy the transition to the target"
+                                .to_string(),
+                        })
+                        .collect(),
+                };
+                let json = serde_json::json!({"error": err});
+                exit_with_error_code(json, err.code.exit_code());
+            }
         }
 
         // Append directed_transition event.
@@ -4775,36 +4931,14 @@ fn handle_next(
             )
         };
 
-    // Every `capture_stdout_as` name in the template, mapped to the state that
-    // delivers it. Read once per tick and shared by the two positions that
-    // refuse an undelivered name: the action closure below, before it hands a
-    // command to `sh -c`, and the final directive substitution after the loop.
-    // The template compiled, so the map is available; an error building it is
-    // unreachable and costs the check nothing.
-    let capture_names = compiled.capture_names().unwrap_or_default();
-
-    let session_name = &name;
-    // The request store `request-leg` gates read: the same `~/.koto` root the
-    // leg promotion above writes to. `None` without a home directory, which
-    // the gate reports as an error rather than a pass.
-    let request_root = dirs::home_dir().map(|home| home.join(".koto"));
-    let gate_closure =
-        |gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
-            // Substitute runtime, overlay, and template variables in every
-            // substitutable gate field. The overlay matters because this closure
-            // runs once per state the loop reaches, so a later state's gate must
-            // see what an earlier state in the same tick produced.
-            let substituted =
-                substitute_gate_fields(gates, &runtime_vars, &variables, &overlay, &capture_names)?;
-            Ok(evaluate_gates_with_request_store(
-                &substituted,
-                &execution_dir,
-                Some(context_store),
-                Some(session_name),
-                Some(&children_eval),
-                request_root.as_deref(),
-            ))
-        };
+    // Substitute runtime, overlay, and template variables in every
+    // substitutable gate field, then evaluate. The overlay matters because
+    // this closure runs once per state the loop reaches, so a later state's
+    // gate must see what an earlier state in the same tick produced.
+    let gate_closure = |gates: &std::collections::BTreeMap<
+        String,
+        crate::template::types::Gate,
+    >| { tick_gates.evaluate(gates, &children_eval) };
 
     let integration_closure = |_name: &str| -> Result<serde_json::Value, IntegrationError> {
         Err(IntegrationError::Unavailable)
@@ -4954,7 +5088,7 @@ fn handle_next(
                         Some(context_store),
                         Some(&name),
                         None, // children-complete not needed in polling loop
-                        request_root.as_deref(),
+                        tick_gates.request_root.as_deref(),
                     )
                 },
                 &shutdown,

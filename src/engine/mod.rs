@@ -31,3 +31,4 @@ pub mod types;
 pub mod variables;
 #[cfg(unix)]
 pub mod wake;
+pub mod wake_signal;

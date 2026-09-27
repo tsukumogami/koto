@@ -93,7 +93,7 @@ The `details` array is empty when the error isn't field-specific. The thirteen e
 
 | Code | Exit | Meaning |
 |------|:----:|---------|
-| `gate_blocked` | 1 | One or more command gates failed or timed out. Transient -- may resolve on retry. |
+| `gate_blocked` | 1 | One or more command gates failed or timed out, or `koto next --to` was refused because the edge to its target depends on an `overridable: false` gate whose current result doesn't satisfy that edge (the message and `details` name the gate; nothing is appended). Transient -- may resolve on retry. |
 | `integration_unavailable` | 1 | The state declares an integration but no runner is available. Transient. |
 | `concurrent_access` | 1 | Another `koto next` invocation is already running on this workflow. Transient -- wait and retry. |
 | `invalid_submission` | 2 | The `--with-data` payload is malformed, too large, or fails schema validation. Caller must fix the payload. |
@@ -104,7 +104,7 @@ The `details` array is empty when the error isn't field-specific. The thirteen e
 | `persistence_error` | 3 | A disk I/O failure while reading or writing the state file. |
 | `execution_anchor_mismatch` | 2 | The tick ran from a directory that is neither the session's execution anchor nor beneath it. The message names the bound directory. Run `koto next` from there, or rebind the session. |
 | `execution_anchor_unresolvable` | 3 | The session's recorded execution anchor names nothing on this machine -- the checkout was deleted or the session moved machines. Rebind the session to where the tree is now. |
-| `capture_unset` | 3 | A state's instruction text reads a `capture_stdout_as` name that no state delivered on this run. The message names the value and the state that produces it. |
+| `capture_unset` | 3 | A state's instruction text, or a field of one of its gates, reads a `capture_stdout_as` name that no state delivered on this run. That includes a non-overridable gate `koto next --to` evaluates. The message names the value and the state that produces it. |
 | `nested_invocation` | 2 | The tick was started from inside a command koto is running. Take the `koto next` call out of the command. |
 
 Exit code 1 means transient -- the agent can retry without changing its behavior. Exit code 2 means the agent must change something (fix the payload, pick a different target, etc.).
@@ -520,7 +520,7 @@ All batch validation runs pre-append — rejected submissions leave no events on
 
 ## Request errors
 
-Every subcommand under `koto request` — `create`, `bind`, `attach`, `get`, `wait`, `list`, `progress`, `resolve`, `abandon`, `abandon-request`, and `close` — reports failure through one nested envelope, the same shape `koto next`'s domain errors use:
+Every subcommand under `koto request` — `create`, `bind`, `attach`, `get`, `wait`, `watch`, `list`, `progress`, `resolve`, `abandon`, `abandon-request`, and `close` — reports failure through one nested envelope, the same shape `koto next`'s domain errors use:
 
 ```json
 {
@@ -539,12 +539,12 @@ The code set is closed. A consumer that had to match on `message` to tell "this 
 | Code | Exit | Meaning |
 |------|:----:|---------|
 | `wait_timeout` | 1 | `wait` hit its `--timeout-secs` deadline with the predicate still unsatisfied. |
-| `wait_interrupted` | 1 | A signal arrived while `wait` was polling. |
+| `wait_interrupted` | 1 | A signal arrived while `wait` or `watch` was polling. |
 | `lock_contention` | 1 | The per-request write lock wasn't acquired within its five-second deadline. Retryable after backoff. |
 | `request_not_found` | 2 | No request record exists at that identifier. |
 | `leg_not_found` | 2 | The request has no leg by that name. |
 | `invalid_identifier` | 2 | A request id, leg name, session id, or coordinator id failed its grammar. Never worth retrying. |
-| `invalid_submission` | 2 | A flag payload was malformed, or the flag combination was — `--with-data` together with the `--role`/`--template`/`--inputs` triple, a creation payload with no legs, a duplicate leg name, a leg `template` list that is empty, longer than eight, or carries an empty entry, a value that isn't a JSON object. |
+| `invalid_submission` | 2 | A flag payload was malformed, or the flag combination was — `--with-data` together with the `--role`/`--template`/`--inputs` triple, a creation payload with no legs, a duplicate leg name, a leg `template` list that is empty, longer than eight, or carries an empty entry, a value that isn't a JSON object, or an unparseable `watch --since` cursor. |
 | `contract_mismatch` | 2 | `--cli-contract` named a contract this build doesn't serve. Checked before any read or write, so a mismatch has no side effect. |
 | `request_closed` | 2 | A leg mutation, or a second `close`, on a closed request. |
 | `leg_already_resolved` | 2 | A second result, or any mutation, on a leg that already answered. |
@@ -564,7 +564,9 @@ The code set is closed. A consumer that had to match on `message` to tell "this 
 | `epoch_fence_violation` | 2 | The presented `--dispatch-epoch` doesn't match the epoch recorded on the leg's bind event, or was omitted on a leg that is bound. Equality is strict, so a future epoch rejects alongside a stale one. |
 | `predicate_impossible` | 2 | The `wait` predicate could never hold, caught before polling began — asking for five resolved legs on a three-leg request, for instance. |
 | `predicate_became_impossible` | 2 | The predicate stopped being reachable while the wait was running, through abandonment or close. Distinct from a timeout so a caller can tell "not yet" from "never". |
-| `persistence_error` | 3 | The filesystem refused, or the log disagrees with itself. |
+| `persistence_error` | 3 | The filesystem refused, or the log disagrees with itself, or the wake file `watch` reads could not be read. |
+
+`watch` never returns `wait_timeout`: reaching `--timeout-secs` is a success with `woke: false`, exit 0, because the caller ticks either way.
 
 An unsatisfiable predicate is a caller error rather than a transient one on purpose: telling a shell loop to retry forever on a condition that can never become true is worse than failing it.
 

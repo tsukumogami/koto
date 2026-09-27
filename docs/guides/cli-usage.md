@@ -96,9 +96,22 @@ koto next <name> [--with-data <json>] [--to <target>] [--no-cleanup]
 
 **Optional flags:**
 - `--with-data <json>` -- Submit evidence as a JSON object, validated against the state's `accepts` schema. On success, appends an `evidence_submitted` event and sets `advanced: true` in the response.
-- `--to <target>` -- Directed transition to a named state. The target must be a valid transition from the current state. Appends a `directed_transition` event, then dispatches on the new state (skipping gate evaluation).
+- `--to <target>` -- Directed transition to a named state. The target must be a valid transition from the current state. Appends a `directed_transition` event, then dispatches on the new state. Gates are skipped, except a non-overridable gate the edge to the target depends on; see [Directed transitions and non-overridable gates](#directed-transitions-and-non-overridable-gates).
 
 The `--with-data` and `--to` flags are mutually exclusive. Passing both produces a `precondition_failed` error with exit code 2. The `--with-data` payload is capped at 1 MB.
+
+#### Directed transitions and non-overridable gates
+
+`--to` skips a state's gates, so it stays the way out of a stuck state, with one exception: a gate declared `overridable: false` that the edge to the target depends on is evaluated first. If its result doesn't satisfy that edge, `--to` exits 1 with `gate_blocked`, names the gate in the message and in `details`, and appends nothing. A `--to` that proceeds appends exactly the `directed_transition` event it always did.
+
+An edge depends on a gate the way `koto next` would route it:
+
+- An edge whose `when` clause reads `gates.<gate>.*` is checked against the gate's real output. An edge that routes on the gate failing stays open while it fails, and an edge that needs a particular output is refused while the gate produces a different one, even if the gate passed.
+- An unconditional edge needs the gate to pass.
+- In a state that has no `accepts` and doesn't route on gate output, every edge needs the gate to pass.
+- Any other edge, such as an evidence-conditioned edge in a state with `accepts`, doesn't depend on the gate.
+
+When several edges lead to the target, `--to` is refused only if every one is blocked. A gate that reads a `capture_stdout_as` value this run hasn't produced can't be evaluated, so `--to` refuses with `capture_unset`. Overridable gates are never evaluated on this path.
 
 The `--with-data` value can be either inline JSON or a file reference. Prefix a path with `@` to read the payload from disk — useful for batch task lists and any payload large enough to be awkward on the command line:
 
@@ -1068,6 +1081,44 @@ All refusals exit 2. On success the command prints the standard request envelope
 On a self-attached leg, `koto request progress`, `koto request resolve` and `koto request abandon` are refused with `self_attached_leg` whatever `--dispatch-epoch` says: the leg's result arrives only when the session reaches a terminal state, including under `koto next --no-cleanup`, which keeps the session on disk. `koto request abandon-request` and `koto request close` stay available, and abandoning the request is how a newer run releases a session for re-attachment.
 
 A dispatched child (one `koto request bind` accepts) presented to `attach` is bound exactly as `bind` binds it. Any other child session is refused with `child_not_fenceable`.
+
+### Leg wakes and request watch
+
+A session parked on a `request-leg` gate learns that its leg changed when it next ticks. koto tells the harness running that session when to tick. There is one contract: a per-session wake file, which the request store rings and every subscriber reads. `koto request watch` is koto's own reader over that file, with a cursor; a harness may read the file directly instead.
+
+**What rings.** Every write that can change what a `request-leg` gate reads rings a wake: a leg's result (a worker's promoted terminal result, `koto request resolve`, or the refusal `koto init --koto-leg` records), a leg abandonment (`koto request abandon`, or each leg of `koto request abandon-request`), and `koto request close`. Creating a request, binding or attaching a leg, and appending progress do not ring. The wake is written by the process that made the change, after the change is durable and before that command returns, so a worker's terminal `koto next` has rung its coordinator by the time it exits.
+
+**Whom it addresses.** The request's coordinator of record and its requester, once each, or once when they name the same session. A name that is not a valid session identifier is skipped with a warning. A wake is delivered whether or not the session exists yet, so a subscriber that starts before its session is created still sees it. A wake never fails the write that caused it: if the file can't be written, the write succeeds and a warning goes to stderr. The wake-candidates pass in `koto next` rings the same file when it records `RequesterWoken`.
+
+**What it means.** Only "look again". A wake carries no state: the session's next tick reads the leg through its gate as it always does. A lost wake costs latency, and a duplicate costs one tick that finds nothing new.
+
+**The wake file.** `~/.koto/wakes/<session>`. Each wake appends one opaque line; the file is never renamed, so a watcher registered on the path keeps working. Once it reaches 32 KiB, the next wake truncates it in place before appending its line, so it stays small. Any change to the file is a wake. A native file watcher or `tail -F` sees each append; a poller should compare the file's size and modification time together, because comparing size alone can miss a wake that followed a truncation.
+
+**Reading it with `koto request watch`.**
+
+```bash
+koto request watch --session <session-id> --timeout-secs <n> [--since <cursor>]
+```
+
+`watch` reads the wake file above: it blocks until the file changes, or until `--timeout-secs` passes, and exits 0 either way with one JSON line:
+
+```json
+{"session":"coord","woke":true,"cursor":"w1:27:1790000000000000000.4242.0","cli_contract":{"major":1,"minor":2}}
+```
+
+`woke` is `true` on a wake and `false` at the timeout. `cursor` is opaque. Pass it as `--since` to the next `watch`: a wake delivered between the two returns at once instead of being missed. Without `--since`, `watch` starts from the file as it is when it starts. The loop a harness runs is: take a cursor first with `koto request watch --session <id> --timeout-secs 0`, then tick the session; start `watch --since <cursor>` in the background; when it exits, tick the session and start `watch` again with the cursor it printed. Taking the cursor before the tick is what makes a wake that lands between the tick and the watch return at once rather than be missed. A harness that reacts to a background command finishing needs nothing else. Any number of watches may run for one session; each exits on the first wake after its cursor, so several wakes between two watches come back as one `woke: true`.
+
+`--session` and `--timeout-secs` are required: without them the command exits 2 with a usage message on stderr and no JSON. An invalid session is `invalid_identifier` and an unparseable `--since` is `invalid_submission`, both exit 2 before anything is read. A wake file that can't be read is `persistence_error`, exit 3. A signal while polling is `wait_interrupted`, exit 1.
+
+**The bound.** A `watch` that was running before the change exits within 1 second of the command that made the change returning. It polls every 100 ms, which leaves room for a loaded machine. The harness's own reaction time after `watch` exits is outside this bound.
+
+**With no subscriber.** Nothing depends on the wake being read. Where no harness watches the file, wait on a leg with `koto request wait`, which polls the request itself and needs a timeout:
+
+```bash
+koto request wait <request-id> --leg <name> --timeout-secs <n>
+```
+
+**Local only.** The wake file, like the request store, lives on one machine. A leg resolved on one host never wakes a coordinator on another, and request records do not replicate under the cloud backend.
 
 ## Typical agent workflow
 

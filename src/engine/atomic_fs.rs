@@ -1,5 +1,6 @@
 //! Filesystem primitives shared by the two stores that create a file
-//! exactly once.
+//! exactly once, and the private-directory helpers the request store and
+//! the wake signal both use.
 //!
 //! # Why this module is neutral
 //!
@@ -132,6 +133,38 @@ pub fn atomic_create_rename(src: &Path, dst: &Path) -> Result<(), AtomicCreateEr
         return Err(AtomicCreateError::Collision);
     }
     std::fs::rename(src, dst).map_err(AtomicCreateError::Io)
+}
+
+/// Refuse to read or write through a symlink at `path`.
+///
+/// A planted symlink would let a foothold redirect a write into a file the
+/// operator never meant to touch. An absent path is fine: the caller is
+/// about to create it.
+pub fn reject_symlink(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to follow the symlink at {}", path.display()),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Create a directory with mode 0700, rather than relying on the home
+/// directory's mode having been set correctly once. A symlink at `path`
+/// is refused, and an existing directory is left as it is.
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    reject_symlink(path)?;
+    if path.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// Route `EEXIST` to [`AtomicCreateError::Collision`] and everything

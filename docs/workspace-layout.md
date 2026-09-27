@@ -33,6 +33,8 @@ of authority for this document).
 ├── coordinators/                              # derived (request-store cursor state)
 │   └── <coord_id>/
 │       └── scan_cursor.toml
+├── wakes/                                     # derived (per-session wake signal)
+│   └── <session-id>                           # one opaque line per wake
 ├── _decider_ledger.jsonl                      # AUTHORITATIVE state (decider consultations and answers)
 ├── _terminal_index.jsonl                      # derived (request-store skip-list)
 └── _terminal_index.compact.lock               # derived (request-store compaction lease)
@@ -133,6 +135,18 @@ whose sequence gap the reader refuses — the record becomes unreadable
 rather than merely stale. Point `~/.koto/` at local storage.
 
 Both are documented limitations rather than silent gaps.
+
+## Derived state: `~/.koto/wakes/`
+
+One file per session name, rung whenever a leg that session may be
+waiting on changes, and read by `koto request watch` or any file
+watcher. Each wake appends one opaque line; the file is never renamed,
+is truncated in place once it reaches 32 KiB, and carries no state, so
+deleting it loses nothing but a pending wake. A native file watcher
+registered on a deleted file goes quiet, though: re-register it after a
+delete. The directory is 0700
+and each file 0600. See "Leg wakes and request watch" in
+`docs/guides/cli-usage.md`.
 
 ## Authoritative state: `~/.koto/_decider_ledger.jsonl`
 
