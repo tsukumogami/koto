@@ -3698,19 +3698,20 @@ fn version_is_derived_from_git_not_cargo_toml() {
     let version = json["version"].as_str().unwrap();
     let commit = json["commit"].as_str().unwrap();
 
-    // Version must follow one of the git-derived patterns:
+    // Version must follow one of the build.rs patterns:
     // - Release tag: "X.Y.Z" (digits and dots only)
     // - Ahead of tag: "X.Y.Z-dev+<hash>"
-    // - No tags: "dev+<hash>"
+    // - No tag visible: Cargo.toml's version
     let valid = version
         .chars()
         .all(|c| c.is_ascii_digit() || c == '.')                    // exact tag
         || version.contains("-dev+")                                  // ahead of tag
-        || version.starts_with("dev+"); // no tags
+        || version == env!("CARGO_PKG_VERSION"); // no tag visible
     assert!(
         valid,
-        "version '{}' doesn't match any git-derived pattern (X.Y.Z, X.Y.Z-dev+hash, dev+hash)",
-        version
+        "version '{}' doesn't match any build.rs pattern (X.Y.Z, X.Y.Z-dev+hash, {})",
+        version,
+        env!("CARGO_PKG_VERSION")
     );
 
     // The commit field should be a short hex hash (or "unknown" in non-git builds).

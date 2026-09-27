@@ -2,7 +2,9 @@ fn main() {
     // Version from git tags.
     // On an exact tag (v0.2.0): "0.2.0"
     // Ahead of a tag (3 commits after v0.2.0): "0.2.0-dev+abc1234"
-    // No tags at all: "dev+abc1234"
+    // No tag visible: Cargo.toml's version ("0.2.0" at a release tag,
+    // "0.2.1-dev" between releases). A `cargo install --git` checkout and a
+    // packaged crate both land here, since neither carries tags.
     let version = git_version();
     println!("cargo:rustc-env=KOTO_VERSION={}", version);
 
@@ -42,11 +44,17 @@ fn git_version() -> String {
                     return format!("{}-dev+{}", base, hash);
                 }
             }
-            // Fallback: no recognized tag pattern
-            format!("dev+{}", hash)
+            // No recognized tag: `describe --always` fell back to the hash.
+            package_version()
         }
-        None => format!("dev+{}", hash),
+        None => package_version(),
     }
+}
+
+/// The version Cargo.toml declares. The release workflow stamps it at each
+/// tag, so it is right for a tagged tree that git cannot see the tag of.
+fn package_version() -> String {
+    std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string())
 }
 
 /// Run a git command and return trimmed stdout, or None on failure.
