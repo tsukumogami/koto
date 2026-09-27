@@ -62,7 +62,23 @@ R2, R3, R12, R14 and R15 and DESIGN Decision 2.
   tick after a flagged one). The index entry is not re-written there.
 - In `src/cli/batch.rs`, the live-child dereference uses
   `recorded_result_for_current_arrival` instead of the latest
-  `request_store.result`.
+  `request_store.result`, and the parent-copy fallback is skipped for a child
+  known to be live on disk (readable log, non-terminal current state).
+
+**Tests** (`tests/child_retention_test.rs` unless named):
+`a_kept_child_delivers_its_result_to_either_parent_shape`,
+`repeat_ticks_of_a_kept_child_write_nothing`,
+`repeat_ticks_of_a_kept_root_write_nothing`,
+`a_child_parked_without_a_result_delivers_on_its_next_tick`,
+`a_rewound_child_reports_no_stale_result`,
+`zero_one_or_two_parent_notices_give_the_same_gate`,
+`a_failed_parent_notice_keeps_the_child_until_it_is_delivered`,
+`a_kept_child_ticked_without_the_flag_is_removed_after_one_notice`; the
+updated `tests/terminal_result_test.rs`, `tests/request_dispatch.rs`,
+`tests/batch_scheduler_test.rs` and `tests/gate_field_substitution_test.rs`;
+the existing fallback tests in `src/cli/batch.rs`
+(`gate_skips_malformed_child_result_and_falls_back_to_parent_copy`,
+`mid_log_malformed_child_result_still_falls_back_to_parent_copy`) still pass.
 - Update the tests that pinned the fused behaviour
   (`tests/terminal_result_test.rs`, `tests/request_dispatch.rs`) to the new
   contract, stating each change in the commit.
@@ -123,6 +139,18 @@ Covers PRD R1, R4, R5, R6, R7, R8, R10 and R11 and DESIGN Decision 1.
   state (a failure terminal is always kept)".
 - Adjust tests that assumed a failed child is removed without the flag
   (for example `tests/batch_child_cleanup_test.rs`).
+
+**Tests** (`tests/child_retention_test.rs`): one per criterion below, named
+for what it asserts (`a_failure_terminal_keeps_a_root`,
+`a_failure_terminal_keeps_a_child`, `a_directed_failure_terminal_keeps_the_session`,
+`a_retained_failure_stays_on_a_flagless_tick`,
+`the_gate_reads_a_retained_failure_for_either_parent_shape`,
+`retry_failed_reaches_a_retained_child`, `rewind_reaches_a_retained_session`,
+`a_removed_session_is_still_refused`, `a_new_arrival_notifies_once`,
+`a_retried_child_that_succeeds_is_removed`,
+`the_response_states_retention`, `the_help_text_describes_retention`,
+`a_bound_failed_child_resolves_its_leg_once`,
+`init_on_a_retained_root_name_is_refused`).
 
 **Acceptance Criteria**:
 - [ ] A root and a child each driven to a `failure: true` terminal without
@@ -185,7 +213,22 @@ R9 and DESIGN Decision 3.
 - `derive_terminal_status` and `TerminalStatus` become `pub(crate)`;
   `collect_descendants` (prune's walk) gains a visited set.
 - Call the sweep from `finish_terminal_tick` before a parent's removal, and
-  from `init_entry`'s replace path before a finished session is replaced.
+  from `init_entry`'s replace path before a finished session is replaced
+  (after the old session's result is read, before it is removed).
+- Trigger: the session's compiled template declares `materialize_children`,
+  or its own log holds a `ChildCompleted`.
+
+**Tests** (`tests/descendant_sweep_test.rs`, plus a unit test with a
+`list()`-counting backend double in `src/cli/workspace.rs`): one per criterion
+below (`removes_terminal_descendants_with_the_parent`,
+`leaves_live_children_and_their_subtrees`,
+`keeps_a_terminal_child_with_a_live_grandchild`,
+`a_kept_parent_keeps_its_children`, `skips_an_unclassifiable_descendant`,
+`stops_on_a_parent_cycle`, `prune_terminates_on_a_cycle`,
+`a_leaf_tick_does_not_list_sessions`,
+`replace_terminal_removes_retained_children`,
+`prune_and_session_cleanup_reclaim_retained_sessions`,
+`a_retained_child_with_a_lost_notice_is_still_swept`).
 
 **Acceptance Criteria**:
 - [ ] A parent reaching a success terminal without the flag removes its
@@ -202,6 +245,9 @@ R9 and DESIGN Decision 3.
   exits 0; `koto workspace prune --root` on a tree with a cycle terminates.
 - [ ] A leaf session's terminal tick does not list sessions (asserted through
   a test backend that counts `list()` calls, or equivalent).
+- [ ] A batch parent whose retained failed child never got its
+  `ChildCompleted` through still sweeps that child when the parent is
+  removed.
 - [ ] `koto init <name> --attach-live --replace-terminal` on a retained root
   removes its retained terminal children and replaces it.
 - [ ] `koto workspace prune --root <root> --yes` removes a retained root and
@@ -224,7 +270,9 @@ session lifecycle and cleanup are described. Covers PRD R13.
   the `retention` response field, each reclaim path (recovery, parent removal
   or replacement, `koto workspace prune`, `koto session cleanup`), the sweep's
   reach over children kept with the flag, name reuse with a retained session,
-  and superseded-epoch children after a batch rewind.
+  superseded-epoch children after a batch rewind, and that
+  `koto session cleanup` on a retained parent leaves its retained children for
+  `koto workflows --orphaned` and prune.
 - `docs/workspace-layout.md`: retained session directories, the storage cost,
   and what removes them.
 - `plugins/koto-skills/skills/koto-user/SKILL.md`,

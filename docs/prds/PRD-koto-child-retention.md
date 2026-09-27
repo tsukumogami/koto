@@ -142,9 +142,11 @@ terminal to another is therefore a new arrival. Ticking a session that is
 already standing in a terminal state, and whose log already records a result
 for this arrival, adds no result event, no terminal-index entry and no parent
 notice. The one exception is a tick that removes a session after an earlier
-tick kept it: that tick re-sends the parent notice before removing, so a notice
-lost to a failed write is never lost for good; a duplicate is harmless under
-R12. A session parked at a terminal by an earlier koto version, with no
+tick kept it: that tick re-sends the parent notice before removing, so for a
+session koto removes, a notice lost to a failed write is never lost for good; a
+duplicate is harmless under R12. A retained session is never removed by a tick,
+so a lost notice for it stays lost, and R12 is what keeps its parent's gate
+correct. A session parked at a terminal by an earlier koto version, with no
 result recorded for its arrival, gets the R2 writes on its next tick.
 
 **R4. `--no-cleanup` controls retention only.** `koto next --no-cleanup` keeps
@@ -371,7 +373,9 @@ Docs and suite
 - **A flag to withhold a child's result.** No caller needs a child's result
   held back from its parent; the old coupling was the defect.
 - **Changes to shirabe skills**, including dropping `/work-on`'s root-only
-  retention rule. That is the consumer's follow-up.
+  retention rule, and deciding whether `/work-on`'s `validation_exit` or
+  `/execute`'s `ready_awaiting_merge` should be declared failures. Neither is
+  today, so neither is retained. That is the consumer's follow-up.
 - **The request store's wake signal, the `--to` guard for non-overridable
   gates, and the decider ledger**, which other work covers.
 
@@ -385,6 +389,10 @@ Docs and suite
 - A parent that koto removes takes every terminal descendant with it,
   including a child a caller kept with `--no-cleanup`. A caller who wants a
   child's record to outlive its parent keeps the parent too.
+- `koto session cleanup` on a retained parent removes only that session and
+  leaves its retained children naming a parent no session holds; they show in
+  `koto workflows --orphaned` and are removed one at a time with
+  `koto session cleanup`, or by pruning the terminal root above them.
 - `koto workspace prune --root` refuses a root that is still live (without
   `--force`), so retained children under a running root wait for it to finish
   or are removed one at a time with `koto session cleanup`.

@@ -128,11 +128,18 @@ number.
    its own, without an operator naming it, has to fail toward keeping.
 6. **No new failure on the terminal tick** (R15): the response prints first and
    the tick exits 0.
-7. **Stay off the lines other open work changes.** The request store's wake
-   signal, the `--to` guard for non-overridable gates and the decider ledger
-   (the PRD's Out of Scope) don't touch `finish_terminal_tick`, its call sites,
-   the converge or `init_entry`'s replace path; this design must not touch the
-   wake reader.
+7. **Stay off the lines other open work changes, and land after it.**
+   Checked against the open PRs' diffs on 2026-09-27: the request store's wake
+   signal (PR 252) rings its wake from `record_result` in the request store,
+   which `promote_leg_result` calls, and changes nothing inside
+   `finish_terminal_tick`; the `--to` guard (PR 257) edits the `--to` branch of
+   `handle_next` above its terminal call site, which this design edits to
+   attach `retention`; the decider ledger (PR 258) edits a separate part of
+   `handle_next`. None touches the converge or `init_entry`'s replace path.
+   Promotion (step 3) stays outside the arrival gate, so a wake wired into it
+   keeps PR 252's semantics: a re-ticked parked session is a no-op because the
+   leg already holds a result. This work lands after PR 252 and rebases over
+   PR 257's `--to` hunks; it does not touch the wake reader.
 8. **Keep the storage cost small and stated** (R14). Measured on 2026-09-27
    with `du -sk` over every session directory on one developer workstation
    that runs koto-driven skill workflows daily: 160 sessions, median 28 KB,
@@ -265,13 +272,21 @@ requester resumes from its own log, so an early wake costs one extra look. Not
 touching the wake reader keeps this work off the lines other open work is
 changing.
 
-**The converge reads the current arrival only.** In `src/cli/batch.rs` the
-live-child dereference changes from "latest `request_store.result`" to
-`recorded_result_for_current_arrival`. Without this, a child retried out of a
-failure terminal still shows its old failure result while it runs again, and a
-parent tick in that window could pass the gate on it and freeze it into
-`BatchFinalized`. With it, a retried child reports no result until its new
-arrival records one, and the converge treats it as pending.
+**The converge reads the current arrival only.** Two changes in
+`src/cli/batch.rs`. The live-child dereference changes from "latest
+`request_store.result`" to `recorded_result_for_current_arrival`. And the
+fallback to the parent's `ChildCompleted.result` no longer applies to a child
+the converge knows is live on disk: one whose log reads and whose template
+marks its current state non-terminal. A child that is gone from disk, standing
+in a terminal, or unreadable still falls back to the parent's copy, which keeps
+the case where the child-log append failed but the parent copy landed.
+
+Without both, a child retried out of a failure terminal carries its old failure
+result into the gate output while it runs again: the gate can't pass (the child
+is not terminal, so `all_complete` is false), but its entry shows the stale
+result and it drops out of `outstanding`, which a coordinator reading the
+directive would take as the child's answer. With them, a retried child reports
+no result until its new arrival records one.
 
 If the step-2 append fails, `arrival` stays true on the next tick and step 5
 runs again, which can duplicate a `ChildCompleted`. That is harmless: the
@@ -333,10 +348,13 @@ The sweep is a new function, `sweep_terminal_descendants(backend, parent)`,
 called just before step 6 removes a parent and before `init_entry`'s replace
 path removes a finished session. It:
 
-- **runs only when the parent had children.** It first checks the parent's own
-  log for a `ChildCompleted` event, which every child that ever reached a
-  terminal appended. A leaf session, which is most terminal ticks, never lists
-  sessions at all.
+- **runs only for a session that can have children.** It runs when the
+  session's compiled template declares a `materialize_children` hook (how koto
+  already recognises a coordinator) or its own log holds a `ChildCompleted`
+  (a legacy `koto init --parent` child reported to it). The template check
+  comes first and needs no log scan, and it doesn't depend on a notice that a
+  failed write could have lost. A leaf session, which is most terminal ticks,
+  never lists sessions at all.
 - **walks with a visited set and a depth cap**, the same guard
   `measure_depth_from_parent` in `src/engine/caps.rs` uses, so a
   `parent_workflow` cycle (constructible by removing a parent and re-creating
@@ -388,8 +406,13 @@ child's `--no-cleanup` past its parent's removal. Rejected because the session
 doesn't record why it was kept, so this needs a new marker, and the result is
 still an orphan with no tree-level reclaim path.
 
-**Sweep on every removal, without the `ChildCompleted` check.** Simpler
-trigger. Rejected on cost: `backend.list()` reads every session header, and
+**Trigger on a `ChildCompleted` in the parent's log alone.** Cheap, and true
+of any parent whose children reported. Rejected because a retained failure
+child whose parent notice failed to write never re-sends it (it is never
+removed, and its arrival is already recorded), so its parent would finish
+without sweeping it and leave exactly the orphan the sweep exists to prevent.
+
+**Sweep on every removal, with no trigger.** Simpler. Rejected on cost: `backend.list()` reads every session header, and
 the code notes workspaces of around 26,000 sessions; on the cloud backend it is
 an S3 list plus a download per session. Most terminal ticks are leaf children
 that have nothing to sweep.
@@ -438,7 +461,7 @@ result is recorded.
 | Component | Change |
 |-----------|--------|
 | `src/cli/mod.rs`, `finish_terminal_tick` | Reorder around `arrival` and `retain`; hoist the index entry and parent notice out of the guard; re-send the notice on a non-arrival removal; call the sweep before cleanup. |
-| `src/cli/mod.rs`, new `terminal_retention(compiled, final_state, no_cleanup)` | Returns `Option<RetentionReason>`; used by both call sites before printing and passed to `finish_terminal_tick`. |
+| `src/cli/mod.rs`, new `terminal_retention(compiled, final_state, no_cleanup)` | Returns `Option<RetentionReason>`; used by both call sites before printing and passed to `finish_terminal_tick`. It derives the failure case from `project_terminal_outcome(..) == TerminalOutcome::Failure`, the projection `ChildCompleted` already uses, so the notice and the retention rule can't disagree about what a failure terminal is. |
 | `src/cli/mod.rs`, both terminal call sites | Attach `retention` to the response before printing. |
 | `src/cli/mod.rs`, `Next` clap args | `--no-cleanup` help text. |
 | `src/cli/next_types.rs`, `NextResponse::Terminal` | New `retention: Option<Retention>` field, serialized as `retention` when present, set through a `with_retention` builder beside `with_terminal_result`; every construction site gains `retention: None`. |
@@ -465,7 +488,7 @@ koto next <name>            (advance loop or --to)
            append ChildCompleted to parent              -> maybe defer
        if retention is None:
            if no deferral:
-               if own log has ChildCompleted:
+               if template has materialize_children or log has ChildCompleted:
                    sweep terminal descendants (guarded, post-order)
                backend.cleanup(name)
 ```
@@ -508,20 +531,27 @@ finds it and the retry appends `Rewound` to its log.
 
 ### Test surface
 
-The PRD's acceptance criteria are the test list. Beyond new tests for them,
-three existing contracts change and their tests change with them: a parked
-terminal now emits its parent notice once on arrival
-(`tests/terminal_result_test.rs`, `tests/request_dispatch.rs`), a terminal
-without a result map now records its result under `--no-cleanup`
-(`tests/terminal_result_test.rs`), and a failed child is now kept without the
-flag (`tests/batch_child_cleanup_test.rs` and similar).
+The PRD's acceptance criteria are the test list; the PLAN names the test for
+each. New tests live in `tests/child_retention_test.rs` (delivery, retention,
+the response field, retry and rewind) and `tests/descendant_sweep_test.rs` (the
+sweep, including a `list()`-counting backend double for the leaf-tick check).
+Existing contracts change with their tests: a parked terminal emits its parent
+notice once on arrival (`tests/terminal_result_test.rs`,
+`tests/request_dispatch.rs`); a terminal without a result map records its
+result under `--no-cleanup` (`tests/terminal_result_test.rs`); tests that
+faked a retry by deleting a child that had already reported now rewind it
+(`tests/batch_scheduler_test.rs`); tests that relied on a flagged child
+withholding its result to hold a gate open start their children in a terminal
+state instead (`tests/gate_field_substitution_test.rs`); and a failed child is
+kept without the flag (`tests/batch_child_cleanup_test.rs` and similar).
 
 ## Implementation Approach
 
 1. **Delivery on arrival and current-arrival reads.** Rework
    `finish_terminal_tick` around `arrival`: step 2 on every arrival, steps 4
-   and 5 hoisted and gated, the non-arrival re-send. Switch
-   the converge to the current-arrival read. Update the parked-terminal tests.
+   and 5 hoisted and gated, the non-arrival re-send. Switch the converge to the
+   current-arrival read and stop its parent-copy fallback for a known-live
+   child. Update the parked-terminal tests.
    On its own this already fixes a flagged child's delivery.
 2. **Retention rule and response field.** Add `terminal_retention`, the
    `retention` field on both call sites, the retain branch, and the help text.
@@ -605,6 +635,11 @@ survives a replace and would be seen by the new run, as it is today.
   removed, which a caller might not expect.
 - A retained failed root now occupies its name, so re-running `koto init` with
   the same name meets the existing "already exists" refusal more often.
+- `koto session cleanup` on a retained parent removes only that session, so
+  its retained children are left naming a parent no session holds. They are
+  listed by `koto workflows --orphaned` and removable one at a time with
+  `koto session cleanup`, or with the whole tree by
+  `koto workspace prune --root` on the terminal root above them.
 - Children moved aside by a rewind of their batch parent (renamed to
   `<parent>~N.<task>`) point at a parent name that no session holds, so neither
   the sweep nor prune reaches them. That's true today for live and flagged
