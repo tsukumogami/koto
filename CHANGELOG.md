@@ -187,6 +187,22 @@ to `0.9.x`).
 
 ### Fixed
 
+- **The decider ledger records `koto next --to` exits from consulted visits
+  (koto#254).** The ledger paired a consultation only with an `answered`
+  record, which only `--with-data` writes, so a visit the agent left with
+  `--to` was counted as a consultation and then dropped from every paired
+  metric. Those are the visits where the agent most likely overrode the
+  decider. `--to` now appends a `directed_exit` record, naming the state left,
+  its `visit_seq`, and the target, when the visit being left holds a
+  consultation that wasn't applied. It's written after the
+  `directed_transition` event is recorded. `koto decider report` counts
+  directed exits per question and per value, lists them with the disagreeing
+  visits, and adds a promotion condition, `ledger_directed_exits`: a value
+  isn't eligible while any visit where the decider chose it confidently was
+  left with `--to`. Directed exits aren't paired observations, so recall and
+  the confusion matrix don't change. An older koto reading the ledger counts
+  the new lines as an unknown kind and skips them.
+
 - **`koto context add` and `koto context remove` refuse a session that has no
   state log, instead of creating a log koto can't read.** Both verbs append an
   event to the session's log, and neither checked that the log existed. The

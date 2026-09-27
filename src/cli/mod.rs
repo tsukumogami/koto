@@ -4103,6 +4103,24 @@ fn handle_next(
             exit_with_error_code(json, ne.code.exit_code());
         }
 
+        // The decider ledger's `directed_exit` record: the agent left a
+        // visit whose consultation wasn't applied without answering it,
+        // paired with that consultation by `visit_seq` (koto#254). Written
+        // only once the transition is recorded, so a `--to` refused above
+        // leaves no ledger record either. A failed write is one warning.
+        if let Some(record) = crate::cli::decider_port::directed_exit_record(
+            &name,
+            Some(header.session_id.as_str()),
+            &events,
+            current_state,
+            target,
+        ) {
+            crate::decider::ledger::append_or_warn(
+                dirs::home_dir().map(|h| h.join(".koto")).as_deref(),
+                &record,
+            );
+        }
+
         // Dispatch on the new (target) state, skip gate evaluation.
         let target_template_state = compiled.states.get(target).unwrap();
         let gate_results = std::collections::BTreeMap::new();

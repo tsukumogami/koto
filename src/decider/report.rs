@@ -17,6 +17,13 @@
 //! record for the same `(session_id, visit_seq)`. A consultation with a
 //! null `session_id` is counted but never paired.
 //!
+//! A **directed exit** is a `directed_exit` record: the agent left a
+//! consulted visit with `koto next --to` instead of answering (koto#254).
+//! It joins its consultation on the same key but is not a paired
+//! observation, since the agent's value is unknown. It is listed with the
+//! disagreements, and one from a visit where the decider chose a value at
+//! or above threshold makes that value ineligible for promotion.
+//!
 //! The decider's **column** for a field is the declared value it chose at or
 //! above threshold, or `below_threshold`, `escape`, or `no_answer` (the
 //! consultation stopped at `input_unavailable` or `error`).
@@ -36,7 +43,7 @@ use serde_json::Value;
 use crate::template::decider::DeciderMode;
 
 use super::evaluate::{evaluate, EffectiveModes, FieldEvaluation, FieldOutcome};
-use super::ledger::{AnsweredRecord, ConsultedRecord, LedgerRecord};
+use super::ledger::{AnsweredRecord, ConsultedRecord, DirectedExitRecord, LedgerRecord};
 use super::record::{ConsultationOutcome, FieldConsultation};
 use super::request::{build_request, AssembledInputs, DeclaredField, DeclaredKind};
 use super::types::{Decider, DeciderError, ErrorClass, SettingOrigin};
@@ -49,6 +56,8 @@ pub const MIN_CASES_TOTAL: u64 = 40;
 pub const MIN_LEDGER_PAIRS: u64 = 30;
 /// Most ledger disagreements where the decider chose a value.
 pub const MAX_DISAGREEMENTS: u64 = 1;
+/// The `agent` a directed exit is listed with among the disagreements.
+pub const AGENT_DIRECTED_EXIT: &str = "directed_exit";
 /// Consultations in `auto` before a question can be flagged low-coverage.
 pub const LOW_COVERAGE_MIN_CONSULTATIONS: u64 = 30;
 /// Coverage (percent) below which such a question is flagged.
@@ -75,7 +84,8 @@ pub struct LedgerRead {
     /// Lines skipped as malformed: bad JSON, a missing or mistyped key, or
     /// a final line with no newline.
     pub malformed: u64,
-    /// Well-formed lines whose `kind` is neither `consulted` nor `answered`.
+    /// Well-formed lines whose `kind` is not `consulted`, `answered`, or
+    /// `directed_exit`.
     pub unknown_kind: u64,
 }
 
@@ -92,7 +102,7 @@ fn parse_line(bytes: &[u8]) -> Line {
     };
     match value.get("kind").and_then(Value::as_str) {
         None => return Line::Malformed,
-        Some("consulted") | Some("answered") => {}
+        Some("consulted") | Some("answered") | Some("directed_exit") => {}
         Some(_) => return Line::UnknownKind,
     }
     match serde_json::from_value::<LedgerRecord>(value) {
@@ -164,6 +174,10 @@ pub struct Header {
     pub duplicate_consulted: u64,
     /// `answered` lines with no consultation to pair with.
     pub orphaned_answered: u64,
+    /// `directed_exit` lines.
+    pub directed_exits: u64,
+    /// `directed_exit` lines with no consultation to join.
+    pub orphaned_directed_exits: u64,
     /// Consultations whose session had no `session_id`: counted, never
     /// paired.
     pub null_session_id: u64,
@@ -261,18 +275,28 @@ pub struct ValueReport {
     pub disagreements: u64,
     /// The same, counting only consultations that count toward eligibility.
     pub counted_disagreements: u64,
+    /// Directed exits from visits where the decider chose this value at or
+    /// above threshold.
+    pub directed_exits: u64,
+    /// The same, counting only consultations that count toward eligibility.
+    pub counted_directed_exits: u64,
 }
 
 /// A paired visit where the decider's confident value differed from the
-/// agent's.
+/// agent's, or a directed exit from a consulted visit.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Disagreement {
     pub session: String,
     pub session_id: String,
     pub visit_seq: u64,
+    /// The agent's value, or [`AGENT_DIRECTED_EXIT`] for a directed exit.
     pub agent: String,
+    /// The decider's column, whatever it was for a directed exit.
     pub decider: String,
     pub endpoint_origin: SettingOrigin,
+    /// The state a directed exit went to; absent for an answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directed_to: Option<String>,
 }
 
 /// Fallback and error rates, each over all of a question's consultations.
@@ -327,6 +351,11 @@ pub struct QuestionReport {
     pub paired: u64,
     /// Paired observations that count toward eligibility.
     pub counted_paired: u64,
+    /// Directed exits from this question's consulted visits. Not paired
+    /// observations: the agent's value is unknown.
+    pub directed_exits: u64,
+    /// Directed exits that count toward eligibility.
+    pub counted_directed_exits: u64,
     /// Declared values, in the order the ledger's `modes` map lists them.
     pub values: Vec<ValueReport>,
     pub coverage: Coverage,
@@ -422,6 +451,8 @@ struct QuestionAcc {
     auto_covered: u64,
     /// (label, column, counted, disagreement)
     pairs: Vec<(String, String, bool, Option<Disagreement>)>,
+    /// (column, counted, listing entry)
+    directed: Vec<(String, bool, Disagreement)>,
 }
 
 /// Join the ledger into per-question metrics.
@@ -447,6 +478,20 @@ pub fn analyze(read: &LedgerRead, opts: &ReportOptions) -> LedgerReport {
                 }
             }
             answered_keys.push(key);
+        }
+    }
+
+    // Directed exits by visit, in file order.
+    let mut exits: HashMap<VisitKey, Vec<String>> = HashMap::new();
+    let mut exit_keys: Vec<Option<VisitKey>> = Vec::new();
+    for r in &read.records {
+        if let LedgerRecord::DirectedExit(d) = r {
+            header.directed_exits += 1;
+            let key = directed_exit_key(d);
+            if let Some(k) = &key {
+                exits.entry(k.clone()).or_default().push(d.target.clone());
+            }
+            exit_keys.push(key);
         }
     }
 
@@ -478,6 +523,10 @@ pub fn analyze(read: &LedgerRead, opts: &ReportOptions) -> LedgerReport {
         .iter()
         .filter(|k| k.as_ref().is_none_or(|k| !seen.contains(k)))
         .count() as u64;
+    header.orphaned_directed_exits = exit_keys
+        .iter()
+        .filter(|k| k.as_ref().is_none_or(|k| !seen.contains(k)))
+        .count() as u64;
 
     let mut questions: BTreeMap<(String, String, String), QuestionAcc> = BTreeMap::new();
     for c in consulted {
@@ -496,6 +545,11 @@ pub fn analyze(read: &LedgerRead, opts: &ReportOptions) -> LedgerReport {
             .session_id
             .as_ref()
             .and_then(|id| answers.get(&(id.clone(), rec.visit_seq)));
+        let visit_exits = c
+            .envelope
+            .session_id
+            .as_ref()
+            .and_then(|id| exits.get(&(id.clone(), rec.visit_seq)));
         for (field, fc) in &rec.fields {
             let key = (
                 rec.state.clone(),
@@ -542,6 +596,22 @@ pub fn analyze(read: &LedgerRead, opts: &ReportOptions) -> LedgerReport {
                 }
             }
 
+            for target in visit_exits.into_iter().flatten() {
+                q.directed.push((
+                    column.clone(),
+                    counted,
+                    Disagreement {
+                        session: c.envelope.session.clone(),
+                        session_id: c.envelope.session_id.clone().unwrap_or_default(),
+                        visit_seq: rec.visit_seq,
+                        agent: AGENT_DIRECTED_EXIT.to_string(),
+                        decider: column.clone(),
+                        endpoint_origin: rec.endpoint_origin,
+                        directed_to: Some(target.clone()),
+                    },
+                ));
+            }
+
             let Some(agent) = answer.and_then(|a| a.get(field)).map(label_of) else {
                 continue;
             };
@@ -552,6 +622,7 @@ pub fn analyze(read: &LedgerRead, opts: &ReportOptions) -> LedgerReport {
                 agent: agent.clone(),
                 decider: column.clone(),
                 endpoint_origin: rec.endpoint_origin,
+                directed_to: None,
             });
             q.pairs.push((agent, column, counted, disagreement));
         }
@@ -569,6 +640,13 @@ fn answered_key(a: &AnsweredRecord) -> Option<VisitKey> {
         .session_id
         .as_ref()
         .map(|id| (id.clone(), a.visit_seq))
+}
+
+fn directed_exit_key(d: &DirectedExitRecord) -> Option<VisitKey> {
+    d.envelope
+        .session_id
+        .as_ref()
+        .map(|id| (id.clone(), d.visit_seq))
 }
 
 fn finish_question(state: String, field: String, hash: String, q: QuestionAcc) -> QuestionReport {
@@ -591,6 +669,17 @@ fn finish_question(state: String, field: String, hash: String, q: QuestionAcc) -
             disagreements.push(d.clone());
         }
     }
+    let mut counted_directed_exits = 0;
+    let mut exits_all: BTreeMap<String, u64> = BTreeMap::new();
+    let mut exits_counted: BTreeMap<String, u64> = BTreeMap::new();
+    for (column, counted, d) in &q.directed {
+        *exits_all.entry(column.clone()).or_insert(0) += 1;
+        if *counted {
+            counted_directed_exits += 1;
+            *exits_counted.entry(column.clone()).or_insert(0) += 1;
+        }
+        disagreements.push(d.clone());
+    }
 
     let values: Vec<ValueReport> = q
         .values
@@ -610,6 +699,8 @@ fn finish_question(state: String, field: String, hash: String, q: QuestionAcc) -
                 },
                 disagreements: dis_all.get(v).copied().unwrap_or(0),
                 counted_disagreements: dis_counted.get(v).copied().unwrap_or(0),
+                directed_exits: exits_all.get(v).copied().unwrap_or(0),
+                counted_directed_exits: exits_counted.get(v).copied().unwrap_or(0),
             }
         })
         .collect();
@@ -664,6 +755,8 @@ fn finish_question(state: String, field: String, hash: String, q: QuestionAcc) -
         well_formed,
         paired: q.pairs.len() as u64,
         counted_paired,
+        directed_exits: q.directed.len() as u64,
+        counted_directed_exits,
         values,
         coverage: coverage.clone(),
         confusion,
@@ -1043,6 +1136,10 @@ pub fn judge(input: &JudgeInput<'_>, results: Vec<CaseResult>) -> FixtureReport 
                 .ledger
                 .and_then(|q| q.value(v))
                 .map_or(0, |r| r.counted_disagreements);
+            let directed_exits = input
+                .ledger
+                .and_then(|q| q.value(v))
+                .map_or(0, |r| r.counted_directed_exits);
             let mut pairs_detail = format!(
                 "at least {} paired observations under the current declaration hash (has {})",
                 MIN_LEDGER_PAIRS, evidence.counted_paired
@@ -1108,6 +1205,17 @@ pub fn judge(input: &JudgeInput<'_>, results: Vec<CaseResult>) -> FixtureReport 
                     detail: format!(
                         "at most {} ledger disagreement where the decider chose {} (has {})",
                         MAX_DISAGREEMENTS, v, disagreements
+                    ),
+                },
+                Condition {
+                    name: "ledger_directed_exits".to_string(),
+                    // None allowed: a confident decision the agent walked away
+                    // from is the strongest evidence against automating it.
+                    met: directed_exits == 0,
+                    detail: format!(
+                        "no ledger visit where the decider chose {} was left with koto next --to \
+                         instead of answered (has {})",
+                        v, directed_exits
                     ),
                 },
                 Condition {
@@ -1233,6 +1341,11 @@ pub fn render_table(report: &Report) -> String {
     );
     let _ = writeln!(
         out,
+        "  {} directed exits ({} orphaned)",
+        h.directed_exits, h.orphaned_directed_exits
+    );
+    let _ = writeln!(
+        out,
         "  {} consultations from a custom endpoint; {} excluded from eligibility",
         h.custom_endpoint_consultations, h.excluded_from_eligibility
     );
@@ -1245,14 +1358,16 @@ pub fn render_table(report: &Report) -> String {
         let _ = writeln!(
             out,
             "  consultations {} (applied {}, not_applied {}, input_unavailable {}, error {}); \
-             paired {} ({} counted toward eligibility)",
+             paired {} ({} counted toward eligibility); directed exits {} ({} counted)",
             q.consultations,
             q.outcomes.applied,
             q.outcomes.not_applied,
             q.outcomes.input_unavailable,
             q.outcomes.error,
             q.paired,
-            q.counted_paired
+            q.counted_paired,
+            q.directed_exits,
+            q.counted_directed_exits
         );
         let _ = writeln!(
             out,
@@ -1297,20 +1412,28 @@ pub fn render_table(report: &Report) -> String {
         }
         let _ = writeln!(
             out,
-            "  {:<16} {:>7} {:>7} {:>8} {:>10} {:>14} {:>14}",
-            "value", "mode", "paired", "recall", "coverage", "coverage(all)", "disagreements"
+            "  {:<16} {:>7} {:>7} {:>8} {:>10} {:>14} {:>14} {:>15}",
+            "value",
+            "mode",
+            "paired",
+            "recall",
+            "coverage",
+            "coverage(all)",
+            "disagreements",
+            "directed_exits"
         );
         for v in &q.values {
             let _ = writeln!(
                 out,
-                "  {:<16} {:>7} {:>7} {:>8} {:>10} {:>14} {:>14}",
+                "  {:<16} {:>7} {:>7} {:>8} {:>10} {:>14} {:>14} {:>15}",
                 v.value,
                 v.mode.map_or("-", |m| m.as_str()),
                 v.paired,
                 pct(v.recall),
                 pct(v.coverage.well_formed),
                 pct(v.coverage.all),
-                v.disagreements
+                v.disagreements,
+                v.directed_exits
             );
         }
         let _ = writeln!(out, "  confusion (rows: agent, columns: decider)");
@@ -1318,10 +1441,14 @@ pub fn render_table(report: &Report) -> String {
         if !q.disagreements.is_empty() {
             let _ = writeln!(out, "  disagreements");
             for d in &q.disagreements {
+                let agent = match &d.directed_to {
+                    Some(target) => format!("left with --to {}", target),
+                    None => d.agent.clone(),
+                };
                 let _ = writeln!(
                     out,
                     "    {}/{} ({}): agent {}, decider {}",
-                    d.session_id, d.visit_seq, d.session, d.agent, d.decider
+                    d.session_id, d.visit_seq, d.session, agent, d.decider
                 );
             }
         }

@@ -153,11 +153,14 @@ Each line is a JSON object tagged by `kind`:
 - `answered`: written when the agent submits evidence on a visit whose
   consultation wasn't applied. It carries the submitted values of the
   declared fields only.
+- `directed_exit`: written when the agent leaves such a visit with
+  `koto next --to` instead of answering. It carries the state left,
+  `visit_seq`, and the `target` state.
 
-Both kinds also carry `v` (always 1), `at` (RFC 3339 UTC), `session`
+Every kind also carries `v` (always 1), `at` (RFC 3339 UTC), `session`
 (the session name), and `session_id` (the session header's UUID, or
-`null` for a header without one). A consultation and its answer pair
-on `session_id` plus `visit_seq`; session names are reused across
+`null` for a header without one). A consultation and its answer (or
+directed exit) pair on `session_id` plus `visit_seq`; session names are reused across
 runs, so the name is never the join key. No line carries input
 content, the API key, a response body, or error text.
 

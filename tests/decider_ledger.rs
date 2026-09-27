@@ -255,6 +255,91 @@ fn two_submissions_in_one_visit_each_write_an_answered_record() {
     assert_eq!(a[1]["values"]["verdict"], "exit");
 }
 
+// ---------------------------------------------------------------------------
+// Directed exits (koto#254)
+// ---------------------------------------------------------------------------
+
+/// `koto next wf --to <target>`, with no decider environment at all: the
+/// record doesn't depend on the decider still being on.
+fn directed(h: &Harness, target: &str) -> Output {
+    let mut cmd = h.koto();
+    cmd.args(["next", WF, "--to", target, "--no-cleanup"]);
+    cmd.output().unwrap()
+}
+
+#[test]
+fn a_directed_exit_from_a_consulted_visit_is_recorded_against_its_visit_seq() {
+    let h = ready(&standard("shadow", "shadow"), vec![go()]);
+    ok(&h.next_mode("shadow"));
+    ok(&directed(&h, "rethink"));
+
+    let lines = ledger(&h);
+    let consulted = of_kind(&lines, "consulted");
+    let exits = of_kind(&lines, "directed_exit");
+    assert_eq!(consulted.len(), 1, "{:?}", lines);
+    assert_eq!(exits.len(), 1, "{:?}", lines);
+    assert!(of_kind(&lines, "answered").is_empty(), "{:?}", lines);
+    let (c, d) = (&consulted[0], &exits[0]);
+    let sid = header(&h)["session_id"].as_str().unwrap().to_string();
+    assert_eq!(d["session_id"], sid.as_str());
+    assert_eq!(d["session"], WF);
+    assert_eq!(d["v"], 1);
+    assert!(d["at"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(d["state"], "review");
+    assert_eq!(d["visit_seq"], c["visit_seq"]);
+    assert_eq!(d["target"], "rethink");
+    // Names and a number only.
+    let mut keys: Vec<&str> = d.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "at",
+            "kind",
+            "session",
+            "session_id",
+            "state",
+            "target",
+            "v",
+            "visit_seq"
+        ]
+    );
+
+    // The session log is what it always was: one directed_transition.
+    assert_eq!(h.events_of("directed_transition").len(), 1);
+}
+
+#[test]
+fn a_directed_exit_with_no_consultation_writes_nothing() {
+    // Not opted in: no consultation, so nothing to pair with.
+    let h = ready(&standard("shadow", "shadow"), vec![]);
+    ok(&h.next_mode("off"));
+    ok(&directed(&h, "rethink"));
+    assert!(!ledger_file(&h).exists());
+
+    // A consultation on `review` doesn't reach an exit from a later state.
+    let h = ready(&standard("shadow", "shadow"), vec![go()]);
+    ok(&h.next_mode("shadow"));
+    ok(&h.next_with("shadow", r#"{"verdict": "exit"}"#));
+    ok(&directed(&h, "review"));
+    let lines = ledger(&h);
+    assert!(of_kind(&lines, "directed_exit").is_empty(), "{:?}", lines);
+    assert_eq!(of_kind(&lines, "consulted").len(), 1);
+    assert_eq!(of_kind(&lines, "answered").len(), 1);
+}
+
+#[test]
+fn an_answer_with_data_writes_no_directed_exit() {
+    let h = ready(&standard("shadow", "shadow"), vec![go()]);
+    ok(&h.next_mode("shadow"));
+    ok(&h.next_with("shadow", r#"{"verdict": "exit"}"#));
+    let lines = ledger(&h);
+    assert_eq!(of_kind(&lines, "consulted").len(), 1, "{:?}", lines);
+    assert_eq!(of_kind(&lines, "answered").len(), 1, "{:?}", lines);
+    assert!(of_kind(&lines, "directed_exit").is_empty(), "{:?}", lines);
+    assert_eq!(lines.len(), 2, "{:?}", lines);
+}
+
 #[test]
 fn the_answer_is_recorded_after_the_decider_is_switched_off() {
     let h = ready(&standard("shadow", "shadow"), vec![go()]);

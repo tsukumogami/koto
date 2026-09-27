@@ -323,6 +323,34 @@ pub fn answered_record(
     ))
 }
 
+/// The ledger's `directed_exit` record for a `koto next --to` that just left
+/// `state` for `target`, or `None` when there's nothing to pair it with.
+///
+/// `events` is the log before the `directed_transition` was appended. A
+/// record is due when the visit being left holds a `decider_consulted`
+/// event whose outcome isn't `applied` -- the same visits an `answered`
+/// record would pair with. Like [`answered_record`], nothing here reads the
+/// decider settings.
+pub fn directed_exit_record(
+    session: &str,
+    session_id: Option<&str>,
+    events: &[Event],
+    state: &str,
+    target: &str,
+) -> Option<LedgerRecord> {
+    let consultation = prior_consultation(events, state)?;
+    if consultation.outcome == ConsultationOutcome::Applied {
+        return None;
+    }
+    Some(LedgerRecord::directed_exit(
+        session,
+        session_id,
+        state,
+        consultation.visit_seq,
+        target,
+    ))
+}
+
 impl DeciderPort for CliDeciderPort<'_> {
     fn policy(&self) -> &DeciderPolicy {
         &self.policy
