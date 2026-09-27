@@ -999,18 +999,7 @@ where
             // decide whether to block immediately (when gates fail) and to guard
             // evidence injection — legacy states (no gates.* references) must not
             // have gate output merged into the resolver evidence map.
-            has_gates_routing = template_state.transitions.iter().any(|t| {
-                t.when
-                    .as_ref()
-                    .map(|w| {
-                        w.keys()
-                            .any(|k| k.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)))
-                    })
-                    .unwrap_or(false)
-            }) || template_state.skip_if.as_ref().is_some_and(|s| {
-                s.keys()
-                    .any(|k| k.starts_with(&format!("{}.", GATES_EVIDENCE_NAMESPACE)))
-            });
+            has_gates_routing = state_routes_on_gates(template_state);
 
             if any_failed {
                 // If the state has an accepts block, fall through so the
@@ -1481,6 +1470,152 @@ fn resolve_transition_edge(
             }
         }
     }
+}
+
+/// Whether a state routes on gate output: some transition's `when` clause, or
+/// its `skip_if`, reads a `gates.*` key.
+///
+/// A state that does not is a legacy state, where gates only pass or block.
+pub(crate) fn state_routes_on_gates(template_state: &TemplateState) -> bool {
+    let prefix = format!("{}.", GATES_EVIDENCE_NAMESPACE);
+    template_state.transitions.iter().any(|t| {
+        t.when
+            .as_ref()
+            .is_some_and(|w| w.keys().any(|k| k.starts_with(&prefix)))
+    }) || template_state
+        .skip_if
+        .as_ref()
+        .is_some_and(|s| s.keys().any(|k| k.starts_with(&prefix)))
+}
+
+/// How the edge at `index` depends on the gate `gate`, in the terms the
+/// advance loop applies.
+enum EdgeGateDependence {
+    /// The edge does not depend on the gate.
+    None,
+    /// The edge fires only when the gate's outcome is `passed`.
+    Outcome,
+    /// The edge's `when` clause reads `gates.<gate>.*`; it fires only when
+    /// those entries match the gate's real output.
+    Output,
+}
+
+fn edge_gate_dependence(
+    template_state: &TemplateState,
+    index: usize,
+    gate: &str,
+) -> EdgeGateDependence {
+    let transition = &template_state.transitions[index];
+    let Some(when) = &transition.when else {
+        // The loop never fires an unconditional fallback past a failing gate.
+        return EdgeGateDependence::Outcome;
+    };
+    let prefix = format!("{}.{}.", GATES_EVIDENCE_NAMESPACE, gate);
+    if when.keys().any(|k| k.starts_with(&prefix)) {
+        return EdgeGateDependence::Output;
+    }
+    if template_state.accepts.is_none() && !state_routes_on_gates(template_state) {
+        // A legacy state with nothing to accept blocks on any failing gate
+        // before transitions are looked at.
+        return EdgeGateDependence::Outcome;
+    }
+    EdgeGateDependence::None
+}
+
+/// The `overridable: false` gates a directed transition (`koto next --to`)
+/// from `template_state` to `target` must evaluate before it proceeds.
+///
+/// A gate is included when at least one edge to `target` depends on it the way
+/// the advance loop would: the edge's `when` clause reads `gates.<name>.*`, the
+/// edge is unconditional, or the state is a legacy state with no `accepts`, where
+/// a failing gate blocks every edge. Overridable gates are never included, so
+/// `--to` still skips them. Empty for a state with no such gate, which is every
+/// state that does not declare `overridable: false` (Issue #251).
+pub(crate) fn directed_target_guard_gates(
+    template_state: &TemplateState,
+    target: &str,
+) -> BTreeMap<String, crate::template::types::Gate> {
+    let mut guards = BTreeMap::new();
+    for (index, transition) in template_state.transitions.iter().enumerate() {
+        if transition.target != target {
+            continue;
+        }
+        for (name, gate) in &template_state.gates {
+            if gate.overridable {
+                continue;
+            }
+            if !matches!(
+                edge_gate_dependence(template_state, index, name),
+                EdgeGateDependence::None
+            ) {
+                guards.insert(name.clone(), gate.clone());
+            }
+        }
+    }
+    guards
+}
+
+/// The gates that refuse a directed transition to `target`, given the real
+/// results of the gates [`directed_target_guard_gates`] returned.
+///
+/// An edge is blocked by a guard gate whose condition on it does not hold: the
+/// outcome is not `passed` for an edge that needs the gate to pass, or the
+/// `gates.<name>.*` entries of its `when` clause do not match the gate's
+/// output. The second is what keeps an edge that routes on a gate *failing*
+/// (`gates.ci.exit_code: 1`) open while the gate fails. `--to` is refused only
+/// when every edge to `target` is blocked, and the result names each gate
+/// blocking one; an empty result means proceed. A guard gate missing from
+/// `results` counts as blocking.
+pub(crate) fn directed_target_blockers(
+    template_state: &TemplateState,
+    target: &str,
+    results: &BTreeMap<String, StructuredGateResult>,
+) -> Vec<String> {
+    let mut blockers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (index, transition) in template_state.transitions.iter().enumerate() {
+        if transition.target != target {
+            continue;
+        }
+        let mut edge_blockers = Vec::new();
+        for (name, gate) in &template_state.gates {
+            if gate.overridable {
+                continue;
+            }
+            let dependence = edge_gate_dependence(template_state, index, name);
+            let holds = match (&dependence, results.get(name)) {
+                (EdgeGateDependence::None, _) => true,
+                (_, None) => false,
+                (EdgeGateDependence::Outcome, Some(result)) => {
+                    matches!(result.outcome, GateOutcome::Passed)
+                }
+                (EdgeGateDependence::Output, Some(result)) => {
+                    let prefix = format!("{}.{}.", GATES_EVIDENCE_NAMESPACE, name);
+                    let mut gates = serde_json::Map::new();
+                    gates.insert(name.clone(), result.output.clone());
+                    let mut evidence = serde_json::Map::new();
+                    evidence.insert(
+                        GATES_EVIDENCE_NAMESPACE.to_string(),
+                        serde_json::Value::Object(gates),
+                    );
+                    let evidence = serde_json::Value::Object(evidence);
+                    transition
+                        .when
+                        .iter()
+                        .flatten()
+                        .filter(|(key, _)| key.starts_with(&prefix))
+                        .all(|(key, expected)| resolve_value(&evidence, key) == Some(expected))
+                }
+            };
+            if !holds {
+                edge_blockers.push(name.clone());
+            }
+        }
+        if edge_blockers.is_empty() {
+            return Vec::new();
+        }
+        blockers.extend(edge_blockers);
+    }
+    blockers.into_iter().collect()
 }
 
 /// Resolve the `context_assignments` of the edge at `edge`, if any.
@@ -4887,6 +5022,142 @@ mod tests {
             evaluated_lint,
             "GateEvaluated must be emitted for non-overridden gate 'lint'"
         );
+    }
+
+    // Issue #251: which gates a `koto next --to` must evaluate, and which of
+    // them refuse it. The rules mirror the advance loop's, so each test pairs
+    // an edge shape with the loop behaviour it copies.
+
+    fn locked_gate() -> crate::template::types::Gate {
+        let mut gate = make_gate_def("command");
+        gate.overridable = false;
+        gate
+    }
+
+    fn gate_result(passed: bool, exit_code: i64) -> StructuredGateResult {
+        StructuredGateResult {
+            outcome: if passed {
+                GateOutcome::Passed
+            } else {
+                GateOutcome::Failed
+            },
+            output: serde_json::json!({"exit_code": exit_code, "error": ""}),
+        }
+    }
+
+    fn results(entries: &[(&str, StructuredGateResult)]) -> BTreeMap<String, StructuredGateResult> {
+        entries
+            .iter()
+            .map(|(name, result)| (name.to_string(), result.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn directed_guard_ignores_overridable_gates() {
+        let mut state = make_state(vec![unconditional("done")]);
+        state.gates.insert("open".into(), make_gate_def("command"));
+        assert!(directed_target_guard_gates(&state, "done").is_empty());
+        assert!(directed_target_blockers(&state, "done", &results(&[])).is_empty());
+    }
+
+    #[test]
+    fn directed_guard_unconditional_edge_blocked_by_failing_gate() {
+        let mut state = make_state(vec![unconditional("done")]);
+        state.gates.insert("locked".into(), locked_gate());
+        state.gates.insert("open".into(), make_gate_def("command"));
+        let guards = directed_target_guard_gates(&state, "done");
+        assert_eq!(guards.keys().collect::<Vec<_>>(), vec!["locked"]);
+        assert_eq!(
+            directed_target_blockers(
+                &state,
+                "done",
+                &results(&[("locked", gate_result(false, 1))])
+            ),
+            vec!["locked".to_string()]
+        );
+        assert!(directed_target_blockers(
+            &state,
+            "done",
+            &results(&[("locked", gate_result(true, 0))])
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn directed_guard_routes_on_output_so_failure_edge_stays_open() {
+        let mut state = make_state(vec![
+            conditional("merge", vec![("gates.ci.exit_code", serde_json::json!(0))]),
+            conditional("fix", vec![("gates.ci.exit_code", serde_json::json!(1))]),
+        ]);
+        state.gates.insert("ci".into(), locked_gate());
+        let failing = results(&[("ci", gate_result(false, 1))]);
+        assert_eq!(
+            directed_target_blockers(&state, "merge", &failing),
+            vec!["ci".to_string()]
+        );
+        assert!(
+            directed_target_blockers(&state, "fix", &failing).is_empty(),
+            "an edge routing on the gate failing must stay open while it fails"
+        );
+        let passing = results(&[("ci", gate_result(true, 0))]);
+        assert!(directed_target_blockers(&state, "merge", &passing).is_empty());
+        assert_eq!(
+            directed_target_blockers(&state, "fix", &passing),
+            vec!["ci".to_string()]
+        );
+    }
+
+    #[test]
+    fn directed_guard_evidence_edge_with_accepts_is_not_gated() {
+        // Legacy state with accepts: the loop falls through a failing gate and
+        // lets an evidence-conditioned edge fire, so `--to` may too.
+        let mut state = make_state(vec![
+            conditional("retry", vec![("decision", serde_json::json!("retry"))]),
+            unconditional("done"),
+        ]);
+        state.accepts = make_accepts(vec!["decision"]);
+        state.gates.insert("locked".into(), locked_gate());
+        let failing = results(&[("locked", gate_result(false, 1))]);
+        assert!(!directed_target_guard_gates(&state, "done").is_empty());
+        assert!(directed_target_guard_gates(&state, "retry").is_empty());
+        assert!(directed_target_blockers(&state, "retry", &failing).is_empty());
+        assert_eq!(
+            directed_target_blockers(&state, "done", &failing),
+            vec!["locked".to_string()]
+        );
+    }
+
+    #[test]
+    fn directed_guard_legacy_state_without_accepts_blocks_every_edge() {
+        let mut state = make_state(vec![conditional(
+            "done",
+            vec![("vars.MODE", serde_json::json!("x"))],
+        )]);
+        state.gates.insert("locked".into(), locked_gate());
+        assert_eq!(
+            directed_target_blockers(
+                &state,
+                "done",
+                &results(&[("locked", gate_result(false, 1))])
+            ),
+            vec!["locked".to_string()]
+        );
+    }
+
+    #[test]
+    fn directed_guard_refuses_only_when_every_edge_to_target_is_blocked() {
+        let mut state = make_state(vec![
+            conditional("done", vec![("gates.ci.exit_code", serde_json::json!(0))]),
+            conditional("done", vec![("decision", serde_json::json!("skip"))]),
+        ]);
+        state.accepts = make_accepts(vec!["decision"]);
+        state.gates.insert("ci".into(), locked_gate());
+        assert!(directed_target_blockers(
+            &state,
+            "done",
+            &results(&[("ci", gate_result(false, 1))])
+        )
+        .is_empty());
     }
 
     // A gate declared `overridable: false` ignores an override record already

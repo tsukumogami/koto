@@ -96,7 +96,7 @@ koto next <name> [--with-data <json>] [--to <target>] [--no-cleanup]
 
 **Optional flags:**
 - `--with-data <json>` -- Submit evidence as a JSON object, validated against the state's `accepts` schema. On success, appends an `evidence_submitted` event and sets `advanced: true` in the response.
-- `--to <target>` -- Directed transition to a named state. The target must be a valid transition from the current state. Appends a `directed_transition` event, then dispatches on the new state (skipping gate evaluation).
+- `--to <target>` -- Directed transition to a named state. The target must be a valid transition from the current state. Appends a `directed_transition` event, then dispatches on the new state. Gates are skipped, with one exception: a gate declared `overridable: false` that the edge to the target depends on is evaluated first, and if it doesn't pass, `--to` exits 1 with `gate_blocked`, names the gate, and appends nothing. The edge depends on the gate when its `when` clause reads `gates.<gate>.*` (the transition is refused when those entries don't match the gate's real output, so an edge that routes on the gate failing stays open while it fails), when the edge is unconditional, or when the state has no `accepts` and doesn't route on gate output. Overridable gates are still skipped, so `--to` remains the way out of a stuck state.
 
 The `--with-data` and `--to` flags are mutually exclusive. Passing both produces a `precondition_failed` error with exit code 2. The `--with-data` payload is capped at 1 MB.
 

@@ -4083,6 +4083,99 @@ fn handle_next(
             exit_with_error_code(json, ne.code.exit_code());
         }
 
+        // A gate declared `overridable: false` holds against `--to` too
+        // (Issue #251). Only the non-overridable gates the edge to the target
+        // depends on are evaluated -- overridable gates are still skipped, so
+        // `--to` stays the recovery path for a stuck session -- and the
+        // refusal comes before the append, so a refused `--to` leaves the log
+        // untouched. The evaluation is not recorded as `GateEvaluated`: a
+        // passing `--to` appends exactly what it did before this check.
+        let guard_gates =
+            crate::engine::advance::directed_target_guard_gates(current_template_state, target);
+        if !guard_gates.is_empty() {
+            // Same substitution and evaluator as the advancement loop's gate
+            // closure, so a gate resolves and evaluates identically on both
+            // paths.
+            let capture_names = compiled.capture_names().unwrap_or_default();
+            let substituted = match substitute_gate_fields(
+                &guard_gates,
+                &runtime_vars,
+                &variables,
+                &overlay,
+                &capture_names,
+            ) {
+                Ok(gates) => gates,
+                Err(refusal) => {
+                    let err = NextError {
+                        code: NextErrorCode::CaptureUnset,
+                        message: format!(
+                            "cannot take --to '{}': gate '{}' in state '{}' is declared \
+                             overridable: false, and its {} reads {{{{{}}}}}, which state '{}' \
+                             delivers with capture_stdout_as and this run has not produced; \
+                             the gate did not run",
+                            target,
+                            refusal.gate,
+                            current_state,
+                            refusal.field,
+                            refusal.key,
+                            refusal.producer
+                        ),
+                        details: vec![],
+                    };
+                    let json = serde_json::json!({"error": err});
+                    exit_with_error_code(json, err.code.exit_code());
+                }
+            };
+            let children_eval =
+                |gate: &crate::template::types::Gate| -> crate::gate::StructuredGateResult {
+                    evaluate_children_complete(
+                        backend,
+                        &name,
+                        &events,
+                        &compiled,
+                        current_state,
+                        gate,
+                    )
+                };
+            let request_root = dirs::home_dir().map(|home| home.join(".koto"));
+            let results = evaluate_gates_with_request_store(
+                &substituted,
+                &execution_dir,
+                Some(context_store),
+                Some(&name),
+                Some(&children_eval),
+                request_root.as_deref(),
+            );
+            let blockers = crate::engine::advance::directed_target_blockers(
+                current_template_state,
+                target,
+                &results,
+            );
+            if !blockers.is_empty() {
+                let quoted: Vec<String> = blockers.iter().map(|g| format!("'{}'", g)).collect();
+                let err = NextError {
+                    code: NextErrorCode::GateBlocked,
+                    message: format!(
+                        "cannot take --to '{}': the transition from '{}' depends on gate {} \
+                         declared overridable: false, which does not currently pass; \
+                         nothing was recorded",
+                        target,
+                        current_state,
+                        quoted.join(", ")
+                    ),
+                    details: blockers
+                        .iter()
+                        .map(|g| ErrorDetail {
+                            field: format!("gates.{}", g),
+                            reason: "overridable: false gate does not pass".to_string(),
+                        })
+                        .collect(),
+                };
+                let json = serde_json::json!({"error": err});
+                exit_with_error_code(json, err.code.exit_code());
+            }
+        }
+
         // Append directed_transition event.
         let payload = EventPayload::DirectedTransition {
             from: current_state.clone(),

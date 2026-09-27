@@ -93,7 +93,7 @@ The `details` array is empty when the error isn't field-specific. The thirteen e
 
 | Code | Exit | Meaning |
 |------|:----:|---------|
-| `gate_blocked` | 1 | One or more command gates failed or timed out. Transient -- may resolve on retry. |
+| `gate_blocked` | 1 | One or more command gates failed or timed out, or `koto next --to` was refused because the edge to its target depends on an `overridable: false` gate that doesn't pass (the message and `details` name the gate; nothing is appended). Transient -- may resolve on retry. |
 | `integration_unavailable` | 1 | The state declares an integration but no runner is available. Transient. |
 | `concurrent_access` | 1 | Another `koto next` invocation is already running on this workflow. Transient -- wait and retry. |
 | `invalid_submission` | 2 | The `--with-data` payload is malformed, too large, or fails schema validation. Caller must fix the payload. |

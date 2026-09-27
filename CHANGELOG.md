@@ -187,6 +187,19 @@ to `0.9.x`).
 
 ### Fixed
 
+- **`koto next --to` no longer walks past a failing `overridable: false`
+  gate (koto#251).** A directed transition skipped gate evaluation entirely,
+  so one `--to` could bypass a gate that `koto overrides record` refuses to
+  force. `--to` now evaluates the non-overridable gates the edge to its target
+  depends on, in the terms the advance loop uses: a `when` clause reading
+  `gates.<gate>.*` must match the gate's real output, and an unconditional edge,
+  or any edge of a state with no `accepts` that doesn't route on gates, needs
+  the gate to pass. If every edge to the target is blocked, `--to` exits 1 with
+  `gate_blocked`, names the gate, and appends nothing. An edge that routes on
+  the gate failing stays reachable while it fails, overridable gates are still
+  skipped, and a `--to` that passes appends exactly what it did before, so
+  `--to` remains the recovery path for a stuck session.
+
 - **`koto context add` and `koto context remove` refuse a session that has no
   state log, instead of creating a log koto can't read.** Both verbs append an
   event to the session's log, and neither checked that the log existed. The

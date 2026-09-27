@@ -6,8 +6,9 @@
 //! The compile-side checks (unknown keys, non-boolean values, a pointless
 //! `override_default`) live in `src/template/compile.rs`; the evaluation-time
 //! defense lives in `src/engine/advance.rs`. This file covers the CLI surface
-//! end to end, plus a snapshot proving templates that don't use the field
-//! compile byte-identical to before it existed.
+//! end to end, including `koto next --to` refusing to walk past a failing
+//! non-overridable gate (Issue #251), plus a snapshot proving templates that
+//! don't use the field compile byte-identical to before it existed.
 
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
@@ -327,4 +328,207 @@ fn templates_without_overridable_compile_byte_identical() {
             name
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// `koto next --to` past a non-overridable gate (Issue #251)
+// ---------------------------------------------------------------------------
+
+/// `locked` passes once a file named `ready` exists in the working directory;
+/// `open` always fails but is overridable, so `--to` keeps skipping it.
+const LOCKED_BY_FILE: &str = r#"---
+name: directed-locked
+version: "1.0"
+initial_state: check
+states:
+  check:
+    gates:
+      locked:
+        type: command
+        command: "test -f ready"
+        overridable: false
+      open:
+        type: command
+        command: "exit 1"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## check
+
+The gate must pass.
+
+## done
+
+Done.
+"#;
+
+/// Only an overridable gate: `--to` skips it exactly as before.
+const OVERRIDABLE_ONLY: &str = r#"---
+name: directed-open
+version: "1.0"
+initial_state: check
+states:
+  check:
+    gates:
+      open:
+        type: command
+        command: "exit 1"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## check
+
+The gate must pass.
+
+## done
+
+Done.
+"#;
+
+/// Routes on the gate's output: `merge` needs it to pass, `fix` is where a
+/// failing run is meant to go.
+const ROUTE_ON_FAILURE: &str = r#"---
+name: directed-route
+version: "1.0"
+initial_state: check
+states:
+  check:
+    gates:
+      ci:
+        type: command
+        command: "exit 1"
+        overridable: false
+    transitions:
+      - target: merge
+        when:
+          gates.ci.exit_code: 0
+      - target: fix
+        when:
+          gates.ci.exit_code: 1
+  merge:
+    terminal: true
+  fix:
+    terminal: true
+---
+
+## check
+
+Route on CI.
+
+## merge
+
+Merged.
+
+## fix
+
+Fix it.
+"#;
+
+fn assert_directed(d: &Path, name: &str, target: &str) {
+    let (code, json, stderr) = run(d, &["next", name, "--to", target, "--no-cleanup"]);
+    assert_eq!(code, 0, "--to {} must proceed: {} {}", target, json, stderr);
+    assert_eq!(json["state"], target, "{}", json);
+    let log = std::fs::read_to_string(state_path(d, name)).unwrap();
+    assert!(
+        log.contains("\"directed_transition\""),
+        "a directed_transition event must be appended: {}",
+        log
+    );
+}
+
+#[test]
+fn directed_transition_refused_past_failing_non_overridable_gate() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    init_workflow(d, "wf", LOCKED_BY_FILE);
+    let state_file = state_path(d, "wf");
+    let before = std::fs::read(&state_file).unwrap();
+
+    let (code, json, stderr) = run(d, &["next", "wf", "--to", "done"]);
+    assert_eq!(code, 1, "refusal must exit 1: {} {}", json, stderr);
+    assert_eq!(json["error"]["code"], "gate_blocked", "{}", json);
+    let msg = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("'locked'") && msg.contains("done") && msg.contains("overridable: false"),
+        "message must name the gate and the target: {}",
+        msg
+    );
+    assert!(
+        !msg.contains("'open'"),
+        "an overridable gate is still skipped and must not be named: {}",
+        msg
+    );
+    assert_eq!(
+        std::fs::read(&state_file).unwrap(),
+        before,
+        "a refused --to must append nothing"
+    );
+
+    // The session is still at `check` and advances normally once the gate
+    // passes.
+    let (code, status, stderr) = run(d, &["status", "wf"]);
+    assert_eq!(code, 0, "{} {}", status, stderr);
+    assert_eq!(status["current_state"], "check", "{}", status);
+}
+
+#[test]
+fn directed_transition_proceeds_when_non_overridable_gate_passes() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    init_workflow(d, "wf", LOCKED_BY_FILE);
+    std::fs::write(d.join("ready"), "").unwrap();
+    let before = std::fs::read_to_string(state_path(d, "wf")).unwrap();
+
+    // `open` still fails; `--to` skips it as it always has.
+    assert_directed(d, "wf", "done");
+
+    // Nothing besides what `--to` appended before this check: no
+    // GateEvaluated record for the gate it evaluated.
+    let after = std::fs::read_to_string(state_path(d, "wf")).unwrap();
+    let appended = &after[before.len()..];
+    assert!(
+        !appended.contains("gate_evaluated"),
+        "a passing --to must not append gate evaluations: {}",
+        appended
+    );
+}
+
+#[test]
+fn directed_transition_unchanged_without_non_overridable_gate() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    init_workflow(d, "wf", OVERRIDABLE_ONLY);
+    assert_directed(d, "wf", "done");
+}
+
+#[test]
+fn directed_transition_allowed_to_edge_routing_on_gate_failure() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    init_workflow(d, "wf", ROUTE_ON_FAILURE);
+    let state_file = state_path(d, "wf");
+    let before = std::fs::read(&state_file).unwrap();
+
+    // `merge` needs the gate to pass: refused.
+    let (code, json, stderr) = run(d, &["next", "wf", "--to", "merge"]);
+    assert_eq!(code, 1, "{} {}", json, stderr);
+    assert_eq!(json["error"]["code"], "gate_blocked", "{}", json);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("'ci'"),
+        "{}",
+        json
+    );
+    assert_eq!(std::fs::read(&state_file).unwrap(), before);
+
+    // `fix` is conditioned on the gate failing, which it does: allowed.
+    assert_directed(d, "wf", "fix");
 }

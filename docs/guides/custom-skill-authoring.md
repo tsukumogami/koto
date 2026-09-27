@@ -603,6 +603,7 @@ With the flag set:
 - `koto overrides record` on the gate exits 2 with the typed code `gate_not_overridable`, whatever `--with-data` holds, and appends nothing to the state log.
 - The gate reports `agent_actionable: false` in `blocking_conditions`, so an agent reading the response isn't told to override it.
 - If the log already holds an override for the gate (written by an older koto, or by hand), `koto next` ignores it and evaluates the gate for real.
+- `koto next --to <target>` can't walk past it. A directed transition whose edge depends on the gate evaluates it first and, if it doesn't pass, exits 1 with `gate_blocked` naming the gate and appends nothing. In the example, `--to merge` is refused until the verdict matches, while `--to wait` is allowed, since that arm is the one the failing verdict selects. Overridable gates are still skipped by `--to`.
 
 A good rule: a gate that routes on a context key your own `default_action` script wrote should be `overridable: false`, because otherwise an override lets the agent supply the value the script exists to produce. Leave gates that only guard against a transient failure overridable, so a stuck run has a logged way forward.
 
