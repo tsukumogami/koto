@@ -602,6 +602,13 @@ straight into `converge`. That's the second conjunct's whole job. On a state tha
 also declares `materialize_children`, the compiler catches the omission as
 warning W4 -- see [batch-authoring.md](batch-authoring.md) for the full rule.
 
+**The state you route into can read the finished batch.** On a state that
+declares `materialize_children`, the tick on which the batch completes
+records it: a `BatchFinalized` event and the context key
+`batch_final_view`. That happens whichever state the tick ends in, so a
+`converge` or summary state reached by one of the branches above can run
+`koto context get {{SESSION_NAME}} batch_final_view` for the per-child outcomes.
+
 #### `request-leg` gate type
 
 The `request-leg` gate reads one leg of a koto request and reports what the

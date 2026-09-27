@@ -700,8 +700,13 @@ pub enum EventPayload {
         /// payload don't need to pair it with the outer envelope.
         timestamp: String,
     },
-    /// Emitted when the `children-complete` gate on a
-    /// `materialize_children` state first reports `all_complete: true`.
+    /// Emitted once per completed batch: the first time the
+    /// `children-complete` gate on a `materialize_children` state reports
+    /// `all_complete: true` for the batch it holds, whichever state the
+    /// completing tick ends in. `state` is the batching state. A session
+    /// can hold one per batching state, and another whenever a batch
+    /// completes again after a retry or rewind or with changed per-child
+    /// outcomes (Issues #263, #275).
     ///
     /// The `view` payload freezes the final batch shape at the moment
     /// the event appends: subsequent `koto status` reads and terminal

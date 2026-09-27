@@ -231,6 +231,39 @@ to `0.9.x`).
 
 ### Fixed
 
+- **A completed batch is recorded even when the completing tick leaves the
+  batching state (koto#263).** The `BatchFinalized` event and the
+  `batch_final_view` context key were written only when the tick that saw the
+  batch complete also stopped in the state that declares
+  `materialize_children`. A parent that routes out of that state on
+  `gates.<gate>.all_complete: true`, the usual way to reach a summary state,
+  left in the same tick and got neither: `koto context get <parent>
+  batch_final_view` exited 3 and the event log had no `BatchFinalized`. Both
+  are now written once per completed batch, decided against the batching
+  state, whether the tick stays there, advances out of it (even if it then
+  stops on an error in a later state), or leaves with `koto next --to`. A
+  tick that completes the batch and advances onto a terminal state now also
+  carries `batch_final_view` in its response (a `--to` response still
+  doesn't). A consumer that read the
+  key after such a batch and went on without it when it was missing now gets
+  the view.
+
+- **Each batch in a session is recorded as its own (koto#275).** Whether a
+  batch was already recorded was decided across the whole log, so once one
+  batch had a `BatchFinalized`, a later batch (a second `materialize_children`
+  state, or the same state re-entered through an ordinary transition) never
+  got one, and `batch_final_view` kept the earlier batch's view. A batching
+  state reached before its task list was submitted could also be recorded
+  at once, with the earlier batch's children. The decision is now made per
+  batching state: a state's batch exists once its task list is submitted,
+  and it is recorded when it completes, again after a retry of one of its
+  own children (including one submitted in another state that routes back)
+  or a rewind, and again whenever its per-child outcomes differ from the last
+  record (a new task list on a later visit); a visit that finds the same
+  children and outcomes, with no retry of them or rewind since, records
+  nothing. With the fix above alone, a parent with two batches in sequence
+  would have read the first batch's view after the second.
+
 - **A variable value may contain `+` (koto#266).** The value allowlist now
   accepts letters, digits, `.`, `_`, `-`, `/`, `:`, `@`, `+` and spaces
   (`^[a-zA-Z0-9._/:@+ \-]*$`). A path such as a directory named

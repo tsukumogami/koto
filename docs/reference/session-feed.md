@@ -684,9 +684,17 @@ Records when an agent bypassed a failing gate via `koto overrides record`.
 
 #### `batch_finalized`
 
-Emitted when a batch's `children-complete` gate first reports `all_complete: true`.
+Emitted once per completed batch: the first time a batching state's
+`children-complete` gate reports `all_complete: true` for the batch it holds,
+on the tick that completes it, whether that tick stays in the state, advances
+out of it, or leaves it with `koto next --to`. `state` names the batching state,
+not the state the tick stopped in. A log can hold several: one per batching
+state that ran a batch, and another whenever a batch completes again after a
+retry of one of its children or a rewind, or with different per-child outcomes
+than its last record.
 The most recent `batch_finalized` event drives `koto status` batch display after
-children are auto-cleaned.
+children are auto-cleaned, and its `view` is what the `batch_final_view`
+context key holds.
 
 **Note**: The `superseded_by` field is always absent in raw JSONL. It is populated
 only by rendering code that annotates the event log after the fact. Consumers MUST NOT

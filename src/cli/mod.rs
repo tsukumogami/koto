@@ -2434,6 +2434,35 @@ fn rewind_relocate_children(
     (Some(branch_prefix), relocated)
 }
 
+/// Take the parent's state-file lock for a tick on a batching state, or exit
+/// with the error a caller can act on: `BatchError::ConcurrentTick` when
+/// another tick holds it, a persistence error otherwise. Every path that
+/// reads, decides and writes a batch record holds this lock, which is what
+/// keeps that record to one per completed batch.
+#[cfg(unix)]
+fn lock_batch_parent_or_exit(
+    backend: &dyn SessionBackend,
+    name: &str,
+) -> crate::session::SessionLock {
+    match backend.lock_state_file(name) {
+        Ok(guard) => guard,
+        Err(SessionError::Locked { holder_pid }) => {
+            let err = crate::cli::batch_error::BatchError::ConcurrentTick { holder_pid };
+            let code = err.exit_code();
+            exit_with_error_code(err.to_envelope(), code);
+        }
+        Err(e) => {
+            let ne = crate::cli::next_types::NextError {
+                code: crate::cli::next_types::NextErrorCode::PersistenceError,
+                message: format!("failed to acquire state file lock: {}", e),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
+        }
+    }
+}
+
 /// Decide whether a workflow state's entry into `handle_next` must be
 /// serialized behind an advisory flock on the parent state file.
 ///
@@ -4272,6 +4301,15 @@ fn handle_next(
             }
         }
 
+        // A directed exit from a batching state may record its batch below,
+        // so it takes the same lock the advance path holds before it writes
+        // anything (Issue #263). Contention refuses with nothing written.
+        let _batch_lock = if state_is_batch_scoped(&compiled, current_state, &events) {
+            Some(lock_batch_parent_or_exit(backend, &name))
+        } else {
+            None
+        };
+
         // Append directed_transition event.
         let payload = EventPayload::DirectedTransition {
             from: current_state.clone(),
@@ -4427,6 +4465,23 @@ fn handle_next(
                     }
                     None => resp,
                 };
+                // A directed exit from a batching state whose batch is
+                // complete records it, as the advance path does when a
+                // tick leaves one (Issue #263): a consumer in the target
+                // state reads `batch_final_view` whichever way the parent
+                // left. An incomplete batch records nothing.
+                if target != current_state
+                    && crate::cli::batch::state_has_materialize_children(&compiled, current_state)
+                {
+                    crate::cli::batch::finalize_batch_if_complete(
+                        backend,
+                        context_store,
+                        &name,
+                        &compiled,
+                        current_state,
+                        None,
+                    );
+                }
                 // The terminal result rides the response, so it is found or
                 // resolved before printing and the same record is handed to
                 // the completion block below.
@@ -4880,23 +4935,7 @@ fn handle_next(
     // loop; its field is intentionally unused.
     let _batch_lock: Option<crate::session::SessionLock> =
         if state_is_batch_scoped(&compiled, current_state, &events) {
-            match backend.lock_state_file(&name) {
-                Ok(guard) => Some(guard),
-                Err(SessionError::Locked { holder_pid }) => {
-                    let err = crate::cli::batch_error::BatchError::ConcurrentTick { holder_pid };
-                    let code = err.exit_code();
-                    exit_with_error_code(err.to_envelope(), code);
-                }
-                Err(e) => {
-                    let ne = NextError {
-                        code: NextErrorCode::PersistenceError,
-                        message: format!("failed to acquire state file lock: {}", e),
-                        details: vec![],
-                    };
-                    let json = serde_json::json!({"error": ne});
-                    exit_with_error_code(json, ne.code.exit_code());
-                }
-            }
+            Some(lock_batch_parent_or_exit(backend, &name))
         } else {
             None
         };
@@ -5252,6 +5291,49 @@ fn handle_next(
             .map(|p| p as &mut dyn crate::engine::decider::DeciderPort),
     );
     drop(decider_port);
+
+    // Issue #263: a tick that leaves a batching state records the batch it
+    // leaves, if that batch is complete. This is decided here, against the
+    // log the loop just wrote, rather than after the stop reason is mapped:
+    // several stops (an unresolvable transition, a cycle, a chain limit, a
+    // capture refusal, an advance error) exit from inside that mapping, and
+    // the transitions they made are already on disk. A record decided later
+    // would be lost with them, and the next tick starts in a state that has
+    // no batch to look at.
+    //
+    // The parent's log is read up to the tick's first transition out of the
+    // state, so what the rest of the tick wrote (including coming back to the
+    // state and stopping on a cycle) doesn't change what is recorded. The
+    // children are read as they are now.
+    //
+    // Only the start state is checked. A batching state entered and left
+    // again later in the same tick had no batch to record: its children are
+    // spawned by the scheduler, which runs only where a tick stops.
+    if crate::cli::batch::state_has_materialize_children(&compiled, current_state) {
+        let tick_start_seq = current_events.last().map(|e| e.seq).unwrap_or(0);
+        let left_at = backend.read_events(&name).ok().and_then(|(_, events)| {
+            events.iter().find_map(|e| match &e.payload {
+                EventPayload::Transitioned { from, to, .. }
+                    if e.seq > tick_start_seq
+                        && from.as_deref() == Some(current_state.as_str())
+                        && to != current_state =>
+                {
+                    Some(e.seq)
+                }
+                _ => None,
+            })
+        });
+        if let Some(left_at) = left_at {
+            crate::cli::batch::finalize_batch_if_complete(
+                backend,
+                context_store,
+                &name,
+                &compiled,
+                current_state,
+                Some(left_at),
+            );
+        }
+    }
 
     // 8. Map AdvanceResult/AdvanceError to NextResponse/NextError and exit.
     match result {
@@ -5789,74 +5871,31 @@ fn handle_next(
                 }
             }
 
-            // Issue #17: append a `BatchFinalized` event when the
-            // `children-complete` gate on the current state first
-            // reports `all_complete: true`. The predicate in
-            // `should_append_batch_finalized` ensures the event
-            // appends at most once per finalization pass; a retry
-            // (retry_failed evidence / Rewound) invalidates the prior
-            // event and the next all-complete tick appends a fresh
-            // BatchFinalized. The view freezes the current gate output
-            // so subsequent `koto status` and terminal `done`
-            // responses can replay the final batch shape.
+            // Issue #17: record a completed batch -- one `BatchFinalized`
+            // event and the `batch_final_view` context key -- the first
+            // time the batch's `children-complete` gate reports
+            // `all_complete: true`. A retry (retry_failed evidence or a
+            // Rewound), or a batch whose outcome has changed since, is
+            // recorded again when it completes. The view freezes the
+            // gate output so `koto status` and terminal `done` responses
+            // can replay the final batch shape.
+            //
+            // This call covers a tick that stops in its batching state.
+            // A tick that left one was recorded right after the advance
+            // loop (Issue #263). Everything below that reads the log (the
+            // terminal result, `batch.phase`, the terminal
+            // `batch_final_view`) runs after both, so it sees the event.
             if scheduler_outcome.is_some()
                 && crate::cli::batch::state_has_materialize_children(&compiled, final_state)
             {
-                let (_, post_events) = backend
-                    .read_events(&name)
-                    .unwrap_or((header.clone(), Vec::new()));
-                let (_converge_passes, gate_output) =
-                    crate::cli::batch::build_children_complete_output(
-                        backend,
-                        &name,
-                        &post_events,
-                        &compiled,
-                        final_state,
-                        None,
-                    );
-                // Finalization tracks terminal completion, not the
-                // converge pass-predicate: a batch is "finalized" once
-                // every child reached a terminal outcome, independent of
-                // whether the converge gate has cleared its results-in
-                // conjunct. Read the `all_complete` field from the gate
-                // output rather than the returned converge bool
-                // (DESIGN-request-store-converge.md Decision 4).
-                let all_complete = gate_output
-                    .get("all_complete")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if crate::cli::batch::should_append_batch_finalized(&post_events, all_complete) {
-                    if let Some(view) =
-                        crate::cli::batch::BatchFinalView::from_gate_output(&gate_output)
-                    {
-                        let ts = crate::engine::types::now_iso8601();
-                        let payload = crate::engine::types::EventPayload::BatchFinalized {
-                            state: final_state.to_string(),
-                            view: serde_json::to_value(&view).unwrap_or(serde_json::Value::Null),
-                            timestamp: ts.clone(),
-                            superseded_by: None,
-                        };
-                        if let Err(e) = backend.append_event(&name, &payload, &ts) {
-                            eprintln!("warning: failed to append BatchFinalized event: {}", e);
-                        }
-                        // Persist batch_final_view to the context store
-                        // so agents can retrieve it via `koto context get
-                        // <wf> batch_final_view` without parsing the
-                        // event log or terminal response.
-                        let view_json =
-                            serde_json::to_value(&view).unwrap_or(serde_json::Value::Null);
-                        if let Ok(serialized) = serde_json::to_string_pretty(&view_json) {
-                            if let Err(e) =
-                                context_store.add(&name, "batch_final_view", serialized.as_bytes())
-                            {
-                                eprintln!(
-                                    "warning: failed to write batch_final_view to context: {}",
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
+                crate::cli::batch::finalize_batch_if_complete(
+                    backend,
+                    context_store,
+                    &name,
+                    &compiled,
+                    final_state,
+                    None,
+                );
             }
 
             // The terminal result rides the response, so it is found or
