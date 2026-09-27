@@ -363,8 +363,8 @@ pub(crate) fn sweep_if_parent(
 /// - a descendant whose log or template can't be read or classified is left
 ///   alone with its subtree;
 /// - a descendant bound to a request leg that is still open is left alone:
-///   it was kept because its leg promotion failed and must be retried, and
-///   removing it would leave the leg open for good;
+///   its result hasn't reached the leg (typically a failed promotion waiting
+///   for a retry), and removing it would leave the leg open for good;
 /// - a `parent_workflow` cycle ends the walk (visited set, depth cap);
 /// - each session's status is read again just before its removal, narrowing
 ///   the window in which a concurrent `koto rewind` could bring it back;
@@ -440,9 +440,12 @@ fn sweep_children(
 }
 
 /// True when `id` is bound to a request leg that is still open, so its
-/// terminal result has not reached the leg yet. A request that can't be read
-/// because of an I/O error counts as open (keep the session); a request that
-/// is gone, closed, or whose leg is resolved or abandoned does not.
+/// terminal result has not reached the leg yet -- typically because the
+/// promotion failed and the session's next tick would retry it. The rules
+/// follow `promote_leg_result`'s own: a request that is gone, closed,
+/// unreadable, or whose leg is resolved or abandoned is not pending (the
+/// tick would give up too); an I/O error, which the tick would retry, keeps
+/// the session.
 fn awaits_leg_promotion(backend: &dyn SessionBackend, id: &str) -> bool {
     use crate::engine::request_store::{self, RequestStoreError, ValidatedRequestId};
     use crate::engine::types::{LegDisposition, RequestState};

@@ -213,8 +213,9 @@ R9 and DESIGN Decision 3.
   terminal and all its children were removed; leaves a session and its subtree
   alone on any read or classification error; re-checks status just before each
   `backend.cleanup`; warns and continues on a failed removal.
-- `derive_terminal_status` and `TerminalStatus` become `pub(crate)`;
-  `collect_descendants` (prune's walk) gains a visited set.
+- The sweep lives in `src/cli/workspace.rs` beside prune and shares its
+  `derive_terminal_status`; `collect_descendants` (prune's walk) gains a
+  visited set.
 - Call the sweep from `finish_terminal_tick` before a parent's removal, and
   from `init_entry`'s replace path before a finished session is replaced
   (after the old session's result is read, before it is removed).

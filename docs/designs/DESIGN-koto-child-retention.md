@@ -394,8 +394,10 @@ path removes a finished session. It:
   missing template, an unreadable log, a failed download on the cloud backend)
   leaves that session and its subtree alone.
 - **leaves a pending leg alone.** A descendant bound to a request leg that is
-  still open was kept because its promotion failed and waits for a retry;
-  removing it would leave the leg open for good, so the sweep skips it.
+  still open hasn't delivered its result there, typically because its
+  promotion failed and waits for a retry; removing it would leave the leg open
+  for good, so the sweep skips it, following the promotion's own rules for
+  what still counts as open.
 - **re-checks just before removing.** Each session's terminal status is read
   again immediately before `backend.cleanup`, narrowing the window in which a
   concurrent `koto rewind` could bring it back.
@@ -403,8 +405,8 @@ path removes a finished session. It:
   stderr and the parent's removal goes ahead; the leftover is visible in
   `koto workflows --orphaned` and removable with `koto session cleanup`.
 
-Terminal status comes from `derive_terminal_status` in `src/cli/workspace.rs`
-(made `pub(crate)`, with its `TerminalStatus`), so the sweep and prune agree on
+Terminal status comes from `derive_terminal_status` in `src/cli/workspace.rs`,
+where the sweep lives beside prune, so the sweep and prune agree on
 what "terminal" means, abandoned included. The walk itself is new: prune's
 `collect_descendants` gathers every descendant without stopping at live ones,
 which is right behind prune's confirmation prompt and wrong for an implicit
@@ -496,7 +498,7 @@ result is recorded.
 | `src/cli/next_types.rs`, `NextResponse::Terminal` | New `retention: Option<Retention>` field, serialized as `retention` when present, set through a `with_retention` builder beside `with_terminal_result`; every construction site gains `retention: None`. |
 | `src/cli/batch.rs`, converge | Live-child dereference uses `recorded_result_for_current_arrival`; the parent-copy fallback is skipped for a readable, classified on-disk child. A child known only from its parent's `ChildCompleted` keeps its full session name, so a cleaned-up `<parent>.<task>` child of a parent without a batch hook matches its result (before, it was listed as `<task>` and stayed outstanding). |
 | New `sweep_terminal_descendants` (in `src/cli/workspace.rs`) | The guarded post-order walk. |
-| `src/cli/workspace.rs` | `derive_terminal_status` and `TerminalStatus` become `pub(crate)`; `collect_descendants` gains a visited set. |
+| `src/cli/workspace.rs` | New `sweep_if_parent` and `sweep_terminal_descendants` beside prune, sharing `derive_terminal_status`; `collect_descendants` gains a visited set. |
 | `src/cli/init_entry.rs`, replace path | Calls the sweep before replacing a finished session. |
 
 ### Data flow on a terminal tick
