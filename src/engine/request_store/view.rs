@@ -45,7 +45,7 @@ pub struct LegView {
     pub bound_child: Option<String>,
     /// The dispatch epoch captured when the leg was bound. The leg's
     /// mutating paths fence against this rather than against the
-    /// child's header, which disappears on the child's terminal tick
+    /// child's header, which can disappear on the child's terminal tick
     /// while this record outlives it.
     ///
     /// Never serialized. koto compares against it; nobody is handed it.

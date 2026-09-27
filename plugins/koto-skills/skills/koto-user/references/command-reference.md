@@ -105,7 +105,7 @@ Gets the current state directive. Submits evidence when `--with-data` is provide
 |---|---|
 | `--with-data <json>` | Submit evidence as a JSON object. Must conform to the state's `accepts` schema. Max 1 MB. The `"gates"` key is reserved and rejected. Mutually exclusive with `--to`. Prefix with `@` to read the payload from a file (e.g. `--with-data @evidence.json`); the file is also capped at 1 MB. |
 | `--to <state>` | Force a directed transition to a named state. Must be a valid transition target from the current state. Skips gates, except an `overridable: false` gate the edge to the target depends on: if that gate's result doesn't satisfy the edge, the call exits 1 with `gate_blocked` naming it and records nothing. Mutually exclusive with `--with-data`. |
-| `--no-cleanup` | Skip automatic session cleanup when the workflow reaches a terminal state. Useful for debugging artifacts after a workflow ends. |
+| `--no-cleanup` | Keep the session after it reaches a terminal state. A terminal declared `failure: true` is always kept anyway. The result still reaches the parent and any bound leg; the response's `retention` field says whether the session was kept and why. |
 | `--full` | Always include the `details` field, even if it was already delivered since you last arrived at the state. By default `details` is omitted once delivered, until the workflow arrives at the state again — from a different state, or via `koto rewind`. A self-transition is a lap rather than an arrival and does not bring it back; a tick that leaves and comes back through another state does. |
 | `--dispatch-epoch <n>` | The epoch this writer was dispatched with. Required for `--with-data` writes against a child workflow's log; validated before any persistence call and rejected with `epoch_fence_violation` (exit 65) on a mismatch. Parent-workflow ticks don't need it. The same value goes on `koto request progress` / `resolve` / `abandon` for a bound leg. |
 
@@ -680,7 +680,7 @@ koto session cleanup <name>
 
 Removes the entire session directory for the named workflow. Idempotent — succeeds even if the session does not exist. Produces no stdout output.
 
-Under normal operation, `koto next` auto-cleans on terminal state unless `--no-cleanup` was passed. Use this command for manual cleanup after abandoned workflows or after using `--no-cleanup` during debugging.
+`koto next` removes a session at its terminal state unless the terminal is declared `failure: true` or the tick passed `--no-cleanup` (the response's `retention` field says which). Use this command to remove a kept session once its record is no longer needed, or after an abandoned workflow. It removes only the named session: a kept parent's kept children are left, listed by `koto workflows --orphaned`. A parent koto removes at its own terminal, or replaces with `koto init --attach-live --replace-terminal`, takes its terminal descendants with it, and `koto workspace prune --root` removes a finished tree.
 
 ---
 

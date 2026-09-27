@@ -42,6 +42,7 @@ pub fn dispatch_next(
             advanced,
             unassigned_children: vec![],
             result: None,
+            retention: None,
         });
     }
 
@@ -173,6 +174,7 @@ mod tests {
                 advanced: false,
                 unassigned_children: vec![],
                 result: None,
+                retention: None,
             }
         );
     }

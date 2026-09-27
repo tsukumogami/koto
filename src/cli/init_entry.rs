@@ -626,6 +626,15 @@ fn create(
         (old.current_state.clone(), old.terminal.clone(), result)
     });
     if replaced.is_some() {
+        // A new run under this name must not inherit the old run's kept
+        // children; they go with the session they belonged to. Unlike the
+        // terminal tick, this sweeps without checking for a batch hook: the
+        // template in scope here is the new one, not the one the old
+        // session ran, and replacing a finished session is rare. If the
+        // cleanup below then fails, the replace is refused with the old
+        // session in place and its kept children already gone; they were
+        // terminal, so nothing live is lost.
+        super::workspace::sweep_terminal_descendants(backend, name);
         if let Err(e) = backend.cleanup(name) {
             refuse(
                 entry,

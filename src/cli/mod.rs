@@ -188,7 +188,7 @@ pub enum Command {
         #[arg(long)]
         to: Option<String>,
 
-        /// Skip session cleanup when reaching a terminal state (useful for debugging)
+        /// Keep the session after it reaches a terminal state (a failure terminal is always kept)
         #[arg(long)]
         no_cleanup: bool,
 
@@ -352,13 +352,14 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         yes: bool,
 
-        /// DANGER: bypasses the terminal-state safety gate. Prunes a
-        /// session tree even if a descendant is currently being
-        /// dispatched. Use only when you know the tree is abandoned
-        /// (e.g., orphan from a crashed run that never reached
-        /// terminal). A force-prune of a live tree corrupts any
-        /// coordinator still holding a claim against it. Combined
-        /// with `--yes`, this flag still triggers a second
+        /// DANGER: bypasses the terminal-state safety gate on the root.
+        /// Without it, prune refuses a root that is not terminal; the
+        /// descendants are removed whatever their state either way (the
+        /// preview names any that are not terminal). Use only when you
+        /// know the tree is abandoned (e.g., orphan from a crashed run
+        /// that never reached terminal). A force-prune of a live tree
+        /// corrupts any coordinator still holding a claim against it.
+        /// Combined with `--yes`, this flag still triggers a second
         /// confirmation prompt requiring the literal string
         /// `force-prune` to proceed.
         #[arg(long)]
@@ -2541,11 +2542,11 @@ fn project_terminal_outcome(compiled: &CompiledTemplate, final_state: &str) -> T
 /// This is the durable record of the child's result: it rides the same
 /// terminal tick — and the same atomic `O_APPEND` discipline
 /// ([`SessionBackend::append_event`]) — that the terminal evidence and
-/// the `ChildCompleted` notification already use. The result is
-/// synthesized once by [`finish_terminal_tick`] via
-/// [`synthesize_workflow_result`] and passed by reference here, so the
-/// child's log, the request leg's promotion, and the parent's
-/// `ChildCompleted` all carry the same envelope.
+/// the `ChildCompleted` notification already use. The result is resolved
+/// once, by the caller through [`terminal_record`] before the response is
+/// printed, and passed through [`finish_terminal_tick`] by reference, so
+/// the response, the child's log, the request leg's promotion, and the
+/// parent's `ChildCompleted` all carry the same envelope.
 ///
 /// Returns `true` when the event was durably appended, which is exactly
 /// the condition under which the terminal-index entry may set
@@ -2720,12 +2721,12 @@ fn terminal_record(
     }
 }
 
-/// Issue #134: append a `ChildCompleted` event to the parent's log just
-/// before a child session's auto-cleanup runs.
+/// Issue #134: append a `ChildCompleted` event to the parent's log.
 ///
-/// Called from both terminal cleanup sites in [`handle_next`] (the `--to`
-/// path and the advance-loop path). The return value tells the caller
-/// whether cleanup is safe:
+/// Called from [`finish_terminal_tick`] on a child's arrival at a terminal,
+/// whether or not the session is then kept, and again on a later tick that
+/// removes a session it did not just land in. The return value tells the
+/// caller whether cleanup is safe:
 ///
 /// * [`ChildCompletedAppend::NoParent`] — no parent to notify (standalone
 ///   child, or the parent was already cleaned up). Cleanup proceeds.
@@ -2777,8 +2778,8 @@ fn append_child_completed_to_parent(
     // Carry a copy of the auto-promoted result on the parent's log so
     // the converge gate can read it after the child session is
     // auto-cleaned (DESIGN-request-store-converge.md Decision 3). The
-    // envelope is synthesized once by [`finish_terminal_tick`] and
-    // shared with the child-log append and the leg promotion.
+    // envelope is resolved once, through [`terminal_record`], and shared
+    // with the child-log append and the leg promotion.
     let payload = EventPayload::ChildCompleted {
         child_name: child_name.to_string(),
         task_name,
@@ -2799,8 +2800,8 @@ fn append_child_completed_to_parent(
     }
 }
 
-/// Issue 8: append a workspace-wide terminal-index entry for `session_id`
-/// just before session cleanup.
+/// Issue 8: append a workspace-wide terminal-index entry for `session_id`,
+/// once per arrival at a terminal, whether or not the session is then kept.
 ///
 /// Classifies the terminal state as `"abandoned"` when the events log
 /// carries a `WorkflowCancelled` event, otherwise `"completed"`. Stats
@@ -2866,7 +2867,7 @@ fn append_terminal_index_for_session(
 /// 3. **Promote** the envelope onto the bound leg's request log.
 /// 4. Write the terminal-index entry carrying the done-bit from 2.
 /// 5. Append `ChildCompleted` to the parent's log.
-/// 6. Auto-clean the child session.
+/// 6. Remove the session, unless `retention` keeps it.
 ///
 /// Step 3 sits before 4 because a crash after the index write would
 /// leave a permanently-skipped session with a forever-open leg, and
@@ -2881,19 +2882,28 @@ fn append_terminal_index_for_session(
 /// child's result, the index entry and the parent event, then deletes
 /// the session while the leg stays open forever.
 ///
-/// **Why steps 2 and 3 run under `--no-cleanup`.** An already-terminal
-/// session ticked again returns immediately from the advance loop, so
-/// under `--no-cleanup` this block runs on every tick. For a terminal that
-/// declares a `result:` map, the child-log record is what pins the
-/// resolved map for a parked session (`koto status`, a later tick), and it
-/// is keyed on the arrival: once [`terminal_record`] finds it on the log,
-/// `already_recorded` is set and nothing is appended again. A terminal
-/// without a map records nothing while parked, as before. Promotion is
-/// gated on the leg having no result yet, which makes a repeat tick a
-/// silent no-op. The index entry
-/// and the parent event stay under the cleanup guard -- appending those
-/// per tick would be unbounded, and existing tests are built on a parked
-/// terminal child *not* emitting the parent event.
+/// **Delivery is keyed on the arrival, not on cleanup.** An
+/// already-terminal session ticked again returns immediately from the
+/// advance loop, so this block runs on every tick of a parked session.
+/// Steps 2, 4 and 5 therefore run once per *arrival* at the terminal:
+/// [`terminal_record`] reports `already_recorded` when the child's own
+/// log already holds a `request_store.result` for the current stay, and a
+/// repeat tick then writes nothing. Step 2 records for every terminal,
+/// with or without a `result:` map and with or without `--no-cleanup`,
+/// because that record is what makes the next tick see the arrival as
+/// delivered. Promotion is gated on the leg having no result yet, which
+/// makes a repeat tick a silent no-op there too. `retention` decides only
+/// step 6, whether the session stays on disk: a failure terminal is always
+/// kept, and `--no-cleanup` keeps any other. Keeping a session never
+/// withholds its result from the parent or the leg (koto issue 240).
+///
+/// A tick that is not an arrival and will remove the session re-sends
+/// step 5 before it tries to. That is a tick after
+/// removal was deferred (a failed parent append or a retryable promotion
+/// failure), and the first flagless tick of a terminal an earlier tick
+/// kept with `--no-cleanup`. A removed child therefore always left its
+/// `ChildCompleted` behind; a duplicate is harmless, because the converge
+/// keeps the latest event per task and prefers an on-disk child.
 #[cfg(unix)]
 fn finish_terminal_tick(
     backend: &dyn SessionBackend,
@@ -2901,28 +2911,20 @@ fn finish_terminal_tick(
     header: &crate::engine::types::StateFileHeader,
     compiled: &CompiledTemplate,
     final_state: &str,
-    no_cleanup: bool,
+    // `None` means koto removes the session after this tick; `Some` says why
+    // it is kept. It is the same value the response's `retention` reports.
+    retention: Option<next_types::RetentionReason>,
     record: &TerminalRecord,
 ) {
     let pointer = crate::engine::leg_pointer::read_pointer_best_effort(&backend.session_dir(name));
     let result = &record.result;
+    let arrival = !record.already_recorded;
+    let remove = retention.is_none();
 
-    // Step 2, the child's own log. The done-bit below means "a durable
-    // result is readable", which an earlier tick's record satisfies too.
-    //
-    // A parked session records only when its terminal declares a result
-    // map: that record is what pins the resolved map against later context
-    // writes. A terminal without one keeps its pre-existing behaviour of
-    // recording nothing while parked, because a recorded result is what
-    // the `children-complete` converge read treats as a finished child,
-    // and existing workflows park children on exactly that distinction.
-    let declares_result = compiled
-        .states
-        .get(final_state)
-        .is_some_and(|s| s.result.is_some());
-    let has_result = record.already_recorded
-        || ((!no_cleanup || declares_result)
-            && append_request_store_result_to_child(backend, name, result));
+    // Step 2, the child's own log, once per arrival. The done-bit for the
+    // index entry below means "a durable result is readable", so it is set
+    // only when this append succeeded.
+    let has_result = arrival && append_request_store_result_to_child(backend, name, result);
 
     // Step 3: a parked terminal session still resolves its leg, because
     // the requester waiting on it has no way to know the session was
@@ -2935,23 +2937,54 @@ fn finish_terminal_tick(
         None => false,
     };
 
-    if no_cleanup {
-        return;
+    // Steps 4 and 5, once per arrival, whether or not the session is kept.
+    // The parent notice is also re-sent on a removal tick that is not an
+    // arrival (see the doc comment).
+    let mut defer_for_parent = false;
+    if arrival {
+        // Re-read so the index classifier sees a mid-tick `WorkflowCancelled`.
+        let post_events = backend
+            .read_events(name)
+            .map(|(_, ev)| ev)
+            .unwrap_or_default();
+        append_terminal_index_for_session(backend, name, &post_events, has_result);
+    }
+    if arrival || remove {
+        let append_result =
+            append_child_completed_to_parent(backend, name, header, compiled, final_state, result);
+        defer_for_parent = matches!(append_result, ChildCompletedAppend::AppendFailed);
     }
 
-    // Re-read so the index classifier sees a mid-tick `WorkflowCancelled`.
-    let post_events = backend
-        .read_events(name)
-        .map(|(_, ev)| ev)
-        .unwrap_or_default();
-    append_terminal_index_for_session(backend, name, &post_events, has_result);
-    let append_result =
-        append_child_completed_to_parent(backend, name, header, compiled, final_state, result);
-    let defer_for_parent = matches!(append_result, ChildCompletedAppend::AppendFailed);
+    // Step 6.
+    if !remove {
+        return;
+    }
     if !defer_for_parent && !defer_for_promotion {
+        // A parent koto removes takes its kept terminal descendants with it.
+        workspace::sweep_if_parent(backend, name, compiled);
         if let Err(e) = backend.cleanup(name) {
             eprintln!("warning: session cleanup failed: {}", e);
         }
+    }
+}
+
+/// Whether koto keeps a session that has just reached `final_state`, and
+/// why. A failure terminal is always kept, whatever the flag says, so its
+/// record survives for a retry, a rewind, or a read (koto issue 240); any
+/// other terminal is kept only under `--no-cleanup`. The failure case reads
+/// the same projection `ChildCompleted` carries, so the parent's view of the
+/// outcome and the retention rule can't disagree.
+fn terminal_retention(
+    compiled: &CompiledTemplate,
+    final_state: &str,
+    no_cleanup: bool,
+) -> Option<next_types::RetentionReason> {
+    if project_terminal_outcome(compiled, final_state) == TerminalOutcome::Failure {
+        Some(next_types::RetentionReason::FailureTerminal)
+    } else if no_cleanup {
+        Some(next_types::RetentionReason::NoCleanup)
+    } else {
+        None
     }
 }
 
@@ -4408,8 +4441,13 @@ fn handle_next(
                 } else {
                     None
                 };
+                let retention = terminal
+                    .as_ref()
+                    .and_then(|_| terminal_retention(&compiled, target, no_cleanup));
                 let resp = match &terminal {
-                    Some(record) => resp.with_terminal_result(record.result.clone()),
+                    Some(record) => resp
+                        .with_terminal_result(record.result.clone())
+                        .with_retention(next_types::Retention { reason: retention }),
                     None => resp,
                 };
                 println!("{}", serde_json::to_string(&resp)?);
@@ -4429,7 +4467,7 @@ fn handle_next(
                         );
                     }
                 }
-                // Auto-cleanup after output when reaching a terminal state.
+                // Deliver the result, then clean up unless the session is kept.
                 if let (
                     next_types::NextResponse::Terminal {
                         state: final_state, ..
@@ -4443,7 +4481,7 @@ fn handle_next(
                         &header,
                         &compiled,
                         final_state,
-                        no_cleanup,
+                        retention,
                         record,
                     );
                 }
@@ -5288,6 +5326,7 @@ fn handle_next(
                     advanced,
                     unassigned_children: unassigned_children.clone(),
                     result: None,
+                    retention: None,
                 },
                 StopReason::GateBlocked(gate_results) => {
                     let blocking =
@@ -5526,6 +5565,7 @@ fn handle_next(
                             advanced,
                             unassigned_children: unassigned_children.clone(),
                             result: None,
+                            retention: None,
                         }
                     } else if let Some(ref es) = expects {
                         NextResponse::EvidenceRequired {
@@ -5833,8 +5873,13 @@ fn handle_next(
             } else {
                 None
             };
+            let retention = terminal
+                .as_ref()
+                .and_then(|_| terminal_retention(&compiled, final_state, no_cleanup));
             let resp = match &terminal {
-                Some(record) => resp.with_terminal_result(record.result.clone()),
+                Some(record) => resp
+                    .with_terminal_result(record.result.clone())
+                    .with_retention(next_types::Retention { reason: retention }),
                 None => resp,
             };
 
@@ -5974,7 +6019,7 @@ fn handle_next(
                     );
                 }
             }
-            // Auto-cleanup after output when reaching a terminal state.
+            // Deliver the result, then clean up unless the session is kept.
             if let (
                 NextResponse::Terminal {
                     state: final_state, ..
@@ -5988,7 +6033,7 @@ fn handle_next(
                     &header,
                     &compiled,
                     final_state,
-                    no_cleanup,
+                    retention,
                     record,
                 );
             }
@@ -6497,9 +6542,10 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     // terminal state. The recorded result for this arrival is what the
     // terminal tick reported, so it is returned as-is: a context write
     // after the terminal does not change it. A terminal session with no
-    // record -- a parked terminal that declares no `result:` map, or one
-    // that reached its terminal before results were recorded -- gets the
-    // result resolved now, read-only; nothing is appended.
+    // record for its arrival -- one parked by a koto that did not record a
+    // result for a terminal without a `result:` map, or one whose record
+    // failed to append -- gets the result resolved now, read-only; nothing
+    // is appended.
     #[cfg(unix)]
     if is_terminal {
         let result =

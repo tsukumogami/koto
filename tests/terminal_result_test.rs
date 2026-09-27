@@ -300,10 +300,11 @@ fn expected_done_payload() -> Value {
 // ===== The five carriers =====
 
 /// One session, one template, every place a result is read from. The first
-/// tick parks the terminal (`--no-cleanup`), which is what makes the child's
-/// own log and `koto status` readable; the second tick lets cleanup run,
-/// which is what emits the parent's `ChildCompleted`. Both ticks report the
-/// value recorded on the first.
+/// tick parks the terminal (`--no-cleanup`), which keeps the child's own log
+/// and `koto status` readable, and already delivers the parent's
+/// `ChildCompleted`; the second tick lets cleanup run and re-sends the notice
+/// before removing the session. Both ticks report the value recorded on the
+/// first.
 #[test]
 fn the_declared_payload_rides_all_five_carriers() {
     let tmp = TempDir::new().unwrap();
@@ -346,8 +347,13 @@ fn the_declared_payload_rides_all_five_carriers() {
     assert_eq!(status["is_terminal"], true);
     assert_eq!(status["result"], result);
 
-    // 4. `ChildCompleted` on the parent, emitted once cleanup is allowed.
-    assert!(child_completed_results(dir, "coord-a").is_empty());
+    // 4. `ChildCompleted` on the parent, emitted on the arrival even though
+    // the session is kept. The later tick that removes the session re-sends
+    // it, so a removed child always left its notice behind.
+    assert_eq!(
+        child_completed_results(dir, "coord-a"),
+        vec![result.clone()]
+    );
     let final_tick = run_ok(dir, &["next", "child-1"]);
     assert_eq!(
         final_tick["result"], result,
@@ -355,7 +361,7 @@ fn the_declared_payload_rides_all_five_carriers() {
     );
     assert_eq!(
         child_completed_results(dir, "coord-a"),
-        vec![result.clone()]
+        vec![result.clone(), result.clone()]
     );
     assert!(
         !session_dir(dir, "child-1").exists(),
@@ -501,14 +507,15 @@ fn a_parked_terminal_records_once_and_later_context_writes_change_nothing() {
         1,
         "no further result events on the child's log"
     );
-    assert!(
-        child_completed_results(dir, "coord-a").is_empty(),
-        "a parked terminal child emits no parent event"
+    assert_eq!(
+        child_completed_results(dir, "coord-a"),
+        vec![result.clone()],
+        "a parked terminal child notifies its parent once, on the arrival"
     );
     assert_eq!(
         terminal_index_entries(dir, "child-1"),
-        0,
-        "a parked terminal writes no terminal-index entry"
+        1,
+        "a parked terminal writes one terminal-index entry, on the arrival"
     );
     assert_eq!(run_ok(dir, &["status", "child-1"])["result"], result);
 }
@@ -579,8 +586,17 @@ fn a_terminal_without_a_map_keeps_the_evidence_derived_payload() {
             "summary": "completed at done",
         })
     );
-    // A parked terminal without a map records nothing, as before.
-    assert!(recorded_results(dir, "child-1").is_empty());
+    // A parked terminal without a map records its result once, like any
+    // other terminal, and notifies its parent once: `--no-cleanup` keeps the
+    // session and withholds nothing.
+    assert_eq!(
+        recorded_results(dir, "child-1"),
+        vec![next["result"].clone()]
+    );
+    assert_eq!(
+        child_completed_results(dir, "coord-a"),
+        vec![next["result"].clone()]
+    );
     let status = run_ok(dir, &["status", "child-1"]);
     assert_eq!(status["result"], next["result"]);
 }

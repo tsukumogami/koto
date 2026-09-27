@@ -126,7 +126,30 @@ koto next coord --with-data @tasks.json
 The 1 MB cap applies to both forms (file size is checked before reading). Use `@-` is **not** supported; only file paths are accepted after `@`.
 
 - `--full` -- Include the `details` field in the response regardless of delivery state. By default, `details` is delivered when the workflow arrives at a state -- entering it from a different state, or being rewound into it -- and omitted on every later tick until it arrives again. Going around a loop it is already in is not an arrival: a self-transition, and a `--to` transition into the state the workflow already occupies, both repeat nothing. What decides it is whether the entry event that landed the workflow records a different source state -- so a tick that leaves a state, passes through another, and comes back within the same tick does deliver. This flag forces inclusion every time.
-- `--no-cleanup` -- Skip automatic session directory cleanup when the workflow reaches a terminal state. Useful for debugging or when you need to inspect session artifacts after completion. Without this flag, koto removes the session directory once it outputs the terminal response.
+- `--no-cleanup` -- Keep the session after it reaches a terminal state. A terminal declared `failure: true` is always kept, so the flag matters for the others. Keeping a session changes nothing else about the tick: the result still reaches the parent and any bound request leg. The flag applies to the tick it's passed on: a kept success terminal ticked again without it is removed.
+
+**What a terminal tick does with the session.** On the tick a session arrives at a terminal state, koto records the result on the session's own log, promotes it to a bound request leg, writes the terminal-index entry and appends `ChildCompleted`, carrying the result, to the parent's log. It does each once per arrival, whether or not the session is then kept; ticking a session already standing in a terminal writes nothing. A session that leaves its terminal (through `retry_failed`, `koto rewind`, or a `--to` from one terminal to another the template declares) and reaches one again is a new arrival.
+
+Then koto decides whether to keep the session, and says so in the response's `retention` field:
+
+| `retention` | When |
+|---|---|
+| `{"retained": true, "reason": "failure_terminal"}` | The terminal is declared `failure: true`. The session is always kept, flag or not, so the parent's `retry_failed`, `koto rewind`, `koto status` and `koto context get` still work on it. |
+| `{"retained": true, "reason": "no_cleanup"}` | Any other terminal, ticked with `--no-cleanup`. |
+| `{"retained": false}` | Any other terminal, ticked without the flag. koto removes the session directory after the response. |
+
+`retained: false` is koto's intent for the tick. If the parent's log or the request store can't be written, koto keeps the session so the next tick can retry, and says so on stderr.
+
+A kept session stays until one of these removes it:
+
+- it is retried or rewound and then reaches a success terminal without `--no-cleanup`, and is removed on that tick;
+- koto removes its parent at the parent's own terminal, or `koto init --attach-live --replace-terminal` replaces the parent; either removes the parent's terminal descendants first, including children kept with `--no-cleanup`. (On the terminal tick this runs only for a parent whose template has a batch hook or whose log holds a `ChildCompleted`; a hook-less parent that never received a child's notice leaves that child for `koto workflows --orphaned`.) It never removes a descendant that is still running, one with anything running under it, one it can't read, or one whose request leg still waits for its result. A parent that is itself kept keeps its children;
+- `koto workspace prune --root <root>` removes a finished root and everything under it;
+- `koto session cleanup <name>` removes one session.
+
+A kept session costs its directory on disk, typically tens of kilobytes. Under a root that is itself kept, which is how skills that pass `--no-cleanup` on every tick run, kept children stay until the root is pruned.
+
+A kept session occupies its name: `koto init` on it is refused with a message naming `koto session cleanup`, and `koto init --attach-live --replace-terminal` replaces it. `koto session cleanup` on a kept parent removes only that session and leaves its kept children naming a parent no session holds; they show in `koto workflows --orphaned` and are removed one at a time, or with the whole tree by pruning the finished root above them. Children moved aside by a `koto rewind` of their batch parent (renamed `<parent>~N.<task>`) are in the same position.
 
 **Runtime variable substitution:**
 
@@ -166,6 +189,8 @@ Every successful response is a JSON object with an `action` field and an `error`
 | `action_output` | -- | -- | -- | -- | object | -- |
 | `integration` | -- | -- | object | object | -- | -- |
 | `unassigned_children` | array | array | array | array | array | array |
+| `result` | -- | -- | -- | -- | -- | object |
+| `retention` | -- | -- | -- | -- | -- | object |
 | `error` | `null` | `null` | `null` | `null` | `null` | `null` |
 
 "yes" = always present. "--" = absent from the JSON (not `null`, just missing). "object or `null`" = present as an object when the state has an `accepts` block, `null` otherwise. "optional" = present when the workflow arrives at the state (or when `--full` is passed), absent on every later tick until it arrives again and when the state has no details content. Use `koto status <name>` to retrieve `directive`/`details`/`expects` unconditionally regardless of delivery state -- see the `status` command below.
@@ -465,7 +490,7 @@ Removes a session directory and all its contents. Idempotent -- succeeds even if
 koto session cleanup <name>
 ```
 
-Produces no output on success. This is the manual equivalent of the auto-cleanup that `koto next` performs when a workflow reaches a terminal state.
+Produces no output on success. This is the manual equivalent of the removal `koto next` performs at a terminal state, and the way to remove a session koto kept: one at a failure terminal, or one ticked with `--no-cleanup`. It removes only the named session; a kept parent's kept children are left for `koto workflows --orphaned` and `koto workspace prune`.
 
 ### context
 
@@ -975,7 +1000,7 @@ koto version
 
 ### workspace prune
 
-Reclaims a workspace tree rooted at a terminal session. The verb reads the root header, verifies the workflow has reached a terminal state (`completed` or `abandoned`), walks descendants via the session backend's `list()` filtered by `parent_workflow`, and removes the directories after operator confirmation.
+Reclaims a workspace tree rooted at a terminal session. The verb reads the root header, verifies the workflow has reached a terminal state (`completed` or `abandoned`), walks descendants via the session backend's `list()` filtered by `parent_workflow`, and removes the directories after operator confirmation, deepest first and the root last. It is how sessions koto kept (failure terminals, `--no-cleanup`) under a kept root are reclaimed. Only the root's state is gated: descendants are removed whatever their state, and the preview names any that aren't terminal.
 
 ```bash
 koto workspace prune --root <session-id> [--dry-run] [--yes] [--force]

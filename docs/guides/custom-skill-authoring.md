@@ -726,7 +726,7 @@ The rules the compiler enforces:
 
 **Where the result appears.** The same value is carried everywhere a result goes:
 
-- the `result` field of the `koto next` response that reaches the terminal (`"action": "done"`), and of every later tick on a session kept with `--no-cleanup`;
+- the `result` field of the `koto next` response that reaches the terminal (`"action": "done"`), and of every later tick on a kept session (one at a `failure: true` terminal, or one kept with `--no-cleanup`);
 - the `result` field of `koto status` on a session standing in a terminal state (a non-terminal session's status has no `result`);
 - the result of a request leg the session is bound to (`koto request get`);
 - the `result` of the `ChildCompleted` event appended to a parent workflow's log when a child finishes.

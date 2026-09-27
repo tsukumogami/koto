@@ -466,7 +466,8 @@ agents encounter today for any state that uses `integration:`.
     "status": "success",
     "summary": "completed at complete",
     "payload": {"outcome": "scoped", "pr": "https://example.test/pr/7"}
-  }
+  },
+  "retention": {"retained": false}
 }
 ```
 
@@ -483,9 +484,17 @@ agents encounter today for any state that uses `integration:`.
 - `advanced: true` confirms the engine transitioned into this terminal state during
   the current call. `advanced: false` would mean the workflow was already terminal
   before this call (e.g., you called `koto next` on an already-completed workflow).
-- After `done`, the session directory is cleaned up automatically unless `--no-cleanup`
-  was passed. Any subsequent `koto next` call returns exit 2 with
-  `error.code = "terminal_state"`.
+- `retention` says what koto does with the session after this tick:
+  `{"retained": false}` (the session is removed), `{"retained": true, "reason":
+  "failure_terminal"}` (the terminal is declared `failure: true`, so the session is
+  always kept), or `{"retained": true, "reason": "no_cleanup"}` (kept because the
+  tick passed `--no-cleanup`). A kept session can still be read with `koto status`
+  and `koto context get`, rewound with `koto rewind`, and retried by its parent's
+  `retry_failed`; ticking it again returns `done` with the same `result`. Keeping a
+  session never withholds its result: the parent's gate and a bound request leg get
+  it on the arrival tick either way.
+- Once the session is removed, `koto next` on its name reports that the workflow
+  doesn't exist.
 
 ---
 

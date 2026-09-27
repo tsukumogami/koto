@@ -556,8 +556,9 @@ fn a_parked_terminal_session_promotes_once_and_then_says_nothing() {
     assert_eq!(after_first["legs"]["reviewer-a"]["disposition"], "resolved");
 
     // Ticking a parked terminal session again is a silent no-op on the
-    // request log: only the promotion is hoisted out of the cleanup
-    // guard, and it is gated on the leg having no result yet.
+    // request log: promotion is gated on the leg having no result yet,
+    // and the other delivery writes on the arrival already being
+    // recorded.
     for _ in 0..3 {
         let (code, _, stderr) = run(tmp.path(), &["next", "child-1", "--no-cleanup"]);
         assert_eq!(code, 0);
@@ -572,12 +573,14 @@ fn a_parked_terminal_session_promotes_once_and_then_says_nothing() {
         "no further appends on the request log"
     );
 
-    // And the other three writes stay under the cleanup guard: a parked
-    // terminal child still does not emit the parent event.
+    // The parent notice is delivered once, on the arrival, and the repeat
+    // ticks add no more: `--no-cleanup` keeps the session without
+    // withholding the result from the parent.
     let parent_log = std::fs::read_to_string(state_path(tmp.path(), "coord-a")).unwrap();
-    assert!(
-        !parent_log.contains("child_completed"),
-        "hoisting the parent event would break a parked child's contract: {parent_log}"
+    assert_eq!(
+        parent_log.matches("\"type\":\"child_completed\"").count(),
+        1,
+        "one parent notice for one arrival: {parent_log}"
     );
 }
 

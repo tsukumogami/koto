@@ -202,6 +202,27 @@ to `0.9.x`).
 
 ### Changed
 
+- **A session that reaches a failure terminal is kept, and keeping a session
+  no longer withholds its result.** A tick that lands a session in a state
+  declared `failure: true` no longer removes it, root or child, with or without
+  `--no-cleanup`, so a parent's `retry_failed`, `koto rewind`, `koto status`
+  and `koto context get` (a `failure_reason`, a skill's running record) still
+  work after the failure. Every arrival at a terminal now records the result on
+  the session's own log, writes the terminal-index entry and appends
+  `ChildCompleted` to the parent, once, whether or not the session is kept, so
+  `--no-cleanup` means only "keep the session": a child that passes it still
+  delivers its result, and the parent's gate reports `results_in: true` for any
+  parent shape. A child parked by an earlier koto without a recorded result
+  delivers on its next tick. The `koto next` terminal response gains a
+  `retention` field: `{"retained": false}`, `{"retained": true, "reason":
+  "failure_terminal"}` or `{"retained": true, "reason": "no_cleanup"}`. When
+  koto removes a parent at its terminal, or `koto init --attach-live
+  --replace-terminal` replaces one, it first removes the parent's terminal
+  descendants, never one that is still running, has anything running under it,
+  can't be read, or has a request leg still waiting for its result. Kept
+  sessions otherwise stay until `koto workspace prune` or `koto session
+  cleanup` removes them.
+
 - **`RequesterWoken` is now delivered.** The wake-candidates pass in `koto
   next` still records `RequesterWoken` with the same fields and the same
   `(child, epoch)` deduplication, but instead of printing a "not yet wired"
@@ -209,6 +230,20 @@ to `0.9.x`).
   `LoggingWaker` is removed.
 
 ### Fixed
+
+- **The `children-complete` gate no longer shows a retried child's old result.**
+  It reads only the result a child recorded for its current arrival, and it no
+  longer answers a child it can read from its own log with the parent's
+  `ChildCompleted` copy, which could belong to an earlier arrival.
+
+- **A cleaned-up `<parent>.<task>` child of a parent without a batch hook is
+  no longer outstanding forever.** The gate listed it as `<task>`, so it never
+  matched the result the parent held under its full name.
+
+- **`koto workspace prune` removes a tree deepest first.** It used to remove a
+  parent before its children and stop at the first failure, which could leave a
+  grandchild whose parent was already gone, out of reach of the next prune. A
+  `parent_workflow` cycle no longer hangs its walk.
 
 - **`koto next --to` no longer walks past a failing `overridable: false`
   gate (koto#251).** A directed transition skipped gate evaluation entirely,
@@ -377,6 +412,7 @@ to `0.9.x`).
   entered, because the run is standing in that state and the fix is not
   a routing one.
   Closes koto#221.
+
 - **A context gate's `key` and `pattern` now resolve `{{KEY}}`
   references.** Substitution rewrote a gate's `command` and nothing else,
   so a state whose action stored `{{SESSION_NAME}}-note` and whose gate

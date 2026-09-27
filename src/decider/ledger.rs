@@ -2,9 +2,11 @@
 //!
 //! Every consultation, every agent answer to a consulted visit, and every
 //! `koto next --to` that leaves such a visit unanswered is appended here as
-//! one JSON line. Session logs are deleted on cleanup and
-//! prune, and child sessions are always cleaned up, so the ledger is the
-//! only place the pairs that promotion is judged on survive. It is
+//! one JSON line. Session logs are deleted on cleanup and prune, and most
+//! sessions are cleaned up on their terminal tick (only a failure terminal,
+//! or one kept with `--no-cleanup`, stays until something removes it), so
+//! the ledger is the only place the pairs that promotion is judged on
+//! survive. It is
 //! authoritative state: it can't be rebuilt, nothing in koto deletes or
 //! compacts it, and it is created mode 0600.
 //!

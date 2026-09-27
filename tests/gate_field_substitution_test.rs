@@ -1018,6 +1018,24 @@ fn child_template() -> &'static str {
     r#"---
 name: filter-child
 version: "1.0"
+initial_state: done
+states:
+  done:
+    terminal: true
+---
+
+## done
+
+Done.
+"#
+}
+
+/// A child that starts in a working state, for a child that is still
+/// unfinished when the parent's gate is read.
+fn working_child_template() -> &'static str {
+    r#"---
+name: working-child
+version: "1.0"
 initial_state: start
 states:
   start:
@@ -1044,7 +1062,7 @@ fn write_template(dir: &Path, filename: &str, content: &str) -> PathBuf {
     src
 }
 
-/// Initialize a child under `parent`, advancing it to its terminal state.
+/// Initialize a child under `parent` directly in its terminal state.
 fn spawn_terminal_child(dir: &Path, name: &str, parent: &str, child_src: &Path) {
     let output = koto_cmd(dir)
         .args([
@@ -1063,18 +1081,11 @@ fn spawn_terminal_child(dir: &Path, name: &str, parent: &str, child_src: &Path) 
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    // `--no-cleanup` keeps the terminal child's session on disk, which is what
-    // the parent's gate reads.
-    let output = koto_cmd(dir)
-        .args(["next", name, "--no-cleanup"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "child advance failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // The child starts in its terminal state and is never ticked, so it is on
+    // disk and complete but has recorded no result. That keeps the parent's
+    // gate from passing on these children, so the gate reports its verdict
+    // as a blocking condition the tests can read. (A ticked terminal child
+    // records its result even under `--no-cleanup`.)
 }
 
 /// A `children-complete` gate's `name_filter` resolves `{{SESSION_NAME}}`, so a
@@ -1223,15 +1234,16 @@ Done.
         .unwrap();
 
     spawn_terminal_child(dir.path(), "cprobe.research.r1", "cprobe", &child_src);
+    let working_src = write_template(dir.path(), "working-child.md", working_child_template());
 
-    // A second research child, initialized but never advanced, so the gate has
+    // A second research child, still in its working state, so the gate has
     // something to still be waiting on.
     koto_cmd(dir.path())
         .args([
             "init",
             "cprobe.research.r2",
             "--template",
-            child_src.to_str().unwrap(),
+            working_src.to_str().unwrap(),
             "--parent",
             "cprobe",
         ])
@@ -1244,7 +1256,7 @@ Done.
             "init",
             "cprobe.audit",
             "--template",
-            child_src.to_str().unwrap(),
+            working_src.to_str().unwrap(),
             "--parent",
             "cprobe",
         ])

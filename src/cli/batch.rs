@@ -37,7 +37,7 @@
 //! issues extend the struct shapes (see design DESIGN-batch-child-
 //! spawning.md Decision 12) without breaking callers.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -2220,12 +2220,19 @@ pub fn build_children_complete_output(
     // Live-child converge read: each on-disk child's auto-promoted
     // result, read from its OWN `request_store.result` event, keyed by
     // raw session id (DESIGN-request-store-converge.md Decision 3, AC2).
-    // This is the preferred dereference source while the child session
-    // still exists; the parent's `ChildCompleted.result` copy is the
-    // fallback once the child has been auto-cleaned. The targeted event
-    // is read directly — no working/session transcript is ever replayed
-    // (AC3).
+    // This is the only dereference source for a child still on disk with
+    // a readable, classified log; the parent's `ChildCompleted.result`
+    // copy is the fallback once the child has been auto-cleaned or when
+    // its log can't be read. The targeted event is read directly — no
+    // working/session transcript is ever replayed (AC3).
     let mut result_by_session: HashMap<String, WorkflowResult> = HashMap::new();
+    // On-disk children whose own log is the authority for their result: a
+    // readable log whose current state the child's template classifies.
+    // For these the parent's `ChildCompleted` copy is never read, because
+    // it may belong to an earlier arrival (see the inlining loop below). An
+    // unreadable log or template is not in this set, and for those the
+    // parent's copy stays a usable fallback.
+    let mut own_log_authoritative: HashSet<String> = HashSet::new();
     match backend.list() {
         Ok(sessions) => {
             let child_prefix = format!("{}.", parent_name);
@@ -2263,16 +2270,20 @@ pub fn build_children_complete_output(
                     }
                 };
                 let current = derive_state_from_log(&child_events).unwrap_or_default();
-                let (terminal, failure, skipped_marker) =
-                    child_state_flags(&child_events, &current).unwrap_or((false, false, false));
+                let flags = child_state_flags(&child_events, &current);
+                if flags.is_some() {
+                    own_log_authoritative.insert(info.id.clone());
+                }
+                let (terminal, failure, skipped_marker) = flags.unwrap_or((false, false, false));
                 let spawn_entry = child_events.iter().find_map(|e| match &e.payload {
                     EventPayload::WorkflowInitialized { spawn_entry, .. } => spawn_entry.clone(),
                     _ => None,
                 });
                 // Dereference the live child's auto-promoted result from
-                // its OWN log: the latest `request_store.result` event
-                // (AC2). A malformed result event (e.g. one missing the
-                // required `result` field) is a serde DESERIALIZATION
+                // its OWN log: the `request_store.result` recorded for
+                // its current arrival (AC2). A malformed result event (e.g.
+                // one missing the required `result` field) is a serde
+                // DESERIALIZATION
                 // FAILURE, not the `Unknown` arm (which only catches
                 // unrecognized type STRINGS). Such a failure is absorbed
                 // here, not propagated: a corrupt child log makes
@@ -2282,10 +2293,15 @@ pub fn build_children_complete_output(
                 // (`result_by_child`, merged below) rather than aborting
                 // (AC4 / AC5). No transcript is replayed — only the
                 // targeted event is read (AC3).
-                if let Some(r) = child_events.iter().rev().find_map(|e| match &e.payload {
-                    EventPayload::RequestStoreResult { result } => Some(result.clone()),
-                    _ => None,
-                }) {
+                //
+                // Only a result recorded for the child's *current* arrival
+                // counts. A child kept on disk after a failure terminal and
+                // then retried or rewound still carries its earlier arrival's
+                // result; reading that would report a stale failure for a
+                // child that is running again (koto issue 240).
+                if let Some(r) = crate::engine::terminal_result::recorded_result_for_current_arrival(
+                    &child_events,
+                ) {
                     result_by_session.insert(info.id.clone(), r);
                 }
                 on_disk_order.push(task_name.clone());
@@ -2365,6 +2381,15 @@ pub fn build_children_complete_output(
         } = &ev.payload
         {
             event_snapshots.insert(task_name.clone(), (*outcome, final_state.clone()));
+            // A child known only from this record keeps its full session
+            // name, so its entry and its `result_by_child` copy share a key.
+            // Without this a cleaned-up `<parent>.<task>` child without a
+            // batch hook was listed as `<task>`, never matched its result,
+            // and stayed outstanding. An on-disk child already put its own
+            // id here.
+            task_to_session_id
+                .entry(task_name.clone())
+                .or_insert_with(|| child_name.clone());
             if let Some(r) = result {
                 result_by_child.insert(child_name.clone(), r.clone());
             }
@@ -2472,18 +2497,32 @@ pub fn build_children_complete_output(
     //     own log.
     //   * FALL BACK to the parent's `ChildCompleted.result`
     //     (`result_by_child`) when the child has been auto-cleaned and is
-    //     no longer on disk — the existing Issue 1 path.
+    //     no longer on disk — the existing Issue 1 path — or when its log
+    //     or template cannot be read, so its own record can't be trusted.
     //
     // Both maps are keyed by the child's full session id: `entry.name` is
     // the composed `<parent>.<task>` identity (the raw session id for
     // legacy non-composed children) set by both entry builders;
     // `result_by_session` is keyed by the on-disk `info.id` (the same
     // composed id) and `result_by_child` by `ChildCompleted.child_name`.
+    //
+    // The parent's copy is not a fallback for a child whose own log is
+    // readable and classified. A child retried or rewound out of a kept
+    // failure terminal has no result for its current arrival until its
+    // new terminal tick records one, and the parent's copy is the earlier
+    // arrival's; inlining it would report a stale answer, whether the
+    // child is running again or has just landed in a terminal (koto issue
+    // 240). Such a child reads as having no result yet, and its next tick
+    // records one. A child gone from disk, or unreadable, still falls back
+    // to the copy.
     for entry in &mut entries {
-        if let Some(r) = result_by_session
-            .get(&entry.name)
-            .or_else(|| result_by_child.get(&entry.name))
-        {
+        if let Some(r) = result_by_session.get(&entry.name).or_else(|| {
+            if own_log_authoritative.contains(&entry.name) {
+                None
+            } else {
+                result_by_child.get(&entry.name)
+            }
+        }) {
             entry.result = Some(r.clone());
         }
         // A `Skipped` child with no evidence never produces an
@@ -2520,10 +2559,15 @@ pub fn build_children_complete_output(
     // `has_result` is gated on the child-log append succeeding, but a
     // result can still be readable from the parent copy when that append
     // failed (`has_result == false`). Keying on the flag alone would block
-    // a converge FOREVER for a child whose child-log append failed yet
-    // whose parent copy is present. The merge above is exactly that
-    // dual-source dereference, so `entry.result` is the correct authority.
-    // (`has_result` remains useful only as a cheap scan hint upstream.)
+    // a converge FOREVER for a child gone from disk whose child-log append
+    // failed yet whose parent copy is present. The merge above is exactly
+    // that dual-source dereference, so `entry.result` is the correct
+    // authority. (`has_result` remains useful only as a cheap scan hint
+    // upstream.) A child still on disk with a readable, classified log is
+    // read only from that log: if its own append failed it stays
+    // outstanding until its next tick, which is still an arrival and
+    // records the result, rather than being answered by a parent copy that
+    // may belong to an earlier arrival.
     //
     // A `Skipped` child never blocks: it carries a synthesized
     // skipped-status default-summary result (above) and is excluded here.
@@ -4770,6 +4814,69 @@ mod tests {
     /// followed by valid lines and `read_events` returns `Err`, is
     /// covered by
     /// `mid_log_malformed_child_result_still_falls_back_to_parent_copy`.)
+    ///
+    /// The fixture's template path does not resolve, so the child's state
+    /// cannot be classified either; that is what keeps the parent's copy
+    /// eligible. A child whose log reads and whose template classifies is
+    /// read only from its own log (see the inlining loop).
+    /// A cleaned-up `<parent>.<task>` child of a parent WITHOUT a batch
+    /// hook, known only from the parent's `ChildCompleted`, keeps its full
+    /// name, so it matches the result copied under that name and is not
+    /// left outstanding. Before the fix it was listed as `<task>` and never
+    /// matched `result_by_child`, so the gate could never pass.
+    #[test]
+    fn a_cleaned_up_child_of_a_hookless_parent_matches_its_result() {
+        let tmp = TempDir::new().unwrap();
+        let backend = crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        backend
+            .init_state_file("p", child_header_for("", "p"), vec![])
+            .unwrap();
+        backend
+            .append_event(
+                "p",
+                &EventPayload::ChildCompleted {
+                    child_name: "p.t".to_string(),
+                    task_name: "t".to_string(),
+                    outcome: TerminalOutcome::Success,
+                    final_state: "done".to_string(),
+                    result: Some(WorkflowResult {
+                        status: TerminalOutcome::Success,
+                        summary: "completed at done".to_string(),
+                        payload: None,
+                    }),
+                },
+                "2026-01-01T00:00:01Z",
+            )
+            .unwrap();
+        assert!(!backend.exists("p.t"), "the child is gone from disk");
+
+        // A parent template with no `materialize_children` hook.
+        let mut states = BTreeMap::new();
+        states.insert("wait".to_string(), TemplateState::default());
+        let template = CompiledTemplate {
+            format_version: 1,
+            name: "p".to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            initial_state: "wait".to_string(),
+            variables: BTreeMap::new(),
+            states,
+        };
+        let (_, parent_events) = backend.read_events("p").unwrap();
+        let (passes, output) =
+            build_children_complete_output(&backend, "p", &parent_events, &template, "wait", None);
+
+        let children = output["children"].as_array().expect("children array");
+        assert_eq!(children.len(), 1, "{output}");
+        assert_eq!(children[0]["name"], "p.t", "{output}");
+        assert_eq!(
+            children[0]["result"]["summary"], "completed at done",
+            "{output}"
+        );
+        assert_eq!(output["outstanding"], serde_json::json!([]), "{output}");
+        assert!(passes, "the gate passes once the result matches: {output}");
+    }
+
     #[test]
     fn gate_skips_malformed_child_result_and_falls_back_to_parent_copy() {
         let tmp = TempDir::new().unwrap();
