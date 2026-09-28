@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 problem: |
   A failed koto check tells the agent almost nothing: a failing command gate
   reaches it as a bare exit code because koto discards the output it already
@@ -31,7 +31,7 @@ user_visible_surface: true
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 
