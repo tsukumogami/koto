@@ -2637,9 +2637,11 @@ fn append_request_store_result_to_child(
     backend: &dyn SessionBackend,
     child_name: &str,
     result: &WorkflowResult,
+    failure_reason: Option<&str>,
 ) -> bool {
     let payload = EventPayload::RequestStoreResult {
         result: result.clone(),
+        failure_reason: failure_reason.map(str::to_string),
     };
     match backend.append_event(child_name, &payload, &now_iso8601()) {
         Ok(_) => true,
@@ -2753,6 +2755,10 @@ fn resolve_terminal_result(
 #[cfg(unix)]
 struct TerminalRecord {
     result: WorkflowResult,
+    /// The session's `failure_reason` for a failure terminal (koto#278),
+    /// resolved with the result and recorded beside it, so the parent's
+    /// batch view reads the reason the result was reported with.
+    failure_reason: Option<String>,
     /// True when a `request_store.result` for this arrival at the terminal
     /// is already on the log -- a parked session ticked again. The record
     /// is then returned as-is and not appended a second time.
@@ -2783,18 +2789,26 @@ fn terminal_record(
     {
         return TerminalRecord {
             result,
+            failure_reason:
+                crate::engine::terminal_result::recorded_failure_reason_for_current_arrival(&events),
             already_recorded: true,
         };
     }
+    let result =
+        resolve_terminal_result(backend, context_store, name, compiled, final_state, &events);
+    let failure_reason = match result.status {
+        crate::engine::types::TerminalOutcome::Failure => {
+            crate::engine::terminal_result::failure_reason_for_current_run(
+                context_store,
+                name,
+                &events,
+            )
+        }
+        _ => None,
+    };
     TerminalRecord {
-        result: resolve_terminal_result(
-            backend,
-            context_store,
-            name,
-            compiled,
-            final_state,
-            &events,
-        ),
+        result,
+        failure_reason,
         already_recorded: false,
     }
 }
@@ -2828,6 +2842,7 @@ fn append_child_completed_to_parent(
     compiled: &CompiledTemplate,
     final_state: &str,
     result: &WorkflowResult,
+    failure_reason: Option<&str>,
 ) -> ChildCompletedAppend {
     let parent_name = match child_header.parent_workflow.as_deref() {
         Some(p) => p,
@@ -2864,6 +2879,7 @@ fn append_child_completed_to_parent(
         outcome,
         final_state: final_state.to_string(),
         result: Some(result.clone()),
+        failure_reason: failure_reason.map(str::to_string),
     };
     match backend.append_event(parent_name, &payload, &now_iso8601()) {
         Ok(_) => ChildCompletedAppend::Notified,
@@ -2936,15 +2952,16 @@ fn append_terminal_index_for_session(
 /// Everything a session does on the tick that lands it in a terminal
 /// state, in the order DESIGN-request-lifecycle.md Decision 6 fixes:
 ///
-/// 1. Resolve the [`WorkflowResult`] envelope once, so the writes below
-///    cannot disagree about what the child answered. The caller does this
-///    through [`terminal_record`] before printing, because the terminal
+/// 1. Resolve the [`WorkflowResult`] envelope once, and for a failure
+///    terminal the session's `failure_reason` beside it, so the writes
+///    below cannot disagree about what the child answered. The caller does
+///    this through [`terminal_record`] before printing, because the terminal
 ///    `koto next` response carries the same envelope.
-/// 2. Append `request_store.result` to the child's own log, once per
-///    arrival at the terminal.
+/// 2. Append `request_store.result` (with the `failure_reason`) to the
+///    child's own log, once per arrival at the terminal.
 /// 3. **Promote** the envelope onto the bound leg's request log.
 /// 4. Write the terminal-index entry carrying the done-bit from 2.
-/// 5. Append `ChildCompleted` to the parent's log.
+/// 5. Append `ChildCompleted`, carrying copies of both, to the parent's log.
 /// 6. Remove the session, unless `retention` keeps it.
 ///
 /// Step 3 sits before 4 because a crash after the index write would
@@ -3002,7 +3019,9 @@ fn finish_terminal_tick(
     // Step 2, the child's own log, once per arrival. The done-bit for the
     // index entry below means "a durable result is readable", so it is set
     // only when this append succeeded.
-    let has_result = arrival && append_request_store_result_to_child(backend, name, result);
+    let failure_reason = record.failure_reason.as_deref();
+    let has_result =
+        arrival && append_request_store_result_to_child(backend, name, result, failure_reason);
 
     // Step 3: a parked terminal session still resolves its leg, because
     // the requester waiting on it has no way to know the session was
@@ -3028,8 +3047,15 @@ fn finish_terminal_tick(
         append_terminal_index_for_session(backend, name, &post_events, has_result);
     }
     if arrival || remove {
-        let append_result =
-            append_child_completed_to_parent(backend, name, header, compiled, final_state, result);
+        let append_result = append_child_completed_to_parent(
+            backend,
+            name,
+            header,
+            compiled,
+            final_state,
+            result,
+            failure_reason,
+        );
         defer_for_parent = matches!(append_result, ChildCompletedAppend::AppendFailed);
     }
 
@@ -6063,7 +6089,10 @@ fn handle_next(
                     if let crate::engine::types::EventPayload::BatchFinalized { view, .. } =
                         &ev.payload
                     {
-                        envelope.insert("batch_final_view".to_string(), view.clone());
+                        envelope.insert(
+                            "batch_final_view".to_string(),
+                            crate::cli::batch::normalize_frozen_view(view),
+                        );
                     }
                 }
             }
@@ -8190,7 +8219,8 @@ Done.
             "done",
             &events,
         );
-        let has_result = append_request_store_result_to_child(&backend, "child", &synthesized);
+        let has_result =
+            append_request_store_result_to_child(&backend, "child", &synthesized, None);
         assert!(
             has_result,
             "a successful child-log append is the has_result done-bit"
@@ -8203,7 +8233,7 @@ Done.
             .iter()
             .rev()
             .find_map(|e| match &e.payload {
-                EventPayload::RequestStoreResult { result } => Some(result.clone()),
+                EventPayload::RequestStoreResult { result, .. } => Some(result.clone()),
                 _ => None,
             })
             .expect("RequestStoreResult event must be on the child's own log");

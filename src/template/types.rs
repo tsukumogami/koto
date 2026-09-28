@@ -502,6 +502,11 @@ fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
+/// The context key a failed session writes to say why it failed. A parent's
+/// batch view reports it as the child's `reason` (koto#278), and compile
+/// warning W5 checks that a failure terminal has a path writing it.
+pub const FAILURE_REASON_KEY: &str = "failure_reason";
+
 /// Gate type: shell command.
 pub const GATE_TYPE_COMMAND: &str = "command";
 /// Gate type: check whether a context key exists.
@@ -2249,7 +2254,7 @@ impl CompiledTemplate {
     /// | W2 | `children-complete.name_filter` is set but does not end with `.` (ergo not scoped to one parent) |
     /// | W3 | Terminal state whose name matches /block|fail|error/ lacks `failure: true` |
     /// | W4 | State with `materialize_children` routes only on `all_complete: true` without a second transition handling failures |
-    /// | W5 | Terminal state with `failure: true` has no path writing `failure_reason` to context: no accepts field and no `context_assignments` entry on every incoming transition (a `default_action` write is not detected, so templates relying on it may see false positives) |
+    /// | W5 | Terminal state with `failure: true` has no path writing `failure_reason` to context: no `context_assignments` entry on every incoming transition (a `default_action` or `koto context add` write is not detected, so templates relying on one may see false positives) |
     ///
     /// Warnings are returned as formatted strings; callers emit them via
     /// stderr (`validate`) or collect them for tests.
@@ -2390,17 +2395,20 @@ impl CompiledTemplate {
         }
 
         // W5: terminal state with `failure: true` has no path writing
-        // `failure_reason` to context. The design calls out three ways the
-        // context key can land:
-        //   (a) the state's `accepts` block declares a `failure_reason` field
-        //   (b) the state's `default_action` writes `failure_reason`
-        //   (c) the transitions into the state carry a `context_assignments`
+        // `failure_reason` to context. The key can land two ways:
+        //   (a) the transitions into the state carry a `context_assignments`
         //       entry writing `failure_reason`
+        //   (b) a `default_action`, or the agent, runs `koto context add`
         //
-        // (a) and (c) are checked. (c) credits the state only when every
+        // Only (a) is checked, and it credits the state only when every
         // incoming edge assigns the key: a single edge that doesn't is a path
         // reaching the terminal with no reason. A terminal no edge reaches is
-        // not credited by (c).
+        // not credited.
+        //
+        // Declaring `failure_reason` in the terminal state's own `accepts`
+        // is not credited (koto#278): evidence writes no context, and
+        // `koto next --with-data` refuses evidence for a session already in
+        // a terminal state, so the declaration never stores the key.
         //
         // TODO(issue-8/W5): (b) is still unchecked. A default_action is a
         // shell command with no declared set of keys it writes, so W5 can
@@ -2409,10 +2417,6 @@ impl CompiledTemplate {
             if !(state.terminal && state.failure) {
                 continue;
             }
-            let has_failure_reason_accepts = state
-                .accepts
-                .as_ref()
-                .is_some_and(|a| a.contains_key("failure_reason"));
             let incoming: Vec<&Transition> = self
                 .states
                 .values()
@@ -2422,12 +2426,14 @@ impl CompiledTemplate {
             let every_edge_assigns = !incoming.is_empty()
                 && incoming
                     .iter()
-                    .all(|t| t.context_assignments.contains_key("failure_reason"));
-            if !has_failure_reason_accepts && !every_edge_assigns {
+                    .all(|t| t.context_assignments.contains_key(FAILURE_REASON_KEY));
+            if !every_edge_assigns {
                 warnings.push(format!(
                     "W5: state {:?}: `failure: true` terminal state has no declared path writing the `failure_reason` context key; \
                      the batch view's per-child `reason` will fall back to the state name\n  \
-                     remedy: add `failure_reason` to the state's accepts block, or assign it in context_assignments on every transition into the state",
+                     remedy: assign it in context_assignments on the edge out of the state that takes the evidence \
+                     (for example `failure_reason: \"${{evidence.failure_reason}}\"`); an assignment on an auto-advancing state's edge \
+                     resolves to an empty value, so a path through one should assign earlier (W5 then still warns)",
                     state_name
                 ));
             }
@@ -6286,7 +6292,7 @@ command: "./check.sh"
     }
 
     #[test]
-    fn issue8_w5_failure_reason_in_accepts_silences_warning() {
+    fn issue8_w5_failure_reason_in_terminal_accepts_does_not_silence_warning() {
         let mut t = minimal_batch_parent();
         let mut failure_accepts: BTreeMap<String, FieldSchema> = BTreeMap::new();
         failure_accepts.insert(
@@ -6316,9 +6322,11 @@ command: "./check.sh"
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();
+        // A terminal state takes no evidence, so declaring the field there
+        // never stores the key (koto#278).
         assert!(
-            !warnings.iter().any(|w| w.starts_with("W5:")),
-            "W5 should be quiet when failure_reason is in accepts; got: {:?}",
+            warnings.iter().any(|w| w.starts_with("W5:")),
+            "W5 should still fire when failure_reason is only in the terminal's accepts; got: {:?}",
             warnings
         );
     }

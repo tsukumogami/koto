@@ -277,6 +277,12 @@ events:
       final_state:
         type: string
         required: true
+      result:
+        type: object
+        required: false
+      failure_reason:
+        type: string
+        required: false
 
   variable_captured:
     tier: 2
@@ -691,7 +697,7 @@ out of it, or leaves it with `koto next --to`. `state` names the batching state,
 not the state the tick stopped in. A log can hold several: one per batching
 state that ran a batch, and another whenever a batch completes again after a
 retry of one of its children or a rewind, or with different per-child outcomes
-than its last record.
+(or failed children's `reason_source`) than its last record.
 The most recent `batch_finalized` event drives `koto status` batch display after
 children are auto-cleaned, and its `view` is what the `batch_final_view`
 context key holds.
@@ -705,7 +711,7 @@ expect this field in raw log files.
   "type": "batch_finalized",
   "payload": {
     "state": "materialize_children",
-    "view": {"all_complete": true, "total": 5, "success": 4, "failure": 1, "skipped": 0},
+    "view": {"all_complete": true, "total": 5, "success": 4, "failed": 1, "skipped": 0, "children": [...]},
     "timestamp": "2026-05-07T10:05:00.000Z"
   }
 }
@@ -716,6 +722,34 @@ expect this field in raw log files.
 | `state` | string | Yes | The `materialize_children` state the batch finalized from. |
 | `view` | object | Yes | Frozen snapshot of the `children-complete` gate output at finalization time. |
 | `timestamp` | string | Yes | RFC 3339 UTC timestamp. Matches the outer envelope `timestamp`. |
+
+`view` holds the gate's aggregate counts and booleans (`total`, `completed`,
+`pending`, `success`, `failed`, `skipped`, `blocked`, `spawn_failed`,
+`all_complete`, `all_success`, `any_failed`, `any_skipped`,
+`any_spawn_failed`, `needs_attention`) and a `children` array with one entry
+per task. Each entry has `name`, `state`, `complete` and `outcome`, plus the
+fields its outcome adds:
+
+| Field | Present when | Description |
+|-------|--------------|-------------|
+| `reason` | `outcome: "failure"` | Why the child failed: the `failure_reason` context key the child wrote during its current run, or its failure state's name when it wrote none. Folded onto one line and cut to at most 500 characters. The same field `koto status` shows for a failed task. |
+| `failure_mode` | `outcome: "failure"` | The name of the failure state the child ended in. |
+| `reason_source` | failed, skipped or spawn-failed | Where the reason came from: `failure_reason`, `state_name`, `skipped` or `not_spawned`. |
+| `skipped_because` | `outcome: "skipped"` | The closest failed or skipped upstream task. |
+| `skipped_because_chain` | `outcome: "skipped"` | Every failed ancestor, closest first. |
+| `blocked_by` | `outcome: "blocked"` | The `waits_on` entries not yet terminal. |
+| `result` | the child's result is in | The child's `status`, `summary` and optional `payload`. |
+
+A view written by a koto older than `reason` has `failure_mode` and no
+`reason`. The raw log keeps it that way, but the terminal response's
+`batch_final_view` and `koto status` add `reason` from `failure_mode`, the
+state name, when they read it. The `batch_final_view` context key is the view as it was
+written, so a key written by an older koto still lacks `reason`.
+
+A child's `reason` is fixed when the child reaches its failure state: koto
+resolves the `failure_reason` then, records it with the child's result (see
+`child_completed`), and every surface reads that record. A `failure_reason`
+the child writes afterwards changes none of them.
 
 ---
 
@@ -944,9 +978,10 @@ same gate in the same state (e.g., during a polling sequence).
 
 #### `child_completed`
 
-Written to the **parent** session's log when a child workflow reaches a terminal state
-and is about to be auto-cleaned. Consumers replaying historical logs (without live
-child state access) should use this event to reconstruct batch outcomes.
+Written to the **parent** session's log when a child workflow reaches a terminal state,
+whether or not the child is then cleaned up (a child in a failure state is always kept).
+Consumers replaying historical logs (without live child state access) should use this
+event to reconstruct batch outcomes.
 
 ```json
 {
@@ -966,6 +1001,8 @@ child state access) should use this event to reconstruct batch outcomes.
 | `task_name` | string | Yes | Short task name — the segment after the parent prefix dot. |
 | `outcome` | string | Yes | Terminal outcome: `"success"`, `"failure"`, or `"skipped"`. |
 | `final_state` | string | Yes | The child's terminal state name. |
+| `result` | object | No | Copy of the child's result (`status`, `summary`, optional `payload`), so the parent's `children-complete` gate can read it after the child session is gone. |
+| `failure_reason` | string | No | For a child that ended in a failure state, the `failure_reason` context key it wrote during its current run, folded onto one line and cut to at most 500 characters. The same value is recorded on the child's own log with its result. Absent when the child wrote none. The batch view reports it as the child's `reason`. |
 
 ---
 

@@ -34,7 +34,7 @@ This skill is for koto-backed workflows only -- a session koto is already runnin
 
 ## Prerequisites
 
-- koto >= 0.14.1 must be installed and on PATH (`koto version` to verify)
+- koto >= 0.14.2 must be installed and on PATH (`koto version` to verify)
 - You need a compiled koto template (`.md` file with YAML frontmatter)
 
 If koto is not installed or the version is too old, install the latest release:
@@ -362,7 +362,7 @@ Route on the derived booleans rather than raw counts:
 - `any_failed`, `any_skipped`, `any_spawn_failed` — individual signals for templates that need finer control.
 - `needs_attention` — `any_failed OR any_skipped OR any_spawn_failed`. One boolean routes the parent into its retry/escalation branch.
 
-Per-child entries carry an `outcome` enum (`success | failure | skipped | pending | blocked | spawn_failed`). Failed children include a `failure_mode` string; skipped children include a `skipped_because` name and `skipped_because_chain` listing the failed ancestors; blocked children include `blocked_by` with the non-terminal `waits_on` names. A `reason_source` field (`failure_reason | state_name | skipped | not_spawned`) tells agents where the failure explanation came from.
+Per-child entries carry an `outcome` enum (`success | failure | skipped | pending | blocked | spawn_failed`). Failed children include a `reason` string (the `failure_reason` context key the child wrote during its current run, else its failure state's name) and `failure_mode` (the failure state's name); skipped children include a `skipped_because` name and `skipped_because_chain` listing the failed ancestors; blocked children include `blocked_by` with the non-terminal `waits_on` names. A `reason_source` field (`failure_reason | state_name | skipped | not_spawned`) tells agents where the failure explanation came from.
 
 Temporal blocks with `needs_attention: false` resolve on their own — poll `koto next` periodically. When `needs_attention: true` the parent's template typically routes to a retry or analysis state.
 
