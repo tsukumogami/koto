@@ -234,9 +234,14 @@ found. The list holds path text from `PATH` itself and nothing else, and a
 record without it (one written before the field existed) reads as an empty
 list.
 
+A recorded `HOME` or `XDG_CONFIG_HOME` that doesn't exist at recording is kept
+and flagged (`home_absent`, `xdg_config_home_absent`) for the same reason: a new
+session would record the same missing value, so reporting it on every tick with
+"start a new session" as the remedy would send the agent round a loop.
+
 **Stale values.** On every tick, before commands run, koto stats each recorded
-`PATH` directory not listed in `path_absent`, the recorded `HOME` and the
-recorded `XDG_CONFIG_HOME`: a few `stat` calls, no spawn. The missing ones form
+`PATH` directory not listed in `path_absent`, and the recorded `HOME` and
+`XDG_CONFIG_HOME` unless flagged absent: a few `stat` calls, no spawn. The missing ones form
 the tick's stale list; each is a value that existed when it was recorded and
 has since gone. Then:
 
@@ -314,7 +319,9 @@ pub struct CommandEnvironment {
     pub path: Option<String>,             // normalized
     pub path_absent: Vec<String>,         // entries of `path` not on disk when recorded
     pub home: Option<String>,
+    pub home_absent: bool,                // `home` not on disk when recorded
     pub xdg_config_home: Option<String>,
+    pub xdg_config_home_absent: bool,     // likewise
     pub pass: Vec<String>,                // the release's default live names
     pub legacy: bool,                     // --legacy-environment
 }
@@ -396,6 +403,10 @@ polling loop's gate closure, and the `--to` guard; both default-action sites
 pass the same value. The shell and standard input apply to a legacy session
 too: the flag keeps the caller's environment, and neither change carries any
 environment content.
+
+A tick that finds no record refuses (`precondition_failed`) rather than run
+commands with the caller's environment. Adoption makes that unreachable today;
+the refusal keeps the boundary closed if a later change ever breaks it.
 
 The same value keeps, for this tick only, how each gate and action last ended
 (passed, failed, or failed looking not-found), because a command gate's

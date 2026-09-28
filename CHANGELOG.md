@@ -234,8 +234,9 @@ to `0.9.x`).
   error, and koto filters them again at run time. Declaring a name koto sets
   itself compiles with warning W7.
 
-  When a gate or action fails and a recorded value no longer exists, or the
-  command wasn't found (exit 127, or the shell's `not found` message), the
+  When a gate or action fails and a recorded value that existed at creation
+  no longer exists, or the command wasn't found (exit 127, or the shell's
+  `not found` message), the
   `koto next` response's directive opens with a note naming the gate or
   action, the missing values or the recorded `PATH`, and the remedy. Stale
   values with no failure get a notice, and a refused `--to` carries the note in

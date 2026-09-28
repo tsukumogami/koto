@@ -290,6 +290,8 @@ fn command_environment_round_trips_and_is_omitted_when_absent() {
     header.command_environment = Some(CommandEnvironment {
         path: Some("/usr/bin:/bin".to_string()),
         path_absent: Vec::new(),
+        home_absent: false,
+        xdg_config_home_absent: false,
         home: Some("/home/u".to_string()),
         xdg_config_home: None,
         pass: vec!["TMPDIR".to_string()],
@@ -321,6 +323,7 @@ fn a_record_without_path_absent_reads_as_an_empty_list() {
     let header: StateFileHeader = serde_json::from_str(json).expect("older record");
     let record = header.command_environment.unwrap();
     assert!(record.path_absent.is_empty());
+    assert!(!record.home_absent && !record.xdg_config_home_absent);
     assert_eq!(record.path.as_deref(), Some("/usr/bin:/opt/tool/bin"));
 
     let mut with_absent = record.clone();

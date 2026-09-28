@@ -286,15 +286,63 @@ where
         })
         .unwrap_or_default();
 
+    let absent = |v: &Option<String>| v.as_deref().is_some_and(|v| !Path::new(v).exists());
+    let home_absent = absent(&home);
+    let xdg_config_home_absent = absent(&xdg_config_home);
+
     let record = CommandEnvironment {
         path,
         path_absent,
         home,
         xdg_config_home,
+        home_absent,
+        xdg_config_home_absent,
         pass: DEFAULT_LIVE_NAMES.iter().map(|s| s.to_string()).collect(),
         legacy,
     };
     (record, report)
+}
+
+/// The recorded values a tick found missing, as (name, value) pairs; see
+/// [`stale`].
+pub type StaleValues = Vec<(&'static str, String)>;
+
+/// A tick found a session with no command environment record.
+///
+/// Adoption gives every session a record before its commands run, so this
+/// can't happen through the CLI today. If it ever does, the tick refuses
+/// rather than falling back to the caller's environment: this is the boundary
+/// the record exists to hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingRecord;
+
+impl std::fmt::Display for MissingRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the session has no recorded command environment, so its commands can't run; \
+             nothing ran",
+        )
+    }
+}
+
+/// The tick's [`CommandEnv`] and stale list for a session's record, or
+/// [`MissingRecord`] when there is none. Never falls back to this process's
+/// environment for a missing record.
+pub fn for_tick<F>(
+    record: Option<&CommandEnvironment>,
+    pass_env: &[String],
+    session: &str,
+    sessions_base: Option<&Path>,
+    lookup: F,
+) -> Result<(CommandEnv, StaleValues), MissingRecord>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let record = record.ok_or(MissingRecord)?;
+    Ok((
+        build_command_env(record, pass_env, session, sessions_base, lookup),
+        stale(record),
+    ))
 }
 
 /// Build a record from this process's environment.
@@ -398,11 +446,13 @@ where
 
 /// The recorded values that no longer exist on disk: each `PATH` directory
 /// that existed when it was recorded, `HOME` and `XDG_CONFIG_HOME`, as (name,
-/// value) pairs in that order. A `PATH` entry that was already missing then is
-/// ordinary (a directory a tool manager would create) and never reported.
+/// value) pairs in that order. A value that was already missing then is never
+/// reported: a `PATH` entry is ordinary (a directory a tool manager would
+/// create), and a `HOME` or `XDG_CONFIG_HOME` a new session would record just
+/// the same, so the remedy the report names wouldn't help.
 ///
 /// A legacy record is never stale; its commands use the caller's values.
-pub fn stale(record: &CommandEnvironment) -> Vec<(&'static str, String)> {
+pub fn stale(record: &CommandEnvironment) -> StaleValues {
     let mut missing = Vec::new();
     if record.legacy {
         return missing;
@@ -414,12 +464,16 @@ pub fn stale(record: &CommandEnvironment) -> Vec<(&'static str, String)> {
             }
         }
     }
-    for (name, value) in [
-        ("HOME", &record.home),
-        ("XDG_CONFIG_HOME", &record.xdg_config_home),
+    for (name, value, absent_at_creation) in [
+        ("HOME", &record.home, record.home_absent),
+        (
+            "XDG_CONFIG_HOME",
+            &record.xdg_config_home,
+            record.xdg_config_home_absent,
+        ),
     ] {
         if let Some(value) = value {
-            if !Path::new(value).exists() {
+            if !absent_at_creation && !Path::new(value).exists() {
                 missing.push((name, value.clone()));
             }
         }
@@ -444,6 +498,8 @@ mod tests {
         CommandEnvironment {
             path: path.map(str::to_string),
             path_absent: Vec::new(),
+            home_absent: false,
+            xdg_config_home_absent: false,
             home: Some("/home/someone".to_string()),
             xdg_config_home: None,
             pass: pass.iter().map(|n| n.to_string()).collect(),
@@ -520,6 +576,39 @@ mod tests {
         rec.path_absent = vec![gone.clone()];
         assert_eq!(stale(&rec), vec![("HOME", gone)]);
         rec.legacy = true;
+        assert!(stale(&rec).is_empty());
+    }
+
+    #[test]
+    fn a_tick_without_a_record_is_refused_not_given_the_callers_environment() {
+        let refused = for_tick(None, &[], "wf", None, env(&[("PATH", "/usr/bin")]));
+        assert_eq!(refused.err(), Some(MissingRecord));
+        let rec = record(Some("/usr/bin"), &[]);
+        let (built, _) = for_tick(Some(&rec), &[], "wf", None, env(&[])).unwrap();
+        assert!(!built.inherits());
+    }
+
+    #[test]
+    fn a_home_or_xdg_missing_at_recording_is_flagged_and_never_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("never").to_string_lossy().into_owned();
+        let present = dir.path().to_string_lossy().into_owned();
+        let (rec, _) = record_from(
+            env(&[
+                ("HOME", gone.as_str()),
+                ("XDG_CONFIG_HOME", present.as_str()),
+            ]),
+            false,
+        );
+        assert!(rec.home_absent);
+        assert!(!rec.xdg_config_home_absent);
+        assert!(
+            stale(&rec).is_empty(),
+            "a HOME missing at recording isn't stale"
+        );
+
+        let (rec, _) = record_from(env(&[("XDG_CONFIG_HOME", gone.as_str())]), false);
+        assert!(rec.xdg_config_home_absent);
         assert!(stale(&rec).is_empty());
     }
 

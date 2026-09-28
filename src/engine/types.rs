@@ -267,6 +267,14 @@ pub struct CommandEnvironment {
     /// `XDG_CONFIG_HOME` at creation; `None` when unset or not absolute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xdg_config_home: Option<String>,
+    /// True when the recorded `home` didn't exist when it was recorded, so
+    /// the stale check never reports it: a new session would record the same
+    /// missing value, and the remedy would loop.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub home_absent: bool,
+    /// The same for the recorded `xdg_config_home`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub xdg_config_home_absent: bool,
     /// The default live names of the koto release that made the record.
     #[serde(default)]
     pub pass: Vec<String>,

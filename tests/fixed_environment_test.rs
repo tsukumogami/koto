@@ -325,13 +325,33 @@ fn credential_markers_never_reach_the_session_directory() {
                 );
             }
         }
-        // Values are recorded only for the three fixed variables.
+        // Values are recorded only for the three fixed variables; the other
+        // keys are names, flags, or entries of the recorded PATH. Which PATH
+        // directories exist differs by host, so `path_absent` is checked
+        // against the recorded PATH rather than against a fixed list.
         let rec = env.record(&name);
         let keys: Vec<&String> = rec.as_object().unwrap().keys().collect();
         for key in keys {
             assert!(
-                ["path", "home", "xdg_config_home", "pass", "legacy"].contains(&key.as_str()),
+                [
+                    "path",
+                    "path_absent",
+                    "home",
+                    "home_absent",
+                    "xdg_config_home",
+                    "xdg_config_home_absent",
+                    "pass",
+                    "legacy"
+                ]
+                .contains(&key.as_str()),
                 "unexpected record key {key}"
+            );
+        }
+        let entries: Vec<&str> = rec["path"].as_str().unwrap_or("").split(':').collect();
+        for absent in rec["path_absent"].as_array().into_iter().flatten() {
+            assert!(
+                entries.contains(&absent.as_str().unwrap()),
+                "path_absent holds {absent}, which isn't an entry of the recorded PATH"
             );
         }
     }

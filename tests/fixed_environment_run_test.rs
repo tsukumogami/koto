@@ -725,6 +725,27 @@ fn a_recorded_home_removed_after_init_is_named() {
     assert!(note.contains(&format!("HOME {}", home.display())), "{note}");
 }
 
+/// A `HOME` that didn't exist when the session was created is never called
+/// stale: a new session would record the same value, so the remedy would loop.
+#[test]
+fn a_home_missing_at_creation_is_not_reported_stale() {
+    let env = Env::new();
+    let never = env.home().join("never-created-home");
+    let cache = env.home().join("cache");
+    let tpl = env.template("fails.md", &gate_template("fails", "exit 1"));
+    env.init(
+        &[
+            ("HOME", never.to_str().unwrap()),
+            ("XDG_CACHE_HOME", cache.to_str().unwrap()),
+        ],
+        "wf",
+        &tpl,
+    );
+    let r = env.next(&[], "wf");
+    assert!(r.success, "{}", r.stderr);
+    assert!(!r.directive().contains("[koto]"), "{}", r.directive());
+}
+
 #[test]
 fn no_note_text_reaches_an_actions_captured_output() {
     let env = Env::new();

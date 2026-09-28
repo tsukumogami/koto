@@ -4337,21 +4337,27 @@ fn handle_next(
 
     // The environment every command this tick runs with, built once so a
     // gate, the `--to` guard and an action can't see different ones
-    // (DESIGN-koto-fixed-environment.md). The record is always present here:
-    // a session without one adopted it above. The stale list is a few `stat`
-    // calls; it only shapes the notes on the response.
-    let (command_env, stale_values) = match header.command_environment.as_ref() {
-        Some(record) => (
-            crate::engine::command_env::build_command_env(
-                record,
-                &compiled.pass_env,
-                &name,
-                backend.session_dir(&name).parent(),
-                |n| std::env::var(n).ok(),
-            ),
-            crate::engine::command_env::stale(record),
-        ),
-        None => (crate::action::CommandEnv::inherit(), Vec::new()),
+    // (DESIGN-koto-fixed-environment.md). A session without a record adopted
+    // one above, so a missing record here is a defect; the tick refuses rather
+    // than running commands with the caller's environment. The stale list is a
+    // few `stat` calls; it only shapes the notes on the response.
+    let (command_env, stale_values) = match crate::engine::command_env::for_tick(
+        header.command_environment.as_ref(),
+        &compiled.pass_env,
+        &name,
+        backend.session_dir(&name).parent(),
+        |n| std::env::var(n).ok(),
+    ) {
+        Ok(built) => built,
+        Err(missing) => {
+            let ne = NextError {
+                code: NextErrorCode::PreconditionFailed,
+                message: format!("session '{}': {}", name, missing),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
+        }
     };
 
     // The one gate evaluator this tick uses, wherever it evaluates gates.

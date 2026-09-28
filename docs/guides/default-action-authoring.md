@@ -333,7 +333,9 @@ Recording cleans the values up first:
   characters long, koto records the variable unset rather than write the credential down.
 - **Directories that don't exist yet stay.** A `PATH` entry that isn't a directory at recording
   stays in `PATH`, so a tool installed there later is found, and is listed in the record's
-  `path_absent`, so the stale check below doesn't report it.
+  `path_absent`, so the stale check below doesn't report it. A `HOME` or `XDG_CONFIG_HOME` that
+  doesn't exist at recording is kept too, and flagged (`home_absent`, `xdg_config_home_absent`)
+  so it isn't reported either.
 
 When recording dropped an entry or left a value unset, the `koto init` response carries an
 `environment` report. It names variables and gives the dropped entries, and never shows a
@@ -382,9 +384,9 @@ The next tick finds the record and takes the ordinary path.
 #### When a recorded value goes stale
 
 Before commands run, each tick checks that the recorded `HOME`, `XDG_CONFIG_HOME` and each
-recorded `PATH` directory not in `path_absent` still exist. A `PATH` directory that was already
-missing at recording is listed in `path_absent` and never reported; any other missing value is
-stale. Tools move: a version manager removes an old version, a dev shell deletes
+recorded `PATH` directory not in `path_absent` still exist. A value that was already missing at
+recording is flagged in the record and never reported, since a new session would record it just
+the same; any other missing value is stale. Tools move: a version manager removes an old version, a dev shell deletes
 its directory on exit.
 
 If a gate or action then fails, and either something is stale or the failure looks like a

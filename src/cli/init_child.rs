@@ -1792,6 +1792,8 @@ Done.
         crate::engine::types::CommandEnvironment {
             path: Some("/parent-only/bin:/usr/bin".to_string()),
             path_absent: Vec::new(),
+            home_absent: false,
+            xdg_config_home_absent: false,
             home: Some("/parent-only/home".to_string()),
             xdg_config_home: None,
             pass: vec!["TMPDIR".to_string()],

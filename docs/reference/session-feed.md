@@ -462,6 +462,8 @@ runs with:
 | `path_absent` | array of strings | No | Entries of `path` that weren't directories when the record was made. They stay in `path`; the stale check skips them. Absent when empty. |
 | `home` | string | No | `HOME` at creation. Absent when unset, relative, or containing a credential's value. |
 | `xdg_config_home` | string | No | `XDG_CONFIG_HOME` at creation, under the same rules as `home`. |
+| `home_absent` | boolean | No | `true` when the recorded `home` didn't exist when the record was made; the stale check skips it. Absent when false. |
+| `xdg_config_home_absent` | boolean | No | The same for `xdg_config_home`. Absent when false. |
 | `pass` | array of strings | Yes | The default list of names whose live values reach commands, as it stood in the koto release that made the record. Names only. The example above shortens it. |
 | `legacy` | boolean | No | `true` when the session was created with `koto init --legacy-environment`, so its commands run with the ticking process's whole environment. Absent when false. |
 
