@@ -817,11 +817,14 @@ fn attach(
     // (DESIGN-koto-fixed-environment.md, R14): attach writes no record, and
     // the session's commands run with the recorded values whoever ticks it.
     // Names only, never values. A session with no record isn't compared; its
-    // next tick adopts one.
+    // next tick adopts one. A legacy session isn't compared either: its
+    // commands do run with the caller's environment, so there's nothing to
+    // warn about.
     let environment_drift = existing
         .header
         .command_environment
         .as_ref()
+        .filter(|record| !record.legacy)
         .map(|record| crate::engine::command_env::drift(record, |n| std::env::var(n).ok()))
         .unwrap_or_default();
 

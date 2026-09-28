@@ -284,8 +284,9 @@ pub fn record_from_process(legacy: bool) -> (CommandEnvironment, RecordReport) {
     record_from(|name| std::env::var(name).ok(), legacy)
 }
 
-/// The fixed variables whose values in a caller's environment, read through
-/// `lookup`, differ from a session's record, in `FIXED_NAMES` order.
+/// The fixed variables (`PATH`, `HOME`, `XDG_CONFIG_HOME`, in that order)
+/// whose values in a caller's environment, read through `lookup`, differ
+/// from a session's record.
 ///
 /// Names only: an attach reports which variables drifted, never a value,
 /// the same rule as the `koto init` response. The caller's values are

@@ -720,6 +720,17 @@ fn a_batch_parent_adopts_before_it_spawns_and_children_copy_it() {
         parent_rec,
         "child copies the adopted record"
     );
+    // A child spawned in the same tick would record the same values from this
+    // process even if spawning came first, so the order is asserted directly:
+    // adoption's event precedes the scheduler's.
+    let seq = |kind: &str| -> u64 {
+        events_of_type(&env, "parent", kind)
+            .first()
+            .unwrap_or_else(|| panic!("no {kind} event"))["seq"]
+            .as_u64()
+            .unwrap()
+    };
+    assert!(seq("environment_adopted") < seq("scheduler_ran"));
 
     // A child that exists before the upgrade adopts on its own first tick.
     strip_record(&env, "parent.A");
@@ -768,6 +779,70 @@ fn attach_reports_drift_by_name_and_refuses_nothing() {
         assert!(!output.contains(SYSTEM_PATH), "{output}");
     }
     assert_eq!(env.record("wf"), before, "attach never changes the record");
+}
+
+#[test]
+fn attach_to_a_legacy_session_reports_no_drift() {
+    let env = Env::new();
+    let tpl = env.template("wait.md", WAIT);
+    assert!(
+        env.run(
+            &[],
+            &["init", "wf", "--template", &tpl, "--legacy-environment"]
+        )
+        .success
+    );
+    let other = format!("/opt/elsewhere/bin:{SYSTEM_PATH}");
+    let r = env.run(
+        &[("PATH", &other)],
+        &["init", "wf", "--template", &tpl, "--attach-live"],
+    );
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.json.get("environment_drift").is_none(), "{}", r.stdout);
+}
+
+#[test]
+fn a_displaced_writer_does_not_adopt() {
+    // A --with-data write to a child log with the wrong dispatch epoch is
+    // refused at the fence, which runs before adoption.
+    let env = Env::new();
+    let tpl = env.template("wait.md", WAIT);
+    assert!(env.run(&[], &["init", "p", "--template", &tpl]).success);
+    assert!(
+        env.run(&[], &["init", "p.kid", "--template", &tpl, "--parent", "p"])
+            .success
+    );
+    strip_record(&env, "p.kid");
+    // The fence covers dispatched (needs-agent) children only.
+    let state = env.state_path("p.kid");
+    let text = std::fs::read_to_string(&state).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut header: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    header["needs_agent"] = serde_json::json!(true);
+    lines[0] = header.to_string();
+    std::fs::write(&state, lines.join("\n") + "\n").unwrap();
+    let r = env.run(
+        &[],
+        &[
+            "next",
+            "p.kid",
+            "--with-data",
+            r#"{"go":"yes"}"#,
+            "--dispatch-epoch",
+            "99",
+        ],
+    );
+    assert!(!r.success, "the fence must refuse: {}", r.stdout);
+    assert!(
+        r.stdout.contains("epoch_fence_violation"),
+        "refused by the fence, not an earlier check: {}",
+        r.stdout
+    );
+    assert!(
+        env.record("p.kid").is_null(),
+        "a refused writer records nothing"
+    );
+    assert!(events_of_type(&env, "p.kid", "environment_adopted").is_empty());
 }
 
 #[test]

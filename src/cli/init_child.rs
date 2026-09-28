@@ -538,15 +538,28 @@ pub(crate) fn resolve_command_environment(
 const ENVIRONMENT_LOCK_FILE: &str = "environment.lock";
 
 /// Give an older session a command environment record on its first tick
-/// (DESIGN-koto-fixed-environment.md, R16).
+/// (DESIGN-koto-fixed-environment.md; PRD R16).
 ///
 /// Under an exclusive lock on the session's `environment.lock`, re-read the
-/// header. If a record is already there -- another tick adopted first -- return
-/// it with no report and write nothing. Otherwise record this process's fixed
-/// values and koto's default live names (never the legacy flag), append an
-/// `environment_adopted` event, then rewrite the header: the anchor's order,
-/// so a crash between the two writes repeats a visible adoption rather than
-/// leaving a silent one. The report is `Some` only when this call adopted.
+/// local header. If a record is already there -- another tick adopted first --
+/// return it with no report and write nothing. Otherwise record this process's
+/// fixed values and koto's default live names (never the legacy flag), append
+/// an `environment_adopted` event, rewrite the header, and push the state file.
+/// The event goes first so a crash between the two writes leaves a visible
+/// adoption the next tick repeats, not a silent one (the execution anchor's
+/// adoption uses the same order). The report is `Some` only when this call
+/// adopted.
+///
+/// Why a lock of its own: `lock_state_file` is non-blocking and is held across
+/// a batch parent's scheduling, so two ticks racing here would fail instead of
+/// waiting. This lock is held only for the few writes below.
+///
+/// The read is local (`read_events_local`) because a pulling read on the cloud
+/// backend would replace the local state file with the remote one inside the
+/// lock, discarding header changes this tick already made locally, such as an
+/// adopted execution anchor. The push afterwards is strict: a record nothing
+/// can change must reach the remote copy, or a later tick's pull would lose it
+/// and adopt again.
 pub(crate) fn adopt_command_environment(
     backend: &dyn SessionBackend,
     name: &str,
@@ -563,7 +576,7 @@ pub(crate) fn adopt_command_environment(
         .with_context(|| format!("failed to open {} for {:?}", ENVIRONMENT_LOCK_FILE, name))?;
     lock_exclusive(&lock)?;
 
-    let header = backend.read_header(name)?;
+    let (header, _) = backend.read_events_local(name)?;
     if let Some(existing) = header.command_environment {
         return Ok((existing, None));
     }
@@ -580,7 +593,9 @@ pub(crate) fn adopt_command_environment(
         h.command_environment = Some(written);
         h
     })?;
-    // The lock is released when `lock` drops, after the header is written.
+    backend
+        .ensure_pushed(name)
+        .map_err(|e| anyhow::anyhow!("failed to push the adopted command environment: {}", e))?;
     drop(lock);
     Ok((record, Some(report)))
 }
@@ -603,7 +618,9 @@ fn lock_exclusive(file: &std::fs::File) -> anyhow::Result<()> {
 
 #[cfg(not(unix))]
 fn lock_exclusive(_file: &std::fs::File) -> anyhow::Result<()> {
-    Ok(())
+    Err(anyhow::anyhow!(
+        "adopting a command environment needs flock, which is only available on Unix"
+    ))
 }
 
 /// The origin record for a session about to be created: its execution

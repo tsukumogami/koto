@@ -850,8 +850,9 @@ pub enum EventPayload {
     /// arrived after the fact and which `PATH` entries were dropped.
     ///
     /// Carries the record itself, which holds no secret: the three fixed
-    /// values and a list of names. At most one appears per session, because
-    /// the header field is what the next tick finds.
+    /// values and a list of names. Normally one appears per session, because
+    /// the header field is what the next tick finds; a crash between the
+    /// event and the header write leaves one the next tick repeats.
     EnvironmentAdopted {
         environment: CommandEnvironment,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
