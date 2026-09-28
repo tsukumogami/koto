@@ -698,17 +698,22 @@ lands in prose and possibly in a shell word, not a transcript. The allowlist alr
 newlines, so anything approaching 4096 bytes is a template mistake -- the bound is there to say
 so early rather than to ration anything.
 
-### The three ways delivery fails
+### The four ways delivery fails
 
 After the command exits zero, koto trims the output and then checks it, in this order:
 
 1. **Empty.** Nothing, or nothing but whitespace.
-2. **Too large.** The trimmed value exceeds 4096 bytes.
-3. **A character the allowlist forbids.** The same allowlist every declared variable passes:
+2. **Redacted.** The output held a credential koto knows about -- a token or proxy password
+   from the environment, a `pass_env:` value, or koto's own decider or cloud key -- and koto
+   replaced it with a `[REDACTED:<source>]` marker before anything read the output. A marker
+   is never stored as a variable, so the capture is refused, and `capture_error` carries a
+   `source` naming the variable or setting the credential came from, never its value.
+3. **Too large.** The trimmed value exceeds 4096 bytes.
+4. **A character the allowlist forbids.** The same allowlist every declared variable passes:
    `^[a-zA-Z0-9._/:@+ \-]*$`. It forbids newlines, which is why a multi-line capture isn't
    representable and why trimming is mandatory rather than a courtesy.
 
-All three are action failures, not skips -- the same stop, the same `__action__` condition, the
+All four are action failures, not skips -- the same stop, the same `__action__` condition, the
 same `fallback` prose -- with `failure_kind: "capture_failed"` and a `capture_error` object
 naming the case:
 
@@ -724,7 +729,8 @@ naming the case:
  "capture_error":{"key":"BRANCH","case":"disallowed_character","position":3,"character":"("}}
 ```
 
-The `too_large` case carries `bytes` and `limit` instead of `position` and `character`.
+The `too_large` case carries `bytes` and `limit` instead of `position` and `character`, and the
+`redacted` case carries `source`.
 
 Skipping the delivery was the obvious alternative and it's wrong three times over. A skip is a
 silent drop. It doesn't make the problem go away, it defers it to the reading state, where the

@@ -443,9 +443,15 @@ byte read; an Aho-Corasick automaton finds all overlapping matches, which merge
 into spans; each span becomes one marker; output is emitted by raw offset up to
 `limit`, with a span that starts before `limit` emitted whole; a final cut at
 `limit` backs off to the start of any marker it would split and to a character
-boundary. When koto killed the process (timeout, wait failure), a trailing
-suffix of 8 or more bytes that is a prefix of a known value is masked too. Each
-stream reports its own truncation flag. With an empty known set the output is
+boundary. When koto killed the process (timeout, wait failure) and the reader
+kept everything the stream carried, a trailing suffix of 8 or more bytes that
+is a prefix of a known value is masked too. (The condition is on what the
+reader kept, not on the capture bound: a value that starts before the bound
+and is cut off by the kill just past it would otherwise leave a fragment.)
+Each stream reports its own truncation flag, set when the stream carried more
+than the bound or its markers pushed it past the bound; in the rare case of a
+marker running to the end of a stream just over the bound, the flag says cut
+when nothing is missing, which errs toward telling the reader to look. With an empty known set the output is
 byte-identical to today's.
 
 #### Alternatives Considered
@@ -550,8 +556,12 @@ template field. A consumer that ignores the new fields sees today's koto.
   `__action__`; `AdvanceResult` gains `attempts: Option<AttemptCounts>`.
 - **`src/cli/mod.rs`.** The action closure returns the redacted
   `CommandOutput`, the capture result and whether it spawned, and no longer
-  appends; `mark_truncated` uses the per-stream flags; `capture_stdout_as`
-  refuses a marker with the new `redacted` case.
+  appends; `mark_truncated` uses the per-stream flags.
+- **`src/engine/advance.rs` capture check.** `prepare_capture`, where a
+  capture is already checked, refuses a value holding a marker with the new
+  `redacted` case, after the empty check and before the size and allowlist
+  checks, so the author sees the real cause rather than a size or character
+  error the marker would also trip.
 - **`src/cli/next_types.rs`.** `BlockingCondition.failure`, skipped when
   absent. `attempts` is added to the serialized JSON envelope beside `leg`, the
   way `leg` is added today, whenever the advance result carries counts and the

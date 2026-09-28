@@ -250,6 +250,10 @@ const CAPTURE_FAILED_KIND: &str = "capture_failed";
 pub enum CaptureError {
     /// The command wrote nothing, or nothing but whitespace.
     Empty { key: String },
+    /// The trimmed output holds a redaction marker: the command printed a
+    /// known credential, which koto replaced before anything read it.
+    /// `source` names where the credential came from, never its value.
+    Redacted { key: String, source: String },
     /// The trimmed output is larger than [`MAX_CAPTURE_BYTES`].
     TooLarge { key: String, bytes: usize },
     /// The trimmed output holds a character the variable allowlist forbids --
@@ -272,6 +276,11 @@ impl CaptureError {
             CaptureError::Empty { key } => serde_json::json!({
                 "key": key,
                 "case": "empty",
+            }),
+            CaptureError::Redacted { key, source } => serde_json::json!({
+                "key": key,
+                "case": "redacted",
+                "source": source,
             }),
             CaptureError::TooLarge { key, bytes } => serde_json::json!({
                 "key": key,
@@ -296,15 +305,24 @@ impl CaptureError {
 /// Prepare a command's stdout for delivery under `key`.
 ///
 /// The order is fixed (DESIGN-koto-runs-commands.md, "Capture delivery and its
-/// three failure cases"): trim, reject empty, reject oversize, then run the
-/// value through the same `validate_value` allowlist every declared variable
-/// passes. Reusing that function rather than restating the character set means
+/// three failure cases"): trim, reject empty, reject a value holding a
+/// redaction marker (DESIGN-koto-failure-reporting.md, Decision 5), reject
+/// oversize, then run the value through the same `validate_value` allowlist
+/// every declared variable passes. The marker check comes before the size and
+/// allowlist checks, both of which a marker would also fail, so the refusal
+/// names what actually happened. Reusing that function rather than restating the character set means
 /// a future widening is a single reviewed change both paths inherit.
 pub fn prepare_capture(key: &str, stdout: &str) -> Result<String, CaptureError> {
     let value = stdout.trim();
     if value.is_empty() {
         return Err(CaptureError::Empty {
             key: key.to_string(),
+        });
+    }
+    if let Some(source) = crate::redact::first_marker_source(value) {
+        return Err(CaptureError::Redacted {
+            key: key.to_string(),
+            source: source.to_string(),
         });
     }
     if value.len() > MAX_CAPTURE_BYTES {
@@ -3851,6 +3869,22 @@ mod tests {
             Err(CaptureError::Empty {
                 key: "BRANCH".to_string()
             })
+        );
+    }
+
+    #[test]
+    fn prepare_capture_refuses_a_redacted_value_naming_the_source() {
+        let err = prepare_capture("TOKEN", " [REDACTED:GH_TOKEN]\n").unwrap_err();
+        assert_eq!(
+            err,
+            CaptureError::Redacted {
+                key: "TOKEN".to_string(),
+                source: "GH_TOKEN".to_string()
+            }
+        );
+        assert_eq!(
+            err.to_json(),
+            serde_json::json!({"key": "TOKEN", "case": "redacted", "source": "GH_TOKEN"})
         );
     }
 

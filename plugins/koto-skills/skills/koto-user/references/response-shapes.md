@@ -670,8 +670,13 @@ response. The failure rides `blocking_conditions` under the reserved name `__act
 - `output.stdout` and `output.stderr` are bounded at 64 KB each; `output.truncated` says
   whether either was cut.
 - `capture_failed` adds a `capture_error` object naming the case —
-  `{"key": "BRANCH", "case": "empty"}`, `"too_large"` (with `bytes` and `limit`), or
+  `{"key": "BRANCH", "case": "empty"}`, `"redacted"` (with `source`, the variable or
+  setting whose credential the output held), `"too_large"` (with `bytes` and `limit`), or
   `"disallowed_character"` (with `position` and `character`).
+- `output.stdout` and `output.stderr` never carry a credential koto knows about: each is
+  replaced with `[REDACTED:<source>]`, where `source` names a variable or a configuration
+  setting (a setting name contains a dot). The marker names where the value came from,
+  never the value.
 - **The state's gates did not evaluate.** The tick returns ahead of gate evaluation, so
   this response carries exactly one condition and no gate results, even for a state that
   declares gates. Nothing advanced, and no later state's action ran.

@@ -1061,6 +1061,7 @@ dependencies = [
 name = "koto"
 version = "0.14.2-dev"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "assert_cmd",
  "assert_fs",

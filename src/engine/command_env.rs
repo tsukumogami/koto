@@ -94,8 +94,9 @@ const CREDENTIAL_CARRIERS: &[&str] = &[
 ];
 
 /// A credential value shorter than this is too short to search for without
-/// matching ordinary path text by accident.
-const MIN_CREDENTIAL_LEN: usize = 8;
+/// matching ordinary path text by accident. The same floor applies to the
+/// values redaction searches captured output for.
+const MIN_CREDENTIAL_LEN: usize = crate::redact::MIN_VALUE_LEN;
 
 /// Names refused exactly: they make the shell source a file at start-up, or
 /// make `git` or `gh` run a program or load configuration of the caller's
@@ -328,21 +329,111 @@ impl std::fmt::Display for MissingRecord {
 /// The tick's [`CommandEnv`] and stale list for a session's record, or
 /// [`MissingRecord`] when there is none. Never falls back to this process's
 /// environment for a missing record.
+///
+/// `config_keys` are koto's own configured secrets as `(source, value)`
+/// pairs, from the configuration the caller already loaded (see
+/// `crate::config::redaction_keys`). They join the tick's known set, built by
+/// [`known_credentials`] and stored on the returned environment, so every
+/// command's output is redacted against it.
 pub fn for_tick<F>(
     record: Option<&CommandEnvironment>,
     pass_env: &[String],
     session: &str,
     sessions_base: Option<&Path>,
+    config_keys: &[(String, String)],
     lookup: F,
 ) -> Result<(CommandEnv, StaleValues), MissingRecord>
 where
     F: Fn(&str) -> Option<String>,
 {
     let record = record.ok_or(MissingRecord)?;
+    let redactor = known_credentials(record, pass_env, config_keys, &lookup);
     Ok((
-        build_command_env(record, pass_env, session, sessions_base, lookup),
+        build_command_env(record, pass_env, session, sessions_base, &lookup)
+            .with_redactor(redactor),
         stale(record),
     ))
+}
+
+/// The password in a proxy URL's userinfo (`scheme://user:password@host`),
+/// percent-decoded. `None` when there is no password or it doesn't decode
+/// to UTF-8.
+fn proxy_password(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let (userinfo, _) = authority.rsplit_once('@')?;
+    let (_, password) = userinfo.split_once(':')?;
+    let bytes = password.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The tick's known credentials, as a [`Redactor`] for captured output
+/// (DESIGN-koto-failure-reporting.md, Decision 5).
+///
+/// In priority order, the first source naming a value that several carry:
+/// the live value of each credential-carrying variable, plus the
+/// percent-decoded password of any proxy URL among them; the value of each
+/// template `pass_env:` name that reaches a command, filtered by name
+/// exactly as [`build_command_env`] filters it; then `config_keys`. A legacy
+/// session's commands inherit the caller's environment, which `lookup`
+/// reads, so the same names are looked up there. The names on the record's
+/// default list other than the carriers hold no secret and aren't searched
+/// for. Values shorter than eight bytes are dropped by the redactor.
+pub fn known_credentials<F>(
+    record: &CommandEnvironment,
+    pass_env: &[String],
+    config_keys: &[(String, String)],
+    lookup: F,
+) -> crate::redact::Redactor
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut known: Vec<(String, String)> = Vec::new();
+    for name in CREDENTIAL_CARRIERS {
+        if let Some(value) = lookup(name) {
+            let password = proxy_password(&value);
+            known.push((name.to_string(), value));
+            if let Some(password) = password {
+                known.push((name.to_string(), password));
+            }
+        }
+    }
+
+    let mut seen: Vec<&str> = Vec::new();
+    for (i, name) in record.pass.iter().chain(pass_env.iter()).enumerate() {
+        let name = name.as_str();
+        if seen.contains(&name)
+            || is_refused(name)
+            || FIXED_NAMES.contains(&name)
+            || KOTO_SET_NAMES.contains(&name)
+        {
+            continue;
+        }
+        seen.push(name);
+        if i < record.pass.len() {
+            continue;
+        }
+        if let Some(value) = lookup(name) {
+            known.push((name.to_string(), value));
+        }
+    }
+
+    known.extend(config_keys.iter().cloned());
+    crate::redact::Redactor::new(known)
 }
 
 /// Build a record from this process's environment.
@@ -581,10 +672,10 @@ mod tests {
 
     #[test]
     fn a_tick_without_a_record_is_refused_not_given_the_callers_environment() {
-        let refused = for_tick(None, &[], "wf", None, env(&[("PATH", "/usr/bin")]));
+        let refused = for_tick(None, &[], "wf", None, &[], env(&[("PATH", "/usr/bin")]));
         assert_eq!(refused.err(), Some(MissingRecord));
         let rec = record(Some("/usr/bin"), &[]);
-        let (built, _) = for_tick(Some(&rec), &[], "wf", None, env(&[])).unwrap();
+        let (built, _) = for_tick(Some(&rec), &[], "wf", None, &[], env(&[])).unwrap();
         assert!(!built.inherits());
     }
 
@@ -774,5 +865,76 @@ mod tests {
         let (rec, report) = record_from(env(&[("GH_TOKEN", "bin"), ("PATH", "/usr/bin")]), false);
         assert_eq!(rec.path.as_deref(), Some("/usr/bin"));
         assert!(report.is_empty());
+    }
+
+    fn redacted(r: &crate::redact::Redactor, text: &str) -> String {
+        crate::redact::redact_str(text, r).into_string()
+    }
+
+    #[test]
+    fn the_known_set_holds_carriers_proxy_passwords_pass_env_and_config_keys() {
+        let rec = record(Some("/usr/bin"), &["LANG", "GH_TOKEN", "HTTPS_PROXY"]);
+        let lookup = env(&[
+            ("GH_TOKEN", "ghp_tokenvalue01"),
+            ("HTTPS_PROXY", "http://me:p%40ssw0rd-long@proxy:3128"),
+            ("LANG", "C.UTF-8-longish"),
+            ("GH_DB", "db-secret-value"),
+            ("BASH_ENV", "/tmp/evil-file"),
+            ("PATH", "/usr/bin:/opt/secretish"),
+        ]);
+        let pass_env: Vec<String> = ["GH_DB", "BASH_ENV", "PATH", "LANG"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let config = vec![("decider.api_key".to_string(), "sk-config-value".to_string())];
+        let r = known_credentials(&rec, &pass_env, &config, &lookup);
+        assert_eq!(
+            redacted(
+                &r,
+                "ghp_tokenvalue01 p@ssw0rd-long db-secret-value sk-config-value"
+            ),
+            "[REDACTED:GH_TOKEN] [REDACTED:HTTPS_PROXY] [REDACTED:GH_DB] \
+             [REDACTED:decider.api_key]"
+        );
+        // Default live names other than the carriers, refused names, fixed
+        // names and a pass_env name the record already passes aren't
+        // searched for.
+        for plain in [
+            "C.UTF-8-longish",
+            "/tmp/evil-file",
+            "/usr/bin:/opt/secretish",
+        ] {
+            assert_eq!(redacted(&r, plain), plain);
+        }
+        assert!(!format!("{:?}", r).contains("tokenvalue"));
+    }
+
+    #[test]
+    fn a_tick_env_carries_the_known_set_and_a_legacy_one_reads_the_caller() {
+        let mut rec = record(Some("/usr/bin"), &[]);
+        rec.legacy = true;
+        let lookup = env(&[
+            ("GITHUB_TOKEN", "ghp_legacyvalue1"),
+            ("GH_DB", "legacy-db-value"),
+        ]);
+        let (built, _) =
+            for_tick(Some(&rec), &["GH_DB".to_string()], "wf", None, &[], lookup).unwrap();
+        assert!(built.inherits());
+        assert_eq!(
+            redacted(built.redactor(), "ghp_legacyvalue1 legacy-db-value"),
+            "[REDACTED:GITHUB_TOKEN] [REDACTED:GH_DB]"
+        );
+        assert!(crate::action::CommandEnv::inherit().redactor().is_empty());
+    }
+
+    #[test]
+    fn proxy_passwords_are_percent_decoded() {
+        assert_eq!(
+            proxy_password("http://u:a%2Fb%3Ac@h:1/x").as_deref(),
+            Some("a/b:c")
+        );
+        assert_eq!(proxy_password("u:pw@h").as_deref(), Some("pw"));
+        assert_eq!(proxy_password("http://u@h"), None);
+        assert_eq!(proxy_password("http://h:8080"), None);
     }
 }

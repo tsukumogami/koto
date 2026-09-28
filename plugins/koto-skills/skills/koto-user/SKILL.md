@@ -202,7 +202,7 @@ A state can declare a `default_action` — a command koto runs itself on enterin
 | `spawn_failed` | No child process started — `/bin/sh` couldn't be run, or the action's `working_dir` was rejected. (A tool the shell can't find is `nonzero_exit` with exit code 127; see [The environment commands run with](#the-environment-commands-run-with).) | Fix the environment or escalate; re-ticking unchanged won't help. |
 | `timed_out` | The command exceeded its 30-second timeout and its process group was killed. Whatever it printed before the kill is still reported. | Check whether the command is hung on something external before retrying. |
 | `wait_failed` | The child started but waiting on it failed, so no exit status was obtained. | Treat as infrastructure; report it. |
-| `capture_failed` | The command exited zero, but its stdout couldn't be delivered under the state's `capture_stdout_as` name. A `capture_error` object names the case: `empty`, `too_large`, or `disallowed_character`. | The command produced the wrong shape of output. This is a template problem — report it rather than working around it. |
+| `capture_failed` | The command exited zero, but its stdout couldn't be delivered under the state's `capture_stdout_as` name. A `capture_error` object names the case: `empty`, `redacted` (the output held a known credential; `source` names where it came from), `too_large`, or `disallowed_character`. | The command produced the wrong shape of output. This is a template problem — report it rather than working around it. |
 
 Three things to know:
 

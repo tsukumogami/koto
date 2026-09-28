@@ -946,8 +946,8 @@ Records when a state's automatic shell command ran.
 | `state` | string | Yes | State where the command ran. |
 | `command` | string | Yes | Shell command string as configured in the template. |
 | `exit_code` | integer | Yes | Process exit code. `-1` when no exit status was ever obtained — the child could not be spawned, the command timed out and its process group was killed, or waiting on it failed. |
-| `stdout` | string | Yes | Standard output, up to the retention bound. May be large. |
-| `stderr` | string | Yes | Standard error, up to the retention bound. May be large. |
+| `stdout` | string | Yes | Standard output, up to the retention bound, with every credential koto knows replaced by `[REDACTED:<source>]`. May be large. |
+| `stderr` | string | Yes | Standard error, up to the retention bound, with every credential koto knows replaced by `[REDACTED:<source>]`. May be large. |
 | `truncated` | boolean | No | True when either stream emitted more than the runner retains (64KB per stream) and `stdout`/`stderr` hold only the leading bytes. One flag covers both streams. Absent on events written before the field existed; readers MUST treat absence as `false`. |
 
 The event is written only when a child process was actually started. An action

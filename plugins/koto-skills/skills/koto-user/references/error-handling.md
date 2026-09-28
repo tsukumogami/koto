@@ -212,7 +212,7 @@ searching stderr for "timed out" is what the key exists to replace.
 | `timed_out` | The command did not finish within its timeout, so its process group was killed. Whatever it wrote before the kill is still reported. |
 | `spawn_failed` | No child process was ever started: `/bin/sh` itself couldn't be run. Also covers an action refused before the spawn: a `working_dir` that is absolute, or one that resolves outside the session's execution anchor. A tool the shell can't find is not this kind; it's `nonzero_exit` with exit code 127. |
 | `wait_failed` | The child started but waiting on it failed, so no exit status was ever obtained. |
-| `capture_failed` | The command exited zero but its stdout could not be delivered under the state's `capture_stdout_as` name. Action failures only; a gate has nothing to capture. The `capture_error` object alongside it names the case: `empty`, `too_large`, or `disallowed_character`. |
+| `capture_failed` | The command exited zero but its stdout could not be delivered under the state's `capture_stdout_as` name. Action failures only; a gate has nothing to capture. The `capture_error` object alongside it names the case: `empty`, `redacted` (with `source`, the variable or setting whose credential the output held), `too_large`, or `disallowed_character`. |
 
 The vocabulary is the same on both surfaces it appears on. What sits beside it is not:
 

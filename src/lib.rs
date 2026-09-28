@@ -10,6 +10,7 @@ pub mod engine;
 pub mod export;
 #[cfg(unix)]
 pub mod gate;
+pub mod redact;
 pub mod session;
 pub mod template;
 pub mod workflows_surface;

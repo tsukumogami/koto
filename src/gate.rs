@@ -712,11 +712,14 @@ mod tests {
     /// cannot be provoked from a real command, so the mapping is exercised
     /// directly rather than through `run_shell_command`.
     fn failed_output(kind: FailureKind, exit_code: i32, stderr: &str) -> CommandOutput {
+        use crate::redact::RedactedText;
         CommandOutput {
             exit_code,
-            stdout: String::new(),
-            stderr: stderr.to_string(),
+            stdout: RedactedText::default(),
+            stderr: RedactedText::koto_note(stderr),
             failure_kind: Some(kind),
+            stdout_truncated: false,
+            stderr_truncated: false,
             truncated: false,
         }
     }
@@ -768,11 +771,14 @@ mod tests {
 
     #[test]
     fn passing_evidence_is_byte_identical_to_the_recorded_default() {
+        use crate::redact::RedactedText;
         let result = command_gate_result(CommandOutput {
             exit_code: 0,
-            stdout: "hi\n".to_string(),
-            stderr: String::new(),
+            stdout: RedactedText::koto_note("hi\n"),
+            stderr: RedactedText::default(),
             failure_kind: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             truncated: false,
         });
         assert_eq!(result.outcome, GateOutcome::Passed);

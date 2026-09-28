@@ -941,16 +941,12 @@ pub(crate) fn resolve_variables(
 }
 
 /// Truncate a string to at most `max_bytes` bytes. If truncated, appends a note.
-/// Handles UTF-8 correctly by truncating at a char boundary.
+/// Cuts at a char boundary and never inside a redaction marker.
 fn truncate_output(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
-    // Find the largest char boundary at or before max_bytes.
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = crate::redact::safe_cut_len(s.as_bytes(), max_bytes);
     let mut truncated = s[..end].to_string();
     truncated.push_str(TRUNCATION_NOTE);
     truncated
@@ -959,19 +955,32 @@ fn truncate_output(s: &str, max_bytes: usize) -> String {
 /// Note appended to a stream whose tail was dropped.
 const TRUNCATION_NOTE: &str = "\n... [output truncated]";
 
-/// Mark `s` as truncated when the runner dropped bytes from this stream.
+/// Mark `s` as truncated when the runner cut this stream.
 ///
-/// `CommandOutput::truncated` is the authority that something was dropped;
-/// it is one flag for both streams, so the length picks out which one. Only
-/// a stream that reached the retention bound can have been cut, and decoding
-/// drops at most the three trailing bytes of a split character, so a stream
-/// within three bytes of the bound is the one that lost its tail.
+/// `stream_truncated` is the stream's own flag from `CommandOutput`
+/// (`stdout_truncated` or `stderr_truncated`), so a stream is marked only
+/// when it lost something, however long it is.
 #[cfg(unix)]
-fn mark_truncated(s: String, truncated: bool) -> String {
-    if truncated && s.len() + 3 >= MAX_ACTION_OUTPUT_BYTES && !s.ends_with(TRUNCATION_NOTE) {
+fn mark_truncated(s: String, stream_truncated: bool) -> String {
+    if stream_truncated && !s.ends_with(TRUNCATION_NOTE) {
         format!("{}{}", s, TRUNCATION_NOTE)
     } else {
         s
+    }
+}
+
+/// The result of a polling action interrupted by a signal: no exit status
+/// was ever obtained for the attempt.
+#[cfg(unix)]
+fn polling_interrupted() -> crate::action::CommandOutput {
+    crate::action::CommandOutput {
+        exit_code: -1,
+        stdout: crate::redact::RedactedText::default(),
+        stderr: crate::redact::RedactedText::koto_note("polling interrupted by signal"),
+        failure_kind: Some(crate::action::FailureKind::WaitFailed),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        truncated: false,
     }
 }
 
@@ -1144,14 +1153,7 @@ where
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            return crate::action::CommandOutput {
-                exit_code: -1,
-                stdout: String::new(),
-                stderr: "polling interrupted by signal".to_string(),
-                // No exit status was ever obtained for this attempt.
-                failure_kind: Some(crate::action::FailureKind::WaitFailed),
-                truncated: false,
-            };
+            return polling_interrupted();
         }
 
         let output = crate::action::run_shell_command(command, working_dir, 30, env);
@@ -1171,17 +1173,18 @@ where
         }
 
         if Instant::now() >= deadline {
+            // koto's note goes on after redaction, so it is never searched.
+            let mut stderr = output.stderr;
+            stderr.push_koto_note(&format!(
+                "\npolling timed out after {} seconds",
+                polling.timeout_secs
+            ));
             return crate::action::CommandOutput {
-                exit_code: output.exit_code,
-                stdout: output.stdout,
-                stderr: format!(
-                    "{}\npolling timed out after {} seconds",
-                    output.stderr, polling.timeout_secs
-                ),
+                stderr,
                 failure_kind: output
                     .failure_kind
                     .or(Some(crate::action::FailureKind::TimedOut)),
-                truncated: output.truncated,
+                ..output
             };
         }
 
@@ -1189,14 +1192,7 @@ where
         let sleep_end = Instant::now() + Duration::from_secs(u64::from(polling.interval_secs));
         while Instant::now() < sleep_end {
             if shutdown.load(Ordering::Relaxed) {
-                return crate::action::CommandOutput {
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: "polling interrupted by signal".to_string(),
-                    // No exit status was ever obtained for this attempt.
-                    failure_kind: Some(crate::action::FailureKind::WaitFailed),
-                    truncated: false,
-                };
+                return polling_interrupted();
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -3762,7 +3758,10 @@ fn handle_next(
     // The decider settings come from the same load. Their warnings (an
     // unrecognized `KOTO_DECIDER`, a key the project config may not set,
     // and so on) are printed here, once per `koto next` invocation.
-    let (request_store_cfg, decider_settings) = {
+    //
+    // The same load names koto's own configured secrets, which join the
+    // tick's known credentials so no command's output carries them.
+    let (request_store_cfg, decider_settings, config_keys) = {
         let base = crate::config::resolve::load_config().unwrap_or_default();
         crate::config::warn_if_request_store_recursion_reserved(&base);
         let cli_overrides = crate::config::resolve::RequestStoreOverrides {
@@ -3777,6 +3776,7 @@ fn handle_next(
         (
             crate::config::resolve::request_store_config(&base.request_store, &cli_overrides),
             decider_settings,
+            crate::config::redaction_keys(&base),
         )
     };
 
@@ -4346,6 +4346,7 @@ fn handle_next(
         &compiled.pass_env,
         &name,
         backend.session_dir(&name).parent(),
+        &config_keys,
         |n| std::env::var(n).ok(),
     ) {
         Ok(built) => built,
@@ -5412,13 +5413,14 @@ fn handle_next(
         );
 
         // Truncate output, then mark whichever stream the runner had to cut.
+        // Both streams are already redacted; the cut never splits a marker.
         let stdout = mark_truncated(
             truncate_output(&output.stdout, MAX_ACTION_OUTPUT_BYTES),
-            output.truncated,
+            output.stdout_truncated,
         );
         let stderr = mark_truncated(
             truncate_output(&output.stderr, MAX_ACTION_OUTPUT_BYTES),
-            output.truncated,
+            output.stderr_truncated,
         );
 
         // Append DefaultActionExecuted event.
@@ -7349,12 +7351,17 @@ mod tests {
         let cut = "x".repeat(MAX_ACTION_OUTPUT_BYTES);
         let short = "boom".to_string();
 
-        // One flag, two streams: only the one at the bound lost a tail.
+        // Each stream carries its own flag: only a flagged one is marked.
         assert!(mark_truncated(cut.clone(), true).ends_with(TRUNCATION_NOTE));
-        assert_eq!(mark_truncated(short.clone(), true), short);
-        // A stream that happens to sit exactly at the bound without the
-        // runner dropping anything is not marked.
+        assert_eq!(mark_truncated(short.clone(), false), short);
+        // A stream shortened by redaction markers can be cut well short of
+        // the bound; its flag still marks it.
+        assert!(mark_truncated(short.clone(), true).ends_with(TRUNCATION_NOTE));
+        // A stream that happens to sit at (or within three bytes of) the
+        // bound without being cut is not marked.
         assert_eq!(mark_truncated(cut.clone(), false), cut);
+        let near = "x".repeat(MAX_ACTION_OUTPUT_BYTES - 3);
+        assert_eq!(mark_truncated(near.clone(), false), near);
         // Marking is not applied twice.
         let marked = mark_truncated(cut, true);
         assert_eq!(mark_truncated(marked.clone(), true), marked);

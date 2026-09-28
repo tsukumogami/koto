@@ -82,12 +82,32 @@ pub fn load_config() -> Result<KotoConfig> {
         );
     }
 
-    // Layer 3: env var overrides for credentials
+    // Layer 3: env var overrides for credentials. A config-file value the
+    // environment replaces is kept aside: koto doesn't use it, but a command
+    // could still print it, so redaction searches for it.
     if let Ok(val) = env::var("AWS_ACCESS_KEY_ID") {
+        if let Some(file) = config.session.cloud.access_key.take() {
+            if file != val {
+                config
+                    .secret_sources
+                    .overridden
+                    .push(("session.cloud.access_key", file));
+            }
+        }
         config.session.cloud.access_key = Some(val);
+        config.secret_sources.access_key_from_env = true;
     }
     if let Ok(val) = env::var("AWS_SECRET_ACCESS_KEY") {
+        if let Some(file) = config.session.cloud.secret_key.take() {
+            if file != val {
+                config
+                    .secret_sources
+                    .overridden
+                    .push(("session.cloud.secret_key", file));
+            }
+        }
         config.session.cloud.secret_key = Some(val);
+        config.secret_sources.secret_key_from_env = true;
     }
 
     // Layer 3b: KOTO_REQUEST_STORE_* env-var overrides for the
@@ -95,7 +115,16 @@ pub fn load_config() -> Result<KotoConfig> {
     apply_request_store_env_overrides(&mut config.request_store);
 
     // Layer 3c: KOTO_DECIDER* env overrides for the global decider values.
+    let file_key = config.decider.api_key.clone();
     apply_decider_env(&mut config.decider, |k| env::var(k).ok());
+    if let Some(file) = file_key {
+        if config.decider.api_key.as_ref() != Some(&file) {
+            config
+                .secret_sources
+                .overridden
+                .push(("decider.api_key", file));
+        }
+    }
 
     Ok(config)
 }
@@ -930,6 +959,7 @@ mod tests {
                 request_store: RequestStoreConfig::default(),
                 workflows: Default::default(),
                 decider: Default::default(),
+                secret_sources: Default::default(),
             },
             request_store_keys: vec![],
             request_store_has_recursion: false,
