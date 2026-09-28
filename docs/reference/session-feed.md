@@ -196,6 +196,9 @@ events:
       size:
         type: integer
         required: true
+      writer:
+        type: string
+        required: false
 
   context_removed:
     tier: 2
@@ -203,6 +206,34 @@ events:
       key:
         type: string
         required: true
+      writer:
+        type: string
+        required: false
+
+  context_read:
+    tier: 2
+    fields:
+      key:
+        type: string
+        required: true
+      reader:
+        type: string
+        required: true
+      state:
+        type: string
+        required: true
+      present:
+        type: boolean
+        required: true
+      hash:
+        type: string
+        required: false
+      access:
+        type: string
+        required: false
+      gate:
+        type: string
+        required: false
 
   instructions_delivered:
     tier: 2
@@ -232,6 +263,27 @@ events:
       truncated:
         type: boolean
         required: false
+      attempt:
+        type: integer
+        required: false
+      visit_attempt:
+        type: integer
+        required: false
+      findings:
+        type: array
+        required: false
+      findings_truncated:
+        type: boolean
+        required: false
+      rule_counts:
+        type: object
+        required: false
+      rule_counts_truncated:
+        type: boolean
+        required: false
+      duration_ms:
+        type: integer
+        required: false
 
   decision_recorded:
     tier: 2
@@ -258,11 +310,44 @@ events:
       outcome:
         type: string
         required: true
-        enum: ["passed", "failed"]
+        enum: ["passed", "failed", "timed_out", "error"]
       timestamp:
         type: string
         required: true
         format: rfc3339
+      attempt:
+        type: integer
+        required: false
+      visit_attempt:
+        type: integer
+        required: false
+      findings:
+        type: array
+        required: false
+      findings_truncated:
+        type: boolean
+        required: false
+      rule_counts:
+        type: object
+        required: false
+      rule_counts_truncated:
+        type: boolean
+        required: false
+      duration_ms:
+        type: integer
+        required: false
+      stdout:
+        type: string
+        required: false
+      stderr:
+        type: string
+        required: false
+      stdout_truncated:
+        type: boolean
+        required: false
+      stderr_truncated:
+        type: boolean
+        required: false
 
   child_completed:
     tier: 2
@@ -839,7 +924,8 @@ before that transition.
   "payload": {
     "key": "research/r1/lead-foo.md",
     "hash": "a3f5b2c1...",
-    "size": 4096
+    "size": 4096,
+    "writer": "agent"
   }
 }
 ```
@@ -849,6 +935,22 @@ before that transition.
 | `key` | string | Yes | Context key (e.g., `scope.md`, `research/r1/lead-foo.md`). |
 | `hash` | string | Yes | SHA-256 hex digest of the artifact content. 64 hex characters. |
 | `size` | integer | Yes | Byte length of the artifact content. |
+| `writer` | string | No | Who wrote the key. An open vocabulary: consumers MUST tolerate values they don't recognize. Absent on events written before writers were recorded; treat absence as an unknown writer. |
+
+The `writer` values koto writes on `context_added`:
+
+| Value | Written by |
+|-------|------------|
+| `agent` | `koto context add`. |
+| `koto` | koto's own keys: the batch final view (`batch_final_view`) and the published `/workflows` location. |
+| `sync` | A cloud pull that brought down a newer copy of the key. |
+
+A transition's `context_assignments` don't produce a `context_added`: the
+`transitioned` event records them, and a reader treats that event's writer as
+`transition` (see [Joining a read to its write](#joining-a-read-to-its-write)).
+The key's stored metadata records `transition` for those writes, so the
+vocabulary a consumer can meet across koto's surfaces is `agent`,
+`transition`, `koto` and `sync`.
 
 ---
 
@@ -868,7 +970,8 @@ do".
 {
   "type": "context_removed",
   "payload": {
-    "key": "research/r1/lead-foo.md"
+    "key": "research/r1/lead-foo.md",
+    "writer": "agent"
   }
 }
 ```
@@ -876,10 +979,66 @@ do".
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `key` | string | Yes | Context key that was removed. |
+| `writer` | string | No | Who removed the key: `agent` for `koto context remove`, the only command that emits this event today. The same open vocabulary as `context_added.writer`. Absent on events written before writers were recorded. |
 
 No `hash` or `size`: there is no content left to describe, and carrying the
 departed artifact's digest would invite a reader to treat the feed as a way to
 recover it.
+
+---
+
+#### `context_read`
+
+Records one read of a context key. It never carries the key's content or
+size; a present key's `hash` is what joins the read to the write that
+produced it.
+
+This is the highest-volume event in the feed, one per logged read. A consumer
+that doesn't need context lineage can skip it like any Tier 2 event, and
+nothing else in the feed depends on it.
+
+```json
+{
+  "type": "context_read",
+  "payload": {
+    "key": "note",
+    "reader": "gate",
+    "state": "check",
+    "present": true,
+    "hash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "access": "presence",
+    "gate": "has_note"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `key` | string | Yes | The key read. |
+| `reader` | string | Yes | Who read it. An open vocabulary; koto writes the values below. Consumers MUST tolerate values they don't recognize. |
+| `state` | string | Yes | The workflow's current state at the time of the read. |
+| `present` | boolean | Yes | Whether the key existed. |
+| `hash` | string | No | Lowercase hex SHA-256 of the key's content, 64 characters. Present exactly when `present` is `true`. |
+| `access` | string | No | `content` for a read that fetched the content, `presence` for one that only asked whether the key exists. An open vocabulary. koto writes it on every read it logs; absence (possible only on events koto didn't write) means `content`. |
+| `gate` | string | No | The gate's name, when `reader` is `gate`. Absent otherwise. |
+
+| `reader` | Reads it covers |
+|----------|-----------------|
+| `gate` | A context-exists gate (`access: "presence"`) or a context-matches gate (`access: "content"`), on an evaluation that `gate_evaluated` records. |
+| `cli` | `koto context get` (`content`) and `koto context exists` (`presence`). A gate script that calls `koto context get` itself shows up here, not as `gate`. |
+| `result` | A terminal state's result map reading `${context.<key>}`, including the `failure_reason` read. |
+| `decider` | A decider's context input. |
+
+A gate's reads are appended immediately before that evaluation's
+`gate_evaluated`. A polling re-evaluation that koto doesn't record logs no
+read, and neither do koto's internal bookkeeping reads. A key that fails the
+key grammar logs nothing, since it isn't a key. A presence read of a key that
+exists but has neither stored metadata nor readable content has no hash to
+record, so it logs nothing rather than a `present: true` event without `hash`.
+
+A read that can't be appended (a full disk, an unwritable log) produces a
+warning on stderr and never fails the command that performed it, so the feed
+can hold fewer reads than koto performed.
 
 ---
 
@@ -939,7 +1098,10 @@ Records when a state's automatic shell command ran.
     "exit_code": 0,
     "stdout": "    Finished dev profile",
     "stderr": "",
-    "truncated": false
+    "truncated": false,
+    "attempt": 1,
+    "visit_attempt": 1,
+    "duration_ms": 8412
   }
 }
 ```
@@ -952,10 +1114,41 @@ Records when a state's automatic shell command ran.
 | `stdout` | string | Yes | Standard output, up to the retention bound, with every credential koto knows replaced by `[REDACTED:<source>]`. May be large. |
 | `stderr` | string | Yes | Standard error, up to the retention bound, with every credential koto knows replaced by `[REDACTED:<source>]`. May be large. |
 | `truncated` | boolean | No | True when either stream emitted more than the runner retains (64KB per stream) and `stdout`/`stderr` hold only the leading bytes. One flag covers both streams. Absent on events written before the field existed; readers MUST treat absence as `false`. |
+| `attempt` | integer | No | The state's session attempt number, at least 1. See [Check Findings and Attempts](#check-findings-and-attempts). |
+| `visit_attempt` | integer | No | The state's attempt number in the current visit, at least 1. Present whenever `attempt` is. |
+| `findings` | array of finding objects | No | The action's findings, whether it passed or failed, at most 50. Absent when there are none. |
+| `findings_truncated` | boolean | No | `true` when the action produced more findings than `findings` holds. Absent means `false`. |
+| `rule_counts` | object | No | On a failed action: per-rule attempt counts for the rules it reported at `error`, under the check name `__action__`. At most 50 keys. |
+| `rule_counts_truncated` | boolean | No | `true` when the action reported more distinct rule ids at `error` than `rule_counts` holds. Absent means `false`. |
+| `duration_ms` | integer | No | The command's wall-clock run time in milliseconds. For an action with `polling:`, it covers the whole polling loop. |
 
-The event is written only when a child process was actually started. An action
-refused before the spawn — an absolute `working_dir`, or one that resolves
-outside the execution anchor — leaves no `default_action_executed` behind.
+The fields from `attempt` down are described in
+[Check Findings and Attempts](#check-findings-and-attempts). They're absent on
+events written before koto recorded them.
+
+**When an action failed.** The event has no `outcome` field, and it doesn't
+record the `failure_kind` the `koto next` response reports. An action failed
+when either of these holds:
+
+- `exit_code` isn't `0`: the command exited non-zero, or `exit_code` is `-1`
+  because it timed out, couldn't be spawned, or couldn't be waited on.
+- `exit_code` is `0` but the state declares `capture_stdout_as` and the output
+  couldn't be delivered under that name (the response's `failure_kind` is
+  `capture_failed`). No `variable_captured` follows such an event.
+
+On an event carrying `attempt`, `rule_counts` is present exactly when the
+action failed: a failed action always reports at least one finding at
+`error`, its own or the one koto writes with `rule_id` `__action__`, and a
+passing action never carries `rule_counts`. That makes `rule_counts` the one
+field that tells a capture failure after exit 0 apart from a success. On an
+older event without `attempt`, only `exit_code` is available, and a capture
+failure can't be told apart from a success except by the missing
+`variable_captured`.
+
+The event is written whenever koto tried to run the command, including a
+spawn that failed. An action refused before that — an absolute `working_dir`,
+or one that resolves outside the execution anchor — leaves no
+`default_action_executed` behind and isn't an attempt.
 That refusal reaches the caller as an `__action__` blocking condition on the
 `koto next` response, not as a feed event; see the failure-kind vocabulary in
 `error-codes.md`.
@@ -968,6 +1161,11 @@ A state whose action requires confirmation writes this event on the tick that
 stops for confirmation, not on the tick that confirms: the confirming tick
 arrives with evidence, which skips the action rather than re-running it. One
 command, one event.
+
+A failed append of this event doesn't fail the command: koto prints a warning
+on stderr and the tick's outcome is unchanged. See
+[An attempt the log can't show](#an-attempt-the-log-cant-show) for what that means
+for attempt counts.
 
 ---
 
@@ -1001,11 +1199,23 @@ same gate in the same state (e.g., during a polling sequence).
 {
   "type": "gate_evaluated",
   "payload": {
-    "state": "implement",
-    "gate": "ci-passes",
-    "output": {"exit_code": 0, "error": null},
-    "outcome": "passed",
-    "timestamp": "2026-05-07T10:01:00.000Z"
+    "state": "lint",
+    "gate": "ruff",
+    "output": {"exit_code": 1, "error": ""},
+    "outcome": "failed",
+    "timestamp": "2026-05-07T10:01:00.000Z",
+    "attempt": 5,
+    "visit_attempt": 3,
+    "findings": [
+      {"rule_id": "E501", "level": "error", "message": "line too long (104 > 88)",
+       "path": "app/main.py", "line": 12, "column": 89,
+       "rule_ref": "https://docs.example.org/rules/E501", "effect_landed": true,
+       "message_source": "check"}
+    ],
+    "rule_counts": {"E501": {"visit": 2, "session": 4}},
+    "duration_ms": 1830,
+    "stdout": "::koto-finding::{\"rule_id\":\"E501\",...}\nFound 1 error.\n",
+    "stderr": ""
   }
 }
 ```
@@ -1014,9 +1224,31 @@ same gate in the same state (e.g., during a polling sequence).
 |-------|------|----------|-------------|
 | `state` | string | Yes | State containing the gate. |
 | `gate` | string | Yes | Gate identifier. |
-| `output` | object | Yes | Gate evaluator output. Schema is gate-type-specific. |
-| `outcome` | string | Yes | `"passed"` or `"failed"`. |
+| `output` | object | Yes | Gate evaluator output. Schema is gate-type-specific. Unchanged by the fields below. |
+| `outcome` | string | Yes | `"passed"`, `"failed"`, `"timed_out"` or `"error"`. `timed_out` is a command gate that ran past its timeout; `error` is a gate that couldn't be evaluated, such as a command that couldn't be spawned or waited on, or a context gate whose key or pattern is unusable. |
 | `timestamp` | string | Yes | RFC 3339 UTC timestamp. Matches the outer envelope `timestamp`. |
+| `attempt` | integer | No | The state's session attempt number, at least 1. The same on every check event of one attempt; never resets. |
+| `visit_attempt` | integer | No | The state's attempt number in the current visit, at least 1. Present whenever `attempt` is. |
+| `findings` | array of finding objects | No | The gate's findings, whether it passed or failed, at most 50. Absent when there are none. |
+| `findings_truncated` | boolean | No | `true` when the gate produced more findings than `findings` holds. Absent means `false`. |
+| `rule_counts` | object | No | On a failed gate that reported at least one finding at `error`: per-rule attempt counts for this gate. At most 50 keys. |
+| `rule_counts_truncated` | boolean | No | `true` when the gate reported more distinct rule ids at `error` than `rule_counts` holds. Absent means `false`. |
+| `duration_ms` | integer | No | For a command gate: the command's wall-clock run time in milliseconds, over the same span the timeout covers. Absent for gates that run no command. |
+| `stdout` | string | No | On a command gate whose `outcome` isn't `passed`: the leading 4,096 bytes of its redacted standard output. |
+| `stderr` | string | No | The same for standard error. Present whenever `stdout` is. |
+| `stdout_truncated` | boolean | No | `true` when `stdout` holds less than the command printed, whether koto's 64 KiB capture bound or the 4,096-byte log cut removed it. Absent means `false`. |
+| `stderr_truncated` | boolean | No | The same for `stderr`. |
+
+The fields from `attempt` down are described in
+[Check Findings and Attempts](#check-findings-and-attempts). They're absent on
+events written before koto recorded them. The gate's `context_read` events,
+if it read a context key, come immediately before this event.
+
+Command, context-exists and context-matches gates produce findings. Other
+gate types, including `children-complete` and `request-leg`, log none, so a
+failure of one of them carries no `findings` and no `rule_counts`.
+
+A failed append of this event fails the command, as it always has.
 
 ---
 
@@ -1324,6 +1556,200 @@ are suppressed to prevent log bloat.
 | `timestamp` | string | Yes | RFC 3339 UTC timestamp. Matches the outer envelope `timestamp`. |
 
 ---
+
+## Check Findings and Attempts
+
+`gate_evaluated` and `default_action_executed` are the feed's check events.
+Each one can carry the check's findings, the attempt it belongs to, per-rule
+attempt counts and the check's run time, and a failed command gate's event
+also carries the leading bytes of its output. `context_read` and the `writer`
+fields on `context_added` and `context_removed` let a reader name the write a
+read saw. This section defines what those fields mean and how to read them
+together. The frontmatter declares each top-level field and its type; the
+nested shapes are defined here.
+
+All of these fields are optional and absent on events written before koto
+recorded them. None of them identifies the host, the agent, or the agent's
+session.
+
+### Conventions
+
+- **A failed check** is a `gate_evaluated` whose `outcome` is anything other
+  than `passed`, or a `default_action_executed` that meets the test under
+  "When an action failed" in [`default_action_executed`](#default_action_executed).
+- **Present "on" a condition.** A field described as present on some
+  condition is absent otherwise. An absent boolean means `false`. koto never
+  writes `null` for these fields; a reader treats `null` as absent.
+- **Byte bounds** are measured on the redacted UTF-8 text, before JSON
+  escaping. 4 KiB is 4,096 bytes. A cut never splits a UTF-8 character or a
+  redaction marker, so a cut string can be a few bytes shorter than its bound.
+  JSON escaping (a control character becomes `\u0000`, for instance) can make
+  the encoded field longer than the bound.
+- **Redaction markers.** Every string in a finding, and every captured stream,
+  has had each credential koto knows replaced by a marker of the form
+  `[REDACTED:<source>]`. `<source>` names where the value came from: an
+  environment variable name, or, when it contains a dot, a koto configuration
+  setting. It is never the value.
+- **Open vocabularies.** `reader`, `writer`, `access`, a finding's `level` and
+  a finding's `message_source` are open: consumers MUST tolerate values they
+  don't recognize. The frontmatter declares them as strings with no `enum`, so
+  `koto template validate-feed` doesn't reject a later value.
+- **Untrusted text.** Finding strings and captured streams come from the
+  check's own output and can hold control characters or terminal escapes.
+  Consumers render them as data.
+
+### The finding object
+
+Each entry of `findings` is an object:
+
+| Field | Type | Required | Meaning | Bound |
+|-------|------|----------|---------|-------|
+| `rule_id` | string | Yes | What the finding violated. Opaque to koto. On a koto-written finding, the check's name (see below). | 128 bytes |
+| `level` | string | Yes | Severity: `error`, `warning` or `info`. Open vocabulary. It never changes the check's outcome. | |
+| `message` | string | Yes | The rule's own message, or the koto-written message. Can contain newlines when the check printed them. | 1,000 bytes |
+| `effect_landed` | boolean | Yes | Whether the change attempted on this invocation was recorded. The check's own claim when it made one; otherwise `true` when this invocation recorded evidence for the state, or the state's `default_action` exited 0 and delivered its capture if it declares one, and `false` otherwise. | |
+| `message_source` | string | Yes | Where `message` came from. Open vocabulary; values below. | |
+| `path` | string | No | Where the problem is. | 512 bytes |
+| `line` | integer | No | Line number, at least 1. Only with `path`. | |
+| `column` | integer | No | Column number, at least 1. Only with `line`. | |
+| `rule_ref` | string | No | Opaque pointer to the rule's full text, such as a URL. | 512 bytes |
+
+| `message_source` | Meaning |
+|------------------|---------|
+| `check` | The check printed this finding. |
+| `output` | koto wrote the finding, and its message is a line taken from the check's output. |
+| `koto` | koto wrote the finding and its message, a sentence describing the outcome (such as `command exited with status 1`). |
+
+A check reports a finding by printing a line to standard output that starts
+with `::koto-finding::` followed by one JSON object; see
+[Reporting findings](../guides/default-action-authoring.md#reporting-findings).
+Findings are recorded whether the check passed or failed, so a passing check's
+warnings reach the log too.
+
+**The koto-written finding.** A failed command gate, context-exists gate,
+context-matches gate or `default_action` whose findings include no `error`
+gets one more finding, written by koto: level `error`, no location, no
+`rule_ref`, and `message_source` `output` or `koto`, never `check`. Its
+`rule_id` is the gate's name, or `__action__` for a `default_action`. That
+`rule_id` is a koto default, not an id from any rule registry: it names the
+check, not a rule. A consumer telling it apart from a check that happened to
+print its own gate name as a rule id reads `message_source`. Its message is
+folded onto one line and cut to 500 characters, then held to the 1,000-byte
+bound like any message.
+
+**Order and the cap.** An event holds at most 50 findings. When a check's
+findings fit, they're in the order the check printed them, with the
+koto-written finding last. When they don't, koto keeps them by level: every
+`error` first, then `warning`, then `info`, then any other level, each level
+in the order printed, until 50 are kept, and sets `findings_truncated`. An
+error is never dropped in favour of a warning. The koto-written finding is
+only added when no printed finding is an error, so on an overflowing list it
+comes first.
+
+### `rule_counts`
+
+`rule_counts` is an object keyed by rule id. Each value has this shape:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `visit` | integer | Attempts on this state in the current visit on which this same check failed and reported this rule at `error`, including this one. At least 1. |
+| `session` | integer | The same, over the whole session. At least `visit`. |
+
+```json
+"rule_counts": {"E501": {"visit": 2, "session": 4}, "F401": {"visit": 1, "session": 1}}
+```
+
+It appears only on a failed check that reported at least one finding at
+`error`. Its keys are the distinct rule ids the check reported at `error`,
+taken from every finding the check produced rather than only the ones the
+event lists, plus the koto-written finding's `rule_id` when there is one. So a
+key can name a rule that isn't in `findings` when `findings_truncated` is
+`true`; that's expected, not corruption. At most 50 keys, with
+`rule_counts_truncated` set when there were more. koto writes the keys in the
+order the check first reported them, but JSON object order carries no meaning
+and readers MUST NOT depend on it.
+
+A rule a check reports several times in one attempt counts once. Warnings and
+info findings never raise a count, and neither do findings from a check that
+passed. Counts are kept per state and per check: the same rule id reported by
+two gates keeps two counts, and the same rule in two states counts separately.
+
+### Reading attempts from the log
+
+An attempt is one entry into a state that evaluates at least one check. Every
+check event of that entry, the `default_action_executed` and each
+`gate_evaluated`, carries the same `attempt` and `visit_attempt`. To read
+attempts:
+
+1. Skip check events without `attempt`. They predate the fields.
+2. Group the rest by `(state, attempt)`. Each group is one attempt.
+3. Read per-rule counts keyed by `(state, check, rule_id)`, where the check is
+   the event's `gate`, or `__action__` for `default_action_executed`. An
+   attempt's counts are its events' `rule_counts`, each under its own check.
+
+`attempt` is one more than the highest `attempt` on any earlier check event
+for the state, and never resets. `visit_attempt` goes back to 1 on the first
+attempt after the workflow arrives from a different state or is rewound; a
+self-transition, an evidence submission and an override keep it running.
+
+Some cases that follow from the definition:
+
+- A state left and re-entered in one `koto next` makes two attempts.
+- A polling loop that re-evaluates its gates several times before they pass
+  is one attempt.
+- A state with no checks, a state whose gates are all overridden, and
+  `koto next --to` record no attempt. An overridden gate appends no
+  `gate_evaluated`.
+- An action refused before koto tries to run it isn't an attempt.
+
+### An attempt the log can't show
+
+A `default_action_executed` append that fails doesn't fail the command; koto
+warns on stderr and carries on. A failed action stops the state before its
+gates run, so its event is the only check event of its attempt, and losing
+that event loses the attempt. The next attempt then reuses its number and the
+log shows no gap. A reader can't detect this, so attempt numbers and counts
+read from the log can undercount a state's real attempts. A `gate_evaluated`
+append that fails fails the command, so a lost gate event can't cause this.
+
+### Joining a read to its write
+
+A `context_read` with `present: true` names a key K and a hash H. The write
+that produced what it read is the write of K with the highest `seq` below the
+read's `seq` whose hash equals H. Writes of K are:
+
+- a `context_added` with `key` K, whose hash is its `hash` field;
+- a `transitioned` whose `context_assignments` holds K, whose hash is the
+  lowercase hex SHA-256 of the assigned string's UTF-8 bytes.
+
+The matched write's writer is its `writer` field for a `context_added`, or
+`transition` for a `transitioned` assignment. A `context_added` without
+`writer` was written before writers were recorded, and its writer is unknown.
+When no write matches, the writer is unknown: the value came from a write the
+log doesn't hold, such as one whose event failed to append.
+
+A read with `present: false` has no write to join to.
+
+### Worst-case sizes
+
+With the bounds above, the fields in this section add at most about 120 KiB to
+one check event: 50 findings of about 2.2 KiB each, 8 KiB of gate output, and
+50 `rule_counts` keys. A `default_action_executed` can already hold 128 KiB of
+`stdout` and `stderr` on top of that. In a `koto next` response, one blocked
+condition's `failure` adds at most about 350 KiB: 100 findings and 128 KiB of
+captured output. Both figures are before JSON escaping, which can enlarge
+strings holding control characters.
+
+### Reserved and aligned names
+
+- `escalation` is reserved on `gate_evaluated` and `default_action_executed`
+  for a later feature that acts on attempt counts, such as a retry cap or an
+  escalation step. It isn't defined and koto doesn't write it. Readers ignore
+  it until this contract defines it.
+- If a check is ever answered by a model rather than a command, its event
+  will name the model with the `provider` and `model` fields
+  `decider_consulted` already uses. koto writes neither field on a check event
+  today.
 
 ## Dashboard `--once` Feed
 
