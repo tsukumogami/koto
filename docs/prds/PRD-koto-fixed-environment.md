@@ -172,8 +172,9 @@ suite keeps passing while the long-term route to add names is decided.
   the creating invocation's environment; a variable unset at creation is
   recorded as unset. The recorded `PATH` has empty and relative entries
   removed, since those resolve inside whatever directory a command starts in.
-  A fixed value that contains the value of any set variable on the default
-  live list is recorded as unset, and the `koto init` response says so. This
+  A fixed value that contains the value of a set credential-carrying default
+  name (the token and proxy variables) is recorded as unset, and the
+  `koto init` response names the variable without its value. This
   covers `koto init` in every form (plain, `--vars-file`, `--replace-terminal`,
   `--koto-leg`, `--from-stdin`) and `koto session start`.
 - **R2. Everything else is a name read live.** Besides the fixed values, a

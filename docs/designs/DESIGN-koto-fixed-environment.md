@@ -216,9 +216,12 @@ default, which in upstream bash ends in `.`. A relative `HOME` or
 `XDG_CONFIG_HOME` is recorded unset.
 
 **A fixed value carrying a credential.** A fixed value that contains the value
-of any set variable on the default live list (a token pasted into `PATH`, say)
-is recorded unset, and the `koto init` response names the variable. The check
-is a substring test against a handful of values at creation.
+of a set credential-carrying default name -- the `gh`/GitHub token variables
+and the proxy URLs, which can embed a password -- is recorded unset, and the
+`koto init` response names the variable, never the value. It is a substring
+test at creation against those few values, skipping any shorter than eight
+characters, which would match ordinary path text by accident. Names like
+`CI` or `TZ`, whose short values carry nothing secret, aren't compared.
 
 **Stale values.** On every tick, before commands run, koto stats each recorded
 `PATH` directory, the recorded `HOME` and the recorded `XDG_CONFIG_HOME`: a few

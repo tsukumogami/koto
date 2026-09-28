@@ -72,8 +72,8 @@ Commands still run as today.
 - Batch, retry, skip-marker, `--parent` and `koto session start` children
   copy the parent's record, legacy flag included, even when created from a
   process with a different `PATH` (tested for each). A child whose parent has
-  no record gets no record in this issue; Issue 2 makes the parent adopt
-  first.
+  no record records from its own process, as a new session would; Issue 2
+  makes a ticking parent adopt before it can spawn.
 - The record survives `koto session rebind`, a rename, `koto session recover`
   and a claim write byte-identical (tested).
 - Credential-shaped log test: with `GH_TOKEN`, `GITHUB_TOKEN` and variables
