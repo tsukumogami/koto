@@ -93,8 +93,10 @@ struct SourceState {
     #[serde(default)]
     result: Option<BTreeMap<String, serde_yaml_ng::Value>>,
     /// Context keys cleared on every entry into the state after the first.
+    /// An `Option` so an explicit empty list can be refused rather than
+    /// read as "not declared".
     #[serde(default)]
-    clear_on_entry: Vec<String>,
+    clear_on_entry: Option<Vec<String>>,
 }
 
 /// YAML front-matter view of a `materialize_children` hook.
@@ -620,6 +622,14 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
                 .as_ref()
                 .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
 
+        if matches!(&source_state.clear_on_entry, Some(keys) if keys.is_empty()) {
+            return Err(anyhow!(
+                "state {:?}: clear_on_entry must list at least one key\n  \
+                 remedy: list the keys to clear, or remove the field",
+                state_name
+            ));
+        }
+
         let compiled_result = match &source_state.result {
             Some(map) => Some(compile_result_map(state_name, map)?),
             None => None,
@@ -641,7 +651,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
                 skipped_marker: source_state.skipped_marker,
                 skip_if: compiled_skip_if,
                 result: compiled_result,
-                clear_on_entry: source_state.clear_on_entry.clone(),
+                clear_on_entry: source_state.clear_on_entry.clone().unwrap_or_default(),
             },
         );
     }
@@ -3054,6 +3064,14 @@ Done.
                 "{bad}: reason missing: {err}"
             );
         }
+    }
+
+    #[test]
+    fn clear_on_entry_refuses_an_empty_list() {
+        let src = assignment_template("    clear_on_entry: []\n", "      - target: done");
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(err.contains("\"start\""), "state missing: {err}");
+        assert!(err.contains("at least one key"), "reason missing: {err}");
     }
 
     #[test]
