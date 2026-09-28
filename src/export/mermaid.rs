@@ -338,6 +338,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let output = to_mermaid(&t);
@@ -380,6 +381,7 @@ mod tests {
                             request: String::new(),
                             leg: String::new(),
                             expect: None,
+                            poll: None,
                         },
                     );
                     g

@@ -93,6 +93,7 @@ mod tests {
                             request: String::new(),
                             leg: String::new(),
                             expect: None,
+                            poll: None,
                         },
                     );
                     g

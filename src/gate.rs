@@ -902,6 +902,7 @@ mod tests {
             request: String::new(),
             leg: String::new(),
             expect: None,
+            poll: None,
         }
     }
 
@@ -1412,6 +1413,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -1449,6 +1451,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -1484,6 +1487,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -1518,6 +1522,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -1560,6 +1565,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -1597,6 +1603,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -1631,6 +1638,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -1661,6 +1669,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -1872,6 +1881,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         gates.insert(
@@ -1889,6 +1899,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         gates.insert(
@@ -1906,6 +1917,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -1956,6 +1968,7 @@ mod tests {
                 request: request.to_string(),
                 leg: leg.to_string(),
                 expect: None,
+                poll: None,
             }
         }
 

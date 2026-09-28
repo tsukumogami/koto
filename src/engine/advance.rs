@@ -3184,6 +3184,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -3370,6 +3371,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -3471,6 +3473,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -3605,6 +3608,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -3740,6 +3744,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -3859,6 +3864,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -5089,6 +5095,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -5128,6 +5135,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -5261,6 +5269,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -5511,6 +5520,7 @@ mod tests {
             request: String::new(),
             leg: String::new(),
             expect: None,
+            poll: None,
         }
     }
 
@@ -6139,6 +6149,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -6271,6 +6282,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -6379,6 +6391,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -6513,6 +6526,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -6606,6 +6620,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 

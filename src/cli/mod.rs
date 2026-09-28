@@ -8735,6 +8735,7 @@ Done.
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let substituted =
@@ -8801,6 +8802,7 @@ Done.
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -8874,6 +8876,7 @@ Done.
             request: "req-{{TOKEN}}".to_string(),
             leg: "{{TOKEN}}-leg".to_string(),
             expect: None,
+            poll: None,
         };
         for (field, raw) in authored.substitutable_fields() {
             assert!(
@@ -9037,6 +9040,7 @@ Done.
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -9116,6 +9120,7 @@ Done.
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let expected_command = {

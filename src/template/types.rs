@@ -165,8 +165,10 @@ pub struct TemplateState {
     /// Each is a literal key: the compiler refuses a `{{VAR}}` reference, a
     /// key outside the context-key grammar, a duplicate, the field on a
     /// terminal state, and a key some transition assigns through
-    /// `context_assignments`. Omitted from the compiled JSON when empty, so
-    /// a template that doesn't declare it keeps its template hash.
+    /// `context_assignments`; the source compiler also refuses an explicit
+    /// empty list, which the compiled form can't tell from an absent one.
+    /// Omitted from the compiled JSON when empty, so a template that doesn't
+    /// declare it keeps its template hash.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clear_on_entry: Vec<String>,
 }
@@ -315,6 +317,83 @@ pub struct Gate {
     /// for the gate to report `valid: true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect: Option<BTreeMap<String, Vec<serde_json::Value>>>,
+    /// Re-evaluation settings for a `command` gate whose command can answer
+    /// "not yet" (DESIGN-koto-ci-wait-stale-keys.md Decisions 4 and 5).
+    /// Absent on every other gate, and omitted from the compiled JSON when
+    /// absent, so a template without it keeps its template hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<PollSpec>,
+}
+
+/// How koto re-evaluates a polling command gate.
+///
+/// The command's exit status decides: 0 is done, `pending_exit_code` is
+/// still pending, anything else is failed. Within one tick koto re-runs a
+/// pending command every `interval_secs` for at most `hold_secs`; across
+/// ticks it gives up `timeout_secs` after the first run since the latest
+/// entry into the state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PollSpec {
+    pub interval_secs: u32,
+    pub timeout_secs: u32,
+    #[serde(default)]
+    pub hold_secs: u32,
+    #[serde(default = "default_pending_exit_code")]
+    pub pending_exit_code: i32,
+}
+
+/// Validate every polling gate on one state.
+///
+/// A polling gate can't sit in a state whose `default_action` polls too: that
+/// loop already re-evaluates the state's gates between its own runs, and two
+/// nested loops would each hold the tick for their own timeout.
+fn validate_poll_gates(state_name: &str, state: &TemplateState) -> Result<(), String> {
+    let action_polls = state
+        .default_action
+        .as_ref()
+        .is_some_and(|a| a.polling.is_some());
+    for (gate_name, gate) in &state.gates {
+        let Some(poll) = &gate.poll else { continue };
+        let at = format!("state {:?} gate {:?}: poll", state_name, gate_name);
+        if gate.gate_type != GATE_TYPE_COMMAND {
+            return Err(format!(
+                "{at} is only allowed on a command gate, not on {:?}",
+                gate.gate_type
+            ));
+        }
+        if poll.interval_secs == 0 {
+            return Err(format!("{at}.interval_secs must be at least 1"));
+        }
+        if poll.timeout_secs == 0 {
+            return Err(format!("{at}.timeout_secs must be at least 1"));
+        }
+        if poll.hold_secs > poll.timeout_secs {
+            return Err(format!(
+                "{at}.hold_secs ({}) must not exceed timeout_secs ({})",
+                poll.hold_secs, poll.timeout_secs
+            ));
+        }
+        if !(1..=255).contains(&poll.pending_exit_code) {
+            return Err(format!(
+                "{at}.pending_exit_code must be between 1 and 255, found {}",
+                poll.pending_exit_code
+            ));
+        }
+        if action_polls {
+            return Err(format!(
+                "{at} can't be declared in a state whose default_action declares polling\n  \
+                 remedy: poll with the gate or with the action, not both"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `EX_TEMPFAIL`: the conventional "try again later" status.
+pub const DEFAULT_PENDING_EXIT_CODE: i32 = 75;
+
+fn default_pending_exit_code() -> i32 {
+    DEFAULT_PENDING_EXIT_CODE
 }
 
 impl Gate {
@@ -364,6 +443,8 @@ impl Gate {
             // `expect` holds literal scalar values compared against a leg's
             // payload; it carries no references.
             expect: _,
+            // `poll` holds numbers only; it carries no references.
+            poll: _,
         } = self;
         let mut fields = vec![
             ("command", command.as_str()),
@@ -1393,6 +1474,7 @@ impl CompiledTemplate {
             }
 
             self.validate_clear_on_entry(state_name, state)?;
+            validate_poll_gates(state_name, state)?;
 
             // Validate a declared terminal result map.
             if let Some(result) = &state.result {
@@ -3162,6 +3244,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3188,6 +3271,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3215,6 +3299,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -3307,6 +3392,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -3342,6 +3428,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -3850,6 +3937,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         t.validate(false).unwrap();
@@ -3906,6 +3994,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3946,6 +4035,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         t.validate(false).unwrap();
@@ -3970,6 +4060,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4001,6 +4092,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         t.validate(false).unwrap();
@@ -4034,6 +4126,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4179,6 +4272,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4208,6 +4302,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4257,6 +4352,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4290,6 +4386,7 @@ mod tests {
                     request: String::new(),
                     leg: String::new(),
                     expect: None,
+                    poll: None,
                 },
             );
             let err = t.validate(true).unwrap_err();
@@ -4334,6 +4431,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         state.transitions = vec![Transition {
@@ -4752,6 +4850,7 @@ command: "./check.sh"
             request: String::new(),
             leg: String::new(),
             expect: None,
+            poll: None,
         }
     }
 
@@ -4769,6 +4868,7 @@ command: "./check.sh"
             request: String::new(),
             leg: String::new(),
             expect: None,
+            poll: None,
         }
     }
 
@@ -4786,6 +4886,7 @@ command: "./check.sh"
             request: String::new(),
             leg: String::new(),
             expect: None,
+            poll: None,
         }
     }
 
@@ -4977,6 +5078,7 @@ command: "./check.sh"
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         t
@@ -5113,6 +5215,7 @@ command: "./check.sh"
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -5148,6 +5251,7 @@ command: "./check.sh"
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -5218,6 +5322,7 @@ command: "./check.sh"
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -5400,6 +5505,7 @@ command: "./check.sh"
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let mut when_a = BTreeMap::new();
@@ -5463,6 +5569,7 @@ command: "./check.sh"
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let mut accepts = BTreeMap::new();
@@ -5521,6 +5628,7 @@ command: "./check.sh"
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         // Dead-end transitions (would trigger D4 if D2 didn't block first).
@@ -5618,6 +5726,7 @@ command: "./check.sh"
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         t
@@ -5923,6 +6032,7 @@ command: "./check.sh"
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();
@@ -6110,6 +6220,7 @@ command: "./check.sh"
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
         let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();
