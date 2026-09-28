@@ -53,6 +53,7 @@ use crate::engine::template_source_status::{check_template_source_path, Template
 use crate::engine::types::{
     ChildSnapshot, Event, EventPayload, SpawnEntrySnapshot, TerminalOutcome, WorkflowResult,
 };
+use crate::session::context::ContextStore;
 use crate::session::SessionBackend;
 use crate::template::types::{CompiledTemplate, FailurePolicy, MaterializeChildrenSpec};
 
@@ -2039,6 +2040,15 @@ pub struct ChildGateEntry {
     /// `"state_name:failure_reason"`. Omitted for non-failed outcomes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_mode: Option<String>,
+    /// Human-readable reason for a failed child, the same string as
+    /// `failure_mode`. It is the field `koto status` has always shown for
+    /// a failed task, so the gate output, `batch_final_view` and the
+    /// status batch view share one shape. `reason_source` names where it
+    /// came from. Omitted for non-failed outcomes. A view frozen before
+    /// this field existed gains it on read through
+    /// [`BatchFinalView::from_gate_output`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Direct upstream blocker name for skipped children. Omitted when
     /// not skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2127,7 +2137,15 @@ impl BatchFinalView {
     pub fn from_gate_output(value: &serde_json::Value) -> Option<Self> {
         let obj = value.as_object()?;
         let children_val = obj.get("children")?;
-        let children: Vec<ChildGateEntry> = serde_json::from_value(children_val.clone()).ok()?;
+        let mut children: Vec<ChildGateEntry> =
+            serde_json::from_value(children_val.clone()).ok()?;
+        // A view frozen before failed children carried `reason` has only
+        // `failure_mode`; give it the same `reason` a fresh view has.
+        for child in &mut children {
+            if child.outcome == TaskOutcome::Failure && child.reason.is_none() {
+                child.reason = child.failure_mode.clone();
+            }
+        }
         Some(BatchFinalView {
             total: obj.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
             completed: obj.get("completed").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
@@ -2183,6 +2201,7 @@ impl BatchFinalView {
 #[allow(clippy::too_many_arguments)]
 pub fn build_children_complete_output(
     backend: &dyn SessionBackend,
+    context_store: &dyn ContextStore,
     parent_name: &str,
     events: &[Event],
     template: &CompiledTemplate,
@@ -2233,6 +2252,11 @@ pub fn build_children_complete_output(
     // unreadable log or template is not in this set, and for those the
     // parent's copy stays a usable fallback.
     let mut own_log_authoritative: HashSet<String> = HashSet::new();
+    // The `failure_reason` each failed on-disk child wrote during its current
+    // run, keyed by session name. A child known only from the parent's
+    // `ChildCompleted` record has no log to read, and falls back to its state
+    // name.
+    let mut failure_reasons: HashMap<String, String> = HashMap::new();
     match backend.list() {
         Ok(sessions) => {
             let child_prefix = format!("{}.", parent_name);
@@ -2275,6 +2299,13 @@ pub fn build_children_complete_output(
                     own_log_authoritative.insert(info.id.clone());
                 }
                 let (terminal, failure, skipped_marker) = flags.unwrap_or((false, false, false));
+                if terminal && failure {
+                    if let Some(reason) =
+                        current_failure_reason(context_store, &info.id, &child_events)
+                    {
+                        failure_reasons.insert(info.id.clone(), reason);
+                    }
+                }
                 let spawn_entry = child_events.iter().find_map(|e| match &e.payload {
                     EventPayload::WorkflowInitialized { spawn_entry, .. } => spawn_entry.clone(),
                     _ => None,
@@ -2467,6 +2498,14 @@ pub fn build_children_complete_output(
         if matches!(entry.outcome, TaskOutcome::Running) {
             entry.outcome = TaskOutcome::Pending;
         }
+        // A failed child that wrote a `failure_reason` reports it in place
+        // of its state name; `failure_mode` keeps the state name.
+        if matches!(entry.outcome, TaskOutcome::Failure) {
+            if let Some(reason) = failure_reasons.remove(&entry.name) {
+                entry.reason = Some(reason);
+                entry.reason_source = Some("failure_reason".to_string());
+            }
+        }
         match entry.outcome {
             TaskOutcome::Success => success += 1,
             TaskOutcome::Failure => failed += 1,
@@ -2633,6 +2672,66 @@ pub fn build_children_complete_output(
 
 /// Render a `ChildGateEntry` as a JSON object, omitting absent optional
 /// fields (matching the serde `skip_serializing_if` directives).
+/// Longest `failure_reason` a batch entry carries, in characters. The text is
+/// written by a child's agent or script and is copied into the parent's gate
+/// output, its frozen view and its responses, so it is bounded.
+pub const FAILURE_REASON_MAX_CHARS: usize = 500;
+
+/// The `failure_reason` a failed child wrote during its current run, as a
+/// batch entry shows it, or `None` when it wrote none.
+///
+/// The child's own log names every write to the key: a transition's
+/// `context_assignments` carries the value, and `koto context add` or
+/// `koto context remove` leaves a `ContextAdded` or `ContextRemoved` event,
+/// whose content is read from `context_store`. The latest write since the
+/// child's last `Rewound` decides, so a reason from a run that `retry_failed`
+/// or `koto rewind` restarted is never shown for the new one. A removal or an
+/// empty value is no reason. See [`one_line_reason`] for the bound.
+fn current_failure_reason(
+    context_store: &dyn ContextStore,
+    session: &str,
+    child_events: &[Event],
+) -> Option<String> {
+    const KEY: &str = "failure_reason";
+    let raw = child_events
+        .iter()
+        .rev()
+        .find_map(|e| match &e.payload {
+            EventPayload::Rewound { .. } => Some(None),
+            EventPayload::Transitioned {
+                context_assignments: Some(assignments),
+                ..
+            } => assignments.get(KEY).map(|v| Some(v.clone())),
+            EventPayload::ContextAdded { key, .. } if key == KEY => Some(
+                context_store
+                    .get(session, KEY)
+                    .ok()
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+            ),
+            EventPayload::ContextRemoved { key } if key == KEY => Some(None),
+            _ => None,
+        })
+        .flatten()?;
+    one_line_reason(&raw)
+}
+
+/// Fold a `failure_reason` onto one line and bound it: every run of
+/// whitespace, line breaks included, becomes one space, and text longer than
+/// [`FAILURE_REASON_MAX_CHARS`] is cut to that many characters, the last
+/// three replaced by `...`. Empty or all-whitespace text is `None`.
+fn one_line_reason(raw: &str) -> Option<String> {
+    let folded = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if folded.is_empty() {
+        return None;
+    }
+    if folded.chars().count() <= FAILURE_REASON_MAX_CHARS {
+        return Some(folded);
+    }
+    let mut cut: String = folded.chars().take(FAILURE_REASON_MAX_CHARS - 3).collect();
+    cut.push_str("...");
+    Some(cut)
+}
+
 fn child_entry_to_json(entry: &ChildGateEntry) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("name".to_string(), serde_json::json!(entry.name));
@@ -2644,6 +2743,9 @@ fn child_entry_to_json(entry: &ChildGateEntry) -> serde_json::Value {
     );
     if let Some(fm) = &entry.failure_mode {
         obj.insert("failure_mode".to_string(), serde_json::json!(fm));
+    }
+    if let Some(r) = &entry.reason {
+        obj.insert("reason".to_string(), serde_json::json!(r));
     }
     if let Some(sb) = &entry.skipped_because {
         obj.insert("skipped_because".to_string(), serde_json::json!(sb));
@@ -2723,6 +2825,7 @@ fn build_entries_from_tasks(
             complete,
             outcome,
             failure_mode: None,
+            reason: None,
             skipped_because: None,
             blocked_by: None,
             skipped_because_chain: Vec::new(),
@@ -2737,6 +2840,7 @@ fn build_entries_from_tasks(
                 // the gate evaluator path).
                 if let Some(s) = snap {
                     entry.failure_mode = Some(s.current_state.clone());
+                    entry.reason = entry.failure_mode.clone();
                 }
                 entry.reason_source = Some("state_name".to_string());
             }
@@ -2905,6 +3009,7 @@ fn build_entries_from_disk(
             complete: snap.terminal,
             outcome,
             failure_mode: None,
+            reason: None,
             skipped_because: None,
             blocked_by: None,
             skipped_because_chain: Vec::new(),
@@ -2914,6 +3019,7 @@ fn build_entries_from_disk(
         match outcome {
             TaskOutcome::Failure => {
                 entry.failure_mode = Some(snap.current_state.clone());
+                entry.reason = entry.failure_mode.clone();
                 entry.reason_source = Some("state_name".to_string());
             }
             TaskOutcome::Skipped => {
@@ -2927,6 +3033,16 @@ fn build_entries_from_disk(
 }
 
 // --------- BatchFinalized helpers (Issue #17) ----------------------
+
+/// Render a frozen `BatchFinalized` view in the current shape. A view
+/// frozen by an older koto passes through [`BatchFinalView::from_gate_output`],
+/// which adds what it lacks (a failed child's `reason`); a value that does
+/// not parse as a view is returned unchanged.
+pub fn normalize_frozen_view(view: &serde_json::Value) -> serde_json::Value {
+    BatchFinalView::from_gate_output(view)
+        .and_then(|v| serde_json::to_value(v).ok())
+        .unwrap_or_else(|| view.clone())
+}
 
 /// Return the most recent `BatchFinalized` event in `events`, if any.
 ///
@@ -3098,6 +3214,7 @@ pub(crate) fn finalize_batch_if_complete(
         };
     let (_converge_passes, gate_output) = build_children_complete_output(
         backend,
+        context_store,
         parent_name,
         &post_events,
         template,
@@ -3680,6 +3797,7 @@ mod tests {
                 complete: true,
                 outcome: TaskOutcome::Success,
                 failure_mode: None,
+                reason: None,
                 skipped_because: None,
                 blocked_by: None,
                 skipped_because_chain: Vec::new(),
@@ -3692,6 +3810,7 @@ mod tests {
                 complete: false,
                 outcome: TaskOutcome::SpawnFailed,
                 failure_mode: None,
+                reason: None,
                 skipped_because: None,
                 blocked_by: None,
                 skipped_because_chain: Vec::new(),
@@ -3721,6 +3840,7 @@ mod tests {
                 complete: true,
                 outcome: TaskOutcome::Success,
                 failure_mode: None,
+                reason: None,
                 skipped_because: None,
                 blocked_by: None,
                 skipped_because_chain: Vec::new(),
@@ -3733,6 +3853,7 @@ mod tests {
                 complete: true,
                 outcome: TaskOutcome::Failure,
                 failure_mode: Some("failed".to_string()),
+                reason: Some("failed".to_string()),
                 skipped_because: None,
                 blocked_by: None,
                 skipped_because_chain: Vec::new(),
@@ -3905,6 +4026,7 @@ mod tests {
             complete: true,
             outcome: TaskOutcome::Failure,
             failure_mode: Some("failed".to_string()),
+            reason: Some("failed".to_string()),
             skipped_because: None,
             blocked_by: None,
             skipped_because_chain: Vec::new(),
@@ -3917,6 +4039,7 @@ mod tests {
             complete: true,
             outcome: TaskOutcome::Skipped,
             failure_mode: None,
+            reason: None,
             skipped_because: Some("p.a".to_string()),
             blocked_by: None,
             skipped_because_chain: vec!["p.a".to_string()],
@@ -3929,6 +4052,7 @@ mod tests {
             complete: false,
             outcome: TaskOutcome::SpawnFailed,
             failure_mode: None,
+            reason: None,
             skipped_because: None,
             blocked_by: None,
             skipped_because_chain: Vec::new(),
@@ -4933,6 +5057,7 @@ mod tests {
 
         let (_all_complete, output) = build_children_complete_output(
             &backend,
+            &backend,
             "parent",
             &parent_events,
             &template,
@@ -5117,6 +5242,7 @@ mod tests {
         let template = converge_template("parent");
         let (_all_complete, output) = build_children_complete_output(
             &backend,
+            &backend,
             "parent",
             &parent_events,
             &template,
@@ -5198,8 +5324,15 @@ mod tests {
             states,
         };
         let (_, parent_events) = backend.read_events("p").unwrap();
-        let (passes, output) =
-            build_children_complete_output(&backend, "p", &parent_events, &template, "wait", None);
+        let (passes, output) = build_children_complete_output(
+            &backend,
+            &backend,
+            "p",
+            &parent_events,
+            &template,
+            "wait",
+            None,
+        );
 
         let children = output["children"].as_array().expect("children array");
         assert_eq!(children.len(), 1, "{output}");
@@ -5310,6 +5443,7 @@ mod tests {
         let (_, parent_events) = backend.read_events("parent").unwrap();
         let template = converge_template("parent");
         let (_all_complete, output) = build_children_complete_output(
+            &backend,
             &backend,
             "parent",
             &parent_events,
@@ -5430,6 +5564,7 @@ mod tests {
         let (_, parent_events) = backend.read_events("parent").unwrap();
         let template = converge_template("parent");
         let (_all_complete, output) = build_children_complete_output(
+            &backend,
             &backend,
             "parent",
             &parent_events,
@@ -5562,6 +5697,7 @@ mod tests {
         let template = converge_template("parent");
         let (converge_passes, output) = build_children_complete_output(
             &backend,
+            &backend,
             "parent",
             &parent_events,
             &template,
@@ -5637,6 +5773,7 @@ mod tests {
         let template = converge_template("parent");
         let (converge_passes, output) = build_children_complete_output(
             &backend,
+            &backend,
             "parent",
             &parent_events,
             &template,
@@ -5704,6 +5841,7 @@ mod tests {
         let template = converge_template("parent");
         let (converge_passes, output) = build_children_complete_output(
             &backend,
+            &backend,
             "parent",
             &parent_events,
             &template,
@@ -5763,6 +5901,7 @@ mod tests {
         let (_, parent_events) = backend.read_events("parent").unwrap();
         let template = converge_template("parent");
         let (converge_passes, output) = build_children_complete_output(
+            &backend,
             &backend,
             "parent",
             &parent_events,
@@ -5832,6 +5971,7 @@ mod tests {
         let template = converge_template("parent");
         let (_passes, output) = build_children_complete_output(
             &backend,
+            &backend,
             "parent",
             &parent_events,
             &template,
@@ -5889,6 +6029,7 @@ mod tests {
         let mid_template = converge_template("top.mid");
         let (mid_passes, mid_out) = build_children_complete_output(
             &backend,
+            &backend,
             "top.mid",
             &mid_events,
             &mid_template,
@@ -5914,6 +6055,7 @@ mod tests {
         let (_, top_events) = backend.read_events("top").unwrap();
         let top_template = converge_template("top");
         let (top_passes, top_out) = build_children_complete_output(
+            &backend,
             &backend,
             "top",
             &top_events,
@@ -5979,6 +6121,7 @@ mod tests {
         let template = converge_template("parent");
         let (passes_before, out_before) = build_children_complete_output(
             &backend,
+            &backend,
             "parent",
             &parent_events,
             &template,
@@ -6007,6 +6150,7 @@ mod tests {
         );
         let (_, parent_events) = backend.read_events("parent").unwrap();
         let (passes_after, out_after) = build_children_complete_output(
+            &backend,
             &backend,
             "parent",
             &parent_events,

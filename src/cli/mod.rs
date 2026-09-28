@@ -1433,7 +1433,8 @@ pub fn run(app: App) -> Result<()> {
                     .into_iter()
                     .filter(|wf| wf.parent_workflow.as_deref() == Some(parent_name.as_str()))
                     .collect();
-                let augmented = annotate_children_with_batch_view(&backend, parent_name, filtered);
+                let augmented =
+                    annotate_children_with_batch_view(&backend, &backend, parent_name, filtered);
                 println!("{}", serde_json::to_string(&augmented)?);
                 return Ok(());
             }
@@ -4238,6 +4239,7 @@ fn handle_next(
                 |gate: &crate::template::types::Gate| -> crate::gate::StructuredGateResult {
                     evaluate_children_complete(
                         backend,
+                        context_store,
                         &name,
                         &events,
                         &compiled,
@@ -5019,6 +5021,7 @@ fn handle_next(
         move |gate: &crate::template::types::Gate| -> crate::gate::StructuredGateResult {
             evaluate_children_complete(
                 backend,
+                context_store,
                 &workflow_name_for_children,
                 &events_for_children,
                 &compiled_for_children,
@@ -5969,7 +5972,10 @@ fn handle_next(
                     if let crate::engine::types::EventPayload::BatchFinalized { view, .. } =
                         &ev.payload
                     {
-                        envelope.insert("batch_final_view".to_string(), view.clone());
+                        envelope.insert(
+                            "batch_final_view".to_string(),
+                            crate::cli::batch::normalize_frozen_view(view),
+                        );
                     }
                 }
             }
@@ -6609,6 +6615,7 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     // the per-row metadata added to `koto workflows --children`.
     if let Some(batch_view) = crate::cli::batch_view::derive_batch_view(
         backend,
+        backend,
         &events,
         &compiled,
         &machine_state.current_state,
@@ -6723,6 +6730,7 @@ fn derive_superseded_branches(backend: &dyn SessionBackend, parent_name: &str) -
 /// not yet complete. Returns `Passed` when all children are complete.
 fn evaluate_children_complete(
     backend: &dyn SessionBackend,
+    context_store: &dyn ContextStore,
     workflow_name: &str,
     parent_events: &[Event],
     template: &CompiledTemplate,
@@ -6784,6 +6792,7 @@ fn evaluate_children_complete(
     // (DESIGN-request-store-converge.md Decision 4).
     let (converge_passes, output) = crate::cli::batch::build_children_complete_output(
         backend,
+        context_store,
         workflow_name,
         parent_events,
         template,
@@ -6831,6 +6840,7 @@ fn evaluate_children_complete(
 /// at serialization time.
 fn annotate_children_with_batch_view(
     backend: &dyn SessionBackend,
+    context_store: &dyn ContextStore,
     parent_name: &str,
     children: Vec<crate::engine::types::WorkflowMetadata>,
 ) -> Vec<serde_json::Value> {
@@ -6848,6 +6858,7 @@ fn annotate_children_with_batch_view(
                         compiled_opt.and_then(|compiled| {
                             crate::cli::batch_view::derive_batch_view(
                                 backend,
+                                context_store,
                                 &events,
                                 &compiled,
                                 &machine_state.current_state,

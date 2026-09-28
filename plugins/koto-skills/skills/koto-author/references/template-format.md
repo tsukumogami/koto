@@ -678,7 +678,7 @@ Each gate type produces structured output that the engine injects into the evide
 | `children-complete` | `any_skipped` | boolean | `skipped > 0`. |
 | `children-complete` | `any_spawn_failed` | boolean | `spawn_failed > 0`. |
 | `children-complete` | `needs_attention` | boolean | `any_failed OR any_skipped OR any_spawn_failed`. Route to retry / analysis states on this boolean. |
-| `children-complete` | `children` | array | Per-child detail: `[{"name", "state", "complete", "outcome", ...}]`. Each entry carries `outcome` (`success \| failure \| skipped \| pending \| blocked \| spawn_failed`); failed entries add `failure_mode` + `reason_source: "state_name"`; skipped entries add `skipped_because` (direct blocker), `skipped_because_chain` (all unique failed ancestors, closest-first), and `reason_source: "skipped"`; blocked entries add `blocked_by` (non-terminal `waits_on` entries). |
+| `children-complete` | `children` | array | Per-child detail: `[{"name", "state", "complete", "outcome", ...}]`. Each entry carries `outcome` (`success \| failure \| skipped \| pending \| blocked \| spawn_failed`); failed entries add `reason`, `failure_mode` (the same string) and `reason_source: "state_name"`; skipped entries add `skipped_because` (direct blocker), `skipped_because_chain` (all unique failed ancestors, closest-first), and `reason_source: "skipped"`; blocked entries add `blocked_by` (non-terminal `waits_on` entries). |
 | `children-complete` | `error` | string | Empty on normal evaluation. Error message on backend failures. |
 | `request-leg` | `found` | boolean | `true` when the request and leg exist and were read. |
 | `request-leg` | `disposition` | string | `open`, `resolved`, `abandoned`, or `missing`; empty when the gate errored. |

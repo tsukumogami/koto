@@ -231,6 +231,17 @@ to `0.9.x`).
 
 ### Fixed
 
+- **A failed child carries `reason` in the gate output and `batch_final_view`
+  (koto#278).** The koto-user batch reference said a failed child in the
+  `children-complete` output has a `reason` string, but only `koto status`
+  had one; the gate output and the `batch_final_view` frozen from it had
+  `failure_mode` and `reason_source` only, so a consumer reading `reason`
+  found nothing. Failed children now carry `reason` on all three surfaces,
+  holding the same string as `failure_mode`. The change is additive:
+  `failure_mode` and `reason_source` are unchanged. A view frozen by an older
+  koto gains `reason` when the terminal response or `koto status` reads it;
+  the `batch_final_view` context key it wrote is left as written.
+
 - **A completed batch is recorded even when the completing tick leaves the
   batching state (koto#263).** The `BatchFinalized` event and the
   `batch_final_view` context key were written only when the tick that saw the

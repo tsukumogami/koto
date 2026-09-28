@@ -881,3 +881,128 @@ fn a_directed_exit_waits_for_the_batch_lock() {
     assert_eq!(json["state"], "summarize", "{json}");
     assert_eq!(batch_finalized_events(dir).len(), 1);
 }
+
+/// The `children[]` entry named `name` in a gate output or frozen view.
+fn child_entry<'a>(view: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    view["children"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no children in {view}"))
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap_or_else(|| panic!("no child {name} in {view}"))
+}
+
+/// Assert the failed-child shape every batch surface shares (Issue #278):
+/// `reason` alongside the `failure_mode` and `reason_source` it has always had.
+fn assert_failed_child_reason(entry: &serde_json::Value) {
+    assert_eq!(entry["outcome"], "failure", "{entry}");
+    assert_eq!(
+        entry["reason"], "failed",
+        "a failed child carries reason: {entry}"
+    );
+    assert_eq!(entry["failure_mode"], "failed", "{entry}");
+    assert_eq!(entry["reason_source"], "state_name", "{entry}");
+}
+
+#[test]
+fn a_failed_child_carries_reason_in_the_gate_output_and_the_frozen_view() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    start_batch(dir, &advancing_parent("summarize"));
+
+    // B fails while A still runs: the gate blocks and reports B.
+    drive_child(dir, "parent.B", "fail");
+    let json = run_ok(dir, &["next", "parent"]);
+    assert_eq!(json["state"], "plan", "{json}");
+    let gate = &json["blocking_conditions"][0]["output"];
+    assert_failed_child_reason(child_entry(gate, "parent.B"));
+    assert!(
+        child_entry(gate, "parent.A").get("reason").is_none(),
+        "a child that has not failed carries no reason: {gate}"
+    );
+
+    // A finishes; the completing tick freezes the view.
+    drive_child(dir, "parent.A", "done");
+    let json = run_ok(dir, &["next", "parent"]);
+    assert_eq!(json["state"], "summarize", "{json}");
+
+    let key = batch_final_view_key(dir).expect("batch_final_view is written");
+    assert_failed_child_reason(child_entry(&key, "parent.B"));
+    assert!(
+        child_entry(&key, "parent.A").get("reason").is_none(),
+        "{key}"
+    );
+    let events = batch_finalized_events(dir);
+    assert_failed_child_reason(child_entry(&events[0]["payload"]["view"], "parent.B"));
+
+    // `koto status` renders the same reason.
+    let status = run_ok(dir, &["status", "parent"]);
+    let task = status["batch"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["task_name"] == "B")
+        .unwrap_or_else(|| panic!("no task B in {status}"));
+    assert_eq!(task["reason"], "failed", "{status}");
+}
+
+#[test]
+fn a_view_frozen_without_reason_gains_it_when_read() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    start_batch(dir, &advancing_parent("closed"));
+
+    drive_child(dir, "parent.A", "done");
+    drive_child(dir, "parent.B", "fail");
+    let json = run_ok(dir, &["next", "parent", "--no-cleanup"]);
+    assert_eq!(json["action"], "done", "{json}");
+
+    // Rewrite the log as an older koto froze it: failed children carry
+    // `failure_mode` and `reason_source` but no `reason`.
+    let path = sessions_base(dir)
+        .join("parent")
+        .join("koto-parent.state.jsonl");
+    let rewritten: Vec<String> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut v: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => return line.to_string(),
+            };
+            if v["type"] != "batch_finalized" {
+                return line.to_string();
+            }
+            for child in v["payload"]["view"]["children"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+            {
+                child.as_object_mut().unwrap().remove("reason");
+            }
+            serde_json::to_string(&v).unwrap()
+        })
+        .collect();
+    std::fs::write(&path, rewritten.join("\n") + "\n").unwrap();
+    let old = batch_finalized_events(dir);
+    assert!(
+        child_entry(&old[0]["payload"]["view"], "parent.B")
+            .get("reason")
+            .is_none(),
+        "the rewritten log has no reason"
+    );
+
+    // The terminal response and `koto status` both render it with `reason`.
+    let json = run_ok(dir, &["next", "parent", "--no-cleanup"]);
+    assert_eq!(json["action"], "done", "{json}");
+    assert_failed_child_reason(child_entry(&json["batch_final_view"], "parent.B"));
+
+    let status = run_ok(dir, &["status", "parent"]);
+    let task = status["batch"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["task_name"] == "B")
+        .unwrap_or_else(|| panic!("no task B in {status}"));
+    assert_eq!(task["reason"], "failed", "{status}");
+}

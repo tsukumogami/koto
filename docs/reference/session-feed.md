@@ -715,6 +715,29 @@ expect this field in raw log files.
 |-------|------|----------|-------------|
 | `state` | string | Yes | The `materialize_children` state the batch finalized from. |
 | `view` | object | Yes | Frozen snapshot of the `children-complete` gate output at finalization time. |
+
+`view` holds the gate's aggregate counts and booleans (`total`, `completed`,
+`pending`, `success`, `failed`, `skipped`, `blocked`, `spawn_failed`,
+`all_complete`, `all_success`, `any_failed`, `any_skipped`,
+`any_spawn_failed`, `needs_attention`) and a `children` array with one entry
+per task. Each entry has `name`, `state`, `complete` and `outcome`, plus the
+fields its outcome adds:
+
+| Field | Present when | Description |
+|-------|--------------|-------------|
+| `reason` | `outcome: "failure"` | Human-readable reason the child failed. The same field `koto status` shows for a failed task. |
+| `failure_mode` | `outcome: "failure"` | The same string as `reason`, under the name the view used before `reason` was added. |
+| `reason_source` | failed, skipped or spawn-failed | Where the reason came from: `failure_reason`, `state_name`, `skipped` or `not_spawned`. |
+| `skipped_because` | `outcome: "skipped"` | The closest failed or skipped upstream task. |
+| `skipped_because_chain` | `outcome: "skipped"` | Every failed ancestor, closest first. |
+| `blocked_by` | `outcome: "blocked"` | The `waits_on` entries not yet terminal. |
+| `result` | the child's result is in | The child's `status`, `summary` and optional `payload`. |
+
+A view written by a koto older than `reason` has `failure_mode` and no
+`reason`. The raw log keeps it that way, but the terminal response's
+`batch_final_view` and `koto status` add `reason` from `failure_mode` when
+they read it. The `batch_final_view` context key is the view as it was
+written, so a key written by an older koto still lacks `reason`.
 | `timestamp` | string | Yes | RFC 3339 UTC timestamp. Matches the outer envelope `timestamp`. |
 
 ---

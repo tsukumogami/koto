@@ -122,7 +122,7 @@ Entry outcomes:
 | `any_skipped` | ≥ 1 skipped | Fine-grained routing. |
 | `any_spawn_failed` | ≥ 1 spawn failure | Fine-grained routing; folded into `needs_attention`. |
 
-Per-child entries in `output.children[]` mirror the data in `materialized_children` but from the gate-observer's perspective. Failed children carry a `reason` string and `reason_source` (one of `failure_reason`, `state_name`, `skipped`, `not_spawned`) so agents can tell where the reason came from.
+Per-child entries in `output.children[]` mirror the data in `materialized_children` but from the gate-observer's perspective. Failed children carry a `reason` string, a `failure_mode` holding the same string, and `reason_source` (one of `failure_reason`, `state_name`, `skipped`, `not_spawned`) so agents can tell where the reason came from. Read `reason`: it is the name `batch_final_view` and `koto status` use too, so one reader works on all three. `failure_mode` stays for consumers that already read it.
 
 ## Converging: reading child results
 
@@ -267,23 +267,29 @@ When `failure_policy: skip_dependents` fires, the scheduler materializes the dep
 
 ## `batch_final_view` on terminal responses
 
-When the parent reaches a terminal state, the response carries `batch_final_view` with the full frozen snapshot:
+When the parent reaches a terminal state, the response carries `batch_final_view` with the full frozen snapshot. It has the shape of the `children-complete` gate output described above, the aggregate counts and booleans plus `children[]`, without the converge fields:
 
 ```json
 {
   "action": "done",
   "state": "summarize",
-  "is_terminal": true,
   "batch_final_view": {
-    "summary": {"total": 3, "success": 3, "failed": 0, "skipped": 0, "pending": 0, "blocked": 0, "spawn_failed": 0},
-    "tasks": [
-      {"name": "coord.task-1", "task_name": "task-1", "outcome": "success"},
-      {"name": "coord.task-2", "task_name": "task-2", "outcome": "success"},
-      {"name": "coord.task-3", "task_name": "task-3", "outcome": "success"}
+    "total": 2, "completed": 2, "pending": 0, "success": 1, "failed": 1,
+    "skipped": 0, "blocked": 0, "spawn_failed": 0,
+    "all_complete": true, "all_success": false, "any_failed": true,
+    "any_skipped": false, "any_spawn_failed": false, "needs_attention": true,
+    "children": [
+      {"name": "coord.task-1", "state": "done", "complete": true, "outcome": "success",
+       "result": {"status": "success", "summary": "completed at done"}},
+      {"name": "coord.task-2", "state": "failed", "complete": true, "outcome": "failure",
+       "reason": "failed", "failure_mode": "failed", "reason_source": "state_name",
+       "result": {"status": "failure", "summary": "failed at failed"}}
     ]
   }
 }
 ```
+
+A failed child's `reason` reads the same here as in the gate output and in `koto status`. A view frozen by a koto older than the `reason` field has only `failure_mode`; the terminal response and `koto status` add `reason` when they read it, but the `batch_final_view` context key such a koto wrote does not have it.
 
 The view is frozen on the tick the batch completes: the gate on the `materialize_children` state reported `all_complete: true`. Agents writing a summary directive read `batch_final_view` directly — no second `koto status` call.
 
@@ -305,7 +311,7 @@ Multiple surfaces expose batch state. Use the right one for the question you're 
 | "I restarted, or I'm not the session holding the gate — where's the result?" | `koto request get <request-id>` — `legs[*].result`. Same envelope the directive carried, promoted from the child's terminal tick. |
 | "What reason should I render for a failed child?" | `blocking_conditions[0].output.children[*].reason` with `reason_source` as the provenance tag. |
 | "Which children are eligible for retry, and how do I invoke it?" | `reserved_actions[0].applies_to` and `reserved_actions[0].invocation`. |
-| "Is this the final batch outcome?" | `batch_final_view.summary` on the terminal `done` response. |
+| "Is this the final batch outcome?" | `batch_final_view` on the terminal `done` response (its counts, booleans and `children[]`), or `koto context get <parent> batch_final_view` from a later non-terminal state. |
 | "Are there children on disk I forgot about?" | `scheduler.feedback.orphan_candidates`. |
 | "Is this child itself a sub-batch coordinator?" | `materialized_children[*].role == "coordinator"` with `subbatch_status` for inner-batch counts. |
 
