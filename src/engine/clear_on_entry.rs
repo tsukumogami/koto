@@ -4,8 +4,11 @@
 //! Whether an entry still needs clearing is decided from the event log
 //! alone, never by reading the context store: every logged read appends an
 //! event and, on the cloud backend, uploads it. [`pending_clearing`] answers
-//! it for the state the workflow now occupies, and the advance loop and the
-//! `koto next --to` and `koto rewind` paths ask it right after an entry.
+//! it for the state the workflow now occupies. The advance loop asks it at
+//! the top of every state and requests the clearing by appending the
+//! `context_cleared` event through its append callback, which in `koto next`
+//! runs [`apply_from_log`]; the `koto next --to` and `koto rewind` paths call
+//! [`apply_from_log`] directly right after their entry.
 //! [`apply_from_log`] re-derives the clearing from the persisted log, removes
 //! the keys and then appends one `context_cleared` event, in that order, so
 //! an interrupted clearing leaves no event and the next call finishes it.

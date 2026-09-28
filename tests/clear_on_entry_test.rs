@@ -405,6 +405,13 @@ fn a_removal_that_fails_records_nothing_and_the_next_tick_clears() {
     let ctx = sessions_base(&dir).join("wf").join("ctx");
     let original = std::fs::metadata(&ctx).unwrap().permissions();
     std::fs::set_permissions(&ctx, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Root ignores directory permissions, so the removal can't be made to fail.
+    if std::fs::write(ctx.join("probe"), b"x").is_ok() {
+        let _ = std::fs::remove_file(ctx.join("probe"));
+        std::fs::set_permissions(&ctx, original).unwrap();
+        eprintln!("skipping: directory permissions are not enforced for this user");
+        return;
+    }
     let out = run(
         &dir,
         &[

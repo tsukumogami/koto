@@ -916,6 +916,7 @@ pub enum IntegrationError {
 /// 1. Signal received (shutdown flag)
 /// 2. Chain limit check
 /// 3. Terminal state
+/// 3a. Clearing the state's `clear_on_entry` keys, when an entry still owes it
 /// 4. Integration declared (invoke runner)
 /// 5. Action execution (if state has default_action)
 /// 6. Gates (evaluate all, stop if any fail)
@@ -923,7 +924,15 @@ pub enum IntegrationError {
 /// 8. Transition resolution (match evidence against conditions)
 ///
 /// I/O operations are injected as closures for testability:
-/// - `append_event`: persist a state transition event
+/// - `append_event`: persist an event. **A `ContextCleared` payload is a
+///   request, not only a record:** the loop asks for a state's
+///   `clear_on_entry` keys to be cleared by appending it, and the closure must
+///   perform the clearing -- remove the keys from the context store, then
+///   record the event -- or fail. `koto next` does this through
+///   [`crate::engine::clear_on_entry::apply_from_log`]. A closure that only
+///   records the event leaves the stale keys in place, and the log then says
+///   they were cleared, so every production caller must route this payload to
+///   the context store.
 /// - `evaluate_gates`: run gate commands and return results
 /// - `invoke_integration`: call an integration runner
 /// - `execute_action`: run a default action command

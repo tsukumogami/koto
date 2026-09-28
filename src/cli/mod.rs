@@ -2385,9 +2385,9 @@ fn handle_rewind(
     }
 
     // Clear the rewound-to state's `clear_on_entry` keys before the response
-    // goes out. A rewind always opens a new epoch, so it always owes one. A
-    // failure leaves no record, and the state's next tick clears them before
-    // anything reads context.
+    // goes out. A rewind always opens a new epoch, so it owes a clearing
+    // whenever the state declares keys. A failure leaves no record, and the
+    // state's next tick clears them before anything reads context.
     clear_after_rewind(backend, context_store, name, &header, &events, &prev_state);
 
     // Re-read events to include the Rewound event we just appended.
