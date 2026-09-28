@@ -154,6 +154,11 @@ pub fn failure_reason_for_current_run(
                     .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
             ),
             EventPayload::ContextRemoved { key, .. } if key == FAILURE_REASON_KEY => Some(None),
+            EventPayload::ContextCleared { keys, .. }
+                if keys.iter().any(|k| k == FAILURE_REASON_KEY) =>
+            {
+                Some(None)
+            }
             _ => None,
         })
         .flatten()?;
@@ -256,6 +261,61 @@ mod tests {
         assert_eq!(
             v,
             serde_json::json!({"a": "{{TOPIC}}", "b": "${context.y}"})
+        );
+    }
+
+    /// A store the code under test must not read.
+    struct Untouched;
+
+    impl ContextStore for Untouched {
+        fn add(&self, _: &str, _: &str, _: &[u8]) -> anyhow::Result<()> {
+            unreachable!("the store was written")
+        }
+        fn get(&self, _: &str, _: &str) -> anyhow::Result<Vec<u8>> {
+            unreachable!("the store was read")
+        }
+        fn ctx_exists(&self, _: &str, _: &str) -> bool {
+            unreachable!("the store was read")
+        }
+        fn remove(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unreachable!("the store was written")
+        }
+        fn list_keys(&self, _: &str, _: Option<&str>) -> anyhow::Result<Vec<String>> {
+            unreachable!("the store was read")
+        }
+    }
+
+    #[test]
+    fn a_clearing_that_names_the_failure_reason_leaves_no_reason() {
+        let ev = |seq: u64, payload: EventPayload| Event {
+            seq,
+            timestamp: String::new(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        };
+        let events = vec![
+            ev(
+                1,
+                EventPayload::ContextAdded {
+                    key: FAILURE_REASON_KEY.to_string(),
+                    hash: "h".to_string(),
+                    size: 1,
+                    writer: None,
+                },
+            ),
+            ev(
+                2,
+                EventPayload::ContextCleared {
+                    state: "work".to_string(),
+                    keys: vec![FAILURE_REASON_KEY.to_string()],
+                    entry_seq: 1,
+                },
+            ),
+        ];
+        assert_eq!(
+            failure_reason_for_current_run(&Untouched, "s", &events),
+            None
         );
     }
 

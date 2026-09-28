@@ -1186,6 +1186,25 @@ where
             });
         }
 
+        // 3a. Clear the state's `clear_on_entry` keys for this entry, before
+        // anything that reads context -- the integration, the action and the
+        // gates -- runs. Decided from the log alone. The append is the
+        // clearing: the caller's append closure removes the keys from the
+        // store before it records the event, and a removal it can't make
+        // fails the tick with nothing recorded, so the next tick retries it.
+        // A state entered on an earlier tick (a rewind, a `--to`, a crash
+        // between the entry and its clearing) is caught here too.
+        if !template_state.clear_on_entry.is_empty() {
+            let pending = crate::engine::clear_on_entry::pending_clearing(
+                &tick_log.borrow(),
+                &state,
+                &template_state.clear_on_entry,
+            );
+            if let Some(clearing) = pending {
+                append_event(&clearing.event()).map_err(AdvanceError::PersistenceError)?;
+            }
+        }
+
         // 4. Integration check
         if let Some(integration_name) = &template_state.integration {
             match invoke_integration(integration_name) {

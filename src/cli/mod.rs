@@ -1398,7 +1398,7 @@ pub fn run(app: App) -> Result<()> {
         }
         Command::Rewind { name, rationale } => {
             let backend = build_backend()?;
-            handle_rewind(&backend, &name, rationale)
+            handle_rewind(&backend, &backend, &name, rationale)
         }
         Command::Status { name } => {
             let backend = build_backend()?;
@@ -2313,6 +2313,7 @@ fn handle_init_inline(
 /// Handle the `koto rewind` command.
 fn handle_rewind(
     backend: &dyn SessionBackend,
+    context_store: &dyn ContextStore,
     name: &str,
     rationale: Option<String>,
 ) -> Result<()> {
@@ -2383,6 +2384,12 @@ fn handle_rewind(
         }));
     }
 
+    // Clear the rewound-to state's `clear_on_entry` keys before the response
+    // goes out. A rewind always opens a new epoch, so it always owes one. A
+    // failure leaves no record, and the state's next tick clears them before
+    // anything reads context.
+    clear_after_rewind(backend, context_store, name, &header, &events, &prev_state);
+
     // Re-read events to include the Rewound event we just appended.
     let (_, events_after) = match backend.read_events(name) {
         Ok(result) => result,
@@ -2415,6 +2422,48 @@ fn handle_rewind(
 
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
+}
+
+/// Perform the clearing a rewind into `state` owes, warning on failure.
+/// The template comes from the session's own log, as `koto status` finds it.
+fn clear_after_rewind(
+    backend: &dyn SessionBackend,
+    context_store: &dyn ContextStore,
+    name: &str,
+    header: &crate::engine::types::StateFileHeader,
+    events: &[crate::engine::types::Event],
+    state: &str,
+) {
+    let session_dir = backend.session_dir(name);
+    let Some(machine_state) =
+        crate::engine::persistence::derive_machine_state(header, events, &session_dir)
+    else {
+        return;
+    };
+    let keys = match load_compiled_template(&machine_state.template_path) {
+        Ok(t) => t
+            .states
+            .get(state)
+            .map(|s| s.clear_on_entry.clone())
+            .unwrap_or_default(),
+        Err(e) => {
+            eprintln!(
+                "warning: could not load the template to clear state {:?}'s keys: {}; \
+                 its next tick clears them",
+                state, e
+            );
+            return;
+        }
+    };
+    if let Err(e) =
+        crate::engine::clear_on_entry::apply_from_log(backend, context_store, name, state, &keys)
+    {
+        eprintln!(
+            "warning: clearing the context keys of state {:?} failed: {}; \
+             the next tick clears them",
+            state, e
+        );
+    }
 }
 
 /// If the `from_state` has a `materialize_children` hook, relocate all
@@ -4567,6 +4616,26 @@ fn handle_next(
             exit_with_error_code(json, ne.code.exit_code());
         }
 
+        // Clear the target's `clear_on_entry` keys for this entry before the
+        // response goes out, so a `koto context exists` right after `--to`
+        // already sees them gone. A removal that fails leaves no record and
+        // the target's next tick clears them before anything reads context.
+        if let Some(target_state) = compiled.states.get(target.as_str()) {
+            if let Err(e) = crate::engine::clear_on_entry::apply_from_log(
+                backend,
+                context_store,
+                &name,
+                target,
+                &target_state.clear_on_entry,
+            ) {
+                eprintln!(
+                    "warning: clearing the context keys of state {:?} failed: {}; \
+                     the next tick clears them",
+                    target, e
+                );
+            }
+        }
+
         // The decider ledger's `directed_exit` record: this `--to` left a
         // visit whose consultation wasn't applied, before the agent answered,
         // paired with that consultation by `visit_seq` (koto#254). Written
@@ -5229,6 +5298,31 @@ fn handle_next(
     // point; a store write that fails here is repaired from the log on the
     // next read, so it is reported rather than failing the tick.
     let mut append_closure = |payload: &EventPayload| -> Result<(), String> {
+        // The advance loop asks for a clearing by appending its event; the
+        // clearing itself (re-derived from the persisted log, keys removed
+        // first, then the event) happens here, where the store is. A removal
+        // that fails fails the tick with nothing recorded.
+        if let EventPayload::ContextCleared { state, .. } = payload {
+            let keys = compiled
+                .states
+                .get(state)
+                .map(|s| s.clear_on_entry.as_slice())
+                .unwrap_or_default();
+            crate::engine::clear_on_entry::apply_from_log(
+                backend,
+                context_store,
+                &name,
+                state,
+                keys,
+            )
+            .map_err(|e| {
+                format!(
+                    "clearing the context keys of state {:?} failed: {}",
+                    state, e
+                )
+            })?;
+            return Ok(());
+        }
         backend
             .append_event(&name, payload, &now_iso8601())
             .map_err(|e| e.to_string())?;

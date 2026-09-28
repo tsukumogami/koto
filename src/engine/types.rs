@@ -885,6 +885,21 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writer: Option<String>,
     },
+    /// One clearing of a state's `clear_on_entry` keys, for one entry into
+    /// the state (DESIGN-koto-ci-wait-stale-keys.md). Carries key names only,
+    /// never values, hashes or sizes. `entry_seq` is the persisted sequence
+    /// number of the entry event the clearing belongs to: any entry, a
+    /// self-transition included (the epoch boundary, not the visit one).
+    /// Additive: an older build lands it in `Unknown` and reads the rest of
+    /// the log unharmed.
+    ContextCleared {
+        /// The state whose entry was cleared.
+        state: String,
+        /// The keys removed, in declaration order.
+        keys: Vec<String>,
+        /// Sequence number of the entry event this clearing belongs to.
+        entry_seq: u64,
+    },
     /// One logged read of a context key. Never carries content or size: a
     /// present key's `hash` is what joins the read to the write that
     /// produced it (the latest write of the key below this event's `seq`
@@ -1656,6 +1671,7 @@ impl EventPayload {
             EventPayload::Rewound { .. } => "rewound",
             EventPayload::ContextAdded { .. } => "context_added",
             EventPayload::ContextRemoved { .. } => "context_removed",
+            EventPayload::ContextCleared { .. } => "context_cleared",
             EventPayload::ContextRead { .. } => "context_read",
             EventPayload::WorkflowCancelled { .. } => "workflow_cancelled",
             EventPayload::DefaultActionExecuted { .. } => "default_action_executed",
@@ -1861,6 +1877,15 @@ impl<'de> Deserialize<'de> for Event {
                 EventPayload::ContextRemoved {
                     key: p.key,
                     writer: lenient_string(p.writer),
+                }
+            }
+            "context_cleared" => {
+                let p: ContextClearedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::ContextCleared {
+                    state: p.state,
+                    keys: p.keys,
+                    entry_seq: p.entry_seq,
                 }
             }
             "context_read" => {
@@ -2185,6 +2210,13 @@ struct ContextRemovedPayload {
     key: String,
     #[serde(default)]
     writer: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct ContextClearedPayload {
+    state: String,
+    keys: Vec<String>,
+    entry_seq: u64,
 }
 
 #[derive(Deserialize)]
