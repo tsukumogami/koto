@@ -16,13 +16,21 @@ states:
         type: enum
         values: [complete, blocked, skipped_by_scheduler]
         required: true
+      failure_reason:
+        type: string
+        required: false
     transitions:
       - target: done
         when:
           status: complete
+      # The assignment stores the reason where the parent's batch view
+      # reads it. It sits on the edge out of the state that takes the
+      # evidence: evidence doesn't reach a later state.
       - target: done_blocked
         when:
           status: blocked
+        context_assignments:
+          failure_reason: "${evidence.failure_reason}"
       # Synthetic edge to satisfy F5 reachability. The scheduler
       # materializes skip markers directly — agents never submit
       # `skipped_by_scheduler`.
@@ -34,10 +42,6 @@ states:
   done_blocked:
     terminal: true
     failure: true
-    accepts:
-      failure_reason:
-        type: string
-        required: true
   skipped_due_to_dep_failure:
     terminal: true
     skipped_marker: true
@@ -53,7 +57,7 @@ Task #{{ISSUE_NUMBER}} completed.
 
 ## done_blocked
 
-Task #{{ISSUE_NUMBER}} is blocked. The accepted `failure_reason` surfaces to the parent's batch view via `reason_source: "failure_reason"`. Without it, W5 warns at compile time and the parent sees the state name as the reason (`reason_source: "state_name"`).
+Task #{{ISSUE_NUMBER}} is blocked. The `failure_reason` stored on the way here is the parent's batch-view `reason` for this task, with `reason_source: "failure_reason"`. Had the worker submitted no `failure_reason`, the parent would see the state name instead (`reason_source: "state_name"`).
 
 ## skipped_due_to_dep_failure
 
