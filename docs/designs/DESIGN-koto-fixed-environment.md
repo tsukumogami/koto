@@ -223,9 +223,22 @@ test at creation against those few values, skipping any shorter than eight
 characters, which would match ordinary path text by accident. Names like
 `CI` or `TZ`, whose short values carry nothing secret, aren't compared.
 
+**Which `PATH` entries can go stale.** A real `PATH` routinely lists
+directories that don't exist: a plugin's `bin` that was never populated, a
+version manager's directory for a version not installed. Measured on one
+developer host, about forty recorded entries were missing at the moment of
+recording. So when a record is made (at `koto init` and at adoption), the
+entries of the normalized `PATH` that aren't directories are listed in the
+record's `path_absent`. They stay in `PATH`, so a tool installed there later is
+found. The list holds path text from `PATH` itself and nothing else, and a
+record without it (one written before the field existed) reads as an empty
+list.
+
 **Stale values.** On every tick, before commands run, koto stats each recorded
-`PATH` directory, the recorded `HOME` and the recorded `XDG_CONFIG_HOME`: a few
-`stat` calls, no spawn. The missing ones form the tick's stale list. Then:
+`PATH` directory not listed in `path_absent`, the recorded `HOME` and the
+recorded `XDG_CONFIG_HOME`: a few `stat` calls, no spawn. The missing ones form
+the tick's stale list; each is a value that existed when it was recorded and
+has since gone. Then:
 
 - If a gate or action fails and either the stale list is non-empty or the
   command reported a command not found, the `koto next` response carries a
@@ -266,6 +279,17 @@ substituting another `HOME` would reopen the channel it closes.
 **A verb that re-records a stale value.** Rejected: the same bypass with a log
 line. A new session is the remedy, and the note says so.
 
+**Drop `PATH` entries that aren't directories when recording** (instead of
+listing them in `path_absent`). Rejected: it changes what commands see. A
+directory created after init, such as a tool manager's first install, would
+never be searched, and a failure it caused would look like a stale record.
+
+**Stat every recorded `PATH` entry, and report missing ones only alongside a
+failure.** Rejected: an entry that never existed still can't be told from one
+removed after init, so the note on a failure lists every never-created
+directory, and the notice for a removed directory with nothing failing, which
+this decision promises, can't be given at all.
+
 ### Decision 3: the record, children, adoption and attach
 
 The record must live where the header's other creation-time facts live,
@@ -288,6 +312,7 @@ the `origin: Option<SessionOrigin>` pattern:
 ```rust
 pub struct CommandEnvironment {
     pub path: Option<String>,             // normalized
+    pub path_absent: Vec<String>,         // entries of `path` not on disk when recorded
     pub home: Option<String>,
     pub xdg_config_home: Option<String>,
     pub pass: Vec<String>,                // the release's default live names
@@ -368,7 +393,14 @@ standard input to null, and spawns `/bin/sh`, reporting a spawn failure as
 such with no fallback to a `PATH` search. `evaluate_gates_with_request_store`
 takes it as a parameter, so the compiler finds every caller: `TickGates`, the
 polling loop's gate closure, and the `--to` guard; both default-action sites
-pass the same value.
+pass the same value. The shell and standard input apply to a legacy session
+too: the flag keeps the caller's environment, and neither change carries any
+environment content.
+
+The same value keeps, for this tick only, how each gate and action last ended
+(passed, failed, or failed looking not-found), because a command gate's
+evidence doesn't carry stderr. The stale and not-found notes are built from it
+after the tick; its `Debug` form names variables and never shows a value.
 
 #### Alternatives Considered
 
@@ -426,8 +458,9 @@ Key assumptions:
   refusal is a compile-time guard for template authors, and the builder
   filters them again.
 - **Set by koto on every command:** `KOTO_TICK_SESSION` and
-  `KOTO_SESSIONS_BASE` (the base of the store the tick is operating on), so a
-  nested `koto` finds the same store and a nested `koto next` is refused.
+  `KOTO_SESSIONS_BASE` (the directory holding the tick's session
+  directories), so a nested `koto` finds the same store whatever `HOME` the
+  record holds, and a nested `koto next` is refused.
 - **Shell:** `/bin/sh` by absolute path on Linux and macOS.
 
 A command can still set any variable for itself (`GIT_DIR=... git ...`): the
@@ -507,7 +540,8 @@ cost of a permanent record visible instead of silent.
 koto init (top-level form)
   compile template (pass_env names validated, not recorded)
   normalize PATH; read HOME, XDG_CONFIG_HOME; unset any that carries a token
-  record = {path, home, xdg_config_home, pass = default live names, legacy}
+  record = {path, path_absent, home, xdg_config_home,
+            pass = default live names, legacy}
   write header; report dropped entries and unset values in the response
 
 child creation (batch, retry, skip marker, --parent, session start)

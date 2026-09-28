@@ -236,8 +236,9 @@ suite keeps passing while the long-term route to add names is decided.
   a command a tick is running is still refused with `nested_invocation`, with
   or without the legacy flag.
 - **R13. A stale record is named, never silent.** On every tick koto checks
-  that each recorded `PATH` directory, the recorded `HOME` and the recorded
-  `XDG_CONFIG_HOME` still exist. When a gate or action fails and either the
+  that each recorded `PATH` directory that existed when it was recorded, the
+  recorded `HOME` and the recorded `XDG_CONFIG_HOME` still exist. A `PATH`
+  entry already missing at recording is ordinary and never reported. When a gate or action fails and either the
   check found a missing value or the command reported a command not found,
   the `koto next` response names the failing gate or action, which recorded
   value is stale (or that the command ran under the recorded `PATH`, given),
