@@ -1193,7 +1193,7 @@ never produces it.
   "type": "environment_adopted",
   "payload": {
     "environment": {
-      "path": "/home/user/.cargo/bin:/usr/bin:/bin",
+      "path": "/home/user/.cargo/bin:/home/user/.local/share/fnm/bin:/usr/bin:/bin",
       "path_absent": ["/home/user/.local/share/fnm/bin"],
       "home": "/home/user",
       "pass": ["USER", "LOGNAME", "LANG", "TMPDIR", "GH_TOKEN", "HTTPS_PROXY"]
@@ -1215,7 +1215,7 @@ recorded values and the dropped entries.
 
 The event is appended before the header field is written, so a crash between the
 two repeats the adoption on the next tick. Two of these in one log mean that
-crash, not a second record.
+crash, not a second record; the last one is what the header holds.
 
 ---
 

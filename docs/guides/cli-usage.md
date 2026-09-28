@@ -61,7 +61,7 @@ Every new session's header carries an **origin record**, `origin`: the session's
 
 `koto init` also records the environment the session's gates and default actions will run with. It records `PATH` (with empty and relative entries dropped), `HOME` and `XDG_CONFIG_HOME` from its own process, plus koto's default list of variable names whose values are read live on each tick. Every command then runs as `/bin/sh -c` in a cleared environment holding those names' live values, the names the template declares in `pass_env:`, the three recorded values, and `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`. Nothing else from your shell reaches it. A child, whether spawned by a batch, `koto init --parent` or `koto session start`, copies its parent's record, and records from its own process only when the parent has none yet. The default-action guide's [What a command's environment is](default-action-authoring.md#what-a-commands-environment-is) publishes the lists.
 
-When recording drops a `PATH` entry, or leaves a value unset because it was relative or contained a token's value, the response carries an `environment` report naming them:
+When recording drops a `PATH` entry, or leaves a value unset because it was relative or contained a token's or proxy URL's value, the response carries an `environment` report naming them:
 
 ```json
 {"name":"my-workflow","state":"assess","environment":{"dropped_path_entries":["node_modules/.bin"],"unset":[]}}

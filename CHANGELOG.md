@@ -220,7 +220,7 @@ to `0.9.x`).
   [What a command's environment is](docs/guides/default-action-authoring.md#what-a-commands-environment-is).
   `koto init` (every top-level form) makes the record, and a child, including
   one from `koto session start`, copies its parent's. `PATH` loses its empty and relative
-  entries, a recorded value that contains a token's value is recorded unset,
+  entries, a recorded value that contains a token's or proxy URL's value is recorded unset,
   and the `koto init` response reports both in a new `environment` object. The
   record can't be changed; the remedy for a wrong one is a new session (`koto
   cancel --cleanup <name>`, then `koto init`). A session created by an earlier

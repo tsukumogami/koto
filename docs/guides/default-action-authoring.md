@@ -239,8 +239,8 @@ command. Standard input is at end of file, so a command can't read whatever a ca
 3. `KOTO_TICK_SESSION`, the session being ticked, and `KOTO_SESSIONS_BASE`, the directory that
    holds the session directories, **set by koto**.
 
-A later step wins over an earlier one, so neither a declared name nor the caller's own value can
-replace a recorded value or one koto sets. Nothing else reaches the command.
+The first step skips the recorded names and the ones koto sets, so neither a declared name nor
+the caller's own value can replace them. Nothing else reaches the command.
 
 The lists decide what koto passes in, not what a command may use. A command can still set a
 variable for itself, as in `GIT_DIR=/srv/mirror.git git log -1`.
@@ -382,8 +382,9 @@ The next tick finds the record and takes the ordinary path.
 #### When a recorded value goes stale
 
 Before commands run, each tick checks that the recorded `HOME`, `XDG_CONFIG_HOME` and each
-recorded `PATH` directory not in `path_absent` still exist. A value that existed at recording and
-is gone now is stale. Tools move: a version manager removes an old version, a dev shell deletes
+recorded `PATH` directory not in `path_absent` still exist. A `PATH` directory that was already
+missing at recording is listed in `path_absent` and never reported; any other missing value is
+stale. Tools move: a version manager removes an old version, a dev shell deletes
 its directory on exit.
 
 If a gate or action then fails, and either something is stale or the failure looks like a
@@ -440,9 +441,9 @@ What you get is this: a session's `PATH`, `HOME` and `XDG_CONFIG_HOME` can't cha
 creation, and shell and git or gh configuration injection names never reach its commands. It
 doesn't promise that an agent which also creates the session can't widen it. In this release
 that agent can pass `--legacy-environment`. Process attributes other than the environment, such as
-the umask and resource limits, are still inherited. The design,
-`docs/designs/DESIGN-koto-fixed-environment.md`, lists what was deferred and the evidence that
-would bring each item back.
+the umask and resource limits, are still inherited. The design document for this change,
+DESIGN-koto-fixed-environment.md, lists what was deferred and the evidence that would bring each
+item back.
 
 ### One command the engine refuses: `koto next`
 
