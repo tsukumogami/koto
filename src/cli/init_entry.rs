@@ -813,6 +813,18 @@ fn attach(
         refuse(entry, *r);
     }
 
+    // Drift in the fixed environment values is reported, never refused
+    // (DESIGN-koto-fixed-environment.md, R14): attach writes no record, and
+    // the session's commands run with the recorded values whoever ticks it.
+    // Names only, never values. A session with no record isn't compared; its
+    // next tick adopts one.
+    let environment_drift = existing
+        .header
+        .command_environment
+        .as_ref()
+        .map(|record| crate::engine::command_env::drift(record, |n| std::env::var(n).ok()))
+        .unwrap_or_default();
+
     let plan = match validate_rebind(
         &existing.compiled,
         &facts.bindings,
@@ -857,6 +869,15 @@ fn attach(
         "outcome": "attached",
         "rebound": plan.changes,
     });
+    if !environment_drift.is_empty() {
+        eprintln!(
+            "warning: session '{}' recorded a different {} than this shell has; its commands \
+             run with the recorded values, not this shell's",
+            name,
+            environment_drift.join(", ")
+        );
+        out["environment_drift"] = serde_json::json!(environment_drift);
+    }
     if let Some((target, written)) = leg {
         out["leg"] = leg_json(target, written);
     }

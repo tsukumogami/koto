@@ -3684,9 +3684,9 @@ fn handle_next(
 ) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
-        blocking_conditions_from_gates, execution_anchor_adopted_notice, ErrorDetail,
-        ExpectsSchema, IntegrationOutput, IntegrationUnavailableMarker, NextError, NextErrorCode,
-        NextResponse, RECOVERY_POINTER,
+        blocking_conditions_from_gates, environment_adopted_notice,
+        execution_anchor_adopted_notice, ErrorDetail, ExpectsSchema, IntegrationOutput,
+        IntegrationUnavailableMarker, NextError, NextErrorCode, NextResponse, RECOVERY_POINTER,
     };
     use crate::engine::advance::{
         advance_until_stop_with_decider, merge_epoch_evidence, ActionResult, AdvanceError,
@@ -4081,6 +4081,41 @@ fn handle_next(
             exit_with_error_code(json, err.code.exit_code());
         }
     };
+
+    // The command environment (DESIGN-koto-fixed-environment.md, R16). A
+    // session created by a koto that recorded none adopts one here, before
+    // any gate or action can run, so every command this tick runs has a
+    // record behind it. A writer the epoch fence below will reject is not
+    // allowed to set a record nothing can change afterwards, so it skips
+    // adoption and is refused at the fence.
+    let mut environment_adopted: Option<(crate::engine::types::CommandEnvironment, Vec<String>)> =
+        None;
+    if header.command_environment.is_none() {
+        let displaced = with_data.is_some()
+            && crate::engine::epoch::fence_applies_to(&header)
+            && crate::engine::types::ValidatedSessionId::new(&name).map_or(true, |sid| {
+                crate::engine::epoch::validate_epoch(&sid, &header, dispatch_epoch).is_err()
+            });
+        if !displaced {
+            match init_child::adopt_command_environment(backend, &name) {
+                Ok((record, report)) => {
+                    if let Some(report) = report {
+                        environment_adopted = Some((record.clone(), report.dropped_path_entries));
+                    }
+                    header.command_environment = Some(record);
+                }
+                Err(e) => {
+                    let ne = NextError {
+                        code: NextErrorCode::PersistenceError,
+                        message: format!("failed to record the command environment: {}", e),
+                        details: vec![],
+                    };
+                    let json = serde_json::json!({"error": ne});
+                    exit_with_error_code(json, ne.code.exit_code());
+                }
+            }
+        }
+    }
 
     // Construct variable bindings from the WorkflowInitialized event.
     // Re-validates values as defense in depth; exits with infrastructure error on failure.
@@ -4508,6 +4543,11 @@ fn handle_next(
                 // the first thing the agent reads: it reports a
                 // binding that was just created, which every later
                 // tick of this session is judged against.
+                let resp = match &environment_adopted {
+                    Some((record, dropped)) => resp
+                        .with_directive_prefix(&environment_adopted_notice(&name, record, dropped)),
+                    None => resp,
+                };
                 let resp = match &anchor_adopted {
                     Some(anchor) => {
                         resp.with_directive_prefix(&execution_anchor_adopted_notice(&name, anchor))
@@ -5833,6 +5873,12 @@ fn handle_next(
             // The anchor-adoption notice, spliced last so it is the
             // first thing the agent reads (see the directed-transition
             // path for the same splice).
+            let resp = match &environment_adopted {
+                Some((record, dropped)) => {
+                    resp.with_directive_prefix(&environment_adopted_notice(&name, record, dropped))
+                }
+                None => resp,
+            };
             let resp = match &anchor_adopted {
                 Some(anchor) => {
                     resp.with_directive_prefix(&execution_anchor_adopted_notice(&name, anchor))

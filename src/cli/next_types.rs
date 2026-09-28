@@ -194,6 +194,46 @@ pub fn execution_anchor_adopted_notice(name: &str, anchor: &std::path::Path) -> 
     )
 }
 
+/// Directive prefix announcing that a session created by an earlier koto
+/// has adopted a command environment record on this tick
+/// (DESIGN-koto-fixed-environment.md, R16).
+///
+/// Shows the three recorded values, which hold no secret (a value carrying
+/// a credential was recorded unset), and the `PATH` entries recording
+/// dropped. Never shows a value of any other variable.
+pub fn environment_adopted_notice(
+    name: &str,
+    record: &crate::engine::types::CommandEnvironment,
+    dropped: &[String],
+) -> String {
+    let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "(unset)".to_string());
+    let dropped = if dropped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Dropped PATH entries that resolve relative to the working directory: {}.",
+            dropped
+                .iter()
+                .map(|e| if e.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    e.clone()
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "[koto] Session '{name}' had no recorded command environment; its commands now run \
+         with PATH={}, HOME={}, XDG_CONFIG_HOME={}.{dropped} Other variables reach them only \
+         when koto's default list or the template's pass_env names them. The record can't be \
+         changed; start a new session to run with a different one.\n\n",
+        show(&record.path),
+        show(&record.home),
+        show(&record.xdg_config_home),
+    )
+}
+
 impl NextResponse {
     /// Return this response with `result` set, when it is a `Terminal`.
     /// Every other variant is returned unchanged: only a terminal response

@@ -284,6 +284,31 @@ pub fn record_from_process(legacy: bool) -> (CommandEnvironment, RecordReport) {
     record_from(|name| std::env::var(name).ok(), legacy)
 }
 
+/// The fixed variables whose values in a caller's environment, read through
+/// `lookup`, differ from a session's record, in `FIXED_NAMES` order.
+///
+/// Names only: an attach reports which variables drifted, never a value,
+/// the same rule as the `koto init` response. The caller's values are
+/// normalized exactly as a record would be, so a `PATH` differing only in
+/// entries recording drops reports no drift.
+pub fn drift<F>(record: &CommandEnvironment, lookup: F) -> Vec<&'static str>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let (caller, _) = record_from(lookup, false);
+    let mut drifted = Vec::new();
+    if record.path != caller.path {
+        drifted.push("PATH");
+    }
+    if record.home != caller.home {
+        drifted.push("HOME");
+    }
+    if record.xdg_config_home != caller.xdg_config_home {
+        drifted.push("XDG_CONFIG_HOME");
+    }
+    drifted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +454,29 @@ mod tests {
         assert!(report.unset.contains(&("PATH", UnsetReason::Credential)));
         let rendered = report.to_json().to_string();
         assert!(!rendered.contains(token));
+    }
+
+    #[test]
+    fn drift_compares_normalized_values_and_names_only() {
+        let (record, _) = record_from(
+            env(&[("PATH", "/usr/bin:/bin"), ("HOME", "/home/u")]),
+            false,
+        );
+        // Only a dropped entry differs: no drift.
+        assert!(drift(
+            &record,
+            env(&[("PATH", ".:/usr/bin:/bin:"), ("HOME", "/home/u")])
+        )
+        .is_empty());
+        let d = drift(
+            &record,
+            env(&[
+                ("PATH", "/opt/new:/usr/bin:/bin"),
+                ("HOME", "/home/u"),
+                ("XDG_CONFIG_HOME", "/home/u/.config"),
+            ]),
+        );
+        assert_eq!(d, vec!["PATH", "XDG_CONFIG_HOME"]);
     }
 
     #[test]

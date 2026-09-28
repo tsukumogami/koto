@@ -536,3 +536,255 @@ fn declaring_a_koto_supplied_name_warns() {
     assert!(r.success, "{}", r.stderr);
     assert!(r.stderr.contains("W7"), "expected W7, got: {}", r.stderr);
 }
+
+// ---------------------------------------------------------------------------
+// older sessions and attach (Issue 2)
+// ---------------------------------------------------------------------------
+
+/// A session that waits for evidence, so a tick stops rather than finishing.
+const WAIT: &str = r#"---
+name: wait
+version: "1.0"
+initial_state: wait
+states:
+  wait:
+    accepts:
+      go:
+        type: enum
+        required: true
+        values: [yes]
+    transitions:
+      - target: done
+        when:
+          go: yes
+  done:
+    terminal: true
+---
+
+## wait
+
+Wait.
+
+## done
+
+Done.
+"#;
+
+/// Make a session look like one created by a koto that recorded no
+/// command environment.
+fn strip_record(env: &Env, name: &str) {
+    let state = env.state_path(name);
+    let text = std::fs::read_to_string(&state).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut header: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    header
+        .as_object_mut()
+        .unwrap()
+        .remove("command_environment");
+    lines[0] = header.to_string();
+    std::fs::write(&state, lines.join("\n") + "\n").unwrap();
+    assert!(env.record(name).is_null());
+}
+
+fn events_of_type(env: &Env, name: &str, kind: &str) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(env.state_path(name))
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|e| e["type"] == kind)
+        .collect()
+}
+
+#[test]
+fn an_older_session_adopts_a_record_once_with_a_notice() {
+    let env = Env::new();
+    let tpl = env.template("wait.md", WAIT);
+    assert!(env.run(&[], &["init", "old", "--template", &tpl]).success);
+    strip_record(&env, "old");
+
+    let tick_path = format!("/opt/tick/bin:.:{SYSTEM_PATH}");
+    let r = env.run(&[("PATH", &tick_path)], &["next", "old"]);
+    assert!(r.success, "{}", r.stderr);
+    let directive = r.json["directive"].as_str().unwrap_or_default();
+    assert!(
+        directive.contains("had no recorded command environment"),
+        "notice missing: {directive}"
+    );
+    assert!(directive.contains("/opt/tick/bin"), "{directive}");
+
+    let rec = env.record("old");
+    assert_eq!(rec["path"], format!("/opt/tick/bin:{SYSTEM_PATH}").as_str());
+    assert!(rec.get("legacy").is_none(), "adoption never sets legacy");
+    let adopted = events_of_type(&env, "old", "environment_adopted");
+    assert_eq!(adopted.len(), 1);
+    assert_eq!(adopted[0]["payload"]["dropped"], serde_json::json!(["."]));
+
+    let r = env.run(&[("PATH", &tick_path)], &["next", "old"]);
+    assert!(r.success, "{}", r.stderr);
+    let directive = r.json["directive"].as_str().unwrap_or_default();
+    assert!(!directive.contains("had no recorded command environment"));
+    assert_eq!(events_of_type(&env, "old", "environment_adopted").len(), 1);
+}
+
+const BATCH_CHILD: &str = r#"---
+name: batch-child
+version: "1.0"
+initial_state: work
+states:
+  work:
+    accepts:
+      marker:
+        type: enum
+        required: true
+        values: [done]
+    transitions:
+      - target: done
+        when:
+          marker: done
+  done:
+    terminal: true
+---
+
+## work
+
+Work.
+
+## done
+
+Done.
+"#;
+
+const BATCH_PARENT: &str = r#"---
+name: batch-parent
+version: "1.0"
+initial_state: plan
+states:
+  plan:
+    accepts:
+      tasks:
+        type: tasks
+        required: true
+    gates:
+      done:
+        type: children-complete
+    materialize_children:
+      from_field: tasks
+      default_template: child.md
+    transitions:
+      - target: closed
+        when:
+          gates.done.all_complete: true
+  closed:
+    terminal: true
+---
+
+## plan
+
+Plan the batch.
+
+## closed
+
+Closed.
+"#;
+
+#[test]
+fn a_batch_parent_adopts_before_it_spawns_and_children_copy_it() {
+    let env = Env::new();
+    std::fs::write(env.cwd.join("child.md"), BATCH_CHILD).unwrap();
+    let parent = env.cwd.join("parent.md");
+    std::fs::write(&parent, BATCH_PARENT).unwrap();
+    assert!(
+        env.run(
+            &[],
+            &["init", "parent", "--template", parent.to_str().unwrap()]
+        )
+        .success
+    );
+    strip_record(&env, "parent");
+
+    let tick_path = format!("/opt/parent-tick/bin:{SYSTEM_PATH}");
+    let tasks = serde_json::json!({"tasks": [
+        {"name": "A", "waits_on": [], "vars": {}},
+    ]})
+    .to_string();
+    let r = env.run(
+        &[("PATH", &tick_path)],
+        &["next", "parent", "--with-data", &tasks],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let parent_rec = env.record("parent");
+    assert_eq!(parent_rec["path"], tick_path.as_str());
+    assert_eq!(
+        env.record("parent.A"),
+        parent_rec,
+        "child copies the adopted record"
+    );
+
+    // A child that exists before the upgrade adopts on its own first tick.
+    strip_record(&env, "parent.A");
+    let child_path = format!("/opt/child-tick/bin:{SYSTEM_PATH}");
+    let r = env.run(
+        &[("PATH", &child_path)],
+        &["next", "parent.A", "--no-cleanup"],
+    );
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(env.record("parent.A")["path"], child_path.as_str());
+}
+
+#[test]
+fn attach_reports_drift_by_name_and_refuses_nothing() {
+    let env = Env::new();
+    let tpl = env.template("wait.md", WAIT);
+    assert!(env.run(&[], &["init", "wf", "--template", &tpl]).success);
+    let before = env.record("wf");
+
+    // Only a dropped entry differs: attaches with no drift reported.
+    let same = format!(".:{SYSTEM_PATH}");
+    let r = env.run(
+        &[("PATH", &same)],
+        &["init", "wf", "--template", &tpl, "--attach-live"],
+    );
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.json.get("environment_drift").is_none(), "{}", r.stdout);
+
+    let other = format!("/opt/drifted-dir/bin:{SYSTEM_PATH}");
+    let xdg = env.home().join("drifted-config");
+    let r = env.run(
+        &[("PATH", &other), ("XDG_CONFIG_HOME", xdg.to_str().unwrap())],
+        &["init", "wf", "--template", &tpl, "--attach-live"],
+    );
+    assert!(r.success, "attach must not be refused: {}", r.stderr);
+    assert_eq!(r.json["outcome"], "attached");
+    assert_eq!(
+        r.json["environment_drift"],
+        serde_json::json!(["PATH", "XDG_CONFIG_HOME"])
+    );
+    assert!(r.stderr.contains("PATH, XDG_CONFIG_HOME"), "{}", r.stderr);
+    // Names only: neither the recorded nor the caller's value is printed.
+    for output in [&r.stdout, &r.stderr] {
+        assert!(!output.contains("/opt/drifted-dir"), "{output}");
+        assert!(!output.contains("drifted-config"), "{output}");
+        assert!(!output.contains(SYSTEM_PATH), "{output}");
+    }
+    assert_eq!(env.record("wf"), before, "attach never changes the record");
+}
+
+#[test]
+fn attach_to_an_unrecorded_session_is_not_compared() {
+    let env = Env::new();
+    let tpl = env.template("wait.md", WAIT);
+    assert!(env.run(&[], &["init", "wf", "--template", &tpl]).success);
+    strip_record(&env, "wf");
+    let other = format!("/opt/elsewhere/bin:{SYSTEM_PATH}");
+    let r = env.run(
+        &[("PATH", &other)],
+        &["init", "wf", "--template", &tpl, "--attach-live"],
+    );
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.json.get("environment_drift").is_none());
+    assert!(
+        env.record("wf").is_null(),
+        "attach doesn't adopt; the next tick does"
+    );
+}

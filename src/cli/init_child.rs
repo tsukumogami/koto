@@ -533,6 +533,79 @@ pub(crate) fn resolve_command_environment(
     Ok((record, Some(report)))
 }
 
+/// Name of the lock file, inside a session's directory, that serializes
+/// adoption of a command environment record.
+const ENVIRONMENT_LOCK_FILE: &str = "environment.lock";
+
+/// Give an older session a command environment record on its first tick
+/// (DESIGN-koto-fixed-environment.md, R16).
+///
+/// Under an exclusive lock on the session's `environment.lock`, re-read the
+/// header. If a record is already there -- another tick adopted first -- return
+/// it with no report and write nothing. Otherwise record this process's fixed
+/// values and koto's default live names (never the legacy flag), append an
+/// `environment_adopted` event, then rewrite the header: the anchor's order,
+/// so a crash between the two writes repeats a visible adoption rather than
+/// leaving a silent one. The report is `Some` only when this call adopted.
+pub(crate) fn adopt_command_environment(
+    backend: &dyn SessionBackend,
+    name: &str,
+) -> anyhow::Result<(
+    crate::engine::types::CommandEnvironment,
+    Option<crate::engine::command_env::RecordReport>,
+)> {
+    let dir = backend.session_dir(name);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(ENVIRONMENT_LOCK_FILE))
+        .with_context(|| format!("failed to open {} for {:?}", ENVIRONMENT_LOCK_FILE, name))?;
+    lock_exclusive(&lock)?;
+
+    let header = backend.read_header(name)?;
+    if let Some(existing) = header.command_environment {
+        return Ok((existing, None));
+    }
+
+    let (record, report) = crate::engine::command_env::record_from_process(false);
+    let payload = EventPayload::EnvironmentAdopted {
+        environment: record.clone(),
+        dropped: report.dropped_path_entries.clone(),
+    };
+    backend.append_event(name, &payload, &now_iso8601())?;
+    let state_path = dir.join(crate::session::state_file_name(name));
+    let written = record.clone();
+    crate::engine::claim::rewrite_header_atomically(&state_path, |mut h| {
+        h.command_environment = Some(written);
+        h
+    })?;
+    // The lock is released when `lock` drops, after the header is written.
+    drop(lock);
+    Ok((record, Some(report)))
+}
+
+/// Take an exclusive advisory lock on `file`, blocking until it is free.
+#[cfg(unix)]
+fn lock_exclusive(file: &std::fs::File) -> anyhow::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: flock on a file descriptor this function borrows for the call;
+    // it neither closes nor retains the descriptor.
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if ret != 0 {
+        return Err(anyhow::anyhow!(
+            "failed to lock the session's command environment: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn lock_exclusive(_file: &std::fs::File) -> anyhow::Result<()> {
+    Ok(())
+}
+
 /// The origin record for a session about to be created: its execution
 /// anchor and the store's identity.
 ///
@@ -1776,6 +1849,35 @@ Done.
                 "{child} must copy the parent's record"
             );
         }
+    }
+
+    #[test]
+    fn a_second_adoption_finds_the_first_record_and_writes_nothing() {
+        // The deterministic half of the race: whichever tick takes the lock
+        // second re-reads the header under it, finds the record, and appends
+        // no event.
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let backend = backend_in(sessions.path());
+        seed_parent_anchored(&backend, "old", None);
+
+        let (first, first_report) = adopt_command_environment(&backend, "old").expect("adopt");
+        assert!(first_report.is_some(), "the first call adopts");
+        let (second, second_report) = adopt_command_environment(&backend, "old").expect("re-adopt");
+        assert!(second_report.is_none(), "the second call finds the record");
+        assert_eq!(first, second);
+        assert!(!first.legacy, "adoption never sets the legacy flag");
+
+        let (_, events) = backend.read_events("old").expect("events");
+        let adopted = events
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::EnvironmentAdopted { .. }))
+            .count();
+        assert_eq!(adopted, 1);
+        assert_eq!(
+            backend.read_header("old").unwrap().command_environment,
+            Some(first)
+        );
     }
 
     #[test]

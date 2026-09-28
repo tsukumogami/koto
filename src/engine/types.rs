@@ -842,6 +842,21 @@ pub enum EventPayload {
     ExecutionAnchorAdopted {
         anchor: PathBuf,
     },
+    /// Emitted on the first tick of a session whose header carries no
+    /// `command_environment` -- a session created by a koto that recorded
+    /// none (DESIGN-koto-fixed-environment.md, R16). The tick records the
+    /// ticking process's fixed values and koto's default live names on the
+    /// header and appends this event, so the log shows when the record
+    /// arrived after the fact and which `PATH` entries were dropped.
+    ///
+    /// Carries the record itself, which holds no secret: the three fixed
+    /// values and a list of names. At most one appears per session, because
+    /// the header field is what the next tick finds.
+    EnvironmentAdopted {
+        environment: CommandEnvironment,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dropped: Vec<String>,
+    },
     /// Emitted by `koto session rebind` when a developer deliberately
     /// moves a session's execution anchor (R13). Rebinding is the only
     /// way an anchor changes once it is recorded, so the log tells a
@@ -1400,6 +1415,7 @@ impl EventPayload {
             EventPayload::ChildCompleted { .. } => "child_completed",
             EventPayload::IntentUpdated { .. } => "intent_updated",
             EventPayload::ExecutionAnchorAdopted { .. } => "execution_anchor_adopted",
+            EventPayload::EnvironmentAdopted { .. } => "environment_adopted",
             EventPayload::ExecutionAnchorRebound { .. } => "execution_anchor_rebound",
             EventPayload::VariableCaptured { .. } => "variable_captured",
             EventPayload::VariablesRebound { .. } => "variables_rebound",
@@ -1681,6 +1697,14 @@ impl<'de> Deserialize<'de> for Event {
                 let p: ExecutionAnchorAdoptedPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
                 EventPayload::ExecutionAnchorAdopted { anchor: p.anchor }
+            }
+            "environment_adopted" => {
+                let p: EnvironmentAdoptedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::EnvironmentAdopted {
+                    environment: p.environment,
+                    dropped: p.dropped,
+                }
             }
             "execution_anchor_rebound" => {
                 let p: ExecutionAnchorReboundPayload = serde_json::from_value(payload_val.clone())
@@ -1964,6 +1988,13 @@ struct IntentUpdatedPayload {
 #[derive(Deserialize)]
 struct ExecutionAnchorAdoptedPayload {
     anchor: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct EnvironmentAdoptedPayload {
+    environment: CommandEnvironment,
+    #[serde(default)]
+    dropped: Vec<String>,
 }
 
 #[derive(Deserialize)]
