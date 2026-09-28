@@ -740,10 +740,10 @@ A view written by a koto older than `reason` has `failure_mode` and no
 state name, when they read it. The `batch_final_view` context key is the view as it was
 written, so a key written by an older koto still lacks `reason`.
 
-The view is frozen when the batch completes. A `failure_reason` a child
-writes after that reaches the live gate output and `koto status` while the
-parent is still in the batching state, but not the frozen view, until the
-batch is recorded again after a retry, a rewind or a change in outcomes.
+A child's `reason` is fixed when the child reaches its failure state: koto
+resolves the `failure_reason` then, records it with the child's result (see
+`child_completed`), and every surface reads that record. A `failure_reason`
+the child writes afterwards changes none of them.
 
 ---
 
@@ -994,6 +994,8 @@ child state access) should use this event to reconstruct batch outcomes.
 | `task_name` | string | Yes | Short task name — the segment after the parent prefix dot. |
 | `outcome` | string | Yes | Terminal outcome: `"success"`, `"failure"`, or `"skipped"`. |
 | `final_state` | string | Yes | The child's terminal state name. |
+| `result` | object | No | Copy of the child's result (`status`, `summary`, optional `payload`), so the parent's `children-complete` gate can read it after the child session is gone. |
+| `failure_reason` | string | No | For a child that ended in a failure state, the `failure_reason` context key it wrote during its current run, folded onto one line and cut to at most 500 characters. The same value is recorded on the child's own log with its result. Absent when the child wrote none. The batch view reports it as the child's `reason`. |
 
 ---
 

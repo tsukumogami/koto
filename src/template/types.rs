@@ -2369,9 +2369,9 @@ impl CompiledTemplate {
         // not credited.
         //
         // Declaring `failure_reason` in the terminal state's own `accepts`
-        // is not credited (koto#278): evidence writes no context, and a
-        // terminal state takes no evidence, so the declaration never stores
-        // the key.
+        // is not credited (koto#278): evidence writes no context, and
+        // `koto next --with-data` refuses evidence for a session already in
+        // a terminal state, so the declaration never stores the key.
         //
         // TODO(issue-8/W5): (b) is still unchecked. A default_action is a
         // shell command with no declared set of keys it writes, so W5 can

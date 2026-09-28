@@ -741,6 +741,7 @@ mod tests {
                     outcome: crate::engine::types::TerminalOutcome::Success,
                     final_state: "done".to_string(),
                     result: None,
+                    failure_reason: None,
                 },
                 "2026-01-01T00:00:01Z",
             )

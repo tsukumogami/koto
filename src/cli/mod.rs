@@ -1433,8 +1433,7 @@ pub fn run(app: App) -> Result<()> {
                     .into_iter()
                     .filter(|wf| wf.parent_workflow.as_deref() == Some(parent_name.as_str()))
                     .collect();
-                let augmented =
-                    annotate_children_with_batch_view(&backend, &backend, parent_name, filtered);
+                let augmented = annotate_children_with_batch_view(&backend, parent_name, filtered);
                 println!("{}", serde_json::to_string(&augmented)?);
                 return Ok(());
             }
@@ -2589,9 +2588,11 @@ fn append_request_store_result_to_child(
     backend: &dyn SessionBackend,
     child_name: &str,
     result: &WorkflowResult,
+    failure_reason: Option<&str>,
 ) -> bool {
     let payload = EventPayload::RequestStoreResult {
         result: result.clone(),
+        failure_reason: failure_reason.map(str::to_string),
     };
     match backend.append_event(child_name, &payload, &now_iso8601()) {
         Ok(_) => true,
@@ -2705,6 +2706,10 @@ fn resolve_terminal_result(
 #[cfg(unix)]
 struct TerminalRecord {
     result: WorkflowResult,
+    /// The session's `failure_reason` for a failure terminal (koto#278),
+    /// resolved with the result and recorded beside it, so the parent's
+    /// batch view reads the reason the result was reported with.
+    failure_reason: Option<String>,
     /// True when a `request_store.result` for this arrival at the terminal
     /// is already on the log -- a parked session ticked again. The record
     /// is then returned as-is and not appended a second time.
@@ -2735,18 +2740,26 @@ fn terminal_record(
     {
         return TerminalRecord {
             result,
+            failure_reason:
+                crate::engine::terminal_result::recorded_failure_reason_for_current_arrival(&events),
             already_recorded: true,
         };
     }
+    let result =
+        resolve_terminal_result(backend, context_store, name, compiled, final_state, &events);
+    let failure_reason = match result.status {
+        crate::engine::types::TerminalOutcome::Failure => {
+            crate::engine::terminal_result::failure_reason_for_current_run(
+                context_store,
+                name,
+                &events,
+            )
+        }
+        _ => None,
+    };
     TerminalRecord {
-        result: resolve_terminal_result(
-            backend,
-            context_store,
-            name,
-            compiled,
-            final_state,
-            &events,
-        ),
+        result,
+        failure_reason,
         already_recorded: false,
     }
 }
@@ -2780,6 +2793,7 @@ fn append_child_completed_to_parent(
     compiled: &CompiledTemplate,
     final_state: &str,
     result: &WorkflowResult,
+    failure_reason: Option<&str>,
 ) -> ChildCompletedAppend {
     let parent_name = match child_header.parent_workflow.as_deref() {
         Some(p) => p,
@@ -2816,6 +2830,7 @@ fn append_child_completed_to_parent(
         outcome,
         final_state: final_state.to_string(),
         result: Some(result.clone()),
+        failure_reason: failure_reason.map(str::to_string),
     };
     match backend.append_event(parent_name, &payload, &now_iso8601()) {
         Ok(_) => ChildCompletedAppend::Notified,
@@ -2954,7 +2969,9 @@ fn finish_terminal_tick(
     // Step 2, the child's own log, once per arrival. The done-bit for the
     // index entry below means "a durable result is readable", so it is set
     // only when this append succeeded.
-    let has_result = arrival && append_request_store_result_to_child(backend, name, result);
+    let failure_reason = record.failure_reason.as_deref();
+    let has_result =
+        arrival && append_request_store_result_to_child(backend, name, result, failure_reason);
 
     // Step 3: a parked terminal session still resolves its leg, because
     // the requester waiting on it has no way to know the session was
@@ -2980,8 +2997,15 @@ fn finish_terminal_tick(
         append_terminal_index_for_session(backend, name, &post_events, has_result);
     }
     if arrival || remove {
-        let append_result =
-            append_child_completed_to_parent(backend, name, header, compiled, final_state, result);
+        let append_result = append_child_completed_to_parent(
+            backend,
+            name,
+            header,
+            compiled,
+            final_state,
+            result,
+            failure_reason,
+        );
         defer_for_parent = matches!(append_result, ChildCompletedAppend::AppendFailed);
     }
 
@@ -4239,7 +4263,6 @@ fn handle_next(
                 |gate: &crate::template::types::Gate| -> crate::gate::StructuredGateResult {
                     evaluate_children_complete(
                         backend,
-                        context_store,
                         &name,
                         &events,
                         &compiled,
@@ -5021,7 +5044,6 @@ fn handle_next(
         move |gate: &crate::template::types::Gate| -> crate::gate::StructuredGateResult {
             evaluate_children_complete(
                 backend,
-                context_store,
                 &workflow_name_for_children,
                 &events_for_children,
                 &compiled_for_children,
@@ -6615,7 +6637,6 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     // the per-row metadata added to `koto workflows --children`.
     if let Some(batch_view) = crate::cli::batch_view::derive_batch_view(
         backend,
-        backend,
         &events,
         &compiled,
         &machine_state.current_state,
@@ -6730,7 +6751,6 @@ fn derive_superseded_branches(backend: &dyn SessionBackend, parent_name: &str) -
 /// not yet complete. Returns `Passed` when all children are complete.
 fn evaluate_children_complete(
     backend: &dyn SessionBackend,
-    context_store: &dyn ContextStore,
     workflow_name: &str,
     parent_events: &[Event],
     template: &CompiledTemplate,
@@ -6792,7 +6812,6 @@ fn evaluate_children_complete(
     // (DESIGN-request-store-converge.md Decision 4).
     let (converge_passes, output) = crate::cli::batch::build_children_complete_output(
         backend,
-        context_store,
         workflow_name,
         parent_events,
         template,
@@ -6840,7 +6859,6 @@ fn evaluate_children_complete(
 /// at serialization time.
 fn annotate_children_with_batch_view(
     backend: &dyn SessionBackend,
-    context_store: &dyn ContextStore,
     parent_name: &str,
     children: Vec<crate::engine::types::WorkflowMetadata>,
 ) -> Vec<serde_json::Value> {
@@ -6858,7 +6876,6 @@ fn annotate_children_with_batch_view(
                         compiled_opt.and_then(|compiled| {
                             crate::cli::batch_view::derive_batch_view(
                                 backend,
-                                context_store,
                                 &events,
                                 &compiled,
                                 &machine_state.current_state,
@@ -8097,7 +8114,8 @@ Done.
             "done",
             &events,
         );
-        let has_result = append_request_store_result_to_child(&backend, "child", &synthesized);
+        let has_result =
+            append_request_store_result_to_child(&backend, "child", &synthesized, None);
         assert!(
             has_result,
             "a successful child-log append is the has_result done-bit"
@@ -8110,7 +8128,7 @@ Done.
             .iter()
             .rev()
             .find_map(|e| match &e.payload {
-                EventPayload::RequestStoreResult { result } => Some(result.clone()),
+                EventPayload::RequestStoreResult { result, .. } => Some(result.clone()),
                 _ => None,
             })
             .expect("RequestStoreResult event must be on the child's own log");

@@ -2,6 +2,10 @@
 //! `failure_reason` the child wrote during its current run, and falls back to
 //! the child's state name (Issue #278).
 //!
+//! The reason is resolved with the child's result on its terminal tick and
+//! recorded beside it, on the child's `request_store.result` and the
+//! parent's `child_completed`.
+//!
 //! Scenarios:
 //!
 //! - a transition's `context_assignments` writes the reason: the gate output,
@@ -16,7 +20,9 @@
 //! - a child restarted by `retry_failed` does not show its previous run's
 //!   reason;
 //! - a multi-line or over-long reason is folded to one line and cut to 500
-//!   characters.
+//!   characters;
+//! - a cleaned-up failed child keeps its reason, from the parent's copy;
+//! - a reason written after the child failed changes nothing.
 
 #![cfg(unix)]
 
@@ -54,10 +60,13 @@ fn run_ok(dir: &Path, args: &[&str]) -> serde_json::Value {
     json
 }
 
-/// A worker that can fail four ways: with evidence only (`fail_plain`), with
-/// an assignment on the state that takes the evidence (`fail_assign`), or
-/// through `hop`, an auto-advancing state whose outgoing edge repeats the
-/// assignment (`fail_hop`).
+/// A worker that can fail three ways: with evidence only (`fail_plain`),
+/// with an assignment on the state that takes the evidence (`fail_assign`),
+/// or through `hop`, an auto-advancing state whose outgoing edge repeats the
+/// assignment (`fail_hop`). `hop` declares `failure_reason` in its own
+/// `accepts` only because the compiler requires an assignment's
+/// `${evidence.<field>}` to name a field its source state accepts; the
+/// declaration does not make the evidence reach it.
 const CHILD_TEMPLATE: &str = r#"---
 name: reason-child
 version: "1.0"
@@ -421,6 +430,44 @@ fn an_over_long_reason_is_cut_to_500_characters() {
         serde_json::json!({"status": "fail_assign", "failure_reason": exact}),
     );
     assert_eq!(gate_entry_for_a(dir)["reason"], "x".repeat(500));
+}
+
+#[test]
+fn a_cleaned_up_failed_child_keeps_its_reason() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    start_batch(dir);
+
+    drive(
+        dir,
+        "parent.A",
+        serde_json::json!({"status": "fail_assign", "failure_reason": "flaky network"}),
+    );
+    // With the child's log gone, the parent's `child_completed` copy answers.
+    run_ok(dir, &["session", "cleanup", "parent.A"]);
+    assert_reason(&gate_entry_for_a(dir), "flaky network", "failure_reason");
+}
+
+#[test]
+fn a_reason_written_after_the_child_failed_changes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    start_batch(dir);
+
+    drive(dir, "parent.A", serde_json::json!({"status": "fail_plain"}));
+    // The reason was resolved with the result on the terminal tick; a later
+    // write reaches neither the live gate output nor the frozen view, so
+    // the two never disagree.
+    let output = koto_cmd(dir)
+        .args(["context", "add", "parent.A", "failure_reason"])
+        .write_stdin("too late")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_reason(&gate_entry_for_a(dir), "failed", "state_name");
+    let (frozen, status_reason) = frozen_entry_and_status_reason_for_a(dir);
+    assert_reason(&frozen, "failed", "state_name");
+    assert_eq!(status_reason, "failed");
 }
 
 /// A parent that leaves its batching state for a terminal state on the tick

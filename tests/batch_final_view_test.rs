@@ -892,9 +892,10 @@ fn child_entry<'a>(view: &'a serde_json::Value, name: &str) -> &'a serde_json::V
         .unwrap_or_else(|| panic!("no child {name} in {view}"))
 }
 
-/// Assert the failed-child shape every batch surface shares (Issue #278):
-/// `reason` alongside the `failure_mode` and `reason_source` it has always had.
-fn assert_failed_child_reason(entry: &serde_json::Value) {
+/// Assert the failed-child shape every batch surface shares (Issue #278) for
+/// a child that wrote no `failure_reason`: `reason` is the state name, beside
+/// the `failure_mode` and `reason_source` it has always had.
+fn assert_state_name_reason(entry: &serde_json::Value) {
     assert_eq!(entry["outcome"], "failure", "{entry}");
     assert_eq!(
         entry["reason"], "failed",
@@ -915,7 +916,7 @@ fn a_failed_child_carries_reason_in_the_gate_output_and_the_frozen_view() {
     let json = run_ok(dir, &["next", "parent"]);
     assert_eq!(json["state"], "plan", "{json}");
     let gate = &json["blocking_conditions"][0]["output"];
-    assert_failed_child_reason(child_entry(gate, "parent.B"));
+    assert_state_name_reason(child_entry(gate, "parent.B"));
     assert!(
         child_entry(gate, "parent.A").get("reason").is_none(),
         "a child that has not failed carries no reason: {gate}"
@@ -927,13 +928,13 @@ fn a_failed_child_carries_reason_in_the_gate_output_and_the_frozen_view() {
     assert_eq!(json["state"], "summarize", "{json}");
 
     let key = batch_final_view_key(dir).expect("batch_final_view is written");
-    assert_failed_child_reason(child_entry(&key, "parent.B"));
+    assert_state_name_reason(child_entry(&key, "parent.B"));
     assert!(
         child_entry(&key, "parent.A").get("reason").is_none(),
         "{key}"
     );
     let events = batch_finalized_events(dir);
-    assert_failed_child_reason(child_entry(&events[0]["payload"]["view"], "parent.B"));
+    assert_state_name_reason(child_entry(&events[0]["payload"]["view"], "parent.B"));
 
     // `koto status` renders the same reason.
     let status = run_ok(dir, &["status", "parent"]);
@@ -995,7 +996,7 @@ fn a_view_frozen_without_reason_gains_it_when_read() {
     // The terminal response and `koto status` both render it with `reason`.
     let json = run_ok(dir, &["next", "parent", "--no-cleanup"]);
     assert_eq!(json["action"], "done", "{json}");
-    assert_failed_child_reason(child_entry(&json["batch_final_view"], "parent.B"));
+    assert_state_name_reason(child_entry(&json["batch_final_view"], "parent.B"));
 
     let status = run_ok(dir, &["status", "parent"]);
     let task = status["batch"]["tasks"]

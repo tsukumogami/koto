@@ -242,22 +242,26 @@ to `0.9.x`).
   the gate output, `batch_final_view` and `koto status`. It is the child's
   `failure_reason` when the child wrote one during its current run, with
   `reason_source: "failure_reason"`, and the state name otherwise, with
-  `reason_source: "state_name"`. A reason from before a `retry_failed` or
-  `koto rewind` restarted the child doesn't count. The text is folded onto
-  one line and cut to at most 500 characters. `failure_mode` is still the
-  state name, so a consumer reading it sees no change. A view frozen by an
-  older koto gains `reason` (the state name) when the terminal response or
-  `koto status` reads it; the `batch_final_view` context key it wrote is left
-  as written.
+  `reason_source: "state_name"`. koto resolves it on the child's terminal
+  tick, with the child's result, and records it beside the result: a new
+  optional `failure_reason` field on the child's `request_store.result`
+  event and on the parent's `child_completed` event. So a child that has
+  been cleaned up keeps its reason, and a write after the child failed
+  changes nothing. A reason from before a `retry_failed` or `koto rewind`
+  restarted the child doesn't count. The text is folded onto one line and
+  cut to at most 500 characters. `failure_mode` is still the state name, so
+  a consumer reading it sees no change. A view frozen by an older koto gains
+  `reason` (the state name) when the terminal response or `koto status`
+  reads it; the `batch_final_view` context key it wrote is left as written.
   The koto-author batch pages recommended declaring `failure_reason` in the
   failure terminal's `accepts`, which never stores it: evidence writes no
-  context, and a terminal state takes none. They now show a
-  `context_assignments` entry on the edge that takes the evidence, and warn
-  that `${evidence.<field>}` on an auto-advancing state's edge resolves to an
-  empty value that overwrites the reason. The W5 compile warning no longer
-  counts `failure_reason` in a failure terminal's `accepts` as storing the
-  key, and its remedy names the assignment form instead, so a template that
-  relied on that declaration now sees W5.
+  context, and koto refuses evidence for a session already in a terminal
+  state. They now show a `context_assignments` entry on the edge that takes
+  the evidence, and warn that `${evidence.<field>}` on an auto-advancing
+  state's edge resolves to an empty value that overwrites the reason. The W5
+  compile warning no longer counts `failure_reason` in a failure terminal's
+  `accepts` as storing the key, and its remedy names the assignment form
+  instead, so a template that relied on that declaration now sees W5.
 
 - **A completed batch is recorded even when the completing tick leaves the
   batching state (koto#263).** The `BatchFinalized` event and the

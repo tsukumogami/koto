@@ -19,7 +19,6 @@ use crate::cli::batch::{
 use crate::engine::batch_validation::TaskEntry;
 use crate::engine::persistence::derive_state_from_log;
 use crate::engine::types::{Event, EventPayload};
-use crate::session::context::ContextStore;
 use crate::session::SessionBackend;
 use crate::template::types::CompiledTemplate;
 
@@ -164,7 +163,6 @@ fn is_false(b: &bool) -> bool {
 /// 3. Otherwise, return `None`.
 pub fn derive_batch_view(
     backend: &dyn SessionBackend,
-    context_store: &dyn ContextStore,
     parent_events: &[Event],
     parent_compiled: &CompiledTemplate,
     parent_current_state: &str,
@@ -180,7 +178,6 @@ pub fn derive_batch_view(
     if has_hook {
         return Some(build_active_view(
             backend,
-            context_store,
             parent_events,
             parent_compiled,
             parent_current_state,
@@ -204,7 +201,6 @@ pub fn derive_batch_view(
 /// `materialize_children` state.
 fn build_active_view(
     backend: &dyn SessionBackend,
-    context_store: &dyn ContextStore,
     parent_events: &[Event],
     parent_compiled: &CompiledTemplate,
     parent_current_state: &str,
@@ -214,7 +210,6 @@ fn build_active_view(
     // section and children-complete gate output stay in lock step.
     let (_, gate_json) = build_children_complete_output(
         backend,
-        context_store,
         parent_name,
         parent_events,
         parent_compiled,
@@ -291,13 +286,11 @@ fn build_active_view(
             .get("reason_source")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let reason = match outcome {
-            TaskOutcome::Failure => child_obj
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            _ => None,
-        };
+        // Only a failed entry carries `reason`.
+        let reason = child_obj
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let skip_reason = child_obj
             .get("skipped_because")
             .and_then(|v| v.as_str())
@@ -401,10 +394,6 @@ fn build_final_view(
             } else {
                 false
             };
-            let reason = match entry.outcome {
-                TaskOutcome::Failure => entry.reason.clone(),
-                _ => None,
-            };
             TaskView {
                 name: entry.name.clone(),
                 task_name: short,
@@ -413,7 +402,7 @@ fn build_final_view(
                 outcome: entry.outcome,
                 synthetic,
                 reason_source: entry.reason_source.clone(),
-                reason,
+                reason: entry.reason.clone(),
                 skip_reason: entry.skipped_because.clone(),
                 skipped_because_chain: entry.skipped_because_chain.clone(),
             }
