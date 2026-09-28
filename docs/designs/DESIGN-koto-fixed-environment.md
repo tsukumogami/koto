@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Proposed
+status: Planned
 problem: |
   `run_shell_command` starts every command gate and default action as `sh -c`
   with the whole environment of the process that called `koto next`. A shim
@@ -46,7 +46,7 @@ upstream: docs/prds/PRD-koto-fixed-environment.md
 
 ## Status
 
-Proposed
+Planned
 
 ## Context and Problem Statement
 
