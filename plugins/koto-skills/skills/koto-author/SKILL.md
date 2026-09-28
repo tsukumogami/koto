@@ -131,7 +131,7 @@ An action must also be safe to re-run -- it fires on every tick that enters the 
 
 Gates and actions run in a cleared environment, not the caller's: the `PATH`, `HOME` and `XDG_CONFIG_HOME` recorded at `koto init`, koto's default list of live names (locale, `TMPDIR`, `GH_TOKEN`, proxies and a few more), and `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`. If a command reads any other variable, declare its name in the template's top-level `pass_env:` list, or it's unset at run time. The exact lists and the compile rules are in the template format guide's `pass_env:` section.
 
-Every `pass_env:` value 8 bytes or longer is treated as a credential, whatever the variable holds. koto replaces it with `[REDACTED:<NAME>]` in command output before the response or the session log sees it, and a `capture_stdout_as` whose output holds such a value is refused with the `redacted` capture error (`capture_error.case: "redacted"`, with a `source` naming the variable, never its value). Don't declare a variable whose value a command needs to print back, and don't capture one.
+koto treats every declared `pass_env:` value as a credential and redacts it from command output, so don't declare a variable whose value a command needs to print back or capture; the rule is in the [`pass_env:` section](references/template-format.md#pass_env--variables-a-command-reads).
 
 ### Reporting findings from a check
 

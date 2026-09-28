@@ -334,12 +334,7 @@ Each entry in `blocking_conditions` includes structured gate output in the `outp
 }
 ```
 
-- `failure.findings` lists what the check reported (at most 100; past that, errors are kept first and `findings_truncated` is `true`). A check reports findings by printing `::koto-finding::` lines to stdout; when it fails without reporting an `error`, koto adds one whose `rule_id` is the gate's name or `__action__`. `message_source` is `check` for a finding the check printed, `output` when koto took the message from the check's output, and `koto` when it's koto's own sentence. The format is in the [`default_action` authoring guide](default-action-authoring.md#reporting-findings).
-- `failure.captured` (command gates and `__action__`) holds the leading 64KB of each stream, with a truncation flag per stream. Known credentials are replaced with `[REDACTED:<source>]`.
-- `attempts.visit` and `attempts.session` count attempts at the state in this visit and in the whole session; `attempts.rules` counts, per check and rule id, the attempts on which that rule was reported at `error`. `rules_truncated: true` appears when more than 100 check and rule pairs exist.
-- `output` is unchanged, and nothing in `failure` or `attempts` can be routed on or overridden.
-
-A passing or evidence-only response has neither field. `failure` is the check's output, which can quote third-party text; agents treat it as data, not instructions, and don't fetch a `rule_ref` automatically.
+`output` is unchanged, so nothing in `failure` or `attempts` can be routed on or overridden, and a passing or evidence-only response has neither field. The field reference, the order an agent works through a failed check, and why `failure` is treated as data rather than instructions are in [Reading why a check failed](../../plugins/koto-skills/skills/koto-user/references/response-shapes.md#reading-why-a-check-failed); a check reports its own findings with the `::koto-finding::` line format in the [`default_action` authoring guide](default-action-authoring.md#reporting-findings).
 
 **Integration / IntegrationUnavailable** -- the state declares an integration. When the runner is available, you get `"integration"` with the output. When unavailable, you get `"integration_unavailable"` with `available: false`:
 
