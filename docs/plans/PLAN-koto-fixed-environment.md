@@ -103,7 +103,8 @@ refuses nothing.
   response carries the notice with the recorded values; the second tick
   carries no notice.
 - Adoption runs after the anchor check and the dispatch-epoch fence, under the
-  state-file lock, re-reading the header first. A deterministic test calls the
+  session's own `environment.lock`, re-reading the local header first and
+  pushing the state file after the write. A deterministic test calls the
   adoption step twice against one session and asserts one event.
 - A batch parent with no record adopts before it spawns, and its new children
   copy the adopted record; a child spawned before the upgrade adopts on its

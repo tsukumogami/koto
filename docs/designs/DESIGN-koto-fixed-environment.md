@@ -520,8 +520,9 @@ koto init --attach-live
 
 koto next
   reentrancy -> anchor -> epoch fence
-  record absent -> under lock, re-read; build from process; append
-                   environment_adopted; rewrite header; remember notice
+  record absent -> under environment.lock, re-read the local header;
+                   build from process; append environment_adopted;
+                   rewrite header; strict push; remember notice
   stale = recorded PATH dirs, HOME, XDG_CONFIG_HOME that don't exist
   CommandEnv = legacy ? process env + KOTO_TICK_SESSION
              : live (pass ∪ pass_env) - refused, then fixed values,
@@ -644,6 +645,7 @@ building it.
 | Remove `--legacy-environment` (no opt-out) | Ruled 2026-09-28 for the next release; the trigger is shirabe's harnesses no longer passing the flag. |
 | Let an adopted record be re-adopted once | A report of an adoption from an atypical first tick (a monitor or a cron job) that stranded a run. |
 | Let a template forbid `--legacy-environment` for its sessions | A template author relying on a strict gate who needs the guarantee against the creator. |
+| Serialize adoption across hosts on the cloud backend | Two ticks on different hosts adopting one older session at once, which `environment.lock` (a local flock) can't order; each pushes its own record and the later push wins. |
 | Inject the request-store root for nested koto | A nested `koto request` that reads a different store because the tick's `HOME` differs from the recorded one. |
 
 ## Security Considerations

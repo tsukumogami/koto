@@ -4288,7 +4288,7 @@ fn handle_next(
     //
     // The abandonment check is deliberately NOT hoisted alongside it:
     // its first delivery appends a record to the child's log, and the
-    // epoch fence below must reject a displaced writer before any
+    // epoch fence must reject a displaced writer before any
     // persistence call. Each directive funnel runs the check for itself,
     // past the fence.
     let leg_pointer =
