@@ -13,10 +13,28 @@
 # Results go to plugins/<plugin>/skills/<name>/evals/workspace/iteration-<N>/.
 #
 # Exit codes:
-#   0  All assertions passed
-#   1  One or more assertions failed
-#   2  No results produced (infrastructure failure)
-#   3  Missing prerequisites
+#   0  Every eval was graded and every assertion passed
+#   1  One or more assertions failed (any ungraded eval beside them is still
+#      listed, as "Also ungraded"); also a usage error
+#   2  An eval produced no graded result (zero graded is never a pass),
+#      --validate found no iteration or no evals to check, or --all found no
+#      skill with evals or got a status it doesn't know
+#   3  Missing prerequisites, including a suite that defines no evals
+#   4  The nested claude session did not execute (plan mode, every command
+#      and write it tried was denied, or it ended in an error before running
+#      anything), so the skill was never exercised
+#   5  Refused: the checkout is under ~/.claude, where Claude Code denies writes
+# --all exits with the most severe status any skill returned, in the order
+# 5, 4, 3, 2, 1.
+#
+# The nested session runs from the repo root as
+#   claude -p --permission-mode acceptEdits --allowedTools Bash --add-dir <scratch>
+# acceptEdits lets Write and Edit change files only under the repo root and the
+# per-run scratch directory; the Bash allow rule lets the graders and the tier-2
+# scenarios run commands. Any other tool that would prompt is denied, since a -p
+# session has nobody to answer. The shell itself is not confined: a Bash command
+# can write anywhere the user can. The session's stream-json transcript is kept
+# as runner_session.jsonl in the iteration directory.
 #
 # Prerequisites: claude CLI, python3, skill-creator plugin installed
 
@@ -25,11 +43,38 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PLUGINS_DIR="$REPO_ROOT/plugins"
+# RUN_EVALS_PLUGINS_DIR is a test seam for scripts/run-evals_test.sh, which
+# pairs it with a stub claude. It moves skill discovery only: a real session
+# still runs from REPO_ROOT, and its Write and Edit tools are confined to
+# REPO_ROOT and the scratch dir, so a suite outside the repo would have those
+# writes denied.
+PLUGINS_DIR="${RUN_EVALS_PLUGINS_DIR:-$REPO_ROOT/plugins}"
+CLASSIFIER="$SCRIPT_DIR/classify-eval-session.py"
+PERMISSION_MODE="acceptEdits"
 
 # Prerequisite checks
 command -v claude >/dev/null 2>&1 || { echo "Error: claude CLI not found"; exit 3; }
 command -v python3 >/dev/null 2>&1 || { echo "Error: python3 not found"; exit 3; }
+
+# Claude Code treats every path under ~/.claude as sensitive and denies Write
+# and Edit there whatever the permission mode, so a session started from a
+# checkout under it loses its eval outputs and grades a partial run. Refuse
+# before starting one.
+refuse_under_claude_home() {
+  local claude_home root
+  claude_home=$(cd "${HOME:-/nonexistent}/.claude" 2>/dev/null && pwd -P) || return 0
+  root=$(cd "$REPO_ROOT" && pwd -P)
+  case "$root/" in
+    "$claude_home"/*)
+      echo "Error: REFUSED, CHECKOUT UNDER ~/.claude"
+      echo "  This checkout is at $root, inside $claude_home."
+      echo "  Claude Code denies writes under ~/.claude whatever the permission mode,"
+      echo "  so the eval session could not save its outputs or grades."
+      echo "  Run the evals from a checkout outside ~/.claude."
+      exit 5
+      ;;
+  esac
+}
 
 usage() {
   echo "Usage: $0 <skill-name> | --all | --list | --validate <skill> | --prep-only <skill>"
@@ -121,7 +166,13 @@ prep_skill_evals() {
   local iter_dir="$workspace/iteration-$iteration"
 
   local eval_count
-  eval_count=$(python3 -c "import json; print(len(json.load(open('$evals_file'))['evals']))")
+  eval_count=$(python3 -c "import json; print(len(json.load(open('$evals_file'))['evals']))" 2>/dev/null)
+  # A suite with no evals would compare zero graded against zero expected and
+  # pass, so it is refused before a session starts.
+  if ! [ "${eval_count:-0}" -gt 0 ] 2>/dev/null; then
+    echo "Error: $evals_file defines no evals (or is not valid JSON with an \"evals\" list)"
+    return 3
+  fi
 
   echo "=== Preparing evals for skill: $skill_name ==="
   echo "  Evals file: $evals_file"
@@ -130,7 +181,7 @@ prep_skill_evals() {
   echo "  Output: $iter_dir"
   echo ""
 
-  python3 << PYEOF
+  if ! python3 << PYEOF
 import json, os, shutil
 
 with open("$evals_file") as f:
@@ -178,11 +229,15 @@ for eval_item in data["evals"]:
 
 print(f"\nPrepared {len(data['evals'])} eval directories.")
 PYEOF
+  then
+    echo "Error: could not prepare the eval workspace from $evals_file"
+    return 3
+  fi
 
-  # Return values for callers
-  echo "$iter_dir" > /tmp/run-evals-iter-dir
-  echo "$eval_count" > /tmp/run-evals-eval-count
-  echo "$iteration" > /tmp/run-evals-iteration
+  # Return values for callers, as globals: prep runs in the caller's shell, and
+  # shared files would let two runs on one host read each other's values.
+  PREP_ITER_DIR="$iter_dir"
+  PREP_ITERATION="$iteration"
 }
 
 run_skill_evals() {
@@ -194,10 +249,9 @@ run_skill_evals() {
   # Step 1: Prepare
   prep_skill_evals "$skill_name" || return $?
 
-  local iter_dir eval_count iteration
-  iter_dir=$(cat /tmp/run-evals-iter-dir)
-  eval_count=$(cat /tmp/run-evals-eval-count)
-  iteration=$(cat /tmp/run-evals-iteration)
+  local iter_dir iteration
+  iter_dir="$PREP_ITER_DIR"
+  iteration="$PREP_ITERATION"
 
   # Step 2: Build tier-specific instructions for each eval
   local fixtures_bin="$skill_dir/evals/fixtures/bin"
@@ -230,8 +284,15 @@ PYEOF
   echo "(this may take several minutes)"
   echo ""
 
+  # The session's only writable places are the repo and this scratch dir (see
+  # the header); it is its TMPDIR too, and goes away when the run ends.
+  local scratch transcript="$iter_dir/runner_session.jsonl"
+  local viewer="$iter_dir/review.html"
+  scratch=$(mktemp -d "${TMPDIR:-/tmp}/run-evals.XXXXXX") || return 3
+
   local claude_exit=0
-  claude -p "$(cat <<PROMPT
+  local prompt
+  prompt="$(cat <<PROMPT
 Invoke /skill-creator. You already have an existing skill with evals ready to run.
 
 The skill is at: $skill_dir/SKILL.md
@@ -261,34 +322,76 @@ Follow the skill-creator workflow for running and evaluating test cases:
   - IMPORTANT: If eval_metadata.json contains "has_fixtures": true, an inputs/ directory exists alongside it with pre-defined artifact files. Before running the with-skill agent for that eval, treat those files as already present -- the skill should read them rather than improvising fixture content.
 - Step 2: Grade each with-skill run against the assertions in eval_metadata.json. Write grading.json in each with_skill/ directory.
 - Step 3: Capture timing data (total_tokens, duration_ms) to timing.json in each run directory.
-- Step 4: Run the aggregation and generate the viewer to /tmp/${skill_name}-eval-review.html using --static mode.
+- Step 4: Run the aggregation and generate the viewer to $viewer using --static mode.
+
+Put every file you and your agents create inside the repository at $REPO_ROOT or
+the scratch directory $scratch: the Write and Edit tools are denied anywhere
+else, and your TMPDIR is the scratch directory. Tools the evals run (koto, gh)
+keep their own state where they normally do.
 
 This is iteration $iteration for the $skill_name skill.
 PROMPT
-)" 2>&1 || claude_exit=$?
+)"
+  (cd "$REPO_ROOT" && TMPDIR="$scratch" claude -p "$prompt" \
+    --permission-mode "$PERMISSION_MODE" --allowedTools Bash --add-dir "$scratch" \
+    --output-format stream-json --verbose >"$transcript") || claude_exit=$?
+  rm -rf "$scratch"
 
+  python3 "$CLASSIFIER" result-text "$transcript"
   if [ "$claude_exit" -ne 0 ]; then
     echo ""
     echo "Warning: claude -p exited with status $claude_exit"
   fi
 
-  # Step 3: Validate results
+  # Step 4: Validate results
   echo ""
   echo "=== Validating results ==="
-  validate_results "$iter_dir" "$eval_count"
+  local rc=0
+  validate_results "$iter_dir" "$evals_file" || rc=$?
 
-  # Step 4: Open viewer if it was generated
-  local viewer="/tmp/${skill_name}-eval-review.html"
+  # Step 4b: when nothing at all was graded, say whether the session ran. A
+  # session that never executed gets its own exit so it can't be read as a
+  # problem with the skill. Any grading.json on disk, even one validation
+  # rejected, proves the session wrote files, so it keeps exit 2.
+  if [ "$rc" -eq 2 ] && [ -z "$(find "$iter_dir" -path '*/with_skill/grading.json' -print -quit)" ]; then
+    python3 "$CLASSIFIER" report "$transcript" "$PERMISSION_MODE" || {
+      local verdict=$?
+      [ "$verdict" -eq 4 ] && rc=4
+    }
+  fi
+
   if [ -f "$viewer" ]; then
     echo ""
     echo "Open the eval viewer:"
     echo "  xdg-open $viewer"
   fi
+  return "$rc"
+}
+
+# Print the directory name prep gives each eval in evals.json, one per line.
+eval_names() {
+  python3 -c "
+import json, sys
+for ev in json.load(open(sys.argv[1]))['evals']:
+    print(ev.get('name', 'eval-%s' % ev['id']))
+" "$1" 2>/dev/null
 }
 
 validate_results() {
   local iter_dir="$1"
-  local expected_count="$2"
+  local evals_file="$2"
+  # Grades are looked up by the evals evals.json defines, never by whatever
+  # directories exist, so a stray graded directory can't stand in for an eval
+  # that went ungraded.
+  local names=()
+  local line
+  while IFS= read -r line; do names+=("$line"); done < <(eval_names "$evals_file")
+  local expected_count=${#names[@]}
+  # Zero expected would let zero graded pass.
+  if [ "$expected_count" -eq 0 ]; then
+    echo "  NO EVALS EXPECTED: $evals_file defines no evals, so nothing can be graded."
+    return 2
+  fi
   local graded=0
   local missing_outputs=()
   local missing_grading=()
@@ -296,14 +399,9 @@ validate_results() {
   local passed_assertions=0
   local failed_assertions=0
 
-  for eval_dir in "$iter_dir"/*/; do
-    [ -d "$eval_dir" ] || continue
-    local name
-    name=$(basename "$eval_dir")
-    # Skip non-eval entries
-    [[ "$name" == *.json ]] && continue
-    [[ "$name" == *.html ]] && continue
-    [[ "$name" == *.md ]] && continue
+  local name
+  for name in "${names[@]}"; do
+    local eval_dir="$iter_dir/$name"
 
     # Check with_skill outputs exist
     if [ ! -d "$eval_dir/with_skill/outputs" ] || [ -z "$(ls -A "$eval_dir/with_skill/outputs" 2>/dev/null)" ]; then
@@ -326,12 +424,18 @@ with open('$eval_dir/with_skill/grading.json') as f:
     g = json.load(f)
 # Handle both formats: {expectations: [...]} and bare [...]
 exps = g if isinstance(g, list) else g.get('expectations', [])
-p = sum(1 for e in exps if e.get('passed', False))
+p = sum(1 for e in exps if e.get('passed') is True)
 print(f'{len(exps)} {p}')
 " 2>/dev/null || echo "0 0")
       local total passed
       total=$(echo "$counts" | cut -d' ' -f1)
       passed=$(echo "$counts" | cut -d' ' -f2)
+      # A grading.json with no gradable expectations (empty or unreadable)
+      # graded nothing.
+      if [ "$total" -eq 0 ]; then
+        graded=$((graded - 1))
+        missing_grading+=("$name (grading.json holds no expectations)")
+      fi
       total_assertions=$((total_assertions + total))
       passed_assertions=$((passed_assertions + passed))
       failed_assertions=$((failed_assertions + total - passed))
@@ -363,31 +467,40 @@ print(f'{len(exps)} {p}')
   if [ "$failed_assertions" -gt 0 ]; then
     echo ""
     echo "  FAILED ASSERTIONS: $failed_assertions"
-    for eval_dir in "$iter_dir"/*/; do
-      [ -d "$eval_dir" ] || continue
-      local gfile="$eval_dir/with_skill/grading.json"
+    local ename
+    for ename in "${names[@]}"; do
+      local gfile="$iter_dir/$ename/with_skill/grading.json"
       [ -f "$gfile" ] || continue
-      local ename
-      ename=$(basename "$eval_dir")
       python3 -c "
 import json
 with open('$gfile') as f:
     g = json.load(f)
 exps = g if isinstance(g, list) else g.get('expectations', [])
 for e in exps:
-    if not e.get('passed', False):
+    if e.get('passed') is not True:
         print(f'    [$ename] FAIL: {e.get(\"text\", \"unknown\")}')
         if e.get('evidence'):
             print(f'           {e[\"evidence\"]}')
 " 2>/dev/null
     done
+    # Failed assertions decide the status; an ungraded eval beside them is
+    # still named so it isn't lost.
+    if [ "$graded" -lt "$expected_count" ]; then
+      echo "  Also ungraded: only $graded of the $expected_count evals produced a grade."
+    fi
     return 1
   fi
 
-  if [ "$graded" -eq 0 ]; then
+  # Every expected eval must carry a grade. Zero graded, or some graded and
+  # some not, is never a pass.
+  if [ "$graded" -lt "$expected_count" ]; then
     echo ""
-    echo "  WARNING: No evals were graded. The claude session may not have produced results."
-    echo "  Re-run or check the workspace: $iter_dir"
+    if [ "$graded" -eq 0 ]; then
+      echo "  NO EVALS GRADED: none of the $expected_count evals produced a grade."
+    else
+      echo "  UNGRADED EVALS: only $graded of the $expected_count evals produced a grade."
+    fi
+    echo "  Check the workspace: $iter_dir"
     return 2
   fi
 
@@ -407,37 +520,47 @@ case "$1" in
     list_skills_with_evals
     ;;
   --all)
+    refuse_under_claude_home
     failed_skills=()
-    infra_failed=()
+    ungraded_skills=()
+    prereq_skills=()
+    not_executed_skills=()
+    other_skills=()
+    ran=0
     for plugin_dir in "$PLUGINS_DIR"/*/; do
       for skill_dir in "$plugin_dir"/skills/*/; do
         [ -d "$skill_dir" ] || continue
         name=$(basename "$skill_dir")
         if [ -f "$skill_dir/evals/evals.json" ]; then
-          if ! run_skill_evals "$name"; then
-            rc=$?
-            if [ "$rc" -eq 2 ] || [ "$rc" -eq 3 ]; then
-              infra_failed+=("$name")
-            else
-              failed_skills+=("$name")
-            fi
-          fi
+          ran=$((ran + 1))
+          # Capture the status before testing it: inside `if ! cmd; then`,
+          # $? is the negation's status, always 0.
+          run_skill_evals "$name"
+          rc=$?
+          case "$rc" in
+            0) ;;
+            1) failed_skills+=("$name") ;;
+            2) ungraded_skills+=("$name") ;;
+            3) prereq_skills+=("$name") ;;
+            4) not_executed_skills+=("$name") ;;
+            *) other_skills+=("$name (exit $rc)") ;;
+          esac
           echo ""
         fi
       done
     done
     echo "=== Summary ==="
-    if [ ${#failed_skills[@]} -gt 0 ]; then
-      echo "  Failed assertions: ${failed_skills[*]}"
-    fi
-    if [ ${#infra_failed[@]} -gt 0 ]; then
-      echo "  Infrastructure failures: ${infra_failed[*]}"
-    fi
-    if [ ${#failed_skills[@]} -eq 0 ] && [ ${#infra_failed[@]} -eq 0 ]; then
-      echo "  All skills passed."
-    fi
+    [ "$ran" -gt 0 ] || echo "  No skill under $PLUGINS_DIR has evals, so nothing was graded."
+    [ ${#failed_skills[@]} -gt 0 ] && echo "  Failed assertions: ${failed_skills[*]}"
+    [ ${#ungraded_skills[@]} -gt 0 ] && echo "  Ungraded evals: ${ungraded_skills[*]}"
+    [ ${#prereq_skills[@]} -gt 0 ] && echo "  Missing prerequisites: ${prereq_skills[*]}"
+    [ ${#not_executed_skills[@]} -gt 0 ] && echo "  Nested session did not execute: ${not_executed_skills[*]}"
+    [ ${#other_skills[@]} -gt 0 ] && echo "  Unexpected runner status: ${other_skills[*]}"
+    [ ${#not_executed_skills[@]} -gt 0 ] && exit 4
+    [ ${#prereq_skills[@]} -gt 0 ] && exit 3
+    [ ${#ungraded_skills[@]} -gt 0 ] || [ ${#other_skills[@]} -gt 0 ] || [ "$ran" -eq 0 ] && exit 2
     [ ${#failed_skills[@]} -gt 0 ] && exit 1
-    [ ${#infra_failed[@]} -gt 0 ] && exit 2
+    echo "  All skills passed."
     exit 0
     ;;
   --prep-only)
@@ -445,9 +568,9 @@ case "$1" in
       echo "Usage: $0 --prep-only <skill-name>"
       exit 1
     fi
-    prep_skill_evals "$2"
+    prep_skill_evals "$2" || exit $?
     skill_dir=$(resolve_skill_dir "$2")
-    iter_dir=$(cat /tmp/run-evals-iter-dir)
+    iter_dir="$PREP_ITER_DIR"
     echo ""
     echo "Workspace ready. To run evals interactively:"
     echo "  Use /skill-creator in Claude Code with this workspace: $iter_dir"
@@ -470,14 +593,16 @@ case "$1" in
       exit 2
     fi
     iter_dir="$workspace/iteration-$iteration"
-    eval_count=$(python3 -c "import json; print(len(json.load(open('$skill_dir/evals/evals.json'))['evals']))")
     echo "=== Validating iteration $iteration for $skill_name ==="
-    validate_results "$iter_dir" "$eval_count"
+    validate_results "$iter_dir" "$skill_dir/evals/evals.json"
+    exit $?
     ;;
   --help|-h)
     usage
     ;;
   *)
+    refuse_under_claude_home
     run_skill_evals "$1"
+    exit $?
     ;;
 esac

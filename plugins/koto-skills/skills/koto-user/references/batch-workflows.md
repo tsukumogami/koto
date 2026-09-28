@@ -166,7 +166,12 @@ This is reading results, distinct from the completion / outcome classification c
 
 ## `reserved_actions`: the retry-discovery surface
 
-When the aggregate shows `any_failed`, `any_skipped`, or `any_spawn_failed`, the response carries a top-level `reserved_actions` array. Every entry is a ready-to-run retry plan:
+When the aggregate shows `any_failed`, `any_skipped`, or `any_spawn_failed`, the response carries a top-level `reserved_actions` array. Every entry is a ready-to-run retry plan.
+
+Two kinds of state carry it:
+
+- **The batching state** (the one declaring `materialize_children`), on every tick where the batch has retryable children.
+- **A state reached after the batch that routes a retry**: a non-terminal state that accepts evidence and has a transition guarded on `evidence.retry_failed` leading back to the batching state, like the coordinator example's `analyze_failures`. There the list comes from the most recently recorded batch (`batch_final_view`), starting with the response that moved the parent there, whether it advanced on the completing tick or left with `koto next --to`. It appears on every tick in that state until a `retry_failed` or a rewind starts the batch over. It names only children that have a session: a dependent skipped because its upstream failed may have none yet, and retrying the upstream brings it back. A state without such a route, or a terminal state, never carries it, because a retry there has nowhere to go.
 
 ```json
 {
@@ -187,10 +192,10 @@ When the aggregate shows `any_failed`, `any_skipped`, or `any_spawn_failed`, the
 | `action` | Canonical action name (`retry_failed` in v1). |
 | `label` | Short human-readable label. |
 | `description` | One-line summary. |
-| `applies_to` | Short task names currently eligible for retry (outcome is `failure`, `skipped`, or `spawn_failed`). |
+| `applies_to` | Short task names to retry: children whose outcome is `failure`, `skipped`, or `spawn_failed`. In a state reached after the batch, only those that have a session on disk. |
 | `invocation` | POSIX-safe ready-to-run command string. Copy and run as-is. |
 
-Reserved-action evidence bypasses the state's `accepts` validator — it's not `expects.fields` content. Read `reserved_actions` and submit the `invocation` directly; don't try to cram `retry_failed` into a normal evidence submission alongside other keys.
+The `retry_failed` key is reserved evidence: it isn't validated against the state's `accepts` fields and isn't part of `expects.fields`, although the state still has to accept evidence at all for `--with-data` to be taken. Read `reserved_actions` and submit the `invocation` directly; don't try to cram `retry_failed` into a normal evidence submission alongside other keys.
 
 ## `retry_failed` mechanics
 

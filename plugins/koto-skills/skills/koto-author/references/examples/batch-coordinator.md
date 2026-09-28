@@ -64,7 +64,7 @@ The `scheduler.feedback.entries` map tells you exactly how every submitted task 
 
 At least one child failed or was skipped. Two recovery paths:
 
-- Retry: copy the `invocation` from `reserved_actions[0]` and run it. That submits the reserved `retry_failed` key, which the `evidence.retry_failed: present` branch routes back to `plan_and_await`, and the scheduler respawns the named children.
+- Retry: copy the `invocation` from `reserved_actions[0]` and run it. That submits the reserved `retry_failed` key, which the `evidence.retry_failed: present` branch routes back to `plan_and_await`, and the scheduler respawns the named children and re-materializes their dependents. Because this state routes `evidence.retry_failed` back to the batching state, every response in it carries `reserved_actions` for the batch that just failed, including the one that brought the workflow here.
 - Give up or acknowledge: submit `{"decision": "give_up"}` or `{"decision": "acknowledge"}`. Neither matches the retry branch, so the unconditional transition carries the workflow to `summarize` with the batch outcome as-is.
 
 The retry branch is the state's only conditional transition, paired with an
