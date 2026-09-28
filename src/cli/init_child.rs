@@ -635,9 +635,11 @@ fn init_child_core(
 
     // Record the environment the session's commands run with
     // (DESIGN-koto-fixed-environment.md). A child copies its parent's
-    // record, like the anchor above: it is created inside the parent's
-    // tick, whose process environment belongs to whoever ticked the
-    // parent.
+    // record, as it copies the anchor above: it is created inside the
+    // parent's tick, whose process environment belongs to whoever ticked
+    // the parent. Unlike the anchor, an unreadable parent header is an
+    // error here -- falling back to this process would pass the ticking
+    // caller's environment to the child, the channel the record closes.
     let (command_environment, environment_report) =
         resolve_command_environment(backend, parent_name, legacy_environment).map_err(|msg| {
             TaskSpawnError::new(child_name, SpawnErrorKind::IoError, msg)

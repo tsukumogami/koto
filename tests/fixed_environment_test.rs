@@ -414,6 +414,11 @@ fn a_parent_child_copies_the_parent_record_from_any_process() {
         &["init", "p.kid", "--template", &tpl, "--parent", "p"],
     );
     assert!(r.success, "{}", r.stderr);
+    assert!(
+        r.json.get("environment").is_none(),
+        "a copied record reports nothing: {}",
+        r.stdout
+    );
     let r = env.run(
         &[("PATH", &other_path)],
         &["session", "start", "p.started", "--parent", "p"],

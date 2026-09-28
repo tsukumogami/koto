@@ -302,7 +302,10 @@ pub fn handle_start(
 
     // A child session takes its parent's recorded environment
     // (DESIGN-koto-fixed-environment.md, R8), or records this process's
-    // when the parent has none yet.
+    // when the parent has none yet. The recording report is dropped on
+    // purpose: `koto session start` prints the session's identity, not an
+    // init response, and a parent with no record adopts one on its own
+    // next tick.
     let (command_environment, _) = crate::cli::init_child::resolve_command_environment(
         backend,
         Some(validated_parent.as_str()),
