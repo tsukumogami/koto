@@ -234,7 +234,7 @@ expect_out "--all says all passed" "All skills passed"
 # The defect in issue 273: a skill that graded nothing was reported as passing.
 run_runner "skill-a:pass,skill-b:none" --all
 expect_rc "--all with a skill that graded nothing fails" 2
-expect_out "--all names the ungraded skill" "No graded result for every eval: skill-b"
+expect_out "--all names the ungraded skill" "Ungraded evals: skill-b"
 expect_no_out "--all does not claim success" "All skills passed"
 
 run_runner "skill-a:fail,skill-b:pass" --all
@@ -248,12 +248,14 @@ expect_out "--all names skills whose session did not execute" "Nested session di
 run_runner "skill-a:fail,skill-b:none" --all
 expect_rc "--all reports the more severe status" 2
 expect_out "--all lists both causes (failed)" "Failed assertions: skill-a"
-expect_out "--all lists both causes (ungraded)" "No graded result for every eval: skill-b"
+expect_out "--all lists both causes (ungraded)" "Ungraded evals: skill-b"
 
 # --- modes that start no session ------------------------------------------
 run_runner "" --prep-only skill-a
 if [ "$RC" -eq 0 ] && [ ! -s "$STUB_LOG" ]; then ok "--prep-only starts no session"
 else not_ok "--prep-only starts no session" "$OUT"; fi
+# --validate reads the latest iteration, which the --prep-only run just above
+# created and left ungraded.
 run_runner "" --validate skill-a
 if [ ! -s "$STUB_LOG" ] && [ "$RC" -eq 2 ]; then ok "--validate starts no session and fails an ungraded iteration"
 else not_ok "--validate starts no session and fails an ungraded iteration (exit $RC)" "$OUT"; fi

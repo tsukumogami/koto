@@ -15,11 +15,13 @@
 # Exit codes:
 #   0  Every eval was graded and every assertion passed
 #   1  One or more assertions failed (any ungraded eval beside them is still
-#      listed, as "Also ungraded")
-#   2  An eval produced no graded result (zero graded is never a pass)
+#      listed, as "Also ungraded"); also a usage error
+#   2  An eval produced no graded result (zero graded is never a pass), or
+#      --validate found no iteration or no evals to check
 #   3  Missing prerequisites, including a suite that defines no evals
-#   4  The nested claude session did not execute (plan mode, or every command
-#      and write it tried was denied), so the skill was never exercised
+#   4  The nested claude session did not execute (plan mode, every command
+#      and write it tried was denied, or it ended in an error before running
+#      anything), so the skill was never exercised
 #   5  Refused: the checkout is under ~/.claude, where Claude Code denies writes
 # --all exits with the most severe status any skill returned, in the order
 # 5, 4, 3, 2, 1.
@@ -40,8 +42,10 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-# RUN_EVALS_PLUGINS_DIR points the runner at another suite; the runner's own
-# test uses it.
+# RUN_EVALS_PLUGINS_DIR is a test seam for scripts/run-evals_test.sh, which
+# pairs it with a stub claude. It moves skill discovery only: a real session
+# still runs from REPO_ROOT and may write only there and in its scratch dir, so
+# a suite outside the repo would have its grades denied.
 PLUGINS_DIR="${RUN_EVALS_PLUGINS_DIR:-$REPO_ROOT/plugins}"
 CLASSIFIER="$SCRIPT_DIR/classify-eval-session.py"
 PERMISSION_MODE="acceptEdits"
@@ -345,7 +349,8 @@ PROMPT
 
   # Step 4b: when nothing at all was graded, say whether the session ran. A
   # session that never executed gets its own exit so it can't be read as a
-  # problem with the skill.
+  # problem with the skill. Any grading.json on disk, even one validation
+  # rejected, proves the session wrote files, so it keeps exit 2.
   if [ "$rc" -eq 2 ] && [ -z "$(find "$iter_dir" -path '*/with_skill/grading.json' -print -quit)" ]; then
     python3 "$CLASSIFIER" report "$transcript" "$PERMISSION_MODE" || {
       local verdict=$?
@@ -545,7 +550,7 @@ case "$1" in
     echo "=== Summary ==="
     [ "$ran" -gt 0 ] || echo "  No skill under $PLUGINS_DIR has evals, so nothing was graded."
     [ ${#failed_skills[@]} -gt 0 ] && echo "  Failed assertions: ${failed_skills[*]}"
-    [ ${#ungraded_skills[@]} -gt 0 ] && echo "  No graded result for every eval: ${ungraded_skills[*]}"
+    [ ${#ungraded_skills[@]} -gt 0 ] && echo "  Ungraded evals: ${ungraded_skills[*]}"
     [ ${#prereq_skills[@]} -gt 0 ] && echo "  Missing prerequisites: ${prereq_skills[*]}"
     [ ${#not_executed_skills[@]} -gt 0 ] && echo "  Nested session did not execute: ${not_executed_skills[*]}"
     [ ${#other_skills[@]} -gt 0 ] && echo "  Unexpected runner status: ${other_skills[*]}"
