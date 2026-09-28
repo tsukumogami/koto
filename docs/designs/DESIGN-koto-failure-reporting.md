@@ -229,7 +229,8 @@ entry that will evaluate a check:
    inside `delivery_window` (`src/engine/persistence.rs`,
    `Boundary::ArrivalFromElsewhere`, made `pub(crate)`), or 1.
 3. For each failed check C of this attempt and each distinct rule id R that C
-   reported at `error`: `rule_counts[R].visit` on C's event = 1 + the highest
+   reported at `error` (among all its parsed findings and koto's own finding,
+   whose rule id is the gate's name or `__action__`): `rule_counts[R].visit` on C's event = 1 + the highest
    stored `visit` for R on C's events for this state in the window, and
    `rule_counts[R].session` = 1 + the highest stored `session` for R on C's
    events for this state across the log.
@@ -709,7 +710,8 @@ type. Conventions the contract states once for all of these fields:
 | `stderr_truncated` | boolean | The same for `stderr`. |
 
 **`default_action_executed`** gains `attempt`, `visit_attempt`, `findings`,
-`findings_truncated`, `rule_counts` and `duration_ms`, with the same meanings;
+`findings_truncated`, `rule_counts`, `rule_counts_truncated` and `duration_ms`,
+with the same meanings;
 its check name for `rule_counts` is `__action__`. For an action with `polling:`, `duration_ms`
 covers the whole polling loop. Its existing
 `stdout`, `stderr` and `truncated` keep their definition (leading 64 KiB per
