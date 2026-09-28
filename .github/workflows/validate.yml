@@ -221,6 +221,69 @@ jobs:
       - name: Check that fixture mutations make it fail
         run: test/compat/decider-v0_12_2.sh --self-test
 
+  failure-reporting-compat-v0-14-1:
+    # Proves koto v0.14.1 compiles every fixture template to the same
+    # template hash as the PR's koto, and reads a session log the PR's koto
+    # writes through failing and passing gates, a default_action and
+    # `koto context add`. The installer is fetched at the commit v0.14.1 was
+    # tagged from and checked against a recorded SHA-256 before it runs. No
+    # secret is needed, so forks can run it.
+    name: Failure Reporting Compat (koto v0.14.1)
+    runs-on: ubuntu-latest
+    env:
+      KOTO_FLOOR_VERSION: v0.14.1
+      # Commit the v0.14.1 tag points to, and the SHA-256 of its install.sh.
+      KOTO_INSTALLER_COMMIT: 8a84f91a59edc330e611640c115067daf51e7ff7
+      KOTO_INSTALLER_SHA256: 5f8c62f618f8181fa4b48e0e600e1208dddd1f0dab668a73e1b52ae7b52ba319
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Require sha256sum
+        run: |
+          if ! command -v sha256sum >/dev/null 2>&1; then
+            echo "::error::sha256sum is not on PATH; the koto installer can't be verified"
+            exit 1
+          fi
+
+      - name: Install koto v0.14.1 through the pinned installer
+        run: |
+          set -euo pipefail
+          installer="$RUNNER_TEMP/koto-install.sh"
+          curl -fsSL -o "$installer" \
+            "https://raw.githubusercontent.com/tsukumogami/koto/${KOTO_INSTALLER_COMMIT}/install.sh"
+          if ! echo "${KOTO_INSTALLER_SHA256}  ${installer}" | sha256sum -c -; then
+            echo "::error::install.sh at ${KOTO_INSTALLER_COMMIT} does not match the recorded SHA-256"
+            exit 1
+          fi
+          install_dir="$RUNNER_TEMP/koto-floor"
+          KOTO_INSTALL_DIR="$install_dir" bash "$installer" --version="$KOTO_FLOOR_VERSION" --no-modify-path
+          KOTO_FLOOR_BIN="$install_dir/bin/koto"
+          reported="$("$KOTO_FLOOR_BIN" version)"
+          echo "$reported"
+          case "$reported" in
+            "koto ${KOTO_FLOOR_VERSION#v} "*|"koto ${KOTO_FLOOR_VERSION#v}") ;;
+            *)
+              echo "::error::$KOTO_FLOOR_BIN reports '$reported', expected koto ${KOTO_FLOOR_VERSION#v}"
+              exit 1
+              ;;
+          esac
+          echo "KOTO_FLOOR_BIN=$KOTO_FLOOR_BIN" >> "$GITHUB_ENV"
+
+      - name: Build the PR's koto
+        run: |
+          cargo build --release
+          echo "KOTO_NEW_BIN=$GITHUB_WORKSPACE/target/release/koto" >> "$GITHUB_ENV"
+
+      - name: Run the v0.14.1 compatibility check
+        run: test/compat/failure-reporting-v0_14_1.sh
+
+      - name: Check that log and template mutations make it fail
+        run: test/compat/failure-reporting-v0_14_1.sh --self-test
+
   audit:
     name: Audit
     runs-on: ubuntu-latest
@@ -313,7 +376,7 @@ jobs:
 
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, stability-tests, fmt, clippy, decider-checks, decider-compat-v0-12-2, audit, tsuku-distributed-install, cloud-integration]
+    needs: [check-artifacts, unit-tests, stability-tests, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, audit, tsuku-distributed-install, cloud-integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -326,6 +389,7 @@ jobs:
              [ "${{ needs.clippy.result }}" = "failure" ] || \
              [ "${{ needs.decider-checks.result }}" = "failure" ] || \
              [ "${{ needs.decider-compat-v0-12-2.result }}" = "failure" ] || \
+             [ "${{ needs.failure-reporting-compat-v0-14-1.result }}" = "failure" ] || \
              [ "${{ needs.audit.result }}" = "failure" ] || \
              [ "${{ needs.cloud-integration.result }}" = "failure" ] || \
              [ "${{ needs.tsuku-distributed-install.result }}" = "failure" ]; then

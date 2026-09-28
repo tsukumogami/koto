@@ -1,0 +1,88 @@
+{
+  "format_version": 1,
+  "name": "no-decider",
+  "version": "1.0",
+  "description": "A template with no decider block, pinned to its template_hash",
+  "initial_state": "gather",
+  "variables": {
+    "PLAN_DOC": {
+      "description": "Path to the plan document",
+      "required": true
+    }
+  },
+  "states": {
+    "done": {
+      "directive": "Done.",
+      "terminal": true
+    },
+    "gather": {
+      "directive": "Gather notes for {{PLAN_DOC}}.",
+      "transitions": [
+        {
+          "target": "review",
+          "when": {
+            "gates.notes.exists": true
+          }
+        },
+        {
+          "target": "gather",
+          "when": {
+            "gates.notes.exists": false
+          }
+        }
+      ],
+      "gates": {
+        "notes": {
+          "type": "context-exists",
+          "key": "notes.md"
+        }
+      },
+      "default_action": {
+        "command": "echo gathered",
+        "capture_stdout_as": "GATHERED"
+      }
+    },
+    "review": {
+      "directive": "Review the plan item. Captured: {{GATHERED}}.",
+      "transitions": [
+        {
+          "target": "done",
+          "when": {
+            "verdict": "proceed"
+          }
+        },
+        {
+          "target": "stopped",
+          "when": {
+            "verdict": "exit"
+          }
+        }
+      ],
+      "accepts": {
+        "rationale": {
+          "field_type": "string",
+          "required": false,
+          "description": "Why this verdict"
+        },
+        "ready": {
+          "field_type": "boolean",
+          "required": false,
+          "description": "Is the branch ready?"
+        },
+        "verdict": {
+          "field_type": "enum",
+          "required": true,
+          "values": [
+            "proceed",
+            "exit"
+          ],
+          "description": "Is the plan outline item clear enough to implement?"
+        }
+      }
+    },
+    "stopped": {
+      "directive": "Stopped.",
+      "terminal": true
+    }
+  }
+}

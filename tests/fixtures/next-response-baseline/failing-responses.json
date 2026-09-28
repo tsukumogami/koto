@@ -1,0 +1,92 @@
+{
+  "cases": [
+    {
+      "description": "A command gate whose script prints a line to stdout and one to stderr, then exits 1. The first `koto next` after `koto init`.",
+      "label": "failing-command-gate",
+      "response": {
+        "action": "gate_blocked",
+        "advanced": false,
+        "blocking_conditions": [
+          {
+            "agent_actionable": true,
+            "category": "corrective",
+            "name": "tests",
+            "output": {
+              "error": "",
+              "exit_code": 1
+            },
+            "status": "failed",
+            "type": "command"
+          }
+        ],
+        "directive": "Run the tests.",
+        "error": null,
+        "expects": null,
+        "state": "check",
+        "unassigned_children": []
+      }
+    },
+    {
+      "description": "A context-exists gate on a key no one has added. The first `koto next` after `koto init`.",
+      "label": "failing-context-gate",
+      "response": {
+        "action": "gate_blocked",
+        "advanced": false,
+        "blocking_conditions": [
+          {
+            "agent_actionable": true,
+            "category": "corrective",
+            "name": "review",
+            "output": {
+              "error": "",
+              "exists": false
+            },
+            "status": "failed",
+            "type": "context-exists"
+          }
+        ],
+        "directive": "Wait for the review note.",
+        "error": null,
+        "expects": null,
+        "state": "check",
+        "unassigned_children": []
+      }
+    },
+    {
+      "description": "A default_action that prints a line to stdout and one to stderr, then exits 3. The first `koto next` after `koto init`.",
+      "label": "failing-default-action",
+      "response": {
+        "action": "gate_blocked",
+        "advanced": false,
+        "blocking_conditions": [
+          {
+            "agent_actionable": false,
+            "category": "corrective",
+            "name": "__action__",
+            "output": {
+              "command": "echo action-stdout-line; echo action-stderr-line >&2; exit 3",
+              "exit_code": 3,
+              "failure_kind": "nonzero_exit",
+              "state": "setup",
+              "stderr": "action-stderr-line\n",
+              "stdout": "action-stdout-line\n",
+              "truncated": false
+            },
+            "status": "failed",
+            "type": "action"
+          }
+        ],
+        "directive": "Prepare the workspace.",
+        "error": null,
+        "expects": null,
+        "state": "setup",
+        "unassigned_children": []
+      }
+    }
+  ],
+  "notes": [
+    "Parsed `koto next` response bodies for three failing checks, captured from koto before the failure-reporting feature changed any response.",
+    "Each case runs in its own temporary HOME and KOTO_SESSIONS_BASE. Any occurrence of that directory in a string is replaced with <ROOT>.",
+    "The rule these pin: a later koto may add optional keys to these responses but may not change or remove any key recorded here. `strip_added_keys` in tests/support/json_baseline.rs deletes keys the fixture lacks before comparing."
+  ]
+}

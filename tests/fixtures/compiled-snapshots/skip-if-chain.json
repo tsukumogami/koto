@@ -1,0 +1,39 @@
+{
+  "format_version": 1,
+  "name": "skip-if-chain",
+  "version": "1.0",
+  "description": "3-state chain where A and B auto-advance via skip_if when CHAIN_DISABLED is unset",
+  "initial_state": "a",
+  "states": {
+    "a": {
+      "directive": "Auto-advances to b when CHAIN_DISABLED is not set.",
+      "transitions": [
+        {
+          "target": "b"
+        }
+      ],
+      "skip_if": {
+        "vars.CHAIN_DISABLED": {
+          "is_set": false
+        }
+      }
+    },
+    "b": {
+      "directive": "Auto-advances to c when CHAIN_DISABLED is not set.",
+      "transitions": [
+        {
+          "target": "c"
+        }
+      ],
+      "skip_if": {
+        "vars.CHAIN_DISABLED": {
+          "is_set": false
+        }
+      }
+    },
+    "c": {
+      "directive": "Terminal state.",
+      "terminal": true
+    }
+  }
+}

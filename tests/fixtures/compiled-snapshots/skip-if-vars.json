@@ -1,0 +1,43 @@
+{
+  "format_version": 1,
+  "name": "skip-if-vars",
+  "version": "1.0",
+  "description": "skip_if fires on vars.SHARED_BRANCH when set, otherwise blocks for evidence",
+  "initial_state": "start",
+  "variables": {
+    "SHARED_BRANCH": {
+      "description": "Branch name to use; when set, skips the start state automatically"
+    }
+  },
+  "states": {
+    "done": {
+      "directive": "Terminal state.",
+      "terminal": true
+    },
+    "start": {
+      "directive": "When SHARED_BRANCH is set, skip_if fires and the state auto-advances to done,\nbypassing the gate and evidence requirement.\nWhen SHARED_BRANCH is not set, the gate blocks and the state requires evidence.",
+      "transitions": [
+        {
+          "target": "done"
+        }
+      ],
+      "gates": {
+        "branch_check": {
+          "type": "command",
+          "command": "test -f wip/branch.txt"
+        }
+      },
+      "accepts": {
+        "branch": {
+          "field_type": "string",
+          "required": true
+        }
+      },
+      "skip_if": {
+        "vars.SHARED_BRANCH": {
+          "is_set": true
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,161 @@
+{
+  "format_version": 1,
+  "name": "decider-compat",
+  "version": "1.0",
+  "description": "Enum and boolean decider declarations for the koto v0.12.2 compatibility check",
+  "initial_state": "triage",
+  "variables": {
+    "CHANGE_NOTE": {
+      "description": "One-line summary of the change under triage",
+      "default": "Rename the --dry-run flag to --plan in the sync command."
+    }
+  },
+  "states": {
+    "build": {
+      "directive": "Build the change and run the tests.",
+      "transitions": [
+        {
+          "target": "done",
+          "when": {
+            "passed": true
+          }
+        },
+        {
+          "target": "triage",
+          "when": {
+            "passed": false
+          }
+        }
+      ],
+      "accepts": {
+        "passed": {
+          "field_type": "boolean",
+          "required": true,
+          "description": "Did the build and the tests pass?",
+          "decider": {
+            "answers": {
+              "false": {
+                "description": "At least one check failed.",
+                "mode": "shadow",
+                "threshold": 0.9
+              },
+              "true": {
+                "description": "Every check passed.",
+                "mode": "shadow",
+                "threshold": 0.9
+              }
+            },
+            "inputs": [
+              {
+                "source": {
+                  "var": "CHANGE_NOTE"
+                },
+                "label": "change_note",
+                "max_bytes": 8192
+              }
+            ]
+          }
+        }
+      }
+    },
+    "done": {
+      "directive": "Done.",
+      "terminal": true
+    },
+    "dropped": {
+      "directive": "Dropped.",
+      "terminal": true
+    },
+    "review": {
+      "directive": "Ask a human to review the change.",
+      "transitions": [
+        {
+          "target": "build",
+          "when": {
+            "approved": true
+          }
+        },
+        {
+          "target": "dropped",
+          "when": {
+            "approved": false
+          }
+        }
+      ],
+      "accepts": {
+        "approved": {
+          "field_type": "boolean",
+          "required": true,
+          "description": "Did a human approve the change?"
+        }
+      }
+    },
+    "triage": {
+      "directive": "Decide how to handle the change: {{CHANGE_NOTE}}",
+      "transitions": [
+        {
+          "target": "build",
+          "when": {
+            "route": "auto"
+          }
+        },
+        {
+          "target": "review",
+          "when": {
+            "route": "manual"
+          }
+        },
+        {
+          "target": "dropped",
+          "when": {
+            "route": "drop"
+          }
+        }
+      ],
+      "accepts": {
+        "route": {
+          "field_type": "enum",
+          "required": true,
+          "values": [
+            "auto",
+            "manual",
+            "drop"
+          ],
+          "description": "How should this change be handled?",
+          "decider": {
+            "answers": {
+              "auto": {
+                "description": "A mechanical change that needs no human review.",
+                "mode": "auto",
+                "threshold": 0.9
+              },
+              "drop": {
+                "description": "Out of scope or already done.",
+                "mode": "never",
+                "threshold": 0.9
+              },
+              "manual": {
+                "description": "Needs a human to look at it first.",
+                "mode": "shadow",
+                "threshold": 0.9
+              }
+            },
+            "escape": {
+              "value": "zq-escape-7kd2",
+              "description": "The note is missing or can't be judged."
+            },
+            "inputs": [
+              {
+                "source": {
+                  "var": "CHANGE_NOTE"
+                },
+                "label": "change_note",
+                "max_bytes": 2048
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "format_version": 1,
+  "name": "legacy-gates",
+  "version": "1.0",
+  "description": "Template using legacy boolean gate behavior",
+  "initial_state": "verify",
+  "states": {
+    "complete": {
+      "directive": "Done.",
+      "terminal": true
+    },
+    "verify": {
+      "directive": "Legacy gate: boolean pass/block only. No gates.* routing.",
+      "transitions": [
+        {
+          "target": "complete"
+        }
+      ],
+      "gates": {
+        "ci_check": {
+          "type": "command",
+          "command": "true"
+        }
+      }
+    }
+  }
+}
