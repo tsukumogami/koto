@@ -3078,14 +3078,21 @@ pub fn should_append_batch_finalized(
 }
 
 /// The part of a batch view that identifies its outcome: each listed
-/// child's name and outcome, sorted by name. Result text, child states and
-/// the other fields are left out, because a view rebuilt after a child's
-/// log was cleaned up reads them from the parent's copy and need not match
-/// byte for byte what was recorded while the child was on disk. A failed
-/// child's `reason` is left out too, so a view frozen before `reason`
-/// existed does not count as a changed batch.
-fn batch_outcomes(view: &serde_json::Value) -> Vec<(String, String)> {
-    let mut outcomes: Vec<(String, String)> = view
+/// child's name, outcome and `reason_source`, sorted by name. Result text,
+/// child states and the other fields are left out, because a view rebuilt
+/// after a child's log was cleaned up reads them from the parent's copy and
+/// need not match byte for byte what was recorded while the child was on
+/// disk. The reason text is left out for the same reason, and so that a view
+/// frozen before `reason` existed does not count as a changed batch.
+///
+/// `reason_source` is in because a tick can see a failed child between its
+/// terminal transition and the append that records its result and
+/// `failure_reason`; the view frozen then says `state_name`. When the record
+/// lands, the source becomes `failure_reason` and the batch is recorded again
+/// with the reason the child gave (koto#278). A view frozen by an older koto
+/// already carries `reason_source`, so upgrading does not re-record it.
+fn batch_outcomes(view: &serde_json::Value) -> Vec<(String, String, String)> {
+    let mut outcomes: Vec<(String, String, String)> = view
         .get("children")
         .and_then(|c| c.as_array())
         .map(|children| {
@@ -3098,7 +3105,7 @@ fn batch_outcomes(view: &serde_json::Value) -> Vec<(String, String)> {
                             .unwrap_or_default()
                             .to_string()
                     };
-                    (field("name"), field("outcome"))
+                    (field("name"), field("outcome"), field("reason_source"))
                 })
                 .collect()
         })
@@ -4498,6 +4505,40 @@ mod tests {
             &tasks_a(),
             true,
             &rebuilt
+        ));
+    }
+
+    #[test]
+    fn a_failed_childs_reason_arriving_late_records_the_batch_again() {
+        // A tick saw the child's terminal transition before its recorded
+        // failure_reason: the view froze with the state name. Once the record
+        // lands the source changes and the batch is recorded again (koto#278).
+        let mut early = view_of(&[("p.A", "failure")]);
+        early["children"][0]["reason_source"] = serde_json::json!("state_name");
+        early["children"][0]["reason"] = serde_json::json!("failed");
+        let events = vec![bf_event_for(5, "plan", early.clone())];
+        let mut late = early.clone();
+        late["children"][0]["reason_source"] = serde_json::json!("failure_reason");
+        late["children"][0]["reason"] = serde_json::json!("disk full");
+        assert!(should_append_batch_finalized(
+            &events,
+            "plan",
+            &tasks_a(),
+            true,
+            &late
+        ));
+
+        // A view frozen before `reason` existed has the same source as one
+        // read now, so upgrading records nothing new.
+        let mut old = early.clone();
+        old["children"][0].as_object_mut().unwrap().remove("reason");
+        let events = vec![bf_event_for(5, "plan", old)];
+        assert!(!should_append_batch_finalized(
+            &events,
+            "plan",
+            &tasks_a(),
+            true,
+            &early
         ));
     }
 

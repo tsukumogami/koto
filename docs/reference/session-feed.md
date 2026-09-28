@@ -691,7 +691,7 @@ out of it, or leaves it with `koto next --to`. `state` names the batching state,
 not the state the tick stopped in. A log can hold several: one per batching
 state that ran a batch, and another whenever a batch completes again after a
 retry of one of its children or a rewind, or with different per-child outcomes
-than its last record.
+(or failed children's `reason_source`) than its last record.
 The most recent `batch_finalized` event drives `koto status` batch display after
 children are auto-cleaned, and its `view` is what the `batch_final_view`
 context key holds.

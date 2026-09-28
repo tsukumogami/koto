@@ -89,6 +89,8 @@ Evidence alone writes nothing to context. A worker that submits `{"status": "blo
 - a `context_assignments` entry on the transition that takes the evidence;
 - `koto context add <parent>.<task> failure_reason`, run by the worker or by a `default_action`, before the worker moves into its failure state.
 
+Use one or the other on a given path, not both. An assignment of `${evidence.failure_reason}` on the edge into the failure state writes an empty value when the submission leaves the field out, and that empty value replaces what `koto context add` stored.
+
 The assignment form, on the state where the worker submits the evidence:
 
 ```yaml
