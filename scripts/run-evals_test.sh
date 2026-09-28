@@ -13,6 +13,8 @@
 #   plan       starts in plan mode, writes only its plan file, grades nothing
 #   denied     every command it tries is denied, grades nothing
 #   silent     leaves an empty transcript and grades nothing
+#   stray      grades the first eval and a directory no eval defines
+#   errored    runs a command, then ends in an error result, grading nothing
 #
 # Usage: scripts/run-evals_test.sh
 
@@ -77,8 +79,19 @@ if mode == "denied":
           "permission_denials": [{"tool_use_id": "t1"}, {"tool_use_id": "t2"}]})
     sys.exit(0)
 
+if mode == "errored":
+    call(1, "Bash")
+    emit({"type": "result", "subtype": "success", "is_error": True,
+          "result": "You've hit your spend limit"})
+    sys.exit(1)
+
 call(1, "Bash", error=(mode == "none"))
 evals = sorted(d for d in os.listdir(iter_dir) if os.path.isdir(os.path.join(iter_dir, d)))
+if mode == "stray":
+    # Grades only the first eval, plus a directory no eval defines.
+    os.makedirs(os.path.join(iter_dir, "stray-rerun", "with_skill", "outputs"))
+    evals = [evals[0], "stray-rerun"]
+    mode = "pass"
 for i, name in enumerate(evals):
     base = os.path.join(iter_dir, name)
     for side in ("with_skill", "without_skill"):
@@ -149,6 +162,14 @@ expect_no_out "an executed session is not called not-executed" "DID NOT EXECUTE"
 run_runner "skill-a:partial" skill-a
 expect_rc "partly graded fails" 2
 expect_out "partly graded is named" "only 1 of the 2 evals"
+
+run_runner "skill-a:stray" skill-a
+expect_rc "a stray graded directory does not stand in for an ungraded eval" 2
+expect_out "the ungraded eval is named" "- second"
+
+run_runner "skill-a:errored" skill-a
+expect_rc "session that ran then errored fails as ungraded" 2
+expect_out "the session's error is shown" "ended in an error"
 
 run_runner "skill-a:empty" skill-a
 expect_rc "grading with no expectations fails" 2

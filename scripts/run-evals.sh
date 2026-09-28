@@ -14,9 +14,10 @@
 #
 # Exit codes:
 #   0  Every eval was graded and every assertion passed
-#   1  One or more assertions failed
+#   1  One or more assertions failed (any ungraded eval beside them is still
+#      listed, as "Also ungraded")
 #   2  An eval produced no graded result (zero graded is never a pass)
-#   3  Missing prerequisites
+#   3  Missing prerequisites, including a suite that defines no evals
 #   4  The nested claude session did not execute (plan mode, or every command
 #      and write it tried was denied), so the skill was never exercised
 #   5  Refused: the checkout is under ~/.claude, where Claude Code denies writes
@@ -230,7 +231,6 @@ PYEOF
   # Return values for callers, as globals: prep runs in the caller's shell, and
   # shared files would let two runs on one host read each other's values.
   PREP_ITER_DIR="$iter_dir"
-  PREP_EVAL_COUNT="$eval_count"
   PREP_ITERATION="$iteration"
 }
 
@@ -243,9 +243,8 @@ run_skill_evals() {
   # Step 1: Prepare
   prep_skill_evals "$skill_name" || return $?
 
-  local iter_dir eval_count iteration
+  local iter_dir iteration
   iter_dir="$PREP_ITER_DIR"
-  eval_count="$PREP_EVAL_COUNT"
   iteration="$PREP_ITERATION"
 
   # Step 2: Build tier-specific instructions for each eval
@@ -342,7 +341,7 @@ PROMPT
   echo ""
   echo "=== Validating results ==="
   local rc=0
-  validate_results "$iter_dir" "$eval_count" || rc=$?
+  validate_results "$iter_dir" "$evals_file" || rc=$?
 
   # Step 4b: when nothing at all was graded, say whether the session ran. A
   # session that never executed gets its own exit so it can't be read as a
@@ -362,12 +361,28 @@ PROMPT
   return "$rc"
 }
 
+# Print the directory name prep gives each eval in evals.json, one per line.
+eval_names() {
+  python3 -c "
+import json, sys
+for ev in json.load(open(sys.argv[1]))['evals']:
+    print(ev.get('name', 'eval-%s' % ev['id']))
+" "$1" 2>/dev/null
+}
+
 validate_results() {
   local iter_dir="$1"
-  local expected_count="$2"
+  local evals_file="$2"
+  # Grades are looked up by the evals evals.json defines, never by whatever
+  # directories exist, so a stray graded directory can't stand in for an eval
+  # that went ungraded.
+  local names=()
+  local line
+  while IFS= read -r line; do names+=("$line"); done < <(eval_names "$evals_file")
+  local expected_count=${#names[@]}
   # Zero expected would let zero graded pass.
-  if ! [ "${expected_count:-0}" -gt 0 ] 2>/dev/null; then
-    echo "  NO EVALS EXPECTED: the suite defines no evals ('$expected_count'), so nothing can be graded."
+  if [ "$expected_count" -eq 0 ]; then
+    echo "  NO EVALS EXPECTED: $evals_file defines no evals, so nothing can be graded."
     return 2
   fi
   local graded=0
@@ -377,14 +392,9 @@ validate_results() {
   local passed_assertions=0
   local failed_assertions=0
 
-  for eval_dir in "$iter_dir"/*/; do
-    [ -d "$eval_dir" ] || continue
-    local name
-    name=$(basename "$eval_dir")
-    # Skip non-eval entries
-    [[ "$name" == *.json ]] && continue
-    [[ "$name" == *.html ]] && continue
-    [[ "$name" == *.md ]] && continue
+  local name
+  for name in "${names[@]}"; do
+    local eval_dir="$iter_dir/$name"
 
     # Check with_skill outputs exist
     if [ ! -d "$eval_dir/with_skill/outputs" ] || [ -z "$(ls -A "$eval_dir/with_skill/outputs" 2>/dev/null)" ]; then
@@ -450,12 +460,10 @@ print(f'{len(exps)} {p}')
   if [ "$failed_assertions" -gt 0 ]; then
     echo ""
     echo "  FAILED ASSERTIONS: $failed_assertions"
-    for eval_dir in "$iter_dir"/*/; do
-      [ -d "$eval_dir" ] || continue
-      local gfile="$eval_dir/with_skill/grading.json"
+    local ename
+    for ename in "${names[@]}"; do
+      local gfile="$iter_dir/$ename/with_skill/grading.json"
       [ -f "$gfile" ] || continue
-      local ename
-      ename=$(basename "$eval_dir")
       python3 -c "
 import json
 with open('$gfile') as f:
@@ -578,9 +586,9 @@ case "$1" in
       exit 2
     fi
     iter_dir="$workspace/iteration-$iteration"
-    eval_count=$(python3 -c "import json; print(len(json.load(open('$skill_dir/evals/evals.json'))['evals']))")
     echo "=== Validating iteration $iteration for $skill_name ==="
-    validate_results "$iter_dir" "$eval_count"
+    validate_results "$iter_dir" "$skill_dir/evals/evals.json"
+    exit $?
     ;;
   --help|-h)
     usage

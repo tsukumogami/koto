@@ -140,6 +140,13 @@ def report(summary, transcript, requested):
         print("  It may have failed to start; its output is above.")
         return EXIT_UNKNOWN
     if summary["verdict"] == "executed":
+        # It ran, but an error (a spend limit, an API failure) can still be
+        # why nothing was graded; say so rather than leave it to look like the
+        # skill's fault.
+        if summary["result_is_error"]:
+            print("")
+            print("  Note: the nested session ran but ended in an error:")
+            print(f"    {summary['result_text'][:300]}")
         if overridden:
             print("")
             print(f"  Note: the nested session ran in permission mode {summary['permission_mode']},"
