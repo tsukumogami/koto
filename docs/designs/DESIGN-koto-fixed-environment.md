@@ -330,12 +330,21 @@ whatever process ticks each first; a batch can therefore end up with records
 that differ, and the adoption notice on each says what it recorded.
 
 **Adoption** runs in `koto next` after the reentrancy check, the anchor check
-and the dispatch-epoch fence, under the state-file lock, re-reading the header
-first so two racing ticks can't both adopt. It records the ticking process's
-fixed values (normalized) and the default list, never the legacy flag, appends
-`environment_adopted`, rewrites the header, and prefixes a one-time notice
-showing the recorded values, the dropped entries, and that variables outside
-the default list no longer reach commands.
+and the dispatch-epoch fence (moved up for this; it reads only the header, and
+`--to` excludes `--with-data`), and before variables, the template, the `--to`
+guard or any command. It takes an exclusive lock on the session's own
+`environment.lock` -- the state-file lock is non-blocking and held across a
+batch parent's scheduling, so it can't serialize two adopters -- and re-reads
+the header locally under it, so two racing ticks can't both adopt and a pulling
+read on the cloud backend can't discard header changes this tick already made.
+It records the ticking process's fixed values (normalized) and the default
+list, never the legacy flag, appends `environment_adopted`, rewrites the
+header, pushes the state file strictly, and prefixes a one-time notice showing
+the recorded values, the dropped entries, and that variables outside the
+default list no longer reach commands. The notice shows values because they
+are the three fixed variables, recorded only after the credential check; attach
+drift names variables only because the caller's own values haven't been
+through that check.
 
 **Attach**, beside `check_origin` in `src/cli/init_entry.rs`, compares the
 caller's normalized `PATH`, `HOME` and `XDG_CONFIG_HOME` with the record. A
