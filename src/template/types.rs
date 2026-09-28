@@ -2399,8 +2399,9 @@ impl CompiledTemplate {
                 warnings.push(format!(
                     "W5: state {:?}: `failure: true` terminal state has no declared path writing the `failure_reason` context key; \
                      the batch view's per-child `reason` will fall back to the state name\n  \
-                     remedy: assign it in context_assignments on every transition into the state, from the state that takes the evidence \
-                     (for example `failure_reason: \"${{evidence.failure_reason}}\"`)",
+                     remedy: assign it in context_assignments on the edge out of the state that takes the evidence \
+                     (for example `failure_reason: \"${{evidence.failure_reason}}\"`); an assignment on an auto-advancing state's edge \
+                     resolves to an empty value, so a path through one should assign earlier (W5 then still warns)",
                     state_name
                 ));
             }
