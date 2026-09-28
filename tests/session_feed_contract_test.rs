@@ -1,5 +1,5 @@
 //! The published session-feed contract covers what koto writes
-//! (PLAN-koto-failure-reporting.md, Issue 5).
+//! (DESIGN-koto-failure-reporting.md, Gate-event schema; PRD-koto-failure-reporting.md, R25-R27).
 //!
 //! One session is driven through the built `koto` so that its log holds every
 //! failure-reporting field on `gate_evaluated` and `default_action_executed`,

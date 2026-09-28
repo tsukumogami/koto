@@ -1,6 +1,6 @@
 //! Attempt stamps, per-check rule counts, findings and captured output on
 //! the check events, and the `attempts` object on a blocked `koto next`
-//! response (PLAN-koto-failure-reporting.md, Issue 3).
+//! response (DESIGN-koto-failure-reporting.md, Decision 2; PRD-koto-failure-reporting.md, R17-R20).
 //!
 //! Every case runs the built `koto` against a template whose checks are
 //! scripts written into the test's temporary directory, then reads the
