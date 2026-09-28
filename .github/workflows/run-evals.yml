@@ -1,0 +1,24 @@
+name: run-evals
+
+# Tests the eval runner itself against a stub claude; no model calls. The
+# evals are still run by hand (see CLAUDE.md).
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - 'scripts/run-evals.sh'
+      - 'scripts/run-evals_test.sh'
+      - 'scripts/classify-eval-session.py'
+      - '.github/workflows/run-evals.yml'
+
+jobs:
+  runner-tests:
+    name: Eval Runner Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Copied into .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      - name: Test run-evals.sh
+        run: scripts/run-evals_test.sh
