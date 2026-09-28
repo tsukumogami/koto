@@ -16,8 +16,9 @@
 #   0  Every eval was graded and every assertion passed
 #   1  One or more assertions failed (any ungraded eval beside them is still
 #      listed, as "Also ungraded"); also a usage error
-#   2  An eval produced no graded result (zero graded is never a pass), or
-#      --validate found no iteration or no evals to check
+#   2  An eval produced no graded result (zero graded is never a pass),
+#      --validate found no iteration or no evals to check, or --all found no
+#      skill with evals or got a status it doesn't know
 #   3  Missing prerequisites, including a suite that defines no evals
 #   4  The nested claude session did not execute (plan mode, every command
 #      and write it tried was denied, or it ended in an error before running
@@ -44,8 +45,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # RUN_EVALS_PLUGINS_DIR is a test seam for scripts/run-evals_test.sh, which
 # pairs it with a stub claude. It moves skill discovery only: a real session
-# still runs from REPO_ROOT and may write only there and in its scratch dir, so
-# a suite outside the repo would have its grades denied.
+# still runs from REPO_ROOT, and its Write and Edit tools are confined to
+# REPO_ROOT and the scratch dir, so a suite outside the repo would have those
+# writes denied.
 PLUGINS_DIR="${RUN_EVALS_PLUGINS_DIR:-$REPO_ROOT/plugins}"
 CLASSIFIER="$SCRIPT_DIR/classify-eval-session.py"
 PERMISSION_MODE="acceptEdits"

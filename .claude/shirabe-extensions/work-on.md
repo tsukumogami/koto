@@ -2,8 +2,8 @@
 
 koto's verification map for shirabe's `/work-on` definition-of-done gate. Schema:
 `skills/work-on/references/verification-map.md` in the shirabe repo. The default runs only when
-no entry matches any changed file. The plugin checks copy step bodies from `validate-plugins.yml`
-and `eval-plugins.yml`, and the eval runner entry from `run-evals.yml`, which point back here: change both together. Deliberate differences, and
+no entry matches any changed file. The plugin checks copy step bodies from `validate-plugins.yml`,
+`eval-plugins.yml` and `run-evals.yml`, which point back here: change each pair together. Deliberate differences, and
 checks PR CI does not run, are marked. Paths that carry behavior where no command here checks
 what they do have their own entry at the end, which makes the gate cannot-verify rather than
 letting the default pass them; this file is knowingly left to the default, since halting every
