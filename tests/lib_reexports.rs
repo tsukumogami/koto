@@ -33,6 +33,7 @@ use koto::error::Error;
 #[test]
 fn state_file_header_resolves_and_constructs() {
     let h = StateFileHeader {
+        command_environment: None,
         schema_version: CURRENT_SCHEMA_VERSION,
         workflow: "test".into(),
         template_hash: "deadbeef".into(),
@@ -192,6 +193,7 @@ fn path_buf_used_for_template_source_dir_field() {
     // shape after the lockdown (paranoid additive-evolution check
     // for an existing field).
     let h = StateFileHeader {
+        command_environment: None,
         schema_version: CURRENT_SCHEMA_VERSION,
         workflow: "x".into(),
         template_hash: "x".into(),

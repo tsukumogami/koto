@@ -173,6 +173,13 @@ pub enum Command {
         /// Every later `koto next` must run there or beneath it.
         #[arg(long, value_name = "DIR")]
         execution_dir: Option<String>,
+
+        /// Run this session's commands with the caller's whole
+        /// environment, as koto did before it recorded one. Recorded in
+        /// the session at init; no later command can set or clear it.
+        /// Temporary: the next release removes it.
+        #[arg(long)]
+        legacy_environment: bool,
     },
 
     /// Get the current state directive for a workflow
@@ -1217,6 +1224,7 @@ pub fn run(app: App) -> Result<()> {
             parent,
             intent,
             execution_dir,
+            legacy_environment,
         } => {
             // Entry-flag usage errors come first, before any IO: they are
             // caller mistakes, and there is no leg yet to record them on.
@@ -1233,6 +1241,12 @@ pub fn run(app: App) -> Result<()> {
             if entry_flags_used && parent.is_some() {
                 init_entry::usage_error(
                     "--attach-live, --replace-terminal and --koto-leg can't be used with --parent",
+                );
+            }
+            if legacy_environment && parent.is_some() {
+                init_entry::usage_error(
+                    "--legacy-environment can't be used with --parent: a child takes its \
+                     parent's recorded environment",
                 );
             }
             let koto_leg = koto_leg.map(|raw| {
@@ -1313,6 +1327,7 @@ pub fn run(app: App) -> Result<()> {
                     &vars,
                     intent.as_deref(),
                     execution_dir.as_deref(),
+                    legacy_environment,
                 )
             } else {
                 let template = template.unwrap_or_else(|| {
@@ -1333,6 +1348,7 @@ pub fn run(app: App) -> Result<()> {
                             vars: &vars,
                             intent: intent.as_deref(),
                             execution_dir: execution_dir.as_deref(),
+                            legacy_environment,
                         },
                         &entry,
                     );
@@ -1345,6 +1361,7 @@ pub fn run(app: App) -> Result<()> {
                     parent.as_deref(),
                     intent.as_deref(),
                     execution_dir.as_deref(),
+                    legacy_environment,
                 )
             }
         }
@@ -1970,6 +1987,19 @@ fn stale_template_source_dir_clause(backend: &Backend, name: &str) -> Option<Str
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
+/// Add an `environment` object to a `koto init` response when recording
+/// this process's environment dropped `PATH` entries or left a fixed value
+/// unset (DESIGN-koto-fixed-environment.md). Names and path text only; no
+/// value of a credential-carrying variable.
+pub(crate) fn add_environment_report(out: &mut serde_json::Value, legacy_environment: bool) {
+    let (_, report) = crate::engine::command_env::record_from_process(legacy_environment);
+    if !report.is_empty() {
+        out["environment"] = report.to_json();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_init(
     backend: &Backend,
     name: &str,
@@ -1978,6 +2008,7 @@ fn handle_init(
     parent: Option<&str>,
     intent: Option<&str>,
     execution_dir: Option<&Path>,
+    legacy_environment: bool,
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation.
     if let Err(msg) = crate::discover::validate_workflow_name(name) {
@@ -2043,6 +2074,7 @@ fn handle_init(
         &mut cache,
         None,
         execution_dir,
+        legacy_environment,
     ) {
         match err.kind {
             SpawnErrorKind::Collision => {
@@ -2127,13 +2159,14 @@ fn handle_init(
             )
         })?;
 
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "name": name,
-            "state": initial_state
-        }))?
-    );
+    let mut out = serde_json::json!({
+        "name": name,
+        "state": initial_state
+    });
+    if parent.is_none() {
+        add_environment_report(&mut out, legacy_environment);
+    }
+    println!("{}", serde_json::to_string(&out)?);
     Ok(())
 }
 
@@ -2159,6 +2192,7 @@ fn handle_init_inline(
     vars: &[String],
     intent: Option<&str>,
     execution_dir: Option<&Path>,
+    legacy_environment: bool,
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation. Guards
     // `<name>` against path traversal (no `/`, `..`, or `~`).
@@ -2186,9 +2220,14 @@ fn handle_init_inline(
         }));
     }
 
-    if let Err(e) =
-        init_child::init_inline_from_stdin_bytes(backend, name, source_bytes, vars, execution_dir)
-    {
+    if let Err(e) = init_child::init_inline_from_stdin_bytes(
+        backend,
+        name,
+        source_bytes,
+        vars,
+        execution_dir,
+        legacy_environment,
+    ) {
         // Variable-resolution failures are caller errors (exit 2); a
         // strict-compile / validation failure or any I/O error is exit 1.
         // The seam prefixes var-resolution errors so we can classify them
@@ -2243,13 +2282,12 @@ fn handle_init_inline(
             )
         })?;
 
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "name": name,
-            "state": initial_state
-        }))?
-    );
+    let mut out = serde_json::json!({
+        "name": name,
+        "state": initial_state
+    });
+    add_environment_report(&mut out, legacy_environment);
+    println!("{}", serde_json::to_string(&out)?);
     Ok(())
 }
 
@@ -7287,6 +7325,7 @@ mod tests {
             },
         );
         CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: name.to_string(),
             version: "1.0".to_string(),
@@ -7344,6 +7383,7 @@ mod tests {
         dir: Option<std::path::PathBuf>,
     ) -> crate::engine::types::StateFileHeader {
         crate::engine::types::StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "test-workflow".to_string(),
             template_hash: "testhash".to_string(),
@@ -7473,6 +7513,7 @@ Done.
             &[],
             None,
             None,
+            false,
         )
         .expect("inline init");
 
@@ -7498,6 +7539,7 @@ Done.
             &[],
             Some("My explicit intent"),
             None,
+            false,
         )
         .expect("inline init");
 
@@ -7532,6 +7574,7 @@ Done.
             None,
             None,
             None,
+            false,
         )
         .expect("init should succeed");
 
@@ -7561,6 +7604,7 @@ Done.
             None,
             None,
             None,
+            false,
         )
         .expect("init should succeed");
 
@@ -7594,6 +7638,7 @@ Done.
             &[],
             None,
             None,
+            false,
         )
         .expect("inline init should succeed");
 
@@ -7645,6 +7690,7 @@ Done.
             None,
             None,
             None,
+            false,
         )
         .expect("init should succeed");
         std::fs::remove_dir_all(&tpl_subdir).unwrap();
@@ -8024,6 +8070,7 @@ Done.
             .init_state_file(
                 "child",
                 crate::engine::types::StateFileHeader {
+                    command_environment: None,
                     schema_version: 1,
                     workflow: "child".to_string(),
                     template_hash: "h".to_string(),
@@ -8068,6 +8115,7 @@ Done.
         let mut states = BTreeMap::new();
         states.insert("done".to_string(), TemplateState::default());
         let compiled = CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "child".to_string(),
             version: "1".to_string(),

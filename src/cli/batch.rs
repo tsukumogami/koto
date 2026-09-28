@@ -3444,6 +3444,7 @@ mod tests {
             default_failure_policy, FailurePolicy, MaterializeChildrenSpec, TemplateState,
         };
         let mut compiled = CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "t".to_string(),
             version: "1".to_string(),
@@ -3581,6 +3582,7 @@ mod tests {
             on_disk.insert(name.to_string(), snap("done", true, false, false));
         }
         let compiled = CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "p".to_string(),
             version: "1".to_string(),
@@ -3628,6 +3630,7 @@ mod tests {
         on_disk.insert("e".to_string(), snap("work", false, false, false));
 
         let compiled = CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "p".to_string(),
             version: "1".to_string(),
@@ -3766,6 +3769,7 @@ mod tests {
         on_disk.insert("A".to_string(), snap("failed", true, true, false));
         on_disk.insert("B".to_string(), snap("failed", true, true, false));
         let compiled = CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "p".to_string(),
             version: "1".to_string(),
@@ -3813,6 +3817,7 @@ mod tests {
         let mut on_disk: HashMap<String, ChildSnapshot> = HashMap::new();
         on_disk.insert("a".to_string(), snap("work", false, false, false));
         let compiled = CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "p".to_string(),
             version: "1".to_string(),
@@ -3851,6 +3856,7 @@ mod tests {
         let mut on_disk: HashMap<String, ChildSnapshot> = HashMap::new();
         on_disk.insert("A".to_string(), snap("failed", true, true, false));
         let compiled = CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "p".to_string(),
             version: "1".to_string(),
@@ -4549,6 +4555,7 @@ mod tests {
         std::fs::create_dir_all(&session_dir).unwrap();
         let state_path = session_dir.join(state_file_name(id));
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: id.to_string(),
             template_hash: "testhash".to_string(),
@@ -4676,6 +4683,7 @@ mod tests {
         std::fs::create_dir_all(&session_dir).unwrap();
         let state_path = session_dir.join(state_file_name("p.b"));
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "p.b".to_string(),
             template_hash: "h".to_string(),
@@ -4835,6 +4843,7 @@ mod tests {
         // disk: it has been auto-cleaned, so the only place the result
         // can be read from is the parent's own log.
         let parent_header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "parent".to_string(),
             template_hash: "testhash".to_string(),
@@ -4922,6 +4931,7 @@ mod tests {
         let mut states = BTreeMap::new();
         states.insert("converge".to_string(), converge);
         let template = CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "parent".to_string(),
             version: "1".to_string(),
@@ -4957,6 +4967,7 @@ mod tests {
     #[cfg(test)]
     fn child_header_for(parent: &str, child: &str) -> StateFileHeader {
         StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: child.to_string(),
             template_hash: "h".to_string(),
@@ -5000,6 +5011,7 @@ mod tests {
         let mut states = BTreeMap::new();
         states.insert("converge".to_string(), converge);
         CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: parent.to_string(),
             version: "1".to_string(),
@@ -5189,6 +5201,7 @@ mod tests {
         let mut states = BTreeMap::new();
         states.insert("wait".to_string(), TemplateState::default());
         let template = CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "p".to_string(),
             version: "1".to_string(),

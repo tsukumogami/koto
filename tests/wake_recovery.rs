@@ -61,6 +61,7 @@ fn sessions_dir(koto_root: &Path) -> PathBuf {
 
 fn make_header(workflow: &str, requested_by: Option<&str>) -> StateFileHeader {
     StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: workflow.to_string(),
         template_hash: "deadbeef".into(),

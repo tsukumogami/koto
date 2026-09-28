@@ -30,6 +30,7 @@ fn write_session_file(dir: &Path, session_id: &str) -> PathBuf {
     std::fs::create_dir_all(&session_dir).unwrap();
     let path = session_dir.join(format!("koto-{}.state.jsonl", session_id));
     let header = StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: session_id.to_string(),
         template_hash: "deadbeef".into(),

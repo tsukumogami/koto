@@ -62,6 +62,7 @@ fn floor() -> Duration {
 
 fn make_header(workflow: &str, role: Option<&str>) -> StateFileHeader {
     StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: workflow.into(),
         template_hash: "deadbeef".into(),

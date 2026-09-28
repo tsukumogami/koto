@@ -530,6 +530,7 @@ mod tests {
             "my-wf".to_string(),
             CachedSession {
                 header: StateFileHeader {
+                    command_environment: None,
                     schema_version: 1,
                     workflow: "my-wf".to_string(),
                     template_hash: "abc".to_string(),
@@ -812,6 +813,7 @@ mod tests {
             "my-workflow".to_string(),
             CachedSession {
                 header: StateFileHeader {
+                    command_environment: None,
                     schema_version: 1,
                     workflow: "my-workflow".to_string(),
                     template_hash: "abc".to_string(),
@@ -1096,6 +1098,7 @@ mod tests {
         use std::time::SystemTime;
         crate::cli::dashboard_data::CachedSession {
             header: StateFileHeader {
+                command_environment: None,
                 schema_version: 1,
                 workflow: "wf".to_string(),
                 template_hash: "abc".to_string(),

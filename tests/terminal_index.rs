@@ -37,6 +37,7 @@ const COORD: &str = "team-lead";
 
 fn make_unassigned_child_header(workflow: &str) -> StateFileHeader {
     StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: workflow.to_string(),
         template_hash: "deadbeef".into(),

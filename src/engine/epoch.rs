@@ -136,6 +136,7 @@ mod tests {
 
     fn make_child_header(epoch: u32) -> StateFileHeader {
         StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "child-a".into(),
             template_hash: "deadbeef".into(),

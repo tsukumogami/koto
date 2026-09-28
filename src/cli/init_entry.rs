@@ -482,6 +482,7 @@ pub(crate) struct InitArgs<'a> {
     pub vars: &'a [String],
     pub intent: Option<&'a str>,
     pub execution_dir: Option<&'a Path>,
+    pub legacy_environment: bool,
 }
 
 /// Run `koto init` with `--vars-file` or any entry flag.
@@ -656,6 +657,7 @@ fn create(
         cache,
         None,
         args.execution_dir,
+        args.legacy_environment,
     ) {
         let r = match err.kind {
             SpawnErrorKind::Collision => {
@@ -702,6 +704,7 @@ fn create(
         "state": state,
         "outcome": if replaced.is_some() { "replaced" } else { "created" },
     });
+    super::add_environment_report(&mut out, args.legacy_environment);
     if let Some((old_state, terminal, result)) = replaced {
         out["replaced_state"] = terminal.unwrap_or(old_state).into();
         out["replaced_result"] = serde_json::to_value(result)?;

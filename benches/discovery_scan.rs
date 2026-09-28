@@ -255,6 +255,7 @@ fn build_workspace(koto_root: &Path, n: usize, seed: u64) -> (usize, usize) {
 /// `#[cfg(test)]` internals.
 fn base_header(id: &str) -> StateFileHeader {
     StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: id.to_string(),
         template_hash: "deadbeef".into(),

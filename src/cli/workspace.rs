@@ -674,6 +674,7 @@ mod tests {
 
     fn header(name: &str) -> StateFileHeader {
         StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: name.to_string(),
             template_hash: "h".to_string(),
@@ -703,6 +704,7 @@ mod tests {
 
     fn leaf_template() -> CompiledTemplate {
         CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "leaf".to_string(),
             version: "1.0".to_string(),

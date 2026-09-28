@@ -1047,6 +1047,7 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let state_path = session_dir.join(state_file_name(id));
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: id.to_string(),
             template_hash: "testhash".to_string(),
@@ -1152,6 +1153,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = test_cloud_backend(tmp.path());
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "wf".to_string(),
             template_hash: "testhash".to_string(),
@@ -1207,6 +1209,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = test_cloud_backend(tmp.path());
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "wf".to_string(),
             template_hash: "testhash".to_string(),
@@ -1265,6 +1268,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = test_cloud_backend(tmp.path());
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "wf".to_string(),
             template_hash: "testhash".to_string(),

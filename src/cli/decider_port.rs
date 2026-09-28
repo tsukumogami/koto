@@ -540,6 +540,7 @@ d
 
     fn header(session_id: &str) -> StateFileHeader {
         StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "wf".to_string(),
             template_hash: "0".repeat(64),

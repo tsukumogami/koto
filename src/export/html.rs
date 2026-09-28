@@ -171,6 +171,7 @@ mod tests {
         );
 
         CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "test-workflow".to_string(),
             version: "1.0".to_string(),
@@ -268,6 +269,7 @@ mod tests {
             },
         );
         let t = CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "injection-test".to_string(),
             version: "1.0".to_string(),

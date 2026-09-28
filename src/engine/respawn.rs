@@ -591,6 +591,7 @@ mod tests {
 
     fn base_header() -> StateFileHeader {
         StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "wf".into(),
             template_hash: "deadbeef".into(),

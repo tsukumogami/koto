@@ -380,6 +380,7 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
     // events back but doesn't require any pre-existing payloads on the
     // parent's log).
     let parent_header = StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: parent.to_string(),
         template_hash: "testhash".to_string(),
@@ -414,6 +415,7 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
     // a Transitioned into the terminal `failed` state.
     let ts = now_iso8601();
     let child_header = StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: child.to_string(),
         template_hash: "testhash".to_string(),

@@ -305,6 +305,14 @@ pub fn handle_start(
     let template_name = template.map(|s| s.to_string());
 
     let header = StateFileHeader {
+        // A child session takes its parent's recorded environment
+        // (DESIGN-koto-fixed-environment.md, R8), or records this
+        // process's when the parent has none yet.
+        command_environment: Some(crate::cli::init_child::resolve_command_environment(
+            backend,
+            Some(validated_parent.as_str()),
+            false,
+        )),
         schema_version: 1,
         workflow: name.to_string(),
         template_hash: String::new(),

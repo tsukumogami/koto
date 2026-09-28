@@ -241,6 +241,35 @@ pub struct SessionStoreIdentity {
     pub base: PathBuf,
 }
 
+/// The environment a session's commands run with
+/// (`StateFileHeader.command_environment`).
+///
+/// Three values are recorded, because they locate the tools and the git
+/// and gh configuration a command uses and hold no secret. Every other
+/// variable is named in `pass` (or declared by the session's template) and
+/// read live on each tick; no value of those is ever recorded. See
+/// `crate::engine::command_env`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandEnvironment {
+    /// `PATH` with empty and relative entries dropped; `None` when unset
+    /// at creation or when no entry survived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// `HOME` at creation; `None` when unset or not absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
+    /// `XDG_CONFIG_HOME` at creation; `None` when unset or not absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xdg_config_home: Option<String>,
+    /// The default live names of the koto release that made the record.
+    #[serde(default)]
+    pub pass: Vec<String>,
+    /// `koto init --legacy-environment`: commands run with the ticking
+    /// process's whole environment, as before this record existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy: bool,
+}
+
 /// Header line written as the first line of a state file.
 ///
 /// Contains metadata about the workflow log. Has no `seq` field -- it is
@@ -364,6 +393,18 @@ pub struct StateFileHeader {
     /// Additive field: omitted when None, defaults to None on old state files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<SessionOrigin>,
+
+    /// The environment this session's commands run with, recorded when
+    /// the session was created (DESIGN-koto-fixed-environment.md).
+    ///
+    /// Written by every `koto init` and copied from the parent by every
+    /// child spawn. `None` on state files written before the field
+    /// existed; such a session adopts a record on its first tick. Nothing
+    /// rewrites a record once written.
+    ///
+    /// Additive field: omitted when None, defaults to None on old state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_environment: Option<CommandEnvironment>,
 
     // ===== Request-store fields (Decision 1) =====
     //
@@ -2138,6 +2179,7 @@ mod tests {
     #[test]
     fn header_parsing_round_trip() {
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "my-workflow".to_string(),
             template_hash: "abc123def456".to_string(),
@@ -2171,6 +2213,7 @@ mod tests {
     #[test]
     fn header_round_trip_with_parent_workflow() {
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "child-wf".to_string(),
             template_hash: "abc123def456".to_string(),
@@ -2216,6 +2259,7 @@ mod tests {
     #[test]
     fn header_round_trip_with_template_source_dir() {
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "wf".to_string(),
             template_hash: "hash".to_string(),
@@ -2254,6 +2298,7 @@ mod tests {
     #[test]
     fn header_none_template_source_dir_not_serialized() {
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "wf".to_string(),
             template_hash: "hash".to_string(),
@@ -2290,6 +2335,7 @@ mod tests {
     #[test]
     fn header_none_parent_workflow_not_serialized() {
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "wf".to_string(),
             template_hash: "hash".to_string(),
@@ -3079,6 +3125,7 @@ mod tests {
     #[test]
     fn header_session_id_round_trip() {
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "wf".to_string(),
             template_hash: "hash".to_string(),
