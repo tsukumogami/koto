@@ -29,8 +29,13 @@
 # `context_added` with writer koto. Its log must hold every event in
 # WRITER_CHECKS, and v0.14.1's `koto context get` of the key must return the
 # koto-written value: an older koto repairs the store from the log, and must
-# not restore the stale assigned value over a later koto write. A write with
-# writer sync needs cloud storage and isn't reachable here.
+# not restore the stale assigned value over a later koto write.
+#
+# Sync writes: a `context_added` with writer sync comes from a sync pull,
+# which needs cloud storage, so the script derives one from koto's write
+# above (writer changed to sync, next seq) and appends it to the wf2 log.
+# v0.14.1 must then run `koto status` and `koto next` on wf2 without error and
+# still return the written value from `koto context get`, not the stale one.
 #
 # To cover a new event kind, make the session emit it (SESSION STEPS below)
 # and add a line to EVENT_CHECKS. The self-test picks the new line up.
@@ -44,6 +49,9 @@
 #                    published-location key at another key (keeping its seq),
 #                    so only the v0.14.1 read can notice: with no later write
 #                    of the key in the log it restores the stale assigned value
+#   drop-sync-write  delete the derived sync line after it is appended
+#   strip-sync-writer
+#                    delete the writer from the derived sync line
 #   strip-field:K    delete payload field K from every check event that
 #                    carries it (one mutation per STRIPPED_FIELDS entry), so
 #                    the events stay but a check-event field goes missing
@@ -134,6 +142,8 @@ mutations() {
   done
   echo drop-transition
   echo hide-koto-write
+  echo drop-sync-write
+  echo strip-sync-writer
   echo template-drift
 }
 
@@ -446,5 +456,64 @@ out="$(floor_koto context get wf2 workflows/publish-location 2>&1)" \
 [ "$out" = "$PUBLISHED_DIR" ] \
   || fail "floor: v$FLOOR_VERSION restored '$out' over koto's later write of the key"
 pass "v$FLOOR_VERSION keeps koto's write over the stale transition value"
+
+# --- a sync write in the log -------------------------------------------------
+
+# A real `context_added` with writer sync comes from a sync pull, which needs
+# cloud storage this script doesn't have. So the line is derived: a copy of
+# koto's write of the transition-assigned key, with only the writer changed to
+# "sync" and the seq set to the next one, written the way the new build writes
+# its log (one compact JSON object per line, fields in the same order).
+source_line="$(jq -c "select(${WRITER_CHECKS[1]#*|})" "$LOG_FILE2" | tail -n 1)"
+[ -n "$source_line" ] || fail "sync: the wf2 log holds no koto write to derive the sync line from"
+next_seq="$(jq -s '[.[] | .seq? // empty] | max + 1' "$LOG_FILE2")"
+SYNC_LINE="$(printf '%s' "$source_line" | jq -c --argjson seq "$next_seq" '.seq = $seq | .payload.writer = "sync"')"
+printf '%s\n' "$SYNC_LINE" >>"$LOG_FILE2"
+case "$MUTATION" in
+  drop-sync-write)
+    echo "MUTATION: deleting the derived sync line"
+    drop_lines '.type? == "context_added" and .payload.writer? == "sync"' "$LOG_FILE2"
+    ;;
+  strip-sync-writer)
+    echo "MUTATION: deleting the writer from the derived sync line"
+    tmp="$LOG_FILE2.mut"
+    : >"$tmp"
+    while IFS= read -r line || [ -n "$line" ]; do
+      if [ "$line" = "$SYNC_LINE" ]; then
+        printf '%s' "$line" | jq -c 'del(.payload.writer)' >>"$tmp"
+        continue
+      fi
+      printf '%s\n' "$line" >>"$tmp"
+    done <"$LOG_FILE2"
+    mv "$tmp" "$LOG_FILE2"
+    ;;
+esac
+# The last event is the sync write of the key, at the seq after the one before
+# it, carrying the same content hash and size as koto's write.
+jq -se --arg key workflows/publish-location --argjson src "$source_line" '
+    [.[] | select(.seq?)] as $ev
+    | ($ev | last) as $s
+    | $s.type == "context_added" and $s.payload.writer == "sync"
+      and $s.payload.key == $key
+      and $s.payload.hash == $src.payload.hash and $s.payload.size == $src.payload.size
+      and $s.seq == ($ev[-2].seq + 1)' "$LOG_FILE2" >/dev/null \
+  || fail "sync: the wf2 log does not end with a sync write of workflows/publish-location"
+pass "events: sync write of the transition-assigned key (seq $next_seq)"
+
+out="$(floor_koto status wf2 2>&1)" || fail "floor: koto status wf2 with a sync write exited non-zero: $out"
+reject_errors "koto status wf2 with a sync write" "$out"
+state="$(printf '%s' "$out" | jq -er '.current_state')" \
+  || fail "floor: koto status wf2 has no current_state: $out"
+[ "$state" = "hold" ] || fail "floor: koto status wf2 says '$state', expected hold"
+out="$(floor_koto next wf2 --no-cleanup 2>&1)" || fail "floor: koto next wf2 with a sync write exited non-zero: $out"
+reject_errors "koto next wf2 with a sync write" "$out"
+printf '%s' "$out" | jq -e '.error == null and .state == "hold"' >/dev/null \
+  || fail "floor: koto next wf2 with a sync write returned: $out"
+pass "v$FLOOR_VERSION koto status and koto next read a log holding a sync write (state hold)"
+out="$(floor_koto context get wf2 workflows/publish-location 2>&1)" \
+  || fail "floor: koto context get after the sync write exited non-zero: $out"
+[ "$out" = "$PUBLISHED_DIR" ] \
+  || fail "floor: v$FLOOR_VERSION restored '$out' over the sync write of the key"
+pass "v$FLOOR_VERSION keeps the sync write over the stale transition value"
 
 pass "all checks passed"

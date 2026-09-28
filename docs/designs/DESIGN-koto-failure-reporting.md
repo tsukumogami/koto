@@ -368,7 +368,10 @@ re-evaluation) drops them. koto writes `access` on every read it logs, so
 "absent means `content`" only covers events from other writers.
 
 `context_added` and `context_removed` gain an optional `writer` (`agent`,
-`transition`, `koto`, `sync`). The three silent writers now append
+`koto`, `sync`). Writer `transition` is never a `writer` value on these
+events: a transition's writes appear as the assignments on its
+`transitioned` event, and `transition` is recorded only in the stored
+`KeyMeta` of a key the transition (or a repair of it) wrote. The three silent writers now append
 `context_added` with `writer: "koto"` or `"sync"`. Reusing `context_added`
 rather than a new type matters for mixed versions: v0.14.1 already treats a
 later `context_added` as superseding a transition assignment when it repairs
@@ -773,7 +776,9 @@ diverge in shape. This feature adds neither field, and it adds no header or
 event field identifying a host or agent session.
 
 **`context_added`** and **`context_removed`** gain `writer` (string: `agent`,
-`transition`, `koto`, `sync`; consumers tolerate unknown values). The contract
+`koto`, `sync`; consumers tolerate unknown values). A transition's writes
+don't appear here: they're the assignments on its `transitioned` event, and
+`transition` is a writer only in stored key metadata. The contract
 stops saying `context_added` comes only from `koto context add`.
 
 **Reading attempts from the log.** One attempt is the check events sharing
