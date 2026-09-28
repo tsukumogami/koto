@@ -7945,6 +7945,8 @@ fn children_complete_gate_pending_children_fails() {
     assert_eq!(conditions[0]["type"], "children-complete");
     assert_eq!(conditions[0]["status"], "failed");
     assert_eq!(conditions[0]["category"], "temporal");
+    // A temporal condition is waiting, not failing a check: no findings.
+    assert!(conditions[0].get("failure").is_none(), "{json}");
     assert_eq!(conditions[0]["output"]["total"], 1);
     assert_eq!(conditions[0]["output"]["completed"], 0);
     assert_eq!(conditions[0]["output"]["pending"], 1);

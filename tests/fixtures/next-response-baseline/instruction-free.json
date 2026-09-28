@@ -141,14 +141,14 @@
             "next",
             "wf"
           ],
-          "stdout": "{\"action\":\"gate_blocked\",\"advanced\":false,\"blocking_conditions\":[{\"agent_actionable\":true,\"category\":\"corrective\",\"name\":\"approval\",\"output\":{\"error\":\"\",\"exists\":false},\"status\":\"failed\",\"type\":\"context-exists\"}],\"directive\":\"Wait for the approval note.\",\"error\":null,\"expects\":null,\"state\":\"guarded\",\"unassigned_children\":[]}\n"
+          "stdout": "{\"action\":\"gate_blocked\",\"advanced\":false,\"blocking_conditions\":[{\"agent_actionable\":true,\"category\":\"corrective\",\"failure\":{\"findings\":[{\"effect_landed\":false,\"level\":\"error\",\"message\":\"context key 'approval_note' is not set\",\"message_source\":\"koto\",\"rule_id\":\"approval\"}],\"findings_truncated\":false},\"name\":\"approval\",\"output\":{\"error\":\"\",\"exists\":false},\"status\":\"failed\",\"type\":\"context-exists\"}],\"directive\":\"Wait for the approval note.\",\"error\":null,\"expects\":null,\"state\":\"guarded\",\"unassigned_children\":[]}\n"
         },
         {
           "argv": [
             "next",
             "wf"
           ],
-          "stdout": "{\"action\":\"gate_blocked\",\"advanced\":false,\"blocking_conditions\":[{\"agent_actionable\":true,\"category\":\"corrective\",\"name\":\"approval\",\"output\":{\"error\":\"\",\"exists\":false},\"status\":\"failed\",\"type\":\"context-exists\"}],\"directive\":\"Wait for the approval note.\",\"error\":null,\"expects\":null,\"state\":\"guarded\",\"unassigned_children\":[]}\n"
+          "stdout": "{\"action\":\"gate_blocked\",\"advanced\":false,\"blocking_conditions\":[{\"agent_actionable\":true,\"category\":\"corrective\",\"failure\":{\"findings\":[{\"effect_landed\":false,\"level\":\"error\",\"message\":\"context key 'approval_note' is not set\",\"message_source\":\"koto\",\"rule_id\":\"approval\"}],\"findings_truncated\":false},\"name\":\"approval\",\"output\":{\"error\":\"\",\"exists\":false},\"status\":\"failed\",\"type\":\"context-exists\"}],\"directive\":\"Wait for the approval note.\",\"error\":null,\"expects\":null,\"state\":\"guarded\",\"unassigned_children\":[]}\n"
         },
         {
           "argv": [
@@ -156,7 +156,7 @@
             "wf",
             "--full"
           ],
-          "stdout": "{\"action\":\"gate_blocked\",\"advanced\":false,\"blocking_conditions\":[{\"agent_actionable\":true,\"category\":\"corrective\",\"name\":\"approval\",\"output\":{\"error\":\"\",\"exists\":false},\"status\":\"failed\",\"type\":\"context-exists\"}],\"directive\":\"Wait for the approval note.\",\"error\":null,\"expects\":null,\"state\":\"guarded\",\"unassigned_children\":[]}\n"
+          "stdout": "{\"action\":\"gate_blocked\",\"advanced\":false,\"blocking_conditions\":[{\"agent_actionable\":true,\"category\":\"corrective\",\"failure\":{\"findings\":[{\"effect_landed\":false,\"level\":\"error\",\"message\":\"context key 'approval_note' is not set\",\"message_source\":\"koto\",\"rule_id\":\"approval\"}],\"findings_truncated\":false},\"name\":\"approval\",\"output\":{\"error\":\"\",\"exists\":false},\"status\":\"failed\",\"type\":\"context-exists\"}],\"directive\":\"Wait for the approval note.\",\"error\":null,\"expects\":null,\"state\":\"guarded\",\"unassigned_children\":[]}\n"
         }
       ]
     },

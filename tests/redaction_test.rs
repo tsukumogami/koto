@@ -297,9 +297,8 @@ fn credentials_echoed_by_a_default_action_are_redacted_in_the_response_and_the_l
     }
 }
 
-/// A failing gate's evidence doesn't carry its streams yet, so this checks
-/// absence only. That the gate's captured output holds markers is checked
-/// in `gate::tests::a_failing_command_gate_captures_its_streams_redacted`.
+/// A failing gate's evidence doesn't carry its streams; its `failure` does,
+/// and holds a marker at each site.
 #[test]
 fn credentials_echoed_by_a_failing_command_gate_never_reach_the_response_or_the_log() {
     let mut env = Env::new();
@@ -310,6 +309,19 @@ fn credentials_echoed_by_a_failing_command_gate_never_reach_the_response_or_the_
 
     let (out, resp) = env.next();
     assert_eq!(resp["action"], "gate_blocked", "{resp}");
+    let captured = &resp["blocking_conditions"][0]["failure"]["captured"];
+    for name in &names {
+        let marker = format!("[REDACTED:{name}]");
+        for (stream, prefix) in [("stdout", "out"), ("stderr", "err")] {
+            assert!(
+                captured[stream]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("no captured {stream}: {resp}"))
+                    .contains(&format!("{prefix} {marker}")),
+                "{resp}"
+            );
+        }
+    }
     assert_absent(&String::from_utf8_lossy(&out.stdout), &values, "response");
     assert_absent(&String::from_utf8_lossy(&out.stderr), &values, "stderr");
     assert_absent(&env.raw_log(), &values, "session log");

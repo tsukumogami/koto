@@ -981,6 +981,7 @@ fn polling_interrupted() -> crate::action::CommandOutput {
         stdout_truncated: false,
         stderr_truncated: false,
         truncated: false,
+        stderr_ends_with_note: true,
     }
 }
 
@@ -1184,6 +1185,7 @@ where
                 failure_kind: output
                     .failure_kind
                     .or(Some(crate::action::FailureKind::TimedOut)),
+                stderr_ends_with_note: true,
                 ..output
             };
         }
@@ -3716,7 +3718,7 @@ fn handle_next(
         IntegrationUnavailableMarker, NextError, NextErrorCode, NextResponse, RECOVERY_POINTER,
     };
     use crate::engine::advance::{
-        advance_until_stop_with_decider, merge_epoch_evidence, ActionResult, AdvanceError,
+        advance_until_stop_recording, merge_epoch_evidence, ActionResult, AdvanceError,
         IntegrationError, StopReason,
     };
     use crate::engine::evidence::validate_evidence;
@@ -5181,6 +5183,18 @@ fn handle_next(
     let epoch_events = derive_evidence(&current_events);
     let evidence = merge_epoch_evidence(&epoch_events.into_iter().cloned().collect::<Vec<_>>());
 
+    // Whether this invocation recorded evidence for the state it starts in:
+    // an `evidence_submitted` for that state that the first read didn't hold.
+    // It is what makes a finding's `effect_landed` true on this state.
+    let pre_evidence_seq = events.last().map(|e| e.seq).unwrap_or(0);
+    let evidence_recorded = current_events.iter().any(|e| {
+        e.seq > pre_evidence_seq
+            && matches!(
+                &e.payload,
+                EventPayload::EvidenceSubmitted { state, .. } if state.as_str() == current_state
+            )
+    });
+
     // Repair any transition `context_assignments` an earlier tick recorded
     // but did not get into the store, before a context gate reads it
     // (koto#204). Non-fatal: the log still holds the value and the next read
@@ -5325,6 +5339,18 @@ fn handle_next(
             match resolve_action_working_dir(&execution_dir, &substituted) {
                 Ok(dir) => dir,
                 Err(message) => {
+                    // Nothing ran, so koto's refusal is the whole of stderr.
+                    let check = crate::findings::CheckOutput {
+                        findings: Vec::new(),
+                        captured: crate::findings::Captured {
+                            stderr: crate::redact::redact_str(
+                                &message,
+                                tick_gates.command_env.redactor(),
+                            ),
+                            ..Default::default()
+                        },
+                        stderr_ends_with_note: true,
+                    };
                     return ActionResult::Failed {
                         command,
                         failure_kind: crate::action::FailureKind::SpawnFailed,
@@ -5332,6 +5358,7 @@ fn handle_next(
                         stdout: String::new(),
                         stderr: message,
                         truncated: false,
+                        check,
                     };
                 }
             }
@@ -5434,6 +5461,10 @@ fn handle_next(
         };
         let _ = backend.append_event(&name, &event_payload, &now_iso8601());
 
+        // The findings and streams the `failure` object carries: the runner's
+        // capture itself, without the truncation note added above.
+        let check = crate::gate::check_output(&output, tick_gates.command_env.redactor());
+
         // Failure is classified before the confirmation branch. Confirmation
         // used to fire on success and failure alike, producing a confirm stop
         // that carried no indication anything had gone wrong; a failing action
@@ -5448,6 +5479,7 @@ fn handle_next(
                 stdout,
                 stderr,
                 truncated: output.truncated,
+                check,
             };
         }
 
@@ -5458,6 +5490,7 @@ fn handle_next(
                 stdout,
                 stderr,
                 truncated: output.truncated,
+                check,
             }
         } else {
             ActionResult::Executed {
@@ -5466,6 +5499,7 @@ fn handle_next(
                 stdout,
                 stderr,
                 truncated: output.truncated,
+                check,
             }
         }
     };
@@ -5495,7 +5529,7 @@ fn handle_next(
             None
         };
 
-    let result = advance_until_stop_with_decider(
+    let result = advance_until_stop_recording(
         current_state,
         &compiled,
         &evidence,
@@ -5509,6 +5543,7 @@ fn handle_next(
         decider_port
             .as_mut()
             .map(|p| p as &mut dyn crate::engine::decider::DeciderPort),
+        evidence_recorded,
     );
     drop(decider_port);
 
@@ -7027,6 +7062,7 @@ fn evaluate_children_complete(
                           remedy: give the variable a default, or omit name_filter \
                           entirely if the gate really should watch every child",
             }),
+            ..Default::default()
         };
     }
 
@@ -7059,7 +7095,11 @@ fn evaluate_children_complete(
         GateOutcome::Failed
     };
 
-    StructuredGateResult { outcome, output }
+    StructuredGateResult {
+        outcome,
+        output,
+        ..Default::default()
+    }
 }
 
 /// Augment each row of `koto workflows --children <parent>` with

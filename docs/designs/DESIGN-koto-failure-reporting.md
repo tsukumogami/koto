@@ -542,7 +542,12 @@ template field. A consumer that ignores the new fields sees today's koto.
   environment and stores it on `CommandEnv`; `for_tick` takes the resolved
   config keys from its caller.
 - **`src/findings.rs` (new).** `Finding`, `parse_findings(&RedactedText,
-  stdout_truncated)`, `fallback_finding(...)`, and the 100/50 caps.
+  stdout_truncated, &Redactor)` (the redactor is needed for the second pass
+  over decoded strings), `fallback_finding(...)`, and the 100/50 caps. A
+  command's output records whether stderr ends with koto's own note (timeout,
+  wait error), because a polling timeout can report a nonzero exit while
+  stderr ends with that note, and the fallback's `message_source` depends on
+  it.
 - **`src/gate.rs`.** `StructuredGateResult` gains `failure:
   Option<GateFailure>` and `context_reads: Vec<ContextReadRecord>`, both
   `#[serde(skip)]` so its serialized form and existing literal constructions
@@ -556,7 +561,10 @@ template field. A consumer that ignores the new fields sees today's koto.
   entry; `effect_landed` filled on every finding the check left unset (true
   when this invocation appended `evidence_submitted` for the state, or the
   state's `default_action` exited 0 and delivered its capture; false
-  otherwise, including a capture failure after exit 0); `rule_counts` computed
+  otherwise, including a capture failure after exit 0; submitted evidence
+  belongs to the state it was submitted for, so it counts only before the
+  tick's first transition, and the CLI passes whether it recorded evidence
+  into the advance loop); `rule_counts` computed
   once per attempt; the `default_action_executed` append, moved here from the
   CLI; new fields written on `gate_evaluated`; gate reads appended before it
   through a best-effort append; `action_condition` fills `failure` for

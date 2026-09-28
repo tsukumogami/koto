@@ -8,6 +8,7 @@ pub mod decider;
 pub mod discover;
 pub mod engine;
 pub mod export;
+pub mod findings;
 #[cfg(unix)]
 pub mod gate;
 pub mod redact;

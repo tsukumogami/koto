@@ -241,6 +241,9 @@ pub struct CommandOutput {
     pub stderr_truncated: bool,
     /// `stdout_truncated || stderr_truncated`.
     pub truncated: bool,
+    /// True when stderr's last line is a note koto wrote (a timeout, spawn,
+    /// wait or polling note) rather than something the command printed.
+    pub stderr_ends_with_note: bool,
 }
 
 /// What one reader thread produced: the retained bytes and how many the
@@ -373,6 +376,7 @@ pub fn run_shell_command(
                 stdout_truncated: false,
                 stderr_truncated: false,
                 truncated: false,
+                stderr_ends_with_note: true,
             };
         }
     };
@@ -424,6 +428,7 @@ pub fn run_shell_command(
                 stdout_truncated,
                 stderr_truncated,
                 truncated,
+                stderr_ends_with_note: false,
             }
         }
         Ok(None) => CommandOutput {
@@ -434,6 +439,7 @@ pub fn run_shell_command(
             stdout_truncated,
             stderr_truncated,
             truncated,
+            stderr_ends_with_note: true,
         },
         Err(_) => CommandOutput {
             exit_code: -1,
@@ -443,6 +449,7 @@ pub fn run_shell_command(
             stdout_truncated,
             stderr_truncated,
             truncated,
+            stderr_ends_with_note: true,
         },
     }
 }

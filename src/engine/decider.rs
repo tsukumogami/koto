@@ -1012,6 +1012,7 @@ mod tests {
                                 GateOutcome::Passed
                             },
                             output: serde_json::json!({"exit_code": if gates_fail { 1 } else { 0 }, "error": ""}),
+                            ..Default::default()
                         },
                     )
                 })

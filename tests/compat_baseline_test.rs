@@ -395,23 +395,6 @@ fn failing_responses_differ_from_baseline_only_by_added_keys() {
     }
 }
 
-/// Today there is nothing to strip, which is what makes the check above
-/// meaningful: the fixture is today's response, not a subset of it. The
-/// first change that adds an optional field to one of these responses is
-/// expected to retire this test; the added-keys test above stays.
-#[test]
-fn failing_responses_equal_baseline_unfiltered() {
-    let fixture = load_response_fixture();
-    for case in CASES {
-        assert_eq!(
-            &capture_case(case),
-            fixture_case(&fixture, case.label),
-            "{}: the unfiltered response differs from {RESPONSE_FIXTURE}",
-            case.label
-        );
-    }
-}
-
 /// Guards against a regeneration that stops recording what the file claims.
 #[test]
 fn failing_response_fixture_covers_each_failure_kind() {

@@ -10,6 +10,7 @@ use crate::engine::decider::{consult_at_stop, DeciderPort, StopContext, StopOutc
 use crate::engine::persistence::derive_overrides;
 use crate::engine::substitute::{GateCaptureRefusal, VariableOverlay};
 use crate::engine::types::{now_iso8601, Event, EventPayload};
+use crate::findings::{build_failure, fill_effect_landed, CheckOutput, GateFailure};
 use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::template::types::{
     is_is_set_matcher, is_present_matcher, ActionDecl, CompiledTemplate, TemplateState,
@@ -68,6 +69,8 @@ pub enum ActionResult {
         stdout: String,
         stderr: String,
         truncated: bool,
+        /// The findings the command printed and its captured streams.
+        check: CheckOutput,
     },
     /// Action was skipped (override evidence existed).
     Skipped,
@@ -78,6 +81,8 @@ pub enum ActionResult {
         stdout: String,
         stderr: String,
         truncated: bool,
+        /// The findings the command printed and its captured streams.
+        check: CheckOutput,
     },
     /// The action did not run, because a `{{KEY}}` in it names a capture no
     /// state has delivered on this run.
@@ -120,6 +125,9 @@ pub enum ActionResult {
         stdout: String,
         stderr: String,
         truncated: bool,
+        /// The findings the command printed and its captured streams, for
+        /// the condition's `failure`.
+        check: CheckOutput,
     },
 }
 
@@ -131,6 +139,7 @@ pub enum ActionResult {
 /// non-zero exit: for a spawn failure, a timeout, or a wait error the runner
 /// never obtained a status, and reporting the synthetic `-1` would be the
 /// conflation `failure_kind` exists to end.
+#[allow(clippy::too_many_arguments)]
 fn action_failure_conditions(
     state: &str,
     command: &str,
@@ -139,6 +148,7 @@ fn action_failure_conditions(
     stdout: &str,
     stderr: &str,
     truncated: bool,
+    check: CheckOutput,
 ) -> BTreeMap<String, StructuredGateResult> {
     // The outcome only sets the condition's `status` string. `failure_kind`
     // in the payload is the discriminator agents route on; this keeps the
@@ -158,6 +168,11 @@ fn action_failure_conditions(
         stderr,
         truncated,
         None,
+        build_failure(
+            ACTION_CONDITION_NAME,
+            Some(check),
+            &crate::gate::command_outcome_sentence(failure_kind, exit_code),
+        ),
     )
 }
 
@@ -177,7 +192,12 @@ fn capture_failure_conditions(
     stderr: &str,
     truncated: bool,
     error: &CaptureError,
+    check: CheckOutput,
 ) -> BTreeMap<String, StructuredGateResult> {
+    let sentence = format!(
+        "command exited 0 but its output could not be delivered as {}",
+        error.key()
+    );
     action_condition(
         state,
         command,
@@ -188,6 +208,7 @@ fn capture_failure_conditions(
         stderr,
         truncated,
         Some(error.to_json()),
+        build_failure(ACTION_CONDITION_NAME, Some(check), &sentence),
     )
 }
 
@@ -204,6 +225,7 @@ fn action_condition(
     stderr: &str,
     truncated: bool,
     capture_error: Option<serde_json::Value>,
+    mut failure: GateFailure,
 ) -> BTreeMap<String, StructuredGateResult> {
     let mut output = serde_json::Map::new();
     output.insert("state".to_string(), serde_json::json!(state));
@@ -219,12 +241,19 @@ fn action_condition(
         output.insert("capture_error".to_string(), error);
     }
 
+    // A failed action landed nothing: its command failed, or its output
+    // could not be delivered. Evidence can't have landed either, since
+    // evidence on the state skips the action.
+    fill_effect_landed(failure.findings.iter_mut(), false);
+
     let mut map = BTreeMap::new();
     map.insert(
         ACTION_CONDITION_NAME.to_string(),
         StructuredGateResult {
             outcome,
             output: serde_json::Value::Object(output),
+            failure: Some(failure),
+            findings: Vec::new(),
         },
     );
     map
@@ -270,6 +299,16 @@ pub enum CaptureError {
 }
 
 impl CaptureError {
+    /// The capture name the failure is about.
+    fn key(&self) -> &str {
+        match self {
+            CaptureError::Empty { key }
+            | CaptureError::Redacted { key, .. }
+            | CaptureError::TooLarge { key, .. }
+            | CaptureError::DisallowedCharacter { key, .. } => key,
+        }
+    }
+
     /// The `capture_error` object carried in the `__action__` payload. `case`
     /// is the discriminator; the remaining fields are what an author needs to
     /// find the offending output.
@@ -372,6 +411,7 @@ fn deliver_capture<F>(
     stdout: &str,
     stderr: &str,
     truncated: bool,
+    check: CheckOutput,
     overlay: &VariableOverlay,
     append_event: &mut F,
 ) -> Result<Option<BTreeMap<String, StructuredGateResult>>, AdvanceError>
@@ -392,7 +432,7 @@ where
             Ok(None)
         }
         Err(error) => Ok(Some(capture_failure_conditions(
-            state, command, stdout, stderr, truncated, &error,
+            state, command, stdout, stderr, truncated, &error, check,
         ))),
     }
 }
@@ -621,7 +661,55 @@ pub fn advance_until_stop_with_decider<F, G, I, A>(
     execute_action: &A,
     overlay: &VariableOverlay,
     shutdown: &AtomicBool,
+    decider: Option<&mut dyn DeciderPort>,
+) -> Result<AdvanceResult, AdvanceError>
+where
+    F: FnMut(&EventPayload) -> Result<(), String>,
+    G: Fn(
+        &BTreeMap<String, crate::template::types::Gate>,
+    ) -> Result<BTreeMap<String, StructuredGateResult>, GateCaptureRefusal>,
+    I: Fn(&str) -> Result<serde_json::Value, IntegrationError>,
+    A: Fn(&str, &ActionDecl, bool) -> ActionResult,
+{
+    advance_until_stop_recording(
+        current_state,
+        template,
+        evidence,
+        all_events,
+        append_event,
+        evaluate_gates,
+        invoke_integration,
+        execute_action,
+        overlay,
+        shutdown,
+        decider,
+        false,
+    )
+}
+
+/// [`advance_until_stop_with_decider`], told whether this invocation
+/// recorded evidence for `current_state` before the loop started.
+///
+/// That is one of the two things that make a finding's `effect_landed`
+/// true (DESIGN-koto-failure-reporting.md, Components): the change this
+/// invocation attempted was recorded. The other, a `default_action` that
+/// exited 0 and delivered its capture, the loop sees for itself. Every
+/// finding a check left without its own `effect_landed` gets the answer
+/// before it leaves the loop.
+#[allow(clippy::too_many_arguments)]
+pub fn advance_until_stop_recording<F, G, I, A>(
+    current_state: &str,
+    template: &CompiledTemplate,
+    evidence: &BTreeMap<String, serde_json::Value>,
+    all_events: &[Event],
+    append_event: &mut F,
+    evaluate_gates: &G,
+    invoke_integration: &I,
+    execute_action: &A,
+    overlay: &VariableOverlay,
+    shutdown: &AtomicBool,
     mut decider: Option<&mut dyn DeciderPort>,
+    evidence_recorded: bool,
 ) -> Result<AdvanceResult, AdvanceError>
 where
     F: FnMut(&EventPayload) -> Result<(), String>,
@@ -731,6 +819,13 @@ where
             }
         }
 
+        // Whether the change attempted on this entry to the state was
+        // recorded: evidence this invocation submitted for the starting state
+        // (before any transition), or a `default_action` that exited 0 and
+        // delivered its capture (set below). Fills `effect_landed` on the
+        // findings of this state's checks.
+        let mut effect_landed = evidence_recorded && !advanced;
+
         // 5. Action execution (if state has default_action)
         if let Some(action) = &template_state.default_action {
             let has_evidence = !current_evidence.is_empty();
@@ -741,6 +836,7 @@ where
                     stdout,
                     stderr,
                     truncated,
+                    check,
                     ..
                 } => {
                     // Deliver the capture, if the state declared a name, and
@@ -752,6 +848,7 @@ where
                         &stdout,
                         &stderr,
                         truncated,
+                        check,
                         overlay,
                         append_event,
                     )? {
@@ -761,6 +858,7 @@ where
                             stop_reason: StopReason::GateBlocked(conditions),
                         });
                     }
+                    effect_landed = true;
                 }
                 ActionResult::Skipped => {
                     // Continue to gate evaluation
@@ -819,6 +917,7 @@ where
                     stdout,
                     stderr,
                     truncated,
+                    check,
                 } => {
                     // Stop at the state that ran the command, and do NOT
                     // evaluate this state's gates: a state's gates judge the
@@ -846,6 +945,7 @@ where
                         &stdout,
                         &stderr,
                         truncated,
+                        check,
                     );
                     return Ok(AdvanceResult {
                         final_state: state,
@@ -859,6 +959,7 @@ where
                     stdout,
                     stderr,
                     truncated,
+                    check,
                 } => {
                     // The command ran and exited zero, so its capture is
                     // delivered here too. Confirming re-enters the state with
@@ -872,6 +973,7 @@ where
                         &stdout,
                         &stderr,
                         truncated,
+                        check,
                         overlay,
                         append_event,
                     )? {
@@ -951,6 +1053,7 @@ where
                         StructuredGateResult {
                             outcome: GateOutcome::Passed,
                             output: override_applied.clone(),
+                            ..Default::default()
                         },
                     );
                     // No GateEvaluated event is emitted for overridden gates.
@@ -969,7 +1072,7 @@ where
                 // any `GateEvaluated` event is appended: nothing ran, so there
                 // is no gate result to report and nothing for a `when` clause
                 // to route on (Issue #225).
-                let evaluated = match evaluate_gates(&gates_to_evaluate) {
+                let mut evaluated = match evaluate_gates(&gates_to_evaluate) {
                     Ok(results) => results,
                     Err(refusal) => {
                         return Ok(AdvanceResult {
@@ -985,6 +1088,14 @@ where
                         });
                     }
                 };
+                for result in evaluated.values_mut() {
+                    let findings = result
+                        .failure
+                        .iter_mut()
+                        .flat_map(|f| f.findings.iter_mut())
+                        .chain(result.findings.iter_mut());
+                    fill_effect_landed(findings, effect_landed);
+                }
                 for (gate_name, result) in &evaluated {
                     gate_evidence_map.insert(gate_name.clone(), result.output.clone());
                     let outcome_str = match result.outcome {
@@ -2621,6 +2732,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -2806,6 +2918,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -2950,6 +3063,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Passed,
                         output: serde_json::json!({"exit_code": 0, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -3080,6 +3194,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -3194,6 +3309,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Passed,
                         output: serde_json::json!({"exit_code": 0, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -3300,6 +3416,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Passed,
                         output: serde_json::json!({"exit_code": 0, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -3334,6 +3451,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -3371,6 +3489,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::TimedOut,
                         output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+                        ..Default::default()
                     },
                 );
             }
@@ -3405,6 +3524,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Error,
                         output: serde_json::json!({"exit_code": -1, "error": "spawn failed"}),
+                        ..Default::default()
                     },
                 );
             }
@@ -3979,6 +4099,7 @@ mod tests {
             stdout: stdout.to_string(),
             stderr: String::new(),
             truncated: false,
+            check: Default::default(),
         }
     }
 
@@ -4150,6 +4271,7 @@ mod tests {
                 stdout: "hello".to_string(),
                 stderr: String::new(),
                 truncated: false,
+                check: Default::default(),
             }
         };
 
@@ -4254,6 +4376,7 @@ mod tests {
                 stdout: "PR #42 created".to_string(),
                 stderr: String::new(),
                 truncated: false,
+                check: Default::default(),
             }
         };
 
@@ -4302,6 +4425,7 @@ mod tests {
             stdout: "partial".to_string(),
             stderr: "boom".to_string(),
             truncated: false,
+            check: Default::default(),
         }
     }
 
@@ -4366,6 +4490,7 @@ mod tests {
                 StructuredGateResult {
                     outcome: GateOutcome::Passed,
                     output: serde_json::json!({"exit_code": 0}),
+                    ..Default::default()
                 },
             );
             Ok(out)
@@ -4651,6 +4776,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -4728,6 +4854,7 @@ mod tests {
                 stdout: "ok".to_string(),
                 stderr: String::new(),
                 truncated: false,
+                check: Default::default(),
             }
         };
 
@@ -5050,6 +5177,7 @@ mod tests {
                         StructuredGateResult {
                             outcome: GateOutcome::Failed,
                             output: serde_json::json!({"exit_code": 1, "error": ""}),
+                            ..Default::default()
                         },
                     );
                 }
@@ -5127,6 +5255,7 @@ mod tests {
                 GateOutcome::Failed
             },
             output: serde_json::json!({"exit_code": exit_code, "error": ""}),
+            ..Default::default()
         }
     }
 
@@ -5331,6 +5460,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -5541,6 +5671,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -5655,6 +5786,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -5775,6 +5907,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Error,
                         output: serde_json::json!({"exit_code": -1, "error": "unsupported gate type"}),
+                        ..Default::default()
                     },
                 );
             }
@@ -5879,6 +6012,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Passed,
                         output: serde_json::json!({"passed": true, "exit_code": 0}),
+                        ..Default::default()
                     },
                 );
             }
@@ -5973,6 +6107,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Passed,
                         output: serde_json::json!({"passed": true, "exit_code": 0}),
+                        ..Default::default()
                     },
                 );
             }

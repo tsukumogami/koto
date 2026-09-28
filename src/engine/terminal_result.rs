@@ -163,7 +163,8 @@ pub fn failure_reason_for_current_run(
 /// Fold a `failure_reason` onto one line and bound it: every run of
 /// whitespace, line breaks included, becomes one space, and text longer than
 /// [`FAILURE_REASON_MAX_CHARS`] is cut to that many characters, the last
-/// three replaced by `...`. Empty or all-whitespace text is `None`.
+/// three replaced by `...`, never inside a redaction marker (one that would
+/// straddle the cut is dropped whole). Empty or all-whitespace text is `None`.
 pub fn one_line_reason(raw: &str) -> Option<String> {
     let folded = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     if folded.is_empty() {
@@ -172,7 +173,15 @@ pub fn one_line_reason(raw: &str) -> Option<String> {
     if folded.chars().count() <= FAILURE_REASON_MAX_CHARS {
         return Some(folded);
     }
-    let mut cut: String = folded.chars().take(FAILURE_REASON_MAX_CHARS - 3).collect();
+    // The cut goes through the marker-safe helper, so a redaction marker
+    // straddling the bound is dropped whole rather than split.
+    let at = folded
+        .char_indices()
+        .nth(FAILURE_REASON_MAX_CHARS - 3)
+        .map(|(byte, _)| byte)
+        .unwrap_or(folded.len());
+    let end = crate::redact::safe_cut_len(folded.as_bytes(), at);
+    let mut cut = folded[..end].to_string();
     cut.push_str("...");
     Some(cut)
 }
