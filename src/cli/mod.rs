@@ -4483,7 +4483,7 @@ fn handle_next(
                             &command_env.failures(),
                         )
                     })
-                    .map(|note| format!(" {}", note.trim_end()))
+                    .map(|note| format!(". {}", note.trim_end()))
                     .unwrap_or_default();
                 let err = NextError {
                     code: NextErrorCode::GateBlocked,
