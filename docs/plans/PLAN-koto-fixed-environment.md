@@ -76,6 +76,12 @@ Commands still run as today.
   first.
 - The record survives `koto session rebind`, a rename, `koto session recover`
   and a claim write byte-identical (tested).
+- Credential-shaped log test: with `GH_TOKEN`, `GITHUB_TOKEN` and variables
+  named `*_TOKEN`, `*_SECRET`, `*_KEY`, `*_PASSWORD` set to unique markers at
+  `koto init` (each creation form), no file under the session directory
+  contains a marker, and the header's record carries values only under
+  `path`, `home` and `xdg_config_home`. The test names variables and never
+  prints an environment.
 - `cargo test` for the touched modules and `cargo clippy --all-targets -- -D
   warnings` pass.
 
