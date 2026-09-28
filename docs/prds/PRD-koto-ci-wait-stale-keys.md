@@ -18,7 +18,8 @@ goals: |
   failure through the command-gate failure payload koto already has. Templates
   that use neither compile and run unchanged, and koto v0.14.1 reads the new
   logs.
-upstream: docs/briefs/BRIEF-koto-ci-wait-stale-keys.md
+absorbed:
+  - docs/briefs/BRIEF-koto-ci-wait-stale-keys.md
 ---
 
 # PRD: koto owns the CI wait and stale-key clearing
@@ -26,6 +27,37 @@ upstream: docs/briefs/BRIEF-koto-ci-wait-stale-keys.md
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-koto-ci-wait-stale-keys](docs/briefs/BRIEF-koto-ci-wait-stale-keys.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+The feature was framed around two protocol steps koto-backed workflows leave
+to the agent in directive prose: waiting on a check that settles later than
+the tick that asks about it, CI on a pull request being the common case, and
+clearing the context keys a state's gates read when the workflow comes back
+to that state for a retry. Both are mechanical, and while the agent does them
+from prose the prose can't be deleted, and a skipped or botched step either
+sends the agent to fix a build that was only pending or lets a stale key pass
+a gate on the retry.
+
+The outcome it set is for a template to declare the wait and the keys and for
+koto to do both: a tick says whether the check is done, failed or still
+pending, and a retry into a state starts with that state's keys cleared and
+recorded in the log, with no forge knowledge or credential in koto and no
+change for templates that use neither feature.
+
+Four journeys framed it, carried as the User Stories below: a retry loop that
+starts clean, an agent waiting on CI, a CI repair loop whose wait restarts on
+each fix, and a log reader reconstructing afterwards why a gate passed. The
+boundary it drew held in the per-state clearing declaration and its log
+record, the polling gate with its interval, deadline and failure payload, the
+session-feed contract text with v0.14.1 compatibility, and a map of the
+shirabe prose each feature makes deletable. It pushed out any shirabe change,
+a built-in forge gate, retry caps and escalation, and routing on variable
+values. The three framing questions it left open -- whether a pending gate
+holds the turn, which entries clear, and how a command says "pending" -- are
+settled under Decisions and Trade-offs.
 
 ## Problem Statement
 
