@@ -993,7 +993,7 @@ Records one read of a context key. It never carries the key's content or
 size; a present key's `hash` is what joins the read to the write that
 produced it.
 
-This is the highest-volume event in the feed, one per logged read. A consumer
+This is the highest-volume event this feature adds, one per logged read. A consumer
 that doesn't need context lineage can skip it like any Tier 2 event, and
 nothing else in the feed depends on it.
 

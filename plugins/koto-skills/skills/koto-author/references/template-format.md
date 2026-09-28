@@ -694,6 +694,34 @@ Each gate type produces structured output that the engine injects into the evide
 
 `passed` is not a field name in any gate type. Don't use it in `when` conditions.
 
+### Findings: telling the agent why a check failed
+
+A failed `command`, `context-exists` or `context-matches` gate, and a failed `default_action`, carry a `failure` object on their blocking condition beside `output`. It holds `findings`, `findings_truncated`, and for command gates and actions the `captured` streams. None of it is routable: `when` clauses, `override_default` and recorded overrides see only the fields in the table above.
+
+A check gets one finding for free. When it fails without reporting an `error` finding, koto writes one: `rule_id` is the gate's name (or `__action__`), `level` is `error`, and the message is the last non-blank stderr line, else the last non-blank stdout line that isn't a finding line, else a sentence koto writes (`command exited with status 1`, `context key 'plan.md' is not set`).
+
+A command that knows more prints one finding per line to **stdout**, prefixed with `::koto-finding::` and followed by exactly one JSON object:
+
+```text
+::koto-finding::{"rule_id":"E501","level":"error","message":"line too long (104 > 88)","path":"src/app.py","line":12,"column":89,"rule_ref":"https://docs.example.org/rules/E501"}
+::koto-finding::{"rule_id":"W291","level":"warning","message":"trailing whitespace","path":"src/app.py","line":40}
+```
+
+| Key | Required | Type | Meaning |
+|---|---|---|---|
+| `rule_id` | Yes | non-empty string | What the finding violated. Opaque to koto |
+| `level` | Yes | `"error"`, `"warning"` or `"info"` | Severity. Doesn't change whether the check passes |
+| `message` | Yes | string | The rule's message |
+| `path` | No | string | Where the problem is |
+| `line` | No | integer, 1 or more | Only with `path` |
+| `column` | No | integer, 1 or more | Only with `line` |
+| `rule_ref` | No | string | Pointer to the rule's full text. Agents aren't told to fetch it |
+| `effect_landed` | No | boolean | The check's own claim that the change it judged was recorded; koto fills it in otherwise |
+
+The prefix must start the line and the object must be the only thing after it. A missing required key, a wrong type, an empty `rule_id`, an unknown `level`, or a `line` without `path` (or `column` without `line`) makes the whole line ordinary output. `null` counts as absent and unknown keys are ignored. Standard error is never read for findings, finding lines stay in the captured text, and a check that exits 0 returns no `failure` whatever it printed. The exit status decides pass or fail, not the levels.
+
+Emit these lines from a wrapper -- `jq` over a linter's JSON output, a few lines of Python -- rather than hand-built `echo`, so the JSON is always valid. Caps, ordering past 100 findings, `message_source` and `effect_landed` are in the [`default_action` authoring guide's Reporting findings section](../../../../../docs/guides/default-action-authoring.md#reporting-findings), which applies to gates as well as actions. You own what your checks print: koto redacts only the credentials it knows about, and the agent reads findings as data, not instructions.
+
 ### Routing on gate output (`gates.*` paths)
 
 Reference gate output in `when` conditions using `gates.<gate_name>.<field>`. When at least one `when` clause on a state references a `gates.*` key, the engine injects gate outputs and resolves transitions automatically -- no agent action is needed.
@@ -961,9 +989,9 @@ states:
 
 **What it must not do.** Call `koto next`. A command runs inside a tick, and a tick started from inside one advances the session while the outer tick goes on reporting the state it started with -- the caller gets a wrong answer, not a missing one. koto refuses the nested call with the `nested_invocation` error code, so an author who reaches for it finds out immediately rather than shipping a workflow that lies. The refusal is scoped to the process tree, so it covers a tick on any session, not just this one. Every other `koto` subcommand is fine from a command; `koto context` reads and writes in particular are a supported pattern. This applies to command gates too. One caveat if you write a command that detaches: koto sets the marker in every command's environment, whatever the command starts gets it too, and nothing checks that the tick is still running, so a process that escapes the process-group kill at timeout keeps it and gets refused by a tick that already exited. The message names the way out; not leaving processes behind a command is the better answer.
 
-**Its output.** Every run appends a `default_action_executed` event with the command, exit code, both streams, and a `truncated` flag; each stream is bounded at 64KB. On a successful run with no `capture_stdout_as`, that log entry is where the output ends -- the agent never sees it.
+**Its output.** Every run appends a `default_action_executed` event with the command, exit code, both streams (known credentials already replaced by `[REDACTED:<source>]` markers), and a `truncated` flag; each stream is bounded at 64KB. On a successful run with no `capture_stdout_as`, that log entry is where the output ends -- the agent never sees it.
 
-**When it fails.** The tick stops at the state that ran the command, in an ordinary blocked response (not an error envelope) carrying a condition named `__action__` whose `output` holds the command, `failure_kind`, both streams, and `state`. `exit_code` is present only for `nonzero_exit`. Route on `failure_kind`: `nonzero_exit`, `spawn_failed`, `timed_out`, `wait_failed`, `capture_failed`. The state's `fallback` prose rides the `directive`. It all arrives in the tick that ran the command.
+**When it fails.** The tick stops at the state that ran the command, in an ordinary blocked response (not an error envelope) carrying a condition named `__action__` whose `output` holds the command, `failure_kind`, both streams, and `state`, and whose `failure` object holds the action's findings (see [Findings](#findings-telling-the-agent-why-a-check-failed)). `exit_code` is present only for `nonzero_exit`. Route on `failure_kind`: `nonzero_exit`, `spawn_failed`, `timed_out`, `wait_failed`, `capture_failed`. The state's `fallback` prose rides the `directive`. It all arrives in the tick that ran the command.
 
 `__action__` is a reserved condition name, so `agent_actionable` is always `false` on it and the compiler rejects any state that declares a gate called `__action__`. A caller can therefore tell an action failure from a gate failure by name alone, and never has to wonder which one it's looking at.
 
@@ -1021,7 +1049,9 @@ Rules the compiler applies to each name:
 - A refused name is a compile error: `BASH_ENV`, `ENV`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `GH_CONFIG_DIR`, and any name starting `BASH_FUNC_` or `GIT_CONFIG`. These make the shell, `git` or `gh` run code or load configuration chosen by whoever ticks the session. koto also filters them at run time.
 - A name koto sets itself (`PATH`, `HOME`, `XDG_CONFIG_HOME`, `KOTO_TICK_SESSION`, `KOTO_SESSIONS_BASE`) compiles with warning **W7**, since koto's value wins and the declaration does nothing. Remove it.
 
-Declared values are read live on each tick and never written to the session, so declaring a token's name is safe. A template that declares nothing compiles to the same hash as before the field existed. A command can still set variables for itself (`GIT_DIR=/srv/mirror.git git log -1`).
+Declared values are read live on each tick and never written to the session, so declaring a token's name is safe.
+
+**Every declared value is treated as a credential.** koto can't tell a token from a hostname, so any `pass_env:` value 8 bytes or longer that reaches a command is replaced with `[REDACTED:<NAME>]` in that command's output before the response, the session log or a finding sees it. A `capture_stdout_as` whose output holds one is refused with `capture_error.case: "redacted"`, naming the variable and never the value. So don't declare a variable whose value you need a command to print back or capture; pass it through a template variable instead if it isn't secret. A value under 8 bytes is never matched. A template that declares nothing compiles to the same hash as before the field existed. A command can still set variables for itself (`GIT_DIR=/srv/mirror.git git log -1`).
 
 Author with two more facts in mind. `PATH` is recorded without its empty and relative entries (`.`, `node_modules/.bin`), so a command that relied on one must spell the path, such as `./node_modules/.bin/eslint`. And the record can't change after creation: a tool that moves off the recorded `PATH` fails until the session is replaced, and koto's response says so when it happens. For the full picture, including `koto init --legacy-environment` (this release only) and what the fixed environment does and doesn't protect against, see [What a command's environment is](../../../../../docs/guides/default-action-authoring.md#what-a-commands-environment-is).
 
