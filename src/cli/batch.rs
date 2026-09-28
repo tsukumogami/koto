@@ -3242,6 +3242,24 @@ pub(crate) fn finalize_batch_if_complete(
     }
 }
 
+/// Whether `state`'s template shape can ever qualify for
+/// [`retryable_children_after_batch`]: non-terminal, no
+/// `materialize_children`, an `accepts` block, and at least one transition
+/// guarded on `evidence.retry_failed`. Needs no log, so a caller can skip
+/// reading one for a state that can never offer a retry.
+pub fn state_may_offer_retry(template: &CompiledTemplate, state: &str) -> bool {
+    template.states.get(state).is_some_and(|s| {
+        !s.terminal
+            && s.materialize_children.is_none()
+            && s.accepts.is_some()
+            && s.transitions.iter().any(|t| {
+                t.when
+                    .as_ref()
+                    .is_some_and(|w| w.contains_key("evidence.retry_failed"))
+            })
+    })
+}
+
 /// The children a parent standing in `state` can retry from there, when the
 /// batch that made them retryable was recorded before the parent reached
 /// `state` (koto#277).
@@ -3281,15 +3299,12 @@ pub fn retryable_children_after_batch(
     parent_name: &str,
     child_exists: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
+    if !state_may_offer_retry(template, state) {
+        return Vec::new();
+    }
     let Some(template_state) = template.states.get(state) else {
         return Vec::new();
     };
-    if template_state.terminal
-        || template_state.materialize_children.is_some()
-        || template_state.accepts.is_none()
-    {
-        return Vec::new();
-    }
     let Some(bf) = find_most_recent_batch_finalized(events) else {
         return Vec::new();
     };

@@ -4534,29 +4534,38 @@ fn handle_next(
                 // A directed move into a state that routes a retry offers it
                 // on this response too, as an arrival by advance does
                 // (koto#277). The batch it names was recorded just above.
-                let mut out = serde_json::to_value(&resp)?;
-                if let Some(obj) = out.as_object_mut() {
+                //
+                // The field is appended to the serialized object rather than
+                // spliced through a `serde_json::Value`, which would sort the
+                // keys: a directed response keeps the struct's key order, and
+                // one with nothing to offer stays byte-identical to what it
+                // was (tests/next_response_baseline.rs).
+                // The log is read only for a target that can offer one, so
+                // other directed moves cost no extra read.
+                let mut body = serde_json::to_string(&resp)?;
+                let retryable = if crate::cli::batch::state_may_offer_retry(&compiled, target) {
                     let post_events = backend
                         .read_events(&name)
                         .map(|(_, evts)| evts)
                         .unwrap_or_default();
-                    let retryable = crate::cli::batch::retryable_children_after_batch(
+                    crate::cli::batch::retryable_children_after_batch(
                         &post_events,
                         &compiled,
                         target,
                         &name,
                         &|child| backend.exists(child),
-                    );
-                    if !retryable.is_empty() {
-                        let actions =
-                            crate::cli::retry::synthesize_reserved_actions(&name, &retryable);
-                        obj.insert(
-                            "reserved_actions".to_string(),
-                            serde_json::to_value(&actions)?,
-                        );
-                    }
+                    )
+                } else {
+                    Vec::new()
+                };
+                if !retryable.is_empty() && body.ends_with('}') {
+                    let actions = crate::cli::retry::synthesize_reserved_actions(&name, &retryable);
+                    body.pop();
+                    body.push_str(",\"reserved_actions\":");
+                    body.push_str(&serde_json::to_string(&actions)?);
+                    body.push('}');
                 }
-                println!("{}", serde_json::to_string(&out)?);
+                println!("{}", body);
                 // The delivery record is appended only after printing --
                 // see the natural-advancement path for the crash-
                 // direction rationale. Non-fatal on error: the response

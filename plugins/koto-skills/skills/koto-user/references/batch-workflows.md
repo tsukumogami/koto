@@ -192,7 +192,7 @@ Two kinds of state carry it:
 | `action` | Canonical action name (`retry_failed` in v1). |
 | `label` | Short human-readable label. |
 | `description` | One-line summary. |
-| `applies_to` | Short task names to retry: children whose outcome is `failure`, `skipped`, or `spawn_failed` and that have a session on disk. |
+| `applies_to` | Short task names to retry: children whose outcome is `failure`, `skipped`, or `spawn_failed`. In a state reached after the batch, only those that have a session on disk. |
 | `invocation` | POSIX-safe ready-to-run command string. Copy and run as-is. |
 
 Reserved-action evidence bypasses the state's `accepts` validator — it's not `expects.fields` content. Read `reserved_actions` and submit the `invocation` directly; don't try to cram `retry_failed` into a normal evidence submission alongside other keys.
