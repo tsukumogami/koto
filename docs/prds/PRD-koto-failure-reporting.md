@@ -250,11 +250,14 @@ shape to build against before it starts.
 ### Attempt counts
 
 - **R17.** koto keeps four counts: attempts on a state in the current visit;
-  attempts on a state across the session; and, for each rule id, attempts on a
-  state in the current visit and across the session in which a failed check
-  reported that rule id at level `error`. Findings from a check that passed
-  don't raise a per-rule count. A rule reported more than once in one attempt
-  counts once for that attempt. Per-rule counts are kept per state.
+  attempts on a state across the session; and, for each pair of a check and a
+  rule id, attempts on a state in the current visit and across the session in
+  which that check failed and reported that rule id at level `error`. A check
+  is named by its gate name, or `__action__` for a `default_action`, so the
+  same rule id reported by two different checks is counted separately.
+  Findings from a check that passed don't raise a per-rule count. A rule
+  reported more than once by one check in one attempt counts once for that
+  attempt. Per-rule counts are kept per state.
 - **R18.** Visit counts reset to zero when a new visit to the state starts.
   Nothing else resets them: a self-transition, a passing check, an override,
   and an evidence submission don't. Session counts never reset.
@@ -264,7 +267,8 @@ shape to build against before it starts.
   reader gets counts without replaying koto's rules.
 - **R20.** A `koto next` response that carries a failed check carries the
   same counts for that state: the attempt numbers, and the per-rule visit and
-  session counts for every rule with a non-zero visit count.
+  session counts for every check and rule id pair with a non-zero visit
+  count.
 
 ### Context reads and writers
 
@@ -404,7 +408,9 @@ shape to build against before it starts.
       another state or rewinding restarts it at 1; the session count keeps
       rising in every case.
 - [ ] The same rule id failing in two different states is counted separately
-      per state.
+      per state, and the same rule id reported at `error` by two failing gates
+      of one state on one attempt yields two counts, one per gate, each
+      rising by one.
 - [ ] A polling loop that re-evaluates a failing gate five times before it
       passes adds one attempt.
 - [ ] A state with no checks, and a state whose only gate is overridden,
@@ -486,6 +492,11 @@ templates retry by looping a state onto itself, and resetting there would
 report every retry as a first attempt. The rule matches the one koto already
 uses for re-sending instructions. Session counts that never reset sit beside
 it, so a reader who wants another window can compute one.
+
+**Per-rule counts are keyed by check and rule id.** Two checks can emit the
+same rule id (two linters both reporting `E501`), and a count keyed by rule id
+alone would merge them so that no reader could separate them afterwards. The
+check's name is already on every event, so keying by the pair costs nothing.
 
 **Per-rule counts count errors only.** Warnings don't block, so counting them
 would make "attempts that failed on this rule" disagree with what blocked the

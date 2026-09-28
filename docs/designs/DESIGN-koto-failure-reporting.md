@@ -3,11 +3,27 @@ schema: design/v1
 status: Proposed
 upstream: docs/prds/PRD-koto-failure-reporting.md
 problem: |
-  placeholder
+  A failed koto check tells the agent almost nothing: a failing command gate
+  reaches it as a bare exit code because koto discards the output it already
+  captured, and the session log can't say how many attempts a state or a rule
+  took, what context was read, or who wrote it. A consumer exporting gate
+  events has no field-level contract to read.
 decision: |
-  placeholder
+  Check scripts report findings as `::koto-finding::{json}` lines on stdout;
+  a failed corrective check with none gets one koto-written finding. Captured
+  output is redacted once at the capture point, then returned in a new
+  `failure` object beside each blocking condition's unchanged `output`, with
+  a top-level `attempts` object. `gate_evaluated` and `default_action_executed`
+  gain optional attempt stamps, findings, per-check rule counts, bounded output
+  and a duration; a new `context_read` event and a `writer` field on context
+  writes record lineage. All of it is additive and `schema_version` stays 1.
 rationale: |
-  placeholder
+  Keeping new data out of `output` leaves routing, overrides and existing
+  templates untouched by construction. Putting counts on the existing check
+  events makes attempt records as durable as the gate result, and deriving
+  them from the log leaves nothing to drift. Redacting at the capture point
+  means no later cut or consumer can expose a known credential. Reusing
+  `context_added` for silent writes keeps an older koto correct on a newer log.
 ---
 
 # DESIGN: koto failure reporting
@@ -190,7 +206,9 @@ Each check event of an attempt carries the same attempt stamp, `attempt`
 (session) and `visit_attempt` (visit), so events sharing `state` and `attempt`
 form one attempt. Each event carries its own check's `findings`, and a failed
 check's event carries `rule_counts` for the rules that check reported at
-`error`. A failed command gate's `gate_evaluated` carries the leading 4 KiB of
+`error`. Counts are kept per check and rule id: the check is the event's
+`gate`, or `__action__` for `default_action_executed`, so two gates that both
+report `E501` keep two separate counts. A failed command gate's `gate_evaluated` carries the leading 4 KiB of
 each stream beside its unchanged `output`. The full field tables are in
 Solution Architecture.
 
@@ -203,14 +221,15 @@ entry that will evaluate a check:
 2. `visit_attempt` = 1 + the highest `visit_attempt` on events for this state
    inside `delivery_window` (`src/engine/persistence.rs`,
    `Boundary::ArrivalFromElsewhere`, made `pub(crate)`), or 1.
-3. For each distinct rule id R reported at `error` by a failed check of this
-   attempt: `rule_counts[R].visit` = 1 + the highest stored `visit` for R in
-   the window, and `rule_counts[R].session` = 1 + the highest stored `session`
-   for R across the log.
+3. For each failed check C of this attempt and each distinct rule id R that C
+   reported at `error`: `rule_counts[R].visit` on C's event = 1 + the highest
+   stored `visit` for R on C's events for this state in the window, and
+   `rule_counts[R].session` = 1 + the highest stored `session` for R on C's
+   events for this state across the log.
 
-"One plus the highest stored value" rather than counting events means two gates
-reporting the same rule in one attempt can't inflate a count, and an attempt
-split across a failed append still numbers correctly. The stamp is computed
+"One plus the highest stored value" rather than counting events means a rule
+a check reports several times in one attempt can't inflate a count, and an
+attempt split across a failed append still numbers correctly. The stamp is computed
 before the action runs, passed into the action closure (a new argument), and
 reused on every `gate_evaluated` for that entry. If nothing appends, it's
 discarded.
@@ -267,8 +286,9 @@ emits it now.
 
 The response gains an optional top-level `attempts` object when
 `blocking_conditions` is non-empty: `visit` and `session` for the blocked
-state, and `rules`, keyed by rule id, each `{visit, session}`, for every rule
-with a non-zero visit count, including rules reported on earlier attempts of
+state, and `rules`, keyed first by check (the gate's name, or `__action__`)
+and then by rule id, each `{visit, session}`, for every check and rule pair
+with a non-zero visit count, including pairs reported on earlier attempts of
 this visit. A passing or evidence-only response is byte-identical to today's.
 
 Internally, `StructuredGateResult` (`src/gate.rs`) gains a typed
@@ -290,7 +310,7 @@ correctly, and any future site must remember to; one missed strip leaks
 unbounded output into routing or the log.
 
 **Counts inside each `failure`.** Rejected because counts belong to the state,
-so they'd repeat on every failing condition, and per-rule counts include rules
+so they'd repeat on every failing condition, and per-rule counts include pairs
 no current condition reports.
 
 **A top-level `failures` map keyed by condition name.** Rejected because it
@@ -548,7 +568,7 @@ evidence:
   "attempts": {
     "visit": 3,
     "session": 5,
-    "rules": {"E501": {"visit": 2, "session": 4}}
+    "rules": {"ruff": {"E501": {"visit": 2, "session": 4}}}
   }
 }
 ```
@@ -574,14 +594,16 @@ checks top-level fields.
 | `visit_attempt` | integer >= 1 | The state's attempt number in the current visit, including this attempt. Returns to 1 on the first attempt after arriving from a different state or being rewound; a self-transition doesn't reset it. Present whenever `attempt` is. |
 | `findings` | array of finding objects | The check's findings, passed or failed: at most 50 in emission order, with the koto-written finding last when there is one. Absent when there are none. |
 | `findings_truncated` | boolean | `true` when the check produced more findings than `findings` holds. Absent means `false`. |
-| `rule_counts` | object | On a failed check that reported at least one finding at `error`: keys are those rule ids, each value `{"visit": int, "session": int}`, the attempts on this state in the current visit and in the session in which a failed check reported that rule at `error`, including this one. |
+| `rule_counts` | object | On a failed check that reported at least one finding at `error`: keys are the distinct rule ids this check reported at `error`, taken from every parsed finding rather than only the logged ones; each value is `{"visit": int, "session": int}`, the attempts on this state in the current visit and in the session in which this same check (this event's `gate`) failed and reported that rule at `error`, including this one. A key can name a rule that isn't in `findings` when `findings_truncated` is `true`; that is expected, not corruption. |
+| `duration_ms` | integer >= 0 | For a command gate: the command's wall-clock run time in milliseconds, measured over the same span the timeout covers. Absent for gates that run no command. |
 | `stdout` | string | On a failed command gate: the leading 4 KiB of redacted standard output, cut on a character boundary and never inside a marker. |
 | `stderr` | string | The same for standard error. |
 | `stdout_truncated` | boolean | `true` when `stdout` holds less than the command printed. Absent means `false`. |
 | `stderr_truncated` | boolean | The same for `stderr`. |
 
 **`default_action_executed`** gains `attempt`, `visit_attempt`, `findings`,
-`findings_truncated` and `rule_counts`, with the same meanings. Its existing
+`findings_truncated`, `rule_counts` and `duration_ms`, with the same meanings;
+its check name for `rule_counts` is `__action__`. Its existing
 `stdout`, `stderr` and `truncated` keep their definition (leading 64 KiB per
 stream) and now carry redacted text.
 
@@ -589,7 +611,9 @@ stream) and now carry redacted text.
 `message`, `effect_landed` (always present), and `path`, `line`, `column`,
 `rule_ref` when known. Every string has been redacted.
 
-**`context_read`** (new, tier 2):
+**`context_read`** (new, tier 2). It is the highest-volume event this feature
+adds, one per logged read, and consumers that don't need context lineage may
+skip it like any tier 2 event:
 
 | Field | Type | Required | Meaning |
 |-------|------|----------|---------|
@@ -601,13 +625,24 @@ stream) and now carry redacted text.
 | `access` | string | no | `content` or `presence` (a context-exists gate or `koto context exists`). Absent means `content`. |
 | `gate` | string | no | The gate's name when `reader` is `gate`. |
 
+**Reserved and aligned names.** The contract reserves the field name
+`escalation` on `gate_evaluated` and `default_action_executed` for a later
+feature that acts on attempt counts (a retry cap or an escalation step), so it
+can be added as an optional field without renaming anything here; readers
+ignore it until it's defined. If a check is ever answered by a model rather
+than a command, its event names the model with the same `provider` and `model`
+fields `decider_consulted` already uses, so the two event families don't
+diverge in shape. This feature adds neither field, and it adds no header or
+event field identifying a host or agent session.
+
 **`context_added`** and **`context_removed`** gain `writer` (string: `agent`,
 `transition`, `koto`, `sync`; consumers tolerate unknown values). The contract
 stops saying `context_added` comes only from `koto context add`.
 
 **Reading attempts from the log.** One attempt is the check events sharing
-`(state, attempt)`. Per-rule counts for an attempt are the union of
-`rule_counts` over those events. Events without `attempt` predate the feature
+`(state, attempt)`. Per-rule counts are keyed by `(state, check, rule_id)`,
+where the check is the event's `gate` or `__action__`; an attempt's counts are
+its events' `rule_counts`, each under its own check. Events without `attempt` predate the feature
 and are skipped. If the only event of an attempt that failed at its action is
 lost, the next attempt reuses its number and the log shows no gap; the contract
 says so.
@@ -742,8 +777,12 @@ seq, write, fsync" closes the duplicate-seq hazard that already existed.
 ### Mitigations
 
 - The `pass_env:` behavior is the PRD's stated rule (R13) and errs toward
-  hiding; the capture refusal names the variable, so an author sees why. A later
-  per-variable opt-out can narrow it without changing anything here.
+  hiding; the capture refusal names the variable, so an author sees why. No
+  template in this repository's tests or in the published shirabe templates
+  declares `pass_env:` and captures one of its values, so the refusal breaks no
+  existing template, which keeps the compatibility promise. A per-variable
+  opt-out from redaction is later work and can narrow the rule without
+  changing anything here.
 - The per-event bounds keep log growth proportional to attempts, and exporters
   that don't want findings can skip the field.
 - The contract states the undercount case, and it requires an append failure
