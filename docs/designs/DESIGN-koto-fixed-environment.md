@@ -669,6 +669,14 @@ only the recorded fixed values and a gate name, go on the response only, and
 never enter captured output. What a command prints is still captured as
 evidence, as today; the secrecy tests cover everything koto writes.
 
+The credential check governs the environment record only. koto already
+records paths elsewhere in a session -- the execution anchor, and the compiled
+template's cache path, which sits under `HOME` -- and those are unchanged. A
+token whose value is literally part of a directory name (`HOME=/home/ghp_...`)
+is kept out of the record but still appears in those paths. That is a
+pre-existing property of those fields, not something this change introduces,
+and it is out of scope here.
+
 ### Other
 
 - **Nested ticks.** koto sets `KOTO_TICK_SESSION` explicitly on every command,
