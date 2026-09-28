@@ -2903,15 +2903,16 @@ fn append_terminal_index_for_session(
 /// Everything a session does on the tick that lands it in a terminal
 /// state, in the order DESIGN-request-lifecycle.md Decision 6 fixes:
 ///
-/// 1. Resolve the [`WorkflowResult`] envelope once, so the writes below
-///    cannot disagree about what the child answered. The caller does this
-///    through [`terminal_record`] before printing, because the terminal
+/// 1. Resolve the [`WorkflowResult`] envelope once, and for a failure
+///    terminal the session's `failure_reason` beside it, so the writes
+///    below cannot disagree about what the child answered. The caller does
+///    this through [`terminal_record`] before printing, because the terminal
 ///    `koto next` response carries the same envelope.
-/// 2. Append `request_store.result` to the child's own log, once per
-///    arrival at the terminal.
+/// 2. Append `request_store.result` (with the `failure_reason`) to the
+///    child's own log, once per arrival at the terminal.
 /// 3. **Promote** the envelope onto the bound leg's request log.
 /// 4. Write the terminal-index entry carrying the done-bit from 2.
-/// 5. Append `ChildCompleted` to the parent's log.
+/// 5. Append `ChildCompleted`, carrying copies of both, to the parent's log.
 /// 6. Remove the session, unless `retention` keeps it.
 ///
 /// Step 3 sits before 4 because a crash after the index write would

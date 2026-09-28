@@ -111,10 +111,7 @@ fn recorded_for_current_arrival(events: &[Event]) -> Option<(WorkflowResult, Opt
     None
 }
 
-/// The context key a failed session writes to say why it failed. A parent's
-/// batch view reports it as the child's `reason` (koto#278), and compile
-/// warning W5 checks that a failure terminal has a path writing it.
-pub const FAILURE_REASON_KEY: &str = "failure_reason";
+pub use crate::template::types::FAILURE_REASON_KEY;
 
 /// Longest `failure_reason` recorded with a result, in characters. The text
 /// is written by an agent or a script and is copied into a parent's gate

@@ -496,6 +496,11 @@ fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
+/// The context key a failed session writes to say why it failed. A parent's
+/// batch view reports it as the child's `reason` (koto#278), and compile
+/// warning W5 checks that a failure terminal has a path writing it.
+pub const FAILURE_REASON_KEY: &str = "failure_reason";
+
 /// Gate type: shell command.
 pub const GATE_TYPE_COMMAND: &str = "command";
 /// Gate type: check whether a context key exists.
@@ -2389,7 +2394,7 @@ impl CompiledTemplate {
             let every_edge_assigns = !incoming.is_empty()
                 && incoming
                     .iter()
-                    .all(|t| t.context_assignments.contains_key("failure_reason"));
+                    .all(|t| t.context_assignments.contains_key(FAILURE_REASON_KEY));
             if !every_edge_assigns {
                 warnings.push(format!(
                     "W5: state {:?}: `failure: true` terminal state has no declared path writing the `failure_reason` context key; \

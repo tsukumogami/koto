@@ -277,6 +277,12 @@ events:
       final_state:
         type: string
         required: true
+      result:
+        type: object
+        required: false
+      failure_reason:
+        type: string
+        required: false
 
   variable_captured:
     tier: 2
@@ -972,9 +978,10 @@ same gate in the same state (e.g., during a polling sequence).
 
 #### `child_completed`
 
-Written to the **parent** session's log when a child workflow reaches a terminal state
-and is about to be auto-cleaned. Consumers replaying historical logs (without live
-child state access) should use this event to reconstruct batch outcomes.
+Written to the **parent** session's log when a child workflow reaches a terminal state,
+whether or not the child is then cleaned up (a child in a failure state is always kept).
+Consumers replaying historical logs (without live child state access) should use this
+event to reconstruct batch outcomes.
 
 ```json
 {

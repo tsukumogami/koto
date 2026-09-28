@@ -2397,8 +2397,13 @@ pub fn build_children_complete_output(
     // (DESIGN-request-store-converge.md Decision 3 / 4). Latest event
     // per child wins, mirroring `event_snapshots`.
     let mut result_by_child: HashMap<String, WorkflowResult> = HashMap::new();
-    // The parent's copy of each child's recorded `failure_reason`, keyed and
-    // superseded like `result_by_child`.
+    // The parent's copy of each child's recorded `failure_reason`, keyed like
+    // `result_by_child` but superseded differently: the latest record
+    // decides even when it has none, so a record without a reason clears an
+    // earlier one. A result is always present on a current record, so
+    // keeping an earlier one costs nothing; a reason is often absent, and
+    // keeping the earlier one would show a retried child's first-run reason
+    // for a later failure that gave none.
     let mut failure_reason_by_child: HashMap<String, String> = HashMap::new();
     for ev in events {
         // Skip events from superseded epochs.
@@ -5344,6 +5349,73 @@ mod tests {
         );
         assert_eq!(output["outstanding"], serde_json::json!([]), "{output}");
         assert!(passes, "the gate passes once the result matches: {output}");
+    }
+
+    /// A cleaned-up failed child's reason comes from the parent's latest
+    /// `ChildCompleted`, and a later record without one clears it: a child
+    /// that failed with a reason, was retried, failed again without one and
+    /// was then cleaned up reports its state name, not the first run's
+    /// reason (koto#278).
+    #[test]
+    fn a_cleaned_up_childs_reason_is_its_latest_records() {
+        let failed = |seq: u64, reason: Option<&str>| {
+            (
+                EventPayload::ChildCompleted {
+                    child_name: "p.t".to_string(),
+                    task_name: "t".to_string(),
+                    outcome: TerminalOutcome::Failure,
+                    final_state: "failed".to_string(),
+                    result: Some(WorkflowResult {
+                        status: TerminalOutcome::Failure,
+                        summary: "failed at failed".to_string(),
+                        payload: None,
+                    }),
+                    failure_reason: reason.map(str::to_string),
+                },
+                format!("2026-01-01T00:00:0{seq}Z"),
+            )
+        };
+        let mut states = BTreeMap::new();
+        states.insert("wait".to_string(), TemplateState::default());
+        let template = CompiledTemplate {
+            format_version: 1,
+            name: "p".to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            initial_state: "wait".to_string(),
+            variables: BTreeMap::new(),
+            states,
+        };
+        let gate_entry = |records: &[(EventPayload, String)]| {
+            let tmp = TempDir::new().unwrap();
+            let backend =
+                crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+            backend
+                .init_state_file("p", child_header_for("", "p"), vec![])
+                .unwrap();
+            for (payload, ts) in records {
+                backend.append_event("p", payload, ts).unwrap();
+            }
+            let (_, parent_events) = backend.read_events("p").unwrap();
+            let (_, output) = build_children_complete_output(
+                &backend,
+                "p",
+                &parent_events,
+                &template,
+                "wait",
+                None,
+            );
+            output["children"][0].clone()
+        };
+
+        let entry = gate_entry(&[failed(1, Some("first run"))]);
+        assert_eq!(entry["reason"], "first run", "{entry}");
+        assert_eq!(entry["reason_source"], "failure_reason", "{entry}");
+
+        let entry = gate_entry(&[failed(1, Some("first run")), failed(2, None)]);
+        assert_eq!(entry["reason"], "failed", "{entry}");
+        assert_eq!(entry["reason_source"], "state_name", "{entry}");
+        assert_eq!(entry["failure_mode"], "failed", "{entry}");
     }
 
     #[test]
