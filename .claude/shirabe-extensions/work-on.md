@@ -2,8 +2,8 @@
 
 koto's verification map for shirabe's `/work-on` definition-of-done gate. Schema:
 `skills/work-on/references/verification-map.md` in the shirabe repo. The default runs only when
-no entry matches any changed file. The plugin checks copy step bodies from `validate-plugins.yml`
-and `eval-plugins.yml`, which point back here: change both together. Deliberate differences, and
+no entry matches any changed file. The plugin checks copy step bodies from `validate-plugins.yml`,
+`eval-plugins.yml` and `run-evals.yml`, which point back here: change each pair together. Deliberate differences, and
 checks PR CI does not run, are marked. Paths that carry behavior where no command here checks
 what they do have their own entry at the end, which makes the gate cannot-verify rather than
 letting the default pass them; this file is knowingly left to the default, since halting every
@@ -26,11 +26,13 @@ run, so it stays short; the reasons are in its commit history.
   - `cargo test --test doc_names` and `cargo test --lib shipped_spec` (the only tests that read `docs/`)
   - `B=$(git merge-base origin/main HEAD) && git diff --name-only --diff-filter=ACMR "$B" -- :/docs/ | grep -vE "(^|/)(evals|tests)/fixtures/" | xargs -r shirabe validate --visibility=public` (errors out when `origin/main` is missing: that is cannot-verify, not a failed change)
   - `shirabe validate --visibility=public --lifecycle . --mode=draft` (not `ready`: an in-flight `/execute` chain keeps its PLAN, which the ready posture rejects)
+- `scripts/run-evals.sh`, `scripts/run-evals_test.sh`, `scripts/classify-eval-session.py` ->
+  `scripts/run-evals_test.sh` (the `run-evals` workflow's step)
 - `test/functional/**` -> `make -C test/functional test-functional` (not in PR CI: the Go feature suite)
 - `benches/**`, `Cargo.toml`, `Cargo.lock` -> `cargo bench --no-run` (not in PR CI: `cargo test` does not build bench targets)
 - `.tsuku-recipes/**` -> `tsuku validate .tsuku-recipes/koto.toml` (not in PR CI: CI's step calls `tsuku recipe validate`, a subcommand tsuku does not have, and skips; it checks structure only, so a download or checksum change passes it)
 - `.github/**` other than `.github/pull_request_template.md`, `install.sh`, `scripts/**` other than
-  `scripts/check-evals-exist.sh`, `.release/**`, `.goreleaser.yaml`, `.cargo/**`,
+  `scripts/check-evals-exist.sh` and the three run-evals files above, `.release/**`, `.goreleaser.yaml`, `.cargo/**`,
   `plugins/koto-skills/hooks/*.sh`, `.claude/settings.json` -> no local check exists. Still run
   every other selected command; if one fails the outcome is failed, otherwise it is cannot-verify:
   no command here checks what these files do and most are not read by PR CI either, so the run
