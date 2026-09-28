@@ -3734,8 +3734,9 @@ fn handle_next(
 
     // 0. Refuse a nested tick before anything else runs.
     //
-    // koto next runs template commands as children, so they inherit the
-    // marker this tick is about to set. A koto next started from inside one
+    // koto next runs template commands as children, and each one gets the
+    // marker this tick is about to set (koto sets it in every command's
+    // environment, see `command_env::build_command_env`). A koto next started from inside one
     // of those commands would append to the event log the outer tick is
     // still working through; the outer tick would then finish against its
     // starting snapshot and report a state the session had already left
@@ -4468,16 +4469,33 @@ fn handle_next(
             );
             if !blockers.is_empty() {
                 let quoted: Vec<String> = blockers.iter().map(|g| format!("'{}'", g)).collect();
+                // A guard gate that failed because the recorded environment is
+                // stale, or couldn't find its command, is named here too: this
+                // refusal is the only response the tick gives.
+                let environment_note = header
+                    .command_environment
+                    .as_ref()
+                    .and_then(|record| {
+                        command_environment_note(
+                            &name,
+                            record,
+                            &stale_values,
+                            &command_env.failures(),
+                        )
+                    })
+                    .map(|note| format!(" {}", note.trim_end()))
+                    .unwrap_or_default();
                 let err = NextError {
                     code: NextErrorCode::GateBlocked,
                     message: format!(
                         "cannot take --to '{}': the transition from '{}' depends on {} {} \
                          declared overridable: false, and the current result does not \
-                         satisfy that transition; nothing was recorded",
+                         satisfy that transition; nothing was recorded{}",
                         target,
                         current_state,
                         if blockers.len() == 1 { "gate" } else { "gates" },
-                        quoted.join(", ")
+                        quoted.join(", "),
+                        environment_note
                     ),
                     details: blockers
                         .iter()

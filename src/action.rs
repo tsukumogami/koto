@@ -171,12 +171,16 @@ impl std::fmt::Debug for CommandEnv {
 }
 
 /// True when a failed command looks like it couldn't find a program: exit
-/// status 127, or the shell's message on stderr (`not found` from dash,
-/// `command not found` from bash). The message matters because a script whose
-/// inner command is missing usually exits with its own status.
+/// status 127, or the shell's own message on stderr (`<name>: not found` from
+/// dash, `command not found` from bash). The message matters because a script
+/// whose inner command is missing usually exits with its own status. A tool's
+/// own "not found" text ("repository not found", "file not found") doesn't
+/// match, because the note it would trigger recommends a new session.
 pub fn looks_not_found(output: &CommandOutput) -> bool {
     output.failure_kind == Some(FailureKind::NonzeroExit)
-        && (output.exit_code == 127 || output.stderr.contains("not found"))
+        && (output.exit_code == 127
+            || output.stderr.contains(": not found")
+            || output.stderr.contains("command not found"))
 }
 
 /// Output captured from a shell command execution.
@@ -581,6 +585,13 @@ mod tests {
         assert!(looks_not_found(&wrapped));
         let plain = run_shell_command("exit 1", dir.path(), 5, &env);
         assert!(!looks_not_found(&plain));
+        let tool_message = run_shell_command(
+            "echo 'fatal: repository not found' >&2; exit 128",
+            dir.path(),
+            5,
+            &env,
+        );
+        assert!(!looks_not_found(&tool_message));
     }
 
     #[test]

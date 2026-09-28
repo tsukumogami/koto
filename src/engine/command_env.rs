@@ -461,13 +461,24 @@ mod tests {
             ("UNLISTED", "x"),
             ("HOME", "/somewhere/else"),
             ("KOTO_TICK_SESSION", "spoofed"),
+            ("BASH_FUNC_probe%%", "() {  true\n}"),
+            ("GIT_CONFIG_COUNT", "1"),
         ]);
-        let pass_env = vec!["GH_DB".to_string(), "KOTO_TICK_SESSION".to_string()];
+        // A refused name can't compile into `pass_env`, but the builder filters
+        // it again rather than trusting that.
+        let pass_env = vec![
+            "GH_DB".to_string(),
+            "KOTO_TICK_SESSION".to_string(),
+            "BASH_FUNC_probe%%".to_string(),
+            "GIT_CONFIG_COUNT".to_string(),
+        ];
         let built = build_command_env(&rec, &pass_env, "wf", Some(Path::new("/s")), lookup);
         assert!(!built.inherits());
         assert_eq!(built.get("LANG"), Some("C.UTF-8"));
         assert_eq!(built.get("GH_DB"), Some("live"));
         assert_eq!(built.get("BASH_ENV"), None);
+        assert_eq!(built.get("BASH_FUNC_probe%%"), None);
+        assert_eq!(built.get("GIT_CONFIG_COUNT"), None);
         assert_eq!(built.get("UNLISTED"), None);
         assert_eq!(built.get("PATH"), Some("/opt/bin:/usr/bin"));
         assert_eq!(built.get("HOME"), Some("/home/someone"));

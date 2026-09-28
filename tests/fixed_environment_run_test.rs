@@ -771,3 +771,54 @@ Done.
         assert!(!payload.contains("[koto]"), "{payload}");
     }
 }
+
+#[test]
+fn a_legacy_session_gets_no_note() {
+    let env = Env::new();
+    let tpl = env.template(
+        "legacy.md",
+        &gate_template("needs_tool", "koto-no-such-tool-xyz"),
+    );
+    let r = env.run(
+        &[],
+        &["init", "wf", "--template", &tpl, "--legacy-environment"],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let r = env.next(&[], "wf");
+    assert!(r.success, "{}", r.stderr);
+    assert!(!r.directive().contains("[koto]"), "{}", r.directive());
+}
+
+#[test]
+fn a_recorded_xdg_config_home_removed_after_init_is_named() {
+    let env = Env::new();
+    let xdg = env.home().join("session-xdg");
+    std::fs::create_dir_all(&xdg).unwrap();
+    let tpl = env.template("fails.md", &gate_template("fails", "exit 1"));
+    env.init(&[("XDG_CONFIG_HOME", xdg.to_str().unwrap())], "wf", &tpl);
+    std::fs::remove_dir_all(&xdg).unwrap();
+    let r = env.next(&[], "wf");
+    let note = r.directive();
+    assert!(note.contains("gate 'fails'"), "{}", r.stdout);
+    assert!(
+        note.contains(&format!("XDG_CONFIG_HOME {}", xdg.display())),
+        "{note}"
+    );
+}
+
+/// `koto next --to` refused by a non-overridable guard gate that couldn't
+/// find its command names it in the refusal, the only response it gives.
+#[test]
+fn a_directed_transition_refused_by_a_missing_tool_names_it() {
+    let env = Env::new();
+    let tpl = env.template(
+        "guard.md",
+        &gate_template("needs_tool", "koto-no-such-tool-xyz"),
+    );
+    env.init(&[], "wf", &tpl);
+    let r = env.run(&[], &["next", "wf", "--to", "done", "--no-cleanup"]);
+    assert!(!r.success, "{}", r.stdout);
+    let message = r.json["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("gate 'needs_tool'"), "{}", r.stdout);
+    assert!(message.contains("koto cancel --cleanup wf"), "{message}");
+}

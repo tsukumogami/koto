@@ -242,13 +242,17 @@ pub fn environment_adopted_notice(
 /// command. A failure is named when anything recorded is stale or the failure
 /// looks not-found; with nothing stale, the note shows the recorded `PATH` it
 /// ran under. Stale values with no failure get a notice of their own. Only the
-/// three recorded values ever appear, never another variable's.
+/// three recorded values ever appear, never another variable's. A legacy
+/// session's commands use the caller's environment, so it gets no note.
 pub fn command_environment_note(
     name: &str,
     record: &crate::engine::types::CommandEnvironment,
     stale: &[(&str, String)],
     failures: &[(String, bool)],
 ) -> Option<String> {
+    if record.legacy {
+        return None;
+    }
     let remedy = format!(
         "The record can't be changed; to run with different values, start a new session: \
          `koto cancel --cleanup {name}`, then `koto init` again."
@@ -265,13 +269,13 @@ pub fn command_environment_note(
         .collect();
     if !named.is_empty() {
         let why = if stale.is_empty() {
-            format!(
-                "it ran under the session's recorded PATH={}",
-                record
-                    .path
-                    .clone()
-                    .unwrap_or_else(|| crate::engine::command_env::UNSET_PATH.to_string())
-            )
+            match &record.path {
+                Some(path) => format!("it ran under the session's recorded PATH={path}"),
+                None => format!(
+                    "the session recorded no PATH, so it ran with PATH={}",
+                    crate::engine::command_env::UNSET_PATH
+                ),
+            }
         } else {
             format!("recorded values no longer exist: {stale_text}")
         };
