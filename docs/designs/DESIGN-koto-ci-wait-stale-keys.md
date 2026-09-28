@@ -470,7 +470,9 @@ shirabe prose deletable.
 
 Nothing in shirabe changes here. This section lists, against shirabe commit
 `e34abda`, what each feature lets shirabe delete later and what stays, so that
-adoption is mechanical. Where a span is keyed to a contradiction-settlement
+adoption is mechanical. Per-skill changes under way in shirabe will move line
+numbers, so adoption re-checks each span's lines against the commit it
+adopts on. Where a span is keyed to a contradiction-settlement
 identifier, the identifier is given so adoption doesn't collide with that
 edit.
 
@@ -497,9 +499,20 @@ doesn't bite. The `changed_paths_record` state could also declare
 `changed_paths.txt`, making the removal inside `record-changed-paths.sh`
 redundant; optional.
 
-work-on's `ci_monitor` has no back edge: `failing_fixed` ends the run at
-`done`. A polling gate there would replace the one-shot `gh pr checks` gate
-and the agent's re-ticking, but not the repair path.
+At `e34abda` work-on's `ci_monitor` has no back edge: `failing_fixed` ends
+the run at `done`. The settled `ci-fix-ends-run-unverified` policy changes
+that: `failing_fixed` loops back to `ci_monitor`, so a fix is re-checked
+rather than trusted. That adds a tenth row:
+
+| Edge | Fires on | Declaration that covers it | Prose it retires |
+|---|---|---|---|
+| ci_monitor -> ci_monitor | `failing_fixed` (after `ci-fix-ends-run-unverified`) | none needed for evidence: `ci_outcome` and its `rationale` are submitted evidence, which koto already scopes to the epoch, so the self-transition drops them and the re-check can't read the previous verdict. If the adopted state records a verdict in a context key (for example a CI summary a later state gates on), that key goes in `ci_monitor: clear_on_entry: [...]`. | the "Re-check" step of phase-6-pr.md's CI Monitoring, and the agent's re-ticking while CI runs |
+
+A polling gate on `ci_monitor` covers the wait on each lap: the self-transition
+is a new entry, so each fix push gets a fresh polling window with a new
+`poll.since`, and the gate re-evaluates until the new run is done, failed or
+timed out. It replaces the one-shot `gh pr checks` gate and the agent's
+re-ticking, but not the repair path (read the logs, fix, push).
 
 **execute (`skills/execute/koto-templates/execute.md`)**, two back edges, both
 `merge_route -> merge_readiness` on `recheck: waited` (one for a pending
