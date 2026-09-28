@@ -915,8 +915,8 @@ pub enum IntegrationError {
 /// The loop iterates states, checking each against stopping conditions in order:
 /// 1. Signal received (shutdown flag)
 /// 2. Chain limit check
-/// 3. Terminal state
-/// 3a. Clearing the state's `clear_on_entry` keys, when an entry still owes it
+/// 3. Terminal state, then clearing the state's `clear_on_entry` keys when an
+///    entry still owes it
 /// 4. Integration declared (invoke runner)
 /// 5. Action execution (if state has default_action)
 /// 6. Gates (evaluate all, stop if any fail)
