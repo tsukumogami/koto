@@ -246,9 +246,9 @@ to `0.9.x`).
   arrives there (by advance or by `koto next --to`) and on every later tick,
   until a `retry_failed` or a rewind starts the batch over. A dependent
   skipped because its upstream failed is left out when it has no skip marker
-  yet; retrying the upstream brings it back. The response shape is unchanged; it appears in more
-  places. A state without that route, and a terminal state, still carries
-  none.
+  yet; retrying the upstream brings it back. The response shape is
+  unchanged; it appears in more places. A state without that route, and a
+  terminal state, still carries none.
 
 - **A failed child's `reason` is the `failure_reason` it wrote, on every
   batch surface (koto#278).** The koto-user batch reference said a failed
