@@ -203,8 +203,8 @@ suite keeps passing while the long-term route to add names is decided.
   --legacy-environment` creates a session whose commands run with the ticking
   process's whole environment, as they did before this change. The choice is
   recorded in the session; no tick, attach or other verb can set or clear it,
-  and children inherit it. It is documented as temporary and removed in a
-  later release.
+  and children inherit it. It is documented as removed in the next release,
+  once shirabe's harnesses have migrated off it.
 - **R7. The record is readable.** The record lives in the session header, the
   first line of its state file. Adopting a record on an older session (R16)
   appends an event carrying it.
@@ -424,8 +424,8 @@ also ships `--legacy-environment`: recorded at creation, never changeable by a
 tick, and documented as removed later. It exists because this changes
 behaviour for every user and a named escape between the release that breaks
 someone and the release that fixes them is cheaper than pinning an old koto.
-Whether the end state has no opt-out at all is a separate ruling, not made
-here.
+The end state was ruled on 2026-09-28: the next release removes the flag once
+shirabe's harnesses have migrated, leaving no opt-out.
 
 ### D2. Three values fixed; everything else read live by name
 

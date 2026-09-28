@@ -22,7 +22,7 @@ decision: |
   session); attach warns on drift and refuses nothing; an older session adopts
   a record on its first tick with a notice. The first release enforces this by
   default and offers `koto init --legacy-environment`, recorded at creation and
-  removed later. More fixed values, a wider refused list, caller routes to add
+  removed in the next release. More fixed values, a wider refused list, caller routes to add
   names and an attach refusal are deferred with their reproductions kept.
 rationale: |
   The three fixed values are the ones with demonstrated bypasses, and none is a
@@ -147,8 +147,13 @@ commands in the cleared environment of Decision 3. `koto init
 process's whole environment, as before this change. The flag is recorded in
 the session header, children inherit it, and no tick, attach or rebind can set
 or clear it, so the choice is made by the creator before any gate is ticked.
-It is documented as temporary. Whether a later release removes it, leaving no
-opt-out, is a separate ruling this design doesn't make.
+
+**Ruling on the end state (2026-09-28).** The maintainers accepted the staged
+end state: the first release enforces the fixed environment by default and
+ships `--legacy-environment`, settable only at `koto init` and recorded in the
+session; the next release removes the flag, once shirabe's harnesses have
+migrated off it, leaving no opt-out. The documentation announces the removal
+from the first release on.
 
 A template author whose gate needs a caller-set variable declares its name in
 `pass_env:` (Decision 4). The strongest argument for this shape over a wider
@@ -161,8 +166,8 @@ withdrawn breaks every template that used it.
 
 #### Alternatives Considered
 
-**On by default with no opt-out at all.** Rejected for the first release, not
-as an end state. It is the stronger guarantee, but every user whose gates read
+**On by default with no opt-out at all, from the first release.** Rejected
+for the first release; it is the ruled end state for the next one. It is the stronger guarantee, but every user whose gates read
 a variable outside the default list would have no remedy short of pinning an
 old koto, and the default list is a set of guesses about what real projects
 need. The opt-out bounds the cost of a wrong guess to one flag.
@@ -615,7 +620,7 @@ building it.
 | Refuse more `GIT_*` names (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_SSL_NO_VERIFY`, ...) and editor, pager and loader names | A shipped template that declares one and a gate whose verdict flips on its value. Until then only an author can declare them. |
 | A creation-time route to add names (`--pass-env`, or an init-time variable) | A named user who can't use `pass_env:` or the legacy flag. Must settle how an ambient value interacts with resume, and refuse credential-shaped items. |
 | Refuse attach on drift | A measured case where a drifted attach caused a wrong verdict that a tick with the recorded values would not. |
-| Remove `--legacy-environment` (no opt-out) | The ruling on the end state, and the count of its uses in the first release. |
+| Remove `--legacy-environment` (no opt-out) | Ruled 2026-09-28 for the next release; the trigger is shirabe's harnesses no longer passing the flag. |
 | Let an adopted record be re-adopted once | A report of an adoption from an atypical first tick (a monitor or a cron job) that stranded a run. |
 | Let a template forbid `--legacy-environment` for its sessions | A template author relying on a strict gate who needs the guarantee against the creator. |
 | Inject the request-store root for nested koto | A nested `koto request` that reads a different store because the tick's `HOME` differs from the recorded one. |
