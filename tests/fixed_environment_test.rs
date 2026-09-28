@@ -295,14 +295,26 @@ fn credential_markers_never_reach_the_session_directory() {
         ("API_KEY", "marker-api-key-3c3c3c"),
         ("DB_PASSWORD", "marker-db-password-55"),
     ];
-    for (i, form) in ["plain", "inline"].iter().enumerate() {
+    let vars = env.home().join("vars.json");
+    std::fs::write(&vars, "[]").unwrap();
+    let vars = vars.to_string_lossy().into_owned();
+    let forms = ["plain", "inline", "varsfile", "replace", "started"];
+    for (i, form) in forms.iter().enumerate() {
         let name = format!("wf{i}");
-        let r = if *form == "inline" {
-            env.run_stdin(&markers, &["init", &name, "--from-stdin"], SIMPLE)
-        } else {
-            env.run(&markers, &["init", &name, "--template", &tpl])
+        let r = match *form {
+            "inline" => env.run_stdin(&markers, &["init", &name, "--from-stdin"], SIMPLE),
+            "varsfile" => env.run(
+                &markers,
+                &["init", &name, "--template", &tpl, "--vars-file", &vars],
+            ),
+            "replace" => env.run(
+                &markers,
+                &["init", &name, "--template", &tpl, "--replace-terminal"],
+            ),
+            "started" => env.run(&markers, &["session", "start", &name, "--parent", "wf0"]),
+            _ => env.run(&markers, &["init", &name, "--template", &tpl]),
         };
-        assert!(r.success, "{}", r.stderr);
+        assert!(r.success, "{form}: {}", r.stderr);
         for (path, bytes) in env.session_files(&name) {
             let text = String::from_utf8_lossy(&bytes);
             for (var, value) in &markers {
@@ -412,6 +424,42 @@ fn a_parent_child_copies_the_parent_record_from_any_process() {
     assert_eq!(env.record("p.kid"), parent);
     assert_eq!(env.record("p.started"), parent);
     assert_eq!(parent["legacy"], true);
+}
+
+#[test]
+fn a_child_of_an_unrecorded_parent_records_from_its_own_process() {
+    let env = Env::new();
+    let tpl = env.template("simple.md", SIMPLE);
+    assert!(env.run(&[], &["init", "old", "--template", &tpl]).success);
+    // Make the parent look like a session from an earlier koto.
+    let state = env.state_path("old");
+    let text = std::fs::read_to_string(&state).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut header: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    header
+        .as_object_mut()
+        .unwrap()
+        .remove("command_environment");
+    lines[0] = header.to_string();
+    std::fs::write(&state, lines.join("\n") + "\n").unwrap();
+    assert!(env.record("old").is_null());
+
+    let child_path = format!("/opt/child/bin:{SYSTEM_PATH}");
+    let r = env.run(
+        &[("PATH", &child_path)],
+        &["init", "old.kid", "--template", &tpl, "--parent", "old"],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let r = env.run(
+        &[("PATH", &child_path)],
+        &["session", "start", "old.started", "--parent", "old"],
+    );
+    assert!(r.success, "{}", r.stderr);
+    for child in ["old.kid", "old.started"] {
+        let rec = env.record(child);
+        assert_eq!(rec["path"], child_path.as_str(), "{child}");
+        assert!(rec.get("legacy").is_none(), "{child}");
+    }
 }
 
 #[test]
