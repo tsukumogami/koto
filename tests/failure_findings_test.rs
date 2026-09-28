@@ -332,42 +332,66 @@ fn an_error_finding_on_a_passing_check_adds_no_failure() {
 }
 
 #[test]
-fn the_response_keeps_100_findings_with_the_fallback_last() {
+fn the_response_keeps_100_findings_with_the_fallback_first() {
     let env = Env::new();
     let body = "i=0\nwhile [ $i -lt 150 ]; do\n  printf '::koto-finding::{\"rule_id\":\"W%d\",\"level\":\"warning\",\"message\":\"w\"}\\n' $i\n  i=$((i+1))\ndone\nexit 1\n";
     let resp = gate_run(&env, body);
     let f = findings(&resp, "lint");
     assert_eq!(f.len(), 100);
     assert_eq!(failure(&resp, "lint")["findings_truncated"], true);
-    assert_eq!(f[98]["rule_id"], "W98");
-    assert_eq!(f[99]["rule_id"], "lint");
-    assert_eq!(f[99]["level"], "error");
+    assert_eq!(f[0]["rule_id"], "lint");
+    assert_eq!(f[0]["level"], "error");
+    assert_eq!(f[1]["rule_id"], "W0");
+    assert_eq!(f[99]["rule_id"], "W98");
 }
 
-/// The fallback is judged over every parsed finding, so an error printed
-/// after 100 warnings suppresses it even though the cap drops that error:
-/// the agent sees warnings only, truncated, on a failed check. This is why
-/// the guide says to print errors first.
+/// The session log's `gate_evaluated` payloads for the gate `lint`.
+fn logged_gate_events(env: &Env) -> Vec<Value> {
+    let log = env
+        .path()
+        .join("sessions")
+        .join("wf")
+        .join("koto-wf.state.jsonl");
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|e| e["type"] == "gate_evaluated" && e["payload"]["gate"] == "lint")
+        .map(|e| e["payload"].clone())
+        .collect()
+}
+
+/// Over the cap, findings are kept by level, so an error printed after 101
+/// warnings leads both the response and the log copy. It also suppresses the
+/// fallback, being judged over every parsed finding.
 #[test]
-fn an_error_after_100_warnings_is_cut_and_adds_no_fallback() {
+fn an_error_after_101_warnings_leads_the_capped_findings() {
     let env = Env::new();
-    let body = "i=0\nwhile [ $i -lt 100 ]; do\n  printf '::koto-finding::{\"rule_id\":\"W%d\",\"level\":\"warning\",\"message\":\"w\"}\\n' $i\n  i=$((i+1))\ndone\necho '::koto-finding::{\"rule_id\":\"E1\",\"level\":\"error\",\"message\":\"e\"}'\nexit 1\n";
+    let body = "i=0\nwhile [ $i -lt 101 ]; do\n  printf '::koto-finding::{\"rule_id\":\"W%d\",\"level\":\"warning\",\"message\":\"w\"}\\n' $i\n  i=$((i+1))\ndone\necho '::koto-finding::{\"rule_id\":\"E1\",\"level\":\"error\",\"message\":\"e\"}'\nexit 1\n";
     let resp = gate_run(&env, body);
     assert_eq!(condition(&resp, "lint")["status"], "failed");
     let f = findings(&resp, "lint");
     assert_eq!(f.len(), 100);
     assert_eq!(failure(&resp, "lint")["findings_truncated"], true);
+    assert_eq!(f[0]["rule_id"], "E1");
+    assert_eq!(f[0]["level"], "error");
+    assert_eq!(f[1]["rule_id"], "W0");
+    assert_eq!(f[99]["rule_id"], "W98");
     assert!(
-        f.iter().all(|x| x["level"] == "warning"),
-        "no error and no fallback reach the response: {resp}"
+        f.iter().all(|x| x["rule_id"] != "lint"),
+        "a parsed error means no fallback: {resp}"
     );
-    assert_eq!(f[99]["rule_id"], "W99");
-    // The error is still in the captured output.
-    let stdout = failure(&resp, "lint")["captured"]["stdout"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(stdout.contains(r#""rule_id":"E1""#), "{stdout}");
+
+    let events = logged_gate_events(&env);
+    assert_eq!(events.len(), 1, "{events:?}");
+    let logged = events[0]["findings"].as_array().unwrap();
+    assert_eq!(logged.len(), 50);
+    assert_eq!(events[0]["findings_truncated"], true);
+    assert_eq!(logged[0]["rule_id"], "E1");
+    assert_eq!(logged[1]["rule_id"], "W0");
+    assert_eq!(logged[49]["rule_id"], "W48");
 }
 
 #[test]

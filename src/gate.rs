@@ -95,8 +95,9 @@ impl StructuredGateResult {
         self.findings.iter_mut().chain(fallback)
     }
 
-    /// At most `cap` findings in emission order with the fallback last, and
-    /// whether a parsed finding was dropped.
+    /// At most `cap` findings, chosen and ordered by
+    /// [`cap_findings`](crate::findings::cap_findings), and whether one was
+    /// dropped.
     ///
     /// The check events record this view at
     /// [`LOG_FINDINGS_CAP`](crate::findings::LOG_FINDINGS_CAP).
@@ -1055,13 +1056,14 @@ mod tests {
 
         let (log, log_cut) = result.capped_findings(crate::findings::LOG_FINDINGS_CAP);
         assert_eq!(log.len(), 50);
-        assert_eq!(log[48].rule_id, "W48");
-        assert_eq!(log[49].rule_id, "check");
+        assert_eq!(log[0].rule_id, "check", "over the cap, the error leads");
+        assert_eq!(log[49].rule_id, "W48");
         assert!(log_cut);
 
         let view = result.response_failure().unwrap();
         assert_eq!(view.findings.len(), 100);
-        assert_eq!(view.findings[99].rule_id, "check");
+        assert_eq!(view.findings[0].rule_id, "check");
+        assert_eq!(view.findings[99].rule_id, "W98");
         assert!(view.findings_truncated);
 
         for f in result.all_findings_mut() {

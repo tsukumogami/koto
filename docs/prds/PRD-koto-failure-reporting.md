@@ -204,9 +204,12 @@ shape to build against before it starts.
 - **R6.** Rule ids and rule references are carried byte-for-byte as emitted.
   koto doesn't define where they come from, validate them against a list, or
   resolve references.
-- **R7.** A response carries at most 100 findings per check, in the order
-  emitted with the koto-written finding (R5) last, and says when it dropped
-  any.
+- **R7.** A response carries at most 100 findings per check, and says when it
+  dropped any. When a check's findings fit, they're in the order emitted with
+  the koto-written finding (R5) last. When they don't, errors are kept first
+  (the koto-written finding after any the check emitted), then warnings, then
+  info, then any other level, each in the order emitted, until the cap is
+  reached.
 - **R8.** Findings from a check that passed are not returned to the agent.
   They are recorded in the session log (R24) so warnings from clean runs stay
   countable.
@@ -295,9 +298,9 @@ shape to build against before it starts.
 
 - **R24.** Each recorded check evaluation's event carries the check's findings
   (for passed and failed checks), the attempt counts of R19, and the captured
-  output of a failed command gate. The log copy keeps at most 50 findings and
-  the leading 4 KiB of each output stream per event, and says when it cut
-  either.
+  output of a failed command gate. The log copy keeps at most 50 findings,
+  chosen and ordered as R7 describes, and the leading 4 KiB of each output
+  stream per event, and says when it cut either.
 - **R25.** Every new event and every new field is written out (name, type,
   required or optional, meaning, allowed values) in
   `docs/reference/session-feed.md`, in its prose and in its machine-readable
@@ -357,6 +360,9 @@ shape to build against before it starts.
       evaluation carries the finding, and no per-rule count rises.
 - [ ] A script that prints 150 findings and exits 1 yields 100 findings in the
       response and the dropped flag set.
+- [ ] A script that prints 101 warnings, then one error, and exits 1 yields
+      100 findings in the response with the error first and the dropped flag
+      set, and 50 in the log's event for that evaluation, the error first.
 - [ ] A command gate that times out yields a koto-written finding naming the
       timeout and whatever the script printed before it was stopped.
 - [ ] A failing context-exists gate yields a koto-written finding naming the
@@ -517,6 +523,13 @@ every failure countable per rule without asking authors to change anything,
 and it's what lets a warnings-only failing script still say why it blocked.
 Its rule id names the check, not a rule, and doesn't define where real rule
 ids come from.
+
+**Errors survive the findings cap.** Decided: when a check's findings exceed
+the cap, errors are kept first, then warnings, then info. The first version
+kept findings in the order emitted, so a check that printed a hundred
+warnings and then its only error showed the agent warnings only. An error
+must never be cut in favour of warnings, since the point of the list is
+telling the agent what failed. Within the cap, emission order is unchanged.
 
 **Findings on stdout only.** Linters and test runners already print their
 diagnostics there, and keeping stderr free for the script's own errors means

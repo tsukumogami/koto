@@ -636,8 +636,8 @@ fn rule_counts_come_from_every_finding_and_hold_at_most_50_keys() {
     assert_eq!(event["rule_counts"]["R00"], count(1, 1));
     assert!(event["rule_counts"].get("R50").is_none());
 
-    // An error printed after 55 warnings is cut from `findings` but still
-    // counted.
+    // An error printed after 55 warnings leads the capped `findings`, and
+    // is counted.
     let env = Env::new();
     let warnings: String = (0..55).map(|_| format!("{W291}\n")).collect();
     let cmd = env.script(
@@ -651,7 +651,8 @@ fn rule_counts_come_from_every_finding_and_hold_at_most_50_keys() {
     let event = &env.gate_events("check", "lint")[0];
     let findings = event["findings"].as_array().unwrap();
     assert_eq!(findings.len(), 50);
-    assert!(findings.iter().all(|f| f["rule_id"] == "W291"));
+    assert_eq!(findings[0]["rule_id"], "E999");
+    assert!(findings[1..].iter().all(|f| f["rule_id"] == "W291"));
     assert_eq!(event["findings_truncated"], true);
     assert_eq!(event["rule_counts"], json!({ "E999": count(1, 1) }));
     assert!(event.get("rule_counts_truncated").is_none());
@@ -820,7 +821,7 @@ fn the_4_kib_cut_never_splits_a_redaction_marker() {
 }
 
 #[test]
-fn a_gate_printing_60_findings_logs_50_with_the_fallback_last() {
+fn a_gate_printing_60_findings_logs_50_with_the_fallback_first() {
     let env = Env::new();
     let warnings: String = (0..60).map(|_| format!("{W291}\n")).collect();
     let cmd = env.script("lint.sh", &format!("{warnings}exit 1\n"));
@@ -829,8 +830,9 @@ fn a_gate_printing_60_findings_logs_50_with_the_fallback_last() {
     let event = &env.gate_events("check", "lint")[0];
     let findings = event["findings"].as_array().unwrap();
     assert_eq!(findings.len(), 50);
-    assert_eq!(findings[49]["rule_id"], "lint");
-    assert_ne!(findings[49]["message_source"], "check");
+    assert_eq!(findings[0]["rule_id"], "lint");
+    assert_ne!(findings[0]["message_source"], "check");
+    assert!(findings[1..].iter().all(|f| f["rule_id"] == "W291"));
     assert_eq!(event["findings_truncated"], true);
     assert_eq!(event["rule_counts"], json!({ "lint": count(1, 1) }));
 }

@@ -154,15 +154,18 @@ text goes through the existing
 `one_line_reason` (`src/engine/terminal_result.rs`): whitespace runs fold to one
 space and anything over 500 characters is cut to 497 plus `...`.
 
-The response keeps the first 100 findings in emission order, or the first 99
-plus the fallback when there is one; the log keeps 50 (49 plus the fallback).
-Per-rule counts use every parsed finding, not the capped list. The fallback is
-also judged over every parsed finding, so a check that prints 100 warnings, then
-its only error, and fails gets no fallback, and the cap drops the error: the
-agent sees a failed status and 100 warnings with `findings_truncated: true`,
-while the error stays in the captured output, the session log and the per-rule
-counts. The guide tells authors to print errors before warnings for this
-reason.
+The response keeps at most 100 findings and the log at most 50. When a
+check's findings fit, they keep emission order with the fallback last. When
+they don't, koto picks them by level: errors, then warnings, then info, then
+any level it doesn't know, each level in emission order, filling the cap in
+that order, and sets `findings_truncated`. The fallback is an error, and it's
+written only when no parsed finding is one, so an overflowing list starts with
+it and always keeps it. One helper applies both caps. An error is never cut in
+favour of warnings, since the point of the list is telling the agent what
+failed. Per-rule counts use every parsed finding, not the capped list. The
+fallback is also judged over every parsed finding, so a check that prints 100
+warnings, then its only error, and fails gets no fallback; its error leads the
+capped list, followed by 99 warnings, with `findings_truncated: true`.
 
 #### Alternatives Considered
 
@@ -549,7 +552,8 @@ template field. A consumer that ignores the new fields sees today's koto.
   config keys from its caller.
 - **`src/findings.rs` (new).** `Finding`, `parse_findings(&RedactedText,
   stdout_truncated, &Redactor)` (the redactor is needed for the second pass
-  over decoded strings), `fallback_finding(...)`, and the 100/50 caps. A
+  over decoded strings), `fallback_finding(...)`, and `cap_findings`, which
+  applies the 100/50 caps and, past a cap, keeps errors first. A
   command's output records whether stderr ends with koto's own note (timeout,
   wait error), because a polling timeout can report a nonzero exit while
   stderr ends with that note, and the fallback's `message_source` depends on
@@ -699,7 +703,7 @@ type. Conventions the contract states once for all of these fields:
 |-------|------|---------|
 | `attempt` | integer >= 1 | The state's session attempt number, including this attempt. The same on every check event of one attempt. Never resets. |
 | `visit_attempt` | integer >= 1 | The state's attempt number in the current visit, including this attempt. Returns to 1 on the first attempt after arriving from a different state or being rewound; a self-transition doesn't reset it. Present whenever `attempt` is. |
-| `findings` | array of finding objects | The check's findings, passed or failed: at most 50 in emission order, with the koto-written finding last when there is one. Absent when there are none. |
+| `findings` | array of finding objects | The check's findings, passed or failed, at most 50. When they fit, they're in emission order with the koto-written finding last when there is one; when there are more, koto keeps errors (the koto-written finding after any parsed ones), then warnings, then info, then any other level, each in emission order. Absent when there are none. |
 | `findings_truncated` | boolean | `true` when the check produced more findings than `findings` holds. Absent means `false`. |
 | `rule_counts` | object | On a failed check that reported at least one finding at `error`: keys are the distinct rule ids this check reported at `error`, taken from every parsed finding rather than only the logged ones; each value is `{"visit": int, "session": int}`, the attempts on this state in the current visit and in the session in which this same check (this event's `gate`) failed and reported that rule at `error`, including this one. A key can name a rule that isn't in `findings` when `findings_truncated` is `true`; that is expected, not corruption. At most 50 keys, first reported first. |
 | `rule_counts_truncated` | boolean | `true` when the check reported more distinct rule ids at `error` than `rule_counts` holds. Absent means `false`. |

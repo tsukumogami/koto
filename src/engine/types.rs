@@ -678,8 +678,8 @@ pub struct CheckEventFields {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visit_attempt: Option<u64>,
     /// The check's findings, at most
-    /// [`LOG_FINDINGS_CAP`](crate::findings::LOG_FINDINGS_CAP), the
-    /// koto-written one last.
+    /// [`LOG_FINDINGS_CAP`](crate::findings::LOG_FINDINGS_CAP), chosen
+    /// and ordered by [`cap_findings`](crate::findings::cap_findings).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<crate::findings::Finding>,
     #[serde(default, skip_serializing_if = "is_false")]

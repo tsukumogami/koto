@@ -738,7 +738,8 @@ fn error_rule_ids(result: &StructuredGateResult) -> Vec<String> {
 /// The failure-reporting fields for one check event.
 ///
 /// Findings are logged whatever the outcome, capped at
-/// [`LOG_FINDINGS_CAP`] with the fallback last. `rule_counts` is written
+/// [`LOG_FINDINGS_CAP`] by
+/// [`cap_findings`](crate::findings::cap_findings). `rule_counts` is written
 /// only for a failed check (outcome other than `passed`) that reported a
 /// rule at `error`; findings from a passing check raise nothing.
 fn check_fields(

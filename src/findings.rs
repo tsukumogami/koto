@@ -227,7 +227,7 @@ pub struct GateFailure {
 impl GateFailure {
     /// The `failure` object the response returns beside the check's
     /// unchanged `output`: `parsed` and the fallback, capped at
-    /// [`RESPONSE_FINDINGS_CAP`] with the fallback last.
+    /// [`RESPONSE_FINDINGS_CAP`] by [`cap_findings`].
     pub fn response(&self, parsed: &[Finding]) -> FailureResponse {
         let (findings, findings_truncated) =
             cap_findings(parsed, self.fallback.clone(), RESPONSE_FINDINGS_CAP);
@@ -450,23 +450,40 @@ pub fn fallback_finding(check: &str, output: Option<&CheckOutput>, sentence: &st
     }
 }
 
-/// Keep at most `cap` findings in emission order, or `cap - 1` plus
-/// `fallback` when there is one, and say whether any parsed finding was
-/// dropped.
+/// Where a level sorts when a list is over its cap: `error`, then
+/// `warning`, then `info`, then any level this koto doesn't know.
+fn level_rank(level: &FindingLevel) -> u8 {
+    match level {
+        FindingLevel::Error => 0,
+        FindingLevel::Warning => 1,
+        FindingLevel::Info => 2,
+        FindingLevel::Other(_) => 3,
+    }
+}
+
+/// The list a response or check event carries: `parsed` with `fallback`
+/// after it, at most `cap` long, and whether a finding was dropped.
+///
+/// Within the cap the list keeps emission order, the fallback last. Over
+/// it, findings are kept by level (errors, then warnings, then info, then
+/// any other level), each level in emission order, so an error is never cut
+/// in favour of a warning. The fallback is an `error` and is written only
+/// when no parsed finding is, so it leads the list; it is kept whenever
+/// `cap` is at least 1.
 pub fn cap_findings(
     parsed: &[Finding],
     fallback: Option<Finding>,
     cap: usize,
 ) -> (Vec<Finding>, bool) {
-    let room = if fallback.is_some() {
-        cap.saturating_sub(1)
-    } else {
-        cap
-    };
-    let mut kept: Vec<Finding> = parsed.iter().take(room).cloned().collect();
-    let truncated = parsed.len() > room;
-    kept.extend(fallback);
-    (kept, truncated)
+    let mut all: Vec<Finding> = parsed.iter().cloned().chain(fallback).collect();
+    if all.len() <= cap {
+        return (all, false);
+    }
+    // Stable, so each level keeps emission order and the fallback, emitted
+    // last, sorts after any parsed error.
+    all.sort_by_key(|f| level_rank(&f.level));
+    all.truncate(cap);
+    (all, true)
 }
 
 /// Judge what a failed corrective check reported: its parsed findings,
@@ -548,21 +565,23 @@ mod tests {
             .all(|f| f.message_source == MessageSource::Check));
         assert!(failure.captured.is_some());
 
-        // The views derive from the two: 99 + fallback for the response,
-        // 49 + fallback for the log.
+        // The views derive from the two: over the cap, the fallback (the
+        // only error) leads, then 99 warnings for the response and 49 for
+        // the log.
         let view = failure.response(&parsed);
         assert_eq!(view.findings.len(), RESPONSE_FINDINGS_CAP);
-        assert_eq!(view.findings.last(), Some(fallback));
+        assert_eq!(view.findings.first(), Some(fallback));
+        assert_eq!(view.findings[99].rule_id, "W98");
         assert!(view.findings_truncated);
         let (log, cut) = cap_findings(&parsed, failure.fallback.clone(), LOG_FINDINGS_CAP);
         assert_eq!(log.len(), LOG_FINDINGS_CAP);
-        assert_eq!(log[48].rule_id, "W48");
-        assert_eq!(log.last(), Some(fallback));
+        assert_eq!(log.first(), Some(fallback));
+        assert_eq!(log[49].rule_id, "W48");
         assert!(cut);
     }
 
     #[test]
-    fn an_error_past_the_cap_suppresses_the_fallback_but_stays_in_the_parsed_list() {
+    fn an_error_past_the_cap_suppresses_the_fallback_and_leads_the_view() {
         let stdout = format!(
             "{}{}",
             numbered("warning", "W", 0..100),
@@ -576,10 +595,9 @@ mod tests {
         let view = failure.response(&parsed);
         assert_eq!(view.findings.len(), RESPONSE_FINDINGS_CAP);
         assert!(view.findings_truncated);
-        assert!(view
-            .findings
-            .iter()
-            .all(|f| f.level == FindingLevel::Warning));
+        assert_eq!(view.findings[0].rule_id, "E0");
+        assert_eq!(view.findings[1].rule_id, "W0");
+        assert_eq!(view.findings[99].rule_id, "W98");
     }
 
     #[test]
@@ -842,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn the_response_keeps_100_with_the_fallback_last() {
+    fn the_response_keeps_100_with_the_fallback_first_when_over_the_cap() {
         let warn = |i: usize| {
             line(&format!(
                 r#"{{"rule_id":"W{i}","level":"warning","message":"w"}}"#
@@ -852,8 +870,9 @@ mod tests {
         let f = respond("g", Some(output(&stdout, "boom")), "s");
         assert_eq!(f.findings.len(), RESPONSE_FINDINGS_CAP);
         assert!(f.findings_truncated);
-        assert_eq!(f.findings[98].rule_id, "W98");
-        assert_eq!(f.findings[99].rule_id, "g");
+        assert_eq!(f.findings[0].rule_id, "g");
+        assert_eq!(f.findings[1].rule_id, "W0");
+        assert_eq!(f.findings[99].rule_id, "W98");
 
         let err = |i: usize| {
             line(&format!(
@@ -868,6 +887,89 @@ mod tests {
 
         let (kept, cut) = cap_findings(&[], None, LOG_FINDINGS_CAP);
         assert!(kept.is_empty() && !cut);
+    }
+
+    fn at(level: FindingLevel, rule_id: &str) -> Finding {
+        Finding {
+            rule_id: rule_id.to_string(),
+            level,
+            message: "m".to_string(),
+            path: None,
+            line: None,
+            column: None,
+            rule_ref: None,
+            effect_landed: None,
+            message_source: MessageSource::Check,
+        }
+    }
+
+    fn ids(findings: &[Finding]) -> Vec<&str> {
+        findings.iter().map(|f| f.rule_id.as_str()).collect()
+    }
+
+    #[test]
+    fn over_the_cap_findings_are_kept_by_level_each_in_emission_order() {
+        let parsed = vec![
+            at(FindingLevel::Info, "I0"),
+            at(FindingLevel::Warning, "W0"),
+            at(FindingLevel::Error, "E0"),
+            at(FindingLevel::Info, "I1"),
+            at(FindingLevel::Warning, "W1"),
+            at(FindingLevel::Error, "E1"),
+            at(FindingLevel::Warning, "W2"),
+        ];
+        let (kept, cut) = cap_findings(&parsed, None, 5);
+        assert_eq!(ids(&kept), ["E0", "E1", "W0", "W1", "W2"]);
+        assert!(cut);
+        let (kept, cut) = cap_findings(&parsed, None, 1);
+        assert_eq!(ids(&kept), ["E0"]);
+        assert!(cut);
+    }
+
+    #[test]
+    fn within_the_cap_emission_order_is_kept_with_the_fallback_last() {
+        let parsed = vec![
+            at(FindingLevel::Info, "I0"),
+            at(FindingLevel::Warning, "W0"),
+        ];
+        let fallback = at(FindingLevel::Error, "g");
+        let (kept, cut) = cap_findings(&parsed, Some(fallback.clone()), 3);
+        assert_eq!(ids(&kept), ["I0", "W0", "g"]);
+        assert!(!cut);
+        let (kept, cut) = cap_findings(&parsed, None, 2);
+        assert_eq!(ids(&kept), ["I0", "W0"]);
+        assert!(!cut);
+    }
+
+    #[test]
+    fn over_the_cap_the_fallback_is_kept_ahead_of_warnings() {
+        let parsed: Vec<Finding> = (0..5)
+            .map(|i| at(FindingLevel::Warning, &format!("W{i}")))
+            .chain([at(FindingLevel::Info, "I0")])
+            .collect();
+        let fallback = at(FindingLevel::Error, "g");
+        let (kept, cut) = cap_findings(&parsed, Some(fallback), 3);
+        assert_eq!(ids(&kept), ["g", "W0", "W1"]);
+        assert!(cut);
+    }
+
+    #[test]
+    fn over_the_cap_an_unknown_level_sorts_after_info() {
+        let parsed = vec![
+            at(FindingLevel::Other("notice".to_string()), "N0"),
+            at(FindingLevel::Info, "I0"),
+            at(FindingLevel::Other("hint".to_string()), "N1"),
+            at(FindingLevel::Warning, "W0"),
+        ];
+        let (kept, cut) = cap_findings(&parsed, None, 3);
+        assert_eq!(ids(&kept), ["W0", "I0", "N0"]);
+        assert!(cut);
+        let (kept, _) = cap_findings(&parsed, None, 4);
+        assert_eq!(
+            ids(&kept),
+            ["N0", "I0", "N1", "W0"],
+            "within the cap, unchanged"
+        );
     }
 
     #[test]
