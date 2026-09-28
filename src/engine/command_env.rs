@@ -356,21 +356,29 @@ where
 }
 
 /// The password in a proxy URL's userinfo (`scheme://user:password@host`),
-/// percent-decoded. `None` when there is no password or it doesn't decode
-/// to UTF-8.
-fn proxy_password(url: &str) -> Option<String> {
+/// in both spellings a command can print: percent-decoded, and as written in
+/// the URL. Empty when there is no password; the decoded spelling is left
+/// out when it doesn't decode to UTF-8, and the written one when it equals
+/// the decoded one.
+fn proxy_passwords(url: &str) -> Vec<String> {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let (userinfo, _) = authority.rsplit_once('@')?;
-    let (_, password) = userinfo.split_once(':')?;
+    let Some((userinfo, _)) = authority.rsplit_once('@') else {
+        return Vec::new();
+    };
+    let Some((_, password)) = userinfo.split_once(':') else {
+        return Vec::new();
+    };
     let bytes = password.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-            if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                out.push(b);
+        // Only `%` and two hex digits is an escape; `from_str_radix` alone
+        // would also take a sign, so `%+f` stays as written.
+        let digit = |k: usize| bytes.get(k).and_then(|&b| (b as char).to_digit(16));
+        if bytes[i] == b'%' {
+            if let (Some(hi), Some(lo)) = (digit(i + 1), digit(i + 2)) {
+                out.push((hi * 16 + lo) as u8);
                 i += 3;
                 continue;
             }
@@ -378,17 +386,28 @@ fn proxy_password(url: &str) -> Option<String> {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8(out).ok()
+    let mut spellings = Vec::new();
+    if let Ok(decoded) = String::from_utf8(out) {
+        spellings.push(decoded);
+    }
+    if !spellings.iter().any(|s| s == password) {
+        spellings.push(password.to_string());
+    }
+    spellings
 }
 
 /// The tick's known credentials, as a [`Redactor`] for captured output
 /// (DESIGN-koto-failure-reporting.md, Decision 5).
 ///
 /// In priority order, the first source naming a value that several carry:
-/// the live value of each credential-carrying variable, plus the
-/// percent-decoded password of any proxy URL among them; the value of each
-/// template `pass_env:` name that reaches a command, filtered by name
-/// exactly as [`build_command_env`] filters it; then `config_keys`. A legacy
+/// the live value of each credential-carrying variable, plus the password
+/// of any proxy URL among them, both percent-decoded and as written; the
+/// value of each template `pass_env:` name that reaches a command, filtered
+/// by name exactly as [`build_command_env`] filters it; then `config_keys`;
+/// then the environment variables that supply koto's own keys
+/// (`crate::config::resolve::ENV_SECRET_NAMES`), read through `lookup`
+/// directly, so they're searched for even when the configuration failed to
+/// load and `config_keys` is empty. A legacy
 /// session's commands inherit the caller's environment, which `lookup`
 /// reads, so the same names are looked up there. The names on the record's
 /// default list other than the carriers hold no secret and aren't searched
@@ -405,9 +424,9 @@ where
     let mut known: Vec<(String, String)> = Vec::new();
     for name in CREDENTIAL_CARRIERS {
         if let Some(value) = lookup(name) {
-            let password = proxy_password(&value);
+            let passwords = proxy_passwords(&value);
             known.push((name.to_string(), value));
-            if let Some(password) = password {
+            for password in passwords {
                 known.push((name.to_string(), password));
             }
         }
@@ -433,6 +452,11 @@ where
     }
 
     known.extend(config_keys.iter().cloned());
+    for name in crate::config::resolve::ENV_SECRET_NAMES {
+        if let Some(value) = lookup(name).filter(|v| !v.trim().is_empty()) {
+            known.push((name.to_string(), value));
+        }
+    }
     crate::redact::Redactor::new(known)
 }
 
@@ -928,13 +952,54 @@ mod tests {
     }
 
     #[test]
-    fn proxy_passwords_are_percent_decoded() {
+    fn proxy_passwords_are_searched_decoded_and_as_written() {
         assert_eq!(
-            proxy_password("http://u:a%2Fb%3Ac@h:1/x").as_deref(),
-            Some("a/b:c")
+            proxy_passwords("http://u:a%2Fb%3Ac@h:1/x"),
+            vec!["a/b:c".to_string(), "a%2Fb%3Ac".to_string()]
         );
-        assert_eq!(proxy_password("u:pw@h").as_deref(), Some("pw"));
-        assert_eq!(proxy_password("http://u@h"), None);
-        assert_eq!(proxy_password("http://h:8080"), None);
+        assert_eq!(proxy_passwords("u:pw@h"), vec!["pw".to_string()]);
+        assert!(proxy_passwords("http://u@h").is_empty());
+        assert!(proxy_passwords("http://h:8080").is_empty());
+        // Only `%` and two hex digits is an escape.
+        assert_eq!(
+            proxy_passwords("http://u:a%+fb%4@h"),
+            vec!["a%+fb%4".to_string()]
+        );
+        // A password that isn't UTF-8 once decoded is still searched as written.
+        assert_eq!(
+            proxy_passwords("http://u:ab%FFcdefgh@h"),
+            vec!["ab%FFcdefgh".to_string()]
+        );
+
+        // Printed without the rest of the URL, either spelling is replaced.
+        let rec = record(Some("/usr/bin"), &["HTTPS_PROXY"]);
+        let lookup = env(&[("HTTPS_PROXY", "http://me:p%40ssw0rd-long@proxy:3128")]);
+        let r = known_credentials(&rec, &[], &[], &lookup);
+        assert_eq!(
+            redacted(&r, "user p%40ssw0rd-long / p@ssw0rd-long"),
+            "user [REDACTED:HTTPS_PROXY] / [REDACTED:HTTPS_PROXY]"
+        );
+    }
+
+    #[test]
+    fn koto_s_own_env_keys_are_searched_without_config_keys() {
+        // As when the configuration failed to load: no config keys, but the
+        // environment still supplies koto's keys to a legacy session.
+        let mut rec = record(Some("/usr/bin"), &[]);
+        rec.legacy = true;
+        let lookup = env(&[
+            ("KOTO_DECIDER_API_KEY", "sk-env-decider-value"),
+            ("AWS_ACCESS_KEY_ID", "AKIAENVACCESSKEY01"),
+            ("AWS_SECRET_ACCESS_KEY", "env-secret-access-value"),
+        ]);
+        let (built, _) = for_tick(Some(&rec), &[], "wf", None, &[], lookup).unwrap();
+        assert_eq!(
+            redacted(
+                built.redactor(),
+                "sk-env-decider-value AKIAENVACCESSKEY01 env-secret-access-value"
+            ),
+            "[REDACTED:KOTO_DECIDER_API_KEY] [REDACTED:AWS_ACCESS_KEY_ID] \
+             [REDACTED:AWS_SECRET_ACCESS_KEY]"
+        );
     }
 }

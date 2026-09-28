@@ -90,6 +90,10 @@ pub struct CommandEnv {
     outcomes: Mutex<BTreeMap<String, CommandOutcome>>,
     /// The credentials this tick knows, replaced in every command's output.
     redactor: Redactor,
+    /// The output each recorded gate or action produced, so a test can see
+    /// what a command gate captured: its evidence doesn't carry the streams.
+    #[cfg(test)]
+    outputs: Mutex<BTreeMap<String, CommandOutput>>,
 }
 
 impl CommandEnv {
@@ -100,6 +104,8 @@ impl CommandEnv {
             inherit: false,
             outcomes: Mutex::new(BTreeMap::new()),
             redactor: Redactor::empty(),
+            #[cfg(test)]
+            outputs: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -155,6 +161,16 @@ impl CommandEnv {
         if let Ok(mut map) = self.outcomes.lock() {
             map.insert(label.to_string(), outcome);
         }
+        #[cfg(test)]
+        if let Ok(mut map) = self.outputs.lock() {
+            map.insert(label.to_string(), output.clone());
+        }
+    }
+
+    /// The output last recorded under `label`, for tests.
+    #[cfg(test)]
+    pub(crate) fn recorded_output(&self, label: &str) -> Option<CommandOutput> {
+        self.outputs.lock().ok()?.get(label).cloned()
     }
 
     /// Every gate or action whose last run on this tick failed, with whether

@@ -294,6 +294,9 @@ fn credentials_echoed_by_a_default_action_are_redacted_in_the_response_and_the_l
     }
 }
 
+/// A failing gate's evidence doesn't carry its streams yet, so this checks
+/// absence only. That the gate's captured output holds markers is checked
+/// in `gate::tests::a_failing_command_gate_captures_its_streams_redacted`.
 #[test]
 fn credentials_echoed_by_a_failing_command_gate_never_reach_the_response_or_the_log() {
     let mut env = Env::new();

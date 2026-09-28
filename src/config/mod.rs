@@ -19,8 +19,8 @@ pub struct KotoConfig {
     /// exactly as before.
     #[serde(default, skip_serializing_if = "DeciderConfig::is_empty")]
     pub decider: DeciderConfig,
-    /// Where the secret settings came from, and the config-file values an
-    /// environment variable overrode. Filled by `resolve::load_config`,
+    /// Where the secret settings came from, and every secret value a config
+    /// file set, in any layer. Filled by `resolve::load_config`,
     /// never serialized; read by [`redaction_keys`].
     #[serde(skip)]
     pub secret_sources: SecretSources,
@@ -28,8 +28,10 @@ pub struct KotoConfig {
 
 /// Provenance of koto's secret settings, for redaction.
 ///
-/// Holds config-file values that an environment variable replaced: koto no
-/// longer uses them, but they are still credentials a command could print.
+/// Holds every secret value a config file set, from the user file and the
+/// project file, including values koto doesn't use: one a later layer or an
+/// environment variable replaced, and a project-file `decider.api_key`,
+/// which is ignored. They are still credentials a command could print.
 /// Never serialized, and its `Debug` prints setting names only.
 #[derive(Clone, Default)]
 pub struct SecretSources {
@@ -37,8 +39,9 @@ pub struct SecretSources {
     pub access_key_from_env: bool,
     /// `AWS_SECRET_ACCESS_KEY` supplied `session.cloud.secret_key`.
     pub secret_key_from_env: bool,
-    /// `(setting name, config-file value)` for each overridden secret.
-    pub overridden: Vec<(&'static str, String)>,
+    /// `(setting name, config-file value)` for each secret a config file
+    /// set, in load order, without repeats.
+    pub file_values: Vec<(&'static str, String)>,
 }
 
 impl std::fmt::Debug for SecretSources {
@@ -47,8 +50,8 @@ impl std::fmt::Debug for SecretSources {
             .field("access_key_from_env", &self.access_key_from_env)
             .field("secret_key_from_env", &self.secret_key_from_env)
             .field(
-                "overridden",
-                &self.overridden.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+                "file_values",
+                &self.file_values.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
             )
             .finish()
     }
@@ -58,9 +61,11 @@ impl std::fmt::Debug for SecretSources {
 /// known credentials (DESIGN-koto-failure-reporting.md, Decision 5).
 ///
 /// Every value koto resolved for the decider key and the cloud access and
-/// secret keys, then every config-file value an environment variable
-/// overrode. The source is the environment variable when one supplied the
-/// value, otherwise the setting name, which always contains a dot.
+/// secret keys, then every value any config file set for them, whether or
+/// not it won: one a later layer or an environment variable replaced, and a
+/// project-file decider key the merge ignores. The source is the
+/// environment variable when one supplied the value, otherwise the setting
+/// name, which always contains a dot.
 pub fn redaction_keys(config: &KotoConfig) -> Vec<(String, String)> {
     let mut keys = Vec::new();
     if let Some(v) = &config.decider.api_key {
@@ -90,7 +95,7 @@ pub fn redaction_keys(config: &KotoConfig) -> Vec<(String, String)> {
             keys.push((source.to_string(), v.clone()));
         }
     }
-    for (setting, v) in &src.overridden {
+    for (setting, v) in &src.file_values {
         keys.push((setting.to_string(), v.clone()));
     }
     keys

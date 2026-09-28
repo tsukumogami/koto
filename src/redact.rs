@@ -24,9 +24,27 @@ pub const MIN_VALUE_LEN: usize = 8;
 /// the variable-value allowlist, so a capture holding one can't be delivered.
 const MARKER_OPEN: &str = "[REDACTED:";
 
+/// Longest source name a marker carries, in bytes. A longer run of name
+/// bytes after `[REDACTED:` isn't a marker, so text a command printed to
+/// look like one can't make a cut back off over most of a stream.
+pub const MAX_SOURCE_LEN: usize = 64;
+
+/// `source` cut to at most [`MAX_SOURCE_LEN`] bytes, at a character
+/// boundary, so every marker koto writes is one it recognizes.
+fn bounded_source(source: &str) -> &str {
+    if source.len() <= MAX_SOURCE_LEN {
+        return source;
+    }
+    let mut end = MAX_SOURCE_LEN;
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    &source[..end]
+}
+
 /// The marker that replaces a value from `source`.
 fn marker(source: &str) -> String {
-    format!("{}{}]", MARKER_OPEN, source)
+    format!("{}{}]", MARKER_OPEN, bounded_source(source))
 }
 
 /// Whether `b` may appear in a source name: a variable name, or a
@@ -46,8 +64,9 @@ fn marker_spans(bytes: &[u8]) -> Vec<(usize, usize)> {
             continue;
         }
         let name_start = i + open.len();
+        let name_limit = bytes.len().min(name_start + MAX_SOURCE_LEN);
         let mut j = name_start;
-        while j < bytes.len() && is_source_byte(bytes[j]) {
+        while j < name_limit && is_source_byte(bytes[j]) {
             j += 1;
         }
         if j > name_start && j < bytes.len() && bytes[j] == b']' {
@@ -102,20 +121,22 @@ pub fn safe_cut_len(bytes: &[u8], max: usize) -> usize {
 /// Text that has been through redaction, or that koto wrote itself.
 ///
 /// The field is private and the only constructors are this module's
-/// redaction functions and [`RedactedText::koto_note`], so a consumer that
-/// holds one knows every known value in it has been replaced.
+/// redaction functions and the crate-private [`RedactedText::koto_note`]
+/// (with [`RedactedText::push_koto_note`] to append), so a consumer that
+/// holds one knows every known value in it has been replaced, and code
+/// outside koto can't wrap text of its own.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RedactedText(String);
 
 impl RedactedText {
     /// Text koto composed itself -- a timeout, polling or `working_dir` note --
     /// that holds no captured output.
-    pub fn koto_note(text: impl Into<String>) -> Self {
+    pub(crate) fn koto_note(text: impl Into<String>) -> Self {
         RedactedText(text.into())
     }
 
     /// Append koto-written `note` exactly as given.
-    pub fn push_koto_note(&mut self, note: &str) {
+    pub(crate) fn push_koto_note(&mut self, note: &str) {
         self.0.push_str(note);
     }
 
@@ -622,6 +643,40 @@ mod tests {
             first_marker_source("a [REDACTED:session.cloud.access_key] b"),
             Some("session.cloud.access_key")
         );
+    }
+
+    #[test]
+    fn a_marker_source_name_is_bounded() {
+        // A fake marker with a huge source name, printed across the bound,
+        // isn't a marker: the cut stays at the bound instead of backing off
+        // to its start.
+        let fake = format!("[REDACTED:{}]", "A".repeat(10_000));
+        let text = redact_str(
+            &format!("head {}", fake),
+            &r(&[("GH_TOKEN", "unused-value")]),
+        );
+        let (cut, dropped) = text.cut_bytes(1000);
+        assert_eq!(cut.len(), 1000);
+        assert!(dropped);
+        assert_eq!(first_marker_source(&fake), None);
+        // One byte over the bound isn't a marker; exactly the bound is.
+        let over = format!("[REDACTED:{}]", "B".repeat(MAX_SOURCE_LEN + 1));
+        assert_eq!(first_marker_source(&over), None);
+        let at = "C".repeat(MAX_SOURCE_LEN);
+        assert_eq!(
+            first_marker_source(&format!("x [REDACTED:{}] y", at)),
+            Some(at.as_str())
+        );
+        // A source name koto knows that is longer than the bound is written
+        // shortened, so its marker is still recognized and never split.
+        let long = format!("LONG_{}", "N".repeat(100));
+        let red = r(&[(long.as_str(), "long-source-secret")]);
+        let text = redact_str("a long-source-secret b", &red);
+        let shown = &long[..MAX_SOURCE_LEN];
+        assert_eq!(text, format!("a [REDACTED:{}] b", shown).as_str());
+        assert_eq!(first_marker_source(&text), Some(shown));
+        let (cut, _) = text.cut_bytes(10);
+        assert_eq!(cut, "a ");
     }
 
     #[test]

@@ -695,6 +695,70 @@ mod tests {
         assert_eq!(results["check"].output["error"], "");
     }
 
+    /// A failing command gate run through `evaluate_gates` with the tick's
+    /// environment, as `for_tick` builds it, captures its streams redacted.
+    /// The gate's evidence doesn't carry the streams yet, so the test reads
+    /// the output the gate recorded on the environment.
+    #[test]
+    fn a_failing_command_gate_captures_its_streams_redacted() {
+        use crate::engine::types::CommandEnvironment;
+        let token = "ghp_gatetokenvalue0123";
+        let db = "gate-db-secret-value";
+        let record = CommandEnvironment {
+            path: Some("/usr/bin:/bin".to_string()),
+            path_absent: Vec::new(),
+            home: None,
+            xdg_config_home: None,
+            home_absent: false,
+            xdg_config_home_absent: false,
+            pass: vec!["GH_TOKEN".to_string()],
+            legacy: false,
+        };
+        let lookup = |n: &str| match n {
+            "GH_TOKEN" => Some(token.to_string()),
+            "GH_DB" => Some(db.to_string()),
+            _ => None,
+        };
+        let (env, _) = crate::engine::command_env::for_tick(
+            Some(&record),
+            &["GH_DB".to_string()],
+            "wf",
+            None,
+            &[],
+            lookup,
+        )
+        .unwrap();
+
+        let dir = tmp_dir();
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            make_gate(
+                "echo \"out $GH_TOKEN $GH_DB\"; echo \"err $GH_TOKEN $GH_DB\" >&2; exit 1",
+                5,
+            ),
+        );
+        let results = evaluate_gates(&gates, dir.path(), &env, None, None, None);
+        assert_eq!(results["check"].outcome, GateOutcome::Failed);
+
+        let output = env
+            .recorded_output("gate 'check'")
+            .expect("gate output recorded");
+        assert_eq!(
+            output.stdout.as_str(),
+            "out [REDACTED:GH_TOKEN] [REDACTED:GH_DB]\n"
+        );
+        assert_eq!(
+            output.stderr.as_str(),
+            "err [REDACTED:GH_TOKEN] [REDACTED:GH_DB]\n"
+        );
+        for value in [token, db] {
+            assert!(!output.stdout.contains(value));
+            assert!(!output.stderr.contains(value));
+            assert!(!results["check"].output.to_string().contains(value));
+        }
+    }
+
     #[test]
     fn timed_out_gate() {
         let dir = tmp_dir();

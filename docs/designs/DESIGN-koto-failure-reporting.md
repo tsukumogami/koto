@@ -403,8 +403,9 @@ those cuts (R13-R16).
 
 Key assumptions:
 
-- "Configured API keys" means the effective values koto resolved: a key in the
-  config file overridden by an environment variable isn't searched for.
+- "Configured API keys" means every value koto's configuration supplies for
+  them, not only the effective one: a config-file value a later layer or an
+  environment variable overrides is searched for too.
 - `pass_env:` values count only when they actually reach the command, after
   `build_command_env`'s name filter.
 
@@ -421,10 +422,14 @@ capture without a compile error.
 The known set is built once per tick beside the command environment, dropping
 values shorter than 8 bytes, first source winning on duplicates: the live
 values of `CREDENTIAL_CARRIERS` (`src/engine/command_env.rs`), plus the
-percent-decoded password from the userinfo of any proxy URL among them; the
-template's `pass_env:` values; and every configured value of koto's decider
-key and cloud access and secret keys, both the one koto resolved and a
-config-file value an environment variable overrides. A legacy session, whose
+password from the userinfo of any proxy URL among them, both percent-decoded
+and as written; the template's `pass_env:` values; and every configured value
+of koto's decider key and cloud access and secret keys: the one koto resolved,
+and each value any config file sets, whichever layer it's in and whether or
+not a later layer, an environment variable or the project-file rule for the
+decider key sets it aside. `KOTO_DECIDER_API_KEY`, `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` are also read from the environment directly, so they
+stay in the set when the configuration fails to load. A legacy session, whose
 commands inherit the caller's whole environment, looks the carriers and
 `pass_env:` names up in that environment. Each value is also added in its JSON
 string spelling (as `serde_json` escapes it, and again with `/` written as
@@ -433,7 +438,9 @@ escaped copy through the captured text.
 
 The marker is `[REDACTED:<source>]`, where the source is a variable name,
 or a configuration setting name (which always contains a dot) for a key read
-from the config file. The marker is ASCII, safe inside a JSON string, and fails
+from the config file. A source name is at most 64 bytes, both when koto writes
+a marker and when it recognizes one, so marker-shaped text a command prints
+with a longer name isn't treated as a marker. The marker is ASCII, safe inside a JSON string, and fails
 the variable-value pattern, so a capture that would store one is refused with a
 new `redacted` case instead of being substituted into later commands.
 
@@ -829,7 +836,8 @@ the capture point (Decision 5) replaces every known credential before any
 consumer sees the text: the live values of the credential-carrier variables and
 the passwords embedded in proxy URLs, `pass_env:` values that reach the
 command, and every configured value of koto's own decider and cloud keys,
-whether or not an environment variable overrides it. Legacy sessions, whose
+in any config layer, whether or not a later layer or an environment variable
+overrides it. Legacy sessions, whose
 commands inherit the whole environment, build the same set from that
 environment. Each value is also matched in its JSON-escaped spelling, so a
 finding line can't carry an escaped copy through the captured text or the log.
