@@ -850,7 +850,7 @@ fn handle_workflows_action(action: WorkflowsAction) -> Result<()> {
                     )
                 })?,
             };
-            crate::workflows_surface::publish_location(&backend, &session_id, &dir)?;
+            crate::workflows_surface::publish_location(&backend, &backend, &session_id, &dir)?;
             Ok(())
         }
     }
@@ -941,16 +941,12 @@ pub(crate) fn resolve_variables(
 }
 
 /// Truncate a string to at most `max_bytes` bytes. If truncated, appends a note.
-/// Handles UTF-8 correctly by truncating at a char boundary.
+/// Cuts at a char boundary and never inside a redaction marker.
 fn truncate_output(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
-    // Find the largest char boundary at or before max_bytes.
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = crate::redact::safe_cut_len(s.as_bytes(), max_bytes);
     let mut truncated = s[..end].to_string();
     truncated.push_str(TRUNCATION_NOTE);
     truncated
@@ -959,19 +955,34 @@ fn truncate_output(s: &str, max_bytes: usize) -> String {
 /// Note appended to a stream whose tail was dropped.
 const TRUNCATION_NOTE: &str = "\n... [output truncated]";
 
-/// Mark `s` as truncated when the runner dropped bytes from this stream.
+/// Mark `s` as truncated when the runner cut this stream.
 ///
-/// `CommandOutput::truncated` is the authority that something was dropped;
-/// it is one flag for both streams, so the length picks out which one. Only
-/// a stream that reached the retention bound can have been cut, and decoding
-/// drops at most the three trailing bytes of a split character, so a stream
-/// within three bytes of the bound is the one that lost its tail.
+/// `stream_truncated` is the stream's own flag from `CommandOutput`
+/// (`stdout_truncated` or `stderr_truncated`), so a stream is marked only
+/// when it lost something, however long it is.
 #[cfg(unix)]
-fn mark_truncated(s: String, truncated: bool) -> String {
-    if truncated && s.len() + 3 >= MAX_ACTION_OUTPUT_BYTES && !s.ends_with(TRUNCATION_NOTE) {
+fn mark_truncated(s: String, stream_truncated: bool) -> String {
+    if stream_truncated && !s.ends_with(TRUNCATION_NOTE) {
         format!("{}{}", s, TRUNCATION_NOTE)
     } else {
         s
+    }
+}
+
+/// The result of a polling action interrupted by a signal: no exit status
+/// was ever obtained for the attempt.
+#[cfg(unix)]
+fn polling_interrupted() -> crate::action::CommandOutput {
+    crate::action::CommandOutput {
+        exit_code: -1,
+        stdout: crate::redact::RedactedText::default(),
+        stderr: crate::redact::RedactedText::koto_note("polling interrupted by signal"),
+        failure_kind: Some(crate::action::FailureKind::WaitFailed),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        truncated: false,
+        stderr_ends_with_note: true,
+        duration_ms: 0,
     }
 }
 
@@ -1144,14 +1155,7 @@ where
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            return crate::action::CommandOutput {
-                exit_code: -1,
-                stdout: String::new(),
-                stderr: "polling interrupted by signal".to_string(),
-                // No exit status was ever obtained for this attempt.
-                failure_kind: Some(crate::action::FailureKind::WaitFailed),
-                truncated: false,
-            };
+            return polling_interrupted();
         }
 
         let output = crate::action::run_shell_command(command, working_dir, 30, env);
@@ -1171,17 +1175,19 @@ where
         }
 
         if Instant::now() >= deadline {
+            // koto's note goes on after redaction, so it is never searched.
+            let mut stderr = output.stderr;
+            stderr.push_koto_note(&format!(
+                "\npolling timed out after {} seconds",
+                polling.timeout_secs
+            ));
             return crate::action::CommandOutput {
-                exit_code: output.exit_code,
-                stdout: output.stdout,
-                stderr: format!(
-                    "{}\npolling timed out after {} seconds",
-                    output.stderr, polling.timeout_secs
-                ),
+                stderr,
                 failure_kind: output
                     .failure_kind
                     .or(Some(crate::action::FailureKind::TimedOut)),
-                truncated: output.truncated,
+                stderr_ends_with_note: true,
+                ..output
             };
         }
 
@@ -1189,14 +1195,7 @@ where
         let sleep_end = Instant::now() + Duration::from_secs(u64::from(polling.interval_secs));
         while Instant::now() < sleep_end {
             if shutdown.load(Ordering::Relaxed) {
-                return crate::action::CommandOutput {
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: "polling interrupted by signal".to_string(),
-                    // No exit status was ever obtained for this attempt.
-                    failure_kind: Some(crate::action::FailureKind::WaitFailed),
-                    truncated: false,
-                };
+                return polling_interrupted();
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -1569,8 +1568,15 @@ pub fn run(app: App) -> Result<()> {
                     key,
                     to_file,
                 } => {
-                    context::restore_assigned(store, &backend, &session, &key);
-                    if let Err(e) = context::handle_get(store, &session, &key, to_file.as_deref()) {
+                    let events = context::restore_assigned(store, &backend, &session, &key);
+                    if let Err(e) = context::handle_get(
+                        store,
+                        &backend,
+                        events.as_deref(),
+                        &session,
+                        &key,
+                        to_file.as_deref(),
+                    ) {
                         exit_with_error_code(
                             serde_json::json!({
                                 "error": e.to_string(),
@@ -1586,8 +1592,9 @@ pub fn run(app: App) -> Result<()> {
                     // caller that branches on success-versus-failure is
                     // unaffected; exit 2 is "not a key at all", which koto
                     // already uses for input the caller must fix.
-                    context::restore_assigned(store, &backend, &session, &key);
-                    match context::handle_exists(store, &session, &key) {
+                    let events = context::restore_assigned(store, &backend, &session, &key);
+                    match context::handle_exists(store, &backend, events.as_deref(), &session, &key)
+                    {
                         context::KeyPresence::Present => std::process::exit(0),
                         context::KeyPresence::Absent => std::process::exit(1),
                         context::KeyPresence::Unusable(reason) => {
@@ -2795,18 +2802,26 @@ fn terminal_record(
             already_recorded: true,
         };
     }
-    let result =
-        resolve_terminal_result(backend, context_store, name, compiled, final_state, &events);
+    // This is the recording path, so its context reads are logged (`reader:
+    // "result"`), the `failure_reason` read included. `koto status` resolves
+    // read-only through `resolve_terminal_result` directly and logs nothing.
+    let recording = crate::session::context_log::RecordingStore::new(context_store);
+    let result = resolve_terminal_result(backend, &recording, name, compiled, final_state, &events);
     let failure_reason = match result.status {
         crate::engine::types::TerminalOutcome::Failure => {
             crate::engine::terminal_result::failure_reason_for_current_run(
-                context_store,
-                name,
-                &events,
+                &recording, name, &events,
             )
         }
         _ => None,
     };
+    crate::session::context_log::append_reads(
+        backend,
+        name,
+        recording.into_reads(),
+        crate::session::context_log::READER_RESULT,
+        final_state,
+    );
     TerminalRecord {
         result,
         failure_reason,
@@ -3720,7 +3735,7 @@ fn handle_next(
         IntegrationUnavailableMarker, NextError, NextErrorCode, NextResponse, RECOVERY_POINTER,
     };
     use crate::engine::advance::{
-        advance_until_stop_with_decider, merge_epoch_evidence, ActionResult, AdvanceError,
+        advance_until_stop_recording, merge_epoch_evidence, ActionResult, AdvanceError,
         IntegrationError, StopReason,
     };
     use crate::engine::evidence::validate_evidence;
@@ -3762,7 +3777,10 @@ fn handle_next(
     // The decider settings come from the same load. Their warnings (an
     // unrecognized `KOTO_DECIDER`, a key the project config may not set,
     // and so on) are printed here, once per `koto next` invocation.
-    let (request_store_cfg, decider_settings) = {
+    //
+    // The same load names koto's own configured secrets, which join the
+    // tick's known credentials so no command's output carries them.
+    let (request_store_cfg, decider_settings, config_keys) = {
         let base = crate::config::resolve::load_config().unwrap_or_default();
         crate::config::warn_if_request_store_recursion_reserved(&base);
         let cli_overrides = crate::config::resolve::RequestStoreOverrides {
@@ -3777,6 +3795,7 @@ fn handle_next(
         (
             crate::config::resolve::request_store_config(&base.request_store, &cli_overrides),
             decider_settings,
+            crate::config::redaction_keys(&base),
         )
     };
 
@@ -4346,6 +4365,7 @@ fn handle_next(
         &compiled.pass_env,
         &name,
         backend.session_dir(&name).parent(),
+        &config_keys,
         |n| std::env::var(n).ok(),
     ) {
         Ok(built) => built,
@@ -5180,6 +5200,18 @@ fn handle_next(
     let epoch_events = derive_evidence(&current_events);
     let evidence = merge_epoch_evidence(&epoch_events.into_iter().cloned().collect::<Vec<_>>());
 
+    // Whether this invocation recorded evidence for the state it starts in:
+    // an `evidence_submitted` for that state that the first read didn't hold.
+    // It is what makes a finding's `effect_landed` true on this state.
+    let pre_evidence_seq = events.last().map(|e| e.seq).unwrap_or(0);
+    let evidence_recorded = current_events.iter().any(|e| {
+        e.seq > pre_evidence_seq
+            && matches!(
+                &e.payload,
+                EventPayload::EvidenceSubmitted { state, .. } if state.as_str() == current_state
+            )
+    });
+
     // Repair any transition `context_assignments` an earlier tick recorded
     // but did not get into the store, before a context gate reads it
     // (koto#204). Non-fatal: the log still holds the value and the next read
@@ -5316,27 +5348,46 @@ fn handle_next(
             // then canonicalize and refuse an escape
             // (DESIGN-koto-runs-commands.md Decision 8). A rejection is an
             // action failure under Decision 3 -- same stop, same response
-            // shape, same `fallback` prose. No `DefaultActionExecuted` event
-            // is appended, because no command ran: the failure is reported as
-            // a spawn failure, which is what it is.
+            // shape, same `fallback` prose. `spawned: false` tells the advance
+            // loop no command ran, so it appends no `DefaultActionExecuted`
+            // event and counts no attempt: the failure is reported as a spawn
+            // failure, which is what it is.
             let substituted =
                 substitute_plain(&action.working_dir, &runtime_vars, &variables, &overlay);
             match resolve_action_working_dir(&execution_dir, &substituted) {
                 Ok(dir) => dir,
                 Err(message) => {
+                    // Nothing ran, so koto's refusal is the whole of stderr.
+                    // The message can quote a substituted value, so it goes
+                    // through the redactor before anything reads it.
+                    let message =
+                        crate::redact::redact_str(&message, tick_gates.command_env.redactor());
+                    let check = crate::findings::CheckOutput {
+                        findings: Vec::new(),
+                        captured: crate::findings::Captured {
+                            stderr: message.clone(),
+                            ..Default::default()
+                        },
+                        stderr_ends_with_note: true,
+                    };
                     return ActionResult::Failed {
                         command,
                         failure_kind: crate::action::FailureKind::SpawnFailed,
                         exit_code: -1,
                         stdout: String::new(),
-                        stderr: message,
+                        stderr: message.into_string(),
                         truncated: false,
+                        check,
+                        duration_ms: 0,
+                        spawned: false,
                     };
                 }
             }
         };
 
-        // Execute: polling or one-shot.
+        // Execute: polling or one-shot. The run time covers the whole
+        // polling loop for a polling action, as its timeout does.
+        let started = std::time::Instant::now();
         let output = if let Some(polling) = &action.polling {
             // For polling, we need to evaluate gates inside the loop.
             // Look up the state's gates from the compiled template.
@@ -5412,25 +5463,24 @@ fn handle_next(
         );
 
         // Truncate output, then mark whichever stream the runner had to cut.
+        // Both streams are already redacted; the cut never splits a marker.
         let stdout = mark_truncated(
             truncate_output(&output.stdout, MAX_ACTION_OUTPUT_BYTES),
-            output.truncated,
+            output.stdout_truncated,
         );
         let stderr = mark_truncated(
             truncate_output(&output.stderr, MAX_ACTION_OUTPUT_BYTES),
-            output.truncated,
+            output.stderr_truncated,
         );
 
-        // Append DefaultActionExecuted event.
-        let event_payload = EventPayload::DefaultActionExecuted {
-            state: state_name.to_string(),
-            command: command.clone(),
-            exit_code: output.exit_code,
-            stdout: stdout.clone(),
-            stderr: stderr.clone(),
-            truncated: output.truncated,
-        };
-        let _ = backend.append_event(&name, &event_payload, &now_iso8601());
+        let duration_ms = crate::action::elapsed_ms(started);
+
+        // The advance loop appends `DefaultActionExecuted` from what this
+        // returns, once it knows the findings, counts and capture result.
+
+        // The findings and streams the `failure` object carries: the runner's
+        // capture itself, without the truncation note added above.
+        let check = crate::gate::check_output(&output, tick_gates.command_env.redactor());
 
         // Failure is classified before the confirmation branch. Confirmation
         // used to fire on success and failure alike, producing a confirm stop
@@ -5446,6 +5496,9 @@ fn handle_next(
                 stdout,
                 stderr,
                 truncated: output.truncated,
+                check,
+                duration_ms,
+                spawned: true,
             };
         }
 
@@ -5456,6 +5509,8 @@ fn handle_next(
                 stdout,
                 stderr,
                 truncated: output.truncated,
+                check,
+                duration_ms,
             }
         } else {
             ActionResult::Executed {
@@ -5464,6 +5519,8 @@ fn handle_next(
                 stdout,
                 stderr,
                 truncated: output.truncated,
+                check,
+                duration_ms,
             }
         }
     };
@@ -5493,7 +5550,7 @@ fn handle_next(
             None
         };
 
-    let result = advance_until_stop_with_decider(
+    let result = advance_until_stop_recording(
         current_state,
         &compiled,
         &evidence,
@@ -5507,6 +5564,7 @@ fn handle_next(
         decider_port
             .as_mut()
             .map(|p| p as &mut dyn crate::engine::decider::DeciderPort),
+        crate::engine::advance::AdvanceOptions { evidence_recorded },
     );
     drop(decider_port);
 
@@ -5558,6 +5616,7 @@ fn handle_next(
         Ok(advance_result) => {
             let final_state = &advance_result.final_state;
             let advanced = advance_result.advanced;
+            let attempts = advance_result.attempts.clone();
 
             let final_template_state = match compiled.states.get(final_state) {
                 Some(s) => s,
@@ -6285,6 +6344,10 @@ fn handle_next(
             if let Some(abandoned) = &abandoned_leg {
                 envelope.insert("leg_abandoned".to_string(), abandoned.sibling());
             }
+            // The blocked state's attempt counts, beside `leg` and only on a
+            // response with blocking conditions
+            // (DESIGN-koto-failure-reporting.md, Decision 3).
+            next_types::attach_attempts(&mut envelope, attempts.as_ref())?;
 
             println!(
                 "{}",
@@ -7025,6 +7088,7 @@ fn evaluate_children_complete(
                           remedy: give the variable a default, or omit name_filter \
                           entirely if the gate really should watch every child",
             }),
+            ..Default::default()
         };
     }
 
@@ -7057,7 +7121,11 @@ fn evaluate_children_complete(
         GateOutcome::Failed
     };
 
-    StructuredGateResult { outcome, output }
+    StructuredGateResult {
+        outcome,
+        output,
+        ..Default::default()
+    }
 }
 
 /// Augment each row of `koto workflows --children <parent>` with
@@ -7349,12 +7417,18 @@ mod tests {
         let cut = "x".repeat(MAX_ACTION_OUTPUT_BYTES);
         let short = "boom".to_string();
 
-        // One flag, two streams: only the one at the bound lost a tail.
+        // Each stream carries its own flag: only a flagged one is marked.
         assert!(mark_truncated(cut.clone(), true).ends_with(TRUNCATION_NOTE));
-        assert_eq!(mark_truncated(short.clone(), true), short);
-        // A stream that happens to sit exactly at the bound without the
-        // runner dropping anything is not marked.
+        assert_eq!(mark_truncated(short.clone(), false), short);
+        // A cut stream can end well short of the bound, when the final cut
+        // drops a marker that would straddle it whole; its flag still
+        // marks it.
+        assert!(mark_truncated(short.clone(), true).ends_with(TRUNCATION_NOTE));
+        // A stream that happens to sit at (or within three bytes of) the
+        // bound without being cut is not marked.
         assert_eq!(mark_truncated(cut.clone(), false), cut);
+        let near = "x".repeat(MAX_ACTION_OUTPUT_BYTES - 3);
+        assert_eq!(mark_truncated(near.clone(), false), near);
         // Marking is not applied twice.
         let marked = mark_truncated(cut, true);
         assert_eq!(mark_truncated(marked.clone(), true), marked);

@@ -1,0 +1,169 @@
+{
+  "format_version": 1,
+  "name": "decider-declared",
+  "version": "1.0",
+  "description": "Enum and boolean decider declarations on accepts fields",
+  "initial_state": "gather",
+  "variables": {
+    "PLAN_DOC": {
+      "description": "Path to the plan document",
+      "default": "docs/plans/PLAN-example.md"
+    }
+  },
+  "states": {
+    "confirm": {
+      "directive": "Changed files: {{CHANGED_FILES}}. Confirm the change stays within the outline item.",
+      "transitions": [
+        {
+          "target": "done",
+          "when": {
+            "ready": true
+          }
+        },
+        {
+          "target": "review",
+          "when": {
+            "ready": false
+          }
+        }
+      ],
+      "accepts": {
+        "ready": {
+          "field_type": "boolean",
+          "required": true,
+          "description": "Does the change touch only the files the outline item names?",
+          "decider": {
+            "answers": {
+              "false": {
+                "description": "Other files changed too.",
+                "mode": "auto",
+                "threshold": 0.9
+              },
+              "true": {
+                "description": "Only the named files changed.",
+                "mode": "shadow",
+                "threshold": 0.9
+              }
+            },
+            "inputs": [
+              {
+                "source": {
+                  "var": "CHANGED_FILES"
+                },
+                "label": "changed_files",
+                "max_bytes": 4096
+              }
+            ]
+          }
+        }
+      }
+    },
+    "done": {
+      "directive": "Done.",
+      "terminal": true
+    },
+    "gather": {
+      "directive": "Write the outline item for {{PLAN_DOC}} to the `outline.md` context key.",
+      "transitions": [
+        {
+          "target": "measure",
+          "when": {
+            "gates.outline.exists": true
+          }
+        }
+      ],
+      "gates": {
+        "outline": {
+          "type": "context-exists",
+          "key": "outline.md"
+        }
+      },
+      "default_action": {
+        "command": "printf 'Add a --dry-run flag to the sync command.' | koto context add {{SESSION_NAME}} outline.md"
+      }
+    },
+    "measure": {
+      "directive": "Record the changed files.",
+      "transitions": [
+        {
+          "target": "review"
+        }
+      ],
+      "default_action": {
+        "command": "echo src/sync.rs",
+        "capture_stdout_as": "CHANGED_FILES"
+      }
+    },
+    "review": {
+      "directive": "Decide whether the outline item is clear enough to implement.",
+      "transitions": [
+        {
+          "target": "confirm",
+          "when": {
+            "verdict": "proceed"
+          }
+        },
+        {
+          "target": "stopped",
+          "when": {
+            "verdict": "exit"
+          }
+        }
+      ],
+      "accepts": {
+        "rationale": {
+          "field_type": "string",
+          "required": false,
+          "description": "Why this verdict"
+        },
+        "verdict": {
+          "field_type": "enum",
+          "required": true,
+          "values": [
+            "proceed",
+            "exit"
+          ],
+          "description": "Is the plan outline item clear and scoped enough to implement?",
+          "decider": {
+            "answers": {
+              "exit": {
+                "description": "Vague, contradictory, or needs design first.",
+                "mode": "never",
+                "threshold": 0.9
+              },
+              "proceed": {
+                "description": "Names a concrete change with checkable criteria.",
+                "mode": "shadow",
+                "threshold": 0.92
+              }
+            },
+            "escape": {
+              "value": "unclear",
+              "description": "Missing, truncated, or unjudgeable."
+            },
+            "inputs": [
+              {
+                "source": {
+                  "context": "outline.md"
+                },
+                "label": "outline_item",
+                "max_bytes": 12000
+              },
+              {
+                "source": {
+                  "var": "PLAN_DOC"
+                },
+                "label": "plan_path",
+                "max_bytes": 8192
+              }
+            ]
+          }
+        }
+      }
+    },
+    "stopped": {
+      "directive": "Stopped.",
+      "terminal": true
+    }
+  }
+}

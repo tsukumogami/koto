@@ -7,10 +7,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::action::FailureKind;
 use crate::engine::decider::{consult_at_stop, DeciderPort, StopContext, StopOutcome};
-use crate::engine::persistence::derive_overrides;
+use crate::engine::persistence::{delivery_window, derive_overrides};
 use crate::engine::substitute::{GateCaptureRefusal, VariableOverlay};
-use crate::engine::types::{now_iso8601, Event, EventPayload};
+use crate::engine::types::{
+    now_iso8601, CheckEventFields, Event, EventPayload, LoggedStreams, RuleCount, RuleCounts,
+    LOG_RULE_COUNTS_CAP, LOG_STREAM_MAX_BYTES,
+};
+use crate::findings::{
+    build_failure, fill_effect_landed, CheckOutput, Finding, FindingLevel, GateFailure,
+    LOG_FINDINGS_CAP,
+};
 use crate::gate::{GateOutcome, StructuredGateResult};
+use crate::session::context_log::{append_best_effort, READER_GATE};
 use crate::template::types::{
     is_is_set_matcher, is_present_matcher, ActionDecl, CompiledTemplate, TemplateState,
     ACTION_CONDITION_NAME, EVIDENCE_NAMESPACE, GATES_EVIDENCE_NAMESPACE, VARS_NAMESPACE,
@@ -68,6 +76,11 @@ pub enum ActionResult {
         stdout: String,
         stderr: String,
         truncated: bool,
+        /// The findings the command printed and its captured streams.
+        check: CheckOutput,
+        /// Wall-clock run time of the command (the whole polling loop for a
+        /// polling action), in milliseconds.
+        duration_ms: u64,
     },
     /// Action was skipped (override evidence existed).
     Skipped,
@@ -78,6 +91,11 @@ pub enum ActionResult {
         stdout: String,
         stderr: String,
         truncated: bool,
+        /// The findings the command printed and its captured streams.
+        check: CheckOutput,
+        /// Wall-clock run time of the command (the whole polling loop for a
+        /// polling action), in milliseconds.
+        duration_ms: u64,
     },
     /// The action did not run, because a `{{KEY}}` in it names a capture no
     /// state has delivered on this run.
@@ -120,6 +138,15 @@ pub enum ActionResult {
         stdout: String,
         stderr: String,
         truncated: bool,
+        /// The findings the command printed and its captured streams, for
+        /// the condition's `failure`.
+        check: CheckOutput,
+        /// Wall-clock run time of the command, in milliseconds.
+        duration_ms: u64,
+        /// Whether a command was spawned. A `working_dir` rejection spawns
+        /// nothing: it appends no `default_action_executed` and is no
+        /// attempt.
+        spawned: bool,
     },
 }
 
@@ -131,6 +158,7 @@ pub enum ActionResult {
 /// non-zero exit: for a spawn failure, a timeout, or a wait error the runner
 /// never obtained a status, and reporting the synthetic `-1` would be the
 /// conflation `failure_kind` exists to end.
+#[allow(clippy::too_many_arguments)]
 fn action_failure_conditions(
     state: &str,
     command: &str,
@@ -139,6 +167,7 @@ fn action_failure_conditions(
     stdout: &str,
     stderr: &str,
     truncated: bool,
+    check: CheckOutput,
 ) -> BTreeMap<String, StructuredGateResult> {
     // The outcome only sets the condition's `status` string. `failure_kind`
     // in the payload is the discriminator agents route on; this keeps the
@@ -158,6 +187,11 @@ fn action_failure_conditions(
         stderr,
         truncated,
         None,
+        build_failure(
+            ACTION_CONDITION_NAME,
+            Some(check),
+            &crate::gate::command_outcome_sentence(failure_kind, exit_code),
+        ),
     )
 }
 
@@ -177,7 +211,12 @@ fn capture_failure_conditions(
     stderr: &str,
     truncated: bool,
     error: &CaptureError,
+    check: CheckOutput,
 ) -> BTreeMap<String, StructuredGateResult> {
+    let sentence = format!(
+        "command exited 0 but its output could not be delivered as {}",
+        error.key()
+    );
     action_condition(
         state,
         command,
@@ -188,6 +227,7 @@ fn capture_failure_conditions(
         stderr,
         truncated,
         Some(error.to_json()),
+        build_failure(ACTION_CONDITION_NAME, Some(check), &sentence),
     )
 }
 
@@ -204,6 +244,7 @@ fn action_condition(
     stderr: &str,
     truncated: bool,
     capture_error: Option<serde_json::Value>,
+    (findings, failure): (Vec<Finding>, GateFailure),
 ) -> BTreeMap<String, StructuredGateResult> {
     let mut output = serde_json::Map::new();
     output.insert("state".to_string(), serde_json::json!(state));
@@ -219,14 +260,21 @@ fn action_condition(
         output.insert("capture_error".to_string(), error);
     }
 
+    // A failed action landed nothing: its command failed, or its output
+    // could not be delivered. Evidence can't have landed either, since
+    // evidence on the state skips the action.
+    let mut result = StructuredGateResult {
+        outcome,
+        output: serde_json::Value::Object(output),
+        failure: Some(failure),
+        findings,
+        duration_ms: None,
+        context_reads: Vec::new(),
+    };
+    fill_effect_landed(result.all_findings_mut(), false);
+
     let mut map = BTreeMap::new();
-    map.insert(
-        ACTION_CONDITION_NAME.to_string(),
-        StructuredGateResult {
-            outcome,
-            output: serde_json::Value::Object(output),
-        },
-    );
+    map.insert(ACTION_CONDITION_NAME.to_string(), result);
     map
 }
 
@@ -250,6 +298,12 @@ const CAPTURE_FAILED_KIND: &str = "capture_failed";
 pub enum CaptureError {
     /// The command wrote nothing, or nothing but whitespace.
     Empty { key: String },
+    /// The trimmed output holds a redaction marker: the command printed a
+    /// known credential, which koto replaced before anything read it, or
+    /// printed marker-shaped text itself (`[REDACTED:FOO]`). `source` is the
+    /// name inside the first marker: where the credential came from, or
+    /// whatever the command wrote there. Never a credential's value.
+    Redacted { key: String, source: String },
     /// The trimmed output is larger than [`MAX_CAPTURE_BYTES`].
     TooLarge { key: String, bytes: usize },
     /// The trimmed output holds a character the variable allowlist forbids --
@@ -264,6 +318,16 @@ pub enum CaptureError {
 }
 
 impl CaptureError {
+    /// The capture name the failure is about.
+    fn key(&self) -> &str {
+        match self {
+            CaptureError::Empty { key }
+            | CaptureError::Redacted { key, .. }
+            | CaptureError::TooLarge { key, .. }
+            | CaptureError::DisallowedCharacter { key, .. } => key,
+        }
+    }
+
     /// The `capture_error` object carried in the `__action__` payload. `case`
     /// is the discriminator; the remaining fields are what an author needs to
     /// find the offending output.
@@ -272,6 +336,11 @@ impl CaptureError {
             CaptureError::Empty { key } => serde_json::json!({
                 "key": key,
                 "case": "empty",
+            }),
+            CaptureError::Redacted { key, source } => serde_json::json!({
+                "key": key,
+                "case": "redacted",
+                "source": source,
             }),
             CaptureError::TooLarge { key, bytes } => serde_json::json!({
                 "key": key,
@@ -296,15 +365,25 @@ impl CaptureError {
 /// Prepare a command's stdout for delivery under `key`.
 ///
 /// The order is fixed (DESIGN-koto-runs-commands.md, "Capture delivery and its
-/// three failure cases"): trim, reject empty, reject oversize, then run the
-/// value through the same `validate_value` allowlist every declared variable
-/// passes. Reusing that function rather than restating the character set means
+/// three failure cases", which this change extends to four): trim, reject
+/// empty, reject a value holding a
+/// redaction marker (DESIGN-koto-failure-reporting.md, Decision 5), reject
+/// oversize, then run the value through the same `validate_value` allowlist
+/// every declared variable passes. The marker check comes before the size and
+/// allowlist checks, both of which a marker would also fail, so the refusal
+/// names what actually happened. Reusing that function rather than restating the character set means
 /// a future widening is a single reviewed change both paths inherit.
 pub fn prepare_capture(key: &str, stdout: &str) -> Result<String, CaptureError> {
     let value = stdout.trim();
     if value.is_empty() {
         return Err(CaptureError::Empty {
             key: key.to_string(),
+        });
+    }
+    if let Some(source) = crate::redact::first_marker_source(value) {
+        return Err(CaptureError::Redacted {
+            key: key.to_string(),
+            source: source.to_string(),
         });
     }
     if value.len() > MAX_CAPTURE_BYTES {
@@ -333,47 +412,109 @@ pub fn prepare_capture(key: &str, stdout: &str) -> Result<String, CaptureError> 
     Ok(value.to_string())
 }
 
-/// Deliver a state's captured stdout, or report why it could not be.
+/// What a `default_action` run left for its `default_action_executed`
+/// event: the substituted command, its exit code, the leading 64 KiB of
+/// each redacted stream (with the truncation note), and its run time.
+struct ActionRun<'a> {
+    state: &'a str,
+    command: &'a str,
+    exit_code: i32,
+    stdout: &'a str,
+    stderr: &'a str,
+    truncated: bool,
+    duration_ms: u64,
+}
+
+/// The `default_action_executed` event for `run`, carrying `result`'s
+/// findings and rule counts under the check name `__action__`.
+fn action_event(
+    run: &ActionRun<'_>,
+    result: &StructuredGateResult,
+    stamp: AttemptStamp,
+    events: &[Event],
+) -> EventPayload {
+    let mut check = check_fields(result, ACTION_CONDITION_NAME, stamp, events, run.state);
+    check.duration_ms = Some(run.duration_ms);
+    EventPayload::DefaultActionExecuted {
+        state: run.state.to_string(),
+        command: run.command.to_string(),
+        exit_code: run.exit_code,
+        stdout: run.stdout.to_string(),
+        stderr: run.stderr.to_string(),
+        truncated: run.truncated,
+        check,
+    }
+}
+
+/// Record a `default_action` that exited 0, and deliver its capture or
+/// report why it could not be.
 ///
 /// Returns `Ok(None)` when the state declares no capture name or the value
 /// was delivered, and `Ok(Some(conditions))` when delivery failed and the tick
 /// must stop at this state with an `__action__` condition.
 ///
-/// The event and the overlay are written in the same step, so the durable
-/// record and the view the rest of this tick reads can never disagree. The
-/// event goes first: a value the rest of the tick can see but the log does not
-/// hold would survive exactly one tick and then vanish.
-#[allow(clippy::too_many_arguments)]
-fn deliver_capture<F>(
-    state: &str,
+/// The capture is checked first, so `default_action_executed` carries a
+/// capture failure's finding, and is appended before `variable_captured`, the
+/// order the two have always had. Its append failure is a warning. The
+/// `variable_captured` event and the overlay are written in the same step, so
+/// the durable record and the view the rest of this tick reads can never
+/// disagree. The event goes first: a value the rest of the tick can see but
+/// the log does not hold would survive exactly one tick and then vanish.
+fn record_successful_action<F>(
+    run: &ActionRun<'_>,
     action: &ActionDecl,
-    command: &str,
-    stdout: &str,
-    stderr: &str,
-    truncated: bool,
+    check: CheckOutput,
+    stamp: AttemptStamp,
+    tick_log: &std::cell::RefCell<Vec<Event>>,
     overlay: &VariableOverlay,
     append_event: &mut F,
 ) -> Result<Option<BTreeMap<String, StructuredGateResult>>, AdvanceError>
 where
     F: FnMut(&EventPayload) -> Result<(), String>,
 {
-    let Some(key) = &action.capture_stdout_as else {
-        return Ok(None);
-    };
-    match prepare_capture(key, stdout) {
-        Ok(value) => {
-            append_event(&EventPayload::VariableCaptured {
-                key: key.clone(),
-                value: value.clone(),
-            })
-            .map_err(AdvanceError::PersistenceError)?;
-            overlay.insert(key.clone(), value);
-            Ok(None)
+    let capture = action
+        .capture_stdout_as
+        .as_ref()
+        .map(|key| (key, prepare_capture(key, run.stdout)));
+    if let Some((_, Err(error))) = &capture {
+        let mut conditions = capture_failure_conditions(
+            run.state,
+            run.command,
+            run.stdout,
+            run.stderr,
+            run.truncated,
+            error,
+            check,
+        );
+        if let Some(result) = conditions.get_mut(ACTION_CONDITION_NAME) {
+            result.duration_ms = Some(run.duration_ms);
+            let payload = action_event(run, result, stamp, &tick_log.borrow());
+            append_action_event(append_event, &payload);
         }
-        Err(error) => Ok(Some(capture_failure_conditions(
-            state, command, stdout, stderr, truncated, &error,
-        ))),
+        return Ok(Some(conditions));
     }
+
+    // The command exited 0 and its capture, if any, is deliverable: the
+    // change landed.
+    let mut result = StructuredGateResult {
+        outcome: GateOutcome::Passed,
+        findings: check.findings,
+        duration_ms: Some(run.duration_ms),
+        ..Default::default()
+    };
+    fill_effect_landed(result.all_findings_mut(), true);
+    let payload = action_event(run, &result, stamp, &tick_log.borrow());
+    append_action_event(append_event, &payload);
+
+    if let Some((key, Ok(value))) = capture {
+        append_event(&EventPayload::VariableCaptured {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .map_err(AdvanceError::PersistenceError)?;
+        overlay.insert(key.clone(), value);
+    }
+    Ok(None)
 }
 
 /// Why the advancement loop stopped.
@@ -466,6 +607,256 @@ pub struct AdvanceResult {
     pub advanced: bool,
     /// Why the loop stopped.
     pub stop_reason: StopReason,
+    /// The final state's attempt counts for its current visit, when a check
+    /// event of that visit carries an attempt stamp. The CLI adds them to a
+    /// response that has blocking conditions.
+    pub attempts: Option<AttemptCounts>,
+}
+
+/// Options for [`advance_until_stop_recording`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdvanceOptions {
+    /// Whether this invocation recorded evidence for the starting state
+    /// before the loop started. One of the two things that make a finding's
+    /// `effect_landed` true.
+    pub evidence_recorded: bool,
+}
+
+/// Most check/rule pairs a response's `attempts.rules` lists.
+pub const RESPONSE_RULE_PAIRS_CAP: usize = 100;
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// The top-level `attempts` object a blocked `koto next` response carries
+/// (DESIGN-koto-failure-reporting.md, Decision 3): the blocked state's attempt
+/// numbers, and every check/rule pair counted in the current visit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AttemptCounts {
+    /// The state's attempt number in the current visit.
+    pub visit: u64,
+    /// The state's attempt number in the session.
+    pub session: u64,
+    /// Check name (a gate's name, or `__action__`), then rule id, to the
+    /// latest counts recorded in this visit.
+    pub rules: BTreeMap<String, BTreeMap<String, RuleCount>>,
+    /// `true` when more pairs exist than `rules` lists.
+    #[serde(skip_serializing_if = "is_false")]
+    pub rules_truncated: bool,
+}
+
+/// One state entry's attempt numbers, shared by every check event it appends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AttemptStamp {
+    pub attempt: u64,
+    pub visit_attempt: u64,
+}
+
+/// A check event's state, check name and failure-reporting fields: a
+/// `gate_evaluated` (check = the gate) or a `default_action_executed`
+/// (check = `__action__`).
+fn check_event(e: &Event) -> Option<(&str, &str, &CheckEventFields)> {
+    match &e.payload {
+        EventPayload::GateEvaluated {
+            state, gate, check, ..
+        } => Some((state, gate, check)),
+        EventPayload::DefaultActionExecuted { state, check, .. } => {
+            Some((state, ACTION_CONDITION_NAME, check))
+        }
+        _ => None,
+    }
+}
+
+/// The attempt stamp for an entry into `state`, which must be the state the
+/// workflow occupies at the end of `events`.
+///
+/// `attempt` is one more than the highest `attempt` on any check event for
+/// the state; `visit_attempt` is one more than the highest `visit_attempt`
+/// on the state's check events inside its delivery window, which a
+/// self-transition doesn't close and an arrival from elsewhere or a rewind
+/// does. "One plus the highest stored value" rather than a count, so an
+/// attempt whose event was lost, or events predating the fields, can't skew
+/// the numbering.
+pub(crate) fn attempt_stamp(events: &[Event], state: &str) -> AttemptStamp {
+    let highest = |evs: &[Event], pick: fn(&CheckEventFields) -> Option<u64>| {
+        evs.iter()
+            .filter_map(check_event)
+            .filter(|(s, _, _)| *s == state)
+            .filter_map(|(_, _, c)| pick(c))
+            .max()
+            .unwrap_or(0)
+    };
+    AttemptStamp {
+        attempt: 1 + highest(events, |c| c.attempt),
+        visit_attempt: 1 + highest(delivery_window(events, state), |c| c.visit_attempt),
+    }
+}
+
+/// The `rule_counts` for failed check `check` on `state`, for `rules` (the
+/// distinct rule ids it reported at `error`, first reported first).
+///
+/// For each rule, `visit` is one more than the highest stored `visit` for
+/// that rule on this check's events for the state in the delivery window,
+/// and `session` one more than the highest stored `session` across the log.
+fn rule_counts_for(events: &[Event], state: &str, check: &str, rules: &[String]) -> RuleCounts {
+    let highest = |evs: &[Event], rule: &str, pick: fn(RuleCount) -> u64| {
+        evs.iter()
+            .filter_map(check_event)
+            .filter(|(s, c, _)| *s == state && *c == check)
+            .filter_map(|(_, _, f)| f.rule_counts.as_ref()?.get(rule))
+            .map(pick)
+            .max()
+            .unwrap_or(0)
+    };
+    let window = delivery_window(events, state);
+    RuleCounts(
+        rules
+            .iter()
+            .map(|rule| {
+                let count = RuleCount {
+                    visit: 1 + highest(window, rule, |c| c.visit),
+                    session: 1 + highest(events, rule, |c| c.session),
+                };
+                (rule.clone(), count)
+            })
+            .collect(),
+    )
+}
+
+/// The distinct rule ids a check reported at `error` across every finding
+/// it produced -- the parsed ones, uncapped, and koto's fallback -- in the
+/// order first reported.
+fn error_rule_ids(result: &StructuredGateResult) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for f in result.all_findings() {
+        if f.level == FindingLevel::Error && !seen.iter().any(|r| r == &f.rule_id) {
+            seen.push(f.rule_id.clone());
+        }
+    }
+    seen
+}
+
+/// The failure-reporting fields for one check event.
+///
+/// Findings are logged whatever the outcome, capped at
+/// [`LOG_FINDINGS_CAP`] by
+/// [`cap_findings`](crate::findings::cap_findings). `rule_counts` is written
+/// only for a failed check (outcome other than `passed`) that reported a
+/// rule at `error`; findings from a passing check raise nothing.
+fn check_fields(
+    result: &StructuredGateResult,
+    check: &str,
+    stamp: AttemptStamp,
+    events: &[Event],
+    state: &str,
+) -> CheckEventFields {
+    let (findings, findings_truncated) = result.capped_findings(LOG_FINDINGS_CAP);
+    let (rule_counts, rule_counts_truncated) = if result.outcome == GateOutcome::Passed {
+        (None, false)
+    } else {
+        let mut rules = error_rule_ids(result);
+        let truncated = rules.len() > LOG_RULE_COUNTS_CAP;
+        rules.truncate(LOG_RULE_COUNTS_CAP);
+        if rules.is_empty() {
+            (None, false)
+        } else {
+            (
+                Some(rule_counts_for(events, state, check, &rules)),
+                truncated,
+            )
+        }
+    };
+    CheckEventFields {
+        attempt: Some(stamp.attempt),
+        visit_attempt: Some(stamp.visit_attempt),
+        findings,
+        findings_truncated,
+        rule_counts,
+        rule_counts_truncated,
+        duration_ms: result.duration_ms,
+    }
+}
+
+/// The leading [`LOG_STREAM_MAX_BYTES`] of each captured stream, for a
+/// command gate whose outcome isn't `passed`. `None` for a passing gate and
+/// for gates that capture nothing.
+fn logged_streams(result: &StructuredGateResult) -> Option<LoggedStreams> {
+    if result.outcome == GateOutcome::Passed {
+        return None;
+    }
+    let captured = result.failure.as_ref()?.captured.as_ref()?;
+    let (stdout, stdout_cut) = captured.stdout.cut_bytes(LOG_STREAM_MAX_BYTES);
+    let (stderr, stderr_cut) = captured.stderr.cut_bytes(LOG_STREAM_MAX_BYTES);
+    Some(LoggedStreams {
+        stdout: stdout.into_string(),
+        stderr: stderr.into_string(),
+        stdout_truncated: captured.stdout_truncated || stdout_cut,
+        stderr_truncated: captured.stderr_truncated || stderr_cut,
+    })
+}
+
+/// The `attempts` object for `state`, the state the workflow occupies at the
+/// end of `events`: the latest stamp in its delivery window and every
+/// check/rule pair counted there, the latest counts for each. Pairs are
+/// taken most recent first, so when more than
+/// [`RESPONSE_RULE_PAIRS_CAP`] exist the ones dropped are the oldest.
+/// `None` when no check event of the visit carries a stamp.
+pub(crate) fn attempt_counts(events: &[Event], state: &str) -> Option<AttemptCounts> {
+    let window = delivery_window(events, state);
+    let mut latest: Option<(u64, u64)> = None;
+    let mut pairs: Vec<(String, String, RuleCount)> = Vec::new();
+    let mut truncated = false;
+    for (_, check, fields) in window
+        .iter()
+        .rev()
+        .filter_map(check_event)
+        .filter(|(s, _, _)| *s == state)
+    {
+        if latest.is_none() {
+            if let (Some(a), Some(v)) = (fields.attempt, fields.visit_attempt) {
+                latest = Some((v, a));
+            }
+        }
+        let Some(counts) = &fields.rule_counts else {
+            continue;
+        };
+        for (rule, count) in &counts.0 {
+            if pairs.iter().any(|(c, r, _)| c == check && r == rule) {
+                continue;
+            }
+            if pairs.len() >= RESPONSE_RULE_PAIRS_CAP {
+                truncated = true;
+                continue;
+            }
+            pairs.push((check.to_string(), rule.clone(), *count));
+        }
+    }
+    let (visit, session) = latest?;
+    let mut rules: BTreeMap<String, BTreeMap<String, RuleCount>> = BTreeMap::new();
+    for (check, rule, count) in pairs {
+        rules.entry(check).or_default().insert(rule, count);
+    }
+    Some(AttemptCounts {
+        visit,
+        session,
+        rules,
+        rules_truncated: truncated,
+    })
+}
+
+/// Append a check event, and say so on stderr instead of failing when the
+/// event is a `default_action_executed`, whose append was never fatal.
+fn append_action_event<F>(append_event: &mut F, payload: &EventPayload)
+where
+    F: FnMut(&EventPayload) -> Result<(), String>,
+{
+    if let Err(e) = append_event(payload) {
+        eprintln!(
+            "warning: failed to append default_action_executed event: {}",
+            e
+        );
+    }
 }
 
 /// Errors that can occur during advancement (not stop reasons).
@@ -600,7 +991,123 @@ pub fn advance_until_stop_with_decider<F, G, I, A>(
     execute_action: &A,
     overlay: &VariableOverlay,
     shutdown: &AtomicBool,
+    decider: Option<&mut dyn DeciderPort>,
+) -> Result<AdvanceResult, AdvanceError>
+where
+    F: FnMut(&EventPayload) -> Result<(), String>,
+    G: Fn(
+        &BTreeMap<String, crate::template::types::Gate>,
+    ) -> Result<BTreeMap<String, StructuredGateResult>, GateCaptureRefusal>,
+    I: Fn(&str) -> Result<serde_json::Value, IntegrationError>,
+    A: Fn(&str, &ActionDecl, bool) -> ActionResult,
+{
+    advance_until_stop_recording(
+        current_state,
+        template,
+        evidence,
+        all_events,
+        append_event,
+        evaluate_gates,
+        invoke_integration,
+        execute_action,
+        overlay,
+        shutdown,
+        decider,
+        AdvanceOptions::default(),
+    )
+}
+
+/// [`advance_until_stop_with_decider`], with [`AdvanceOptions`]: whether this
+/// invocation recorded evidence for `current_state` before the loop started.
+///
+/// That is one of the two things that make a finding's `effect_landed`
+/// true (DESIGN-koto-failure-reporting.md, Components): the change this
+/// invocation attempted was recorded. The other, a `default_action` that
+/// exited 0 (and delivered its capture, if it declares one), the loop sees
+/// for itself. Every
+/// finding a check left without its own `effect_landed` gets the answer
+/// before it leaves the loop.
+///
+/// Every event the loop appends is also kept in an in-tick list after the
+/// pre-tick log, so a state's attempt stamp and rule counts
+/// (DESIGN-koto-failure-reporting.md, Decision 2) see what this invocation
+/// already wrote, and the result's `attempts` is read from the same list.
+#[allow(clippy::too_many_arguments)]
+pub fn advance_until_stop_recording<F, G, I, A>(
+    current_state: &str,
+    template: &CompiledTemplate,
+    evidence: &BTreeMap<String, serde_json::Value>,
+    all_events: &[Event],
+    append_event: &mut F,
+    evaluate_gates: &G,
+    invoke_integration: &I,
+    execute_action: &A,
+    overlay: &VariableOverlay,
+    shutdown: &AtomicBool,
+    decider: Option<&mut dyn DeciderPort>,
+    options: AdvanceOptions,
+) -> Result<AdvanceResult, AdvanceError>
+where
+    F: FnMut(&EventPayload) -> Result<(), String>,
+    G: Fn(
+        &BTreeMap<String, crate::template::types::Gate>,
+    ) -> Result<BTreeMap<String, StructuredGateResult>, GateCaptureRefusal>,
+    I: Fn(&str) -> Result<serde_json::Value, IntegrationError>,
+    A: Fn(&str, &ActionDecl, bool) -> ActionResult,
+{
+    // The pre-tick log plus every event this invocation appends, in order.
+    // Only `.payload` and position matter to the readers of this list, so
+    // the in-tick events carry placeholder metadata.
+    let tick_log: std::cell::RefCell<Vec<Event>> = std::cell::RefCell::new(all_events.to_vec());
+    let mut recording_append = |payload: &EventPayload| -> Result<(), String> {
+        append_event(payload)?;
+        let mut log = tick_log.borrow_mut();
+        let seq = log.last().map_or(1, |e| e.seq + 1);
+        log.push(Event {
+            seq,
+            timestamp: String::new(),
+            event_type: payload.type_name().to_string(),
+            payload: payload.clone(),
+            idempotency_hash: None,
+        });
+        Ok(())
+    };
+    let mut result = advance_loop(
+        current_state,
+        template,
+        evidence,
+        all_events,
+        &mut recording_append,
+        &tick_log,
+        evaluate_gates,
+        invoke_integration,
+        execute_action,
+        overlay,
+        shutdown,
+        decider,
+        options.evidence_recorded,
+    )?;
+    result.attempts = attempt_counts(&tick_log.borrow(), &result.final_state);
+    Ok(result)
+}
+
+/// The loop [`advance_until_stop_recording`] runs. `append_event` records
+/// into `tick_log` as well as persisting, so the log never lags it.
+#[allow(clippy::too_many_arguments)]
+fn advance_loop<F, G, I, A>(
+    current_state: &str,
+    template: &CompiledTemplate,
+    evidence: &BTreeMap<String, serde_json::Value>,
+    all_events: &[Event],
+    append_event: &mut F,
+    tick_log: &std::cell::RefCell<Vec<Event>>,
+    evaluate_gates: &G,
+    invoke_integration: &I,
+    execute_action: &A,
+    overlay: &VariableOverlay,
+    shutdown: &AtomicBool,
     mut decider: Option<&mut dyn DeciderPort>,
+    evidence_recorded: bool,
 ) -> Result<AdvanceResult, AdvanceError>
 where
     F: FnMut(&EventPayload) -> Result<(), String>,
@@ -643,6 +1150,7 @@ where
         // 1. Check shutdown flag
         if shutdown.load(Ordering::Relaxed) {
             return Ok(AdvanceResult {
+                attempts: None,
                 final_state: state,
                 advanced,
                 stop_reason: StopReason::SignalReceived,
@@ -652,6 +1160,7 @@ where
         // 2. Chain limit check
         if transition_count >= MAX_CHAIN_LENGTH {
             return Ok(AdvanceResult {
+                attempts: None,
                 final_state: state,
                 advanced,
                 stop_reason: StopReason::ChainLimitReached,
@@ -670,6 +1179,7 @@ where
         // 3. Terminal state
         if template_state.terminal {
             return Ok(AdvanceResult {
+                attempts: None,
                 final_state: state,
                 advanced,
                 stop_reason: StopReason::Terminal,
@@ -681,6 +1191,7 @@ where
             match invoke_integration(integration_name) {
                 Ok(output) => {
                     return Ok(AdvanceResult {
+                        attempts: None,
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::Integration {
@@ -691,6 +1202,7 @@ where
                 }
                 Err(IntegrationError::Unavailable) => {
                     return Ok(AdvanceResult {
+                        attempts: None,
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::IntegrationUnavailable {
@@ -700,6 +1212,7 @@ where
                 }
                 Err(IntegrationError::Failed(msg)) => {
                     return Ok(AdvanceResult {
+                        attempts: None,
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::IntegrationUnavailable {
@@ -710,6 +1223,18 @@ where
             }
         }
 
+        // Whether the change attempted on this entry to the state was
+        // recorded: evidence this invocation submitted for the starting state
+        // (before any transition), or a `default_action` that exited 0 and
+        // delivered its capture if it declares one (set below). Fills
+        // `effect_landed` on the findings of this state's gates.
+        let mut effect_landed = evidence_recorded && !advanced;
+
+        // This entry's attempt stamp, computed the first time a check event
+        // is about to be appended and shared by every check event the entry
+        // appends. An entry that appends none never computes one.
+        let mut entry_stamp: Option<AttemptStamp> = None;
+
         // 5. Action execution (if state has default_action)
         if let Some(action) = &template_state.default_action {
             let has_evidence = !current_evidence.is_empty();
@@ -717,29 +1242,44 @@ where
             match result {
                 ActionResult::Executed {
                     command,
+                    exit_code,
                     stdout,
                     stderr,
                     truncated,
-                    ..
+                    check,
+                    duration_ms,
                 } => {
-                    // Deliver the capture, if the state declared a name, and
-                    // then continue to gate evaluation.
-                    if let Some(conditions) = deliver_capture(
-                        &state,
+                    // Record the run and deliver the capture, if the state
+                    // declared a name, then continue to gate evaluation. The
+                    // action passed, so its findings go on no response, only
+                    // on `default_action_executed`.
+                    let stamp = *entry_stamp
+                        .get_or_insert_with(|| attempt_stamp(&tick_log.borrow(), &state));
+                    if let Some(conditions) = record_successful_action(
+                        &ActionRun {
+                            state: &state,
+                            command: &command,
+                            exit_code,
+                            stdout: &stdout,
+                            stderr: &stderr,
+                            truncated,
+                            duration_ms,
+                        },
                         action,
-                        &command,
-                        &stdout,
-                        &stderr,
-                        truncated,
+                        check,
+                        stamp,
+                        tick_log,
                         overlay,
                         append_event,
                     )? {
                         return Ok(AdvanceResult {
+                            attempts: None,
                             final_state: state,
                             advanced,
                             stop_reason: StopReason::GateBlocked(conditions),
                         });
                     }
+                    effect_landed = true;
                 }
                 ActionResult::Skipped => {
                     // Continue to gate evaluation
@@ -758,6 +1298,7 @@ where
                     // stop carries only what the operator needs to fix the
                     // template.
                     return Ok(AdvanceResult {
+                        attempts: None,
                         final_state: state.clone(),
                         advanced,
                         stop_reason: StopReason::ActionRefusedUnsetCapture {
@@ -780,6 +1321,7 @@ where
                     // the same five values: the two positions meet here rather
                     // than at two stops that could drift.
                     return Ok(AdvanceResult {
+                        attempts: None,
                         final_state: state.clone(),
                         advanced,
                         stop_reason: StopReason::GateRefusedUnsetCapture {
@@ -798,6 +1340,9 @@ where
                     stdout,
                     stderr,
                     truncated,
+                    check,
+                    duration_ms,
+                    spawned,
                 } => {
                     // Stop at the state that ran the command, and do NOT
                     // evaluate this state's gates: a state's gates judge the
@@ -817,7 +1362,7 @@ where
                     // failing action stops here whether or not confirmation
                     // was requested, and the confirm stop is reached only on
                     // success.
-                    let conditions = action_failure_conditions(
+                    let mut conditions = action_failure_conditions(
                         &state,
                         &command,
                         failure_kind,
@@ -825,8 +1370,34 @@ where
                         &stdout,
                         &stderr,
                         truncated,
+                        check,
                     );
+                    // A command that never spawned (a `working_dir`
+                    // rejection) appends nothing and is no attempt.
+                    if spawned {
+                        let stamp = *entry_stamp
+                            .get_or_insert_with(|| attempt_stamp(&tick_log.borrow(), &state));
+                        if let Some(result) = conditions.get_mut(ACTION_CONDITION_NAME) {
+                            result.duration_ms = Some(duration_ms);
+                            let payload = action_event(
+                                &ActionRun {
+                                    state: &state,
+                                    command: &command,
+                                    exit_code,
+                                    stdout: &stdout,
+                                    stderr: &stderr,
+                                    truncated,
+                                    duration_ms,
+                                },
+                                result,
+                                stamp,
+                                &tick_log.borrow(),
+                            );
+                            append_action_event(append_event, &payload);
+                        }
+                    }
                     return Ok(AdvanceResult {
+                        attempts: None,
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::GateBlocked(conditions),
@@ -838,29 +1409,42 @@ where
                     stdout,
                     stderr,
                     truncated,
+                    check,
+                    duration_ms,
                 } => {
                     // The command ran and exited zero, so its capture is
                     // delivered here too. Confirming re-enters the state with
                     // evidence, which skips the action entirely -- capturing
                     // only on the unconfirmed path would mean a confirmed
                     // action never delivered its value at all.
-                    if let Some(conditions) = deliver_capture(
-                        &state,
+                    let stamp = *entry_stamp
+                        .get_or_insert_with(|| attempt_stamp(&tick_log.borrow(), &state));
+                    if let Some(conditions) = record_successful_action(
+                        &ActionRun {
+                            state: &state,
+                            command: &command,
+                            exit_code,
+                            stdout: &stdout,
+                            stderr: &stderr,
+                            truncated,
+                            duration_ms,
+                        },
                         action,
-                        &command,
-                        &stdout,
-                        &stderr,
-                        truncated,
+                        check,
+                        stamp,
+                        tick_log,
                         overlay,
                         append_event,
                     )? {
                         return Ok(AdvanceResult {
+                            attempts: None,
                             final_state: state,
                             advanced,
                             stop_reason: StopReason::GateBlocked(conditions),
                         });
                     }
                     return Ok(AdvanceResult {
+                        attempts: None,
                         final_state: state.clone(),
                         advanced,
                         stop_reason: StopReason::ActionRequiresConfirmation {
@@ -930,6 +1514,7 @@ where
                         StructuredGateResult {
                             outcome: GateOutcome::Passed,
                             output: override_applied.clone(),
+                            ..Default::default()
                         },
                     );
                     // No GateEvaluated event is emitted for overridden gates.
@@ -948,10 +1533,11 @@ where
                 // any `GateEvaluated` event is appended: nothing ran, so there
                 // is no gate result to report and nothing for a `when` clause
                 // to route on (Issue #225).
-                let evaluated = match evaluate_gates(&gates_to_evaluate) {
+                let mut evaluated = match evaluate_gates(&gates_to_evaluate) {
                     Ok(results) => results,
                     Err(refusal) => {
                         return Ok(AdvanceResult {
+                            attempts: None,
                             final_state: state.clone(),
                             advanced,
                             stop_reason: StopReason::GateRefusedUnsetCapture {
@@ -964,6 +1550,11 @@ where
                         });
                     }
                 };
+                for result in evaluated.values_mut() {
+                    fill_effect_landed(result.all_findings_mut(), effect_landed);
+                }
+                let stamp =
+                    *entry_stamp.get_or_insert_with(|| attempt_stamp(&tick_log.borrow(), &state));
                 for (gate_name, result) in &evaluated {
                     gate_evidence_map.insert(gate_name.clone(), result.output.clone());
                     let outcome_str = match result.outcome {
@@ -972,13 +1563,28 @@ where
                         GateOutcome::TimedOut => "timed_out",
                         GateOutcome::Error => "error",
                     };
+                    // Every gate of this entry carries the same stamp. Rule
+                    // counts are per check, so one gate's event never feeds
+                    // another's counts within the attempt.
+                    let check = check_fields(result, gate_name, stamp, &tick_log.borrow(), &state);
                     let gate_evaluated_payload = EventPayload::GateEvaluated {
                         state: state.clone(),
                         gate: gate_name.clone(),
                         output: result.output.clone(),
                         outcome: outcome_str.to_string(),
                         timestamp: now_iso8601(),
+                        check,
+                        streams: logged_streams(result),
                     };
+                    // The gate's own context reads come immediately before
+                    // its `gate_evaluated`, best-effort: a read that can't be
+                    // logged never fails the tick.
+                    for read in &result.context_reads {
+                        let read_event =
+                            read.clone()
+                                .into_event(READER_GATE, &state, Some(gate_name.as_str()));
+                        append_best_effort(&read_event, |p| append_event(p));
+                    }
                     append_event(&gate_evaluated_payload)
                         .map_err(AdvanceError::PersistenceError)?;
                     gate_results.insert(gate_name.clone(), result.clone());
@@ -1011,6 +1617,7 @@ where
                 // If neither condition holds, return GateBlocked immediately.
                 if template_state.accepts.is_none() && !has_gates_routing {
                     return Ok(AdvanceResult {
+                        attempts: None,
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::GateBlocked(gate_results),
@@ -1084,6 +1691,7 @@ where
                         // Cycle detection BEFORE writing the event.
                         if visited.contains(&target) {
                             return Ok(AdvanceResult {
+                                attempts: None,
                                 final_state: state,
                                 advanced,
                                 stop_reason: StopReason::CycleDetected { state: target },
@@ -1207,6 +1815,7 @@ where
                         }
                     }
                     return Ok(AdvanceResult {
+                        attempts: None,
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::EvidenceRequired {
@@ -1217,12 +1826,14 @@ where
                     // No accepts block but gate(s) failed and no gates.* condition
                     // matched -- the gate itself is blocking.
                     return Ok(AdvanceResult {
+                        attempts: None,
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::GateBlocked(gate_results),
                     });
                 } else {
                     return Ok(AdvanceResult {
+                        attempts: None,
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::UnresolvableTransition,
@@ -1270,6 +1881,7 @@ where
     // Check for cycle before transitioning.
     if visited.contains(&target) {
         return Ok(Some(AdvanceResult {
+            attempts: None,
             final_state: state.clone(),
             advanced: *advanced,
             stop_reason: StopReason::CycleDetected { state: target },
@@ -2600,6 +3212,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -2785,6 +3398,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -2929,6 +3543,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Passed,
                         output: serde_json::json!({"exit_code": 0, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -3059,6 +3674,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -3173,6 +3789,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Passed,
                         output: serde_json::json!({"exit_code": 0, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -3279,6 +3896,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Passed,
                         output: serde_json::json!({"exit_code": 0, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -3313,6 +3931,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -3350,6 +3969,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::TimedOut,
                         output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+                        ..Default::default()
                     },
                 );
             }
@@ -3384,6 +4004,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Error,
                         output: serde_json::json!({"exit_code": -1, "error": "spawn failed"}),
+                        ..Default::default()
                     },
                 );
             }
@@ -3855,6 +4476,22 @@ mod tests {
     }
 
     #[test]
+    fn prepare_capture_refuses_a_redacted_value_naming_the_source() {
+        let err = prepare_capture("TOKEN", " [REDACTED:GH_TOKEN]\n").unwrap_err();
+        assert_eq!(
+            err,
+            CaptureError::Redacted {
+                key: "TOKEN".to_string(),
+                source: "GH_TOKEN".to_string()
+            }
+        );
+        assert_eq!(
+            err.to_json(),
+            serde_json::json!({"key": "TOKEN", "case": "redacted", "source": "GH_TOKEN"})
+        );
+    }
+
+    #[test]
     fn prepare_capture_accepts_output_at_the_bound() {
         let value = "a".repeat(MAX_CAPTURE_BYTES);
         assert_eq!(
@@ -3942,6 +4579,8 @@ mod tests {
             stdout: stdout.to_string(),
             stderr: String::new(),
             truncated: false,
+            check: Default::default(),
+            duration_ms: 0,
         }
     }
 
@@ -4113,6 +4752,8 @@ mod tests {
                 stdout: "hello".to_string(),
                 stderr: String::new(),
                 truncated: false,
+                check: Default::default(),
+                duration_ms: 0,
             }
         };
 
@@ -4217,6 +4858,8 @@ mod tests {
                 stdout: "PR #42 created".to_string(),
                 stderr: String::new(),
                 truncated: false,
+                check: Default::default(),
+                duration_ms: 0,
             }
         };
 
@@ -4265,6 +4908,9 @@ mod tests {
             stdout: "partial".to_string(),
             stderr: "boom".to_string(),
             truncated: false,
+            check: Default::default(),
+            duration_ms: 0,
+            spawned: true,
         }
     }
 
@@ -4329,6 +4975,7 @@ mod tests {
                 StructuredGateResult {
                     outcome: GateOutcome::Passed,
                     output: serde_json::json!({"exit_code": 0}),
+                    ..Default::default()
                 },
             );
             Ok(out)
@@ -4614,6 +5261,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -4691,6 +5339,8 @@ mod tests {
                 stdout: "ok".to_string(),
                 stderr: String::new(),
                 truncated: false,
+                check: Default::default(),
+                duration_ms: 0,
             }
         };
 
@@ -5013,6 +5663,7 @@ mod tests {
                         StructuredGateResult {
                             outcome: GateOutcome::Failed,
                             output: serde_json::json!({"exit_code": 1, "error": ""}),
+                            ..Default::default()
                         },
                     );
                 }
@@ -5090,6 +5741,7 @@ mod tests {
                 GateOutcome::Failed
             },
             output: serde_json::json!({"exit_code": exit_code, "error": ""}),
+            ..Default::default()
         }
     }
 
@@ -5294,6 +5946,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -5504,6 +6157,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -5618,6 +6272,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Failed,
                         output: serde_json::json!({"exit_code": 1, "error": ""}),
+                        ..Default::default()
                     },
                 );
             }
@@ -5738,6 +6393,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Error,
                         output: serde_json::json!({"exit_code": -1, "error": "unsupported gate type"}),
+                        ..Default::default()
                     },
                 );
             }
@@ -5842,6 +6498,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Passed,
                         output: serde_json::json!({"passed": true, "exit_code": 0}),
+                        ..Default::default()
                     },
                 );
             }
@@ -5936,6 +6593,7 @@ mod tests {
                     StructuredGateResult {
                         outcome: GateOutcome::Passed,
                         output: serde_json::json!({"passed": true, "exit_code": 0}),
+                        ..Default::default()
                     },
                 );
             }
@@ -6543,5 +7201,469 @@ mod tests {
             let (result, _) = run(&template, root, evidence);
             assert_eq!(result.final_state, "scoped");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // check events: attempt stamps, and which appends are fatal
+    // -----------------------------------------------------------------------
+
+    fn command_gate(command: &str) -> crate::template::types::Gate {
+        serde_json::from_value(serde_json::json!({"type": "command", "command": command})).unwrap()
+    }
+
+    /// A failing command-gate result whose script printed `findings`.
+    fn failing_gate_result(name: &str, findings: Vec<Finding>) -> StructuredGateResult {
+        let check = CheckOutput {
+            findings,
+            ..Default::default()
+        };
+        let (findings, failure) = build_failure(name, Some(check), "command exited with status 1");
+        StructuredGateResult {
+            outcome: GateOutcome::Failed,
+            output: serde_json::json!({"exit_code": 1, "error": ""}),
+            failure: Some(failure),
+            findings,
+            duration_ms: Some(7),
+            context_reads: Vec::new(),
+        }
+    }
+
+    fn finding(rule: &str, level: FindingLevel) -> Finding {
+        Finding {
+            rule_id: rule.to_string(),
+            level,
+            message: "m".to_string(),
+            path: None,
+            line: None,
+            column: None,
+            rule_ref: None,
+            effect_landed: None,
+            message_source: crate::findings::MessageSource::Check,
+        }
+    }
+
+    fn gated_state(gates: &[&str]) -> TemplateState {
+        TemplateState {
+            directive: "Check.".to_string(),
+            details: String::new(),
+            transitions: vec![unconditional("done")],
+            terminal: false,
+            gates: gates
+                .iter()
+                .map(|g| (g.to_string(), command_gate("false")))
+                .collect(),
+            accepts: None,
+            integration: None,
+            default_action: None,
+            materialize_children: None,
+            failure: false,
+            skipped_marker: false,
+            skip_if: None,
+            result: None,
+        }
+    }
+
+    fn event(seq: u64, payload: EventPayload) -> Event {
+        Event {
+            seq,
+            timestamp: String::new(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        }
+    }
+
+    /// A failing gate that read `note` (absent) and `other` (present).
+    fn gate_with_reads() -> StructuredGateResult {
+        let mut result = failing_gate_result("lint", vec![]);
+        result.context_reads = vec![
+            crate::session::context_log::ContextReadRecord::content("note", None).unwrap(),
+            crate::session::context_log::ContextReadRecord::content("other", Some(b"x")).unwrap(),
+        ];
+        result
+    }
+
+    fn run_with_reads(appended: &mut Vec<EventPayload>) -> Result<AdvanceResult, AdvanceError> {
+        let template = make_template(vec![("check", gated_state(&["lint"]))]);
+        let mut append = |p: &EventPayload| -> Result<(), String> {
+            appended.push(p.clone());
+            Ok(())
+        };
+        let gates = |_: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut out = BTreeMap::new();
+            out.insert("lint".to_string(), gate_with_reads());
+            Ok(out)
+        };
+        advance_until_stop(
+            "check",
+            &template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &gates,
+            &unavailable_integration,
+            &noop_action,
+            &VariableOverlay::new(),
+            &AtomicBool::new(false),
+        )
+    }
+
+    #[test]
+    fn a_gates_reads_are_appended_immediately_before_its_gate_evaluated() {
+        let mut appended = Vec::new();
+        run_with_reads(&mut appended).unwrap();
+        let types: Vec<&str> = appended.iter().map(|p| p.type_name()).collect();
+        assert_eq!(
+            types,
+            vec!["context_read", "context_read", "gate_evaluated"]
+        );
+        match &appended[0] {
+            EventPayload::ContextRead {
+                key,
+                reader,
+                state,
+                present,
+                hash,
+                gate,
+                ..
+            } => {
+                assert_eq!(key, "note");
+                assert_eq!(reader, "gate");
+                assert_eq!(state, "check");
+                assert!(!present);
+                assert_eq!(*hash, None);
+                assert_eq!(gate.as_deref(), Some("lint"));
+            }
+            other => panic!("expected a read, got {other:?}"),
+        }
+    }
+
+    /// With the reads' appends failing, the tick ends exactly as it does
+    /// when they land, and the gate's own record is still written.
+    #[test]
+    fn failing_read_appends_leave_the_tick_unchanged() {
+        let mut logged = Vec::new();
+        let expected = run_with_reads(&mut logged).unwrap();
+
+        let _hook = crate::session::context_log::fail_best_effort_appends();
+        crate::session::context_log::take_warnings();
+        let mut appended = Vec::new();
+        let result = run_with_reads(&mut appended).unwrap();
+        assert_eq!(result, expected);
+        let types: Vec<&str> = appended.iter().map(|p| p.type_name()).collect();
+        assert_eq!(types, vec!["gate_evaluated"]);
+        // Each refused read warns on stderr, naming its key.
+        assert_eq!(
+            crate::session::context_log::take_warnings(),
+            vec![
+                "warning: failed to record context_read for context key \"note\": test hook: append refused",
+                "warning: failed to record context_read for context key \"other\": test hook: append refused",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_gate_evaluated_append_still_fails_the_tick() {
+        let template = make_template(vec![("check", gated_state(&["lint"]))]);
+        let mut append = |p: &EventPayload| -> Result<(), String> {
+            match p {
+                EventPayload::GateEvaluated { .. } => Err("disk full".to_string()),
+                _ => Ok(()),
+            }
+        };
+        let gates = |_: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut out = BTreeMap::new();
+            out.insert("lint".to_string(), failing_gate_result("lint", vec![]));
+            Ok(out)
+        };
+        let result = advance_until_stop(
+            "check",
+            &template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &gates,
+            &unavailable_integration,
+            &noop_action,
+            &VariableOverlay::new(),
+            &AtomicBool::new(false),
+        );
+        assert!(
+            matches!(result, Err(AdvanceError::PersistenceError(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_default_action_executed_append_leaves_the_outcome_unchanged() {
+        let failing_append = |p: &EventPayload| -> Result<(), String> {
+            match p {
+                EventPayload::DefaultActionExecuted { .. } => Err("disk full".to_string()),
+                _ => Ok(()),
+            }
+        };
+
+        // A failing action stops at its `__action__` condition either way.
+        let template = action_failure_template(BTreeMap::new());
+        let mut append = failing_append;
+        let action = |_: &str, _: &ActionDecl, _: bool| failed_action(FailureKind::NonzeroExit, 2);
+        let result = advance_until_stop(
+            "run",
+            &template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &VariableOverlay::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result.final_state, "run");
+        let StopReason::GateBlocked(conditions) = &result.stop_reason else {
+            panic!("expected the action failure, got {:?}", result.stop_reason);
+        };
+        assert!(conditions.contains_key(ACTION_CONDITION_NAME));
+
+        // A succeeding action still delivers its capture and advances.
+        let mut decl = make_action_decl("echo main");
+        decl.capture_stdout_as = Some("BRANCH".to_string());
+        let mut template = action_failure_template(BTreeMap::new());
+        template.states.get_mut("run").unwrap().default_action = Some(decl);
+        let appended = std::cell::RefCell::new(Vec::new());
+        let mut append = |p: &EventPayload| -> Result<(), String> {
+            failing_append(p)?;
+            appended.borrow_mut().push(p.clone());
+            Ok(())
+        };
+        let overlay = VariableOverlay::new();
+        let action = |_: &str, _: &ActionDecl, _: bool| executed("main\n");
+        let result = advance_until_stop(
+            "run",
+            &template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &overlay,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result.final_state, "done");
+        assert_eq!(overlay.get("BRANCH").as_deref(), Some("main"));
+        assert!(appended
+            .borrow()
+            .iter()
+            .any(|p| matches!(p, EventPayload::VariableCaptured { .. })));
+    }
+
+    #[test]
+    fn a_working_dir_rejection_appends_nothing_and_is_no_attempt() {
+        let template = action_failure_template(BTreeMap::new());
+        let appended = std::cell::RefCell::new(Vec::new());
+        let mut append = |p: &EventPayload| -> Result<(), String> {
+            appended.borrow_mut().push(p.clone());
+            Ok(())
+        };
+        let action =
+            |_: &str, _: &ActionDecl, _: bool| match failed_action(FailureKind::SpawnFailed, -1) {
+                ActionResult::Failed {
+                    command,
+                    failure_kind,
+                    exit_code,
+                    stdout,
+                    stderr,
+                    truncated,
+                    check,
+                    duration_ms,
+                    ..
+                } => ActionResult::Failed {
+                    command,
+                    failure_kind,
+                    exit_code,
+                    stdout,
+                    stderr,
+                    truncated,
+                    check,
+                    duration_ms,
+                    spawned: false,
+                },
+                other => other,
+            };
+        let result = advance_until_stop(
+            "run",
+            &template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &VariableOverlay::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(matches!(result.stop_reason, StopReason::GateBlocked(_)));
+        assert!(appended.borrow().is_empty(), "{:?}", appended.borrow());
+        assert_eq!(result.attempts, None);
+    }
+
+    #[test]
+    fn gates_of_one_entry_share_a_stamp_and_count_rules_per_check() {
+        let template = make_template(vec![("check", gated_state(&["a", "b"]))]);
+        let appended = std::cell::RefCell::new(Vec::new());
+        let mut append = |p: &EventPayload| -> Result<(), String> {
+            appended.borrow_mut().push(p.clone());
+            Ok(())
+        };
+        let gates = |_: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut out = BTreeMap::new();
+            for name in ["a", "b"] {
+                out.insert(
+                    name.to_string(),
+                    failing_gate_result(
+                        name,
+                        vec![
+                            finding("E501", FindingLevel::Error),
+                            finding("E501", FindingLevel::Error),
+                            finding("W291", FindingLevel::Warning),
+                        ],
+                    ),
+                );
+            }
+            Ok(out)
+        };
+        // One earlier attempt on the state, by gate `a` only.
+        let earlier = vec![event(
+            1,
+            EventPayload::GateEvaluated {
+                state: "check".to_string(),
+                gate: "a".to_string(),
+                output: serde_json::Value::Null,
+                outcome: "failed".to_string(),
+                timestamp: String::new(),
+                check: CheckEventFields {
+                    attempt: Some(4),
+                    visit_attempt: Some(2),
+                    rule_counts: Some(RuleCounts(vec![(
+                        "E501".to_string(),
+                        RuleCount {
+                            visit: 2,
+                            session: 4,
+                        },
+                    )])),
+                    ..Default::default()
+                },
+                streams: None,
+            },
+        )];
+        let result = advance_until_stop(
+            "check",
+            &template,
+            &BTreeMap::new(),
+            &earlier,
+            &mut append,
+            &gates,
+            &unavailable_integration,
+            &noop_action,
+            &VariableOverlay::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        let appended = appended.borrow();
+        let fields: BTreeMap<&str, &CheckEventFields> = appended
+            .iter()
+            .filter_map(|p| match p {
+                EventPayload::GateEvaluated { gate, check, .. } => Some((gate.as_str(), check)),
+                _ => None,
+            })
+            .collect();
+        for f in fields.values() {
+            assert_eq!((f.attempt, f.visit_attempt), (Some(5), Some(3)));
+            assert_eq!(f.duration_ms, Some(7));
+            assert_eq!(f.findings.len(), 3, "warnings are logged too");
+        }
+        let counts = |g: &str| fields[g].rule_counts.clone().unwrap();
+        assert_eq!(
+            counts("a").0,
+            vec![(
+                "E501".to_string(),
+                RuleCount {
+                    visit: 3,
+                    session: 5
+                }
+            )]
+        );
+        assert_eq!(
+            counts("b").0,
+            vec![(
+                "E501".to_string(),
+                RuleCount {
+                    visit: 1,
+                    session: 1
+                }
+            )]
+        );
+
+        let attempts = result.attempts.expect("a blocked state has counts");
+        assert_eq!((attempts.visit, attempts.session), (3, 5));
+        assert_eq!(attempts.rules["a"]["E501"].session, 5);
+        assert_eq!(attempts.rules["b"]["E501"].session, 1);
+        assert!(!attempts.rules_truncated);
+    }
+
+    #[test]
+    fn attempt_counts_keep_the_most_recent_100_pairs() {
+        let rules = |prefix: &str| {
+            RuleCounts(
+                (0..50)
+                    .map(|i| {
+                        (
+                            format!("{prefix}{i:02}"),
+                            RuleCount {
+                                visit: 1,
+                                session: 1,
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let events: Vec<Event> = ["a", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, gate)| {
+                event(
+                    i as u64 + 1,
+                    EventPayload::GateEvaluated {
+                        state: "check".to_string(),
+                        gate: gate.to_string(),
+                        output: serde_json::Value::Null,
+                        outcome: "failed".to_string(),
+                        timestamp: String::new(),
+                        check: CheckEventFields {
+                            attempt: Some(1),
+                            visit_attempt: Some(1),
+                            rule_counts: Some(rules("R")),
+                            ..Default::default()
+                        },
+                        streams: None,
+                    },
+                )
+            })
+            .collect();
+        let counts = attempt_counts(&events, "check").unwrap();
+        let pairs: usize = counts.rules.values().map(|r| r.len()).sum();
+        assert_eq!(pairs, RESPONSE_RULE_PAIRS_CAP);
+        assert!(counts.rules_truncated);
+        assert!(
+            !counts.rules.contains_key("a"),
+            "the oldest pairs are the ones dropped"
+        );
+        assert_eq!(attempt_counts(&[], "check"), None);
     }
 }

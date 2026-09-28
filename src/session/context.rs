@@ -8,6 +8,12 @@ pub struct KeyMeta {
     pub created_at: String,
     pub size: u64,
     pub hash: String,
+    /// Who wrote the key's current content: `agent`, `transition`, `koto` or
+    /// `sync` (an open vocabulary). Absent for a key written before writers
+    /// were recorded, or through plain [`ContextStore::add`]; it then reads
+    /// as unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<String>,
 }
 
 /// On-disk manifest format stored at `ctx/manifest.json`.
@@ -48,6 +54,33 @@ pub trait ContextStore: Send + Sync {
     /// Store content under the given key, creating or replacing it.
     fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()>;
 
+    /// [`add`](Self::add), recording `writer` in the key's metadata
+    /// ([`KeyMeta::writer`]). Every production write goes through this; the
+    /// default body ignores the writer and calls `add`, so a store that keeps
+    /// no metadata needs nothing more.
+    ///
+    /// This writes the store only. Appending the matching `context_added`
+    /// event is the caller's job, because only the caller knows whether the
+    /// write is one the log records (a transition's assignment is recorded by
+    /// the `transitioned` event itself).
+    fn add_with_writer(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        let _ = writer;
+        self.add(session, key, content)
+    }
+
+    /// The stored metadata for `key`, or `None` when the key is absent, fails
+    /// the key grammar, or the store keeps no metadata (the default).
+    fn meta(&self, session: &str, key: &str) -> Option<KeyMeta> {
+        let _ = (session, key);
+        None
+    }
+
     /// Retrieve content for the given key.
     fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>>;
 
@@ -68,4 +101,65 @@ pub trait ContextStore: Send + Sync {
 
     /// List all keys, optionally filtered by prefix.
     fn list_keys(&self, session: &str, prefix: Option<&str>) -> anyhow::Result<Vec<String>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A manifest entry written before writers were recorded (koto v0.14.1)
+    /// reads with no writer, and one with no writer writes back without the
+    /// field.
+    #[test]
+    fn key_meta_without_a_writer_round_trips_unchanged() {
+        let old = r#"{"created_at":"2026-01-01T00:00:00Z","size":3,"hash":"ab"}"#;
+        let meta: KeyMeta = serde_json::from_str(old).unwrap();
+        assert_eq!(meta.writer, None);
+        assert_eq!(serde_json::to_string(&meta).unwrap(), old);
+
+        let new = r#"{"created_at":"2026-01-01T00:00:00Z","size":3,"hash":"ab","writer":"sync"}"#;
+        let meta: KeyMeta = serde_json::from_str(new).unwrap();
+        assert_eq!(meta.writer.as_deref(), Some("sync"));
+        assert_eq!(serde_json::to_string(&meta).unwrap(), new);
+    }
+
+    /// A store that implements only the original five methods, as existing
+    /// test doubles do.
+    #[derive(Default)]
+    struct Minimal {
+        added: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    impl ContextStore for Minimal {
+        fn add(&self, _session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
+            self.added
+                .lock()
+                .unwrap()
+                .push((key.to_string(), content.to_vec()));
+            Ok(())
+        }
+        fn get(&self, _session: &str, _key: &str) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("absent")
+        }
+        fn ctx_exists(&self, _session: &str, _key: &str) -> bool {
+            false
+        }
+        fn remove(&self, _session: &str, _key: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list_keys(&self, _session: &str, _prefix: Option<&str>) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn default_bodies_write_through_add_and_report_no_metadata() {
+        let store = Minimal::default();
+        store.add_with_writer("s", "k", b"v", "koto").unwrap();
+        assert_eq!(
+            *store.added.lock().unwrap(),
+            vec![("k".to_string(), b"v".to_vec())]
+        );
+        assert!(store.meta("s", "k").is_none());
+    }
 }

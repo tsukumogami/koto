@@ -158,6 +158,9 @@ pub fn append_event_in<H: LogHeader>(
         !matches!(payload, EventPayload::Unknown { .. }),
         "Unknown events must not be passed to append_event"
     );
+    // Held from reading the last seq until the line is synced, so two
+    // processes appending at once can't both take the same seq.
+    let _append_lock = AppendLock::acquire(path);
     let next_seq = next_seq_after_header::<H>(path)?;
 
     let event = Event {
@@ -330,6 +333,10 @@ pub fn append_event_idempotent_in<H: LogHeader>(
     // file; concurrent readers via `read_events` do NOT take a lock and
     // are unaffected (advisory).
     let _guard = acquire_state_flock(path)?;
+    // The append lock every append path shares, held through the seq read,
+    // the scan and the write, so a plain `append_event` from another process
+    // can't take the seq this append is about to use.
+    let _append_lock = AppendLock::acquire(path);
 
     // Check the header first, so a log that is missing, empty or headerless
     // is refused whether or not the scan below finds a prior event. Doing it
@@ -403,15 +410,88 @@ pub fn append_event_idempotent_in<H: LogHeader>(
     Ok(AppendOutcome::Written { seq: next_seq })
 }
 
+/// File name of the per-log append lock, a sidecar in the log's directory.
+/// It holds no data.
+pub const APPEND_LOCK_FILE: &str = "append.lock";
+
+/// An exclusive `flock` on the sidecar [`APPEND_LOCK_FILE`] beside a log,
+/// released on drop.
+///
+/// Every append path takes it, and only around reading the last seq, writing
+/// the line and syncing it: never while a command runs, so a gate's own
+/// `koto context get` can't wait on the tick that is running it. It is a
+/// dedicated file rather than the log itself, so it never contends with the
+/// state-file lock a batch tick holds for the whole tick.
+///
+/// Where the lock can't be had -- no `flock` on this platform, a directory
+/// the sidecar can't be created in, a filesystem that refuses the call --
+/// the append proceeds unlocked, as appends did before the lock existed.
+struct AppendLock {
+    #[cfg(unix)]
+    _file: Option<std::fs::File>,
+}
+
+impl AppendLock {
+    #[cfg(unix)]
+    fn acquire(log: &Path) -> Self {
+        use std::os::fd::AsRawFd;
+        let Some(dir) = log.parent() else {
+            return AppendLock { _file: None };
+        };
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(APPEND_LOCK_FILE))
+        {
+            Ok(f) => f,
+            Err(_) => return AppendLock { _file: None },
+        };
+        // SAFETY: `fd` is borrowed from `file`, which outlives the call.
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if ret != 0 {
+            return AppendLock { _file: None };
+        }
+        AppendLock { _file: Some(file) }
+    }
+
+    #[cfg(not(unix))]
+    fn acquire(_log: &Path) -> Self {
+        AppendLock {}
+    }
+}
+
 /// Acquire an exclusive `flock(LOCK_EX)` on the state file. The lock
 /// is released when the returned `File` is dropped.
 ///
 /// Used by [`append_event_idempotent`] to serialize the read-then-write
 /// window so concurrent identical retries collapse to a single write
 /// rather than racing past the hash scan.
+///
+/// # Lock order and the invariant it relies on
+///
+/// [`append_event_idempotent_in`] takes this lock first and the sidecar
+/// [`AppendLock`] second. This is the same file
+/// [`SessionBackend::lock_state_file`](crate::session::SessionBackend::lock_state_file)
+/// locks for a whole batch tick, and `flock` locks belong to the open file,
+/// not the process: a thread holding that tick lock that reached this
+/// blocking call on the same state file would wait on itself forever. No
+/// production caller does -- the only idempotent append today writes a
+/// request store's log, a different file -- and nothing may start to: an
+/// idempotent append to a session's state file must not run on a thread
+/// holding that session's tick lock. Debug builds check this with
+/// [`held_state_locks`] and panic instead of hanging.
 #[cfg(unix)]
 fn acquire_state_flock(path: &Path) -> anyhow::Result<std::fs::File> {
     use std::os::fd::AsRawFd;
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        !held_state_locks::held_by_this_thread(path),
+        "acquire_state_flock on {} while this thread holds its lock_state_file lock \
+         would deadlock",
+        path.display()
+    );
     // Open without `create`: a log is created when its session is created,
     // and a lock open that created the file would leave an empty log behind
     // for the header check in `next_seq_after_header` to refuse.
@@ -445,6 +525,53 @@ fn acquire_state_flock(_path: &Path) -> anyhow::Result<std::fs::File> {
     // unlikely in koto's single-coordinator model; falling through
     // produces correct semantics in the no-contention case.
     Err(anyhow::anyhow!("flock not available on this platform"))
+}
+
+/// Debug-build record of which threads hold a
+/// [`SessionBackend::lock_state_file`](crate::session::SessionBackend::lock_state_file)
+/// lock on which state file, so [`acquire_state_flock`] can refuse the
+/// same-thread re-lock that would deadlock. Release builds carry none of it.
+#[cfg(debug_assertions)]
+pub(crate) mod held_state_locks {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::thread::ThreadId;
+
+    static HELD: Mutex<Vec<(ThreadId, PathBuf)>> = Mutex::new(Vec::new());
+
+    fn identity(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// Marks `path` as locked by the current thread until dropped. Dropping
+    /// it on another thread still removes the right entry.
+    #[derive(Debug)]
+    pub(crate) struct Held {
+        entry: (ThreadId, PathBuf),
+    }
+
+    pub(crate) fn hold(path: &Path) -> Held {
+        let entry = (std::thread::current().id(), identity(path));
+        if let Ok(mut held) = HELD.lock() {
+            held.push(entry.clone());
+        }
+        Held { entry }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            if let Ok(mut held) = HELD.lock() {
+                if let Some(i) = held.iter().position(|e| *e == self.entry) {
+                    held.swap_remove(i);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn held_by_this_thread(path: &Path) -> bool {
+        let entry = (std::thread::current().id(), identity(path));
+        HELD.lock().map(|h| h.contains(&entry)).unwrap_or(false)
+    }
 }
 
 /// Extract the session id (workflow name) from a state file path.
@@ -1215,7 +1342,7 @@ fn epoch_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
 /// re-sent instructions it already holds. Any rewind does open one: a rewind is
 /// an instruction to redo the work rather than to continue it, and the agent it
 /// addresses needs the procedure again.
-fn delivery_window<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
+pub(crate) fn delivery_window<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
     entry_slice(events, current_state, Boundary::ArrivalFromElsewhere)
 }
 
@@ -1887,6 +2014,7 @@ mod tests {
             key: key.to_string(),
             hash: "abc".to_string(),
             size: 1,
+            writer: None,
         }
     }
 
@@ -2353,6 +2481,8 @@ mod tests {
                 output,
                 outcome: "failed".to_string(),
                 timestamp: "2026-04-01T00:00:00Z".to_string(),
+                check: Default::default(),
+                streams: None,
             },
         )
     }
@@ -2851,6 +2981,7 @@ mod tests {
                     stdout: "hi\n".to_string(),
                     stderr: String::new(),
                     truncated: false,
+                    check: Default::default(),
                 },
             ),
             make_event(
@@ -2913,6 +3044,8 @@ mod tests {
                 output: serde_json::json!({}),
                 outcome: outcome.to_string(),
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
+                check: Default::default(),
+                streams: None,
             },
         )
     }

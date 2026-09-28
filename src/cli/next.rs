@@ -203,6 +203,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exit_code": 1, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -234,6 +235,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::TimedOut,
                 output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+                ..Default::default()
             },
         );
 
@@ -259,6 +261,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Error,
                 output: serde_json::json!({"exit_code": -1, "error": "spawn failed"}),
+                ..Default::default()
             },
         );
 
@@ -284,6 +287,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exit_code": 1, "error": ""}),
+                ..Default::default()
             },
         );
         gates.insert(
@@ -291,6 +295,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::TimedOut,
                 output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+                ..Default::default()
             },
         );
         gates.insert(
@@ -298,6 +303,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Passed,
                 output: serde_json::json!({"exit_code": 0, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -330,6 +336,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Passed,
                 output: serde_json::json!({"exit_code": 0, "error": ""}),
+                ..Default::default()
             },
         );
         gates.insert(
@@ -337,6 +344,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Passed,
                 output: serde_json::json!({"exit_code": 0, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -362,6 +370,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exit_code": 1, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -457,6 +466,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exit_code": 1, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -605,6 +615,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exit_code": 1, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -664,6 +675,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exit_code": 1, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -690,6 +702,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exit_code": 1, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -730,6 +743,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Passed,
                 output: serde_json::json!({"exit_code": 0, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -773,6 +787,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Passed,
                 output: serde_json::json!({"exit_code": 0, "error": ""}),
+                ..Default::default()
             },
         );
         gates.insert(
@@ -780,6 +795,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exit_code": 1, "error": ""}),
+                ..Default::default()
             },
         );
 

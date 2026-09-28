@@ -215,6 +215,14 @@ pub trait DeciderPort {
     /// Called exactly once after each `decider_consulted` event is durably
     /// appended, while the visit's guard is still held.
     fn recorded(&mut self, _event: &EventPayload) {}
+
+    /// The `context_read` events for the context inputs the last
+    /// [`consult`](Self::consult) read, taken (so a second call returns
+    /// none). The engine appends them, best-effort, just before that
+    /// consultation's `decider_consulted`. The default reads nothing.
+    fn take_context_reads(&mut self) -> Vec<EventPayload> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +504,10 @@ where
         endpoint_origin,
         fields: recorded_fields,
     });
+    // The inputs the consultation read come just before it, best-effort.
+    for read in port.take_context_reads() {
+        crate::session::context_log::append_best_effort(&read, |p| append_event(p));
+    }
     // A failed append falls back to the opted-out stop: the decider never
     // turns a tick into an error.
     if append_event(&payload).is_err() {
@@ -1012,6 +1024,7 @@ mod tests {
                                 GateOutcome::Passed
                             },
                             output: serde_json::json!({"exit_code": if gates_fail { 1 } else { 0 }, "error": ""}),
+                            ..Default::default()
                         },
                     )
                 })

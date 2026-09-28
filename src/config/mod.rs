@@ -19,6 +19,86 @@ pub struct KotoConfig {
     /// exactly as before.
     #[serde(default, skip_serializing_if = "DeciderConfig::is_empty")]
     pub decider: DeciderConfig,
+    /// Where the secret settings came from, and every secret value a config
+    /// file set, in any layer. Filled by `resolve::load_config`,
+    /// never serialized; read by [`redaction_keys`].
+    #[serde(skip)]
+    pub secret_sources: SecretSources,
+}
+
+/// Provenance of koto's secret settings, for redaction.
+///
+/// Holds every secret value a config file set, from the user file and the
+/// project file, including values koto doesn't use: one a later layer or an
+/// environment variable replaced, and a project-file `decider.api_key`,
+/// which is ignored. They are still credentials a command could print.
+/// Never serialized, and its `Debug` prints setting names only.
+#[derive(Clone, Default)]
+pub struct SecretSources {
+    /// `AWS_ACCESS_KEY_ID` supplied `session.cloud.access_key`.
+    pub access_key_from_env: bool,
+    /// `AWS_SECRET_ACCESS_KEY` supplied `session.cloud.secret_key`.
+    pub secret_key_from_env: bool,
+    /// `(setting name, config-file value)` for each secret a config file
+    /// set, in load order, without repeats.
+    pub file_values: Vec<(&'static str, String)>,
+}
+
+impl std::fmt::Debug for SecretSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretSources")
+            .field("access_key_from_env", &self.access_key_from_env)
+            .field("secret_key_from_env", &self.secret_key_from_env)
+            .field(
+                "file_values",
+                &self.file_values.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+/// koto's own configured secrets as `(source, value)` pairs, for the tick's
+/// known credentials (DESIGN-koto-failure-reporting.md, Decision 5).
+///
+/// Every value koto resolved for the decider key and the cloud access and
+/// secret keys, then every value any config file set for them, whether or
+/// not it won: one a later layer or an environment variable replaced, and a
+/// project-file decider key the merge ignores. The source is the
+/// environment variable when one supplied the value, otherwise the setting
+/// name, which always contains a dot.
+pub fn redaction_keys(config: &KotoConfig) -> Vec<(String, String)> {
+    let mut keys = Vec::new();
+    if let Some(v) = &config.decider.api_key {
+        let source = match config.decider.api_key_origin {
+            SettingOrigin::Env => resolve::ENV_DECIDER_API_KEY,
+            _ => "decider.api_key",
+        };
+        keys.push((source.to_string(), v.clone()));
+    }
+    let src = &config.secret_sources;
+    for (value, from_env, env_name, setting) in [
+        (
+            &config.session.cloud.access_key,
+            src.access_key_from_env,
+            resolve::ENV_AWS_ACCESS_KEY_ID,
+            "session.cloud.access_key",
+        ),
+        (
+            &config.session.cloud.secret_key,
+            src.secret_key_from_env,
+            resolve::ENV_AWS_SECRET_ACCESS_KEY,
+            "session.cloud.secret_key",
+        ),
+    ] {
+        if let Some(v) = value {
+            let source = if from_env { env_name } else { setting };
+            keys.push((source.to_string(), v.clone()));
+        }
+    }
+    for (setting, v) in &src.file_values {
+        keys.push((setting.to_string(), v.clone()));
+    }
+    keys
 }
 
 /// The `[decider]` table.

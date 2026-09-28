@@ -1,5 +1,6 @@
 pub mod cloud;
 pub mod context;
+pub mod context_log;
 pub mod local;
 pub mod recover;
 pub mod sync;
@@ -114,6 +115,10 @@ pub struct SessionLock {
     // Drop impl: its sole purpose is to keep the file descriptor open
     // so the kernel-level flock remains held.
     _file: std::fs::File,
+    // Debug builds record the holder so an idempotent append on the same
+    // thread and file panics instead of deadlocking (see `lock_state_file`).
+    #[cfg(debug_assertions)]
+    _held: crate::engine::persistence::held_state_locks::Held,
 }
 
 /// Non-Unix fallback. koto does not support Windows today; this stub
@@ -428,6 +433,18 @@ pub trait SessionBackend: Send + Sync {
     /// ordering described in the design's Decision 12 (Q6), not by
     /// this lock.
     ///
+    /// # Not with an idempotent append on the same thread
+    ///
+    /// [`append_event_idempotent`](crate::engine::persistence::append_event_idempotent)
+    /// takes a blocking `flock` on this same state file (then the sidecar
+    /// append lock). `flock` locks belong to the open file, so a thread
+    /// holding this guard that made an idempotent append to the same
+    /// session would block on itself forever. Plain appends
+    /// ([`append_event`](Self::append_event)) take only the sidecar lock and
+    /// are safe under the guard. No production path makes that call today,
+    /// and none may: debug builds record the holder in the guard and panic
+    /// on the combination rather than hang.
+    ///
     /// # Windows
     ///
     /// Not supported. koto targets Unix-like systems; on non-Unix
@@ -612,6 +629,26 @@ impl ContextStore for Backend {
         match self {
             Backend::Local(b) => b.add(session, key, content),
             Backend::Cloud(b) => b.add(session, key, content),
+        }
+    }
+
+    fn add_with_writer(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.add_with_writer(session, key, content, writer),
+            Backend::Cloud(b) => b.add_with_writer(session, key, content, writer),
+        }
+    }
+
+    fn meta(&self, session: &str, key: &str) -> Option<context::KeyMeta> {
+        match self {
+            Backend::Local(b) => b.meta(session, key),
+            Backend::Cloud(b) => b.meta(session, key),
         }
     }
 

@@ -1,0 +1,83 @@
+{
+  "format_version": 1,
+  "name": "compat-failure-reporting",
+  "version": "1.0",
+  "description": "Walks a session through a failing and then passing command gate, a failing and then succeeding default action, and a context-exists gate, for the failure-reporting compatibility check",
+  "initial_state": "build",
+  "states": {
+    "build": {
+      "directive": "Build the change and run the tests.",
+      "transitions": [
+        {
+          "target": "setup"
+        }
+      ],
+      "gates": {
+        "tests": {
+          "type": "command",
+          "command": "echo build-stdout-line; echo build-stderr-line >&2; test -f ready"
+        }
+      }
+    },
+    "done": {
+      "directive": "Shipped.",
+      "terminal": true
+    },
+    "held": {
+      "directive": "Held back.",
+      "terminal": true
+    },
+    "review": {
+      "directive": "Wait for the review note.",
+      "transitions": [
+        {
+          "target": "wrapup"
+        }
+      ],
+      "gates": {
+        "note": {
+          "type": "context-exists",
+          "key": "review_note"
+        }
+      }
+    },
+    "setup": {
+      "directive": "Prepare the workspace.",
+      "transitions": [
+        {
+          "target": "review"
+        }
+      ],
+      "default_action": {
+        "command": "echo setup-stdout-line; echo setup-stderr-line >&2; test -f setup-ok"
+      }
+    },
+    "wrapup": {
+      "directive": "Decide whether to ship.",
+      "transitions": [
+        {
+          "target": "done",
+          "when": {
+            "verdict": "ship"
+          }
+        },
+        {
+          "target": "held",
+          "when": {
+            "verdict": "hold"
+          }
+        }
+      ],
+      "accepts": {
+        "verdict": {
+          "field_type": "enum",
+          "required": true,
+          "values": [
+            "ship",
+            "hold"
+          ]
+        }
+      }
+    }
+  }
+}

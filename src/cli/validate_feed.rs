@@ -465,4 +465,54 @@ Body text.
         let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
         assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
     }
+
+    // -- Failure reporting (DESIGN-koto-failure-reporting.md, Gate-event schema) --
+
+    /// Check events carrying every failure-reporting field, the four gate
+    /// outcomes, and context events whose `reader`, `writer` and `access`
+    /// hold values no koto writes yet: open vocabularies have no `enum`, so
+    /// a later value validates.
+    #[test]
+    fn shipped_spec_accepts_the_failure_reporting_fields_and_open_vocabularies() {
+        let finding = r#"{"rule_id":"E501","level":"notice","message":"m","effect_landed":true,"message_source":"linter"}"#;
+        let check = format!(
+            r#""attempt":2,"visit_attempt":1,"findings":[{finding}],"findings_truncated":true,"rule_counts":{{"E501":{{"visit":1,"session":2}}}},"rule_counts_truncated":true,"duration_ms":12"#
+        );
+        let mut lines = vec![anchored_header_line().to_string()];
+        for (seq, outcome) in ["passed", "failed", "timed_out", "error"]
+            .iter()
+            .enumerate()
+        {
+            lines.push(format!(
+                r#"{{"seq":{},"timestamp":"t","type":"gate_evaluated","payload":{{"state":"s","gate":"g","output":{{}},"outcome":"{outcome}","timestamp":"t",{check},"stdout":"o","stderr":"","stdout_truncated":true,"stderr_truncated":false}}}}"#,
+                seq + 1
+            ));
+        }
+        lines.push(format!(
+            r#"{{"seq":5,"timestamp":"t","type":"default_action_executed","payload":{{"state":"s","command":"c","exit_code":0,"stdout":"","stderr":"","truncated":false,{check}}}}}"#
+        ));
+        lines.push(r#"{"seq":6,"timestamp":"t","type":"context_added","payload":{"key":"k","hash":"h","size":1,"writer":"a_later_writer"}}"#.to_string());
+        lines.push(r#"{"seq":7,"timestamp":"t","type":"context_removed","payload":{"key":"k","writer":"a_later_writer"}}"#.to_string());
+        lines.push(r#"{"seq":8,"timestamp":"t","type":"context_read","payload":{"key":"k","reader":"a_later_reader","state":"s","present":true,"hash":"h","access":"a_later_access","gate":"g"}}"#.to_string());
+        lines.push(r#"{"seq":9,"timestamp":"t","type":"context_read","payload":{"key":"k","reader":"cli","state":"s","present":false}}"#.to_string());
+        let log = write_temp(&(lines.join("\n") + "\n"));
+        let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+        assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
+    }
+
+    /// `context_read` is declared, not skipped as unknown, and its required
+    /// fields and the check events' new field types are enforced.
+    #[test]
+    fn shipped_spec_rejects_a_context_read_without_key_and_a_string_attempt() {
+        for bad in [
+            r#"{"seq":1,"timestamp":"t","type":"context_read","payload":{"reader":"cli","state":"s","present":false}}"#,
+            r#"{"seq":1,"timestamp":"t","type":"gate_evaluated","payload":{"state":"s","gate":"g","output":{},"outcome":"failed","timestamp":"t","attempt":"2"}}"#,
+            r#"{"seq":1,"timestamp":"t","type":"default_action_executed","payload":{"state":"s","command":"c","exit_code":1,"stdout":"","stderr":"","rule_counts":[]}}"#,
+            r#"{"seq":1,"timestamp":"t","type":"gate_evaluated","payload":{"state":"s","gate":"g","output":{},"outcome":"skipped","timestamp":"t"}}"#,
+        ] {
+            let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), bad));
+            let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+            assert!(result.is_err(), "shipped spec accepted: {bad}");
+        }
+    }
 }

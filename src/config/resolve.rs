@@ -61,6 +61,7 @@ pub fn load_config() -> Result<KotoConfig> {
     if let Some(user_path) = user_config_path() {
         if user_path.exists() {
             let user_config = load_config_file(&user_path, "user config")?;
+            record_file_secrets(&mut config.secret_sources, &user_config.config);
             merge_config(&mut config, &user_config);
             merge_decider(
                 &mut config.decider,
@@ -74,6 +75,7 @@ pub fn load_config() -> Result<KotoConfig> {
     let project_path = project_config_path();
     if project_path.exists() {
         let project_config = load_config_file(&project_path, "project config")?;
+        record_file_secrets(&mut config.secret_sources, &project_config.config);
         merge_config(&mut config, &project_config);
         merge_decider(
             &mut config.decider,
@@ -82,12 +84,15 @@ pub fn load_config() -> Result<KotoConfig> {
         );
     }
 
-    // Layer 3: env var overrides for credentials
-    if let Ok(val) = env::var("AWS_ACCESS_KEY_ID") {
+    // Layer 3: env var overrides for credentials. The config-file values
+    // they replace were recorded above, so redaction still searches for them.
+    if let Ok(val) = env::var(ENV_AWS_ACCESS_KEY_ID) {
         config.session.cloud.access_key = Some(val);
+        config.secret_sources.access_key_from_env = true;
     }
-    if let Ok(val) = env::var("AWS_SECRET_ACCESS_KEY") {
+    if let Ok(val) = env::var(ENV_AWS_SECRET_ACCESS_KEY) {
         config.session.cloud.secret_key = Some(val);
+        config.secret_sources.secret_key_from_env = true;
     }
 
     // Layer 3b: KOTO_REQUEST_STORE_* env-var overrides for the
@@ -98,6 +103,29 @@ pub fn load_config() -> Result<KotoConfig> {
     apply_decider_env(&mut config.decider, |k| env::var(k).ok());
 
     Ok(config)
+}
+
+/// Record every secret value one config file sets, before the merge can
+/// replace or drop it: a later layer or an environment variable may
+/// override it, and the merge ignores a project file's `decider.api_key`.
+/// koto doesn't use those values, but a command could still print them, so
+/// redaction searches for them under their setting names.
+fn record_file_secrets(sources: &mut super::SecretSources, file: &KotoConfig) {
+    for (setting, value) in [
+        ("session.cloud.access_key", &file.session.cloud.access_key),
+        ("session.cloud.secret_key", &file.session.cloud.secret_key),
+        ("decider.api_key", &file.decider.api_key),
+    ] {
+        if let Some(v) = value {
+            if !sources
+                .file_values
+                .iter()
+                .any(|(s, x)| *s == setting && x == v)
+            {
+                sources.file_values.push((setting, v.clone()));
+            }
+        }
+    }
 }
 
 /// Resolve `RequestStoreConfig` through the full 5-level precedence
@@ -413,6 +441,21 @@ pub const DEFAULT_DECIDER_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone
 pub const ENV_DECIDER_MODE: &str = "KOTO_DECIDER";
 /// Env var that supplies the decider API key.
 pub const ENV_DECIDER_API_KEY: &str = "KOTO_DECIDER_API_KEY";
+/// Env vars that supply koto's own secrets: the decider key and the cloud
+/// access and secret keys. Redaction reads them from the environment
+/// directly as well as through the loaded configuration, so they're
+/// searched for even when a config file fails to load.
+pub const ENV_SECRET_NAMES: [&str; 3] = [
+    ENV_DECIDER_API_KEY,
+    ENV_AWS_ACCESS_KEY_ID,
+    ENV_AWS_SECRET_ACCESS_KEY,
+];
+/// Env var that overrides `session.cloud.access_key`. Also a redaction
+/// marker's source name, so it's visible in captured output.
+pub const ENV_AWS_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
+/// Env var that overrides `session.cloud.secret_key`. Also a redaction
+/// marker's source name, so it's visible in captured output.
+pub const ENV_AWS_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
 /// Env var that sets the decider endpoint.
 pub const ENV_DECIDER_ENDPOINT: &str = "KOTO_DECIDER_ENDPOINT";
 
@@ -930,6 +973,7 @@ mod tests {
                 request_store: RequestStoreConfig::default(),
                 workflows: Default::default(),
                 decider: Default::default(),
+                secret_sources: Default::default(),
             },
             request_store_keys: vec![],
             request_store_has_recursion: false,
@@ -1077,6 +1121,58 @@ mod tests {
         let config = load_config().unwrap();
         assert_eq!(config.session.backend, "cloud");
         assert_eq!(config.session.cloud.bucket, Some("proj-bucket".to_string()));
+    }
+
+    #[test]
+    fn secrets_from_every_config_layer_are_redaction_keys() {
+        let tmp = TempDir::new().unwrap();
+        let _lock = process_env_lock();
+        let _guard = SetCwd::new(tmp.path());
+        // The user layer gets its own HOME, apart from the project directory.
+        let user_home = tmp.path().join("user-home");
+        fs::create_dir_all(user_home.join(".koto")).unwrap();
+        let _home_guard = SetEnv::new("HOME", user_home.to_str().unwrap());
+        env::remove_var("AWS_ACCESS_KEY_ID");
+        env::remove_var("AWS_SECRET_ACCESS_KEY");
+        env::remove_var(ENV_DECIDER_API_KEY);
+
+        // The user file's cloud key is replaced by the project file's, and
+        // the project file's decider key is ignored by the merge.
+        let koto_dir = tmp.path().join(".koto");
+        fs::create_dir_all(&koto_dir).unwrap();
+        fs::write(
+            user_home.join(".koto").join("config.toml"),
+            "[session.cloud]\naccess_key = \"user-file-access-key\"\n\
+             secret_key = \"user-file-secret-key\"\n",
+        )
+        .unwrap();
+        fs::write(
+            koto_dir.join("config.toml"),
+            "[session.cloud]\naccess_key = \"project-file-access-key\"\n\n\
+             [decider]\napi_key = \"project-file-decider-key\"\n",
+        )
+        .unwrap();
+
+        let config = load_config().unwrap();
+        assert_eq!(
+            config.session.cloud.access_key.as_deref(),
+            Some("project-file-access-key")
+        );
+        assert!(config.decider.api_key.is_none());
+        let keys = crate::config::redaction_keys(&config);
+        for (source, value) in [
+            ("session.cloud.access_key", "project-file-access-key"),
+            ("session.cloud.access_key", "user-file-access-key"),
+            ("session.cloud.secret_key", "user-file-secret-key"),
+            ("decider.api_key", "project-file-decider-key"),
+        ] {
+            assert!(
+                keys.iter().any(|(s, v)| s == source && v == value),
+                "{source} missing"
+            );
+        }
+        // The Debug form names settings only.
+        assert!(!format!("{:?}", config.secret_sources).contains("file-"));
     }
 
     #[test]

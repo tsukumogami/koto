@@ -13,14 +13,18 @@ use std::time::Duration;
 
 use wait_timeout::ChildExt;
 
+use crate::redact::{redact_capture, RedactedText, Redactor};
+
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Maximum number of bytes retained from each of stdout and stderr (64 KB).
 ///
-/// The reader threads keep draining past this bound and retain only the
-/// first `MAX_ACTION_OUTPUT_BYTES`; stopping the read at the bound would
-/// reintroduce the pipe-buffer deadlock for anything larger. The bound
-/// applies to gate commands and action commands alike.
+/// The reader threads keep draining past this bound; stopping the read at
+/// the bound would reintroduce the pipe-buffer deadlock for anything larger.
+/// They retain the first `MAX_ACTION_OUTPUT_BYTES` plus, when the tick knows
+/// credentials, enough lookahead to see a value that starts before the bound
+/// whole (see [`Redactor::retention`]). The bound applies to gate commands
+/// and action commands alike.
 pub const MAX_ACTION_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Size of the chunk each reader thread pulls from its pipe.
@@ -84,30 +88,55 @@ pub struct CommandEnv {
     vars: Vec<(String, String)>,
     inherit: bool,
     outcomes: Mutex<BTreeMap<String, CommandOutcome>>,
+    /// The credentials this tick knows, replaced in every command's output.
+    redactor: Redactor,
+    /// The output each recorded gate or action produced, so a test can see
+    /// what a command gate captured: its evidence doesn't carry the streams.
+    #[cfg(test)]
+    outputs: Mutex<BTreeMap<String, CommandOutput>>,
 }
 
 impl CommandEnv {
-    /// Exactly `vars`, in order, with nothing inherited from this process.
-    pub fn cleared(vars: Vec<(String, String)>) -> Self {
+    /// Exactly `vars`, in order, with nothing inherited from this process,
+    /// and `redactor` replacing known credentials in the output of every
+    /// command run under it.
+    ///
+    /// A tick gets its environment from
+    /// `crate::engine::command_env::for_tick`, which passes the tick's known
+    /// set; the redactor is required here so no environment can be built
+    /// without choosing one.
+    pub fn cleared(vars: Vec<(String, String)>, redactor: Redactor) -> Self {
         Self {
             vars,
             inherit: false,
             outcomes: Mutex::new(BTreeMap::new()),
+            redactor,
+            #[cfg(test)]
+            outputs: Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// This process's environment with `vars` applied on top: a session
-    /// created with `--legacy-environment`.
-    pub fn inherited(vars: Vec<(String, String)>) -> Self {
+    /// The redactor for output captured under this environment.
+    pub fn redactor(&self) -> &Redactor {
+        &self.redactor
+    }
+
+    /// This process's environment with `vars` applied on top, for a session
+    /// created with `--legacy-environment`, redacting output against
+    /// `redactor` as [`CommandEnv::cleared`] does.
+    pub fn inherited(vars: Vec<(String, String)>, redactor: Redactor) -> Self {
         Self {
             inherit: true,
-            ..Self::cleared(vars)
+            ..Self::cleared(vars, redactor)
         }
     }
 
-    /// This process's environment unchanged, for callers outside a tick.
+    /// This process's environment unchanged, with no redaction: for callers
+    /// outside a tick, which have no known set. A tick's commands never run
+    /// under it; they use the environment
+    /// `crate::engine::command_env::for_tick` builds.
     pub fn inherit() -> Self {
-        Self::inherited(Vec::new())
+        Self::inherited(Vec::new(), Redactor::empty())
     }
 
     /// True when commands inherit this process's environment.
@@ -136,6 +165,16 @@ impl CommandEnv {
         if let Ok(mut map) = self.outcomes.lock() {
             map.insert(label.to_string(), outcome);
         }
+        #[cfg(test)]
+        if let Ok(mut map) = self.outputs.lock() {
+            map.insert(label.to_string(), output.clone());
+        }
+    }
+
+    /// The output last recorded under `label`, for tests.
+    #[cfg(test)]
+    pub(crate) fn recorded_output(&self, label: &str) -> Option<CommandOutput> {
+        self.outputs.lock().ok()?.get(label).cloned()
     }
 
     /// Every gate or action whose last run on this tick failed, with whether
@@ -166,6 +205,7 @@ impl std::fmt::Debug for CommandEnv {
                     .collect::<Vec<_>>(),
             )
             .field("inherit", &self.inherit)
+            .field("redactor", &self.redactor)
             .finish()
     }
 }
@@ -184,92 +224,108 @@ pub fn looks_not_found(output: &CommandOutput) -> bool {
 }
 
 /// Output captured from a shell command execution.
+///
+/// `stdout` and `stderr` have been through the tick's redactor: every known
+/// credential in them is a `[REDACTED:<source>]` marker, and code outside
+/// the runner can't reach the raw bytes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandOutput {
     pub exit_code: i32,
-    pub stdout: String,
-    pub stderr: String,
+    pub stdout: RedactedText,
+    pub stderr: RedactedText,
     /// `None` when the command exited zero; otherwise names why it failed.
     pub failure_kind: Option<FailureKind>,
-    /// True when retention dropped bytes from stdout or stderr.
+    /// True when stdout was cut at the bound.
+    pub stdout_truncated: bool,
+    /// True when stderr was cut at the bound.
+    pub stderr_truncated: bool,
+    /// `stdout_truncated || stderr_truncated`.
     pub truncated: bool,
+    /// True when stderr's last line is a note koto wrote (a timeout, spawn,
+    /// wait or polling note) rather than something the command printed.
+    pub stderr_ends_with_note: bool,
+    /// Wall-clock milliseconds from spawning the command to its exit or
+    /// kill: the span the timeout covers.
+    pub duration_ms: u64,
 }
 
-/// What one reader thread produced: the retained bytes and whether it saw
-/// more than it retained.
+/// What one reader thread produced: the retained bytes and how many the
+/// stream carried in all.
 struct Capture {
     bytes: Vec<u8>,
-    truncated: bool,
+    total: usize,
 }
 
-/// Read `reader` to end on a dedicated thread, retaining the first `limit`
-/// bytes.
+/// Read `reader` to end on a dedicated thread, retaining the first `retain`
+/// bytes and counting every byte.
 ///
-/// The thread keeps reading after `limit` is reached and discards the excess,
-/// so the child never blocks writing into a full pipe. It ends when the pipe
-/// closes, which happens when the child exits or its process group is killed.
-fn spawn_reader<R>(mut reader: R, limit: usize) -> JoinHandle<Capture>
+/// The thread keeps reading after `retain` is reached and discards the
+/// excess, so the child never blocks writing into a full pipe. It ends when
+/// the pipe closes, which happens when the child exits or its process group
+/// is killed.
+fn spawn_reader<R>(mut reader: R, retain: usize) -> JoinHandle<Capture>
 where
     R: Read + Send + 'static,
 {
     std::thread::spawn(move || {
         let mut bytes: Vec<u8> = Vec::new();
-        let mut truncated = false;
+        let mut total: usize = 0;
         let mut chunk = [0u8; READ_CHUNK_BYTES];
         loop {
             match reader.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let room = limit.saturating_sub(bytes.len());
+                    total = total.saturating_add(n);
+                    let room = retain.saturating_sub(bytes.len());
                     let keep = room.min(n);
                     if keep > 0 {
                         bytes.extend_from_slice(&chunk[..keep]);
-                    }
-                    if keep < n {
-                        truncated = true;
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
-        Capture { bytes, truncated }
+        Capture { bytes, total }
     })
 }
 
-/// Decode captured bytes, dropping a trailing partial UTF-8 sequence.
-///
-/// Retention cuts at a byte count, which can split a multi-byte character.
-/// An incomplete tail is dropped; any other invalid byte is replaced, so a
-/// command emitting binary still yields readable output rather than nothing.
-fn decode_capture(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_string(),
-        // `error_len() == None` means the input ended mid-character.
-        Err(e) if e.error_len().is_none() => {
-            String::from_utf8_lossy(&bytes[..e.valid_up_to()]).into_owned()
-        }
-        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
-    }
-}
-
-/// Join a reader thread, treating a panicked reader as empty output.
-fn join_reader(handle: Option<JoinHandle<Capture>>) -> (String, bool) {
+/// Join a reader thread and redact what it kept, treating a panicked reader
+/// as empty output. This is the one place raw capture becomes text.
+fn join_reader(
+    handle: Option<JoinHandle<Capture>>,
+    killed: bool,
+    redactor: &Redactor,
+) -> (RedactedText, bool) {
     match handle.and_then(|h| h.join().ok()) {
-        Some(capture) => (decode_capture(&capture.bytes), capture.truncated),
-        None => (String::new(), false),
+        Some(capture) => redact_capture(
+            &capture.bytes,
+            capture.total,
+            killed,
+            MAX_ACTION_OUTPUT_BYTES,
+            redactor,
+        ),
+        None => (RedactedText::default(), false),
     }
 }
 
-/// Append `note` to captured stderr without losing what the command wrote.
-fn append_note(stderr: String, note: String) -> String {
+/// Append koto's `note` to captured stderr without losing what the command
+/// wrote. The note is appended after redaction, so it is never searched.
+fn append_note(mut stderr: RedactedText, note: String) -> RedactedText {
     if stderr.is_empty() {
-        note
-    } else if stderr.ends_with('\n') {
-        format!("{}{}", stderr, note)
+        RedactedText::koto_note(note)
     } else {
-        format!("{}\n{}", stderr, note)
+        if !stderr.ends_with('\n') {
+            stderr.push_koto_note("\n");
+        }
+        stderr.push_koto_note(&note);
+        stderr
     }
+}
+
+/// Milliseconds since `started`, saturating.
+pub fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Run a shell command with process-group isolation, timeout, and output capture.
@@ -317,15 +373,20 @@ pub fn run_shell_command(
         });
     }
 
+    let started = std::time::Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return CommandOutput {
                 exit_code: -1,
-                stdout: String::new(),
-                stderr: format!("failed to spawn command: {}", e),
+                stdout: RedactedText::default(),
+                stderr: RedactedText::koto_note(format!("failed to spawn command: {}", e)),
                 failure_kind: Some(FailureKind::SpawnFailed),
+                stdout_truncated: false,
+                stderr_truncated: false,
                 truncated: false,
+                stderr_ends_with_note: true,
+                duration_ms: elapsed_ms(started),
             };
         }
     };
@@ -333,14 +394,9 @@ pub fn run_shell_command(
     // Start draining before waiting. A command that writes more than the
     // kernel pipe buffer blocks on write until someone reads, so waiting
     // first would deadlock until the timeout fired.
-    let stdout_reader = child
-        .stdout
-        .take()
-        .map(|pipe| spawn_reader(pipe, MAX_ACTION_OUTPUT_BYTES));
-    let stderr_reader = child
-        .stderr
-        .take()
-        .map(|pipe| spawn_reader(pipe, MAX_ACTION_OUTPUT_BYTES));
+    let retain = env.redactor.retention(MAX_ACTION_OUTPUT_BYTES);
+    let stdout_reader = child.stdout.take().map(|pipe| spawn_reader(pipe, retain));
+    let stderr_reader = child.stderr.take().map(|pipe| spawn_reader(pipe, retain));
 
     let wait_result = child.wait_timeout(timeout);
 
@@ -363,9 +419,13 @@ pub fn run_shell_command(
         // Reap the child so we don't leave a zombie.
         let _ = child.wait();
     }
+    let duration_ms = elapsed_ms(started);
 
-    let (stdout, stdout_truncated) = join_reader(stdout_reader);
-    let (stderr, stderr_truncated) = join_reader(stderr_reader);
+    // Redact once, after both readers finish and before anything decodes,
+    // cuts or reads the output. A killed process may have stopped mid-value.
+    let killed = note.is_some();
+    let (stdout, stdout_truncated) = join_reader(stdout_reader, killed, &env.redactor);
+    let (stderr, stderr_truncated) = join_reader(stderr_reader, killed, &env.redactor);
     let truncated = stdout_truncated || stderr_truncated;
 
     match wait_result {
@@ -376,7 +436,11 @@ pub fn run_shell_command(
                 stdout,
                 stderr,
                 failure_kind: (exit_code != 0).then_some(FailureKind::NonzeroExit),
+                stdout_truncated,
+                stderr_truncated,
                 truncated,
+                stderr_ends_with_note: false,
+                duration_ms,
             }
         }
         Ok(None) => CommandOutput {
@@ -384,14 +448,22 @@ pub fn run_shell_command(
             stdout,
             stderr: append_note(stderr, note.unwrap_or_default()),
             failure_kind: Some(FailureKind::TimedOut),
+            stdout_truncated,
+            stderr_truncated,
             truncated,
+            stderr_ends_with_note: true,
+            duration_ms,
         },
         Err(_) => CommandOutput {
             exit_code: -1,
             stdout,
             stderr: append_note(stderr, note.unwrap_or_default()),
             failure_kind: Some(FailureKind::WaitFailed),
+            stdout_truncated,
+            stderr_truncated,
             truncated,
+            stderr_ends_with_note: true,
+            duration_ms,
         },
     }
 }
@@ -537,10 +609,13 @@ mod tests {
     #[test]
     fn a_cleared_environment_holds_only_what_it_sets() {
         let dir = tmp_dir();
-        let env = CommandEnv::cleared(vec![
-            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
-            ("KOTO_TEST_SET".to_string(), "yes".to_string()),
-        ]);
+        let env = CommandEnv::cleared(
+            vec![
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+                ("KOTO_TEST_SET".to_string(), "yes".to_string()),
+            ],
+            Redactor::empty(),
+        );
         // Names only: the child reports which of these it can see.
         let out = run_shell_command(
             "[ -n \"${PATH+x}\" ] && echo PATH; \
@@ -570,14 +645,22 @@ mod tests {
     #[test]
     fn the_shell_is_found_without_a_path() {
         let dir = tmp_dir();
-        let out = run_shell_command("echo ran", dir.path(), 5, &CommandEnv::cleared(vec![]));
+        let out = run_shell_command(
+            "echo ran",
+            dir.path(),
+            5,
+            &CommandEnv::cleared(vec![], Redactor::empty()),
+        );
         assert_eq!(out.stdout, "ran\n");
     }
 
     #[test]
     fn not_found_is_exit_127_or_the_shell_message() {
         let dir = tmp_dir();
-        let env = CommandEnv::cleared(vec![("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let env = CommandEnv::cleared(
+            vec![("PATH".to_string(), "/usr/bin:/bin".to_string())],
+            Redactor::empty(),
+        );
         let missing = run_shell_command("koto_no_such_command_xyz", dir.path(), 5, &env);
         assert!(looks_not_found(&missing), "{:?}", missing.exit_code);
         let wrapped = run_shell_command("koto_no_such_command_xyz; exit 3", dir.path(), 5, &env);
@@ -597,7 +680,10 @@ mod tests {
     #[test]
     fn outcomes_keep_the_last_run_of_each_label() {
         let dir = tmp_dir();
-        let env = CommandEnv::cleared(vec![("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let env = CommandEnv::cleared(
+            vec![("PATH".to_string(), "/usr/bin:/bin".to_string())],
+            Redactor::empty(),
+        );
         env.record("g", &run_shell_command("exit 1", dir.path(), 5, &env));
         env.record(
             "h",
@@ -613,7 +699,10 @@ mod tests {
 
     #[test]
     fn debug_shows_names_and_never_values() {
-        let env = CommandEnv::cleared(vec![("GH_TOKEN".to_string(), "marker-value".to_string())]);
+        let env = CommandEnv::cleared(
+            vec![("GH_TOKEN".to_string(), "marker-value".to_string())],
+            Redactor::empty(),
+        );
         let shown = format!("{:?}", env);
         assert!(shown.contains("GH_TOKEN"));
         assert!(!shown.contains("marker-value"));
@@ -625,20 +714,5 @@ mod tests {
         assert_eq!(FailureKind::SpawnFailed.as_str(), "spawn_failed");
         assert_eq!(FailureKind::TimedOut.as_str(), "timed_out");
         assert_eq!(FailureKind::WaitFailed.as_str(), "wait_failed");
-    }
-
-    #[test]
-    fn decode_capture_drops_a_split_multibyte_tail() {
-        // "é" is two bytes; cutting after the first leaves an incomplete tail.
-        let bytes = [b'a', 0xC3];
-        assert_eq!(decode_capture(&bytes), "a");
-    }
-
-    #[test]
-    fn decode_capture_replaces_invalid_bytes_mid_stream() {
-        let bytes = [b'a', 0xFF, b'b'];
-        let decoded = decode_capture(&bytes);
-        assert!(decoded.starts_with('a'));
-        assert!(decoded.ends_with('b'));
     }
 }

@@ -1,0 +1,27 @@
+{
+  "format_version": 1,
+  "name": "structured-gates",
+  "version": "1.0",
+  "description": "Demonstrates structured gate output in blocking_conditions; gate always fails",
+  "initial_state": "check",
+  "states": {
+    "check": {
+      "directive": "Run the ci_check gate (always exits 1). Observe the structured output in blocking_conditions.",
+      "transitions": [
+        {
+          "target": "done"
+        }
+      ],
+      "gates": {
+        "ci_check": {
+          "type": "command",
+          "command": "exit 1"
+        }
+      }
+    },
+    "done": {
+      "directive": "Structured gate output workflow complete.",
+      "terminal": true
+    }
+  }
+}

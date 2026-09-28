@@ -1,0 +1,33 @@
+{
+  "format_version": 1,
+  "name": "var-substitution",
+  "version": "1.0",
+  "description": "Tests variable substitution in gate commands",
+  "initial_state": "check",
+  "variables": {
+    "MY_VAR": {
+      "description": "Variable to substitute in gate command",
+      "required": true
+    }
+  },
+  "states": {
+    "check": {
+      "directive": "This state has a gate using {{MY_VAR}} in the command.",
+      "transitions": [
+        {
+          "target": "done"
+        }
+      ],
+      "gates": {
+        "var_gate": {
+          "type": "command",
+          "command": "test -f wip/{{MY_VAR}}.txt"
+        }
+      }
+    },
+    "done": {
+      "directive": "Variable substitution test complete.",
+      "terminal": true
+    }
+  }
+}

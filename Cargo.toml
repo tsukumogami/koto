@@ -33,6 +33,9 @@ serde_yaml_ng = "0.10"
 sha2 = "0.10"
 hex = "0.4"
 regex = "1"
+# Known-credential redaction of captured output. Declared at the 1.1 line
+# already in the lockfile through regex, so no crate is added.
+aho-corasick = "1.1"
 opener = "0.7"
 thiserror = "1"
 toml = "0.8"

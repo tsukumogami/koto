@@ -680,6 +680,8 @@ mod tests {
                     output: expected_output.clone(),
                     outcome: "failed".to_string(),
                     timestamp: ts.clone(),
+                    check: Default::default(),
+                    streams: None,
                 },
                 idempotency_hash: None,
             },

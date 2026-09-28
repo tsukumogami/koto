@@ -16,7 +16,12 @@ use serde::{Deserialize, Serialize};
 use crate::action::{run_shell_command, CommandEnv, CommandOutput, FailureKind};
 use crate::engine::request_store::{self, LegView, RequestStoreError, ValidatedRequestId};
 use crate::engine::types::{CloseDisposition, LegDisposition, LegResultSource, RequestState};
+use crate::findings::{
+    build_failure, Captured, CheckOutput, FailureResponse, Finding, GateFailure,
+};
+use crate::redact::{redact_str, Redactor};
 use crate::session::context::ContextStore;
+use crate::session::context_log::ContextReadRecord;
 use crate::template::types::{
     Gate, GATE_TYPE_CHILDREN_COMPLETE, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS,
     GATE_TYPE_CONTEXT_MATCHES, GATE_TYPE_REQUEST_LEG, SUPPORTED_GATE_TYPES,
@@ -45,12 +50,89 @@ pub enum GateOutcome {
 /// output. The `output` field holds structured data matching the gate type's
 /// schema (e.g. `{"exit_code": 0, "error": ""}` for command gates), making it
 /// available for injection into the evidence map and transition routing.
+///
+/// `failure` and `findings` sit beside `output`, never inside it, and are
+/// never serialized: the evidence map, `gate_evaluated.output` and an
+/// override's `actual_output` all read `output`, so routing and
+/// `override_default` validation can't see the new data by construction
+/// (DESIGN-koto-failure-reporting.md, Decision 3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StructuredGateResult {
     /// Control-flow outcome used by the advance loop.
     pub outcome: GateOutcome,
     /// Gate-type-specific structured output for evidence injection.
     pub output: serde_json::Value,
+    /// koto's fallback finding and the captured output, on a failed
+    /// corrective check: a command or context gate, or the `__action__`
+    /// condition. `None` on a pass and for gate types that report no
+    /// findings.
+    #[serde(skip)]
+    pub failure: Option<GateFailure>,
+    /// Every finding the check printed, in emission order and uncapped,
+    /// whatever the outcome. The response's capped list is derived from
+    /// these and `failure`'s fallback.
+    #[serde(skip)]
+    pub findings: Vec<Finding>,
+    /// For a command gate: the command's wall-clock run time in
+    /// milliseconds. `None` for gates that run no command.
+    #[serde(skip)]
+    pub duration_ms: Option<u64>,
+    /// The context reads a context gate performed, held here rather than in
+    /// `output` so routing never sees them. The advance loop appends them
+    /// as `context_read` events just before this evaluation's
+    /// `gate_evaluated`; an evaluation that isn't recorded drops them.
+    #[serde(skip)]
+    pub context_reads: Vec<ContextReadRecord>,
+}
+
+impl StructuredGateResult {
+    /// koto's fallback finding, when this failed check has one.
+    pub fn fallback(&self) -> Option<&Finding> {
+        self.failure.as_ref().and_then(|f| f.fallback.as_ref())
+    }
+
+    /// Every finding: the parsed ones, uncapped, then the fallback.
+    pub fn all_findings(&self) -> impl Iterator<Item = &Finding> {
+        self.findings.iter().chain(self.fallback())
+    }
+
+    /// [`all_findings`](Self::all_findings), mutably.
+    pub fn all_findings_mut(&mut self) -> impl Iterator<Item = &mut Finding> {
+        let fallback = self.failure.as_mut().and_then(|f| f.fallback.as_mut());
+        self.findings.iter_mut().chain(fallback)
+    }
+
+    /// At most `cap` findings, chosen and ordered by
+    /// [`cap_findings`](crate::findings::cap_findings), and whether one was
+    /// dropped.
+    ///
+    /// The check events record this view at
+    /// [`LOG_FINDINGS_CAP`](crate::findings::LOG_FINDINGS_CAP).
+    pub fn capped_findings(&self, cap: usize) -> (Vec<Finding>, bool) {
+        crate::findings::cap_findings(&self.findings, self.fallback().cloned(), cap)
+    }
+
+    /// The response's `failure` object, when this is a failed check that
+    /// reports one.
+    pub fn response_failure(&self) -> Option<FailureResponse> {
+        self.failure.as_ref().map(|f| f.response(&self.findings))
+    }
+}
+
+/// A passing result with `null` output. Exists so a literal construction
+/// can fill the skipped fields with `..Default::default()`; every
+/// construction sets `outcome` and `output` itself.
+impl Default for StructuredGateResult {
+    fn default() -> Self {
+        StructuredGateResult {
+            outcome: GateOutcome::Passed,
+            output: serde_json::Value::Null,
+            failure: None,
+            findings: Vec::new(),
+            duration_ms: None,
+            context_reads: Vec::new(),
+        }
+    }
 }
 
 /// Evaluate all gates, running each command with `working_dir` as the current
@@ -112,9 +194,30 @@ pub fn evaluate_gates_with_request_store(
         let result = match gate.gate_type.as_str() {
             GATE_TYPE_COMMAND => evaluate_command_gate(name, gate, working_dir, env),
             GATE_TYPE_REQUEST_LEG => evaluate_request_leg_gate(gate, request_root),
-            GATE_TYPE_CONTEXT_EXISTS => evaluate_context_exists_gate(gate, context_store, session),
+            GATE_TYPE_CONTEXT_EXISTS => with_context_failure(
+                evaluate_context_exists_gate(gate, context_store, session),
+                name,
+                || key_not_set(&gate.key),
+                env.redactor(),
+            ),
             GATE_TYPE_CONTEXT_MATCHES => {
-                evaluate_context_matches_gate(gate, context_store, session)
+                let (result, key_absent) =
+                    evaluate_context_matches_gate(gate, context_store, session);
+                with_context_failure(
+                    result,
+                    name,
+                    || {
+                        if key_absent {
+                            key_not_set(&gate.key)
+                        } else {
+                            format!(
+                                "context key '{}' does not match pattern '{}'",
+                                gate.key, gate.pattern
+                            )
+                        }
+                    },
+                    env.redactor(),
+                )
             }
             GATE_TYPE_CHILDREN_COMPLETE => match children_evaluator {
                 Some(eval_fn) => eval_fn(gate),
@@ -138,6 +241,7 @@ pub fn evaluate_gates_with_request_store(
                         "children": [],
                         "error": "children-complete gate requires a session backend"
                     }),
+                    ..Default::default()
                 },
             },
             other => StructuredGateResult {
@@ -150,6 +254,7 @@ pub fn evaluate_gates_with_request_store(
                         SUPPORTED_GATE_TYPES.join(", ")
                     )
                 }),
+                ..Default::default()
             },
         };
         results.insert(name.clone(), result);
@@ -213,6 +318,7 @@ fn request_leg_error(error: String) -> StructuredGateResult {
             ..Default::default()
         }
         .into_json(),
+        ..Default::default()
     }
 }
 
@@ -226,6 +332,7 @@ fn request_leg_missing(error: String) -> StructuredGateResult {
             ..Default::default()
         }
         .into_json(),
+        ..Default::default()
     }
 }
 
@@ -303,6 +410,7 @@ pub fn evaluate_request_leg_gate(gate: &Gate, request_root: Option<&Path>) -> St
             StructuredGateResult {
                 outcome: GateOutcome::Passed,
                 output: out.into_json(),
+                ..Default::default()
             }
         }
         LegDisposition::Abandoned => {
@@ -310,6 +418,7 @@ pub fn evaluate_request_leg_gate(gate: &Gate, request_root: Option<&Path>) -> St
             StructuredGateResult {
                 outcome: GateOutcome::Passed,
                 output: out.into_json(),
+                ..Default::default()
             }
         }
         LegDisposition::Open if request_given_up => {
@@ -319,6 +428,7 @@ pub fn evaluate_request_leg_gate(gate: &Gate, request_root: Option<&Path>) -> St
             StructuredGateResult {
                 outcome: GateOutcome::Passed,
                 output: out.into_json(),
+                ..Default::default()
             }
         }
         LegDisposition::Open => {
@@ -326,6 +436,7 @@ pub fn evaluate_request_leg_gate(gate: &Gate, request_root: Option<&Path>) -> St
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: out.into_json(),
+                ..Default::default()
             }
         }
     }
@@ -407,21 +518,30 @@ fn evaluate_context_exists_gate(
                     "exists": false,
                     "error": "context-exists gate requires a context store and session"
                 }),
+                ..Default::default()
             };
         }
     };
     if let Some(result) = unusable_key_result(&gate.key, "exists") {
         return result;
     }
-    if store.ctx_exists(sess, &gate.key) {
+    let present = store.ctx_exists(sess, &gate.key);
+    let context_reads = ContextReadRecord::presence(store, sess, &gate.key, present)
+        .into_iter()
+        .collect();
+    if present {
         StructuredGateResult {
             outcome: GateOutcome::Passed,
             output: serde_json::json!({"exists": true, "error": ""}),
+            context_reads,
+            ..Default::default()
         }
     } else {
         StructuredGateResult {
             outcome: GateOutcome::Failed,
             output: serde_json::json!({"exists": false, "error": ""}),
+            context_reads,
+            ..Default::default()
         }
     }
 }
@@ -453,13 +573,32 @@ fn unusable_key_result(key: &str, field: &str) -> Option<StructuredGateResult> {
             field: false,
             "error": reason
         }),
+        ..Default::default()
     })
 }
 
+/// Evaluate a context-matches gate, and say whether a `Failed` outcome means
+/// the key isn't there rather than that its content didn't match: the
+/// evidence is the same for both, but the fallback finding's message isn't.
 fn evaluate_context_matches_gate(
     gate: &Gate,
     context_store: Option<&dyn ContextStore>,
     session: Option<&str>,
+) -> (StructuredGateResult, bool) {
+    let mut key_absent = false;
+    let mut reads = Vec::new();
+    let mut result =
+        context_matches_result(gate, context_store, session, &mut key_absent, &mut reads);
+    result.context_reads = reads;
+    (result, key_absent)
+}
+
+fn context_matches_result(
+    gate: &Gate,
+    context_store: Option<&dyn ContextStore>,
+    session: Option<&str>,
+    key_absent: &mut bool,
+    reads: &mut Vec<ContextReadRecord>,
 ) -> StructuredGateResult {
     let (store, sess) = match (context_store, session) {
         (Some(s), Some(n)) => (s, n),
@@ -470,6 +609,7 @@ fn evaluate_context_matches_gate(
                     "matches": false,
                     "error": "context-matches gate requires a context store and session"
                 }),
+                ..Default::default()
             };
         }
     };
@@ -493,22 +633,31 @@ fn evaluate_context_matches_gate(
                           remedy: give the variable a default, or make the \
                           pattern more than the reference alone"
             }),
+            ..Default::default()
         };
     }
-    let content = match store.get(sess, &gate.key) {
+    let fetched = store.get(sess, &gate.key);
+    reads.extend(ContextReadRecord::content(
+        &gate.key,
+        fetched.as_deref().ok(),
+    ));
+    let content = match fetched {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(s) => s,
             Err(_) => {
                 return StructuredGateResult {
                     outcome: GateOutcome::Failed,
                     output: serde_json::json!({"matches": false, "error": ""}),
+                    ..Default::default()
                 };
             }
         },
         Err(_) => {
+            *key_absent = true;
             return StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"matches": false, "error": ""}),
+                ..Default::default()
             };
         }
     };
@@ -518,11 +667,13 @@ fn evaluate_context_matches_gate(
                 StructuredGateResult {
                     outcome: GateOutcome::Passed,
                     output: serde_json::json!({"matches": true, "error": ""}),
+                    ..Default::default()
                 }
             } else {
                 StructuredGateResult {
                     outcome: GateOutcome::Failed,
                     output: serde_json::json!({"matches": false, "error": ""}),
+                    ..Default::default()
                 }
             }
         }
@@ -532,6 +683,7 @@ fn evaluate_context_matches_gate(
                 "matches": false,
                 "error": format!("invalid regex pattern: {}", e)
             }),
+            ..Default::default()
         },
     }
 }
@@ -547,7 +699,36 @@ fn evaluate_command_gate(
 ) -> StructuredGateResult {
     let output = run_shell_command(&gate.command, working_dir, gate.timeout, env);
     env.record(&format!("gate '{}'", name), &output);
-    command_gate_result(output)
+    command_gate_result(name, output, env.redactor())
+}
+
+/// A command's captured streams and the findings its stdout carries.
+///
+/// The streams are already redacted, and whole: the leading 64 KiB of each,
+/// with no truncation note, so the findings and the fallback read exactly
+/// what the command printed.
+pub fn check_output(output: &CommandOutput, redactor: &Redactor) -> CheckOutput {
+    CheckOutput::parse(
+        Captured {
+            stdout: output.stdout.clone(),
+            stderr: output.stderr.clone(),
+            stdout_truncated: output.stdout_truncated,
+            stderr_truncated: output.stderr_truncated,
+        },
+        output.stderr_ends_with_note,
+        redactor,
+    )
+}
+
+/// koto's own description of how a command ended, the last choice for a
+/// fallback finding's message.
+pub fn command_outcome_sentence(kind: FailureKind, exit_code: i32) -> String {
+    match kind {
+        FailureKind::NonzeroExit => format!("command exited with status {}", exit_code),
+        FailureKind::TimedOut => "command timed out".to_string(),
+        FailureKind::SpawnFailed => "command could not be started".to_string(),
+        FailureKind::WaitFailed => "waiting for the command failed".to_string(),
+    }
 }
 
 /// Map a command result onto a gate outcome and its evidence.
@@ -557,33 +738,92 @@ fn evaluate_command_gate(
 /// searching stderr for "timed out". Evidence for those three gains a
 /// `failure_kind` key; the passing and failing shapes are unchanged, which
 /// keeps recorded gate evidence and overrides comparable byte for byte.
-fn command_gate_result(output: CommandOutput) -> StructuredGateResult {
-    match output.failure_kind {
-        Some(FailureKind::TimedOut) => StructuredGateResult {
-            outcome: GateOutcome::TimedOut,
-            output: serde_json::json!({
+///
+/// The findings and captured streams go beside `output`, never in it: every
+/// parsed finding in `findings` whatever the outcome, and on a failure the
+/// fallback and captured streams in `failure`.
+fn command_gate_result(
+    name: &str,
+    output: CommandOutput,
+    redactor: &Redactor,
+) -> StructuredGateResult {
+    let check = check_output(&output, redactor);
+    let duration_ms = Some(output.duration_ms);
+    let Some(kind) = output.failure_kind else {
+        return StructuredGateResult {
+            outcome: GateOutcome::Passed,
+            output: serde_json::json!({"exit_code": 0, "error": ""}),
+            failure: None,
+            findings: check.findings,
+            duration_ms,
+            context_reads: Vec::new(),
+        };
+    };
+    let (outcome, evidence) = match kind {
+        FailureKind::TimedOut => (
+            GateOutcome::TimedOut,
+            serde_json::json!({
                 "exit_code": -1,
                 "error": "timed_out",
                 "failure_kind": FailureKind::TimedOut.as_str(),
             }),
-        },
-        Some(kind @ (FailureKind::SpawnFailed | FailureKind::WaitFailed)) => StructuredGateResult {
-            outcome: GateOutcome::Error,
-            output: serde_json::json!({
+        ),
+        FailureKind::SpawnFailed | FailureKind::WaitFailed => (
+            GateOutcome::Error,
+            serde_json::json!({
                 "exit_code": -1,
                 "error": output.stderr,
                 "failure_kind": kind.as_str(),
             }),
-        },
-        Some(FailureKind::NonzeroExit) => StructuredGateResult {
-            outcome: GateOutcome::Failed,
-            output: serde_json::json!({"exit_code": output.exit_code, "error": ""}),
-        },
-        None => StructuredGateResult {
-            outcome: GateOutcome::Passed,
-            output: serde_json::json!({"exit_code": 0, "error": ""}),
-        },
+        ),
+        FailureKind::NonzeroExit => (
+            GateOutcome::Failed,
+            serde_json::json!({"exit_code": output.exit_code, "error": ""}),
+        ),
+    };
+    let sentence = command_outcome_sentence(kind, output.exit_code);
+    let (findings, failure) = build_failure(name, Some(check), &sentence);
+    StructuredGateResult {
+        outcome,
+        output: evidence,
+        failure: Some(failure),
+        findings,
+        duration_ms,
+        context_reads: Vec::new(),
     }
+}
+
+/// The fallback sentence for a context key that isn't there.
+fn key_not_set(key: &str) -> String {
+    format!("context key '{}' is not set", key)
+}
+
+/// Add the `failure` a failed context gate carries: the fallback finding
+/// alone, since a context gate runs no command and has no output.
+///
+/// The message is the gate's own `output.error` text when the outcome is
+/// `error`, and otherwise `sentence`. Either can hold a substituted value,
+/// so it goes through the redactor.
+fn with_context_failure(
+    mut result: StructuredGateResult,
+    name: &str,
+    sentence: impl FnOnce() -> String,
+    redactor: &Redactor,
+) -> StructuredGateResult {
+    let text = match result.outcome {
+        GateOutcome::Passed => return result,
+        GateOutcome::Error => result.output["error"]
+            .as_str()
+            .filter(|e| !e.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(sentence),
+        GateOutcome::Failed | GateOutcome::TimedOut => sentence(),
+    };
+    let text = redact_str(&text, redactor);
+    let (findings, failure) = build_failure(name, None, &text);
+    result.findings = findings;
+    result.failure = Some(failure);
+    result
 }
 
 /// Return the built-in default override value for a known gate type.
@@ -695,6 +935,224 @@ mod tests {
         assert_eq!(results["check"].output["error"], "");
     }
 
+    /// A failing command gate run through `evaluate_gates` with the tick's
+    /// environment, as `for_tick` builds it, captures its streams redacted.
+    /// The gate's evidence doesn't carry the streams yet, so the test reads
+    /// the output the gate recorded on the environment.
+    #[test]
+    fn a_failing_command_gate_captures_its_streams_redacted() {
+        use crate::engine::types::CommandEnvironment;
+        let token = "ghp_gatetokenvalue0123";
+        let db = "gate-db-secret-value";
+        let record = CommandEnvironment {
+            path: Some("/usr/bin:/bin".to_string()),
+            path_absent: Vec::new(),
+            home: None,
+            xdg_config_home: None,
+            home_absent: false,
+            xdg_config_home_absent: false,
+            pass: vec!["GH_TOKEN".to_string()],
+            legacy: false,
+        };
+        let lookup = |n: &str| match n {
+            "GH_TOKEN" => Some(token.to_string()),
+            "GH_DB" => Some(db.to_string()),
+            _ => None,
+        };
+        let (env, _) = crate::engine::command_env::for_tick(
+            Some(&record),
+            &["GH_DB".to_string()],
+            "wf",
+            None,
+            &[],
+            lookup,
+        )
+        .unwrap();
+
+        let dir = tmp_dir();
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            make_gate(
+                "echo \"out $GH_TOKEN $GH_DB\"; echo \"err $GH_TOKEN $GH_DB\" >&2; exit 1",
+                5,
+            ),
+        );
+        let results = evaluate_gates(&gates, dir.path(), &env, None, None, None);
+        assert_eq!(results["check"].outcome, GateOutcome::Failed);
+
+        let output = env
+            .recorded_output("gate 'check'")
+            .expect("gate output recorded");
+        assert_eq!(
+            output.stdout.as_str(),
+            "out [REDACTED:GH_TOKEN] [REDACTED:GH_DB]\n"
+        );
+        assert_eq!(
+            output.stderr.as_str(),
+            "err [REDACTED:GH_TOKEN] [REDACTED:GH_DB]\n"
+        );
+        for value in [token, db] {
+            assert!(!output.stdout.contains(value));
+            assert!(!output.stderr.contains(value));
+            assert!(!results["check"].output.to_string().contains(value));
+        }
+
+        // The same redacted streams are what the failure carries.
+        let failure = results["check"].failure.as_ref().expect("a failure");
+        let captured = failure.captured.as_ref().expect("captured output");
+        assert_eq!(captured.stdout, output.stdout);
+        assert_eq!(captured.stderr, output.stderr);
+        assert_eq!(
+            results["check"].fallback().unwrap().message,
+            "err [REDACTED:GH_TOKEN] [REDACTED:GH_DB]"
+        );
+    }
+
+    #[test]
+    fn a_gate_that_cannot_be_spawned_reports_koto_s_error_text() {
+        let dir = tmp_dir();
+        let missing = dir.path().join("gone");
+        let mut gates = BTreeMap::new();
+        gates.insert("check".to_string(), make_gate("echo never", 5));
+        let results = evaluate_gates(&gates, &missing, &CommandEnv::inherit(), None, None, None);
+        let result = &results["check"];
+        assert_eq!(result.outcome, GateOutcome::Error);
+        assert_eq!(result.output["failure_kind"], "spawn_failed");
+        let failure = result.failure.as_ref().expect("a failure");
+        let captured = failure.captured.as_ref().expect("captured output");
+        assert!(captured.stdout.is_empty());
+        assert!(captured.stderr.starts_with("failed to spawn command"));
+        assert!(result.findings.is_empty());
+        let fallback = result.fallback().expect("a fallback");
+        assert_eq!(fallback.message, captured.stderr.trim());
+        assert_eq!(
+            fallback.message_source,
+            crate::findings::MessageSource::Koto
+        );
+        assert_eq!(
+            result.response_failure().unwrap().findings,
+            std::slice::from_ref(fallback)
+        );
+    }
+
+    #[test]
+    fn a_passing_gate_keeps_its_findings_off_the_failure() {
+        let dir = tmp_dir();
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            make_gate(
+                r#"echo '::koto-finding::{"rule_id":"E1","level":"error","message":"m"}'"#,
+                5,
+            ),
+        );
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
+        let result = &results["check"];
+        assert_eq!(result.outcome, GateOutcome::Passed);
+        assert!(result.failure.is_none());
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].rule_id, "E1");
+        // Neither skipped field reaches the serialized form.
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::json!({"outcome": "Passed", "output": {"exit_code": 0, "error": ""}})
+        );
+    }
+
+    #[test]
+    fn a_failing_gate_keeps_every_parsed_finding_and_its_fallback_apart() {
+        let dir = tmp_dir();
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            make_gate(
+                r#"i=0; while [ $i -lt 120 ]; do echo "::koto-finding::{\"rule_id\":\"W$i\",\"level\":\"warning\",\"message\":\"m\"}"; i=$((i+1)); done; echo boom >&2; exit 1"#,
+                10,
+            ),
+        );
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
+        let mut result = results["check"].clone();
+        assert_eq!(result.outcome, GateOutcome::Failed);
+        assert_eq!(result.findings.len(), 120, "parsed findings are uncapped");
+        assert_eq!(result.fallback().unwrap().message, "boom");
+        assert_eq!(result.all_findings().count(), 121);
+        assert_eq!(result.all_findings().last(), result.fallback());
+
+        let (log, log_cut) = result.capped_findings(crate::findings::LOG_FINDINGS_CAP);
+        assert_eq!(log.len(), 50);
+        assert_eq!(log[0].rule_id, "check", "over the cap, the error leads");
+        assert_eq!(log[49].rule_id, "W48");
+        assert!(log_cut);
+
+        let view = result.response_failure().unwrap();
+        assert_eq!(view.findings.len(), 100);
+        assert_eq!(view.findings[0].rule_id, "check");
+        assert_eq!(view.findings[99].rule_id, "W98");
+        assert!(view.findings_truncated);
+
+        for f in result.all_findings_mut() {
+            f.effect_landed = Some(false);
+        }
+        assert!(result
+            .findings
+            .iter()
+            .all(|f| f.effect_landed == Some(false)));
+        assert_eq!(result.fallback().unwrap().effect_landed, Some(false));
+    }
+
+    #[test]
+    fn an_erroring_context_gate_uses_its_own_error_text() {
+        let dir = tmp_dir();
+        let store = MockContextStore::new();
+        store.insert("s", "k", b"content");
+        let mut matches = make_gate("", 0);
+        matches.gate_type = GATE_TYPE_CONTEXT_MATCHES.to_string();
+        matches.key = "k".to_string();
+        matches.pattern = "(".to_string();
+        let mut exists = make_gate("", 0);
+        exists.gate_type = GATE_TYPE_CONTEXT_EXISTS.to_string();
+        exists.key = "k".to_string();
+        let mut gates = BTreeMap::new();
+        gates.insert("bad_regex".to_string(), matches);
+        gates.insert("no_store".to_string(), exists);
+
+        let with_store = evaluate_gates(
+            &gates,
+            dir.path(),
+            &CommandEnv::inherit(),
+            Some(&store),
+            Some("s"),
+            None,
+        );
+        let bad = &with_store["bad_regex"];
+        assert_eq!(bad.outcome, GateOutcome::Error);
+        let message = &bad.fallback().unwrap().message;
+        assert!(message.starts_with("invalid regex pattern:"), "{message}");
+        assert!(bad.failure.as_ref().unwrap().captured.is_none());
+        assert!(bad.findings.is_empty());
+
+        let without = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
+        assert_eq!(
+            without["no_store"].fallback().unwrap().message,
+            "context-exists gate requires a context store and session"
+        );
+        // A passing context gate carries nothing.
+        assert!(with_store["no_store"].failure.is_none());
+    }
+
+    #[test]
+    fn unknown_gate_types_report_no_findings() {
+        let dir = tmp_dir();
+        let mut gate = make_gate("", 0);
+        gate.gate_type = "mystery".to_string();
+        let mut gates = BTreeMap::new();
+        gates.insert("m".to_string(), gate);
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
+        assert_eq!(results["m"].outcome, GateOutcome::Error);
+        assert!(results["m"].failure.is_none());
+    }
+
     #[test]
     fn timed_out_gate() {
         let dir = tmp_dir();
@@ -711,19 +1169,28 @@ mod tests {
     /// Build a `CommandOutput` for the mapping tests below. `wait_failed`
     /// cannot be provoked from a real command, so the mapping is exercised
     /// directly rather than through `run_shell_command`.
+    fn map(output: CommandOutput) -> StructuredGateResult {
+        command_gate_result("check", output, &crate::redact::Redactor::empty())
+    }
+
     fn failed_output(kind: FailureKind, exit_code: i32, stderr: &str) -> CommandOutput {
+        use crate::redact::RedactedText;
         CommandOutput {
             exit_code,
-            stdout: String::new(),
-            stderr: stderr.to_string(),
+            stdout: RedactedText::default(),
+            stderr: RedactedText::koto_note(stderr),
             failure_kind: Some(kind),
+            stdout_truncated: false,
+            stderr_truncated: false,
             truncated: false,
+            stderr_ends_with_note: kind != FailureKind::NonzeroExit,
+            duration_ms: 0,
         }
     }
 
     #[test]
     fn timed_out_maps_to_timed_out_with_the_existing_evidence_shape() {
-        let result = command_gate_result(failed_output(FailureKind::TimedOut, -1, "partial"));
+        let result = map(failed_output(FailureKind::TimedOut, -1, "partial"));
         assert_eq!(result.outcome, GateOutcome::TimedOut);
         assert_eq!(result.output["exit_code"], -1);
         assert_eq!(result.output["error"], "timed_out");
@@ -732,7 +1199,7 @@ mod tests {
 
     #[test]
     fn spawn_failed_maps_to_error() {
-        let result = command_gate_result(failed_output(
+        let result = map(failed_output(
             FailureKind::SpawnFailed,
             -1,
             "failed to spawn command: boom",
@@ -745,7 +1212,7 @@ mod tests {
 
     #[test]
     fn wait_failed_maps_to_error_and_is_not_reported_as_a_timeout() {
-        let result = command_gate_result(failed_output(
+        let result = map(failed_output(
             FailureKind::WaitFailed,
             -1,
             "error waiting for command: boom",
@@ -758,7 +1225,7 @@ mod tests {
 
     #[test]
     fn nonzero_exit_evidence_is_unchanged() {
-        let result = command_gate_result(failed_output(FailureKind::NonzeroExit, 3, ""));
+        let result = map(failed_output(FailureKind::NonzeroExit, 3, ""));
         assert_eq!(result.outcome, GateOutcome::Failed);
         assert_eq!(
             result.output,
@@ -768,12 +1235,17 @@ mod tests {
 
     #[test]
     fn passing_evidence_is_byte_identical_to_the_recorded_default() {
-        let result = command_gate_result(CommandOutput {
+        use crate::redact::RedactedText;
+        let result = map(CommandOutput {
             exit_code: 0,
-            stdout: "hi\n".to_string(),
-            stderr: String::new(),
+            stdout: RedactedText::koto_note("hi\n"),
+            stderr: RedactedText::default(),
             failure_kind: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             truncated: false,
+            stderr_ends_with_note: false,
+            duration_ms: 0,
         });
         assert_eq!(result.outcome, GateOutcome::Passed);
         assert_eq!(
@@ -1245,6 +1717,7 @@ mod tests {
         let result = StructuredGateResult {
             outcome: GateOutcome::Passed,
             output: serde_json::json!({"exit_code": 0, "error": ""}),
+            ..Default::default()
         };
         let json = serde_json::to_string(&result).unwrap();
         let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
@@ -1258,6 +1731,7 @@ mod tests {
         let result = StructuredGateResult {
             outcome: GateOutcome::Failed,
             output: serde_json::json!({"exit_code": 1, "error": ""}),
+            ..Default::default()
         };
         let json = serde_json::to_string(&result).unwrap();
         let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
@@ -1270,6 +1744,7 @@ mod tests {
         let result = StructuredGateResult {
             outcome: GateOutcome::TimedOut,
             output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+            ..Default::default()
         };
         let json = serde_json::to_string(&result).unwrap();
         let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
@@ -1283,6 +1758,7 @@ mod tests {
         let result = StructuredGateResult {
             outcome: GateOutcome::Error,
             output: serde_json::json!({"exit_code": -1, "error": "spawn failed: no such file"}),
+            ..Default::default()
         };
         let json = serde_json::to_string(&result).unwrap();
         let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
@@ -1295,6 +1771,7 @@ mod tests {
         let result = StructuredGateResult {
             outcome: GateOutcome::Passed,
             output: serde_json::json!({"exists": true, "error": ""}),
+            ..Default::default()
         };
         let json = serde_json::to_string(&result).unwrap();
         let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
@@ -1308,6 +1785,7 @@ mod tests {
         let result = StructuredGateResult {
             outcome: GateOutcome::Failed,
             output: serde_json::json!({"matches": false, "error": ""}),
+            ..Default::default()
         };
         let json = serde_json::to_string(&result).unwrap();
         let decoded: StructuredGateResult = serde_json::from_str(&json).unwrap();
@@ -1327,6 +1805,7 @@ mod tests {
         let result = StructuredGateResult {
             outcome: GateOutcome::Passed,
             output: serde_json::json!({"exit_code": 0, "error": ""}),
+            ..Default::default()
         };
         let cloned = result.clone();
         assert_eq!(cloned.outcome, GateOutcome::Passed);

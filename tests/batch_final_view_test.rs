@@ -293,6 +293,41 @@ fn a_batch_completed_by_a_tick_that_advances_out_is_recorded_once() {
     assert_eq!(batch_finalized_events(dir).len(), 1);
 }
 
+/// koto writes the key itself, so the write names koto as its writer, in the
+/// log (a `context_added` right after the store write) and in the manifest.
+#[test]
+fn the_batch_final_view_write_is_logged_with_writer_koto() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    start_batch(dir, &advancing_parent("summarize"));
+    drive_child(dir, "parent.A", "done");
+    drive_child(dir, "parent.B", "done");
+    run_ok(dir, &["next", "parent"]);
+
+    let parent_dir = sessions_base(dir).join("parent");
+    let events: Vec<serde_json::Value> =
+        std::fs::read_to_string(parent_dir.join("koto-parent.state.jsonl"))
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+    let added: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["type"] == "context_added" && e["payload"]["key"] == "batch_final_view")
+        .collect();
+    assert_eq!(added.len(), 1, "{events:?}");
+    assert_eq!(added[0]["payload"]["writer"], "koto");
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(parent_dir.join("ctx").join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let meta = &manifest["keys"]["batch_final_view"];
+    assert_eq!(meta["writer"], "koto");
+    assert_eq!(meta["hash"], added[0]["payload"]["hash"]);
+}
+
 #[test]
 fn a_batch_completed_by_a_tick_that_lands_on_a_terminal_state_is_in_the_response() {
     let tmp = TempDir::new().unwrap();

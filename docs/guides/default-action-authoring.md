@@ -11,8 +11,8 @@ This guide answers two questions, and it's the one place both are answered:
    schema. It's the question authors get wrong, and getting it wrong is not recoverable by
    anything koto ships later.
 2. **How do I write the action?** The field, how the command is invoked, where it runs, what
-   happens to its output, what happens when it fails, and how a failing action interacts with
-   the state's gates.
+   happens to its output, what happens when it fails, how a failing action interacts with
+   the state's gates, and how a failed check (an action or a gate) reports findings.
 
 ## Part 1: which commands the engine may run
 
@@ -539,7 +539,13 @@ next` still exits 0 -- carrying a blocking condition under the reserved name `__
    "output":{"command":"git rev-parse --abbrev-ref HEAD","exit_code":128,
              "failure_kind":"nonzero_exit","state":"detect",
              "stdout":"","stderr":"fatal: not a git repository (or any of the parent directories): .git\n",
-             "truncated":false}}],
+             "truncated":false},
+   "failure":{"findings":[{"rule_id":"__action__","level":"error",
+                "message":"fatal: not a git repository (or any of the parent directories): .git",
+                "effect_landed":false,"message_source":"output"}],
+              "findings_truncated":false,
+              "captured":{"stdout":"","stderr":"fatal: not a git repository (or any of the parent directories): .git\n",
+                          "stdout_truncated":false,"stderr_truncated":false}}}],
  "directive":"koto could not read the branch name. Run `git rev-parse --abbrev-ref HEAD` yourself, ...\n\nReading the current branch.",
  "state":"detect"}
 ```
@@ -583,6 +589,92 @@ direction: because the failure returns ahead of the gate block, an action failur
 The ordering against `requires_confirmation` is the same shape. Failure is classified first, so a
 failing action stops as a failure whether or not the flag is set, and the confirm stop is reached
 only after a successful run.
+
+### Reporting findings
+
+A failed check tells the agent why it failed through a `failure` object that sits beside the
+condition's `output`. This applies to a failing `default_action` (the `__action__` condition) and
+equally to a failing `command`, `context-exists` or `context-matches` gate. `output` doesn't
+change, so `when` clauses, `override_default` values and recorded overrides see exactly what they
+saw before; nothing in `failure` can be routed on.
+
+`failure` holds a list of `findings`, a `findings_truncated` flag, and, for a command gate or
+`default_action`, `captured`: the leading 64KB of each stream as the command printed it, with
+`stdout_truncated` and `stderr_truncated`. Both streams have already been through credential
+redaction.
+
+A check doesn't have to do anything to get a useful finding. When a failed check reports no finding
+at level `error`, koto adds one itself: its `rule_id` is the gate's name (or `__action__`), its
+level is `error`, and its message is the last non-blank line of stderr, or else the last non-blank
+stdout line that isn't a finding line, or else a sentence koto writes from the outcome, such as
+`command exited with status 1` or `context key 'review_note' is not set`. On a timeout the message
+is koto's own `command timed out after N seconds` note. The message is folded onto one line and cut
+to 500 characters, then held to the 1,000-byte message cap below. A script that prints `boom` and exits 1 gets exactly one finding:
+
+```json
+{"rule_id":"lint","level":"error","message":"boom","effect_landed":false,"message_source":"output"}
+```
+
+A check that knows more can say so. Print one line per finding to **stdout**, starting with
+`::koto-finding::` and followed by one JSON object:
+
+```text
+::koto-finding::{"rule_id":"E501","level":"error","message":"line too long (104 > 88)","path":"src/app.py","line":12,"column":89,"rule_ref":"https://docs.example.org/rules/E501"}
+::koto-finding::{"rule_id":"W291","level":"warning","message":"trailing whitespace","path":"src/app.py","line":40}
+```
+
+| Key | Type | Required | Meaning |
+|-----|------|----------|---------|
+| `rule_id` | non-empty string | yes | What the finding violated. koto treats it as opaque |
+| `level` | `"error"`, `"warning"` or `"info"` | yes | Severity. It doesn't change whether the check passes |
+| `message` | string | yes | The rule's own message |
+| `path` | string | no | Where the problem is |
+| `line` | integer, 1 or more | no | Only together with `path` |
+| `column` | integer, 1 or more | no | Only together with `line` |
+| `rule_ref` | string | no | A pointer to the rule's full text. The agent isn't told to fetch it |
+| `effect_landed` | boolean | no | The check's own claim that the change it judged was recorded |
+
+The rules are strict so that ordinary output is never mistaken for a finding. The prefix has to be
+the first thing on the line, the JSON object has to be the only thing after it (trailing spaces or
+tabs are allowed, and one carriage return as the line's last character), and `null` counts as
+absent. A missing required key, a wrong type, an empty `rule_id`, an unknown `level`, a `line`
+without a `path`, or a `column` without a `line` makes the whole line ordinary
+output: it stays in `captured.stdout` and isn't reported as a finding. Keys koto doesn't know are
+ignored, so the format can grow. Standard error is never read for finding lines. Finding lines
+stay in the captured text too, so the agent sees them in place. When stdout is cut at 64KB, its
+unfinished last line is never read as a finding.
+
+A check that printed the two lines above and exited 1 returns both findings as written, each with
+`"message_source":"check"`, and no koto-written one, because it reported an error. A check that
+reports only warnings and fails still gets koto's `error` finding after them. A check that exits 0
+passes whatever it printed, and its response carries no `failure`.
+
+Every finding carries `effect_landed`. Unless the check states it, koto sets it to `true` when the
+invocation that ran the check recorded the evidence the agent submitted for the state, or when the
+state's `default_action` exited 0 (and delivered its capture, if it declares one), and to `false`
+otherwise.
+
+`message_source` says where a finding's message came from: `check` for a line the check printed,
+`output` for a koto-written finding whose message is a line of the check's output, and `koto` for
+one whose message is koto's own sentence. Each string field is capped after redaction: `rule_id` at
+128 bytes, `path` and `rule_ref` at 512, `message` at 1,000, never splitting a character or a
+redaction marker.
+
+A response keeps at most 100 findings per condition, and the check's event in the session log
+keeps at most 50. When the findings fit, they stay in the order they were printed, with the
+koto-written one last. When there are more, koto keeps errors first, then warnings, then info,
+each in the order printed, and sets `findings_truncated`. So a check that prints a hundred
+warnings, then its only error, and fails shows the agent that error first, followed by 99
+warnings. The koto-written finding is an error too, so it's never the one dropped. Still, keep
+the output to what an agent can act on: findings past the cap only reach the agent through the
+captured output.
+
+Check authors own what their scripts print. koto replaces the credentials it knows about before
+any of this output reaches the response or the log, but it can't recognize a secret it wasn't
+told about: a password read from a file, a token another tool keeps in its own config, or a value
+printed in some other encoding. Don't print what you wouldn't want the agent, the session log or a
+synced copy of it to hold. Messages are often lifted from tools that quote source lines or
+third-party text, so they reach the agent as data, not as instructions.
 
 ## Part 3: capturing output into a name
 
@@ -698,17 +790,22 @@ lands in prose and possibly in a shell word, not a transcript. The allowlist alr
 newlines, so anything approaching 4096 bytes is a template mistake -- the bound is there to say
 so early rather than to ration anything.
 
-### The three ways delivery fails
+### The four ways delivery fails
 
 After the command exits zero, koto trims the output and then checks it, in this order:
 
 1. **Empty.** Nothing, or nothing but whitespace.
-2. **Too large.** The trimmed value exceeds 4096 bytes.
-3. **A character the allowlist forbids.** The same allowlist every declared variable passes:
+2. **Redacted.** The output held a credential koto knows about -- a token or proxy password
+   from the environment, a `pass_env:` value, or koto's own decider or cloud key -- and koto
+   replaced it with a `[REDACTED:<source>]` marker before anything read the output. A marker
+   is never stored as a variable, so the capture is refused, and `capture_error` carries a
+   `source` naming the variable or setting the credential came from, never its value.
+3. **Too large.** The trimmed value exceeds 4096 bytes.
+4. **A character the allowlist forbids.** The same allowlist every declared variable passes:
    `^[a-zA-Z0-9._/:@+ \-]*$`. It forbids newlines, which is why a multi-line capture isn't
    representable and why trimming is mandatory rather than a courtesy.
 
-All three are action failures, not skips -- the same stop, the same `__action__` condition, the
+All four are action failures, not skips -- the same stop, the same `__action__` condition, the
 same `fallback` prose -- with `failure_kind: "capture_failed"` and a `capture_error` object
 naming the case:
 
@@ -724,7 +821,8 @@ naming the case:
  "capture_error":{"key":"BRANCH","case":"disallowed_character","position":3,"character":"("}}
 ```
 
-The `too_large` case carries `bytes` and `limit` instead of `position` and `character`.
+The `too_large` case carries `bytes` and `limit` instead of `position` and `character`, and the
+`redacted` case carries `source`.
 
 Skipping the delivery was the obvious alternative and it's wrong three times over. A skip is a
 silent drop. It doesn't make the problem go away, it defers it to the reading state, where the

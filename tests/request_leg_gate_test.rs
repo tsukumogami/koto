@@ -335,6 +335,10 @@ fn an_overridable_leg_gate_records_the_built_in_default() {
     assert_eq!(blocked["action"], "gate_blocked", "{blocked}");
     assert_eq!(blocked["blocking_conditions"][0]["agent_actionable"], true);
     assert_eq!(blocked["blocking_conditions"][0]["category"], "temporal");
+    assert!(
+        blocked["blocking_conditions"][0].get("failure").is_none(),
+        "a request-leg condition carries no findings: {blocked}"
+    );
 
     run_ok(
         d,

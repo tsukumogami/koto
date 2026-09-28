@@ -886,9 +886,19 @@ impl SessionBackend for CloudBackend {
     }
 }
 
-impl ContextStore for CloudBackend {
-    fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
-        self.local.add(session, key, content)?;
+impl CloudBackend {
+    /// Write locally (recording `writer` when given), then push the key.
+    fn add_as(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: Option<&str>,
+    ) -> anyhow::Result<()> {
+        match writer {
+            Some(w) => self.local.add_with_writer(session, key, content, w)?,
+            None => self.local.add(session, key, content)?,
+        }
 
         // Check version before pushing. Conflicts are hard errors;
         // S3 connectivity failures are non-fatal (version check is skipped).
@@ -915,10 +925,46 @@ impl ContextStore for CloudBackend {
 
         Ok(())
     }
+}
+
+impl ContextStore for CloudBackend {
+    fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
+        self.add_as(session, key, content, None)
+    }
+
+    fn add_with_writer(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        self.add_as(session, key, content, Some(writer))
+    }
+
+    /// The local metadata, or for a key only the remote store has, the
+    /// remote manifest's.
+    fn meta(&self, session: &str, key: &str) -> Option<crate::session::context::KeyMeta> {
+        if let Some(meta) = self.local.meta(session, key) {
+            return Some(meta);
+        }
+        if !crate::session::context_log::loggable_key(key) {
+            return None;
+        }
+        sync::remote_key_meta(
+            &self.bucket,
+            &self.prefix,
+            session,
+            key,
+            &self.manifest_cache,
+        )
+    }
 
     fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
-        // Pull from remote if a newer version exists.
-        sync::pull_context_if_newer(
+        // Pull from remote if a newer version exists. A pull that wrote the
+        // local store is a write like any other, so it is logged -- before
+        // the read the caller is about to log, which it produced.
+        let pulled = sync::pull_context_if_newer(
             &self.local,
             &self.bucket,
             &self.prefix,
@@ -926,6 +972,19 @@ impl ContextStore for CloudBackend {
             key,
             &self.manifest_cache,
         );
+        if pulled {
+            if let Some(meta) = self.local.meta(session, key) {
+                crate::session::context_log::append_to_session_best_effort(
+                    self,
+                    session,
+                    &crate::session::context_log::added_event_from_meta(
+                        key,
+                        &meta,
+                        crate::session::context_log::WRITER_SYNC,
+                    ),
+                );
+            }
+        }
         self.local.get(session, key)
     }
 
@@ -1800,5 +1859,138 @@ mod tests {
             backend.reconcile_child("child", "accept-remote"),
             ChildResolution::Errored { .. }
         ));
+    }
+
+    // -- A cloud pull is a logged write with writer `sync` --
+
+    /// A minimal S3 stand-in: answers a GET for a path ending in one of
+    /// `objects`' names with its bytes, any other GET with 404, and every
+    /// other request (the state push) with an empty 200.
+    fn serve_objects(objects: Vec<(String, Vec<u8>)>) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut body);
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let path = parts.next().unwrap_or("").split('?').next().unwrap_or("");
+                let (status, payload): (&str, Vec<u8>) = if method == "GET" {
+                    match objects
+                        .iter()
+                        .find(|(name, _)| path.ends_with(name.as_str()))
+                    {
+                        Some((_, bytes)) => ("200 OK", bytes.clone()),
+                        None => ("404 Not Found", Vec::new()),
+                    }
+                } else {
+                    ("200 OK", Vec::new())
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = stream.write_all(&payload);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn cloud_backend_at(base_dir: &Path, endpoint: String) -> CloudBackend {
+        let region = Region::Custom {
+            region: "us-east-1".to_string(),
+            endpoint,
+        };
+        let credentials =
+            Credentials::new(Some("test-key"), Some("test-secret"), None, None, None).unwrap();
+        let bucket = Bucket::new("test-bucket", region, credentials)
+            .unwrap()
+            .with_path_style();
+        let local = LocalBackend::with_base_dir(base_dir.to_path_buf());
+        CloudBackend::with_parts(local, bucket, "test-prefix".to_string())
+    }
+
+    #[test]
+    fn a_pull_records_writer_sync_in_the_store_and_the_log() {
+        use crate::cache::sha256_hex;
+        use crate::engine::types::EventPayload;
+        use crate::session::context::{KeyMeta, Manifest};
+
+        let content = b"pulled from the remote store".to_vec();
+        let meta = |c: &[u8], writer: &str| KeyMeta {
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            size: c.len() as u64,
+            hash: sha256_hex(c),
+            writer: Some(writer.to_string()),
+        };
+        let mut manifest = Manifest::default();
+        manifest
+            .keys
+            .insert("notes.md".to_string(), meta(&content, "agent"));
+        manifest
+            .keys
+            .insert("remote-only.md".to_string(), meta(b"elsewhere", "agent"));
+        let endpoint = serve_objects(vec![
+            (
+                "/ctx/manifest.json".to_string(),
+                serde_json::to_vec(&manifest).unwrap(),
+            ),
+            ("/ctx/notes.md".to_string(), content.clone()),
+        ]);
+
+        let tmp = TempDir::new().unwrap();
+        write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+
+        // A key only the remote store has reads its metadata from there.
+        let remote = backend.meta("wf", "remote-only.md").expect("remote meta");
+        assert_eq!(remote.hash, sha256_hex(b"elsewhere"));
+
+        assert_eq!(backend.get("wf", "notes.md").unwrap(), content);
+
+        let local_meta = backend.local.meta("wf", "notes.md").unwrap();
+        assert_eq!(local_meta.writer.as_deref(), Some("sync"));
+        let (_, events) = backend.local.read_events("wf").unwrap();
+        let pulls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::ContextAdded {
+                    key, hash, writer, ..
+                } if key == "notes.md" => Some((hash.clone(), writer.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pulls,
+            vec![(sha256_hex(&content), Some("sync".to_string()))],
+            "one context_added with writer sync for the pull"
+        );
+
+        // A second read finds the hashes equal: no pull, no second event.
+        backend.get("wf", "notes.md").unwrap();
+        let (_, again) = backend.local.read_events("wf").unwrap();
+        assert_eq!(again.len(), events.len());
     }
 }

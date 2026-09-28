@@ -16,16 +16,21 @@ use std::collections::BTreeMap;
 
 use crate::engine::types::{Event, EventPayload};
 use crate::session::context::ContextStore;
+use crate::session::context_log::WRITER_TRANSITION;
 
-/// Write resolved assignments to the store. Stops at the first failure; the
-/// caller reports it, and [`reconcile`] repairs what did not land.
+/// Write resolved assignments to the store, each with writer `transition`.
+/// Stops at the first failure; the caller reports it, and [`reconcile`]
+/// repairs what did not land.
+///
+/// Appends nothing: the `transitioned` event that carries the assignments is
+/// the log's record of these writes, and its type names the writer.
 pub fn write_assignments(
     store: &dyn ContextStore,
     session: &str,
     assignments: &BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     for (key, value) in assignments {
-        store.add(session, key, value.as_bytes())?;
+        store.add_with_writer(session, key, value.as_bytes(), WRITER_TRANSITION)?;
     }
     Ok(())
 }
@@ -44,7 +49,7 @@ pub fn outstanding_assignments(events: &[Event]) -> BTreeMap<String, String> {
                     latest.insert(key.clone(), Some(value.clone()));
                 }
             }
-            EventPayload::ContextAdded { key, .. } | EventPayload::ContextRemoved { key } => {
+            EventPayload::ContextAdded { key, .. } | EventPayload::ContextRemoved { key, .. } => {
                 latest.insert(key.clone(), None);
             }
             _ => {}
@@ -58,7 +63,9 @@ pub fn outstanding_assignments(events: &[Event]) -> BTreeMap<String, String> {
 
 /// Bring the store in line with the assignments recorded in `events`,
 /// rewriting any key whose stored content differs from its latest assigned
-/// value. When `only` is given, just that key is checked.
+/// value. When `only` is given, just that key is checked. A repair restores a
+/// transition's value, so it records writer `transition`; the check that
+/// decides whether to repair is bookkeeping and logs no read.
 ///
 /// Cheap when nothing is outstanding: a log with no assignments costs one pass
 /// over the events and no store access.
@@ -74,7 +81,7 @@ pub fn reconcile(
         }
         let current = store.get(session, &key).ok();
         if current.as_deref() != Some(value.as_bytes()) {
-            store.add(session, &key, value.as_bytes())?;
+            store.add_with_writer(session, &key, value.as_bytes(), WRITER_TRANSITION)?;
         }
     }
     Ok(())
@@ -191,12 +198,14 @@ mod tests {
                     key: "a".to_string(),
                     hash: String::new(),
                     size: 0,
+                    writer: None,
                 },
             ),
             event(
                 3,
                 EventPayload::ContextRemoved {
                     key: "b".to_string(),
+                    writer: None,
                 },
             ),
         ];

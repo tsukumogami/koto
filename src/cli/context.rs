@@ -5,12 +5,15 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::cache::sha256_hex;
-use crate::engine::types::{now_iso8601, EventPayload};
+use crate::engine::persistence::derive_state_from_log;
+use crate::engine::types::{now_iso8601, Event, EventPayload};
 use crate::session::context::ContextStore;
+use crate::session::context_log::{self, ContextReadRecord, READER_CLI, WRITER_AGENT};
 use crate::session::SessionBackend;
 
-/// Read content from stdin and store it under the given key, then emit a
-/// `context_added` event to the session log.
+/// Read content from stdin and store it under the given key with writer
+/// `agent`, then emit a `context_added` event naming that writer to the
+/// session log. A failed append fails the command, as it always has.
 ///
 /// When `from_file` is provided, reads from that path instead of stdin.
 pub fn handle_add(
@@ -43,7 +46,7 @@ pub fn handle_add(
         }
     };
 
-    store.add(session, key, &content)?;
+    store.add_with_writer(session, key, &content, WRITER_AGENT)?;
 
     let hash = sha256_hex(&content);
     let size = content.len() as u64;
@@ -51,6 +54,7 @@ pub fn handle_add(
         key: key.to_string(),
         hash,
         size,
+        writer: Some(WRITER_AGENT.to_string()),
     };
     backend.append_event(session, &event, &now_iso8601())?;
 
@@ -64,36 +68,73 @@ pub fn handle_add(
 /// Best-effort and silent: a session that does not exist, a log that cannot be
 /// read, or a key that is not a usable key leaves the store as it is, and the
 /// read that follows reports whatever it finds.
+///
+/// Returns the log it read, so the read that follows can name the session's
+/// current state without reading it again; `None` exactly when nothing was
+/// read, which is also when the read logs nothing. The check here is
+/// bookkeeping and logs no read of its own.
 pub fn restore_assigned(
     store: &dyn ContextStore,
     backend: &dyn SessionBackend,
     session: &str,
     key: &str,
-) {
+) -> Option<Vec<Event>> {
     if crate::session::validate::validate_context_key(key).is_err() || !backend.exists(session) {
-        return;
+        return None;
     }
-    let Ok((_, events)) = backend.read_events(session) else {
-        return;
-    };
+    let (_, events) = backend.read_events(session).ok()?;
     if let Err(e) = crate::engine::context_assign::reconcile(store, session, &events, Some(key)) {
         eprintln!(
             "warning: failed to restore assigned context value {:?}: {}",
             key, e
         );
     }
+    Some(events)
+}
+
+/// Append a `koto context get`/`exists` read to the session's log as
+/// `reader: "cli"`, best-effort, naming the state `events` ends in. A read
+/// with no log behind it (`events` is `None`) logs nothing.
+fn log_cli_read(
+    backend: &dyn SessionBackend,
+    session: &str,
+    events: Option<&[Event]>,
+    read: Option<ContextReadRecord>,
+) {
+    let (Some(events), Some(read)) = (events, read) else {
+        return;
+    };
+    let state = derive_state_from_log(events).unwrap_or_default();
+    context_log::append_to_session_best_effort(
+        backend,
+        session,
+        &read.into_event(READER_CLI, &state, None),
+    );
 }
 
 /// Retrieve stored content and write it to stdout.
 ///
 /// When `to_file` is provided, writes to that path instead of stdout.
+///
+/// The read is logged as a `context_read` (`reader: "cli"`, `access:
+/// "content"`) when `events` holds the session's log, including a read of an
+/// absent key, which still fails the command.
 pub fn handle_get(
     store: &dyn ContextStore,
+    backend: &dyn SessionBackend,
+    events: Option<&[Event]>,
     session: &str,
     key: &str,
     to_file: Option<&str>,
 ) -> Result<()> {
-    let content = store.get(session, key)?;
+    let result = store.get(session, key);
+    log_cli_read(
+        backend,
+        session,
+        events,
+        ContextReadRecord::content(key, result.as_deref().ok()),
+    );
+    let content = result?;
 
     match to_file {
         Some(path) => {
@@ -146,11 +187,27 @@ pub enum KeyPresence {
 /// drift into describing the same key differently.
 ///
 /// The caller is responsible for mapping the outcome to exit codes.
-pub fn handle_exists(store: &dyn ContextStore, session: &str, key: &str) -> KeyPresence {
+///
+/// A usable key's answer is logged as a `context_read` (`reader: "cli"`,
+/// `access: "presence"`) when `events` holds the session's log.
+pub fn handle_exists(
+    store: &dyn ContextStore,
+    backend: &dyn SessionBackend,
+    events: Option<&[Event]>,
+    session: &str,
+    key: &str,
+) -> KeyPresence {
     if let Some(reason) = crate::session::validate::unusable_context_key_reason(key) {
         return KeyPresence::Unusable(reason);
     }
-    if store.ctx_exists(session, key) {
+    let present = store.ctx_exists(session, key);
+    log_cli_read(
+        backend,
+        session,
+        events,
+        ContextReadRecord::presence(store, session, key, present),
+    );
+    if present {
         KeyPresence::Present
     } else {
         KeyPresence::Absent
@@ -184,6 +241,7 @@ pub fn handle_remove(
 
     let event = EventPayload::ContextRemoved {
         key: key.to_string(),
+        writer: Some(WRITER_AGENT.to_string()),
     };
     backend.append_event(session, &event, &now_iso8601())?;
 
@@ -195,4 +253,193 @@ pub fn handle_list(store: &dyn ContextStore, session: &str, prefix: Option<&str>
     let keys = store.list_keys(session, prefix)?;
     println!("{}", serde_json::to_string(&keys)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::context_log::{fail_best_effort_appends, take_warnings};
+    use crate::session::local::LocalBackend;
+    use crate::session::state_file_name;
+
+    /// A session `s` in state `work`, with its log written directly.
+    fn session(dir: &std::path::Path) -> LocalBackend {
+        let backend = LocalBackend::with_base_dir(dir.to_path_buf());
+        std::fs::create_dir_all(dir.join("s")).unwrap();
+        std::fs::write(
+            dir.join("s").join(state_file_name("s")),
+            concat!(
+                r#"{"schema_version":1,"workflow":"s","template_hash":"h","created_at":"2026-01-01T00:00:00Z"}"#,
+                "\n",
+                r#"{"seq":1,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":null,"to":"work","condition_type":"auto"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        backend
+    }
+
+    fn event_types(backend: &LocalBackend) -> Vec<String> {
+        let (_, events) = backend.read_events("s").unwrap();
+        events.into_iter().map(|e| e.event_type).collect()
+    }
+
+    #[test]
+    fn get_and_exists_log_one_read_each_naming_the_current_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = session(dir.path());
+        backend
+            .add_with_writer("s", "k", b"v", WRITER_AGENT)
+            .unwrap();
+        let out = dir.path().join("out.txt");
+
+        let events = restore_assigned(&backend, &backend, "s", "k");
+        handle_get(
+            &backend,
+            &backend,
+            events.as_deref(),
+            "s",
+            "k",
+            Some(out.to_str().unwrap()),
+        )
+        .unwrap();
+        assert!(matches!(
+            handle_exists(&backend, &backend, events.as_deref(), "s", "k"),
+            KeyPresence::Present
+        ));
+        let (_, events) = backend.read_events("s").unwrap();
+        let reads: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::ContextRead {
+                    reader,
+                    state,
+                    access,
+                    hash,
+                    ..
+                } => Some((
+                    reader.as_str(),
+                    state.as_str(),
+                    access.clone(),
+                    hash.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reads,
+            vec![
+                (
+                    "cli",
+                    "work",
+                    Some("content".to_string()),
+                    Some(sha256_hex(b"v"))
+                ),
+                (
+                    "cli",
+                    "work",
+                    Some("presence".to_string()),
+                    Some(sha256_hex(b"v"))
+                ),
+            ]
+        );
+    }
+
+    /// With every best-effort append failing, reads and writes behave as they
+    /// did before reads were logged: `get` returns the content, `exists`
+    /// answers, `add` stores and logs its own `context_added` (which is not
+    /// best-effort), and only the reads go unrecorded.
+    #[test]
+    fn failing_read_appends_change_nothing_the_commands_return() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = session(dir.path());
+        let input = dir.path().join("in.txt");
+        std::fs::write(&input, b"content").unwrap();
+        let out = dir.path().join("out.txt");
+        let _hook = fail_best_effort_appends();
+        take_warnings();
+
+        // `add` makes no best-effort append of its own (its `context_added`
+        // is a required write), so the hook has nothing to refuse and `add`
+        // warns about nothing.
+        handle_add(&backend, &backend, "s", "k", Some(input.to_str().unwrap())).unwrap();
+        assert_eq!(take_warnings(), Vec::<String>::new());
+        let events = restore_assigned(&backend, &backend, "s", "k");
+        handle_get(
+            &backend,
+            &backend,
+            events.as_deref(),
+            "s",
+            "k",
+            Some(out.to_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"content");
+        assert!(matches!(
+            handle_exists(&backend, &backend, events.as_deref(), "s", "k"),
+            KeyPresence::Present
+        ));
+        assert!(handle_get(&backend, &backend, events.as_deref(), "s", "absent", None).is_err());
+        let refused = "test hook: append refused";
+        assert_eq!(
+            take_warnings(),
+            vec![
+                format!("warning: failed to record context_read for context key \"k\": {refused}"),
+                format!("warning: failed to record context_read for context key \"k\": {refused}"),
+                format!(
+                    "warning: failed to record context_read for context key \"absent\": {refused}"
+                ),
+            ]
+        );
+
+        assert_eq!(event_types(&backend), vec!["transitioned", "context_added"]);
+        assert_eq!(
+            backend.meta("s", "k").unwrap().writer.as_deref(),
+            Some(WRITER_AGENT)
+        );
+    }
+
+    /// A store that says every key exists but has no metadata and no
+    /// readable content for any of them.
+    struct Hashless;
+
+    impl ContextStore for Hashless {
+        fn add(&self, _: &str, _: &str, _: &[u8]) -> Result<()> {
+            anyhow::bail!("read-only")
+        }
+        fn get(&self, _: &str, _: &str) -> Result<Vec<u8>> {
+            anyhow::bail!("unreadable")
+        }
+        fn ctx_exists(&self, _: &str, _: &str) -> bool {
+            true
+        }
+        fn remove(&self, _: &str, _: &str) -> Result<()> {
+            anyhow::bail!("read-only")
+        }
+        fn list_keys(&self, _: &str, _: Option<&str>) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// `koto context exists` on a key with no hash to be had still answers
+    /// present, and appends nothing to the log.
+    #[test]
+    fn exists_on_a_key_with_no_hash_logs_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = session(dir.path());
+        let (_, events) = backend.read_events("s").unwrap();
+        assert!(matches!(
+            handle_exists(&Hashless, &backend, Some(&events), "s", "k"),
+            KeyPresence::Present
+        ));
+        assert_eq!(event_types(&backend), vec!["transitioned"]);
+    }
+
+    #[test]
+    fn a_session_with_no_log_logs_no_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(dir.path().to_path_buf());
+        assert!(restore_assigned(&backend, &backend, "nope", "k").is_none());
+        assert!(handle_get(&backend, &backend, None, "nope", "k", None).is_err());
+    }
 }

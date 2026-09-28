@@ -43,14 +43,57 @@ const CLAUDE_SESSION_ID_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 /// Best-effort: any failure is logged and swallowed so the commit itself never
 /// fails. `backend` and `store` are the same `LocalBackend`, passed as its two
 /// trait faces.
+///
+/// Not re-entrant: materializing can publish a location, and publishing
+/// appends a `context_added` event through the same commit funnel. That
+/// nested append does not materialize again; the outer materialization is
+/// already writing the session's file.
 pub fn materialize_after_commit(
     backend: &dyn SessionBackend,
     store: &dyn ContextStore,
     session_id: &str,
 ) {
+    let Some(_guard) = MaterializeGuard::enter() else {
+        return;
+    };
+    #[cfg(test)]
+    MATERIALIZE_RUNS.with(|n| n.set(n.get() + 1));
     if let Err(e) = try_materialize(backend, store, session_id) {
         eprintln!("warning: /workflows materialization skipped for {session_id}: {e}");
     }
+}
+
+thread_local! {
+    static MATERIALIZING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks this thread as materializing for as long as it lives.
+struct MaterializeGuard;
+
+impl MaterializeGuard {
+    /// `None` when this thread is already materializing.
+    fn enter() -> Option<Self> {
+        MATERIALIZING.with(|m| {
+            if m.get() {
+                None
+            } else {
+                m.set(true);
+                Some(MaterializeGuard)
+            }
+        })
+    }
+}
+
+impl Drop for MaterializeGuard {
+    fn drop(&mut self) {
+        MATERIALIZING.with(|m| m.set(false));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many materializations this thread has run, for tests.
+    static MATERIALIZE_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 fn try_materialize(
@@ -207,16 +250,50 @@ fn preview(s: &str) -> String {
 ///
 /// `None` means no target resolved: write nothing, default path untouched
 /// (fully headless, or opted out).
+/// A variable the hosting Claude Code session hands koto.
+#[cfg(not(test))]
+fn host_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// In unit tests the host's variables are never read from the process
+/// environment: a test run inside a Claude Code session would otherwise
+/// discover that session's real `/workflows` directory, write into it, and
+/// publish a location whose logged write changes the events the test counts.
+/// A test that wants a host variable sets it with [`set_host_env_for_test`].
+#[cfg(test)]
+fn host_env(name: &str) -> Option<String> {
+    HOST_ENV.with(|m| m.borrow().get(name).cloned())
+}
+
+#[cfg(test)]
+thread_local! {
+    static HOST_ENV: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Set (or with `None`, clear) a host variable for this thread's unit tests.
+#[cfg(test)]
+pub(crate) fn set_host_env_for_test(name: &str, value: Option<&str>) {
+    HOST_ENV.with(|m| {
+        let mut m = m.borrow_mut();
+        match value {
+            Some(v) => m.insert(name.to_string(), v.to_string()),
+            None => m.remove(name),
+        };
+    });
+}
+
 fn resolve_target_dir(
     backend: &dyn SessionBackend,
     store: &dyn ContextStore,
     session_id: &str,
 ) -> Option<PathBuf> {
     // 1. Explicit host handoff.
-    if let Ok(env_dir) = std::env::var(WORKFLOWS_DIR_ENV) {
+    if let Some(env_dir) = host_env(WORKFLOWS_DIR_ENV) {
         let env_dir = env_dir.trim().to_string();
         if !env_dir.is_empty() {
-            self_publish_if_absent(store, session_id, &env_dir);
+            self_publish_if_absent(backend, store, session_id, &env_dir);
             return Some(PathBuf::from(env_dir));
         }
     }
@@ -229,7 +306,7 @@ fn resolve_target_dir(
     if workflows_native_enabled() {
         if let Some(dir) = resolve_from_claude_env() {
             if let Some(s) = dir.to_str() {
-                self_publish_if_absent(store, session_id, s);
+                self_publish_if_absent(backend, store, session_id, s);
             }
             return Some(dir);
         }
@@ -239,9 +316,14 @@ fn resolve_target_dir(
 
 /// Publish `dir` as `session_id`'s location if it has not already published one
 /// (so descendants can discover it by the ancestor walk). Best-effort.
-fn self_publish_if_absent(store: &dyn ContextStore, session_id: &str, dir: &str) {
+fn self_publish_if_absent(
+    backend: &dyn SessionBackend,
+    store: &dyn ContextStore,
+    session_id: &str,
+    dir: &str,
+) {
     if !discover::has_published_location(store, session_id) {
-        let _ = discover::publish_location(store, session_id, dir);
+        let _ = discover::publish_location(backend, store, session_id, dir);
     }
 }
 
@@ -265,7 +347,7 @@ fn workflows_native_enabled() -> bool {
 /// var is unset/empty or no matching transcript exists (e.g. a fully headless
 /// run) -- in which case nothing renders and the dashboard stays the surface.
 fn resolve_from_claude_env() -> Option<PathBuf> {
-    let session_id = std::env::var(CLAUDE_SESSION_ID_ENV).ok()?;
+    let session_id = host_env(CLAUDE_SESSION_ID_ENV)?;
     let session_id = session_id.trim();
     if session_id.is_empty() {
         return None;
@@ -434,6 +516,8 @@ mod tests {
             output: serde_json::json!({}),
             outcome: outcome.to_string(),
             timestamp: "2026-01-01T00:01:00Z".to_string(),
+            check: Default::default(),
+            streams: None,
         };
         backend
             .append_event(id, &payload, "2026-01-01T00:01:00Z")
@@ -450,7 +534,8 @@ mod tests {
         let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
         init_session(&backend, "solo");
         write_template(&backend, "solo", MULTI_PHASE_TEMPLATE);
-        discover::publish_location(&backend, "solo", wf.path().to_str().unwrap()).unwrap();
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
 
         // Drive through gather_context (with evidence) and implement, landing on
         // verify as the active (non-terminal) phase.
@@ -530,7 +615,8 @@ mod tests {
         let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
         init_session(&backend, "solo");
         write_template(&backend, "solo", MULTI_PHASE_TEMPLATE);
-        discover::publish_location(&backend, "solo", wf.path().to_str().unwrap()).unwrap();
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
 
         transition(&backend, "solo", "implement");
         transition(&backend, "solo", "verify");
@@ -561,7 +647,8 @@ mod tests {
         let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
         init_session(&backend, "solo");
         write_template(&backend, "solo", MULTI_PHASE_TEMPLATE);
-        discover::publish_location(&backend, "solo", wf.path().to_str().unwrap()).unwrap();
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
 
         transition(&backend, "solo", "implement");
         transition(&backend, "solo", "verify");
@@ -580,7 +667,8 @@ mod tests {
         let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
         init_session(&backend, "solo");
         write_template(&backend, "solo", MULTI_PHASE_TEMPLATE);
-        discover::publish_location(&backend, "solo", wf.path().to_str().unwrap()).unwrap();
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
 
         transition(&backend, "solo", "implement");
         transition(&backend, "solo", "verify");
@@ -637,7 +725,8 @@ mod tests {
         let wf = TempDir::new().unwrap();
         let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
         init_session(&backend, "solo");
-        discover::publish_location(&backend, "solo", wf.path().to_str().unwrap()).unwrap();
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
 
         transition(&backend, "solo", "building");
 
@@ -653,7 +742,8 @@ mod tests {
         let wf = TempDir::new().unwrap();
         let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
         init_session(&backend, "solo");
-        discover::publish_location(&backend, "solo", wf.path().to_str().unwrap()).unwrap();
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
 
         transition(&backend, "solo", "building");
         assert_eq!(
@@ -715,7 +805,8 @@ mod tests {
         let wf = TempDir::new().unwrap();
         let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
         init_session(&backend, "solo");
-        discover::publish_location(&backend, "solo", wf.path().to_str().unwrap()).unwrap();
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
 
         transition(&backend, "solo", "building");
         let first = read_file(wf.path(), "solo-uuid").unwrap()["startTime"]
@@ -735,7 +826,7 @@ mod tests {
         let nested = wf_parent.path().join("does/not/exist/workflows");
         let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
         init_session(&backend, "solo");
-        discover::publish_location(&backend, "solo", nested.to_str().unwrap()).unwrap();
+        discover::publish_location(&backend, &backend, "solo", nested.to_str().unwrap()).unwrap();
 
         transition(&backend, "solo", "building");
 
@@ -775,5 +866,97 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let absent = tmp.path().join("no-such-projects");
         assert_eq!(find_session_project_dir(&absent, "any"), None);
+    }
+
+    fn materialize_runs() -> u32 {
+        MATERIALIZE_RUNS.with(|n| n.get())
+    }
+
+    /// Publishing appends a `context_added` through the commit funnel. When
+    /// that happens inside a materialization, the nested append must not
+    /// materialize again; outside one, the append materializes as any commit
+    /// does.
+    #[test]
+    fn a_publish_inside_a_materialization_does_not_materialize_again() {
+        use crate::session::context::ContextStore;
+
+        let base = TempDir::new().unwrap();
+        let wf = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+
+        let before = materialize_runs();
+        {
+            let _outer = MaterializeGuard::enter().expect("not yet materializing");
+            discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+                .unwrap();
+        }
+        assert_eq!(materialize_runs(), before, "the nested append materialized");
+        assert!(read_file(wf.path(), "solo-uuid").is_none());
+
+        // The publish was still recorded: in the store with writer koto, and
+        // in the log.
+        let meta = backend
+            .meta("solo", discover::PUBLISH_LOCATION_KEY)
+            .expect("published");
+        assert_eq!(meta.writer.as_deref(), Some("koto"));
+        let (_, events) = backend.read_events("solo").unwrap();
+        let added: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::ContextAdded { key, writer, .. }
+                    if key == discover::PUBLISH_LOCATION_KEY =>
+                {
+                    Some(writer.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(added, vec![Some("koto".to_string())]);
+
+        // Outside a materialization, the next commit materializes once.
+        transition(&backend, "solo", "building");
+        assert_eq!(materialize_runs(), before + 1);
+        assert!(read_file(wf.path(), "solo-uuid").is_some());
+        assert!(
+            MaterializeGuard::enter().is_some(),
+            "the guard was released"
+        );
+    }
+
+    /// The host handoff publishes from inside a materialization: the publish
+    /// is logged once, the nested append doesn't materialize again, and the
+    /// outer materialization writes the file.
+    #[test]
+    fn a_host_handoff_publishes_once_from_inside_a_materialization() {
+        use crate::session::context::ContextStore;
+
+        let base = TempDir::new().unwrap();
+        let wf = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+        set_host_env_for_test(WORKFLOWS_DIR_ENV, wf.path().to_str());
+
+        let before = materialize_runs();
+        transition(&backend, "solo", "building");
+        set_host_env_for_test(WORKFLOWS_DIR_ENV, None);
+
+        assert_eq!(materialize_runs(), before + 1, "one materialization");
+        assert!(read_file(wf.path(), "solo-uuid").is_some());
+        assert_eq!(
+            backend
+                .meta("solo", discover::PUBLISH_LOCATION_KEY)
+                .and_then(|m| m.writer),
+            Some("koto".to_string())
+        );
+        let (_, events) = backend.read_events("solo").unwrap();
+        let published = events
+            .iter()
+            .filter(|e| {
+                matches!(&e.payload, EventPayload::ContextAdded { key, .. }
+                    if key == discover::PUBLISH_LOCATION_KEY)
+            })
+            .count();
+        assert_eq!(published, 1);
     }
 }

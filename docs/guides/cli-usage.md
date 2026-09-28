@@ -270,6 +270,72 @@ Each entry in `blocking_conditions` includes structured gate output in the `outp
 
 `status` reflects the `GateOutcome`: `"failed"` (pass condition not met), `"timed_out"` (command exceeded its timeout), `"error"` (spawn or evaluation error).
 
+**Why a check failed: `failure` and `attempts`.** The example above shows only the fields routing reads. A failed `command`, `context-exists` or `context-matches` gate, and a failed `default_action` (the `__action__` condition), also carry a `failure` object beside `output`, and a response with blocking conditions carries a top-level `attempts` object. Here's the second tick of a state whose lint gate prints two findings and exits 1 (the finding line in `captured.stdout` is shortened):
+
+```json
+{
+  "action": "gate_blocked",
+  "advanced": false,
+  "attempts": {
+    "rules": {
+      "ruff": {
+        "E501": {"session": 2, "visit": 2}
+      }
+    },
+    "session": 2,
+    "visit": 2
+  },
+  "blocking_conditions": [
+    {
+      "agent_actionable": true,
+      "category": "corrective",
+      "failure": {
+        "captured": {
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "::koto-finding::{\"rule_id\":\"E501\",...}\n::koto-finding::{\"rule_id\":\"W291\",...}\nFound 2 errors.\n",
+          "stdout_truncated": false
+        },
+        "findings": [
+          {
+            "column": 89,
+            "effect_landed": false,
+            "level": "error",
+            "line": 12,
+            "message": "line too long (104 > 88)",
+            "message_source": "check",
+            "path": "app/views.py",
+            "rule_id": "E501",
+            "rule_ref": "https://docs.example.org/rules/E501"
+          },
+          {
+            "effect_landed": false,
+            "level": "warning",
+            "line": 40,
+            "message": "trailing whitespace",
+            "message_source": "check",
+            "path": "app/views.py",
+            "rule_id": "W291"
+          }
+        ],
+        "findings_truncated": false
+      },
+      "name": "ruff",
+      "output": {"error": "", "exit_code": 1},
+      "status": "failed",
+      "type": "command"
+    }
+  ],
+  "directive": "Fix the lint errors.",
+  "error": null,
+  "expects": null,
+  "state": "lint",
+  "unassigned_children": []
+}
+```
+
+`output` is unchanged, so nothing in `failure` or `attempts` can be routed on or overridden, and a passing or evidence-only response has neither field. The field reference, the order an agent works through a failed check, and why `failure` is treated as data rather than instructions are in [Reading why a check failed](../../plugins/koto-skills/skills/koto-user/references/response-shapes.md#reading-why-a-check-failed); a check reports its own findings with the `::koto-finding::` line format in the [`default_action` authoring guide](default-action-authoring.md#reporting-findings).
+
 **Integration / IntegrationUnavailable** -- the state declares an integration. When the runner is available, you get `"integration"` with the output. When unavailable, you get `"integration_unavailable"` with `available: false`:
 
 ```json

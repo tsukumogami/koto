@@ -182,7 +182,7 @@ A command koto runs -- a state's `default_action` or a command gate -- reports *
 | `timed_out` | The command did not finish within its timeout, so its process group was killed. Whatever it wrote before the kill is still reported. |
 | `spawn_failed` | No child process was ever started. Also covers an action refused before the spawn: a `working_dir` that is absolute, or one that resolves outside the session's execution anchor. |
 | `wait_failed` | The child started but waiting on it failed, so no exit status was ever obtained. |
-| `capture_failed` | The command exited zero but its stdout could not be delivered under the state's `capture_stdout_as` name. Action failures only; a gate has nothing to capture. The `capture_error` object alongside it names the case: `empty`, `too_large`, or `disallowed_character`. |
+| `capture_failed` | The command exited zero but its stdout could not be delivered under the state's `capture_stdout_as` name. Action failures only; a gate has nothing to capture. The `capture_error` object alongside it names the case: `empty`, `redacted`, `too_large`, or `disallowed_character`. `redacted` means the output held a known credential, which koto replaced with a `[REDACTED:<source>]` marker; its `source` names the variable or setting the credential came from, never the value. |
 
 The vocabulary is the same on the two surfaces it appears on. What sits beside it is not.
 

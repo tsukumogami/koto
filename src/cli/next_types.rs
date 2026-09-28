@@ -4,6 +4,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::batch_error::BatchError;
+use crate::findings::FailureResponse;
 use crate::gate::{built_in_default, GateOutcome, StructuredGateResult};
 use crate::template::types::{Gate, TemplateState, ACTION_CONDITION_NAME, FIELD_TYPE_TASKS};
 
@@ -1049,6 +1050,12 @@ pub struct BlockingCondition {
     // output. Always false for a gate declared `overridable: false`.
     pub agent_actionable: bool,
     pub output: serde_json::Value,
+    /// Findings and captured output for a failed corrective check, beside
+    /// its unchanged `output` (DESIGN-koto-failure-reporting.md, Decision 3).
+    /// Absent for temporal conditions and for gate types that report no
+    /// findings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<FailureResponse>,
 }
 
 /// Output from a default action that requires confirmation.
@@ -1079,6 +1086,28 @@ pub struct IntegrationUnavailableMarker {
 pub struct ErrorDetail {
     pub field: String,
     pub reason: String,
+}
+
+/// Add the top-level `attempts` object to a serialized response envelope,
+/// the way `leg` is added: only when there are counts and the response has
+/// a non-empty `blocking_conditions` list
+/// (DESIGN-koto-failure-reporting.md, Decision 3). A passing or
+/// evidence-only response is left byte-identical.
+pub fn attach_attempts(
+    envelope: &mut serde_json::Map<String, serde_json::Value>,
+    attempts: Option<&crate::engine::advance::AttemptCounts>,
+) -> Result<(), serde_json::Error> {
+    let Some(attempts) = attempts else {
+        return Ok(());
+    };
+    let blocked = envelope
+        .get("blocking_conditions")
+        .and_then(|b| b.as_array())
+        .is_some_and(|b| !b.is_empty());
+    if blocked {
+        envelope.insert("attempts".to_string(), serde_json::to_value(attempts)?);
+    }
+    Ok(())
 }
 
 /// Convert gate evaluation results into a list of blocking conditions.
@@ -1118,6 +1147,7 @@ pub fn blocking_conditions_from_gates(
                     category: "corrective".to_string(),
                     agent_actionable: false,
                     output: result.output.clone(),
+                    failure: result.response_failure(),
                 });
             }
             let condition_type = gate_defs
@@ -1142,6 +1172,7 @@ pub fn blocking_conditions_from_gates(
                 category,
                 agent_actionable,
                 output: result.output.clone(),
+                failure: result.response_failure(),
             })
         })
         .collect()
@@ -1450,6 +1481,7 @@ mod tests {
                     category: "corrective".to_string(),
                     agent_actionable: false,
                     output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    failure: None,
                 },
                 BlockingCondition {
                     name: "lint_check".to_string(),
@@ -1458,6 +1490,7 @@ mod tests {
                     category: "corrective".to_string(),
                     agent_actionable: false,
                     output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+                    failure: None,
                 },
             ],
             unassigned_children: vec![],
@@ -1962,6 +1995,7 @@ mod tests {
             category: "corrective".to_string(),
             agent_actionable: false,
             output: serde_json::json!({"exit_code": 1, "error": ""}),
+            failure: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&cond).unwrap();
@@ -2202,6 +2236,7 @@ mod tests {
                     "failure_kind": "nonzero_exit",
                     "exit_code": 3,
                 }),
+                ..Default::default()
             },
         );
 
@@ -2230,6 +2265,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Passed,
                 output: serde_json::json!({"exit_code": 0, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -2251,6 +2287,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exit_code": 1, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -2280,6 +2317,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exists": false, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -2307,6 +2345,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::TimedOut,
                 output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
+                ..Default::default()
             },
         );
 
@@ -2330,6 +2369,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Error,
                 output: serde_json::json!({"exit_code": -1, "error": "spawn failed"}),
+                ..Default::default()
             },
         );
 
@@ -2350,6 +2390,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exit_code": 1, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -2369,6 +2410,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Passed,
                 output: serde_json::json!({"exit_code": 0, "error": ""}),
+                ..Default::default()
             },
         );
         gate_results.insert(
@@ -2376,6 +2418,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exit_code": 2, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -2438,6 +2481,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exit_code": 1, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -2461,6 +2505,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exit_code": 1, "error": ""}),
+                ..Default::default()
             },
         );
 
@@ -2502,6 +2547,7 @@ mod tests {
                 StructuredGateResult {
                     outcome: GateOutcome::Failed,
                     output: serde_json::json!({"exit_code": 1, "error": ""}),
+                    ..Default::default()
                 },
             );
         }
@@ -2544,6 +2590,7 @@ mod tests {
             StructuredGateResult {
                 outcome: GateOutcome::Failed,
                 output: serde_json::json!({"exit_code": 1, "error": ""}),
+                ..Default::default()
             },
         );
 

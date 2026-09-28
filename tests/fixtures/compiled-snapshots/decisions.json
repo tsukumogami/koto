@@ -1,0 +1,30 @@
+{
+  "format_version": 1,
+  "name": "decisions",
+  "version": "1.0",
+  "description": "Tests decision recording and listing",
+  "initial_state": "work",
+  "states": {
+    "done": {
+      "directive": "Decision test complete.",
+      "terminal": true
+    },
+    "work": {
+      "directive": "Do some work and record decisions along the way.",
+      "transitions": [
+        {
+          "target": "done"
+        }
+      ],
+      "accepts": {
+        "status": {
+          "field_type": "enum",
+          "required": true,
+          "values": [
+            "completed"
+          ]
+        }
+      }
+    }
+  }
+}

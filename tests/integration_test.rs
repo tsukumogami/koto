@@ -14,6 +14,11 @@ fn koto_cmd(dir: &Path) -> Command {
     // Override HOME so tests don't read the user's ~/.koto/config.toml
     // (which might set backend = "cloud" or other non-default values).
     cmd.env("HOME", dir);
+    // A host Claude Code session would make every append publish the
+    // `/workflows` location and log that write, adding events these tests
+    // don't expect.
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
+    cmd.env_remove("KOTO_WORKFLOWS_DIR");
     cmd
 }
 
@@ -7945,6 +7950,8 @@ fn children_complete_gate_pending_children_fails() {
     assert_eq!(conditions[0]["type"], "children-complete");
     assert_eq!(conditions[0]["status"], "failed");
     assert_eq!(conditions[0]["category"], "temporal");
+    // A temporal condition is waiting, not failing a check: no findings.
+    assert!(conditions[0].get("failure").is_none(), "{json}");
     assert_eq!(conditions[0]["output"]["total"], 1);
     assert_eq!(conditions[0]["output"]["completed"], 0);
     assert_eq!(conditions[0]["output"]["pending"], 1);

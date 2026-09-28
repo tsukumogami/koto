@@ -1298,6 +1298,8 @@ mod tests {
                 output: serde_json::Value::Null,
                 outcome: "failed".to_string(),
                 timestamp: "2026-01-01T00:00:02Z".to_string(),
+                check: Default::default(),
+                streams: None,
             },
             "2026-01-01T00:00:02Z",
         )
@@ -1325,6 +1327,8 @@ mod tests {
                 output: serde_json::Value::Null,
                 outcome: "passed".to_string(),
                 timestamp: "2026-01-01T00:00:02Z".to_string(),
+                check: Default::default(),
+                streams: None,
             },
             "2026-01-01T00:00:02Z",
         )

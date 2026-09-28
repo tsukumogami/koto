@@ -1,0 +1,43 @@
+{
+  "format_version": 1,
+  "name": "skip-if-branch",
+  "version": "1.0",
+  "description": "skip_if selects correct conditional branch based on vars.ROUTE",
+  "initial_state": "triage",
+  "variables": {
+    "ROUTE": {
+      "description": "Routing variable; when set, triage auto-advances to main_track"
+    }
+  },
+  "states": {
+    "hotfix_track": {
+      "directive": "Terminal state reached when ROUTE was not set.",
+      "terminal": true
+    },
+    "main_track": {
+      "directive": "Terminal state reached when ROUTE was set.",
+      "terminal": true
+    },
+    "triage": {
+      "directive": "When ROUTE is set, skip_if fires and auto-advances to main_track via the\nconditional transition. When ROUTE is unset, falls through to hotfix_track.",
+      "transitions": [
+        {
+          "target": "main_track",
+          "when": {
+            "vars.ROUTE": {
+              "is_set": true
+            }
+          }
+        },
+        {
+          "target": "hotfix_track"
+        }
+      ],
+      "skip_if": {
+        "vars.ROUTE": {
+          "is_set": true
+        }
+      }
+    }
+  }
+}
