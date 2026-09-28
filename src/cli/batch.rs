@@ -2671,8 +2671,6 @@ pub fn build_children_complete_output(
     )
 }
 
-/// Render a `ChildGateEntry` as a JSON object, omitting absent optional
-/// fields (matching the serde `skip_serializing_if` directives).
 /// Longest `failure_reason` a batch entry carries, in characters. The text is
 /// written by a child's agent or script and is copied into the parent's gate
 /// output, its frozen view and its responses, so it is bounded.
@@ -2733,6 +2731,8 @@ fn one_line_reason(raw: &str) -> Option<String> {
     Some(cut)
 }
 
+/// Render a `ChildGateEntry` as a JSON object, omitting absent optional
+/// fields (matching the serde `skip_serializing_if` directives).
 fn child_entry_to_json(entry: &ChildGateEntry) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("name".to_string(), serde_json::json!(entry.name));

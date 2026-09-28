@@ -254,7 +254,10 @@ to `0.9.x`).
   context, and a terminal state takes none. They now show a
   `context_assignments` entry on the edge that takes the evidence, and warn
   that `${evidence.<field>}` on an auto-advancing state's edge resolves to an
-  empty value that overwrites the reason.
+  empty value that overwrites the reason. The W5 compile warning no longer
+  counts `failure_reason` in a failure terminal's `accepts` as storing the
+  key, and its remedy names the assignment form instead, so a template that
+  relied on that declaration now sees W5.
 
 - **A completed batch is recorded even when the completing tick leaves the
   batching state (koto#263).** The `BatchFinalized` event and the

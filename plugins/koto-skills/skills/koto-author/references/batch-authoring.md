@@ -87,7 +87,7 @@ When a worker ends in a terminal state with `failure: true`, the parent's batch 
 Evidence alone writes nothing to context. A worker that submits `{"status": "blocked", "failure_reason": "API quota exhausted"}` has told koto the reason only if something stores it. Two things do:
 
 - a `context_assignments` entry on the transition that takes the evidence;
-- `koto context add <parent>.<task> failure_reason`, run by the worker or by a `default_action`, before or after the failure.
+- `koto context add <parent>.<task> failure_reason`, run by the worker or by a `default_action`, before the worker moves into its failure state.
 
 The assignment form, on the state where the worker submits the evidence:
 
@@ -113,9 +113,9 @@ The worker submits `{"status": "blocked", "failure_reason": "API quota exhausted
 
 Put the assignment on the edge out of the state that takes the evidence, not further along. Evidence belongs to the state it was submitted to. If `blocked` leads to an intermediate state that auto-advances to `done_blocked` in the same tick, an assignment of `${evidence.failure_reason}` on that intermediate state's edge resolves to an empty string, even when the intermediate state declares the field in its own `accepts`. The empty value replaces the reason the first edge stored, and the parent falls back to the state name.
 
-koto reads only what the worker wrote during its current run. After `retry_failed` or `koto rewind` restarts the worker, a reason from the earlier run no longer counts, even though the context key still holds it. The latest write wins: a later empty value, or `koto context remove`, leaves no reason. The text is folded onto one line, with each run of whitespace and line breaks becoming one space, and anything longer than 500 characters is cut to 500, ending in `...`. The full text stays readable with `koto context get <parent>.<task> failure_reason`, since a child that reaches a `failure: true` terminal keeps its session.
+The parent freezes `batch_final_view` on the tick its batch completes, so a reason written after the worker failed may miss it; write the reason before or on the transition into the failure state. koto reads only what the worker wrote during its current run. After `retry_failed` or `koto rewind` restarts the worker, a reason from the earlier run no longer counts, even though the context key still holds it. The latest write wins: a later empty value, or `koto context remove`, leaves no reason. The text is folded onto one line, with each run of whitespace and line breaks becoming one space, and anything longer than 500 characters is cut to 500, ending in `...`. The full text stays readable with `koto context get <parent>.<task> failure_reason`, since a child that reaches a `failure: true` terminal keeps its session.
 
-W5 warns at compile time when a `failure: true` terminal has no declared path writing `failure_reason`. It is satisfied when every transition into the terminal assigns `failure_reason`, or when the terminal state's `accepts` declares the field. A `default_action` or a worker's `koto context add` isn't detected, so a template relying on one still sees W5. Declaring `failure_reason` in the terminal state's own `accepts` silences W5 but doesn't write the key, because a terminal state takes no evidence. Use the assignment form above.
+W5 warns at compile time when a `failure: true` terminal has no declared path writing `failure_reason`. It is satisfied only when every transition into the terminal assigns `failure_reason`. A `default_action` or a worker's `koto context add` isn't detected, so a template relying on one still sees W5. Declaring `failure_reason` in the terminal state's own `accepts` doesn't satisfy it, and doesn't store the key either, because a terminal state takes no evidence.
 
 ## F5: child templates need a `skipped_marker` state
 
@@ -204,7 +204,7 @@ Cross-level retry is rejected in v1. Naming a coordinator child in `retry_failed
 The `examples/` directory carries a minimal runnable pair:
 
 - `batch-coordinator.md` — parent with `plan_and_await` / `analyze_failures` / `summarize`. Demonstrates `materialize_children`, routing on aggregate booleans, and the retry path.
-- `batch-worker.md` — child with `working` / `done` / `done_blocked` / `skipped_due_to_dep_failure`. Demonstrates `failure: true`, the `failure_reason` accepts path for W5, and the F5 skip-marker state.
+- `batch-worker.md` — child with `working` / `done` / `done_blocked` / `skipped_due_to_dep_failure`. Demonstrates `failure: true`, storing `failure_reason` with a `context_assignments` entry so the parent sees the worker's reason (and W5 stays quiet), and the F5 skip-marker state.
 
 Both compile as-is. Use them as a starting skeleton when you add a new batch workflow.
 </content>

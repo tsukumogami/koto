@@ -422,3 +422,77 @@ fn an_over_long_reason_is_cut_to_500_characters() {
     );
     assert_eq!(gate_entry_for_a(dir)["reason"], "x".repeat(500));
 }
+
+/// A parent that leaves its batching state for a terminal state on the tick
+/// its batch completes.
+const LEAVING_PARENT_TEMPLATE: &str = r#"---
+name: reason-parent-leave
+version: "1.0"
+initial_state: plan
+states:
+  plan:
+    accepts:
+      tasks:
+        type: tasks
+        required: true
+    gates:
+      done:
+        type: children-complete
+    materialize_children:
+      from_field: tasks
+      default_template: child.md
+    transitions:
+      - target: closed
+        when:
+          gates.done.all_complete: true
+  closed:
+    terminal: true
+---
+
+## plan
+
+Plan.
+
+## closed
+
+Closed.
+"#;
+
+#[test]
+fn a_reason_reaches_the_terminal_response_when_the_completing_tick_leaves() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    std::fs::write(dir.join("child.md"), CHILD_TEMPLATE).unwrap();
+    let parent = dir.join("parent.md");
+    std::fs::write(&parent, LEAVING_PARENT_TEMPLATE).unwrap();
+    run_ok(
+        dir,
+        &["init", "parent", "--template", parent.to_str().unwrap()],
+    );
+    let tasks = serde_json::json!({
+        "tasks": [
+            {"name": "A", "waits_on": [], "vars": {}},
+            {"name": "B", "waits_on": [], "vars": {}},
+        ]
+    });
+    run_koto(dir, &["next", "parent", "--with-data", &tasks.to_string()]);
+
+    drive(
+        dir,
+        "parent.A",
+        serde_json::json!({"status": "fail_assign", "failure_reason": "tests red on main"}),
+    );
+    drive(dir, "parent.B", serde_json::json!({"status": "done"}));
+
+    // One tick completes the batch and lands on the terminal state.
+    let json = run_ok(dir, &["next", "parent", "--no-cleanup"]);
+    assert_eq!(json["action"], "done", "{json}");
+    let entry = json["batch_final_view"]["children"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no batch_final_view in {json}"))
+        .iter()
+        .find(|c| c["name"] == "parent.A")
+        .cloned()
+        .unwrap_or_else(|| panic!("no parent.A in {json}"));
+    assert_reason(&entry, "tests red on main", "failure_reason");
+}

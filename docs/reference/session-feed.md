@@ -705,7 +705,7 @@ expect this field in raw log files.
   "type": "batch_finalized",
   "payload": {
     "state": "materialize_children",
-    "view": {"all_complete": true, "total": 5, "success": 4, "failure": 1, "skipped": 0},
+    "view": {"all_complete": true, "total": 5, "success": 4, "failed": 1, "skipped": 0, "children": [...]},
     "timestamp": "2026-05-07T10:05:00.000Z"
   }
 }
@@ -715,6 +715,7 @@ expect this field in raw log files.
 |-------|------|----------|-------------|
 | `state` | string | Yes | The `materialize_children` state the batch finalized from. |
 | `view` | object | Yes | Frozen snapshot of the `children-complete` gate output at finalization time. |
+| `timestamp` | string | Yes | RFC 3339 UTC timestamp. Matches the outer envelope `timestamp`. |
 
 `view` holds the gate's aggregate counts and booleans (`total`, `completed`,
 `pending`, `success`, `failed`, `skipped`, `blocked`, `spawn_failed`,
@@ -738,7 +739,11 @@ A view written by a koto older than `reason` has `failure_mode` and no
 `batch_final_view` and `koto status` add `reason` from `failure_mode`, the
 state name, when they read it. The `batch_final_view` context key is the view as it was
 written, so a key written by an older koto still lacks `reason`.
-| `timestamp` | string | Yes | RFC 3339 UTC timestamp. Matches the outer envelope `timestamp`. |
+
+The view is frozen when the batch completes. A `failure_reason` a child
+writes after that reaches the live gate output and `koto status` while the
+parent is still in the batching state, but not the frozen view, until the
+batch is recorded again after a retry, a rewind or a change in outcomes.
 
 ---
 
