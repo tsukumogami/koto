@@ -335,6 +335,11 @@ fn a_rewind_clears_before_it_returns() {
 fn an_override_and_a_recheck_clear_nothing() {
     let (_tmp, dir) = setup();
     next(&dir, "wf", None);
+    // Leave and come back, so review is in an epoch that did owe a clearing.
+    next(&dir, "wf", Some(r#"{"outcome":"retry"}"#));
+    next(&dir, "wf", Some(r#"{"fixed":"yes"}"#));
+    assert_eq!(of_type(&events(&dir, "wf"), "context_cleared").len(), 1);
+
     add(&dir, "wf", "verdict", "kept");
     run_ok(
         &dir,
@@ -349,8 +354,43 @@ fn an_override_and_a_recheck_clear_nothing() {
         ],
     );
     next(&dir, "wf", None);
-    assert!(exists(&dir, "wf", "verdict"));
-    assert!(of_type(&events(&dir, "wf"), "context_cleared").is_empty());
+    next(&dir, "wf", None);
+    assert!(exists(&dir, "wf", "verdict"), "an override is not an entry");
+    assert_eq!(of_type(&events(&dir, "wf"), "context_cleared").len(), 1);
+}
+
+#[test]
+fn an_entry_another_writer_recorded_is_cleared_on_the_next_tick() {
+    // A batch retry rewinds a failed child by appending `rewound` to the
+    // child's log directly, with no clearing. The child's next tick owes it.
+    let (_tmp, dir) = setup();
+    next(&dir, "wf", None);
+    add(&dir, "wf", "verdict", "stale");
+    next(&dir, "wf", Some(r#"{"outcome":"retry"}"#));
+
+    let log = sessions_base(&dir).join("wf").join("koto-wf.state.jsonl");
+    let seq = events(&dir, "wf").last().unwrap()["seq"].as_u64().unwrap() + 1;
+    let line = serde_json::json!({
+        "seq": seq,
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "type": "rewound",
+        "payload": {"from": "fix", "to": "review"},
+    });
+    let mut body = std::fs::read_to_string(&log).unwrap();
+    body.push_str(&format!("{line}\n"));
+    std::fs::write(&log, body).unwrap();
+    assert!(
+        exists(&dir, "wf", "verdict"),
+        "appending the entry clears nothing"
+    );
+
+    let resp = next(&dir, "wf", None);
+    assert_eq!(resp["state"], "review");
+    assert!(!exists(&dir, "wf", "verdict"));
+    assert_eq!(seen(&dir), "absent");
+    let cleared = of_type(&events(&dir, "wf"), "context_cleared");
+    assert_eq!(cleared.len(), 1);
+    assert_eq!(cleared[0]["payload"]["entry_seq"], seq);
 }
 
 #[test]

@@ -6,9 +6,9 @@
 //! event and, on the cloud backend, uploads it. [`pending_clearing`] answers
 //! it for the state the workflow now occupies, and the advance loop and the
 //! `koto next --to` and `koto rewind` paths ask it right after an entry.
-//! [`apply`] removes the keys and then appends one `context_cleared` event,
-//! in that order, so an interrupted clearing leaves no event and the next
-//! call finishes it.
+//! [`apply_from_log`] re-derives the clearing from the persisted log, removes
+//! the keys and then appends one `context_cleared` event, in that order, so
+//! an interrupted clearing leaves no event and the next call finishes it.
 
 use crate::engine::persistence::any_entry_index;
 use crate::engine::types::now_iso8601;
@@ -114,6 +114,15 @@ pub fn remove_keys(store: &dyn ContextStore, session: &str, keys: &[String]) -> 
 /// another process made since the entry is seen and spared. The keys are
 /// removed before the event is appended: a removal that fails returns the
 /// error with nothing recorded, and the next call makes the clearing again.
+///
+/// The price is one extra read of the log per clearing (one per entry into a
+/// declaring state), which on the cloud backend is a pull. The advance loop's
+/// in-memory log can then disagree with the persisted one about a clearing it
+/// asked for: when this call finds nothing owed (every key was written since
+/// the entry by another process) it appends nothing, while the in-memory log
+/// holds the requested event for the rest of the tick. That only stops the
+/// loop asking again within the tick, which is what an appended event would
+/// have done.
 pub fn apply_from_log(
     backend: &dyn SessionBackend,
     store: &dyn ContextStore,
