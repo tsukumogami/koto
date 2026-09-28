@@ -147,9 +147,11 @@ shape to build against before it starts.
 - **Attempt**: for one state, one `koto next` invocation that evaluates at
   least one of that state's checks and records the evaluation in the session
   log (a `gate_evaluated` or `default_action_executed` event for that state).
-  Several checks evaluated for the same state in one invocation are one
+  Several checks evaluated for the same state on one entry into it are one
   attempt. An invocation that passes through several states makes one attempt
-  on each state whose checks it evaluated. Re-evaluations inside a polling
+  on each state whose checks it evaluated, and one that enters the same state
+  more than once (leaving and coming back within one tick) makes one attempt
+  per entry. Re-evaluations inside a polling
   loop that append no event are not attempts; the evaluation that ends the
   loop and is recorded is. A state whose checks are all overridden, or that
   has no checks, accumulates no attempts. A directed transition
@@ -300,6 +302,10 @@ shape to build against before it starts.
   required or optional, meaning, allowed values) in
   `docs/reference/session-feed.md`, in its prose and in its machine-readable
   frontmatter, so an exporter can consume them without reading koto's source.
+  The frontmatter lists top-level fields; nested objects (a finding, a rule
+  count) are written out in prose tables, as the contract already does for
+  `decider_consulted`, because `koto template validate-feed` checks top-level
+  fields.
 - **R26.** The additions follow the session-feed contract's existing
   forward-compatibility rules: new fields on existing events are optional, new
   events have new type names, and the header's `schema_version` stays `1`.
@@ -309,7 +315,11 @@ shape to build against before it starts.
   same compiled template it compiles to on koto v0.14.1, and routes the same
   way: the gate-output fields a `when` clause or an `override_default` can
   reference are unchanged. No template field is added as required, and no
-  consumer has to raise the koto version it requires.
+  consumer has to raise the koto version it requires. One runtime change
+  follows from R13 and is accepted: a `capture_stdout_as` whose captured value
+  contains a known credential value (including a `pass_env:` value of 8 or
+  more bytes) is refused rather than stored. No template in this repository's
+  tests or in the published shirabe templates does this.
 - **R29.** Every addition to the `koto next` response is an optional field
   inside an existing structure. No response variant is added and no existing
   field changes meaning.

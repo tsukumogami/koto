@@ -1,7 +1,6 @@
 ---
 schema: design/v1
-status: Proposed
-upstream: docs/prds/PRD-koto-failure-reporting.md
+status: Accepted
 problem: |
   A failed koto check tells the agent almost nothing: a failing command gate
   reaches it as a bare exit code because koto discards the output it already
@@ -24,13 +23,15 @@ rationale: |
   them from the log leaves nothing to drift. Redacting at the capture point
   means no later cut or consumer can expose a known credential. Reusing
   `context_added` for silent writes keeps an older koto correct on a newer log.
+upstream: docs/prds/PRD-koto-failure-reporting.md
+user_visible_surface: true
 ---
 
 # DESIGN: koto failure reporting
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context and Problem Statement
 
@@ -145,7 +146,11 @@ note; on a spawn or wait failure it's koto's error text); the last non-blank
 stdout line that isn't a finding line; or a sentence koto writes from the
 outcome (`command exited with status N`, `context key 'KEY' is not set`,
 `context key 'KEY' does not match pattern 'PATTERN'`, `command exited 0 but its
-output could not be delivered as NAME`). The text goes through the existing
+output could not be delivered as NAME`, and, for a context gate whose outcome
+is `error`, that gate's own `output.error` text). koto's truncation note is
+never chosen as the message. Gate types other than command, context-exists,
+context-matches, children-complete and request-leg produce no findings. The
+text goes through the existing
 `one_line_reason` (`src/engine/terminal_result.rs`): whitespace runs fold to one
 space and anything over 500 characters is cut to 497 plus `...`.
 
@@ -192,9 +197,7 @@ would be best-effort under R30.
 Key assumptions:
 
 - A state entered twice in one invocation (A to B to A) makes one attempt per
-  entry. The PRD's "one attempt per invocation" was written about several
-  gates evaluated together, and counting per entry keeps a re-entered state
-  from showing a new visit with zero attempts.
+  entry, as the PRD's definition of an attempt states.
 - A `working_dir` rejection, which fails the action without spawning or
   appending `default_action_executed`, isn't an attempt, as the PRD defines it.
 - Temporal gates that append `gate_evaluated` count as attempts but never raise
@@ -229,13 +232,21 @@ entry that will evaluate a check:
 
 "One plus the highest stored value" rather than counting events means a rule
 a check reports several times in one attempt can't inflate a count, and an
-attempt split across a failed append still numbers correctly. The stamp is computed
-before the action runs, passed into the action closure (a new argument), and
-reused on every `gate_evaluated` for that entry. If nothing appends, it's
-discarded.
+attempt split across a failed append still numbers correctly. The session
+maximum is taken per state, like every other count. The stamp is computed when
+the loop enters the state and reused on every event for that entry. If nothing
+appends, it's discarded.
+
+The `default_action_executed` append moves from the CLI's action closure into
+the advance loop. The closure returns the command's result, including a
+capture failure it detected, and the loop appends the event once it knows the
+findings and counts. That is what lets the event carry `rule_counts` for a
+failed action, lets a capture failure's finding reach the log, and puts the
+event in the in-tick list so a state re-entered in the same invocation numbers
+its next attempt correctly.
 
 `gate_evaluated`'s append failure stays fatal, as today. A failed
-`default_action_executed` append changes from silent to a warning on stderr,
+`default_action_executed` append, silent today, becomes a warning on stderr,
 with the command's outcome unchanged.
 
 #### Alternatives Considered
@@ -289,7 +300,8 @@ The response gains an optional top-level `attempts` object when
 state, and `rules`, keyed first by check (the gate's name, or `__action__`)
 and then by rule id, each `{visit, session}`, for every check and rule pair
 with a non-zero visit count, including pairs reported on earlier attempts of
-this visit. A passing or evidence-only response is byte-identical to today's.
+this visit, at most 100 pairs with a `rules_truncated` flag when more exist.
+A passing or evidence-only response is byte-identical to today's.
 
 Internally, `StructuredGateResult` (`src/gate.rs`) gains a typed
 `failure: Option<GateFailure>` beside `output`. The evidence map,
@@ -408,9 +420,18 @@ capture without a compile error.
 
 The known set is built once per tick beside the command environment, dropping
 values shorter than 8 bytes, first source winning on duplicates: the live
-values of `CREDENTIAL_CARRIERS` (`src/engine/command_env.rs`); the template's
-`pass_env:` values; and koto's resolved decider key and cloud access and secret
-keys. The marker is `[REDACTED:<source>]`, where the source is a variable name,
+values of `CREDENTIAL_CARRIERS` (`src/engine/command_env.rs`), plus the
+percent-decoded password from the userinfo of any proxy URL among them; the
+template's `pass_env:` values; and every configured value of koto's decider
+key and cloud access and secret keys, both the one koto resolved and a
+config-file value an environment variable overrides. A legacy session, whose
+commands inherit the caller's whole environment, looks the carriers and
+`pass_env:` names up in that environment. Each value is also added in its JSON
+string spelling (as `serde_json` escapes it, and again with `/` written as
+`\/`) when that differs from the raw value, so a finding line can't carry an
+escaped copy through the captured text.
+
+The marker is `[REDACTED:<source>]`, where the source is a variable name,
 or a configuration setting name (which always contains a dot) for a key read
 from the config file. The marker is ASCII, safe inside a JSON string, and fails
 the variable-value pattern, so a capture that would store one is refused with a
@@ -495,9 +516,12 @@ template field. A consumer that ignores the new fields sees today's koto.
 
 - **`src/redact.rs` (new).** `Redactor` (known set, Aho-Corasick automaton,
   source names, `Debug` printing names only), `RedactedText`,
-  `redact_capture(raw, raw_total, killed, limit, &Redactor)`, `redact_str`, and
-  the shared marker-safe cut helper used for the 4 KiB log copies and the
-  500-character fold.
+  `redact_capture(raw, raw_total, killed, limit, &Redactor)`, `redact_str`,
+  `RedactedText::koto_note(&str)` for text koto writes itself (timeout,
+  polling and `working_dir` notes), and one marker-safe cut helper used for
+  the 4 KiB log copies, the per-field finding caps and, inside
+  `one_line_reason`, the 500-character fold. `aho-corasick` becomes a direct
+  dependency in `Cargo.toml`.
 - **`src/action.rs`.** Reader threads retain `limit + L - 1` bytes and count
   `raw_total`; `CommandOutput` gains `stdout_truncated` and `stderr_truncated`
   (keeping `truncated` as their OR) and carries `RedactedText`.
@@ -506,27 +530,58 @@ template field. A consumer that ignores the new fields sees today's koto.
   config keys from its caller.
 - **`src/findings.rs` (new).** `Finding`, `parse_findings(&RedactedText,
   stdout_truncated)`, `fallback_finding(...)`, and the 100/50 caps.
-- **`src/gate.rs`.** `StructuredGateResult.failure: Option<GateFailure>`;
-  `command_gate_result` fills it for failed command gates; context gates fill
-  it with their fallback finding and record reads into a side list.
+- **`src/gate.rs`.** `StructuredGateResult` gains `failure:
+  Option<GateFailure>` and `context_reads: Vec<ContextReadRecord>`, both
+  `#[serde(skip)]` so its serialized form and existing literal constructions
+  change only by `..Default::default()`; `command_gate_result` fills `failure`
+  for command gates whose outcome isn't `passed`; context gates fill it with
+  their fallback finding and push their reads onto `context_reads`.
 - **`src/engine/advance.rs`.** In-tick event list; attempt stamp per state
-  entry; stamp passed to the action closure; `rule_counts` computed once per
-  attempt; new fields written on `gate_evaluated`; gate reads appended before
-  it; `action_condition` fills `failure` for `__action__`.
-- **`src/cli/mod.rs`.** The action closure writes the stamp and findings on
-  `default_action_executed`, reports whether it appended, and warns on a failed
-  append; `mark_truncated` uses the per-stream flags; `capture_stdout_as`
+  entry; `effect_landed` filled on every finding the check left unset (true
+  when this invocation appended `evidence_submitted` for the state, or the
+  state's `default_action` exited 0 and delivered its capture; false
+  otherwise, including a capture failure after exit 0); `rule_counts` computed
+  once per attempt; the `default_action_executed` append, moved here from the
+  CLI; new fields written on `gate_evaluated`; gate reads appended before it
+  through a best-effort append; `action_condition` fills `failure` for
+  `__action__`; `AdvanceResult` gains `attempts: Option<AttemptCounts>`.
+- **`src/cli/mod.rs`.** The action closure returns the redacted
+  `CommandOutput`, the capture result and whether it spawned, and no longer
+  appends; `mark_truncated` uses the per-stream flags; `capture_stdout_as`
   refuses a marker with the new `redacted` case.
-- **`src/cli/next_types.rs`.** `BlockingCondition.failure` and
-  `NextResponse`'s top-level `attempts`, both skipped when absent.
+- **`src/cli/next_types.rs`.** `BlockingCondition.failure`, skipped when
+  absent. `attempts` is added to the serialized JSON envelope beside `leg`, the
+  way `leg` is added today, whenever the advance result carries counts and the
+  response has blocking conditions, so no `NextResponse` variant or combinator
+  changes.
 - **`src/engine/types.rs`.** New optional fields on `GateEvaluated`,
   `DefaultActionExecuted`, `ContextAdded`, `ContextRemoved`; new
   `EventPayload::ContextRead`.
 - **`src/session/context.rs`, `local.rs`, `cloud.rs`, `sync.rs`.**
-  `KeyMeta.writer`, `add_with_writer`, `meta`; cloud pull reports whether it
-  wrote.
+  `KeyMeta.writer: Option<String>`; `ContextStore::add_with_writer(session,
+  key, content, writer)` defaulting to `add`; `ContextStore::meta(session,
+  key) -> Option<KeyMeta>` defaulting to `None`, used for presence-read hashes
+  (on the cloud backend it falls back to the remote manifest for a remote-only
+  key); `CloudBackend::get` appends `context_added {writer: "sync"}` when
+  `pull_context_if_newer` reports that it wrote; `reconcile`'s repair writes
+  record `transition`.
+- **Context-read sites.** `koto context get`/`exists` append from the CLI
+  process (`reader: "cli"`, which is also how a gate script's own call
+  appears); `terminal_record`, not the read-only status path, appends
+  `reader: "result"` reads, including the `failure_reason` read; the decider
+  port appends `reader: "decider"` reads just before `decider_consulted`.
+  Every new append, and the three newly logged silent writes, go through one
+  best-effort helper that warns on stderr (R30). Tests make appends of new
+  event types fail through a `cfg(test)`-only hook in that helper.
+- **`src/workflows_surface/`.** The publish-location write appends
+  `context_added` with `writer: "koto"`; `materialize_after_commit` gains a
+  re-entrancy guard so that nested append doesn't materialize again.
 - **`src/engine/persistence.rs`.** `delivery_window` becomes `pub(crate)`;
-  `append_event` takes a short per-session append lock.
+  every append path (`append_event` and `append_event_idempotent_in`) takes
+  an exclusive lock on a dedicated per-session sidecar file, held only around
+  reading the last seq, writing and syncing, never while a command runs, and
+  never the state-file lock a batch tick holds. Where `flock` isn't available
+  appends proceed unlocked, as today.
 - **`docs/reference/session-feed.md`, `docs/guides/`, and the koto-skills
   plugin.** The contract, a finding-format section in the gate-authoring
   guide, and the `koto-user` and `koto-author` skills' descriptions of
@@ -553,7 +608,8 @@ evidence:
         "findings": [
           {"rule_id": "E501", "level": "error", "message": "line too long (104 > 88)",
            "path": "src/app.py", "line": 12, "column": 89,
-           "rule_ref": "https://docs.example.org/rules/E501", "effect_landed": true}
+           "rule_ref": "https://docs.example.org/rules/E501", "effect_landed": true,
+           "message_source": "check"}
         ],
         "findings_truncated": false,
         "captured": {
@@ -582,7 +638,24 @@ the evidence submitted on this invocation was recorded.
 All new fields are optional and absent on events written before this feature.
 Nested shapes are written out in prose tables in the contract, as
 `decider_consulted.fields` already is, because `koto template validate-feed`
-checks top-level fields.
+checks top-level fields; the frontmatter lists each top-level field with its
+type. Conventions the contract states once for all of these fields:
+
+- "A failed check" means a check whose `outcome` is anything other than
+  `passed`.
+- A field described as present "on" some condition is absent otherwise, and
+  an absent boolean means `false`.
+- Byte bounds (4 KiB is 4,096 bytes) are measured on the redacted UTF-8 text,
+  and a cut never splits a character or a redaction marker. A marker is
+  `[REDACTED:<source>]`, where `<source>` is an environment variable name or,
+  when it contains a dot, a koto configuration setting.
+- `reader`, `writer`, `access`, `message_source` and `level` are open
+  vocabularies: consumers tolerate values they don't know, and the frontmatter
+  declares them as strings without an `enum`, so validate-feed doesn't reject
+  a later value.
+- A gate's `context_read` events come immediately before that evaluation's
+  `gate_evaluated`. A gate script that calls `koto context get` itself appears
+  as `reader: "cli"`.
 
 **`gate_evaluated`** keeps `state`, `gate`, `output`, `outcome` and
 `timestamp`; the contract's `outcome` enum becomes `passed`, `failed`,
@@ -594,11 +667,12 @@ checks top-level fields.
 | `visit_attempt` | integer >= 1 | The state's attempt number in the current visit, including this attempt. Returns to 1 on the first attempt after arriving from a different state or being rewound; a self-transition doesn't reset it. Present whenever `attempt` is. |
 | `findings` | array of finding objects | The check's findings, passed or failed: at most 50 in emission order, with the koto-written finding last when there is one. Absent when there are none. |
 | `findings_truncated` | boolean | `true` when the check produced more findings than `findings` holds. Absent means `false`. |
-| `rule_counts` | object | On a failed check that reported at least one finding at `error`: keys are the distinct rule ids this check reported at `error`, taken from every parsed finding rather than only the logged ones; each value is `{"visit": int, "session": int}`, the attempts on this state in the current visit and in the session in which this same check (this event's `gate`) failed and reported that rule at `error`, including this one. A key can name a rule that isn't in `findings` when `findings_truncated` is `true`; that is expected, not corruption. |
+| `rule_counts` | object | On a failed check that reported at least one finding at `error`: keys are the distinct rule ids this check reported at `error`, taken from every parsed finding rather than only the logged ones; each value is `{"visit": int, "session": int}`, the attempts on this state in the current visit and in the session in which this same check (this event's `gate`) failed and reported that rule at `error`, including this one. A key can name a rule that isn't in `findings` when `findings_truncated` is `true`; that is expected, not corruption. At most 50 keys, first reported first. |
+| `rule_counts_truncated` | boolean | `true` when the check reported more distinct rule ids at `error` than `rule_counts` holds. Absent means `false`. |
 | `duration_ms` | integer >= 0 | For a command gate: the command's wall-clock run time in milliseconds, measured over the same span the timeout covers. Absent for gates that run no command. |
-| `stdout` | string | On a failed command gate: the leading 4 KiB of redacted standard output, cut on a character boundary and never inside a marker. |
+| `stdout` | string | On a command gate whose `outcome` isn't `passed`: the leading 4 KiB of redacted standard output. |
 | `stderr` | string | The same for standard error. |
-| `stdout_truncated` | boolean | `true` when `stdout` holds less than the command printed. Absent means `false`. |
+| `stdout_truncated` | boolean | `true` when `stdout` holds less than the command printed, whether the 64 KiB capture bound or the 4 KiB log cut removed it. |
 | `stderr_truncated` | boolean | The same for `stderr`. |
 
 **`default_action_executed`** gains `attempt`, `visit_attempt`, `findings`,
@@ -607,13 +681,33 @@ its check name for `rule_counts` is `__action__`. Its existing
 `stdout`, `stderr` and `truncated` keep their definition (leading 64 KiB per
 stream) and now carry redacted text.
 
-**Finding object** (in the response and the log): `rule_id`, `level`,
-`message`, `effect_landed` (always present), and `path`, `line`, `column`,
-`rule_ref` when known. Every string has been redacted.
+**Finding object** (in the response and the log):
 
-**`context_read`** (new, tier 2). It is the highest-volume event this feature
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `rule_id` | string | yes | What the finding violated; the gate's name or `__action__` on a koto-written finding. Opaque. |
+| `level` | string | yes | `error`, `warning` or `info`. |
+| `message` | string | yes | The rule's message, or the koto-written message. |
+| `effect_landed` | boolean | yes | Whether the change attempted on this invocation was recorded (R3). |
+| `message_source` | string | yes | `check`, `output` or `koto`, as below. |
+| `path` | string | no | Location, when known. |
+| `line` | integer >= 1 | no | Only with `path`. |
+| `column` | integer >= 1 | no | Only with `line`. |
+| `rule_ref` | string | no | Opaque pointer to the rule's full text. |
+
+`message_source` is `check` for a finding the check printed, `output` for a koto-written finding whose message is
+a line lifted from the check's output, and `koto` for one whose message is
+koto's own sentence. Every string has been redacted, and each is capped after
+redaction on a character boundary that never splits a marker: `rule_id` 128
+bytes, `path` and `rule_ref` 512 bytes, `message` 1,000 bytes (the
+koto-written message is already folded to 500 characters). A finding whose
+`rule_id` had to be cut keeps the cut value; counts key on the cut value.
+These strings come from the check's output and may contain control characters
+or terminal escapes; consumers render them as data.
+
+**`context_read`** (new, `tier: 2`). It is the highest-volume event this feature
 adds, one per logged read, and consumers that don't need context lineage may
-skip it like any tier 2 event:
+skip it like any `tier: 2` event:
 
 | Field | Type | Required | Meaning |
 |-------|------|----------|---------|
@@ -647,6 +741,12 @@ and are skipped. If the only event of an attempt that failed at its action is
 lost, the next attempt reuses its number and the log shows no gap; the contract
 says so.
 
+**Worst-case size.** With the field caps above, one check event adds at most
+about 120 KiB to the log (50 findings of about 2.2 KiB, 8 KiB of gate output,
+50 rule-count keys), and one blocked condition adds at most about 350 KiB to a
+response (100 findings and 128 KiB of captured output). Both are stated in the
+contract so a consumer can size its buffers.
+
 ### Data flow for one failing gate
 
 1. The tick builds the command environment and the `Redactor`.
@@ -663,90 +763,125 @@ says so.
 
 ## Implementation Approach
 
-### Phase 1: Redaction at the capture point
+### Phase 1: Compatibility baseline and redaction
 
-Add `src/redact.rs`, the per-stream truncation flags, lookahead retention in
-`run_shell_command`, the `Redactor` built in `command_env.rs`, and the
-`capture_stdout_as` `redacted` refusal. Existing `default_action` output and
+Land the compatibility tests first, so every later phase runs against them:
+fixture templates compile to the same JSON as under v0.14.1; a v0.14.1 binary
+reads a log the new koto writes; a failing response differs from v0.14.1's
+only by added optional fields. Then add `src/redact.rs`, the per-stream
+truncation flags, lookahead retention in `run_shell_command`, the `Redactor`
+built in `command_env.rs`, the `capture_stdout_as` `redacted` refusal, and the
+contract text for the redaction marker. Existing `default_action` output and
 `default_action_executed` become redacted with no other visible change.
-Dependencies: none. This lands first because every later phase handles
-captured output.
 
 ### Phase 2: Findings and the response payload
 
 Add `src/findings.rs`, `StructuredGateResult.failure`, `failure` on
-`BlockingCondition` for command, context and `__action__` conditions, and the
-finding-format section of the gate-authoring guide. Dependencies: Phase 1.
+`BlockingCondition` for command, context and `__action__` conditions,
+`effect_landed` filling in the advance loop, the finding-format section of the
+gate-authoring guide, and the `koto-user` skill's description of `failure`.
+Dependencies: Phase 1.
 
 ### Phase 3: Attempt counts and the log fields
 
-Add the in-tick event list, the attempt stamp, `rule_counts`, the new fields on
-`gate_evaluated` and `default_action_executed`, the top-level `attempts` field,
-and the stderr warning on a failed `default_action_executed` append.
-Dependencies: Phase 2 (counts read findings).
+Add the in-tick event list, the attempt stamp, `rule_counts`, the move of the
+`default_action_executed` append into the advance loop, the new fields on
+`gate_evaluated` and `default_action_executed`, `AdvanceResult.attempts` and
+the `attempts` envelope field, and the contract text for every field this
+phase adds, including the corrected `outcome` enum. Dependencies: Phase 2
+(counts read findings).
 
 ### Phase 4: Context reads and writers
 
 Add `context_read`, `writer` on `context_added`/`context_removed` and
-`KeyMeta`, `add_with_writer`, events for the three silent writers (with the
-re-entrancy guard in `materialize_after_commit`), and the per-session append
-lock. Dependencies: none on Phases 1-3; it can run in parallel with them.
+`KeyMeta`, `add_with_writer` and `meta`, events for the three silent writers
+(with the re-entrancy guard in `materialize_after_commit`), the best-effort
+append helper, the sidecar append lock, and the contract text for the join
+rule. Dependencies: none on Phases 1-3; it can run beside them, but it and
+Phase 3 both edit `src/engine/persistence.rs`, so land them in sequence.
 
-### Phase 5: Contract, compatibility checks and skills
+### Phase 5: Skills and closing checks
 
-Write every new field into `docs/reference/session-feed.md` (prose and
-frontmatter), fix the `outcome` enum, add the join rule and the attempt-reading
-rules, and update the `koto-user` and `koto-author` skills. Add the
-compatibility tests: fixture templates compile identically to v0.14.1; a
-v0.14.1 binary reads a new log; a failing response differs from v0.14.1's only
-by added optional fields. Dependencies: Phases 1-4.
+Update the `koto-author` skill, run `cargo test --test doc_names` over the new
+guide and contract text, and extend the compatibility tests from Phase 1 with
+a log that exercises every new field against `koto template validate-feed`.
+Dependencies: Phases 1-4.
 
 ## Security Considerations
 
-**Credential exposure through captured output.** This feature starts
-returning command-gate output that koto used to discard, and writes 4 KiB of it
-to the session log, which is readable by anything that reads the session store
-and is uploaded by cloud sync. Redaction at the capture point (Decision 5)
-covers the credentials koto knows about: the carrier variables it already
-treats as sensitive, `pass_env:` values, and its own API keys. It also applies,
-for the first time, to `default_action` output, which koto already writes to
-the log unredacted today, so the feature reduces existing exposure. The
-residual risk is a secret koto doesn't know about (a password a script reads
-from a file and prints). That stays the check author's responsibility and is
-listed in the PRD's known limitations; the guide says so next to the finding
-format.
+**Credential exposure through captured output.** Command-gate output that koto
+used to discard now reaches the agent, the session log (4 KiB per stream per
+event, plus findings) and, where cloud sync is on, remote storage. Redaction at
+the capture point (Decision 5) replaces every known credential before any
+consumer sees the text: the live values of the credential-carrier variables and
+the passwords embedded in proxy URLs, `pass_env:` values that reach the
+command, and every configured value of koto's own decider and cloud keys,
+whether or not an environment variable overrides it. Legacy sessions, whose
+commands inherit the whole environment, build the same set from that
+environment. Each value is also matched in its JSON-escaped spelling, so a
+finding line can't carry an escaped copy through the captured text or the log.
+The feature also redacts `default_action` output, which koto writes to the log
+unredacted today, so it reduces an existing exposure.
 
-**Fragments at cuts.** Every cut (64 KiB, 4 KiB, 500 characters) happens after
-redaction, and the lookahead retention means a value that starts before the
-capture bound is seen whole, so no cut can leave a fragment of 8 or more bytes.
-The one exception is a stream koto killed mid-value on a timeout, where the
-trailing-prefix rule masks a suffix of 8 or more bytes; up to 7 bytes of a
-value's start can remain.
+**What redaction does not cover.** A secret koto doesn't know about (a password
+read from a file, a token another tool keeps in its own config, a `.env` a
+failing test dumps) is now persisted and, with cloud sync, uploaded, where
+before a command gate's output was discarded. Encodings other than JSON
+escaping (base64 in a Basic auth header, URL encoding, hex, arbitrary `\u`
+escapes in raw captured text), values a tool wraps or colors mid-token, and
+values under 8 bytes are not matched. Check authors remain responsible for what
+their scripts print, and the gate-authoring guide says so beside the finding
+format. Redaction keeps known secrets out of the response, the log and remote
+storage; it isn't a barrier against a process that can already read the
+environment, and an agent that can influence what a check echoes could use the
+marker as an equality test.
 
-**No new secret surface.** The `Redactor` keeps known values in memory for the
-duration of a tick, the same lifetime `CommandEnv` already gives them, and its
-`Debug` output prints source names only. Markers name a variable or setting,
-never a value or its length.
+**Fragments at cuts.** Every cut (64 KiB, 4 KiB, the 500-character fold, the
+per-field finding caps) runs after redaction and never splits a marker, and
+lookahead retention means a value that starts before the capture bound is seen
+whole. When a stream ends mid-value because koto killed the process, a trailing
+suffix of 8 or more bytes that is a prefix of a known value is masked; up to 7
+bytes of a value's start can remain.
+
+**No new secret surface.** The `Redactor` holds known values for one tick, the
+lifetime `CommandEnv` already gives them. Nothing that contains its automaton
+derives `Debug`; its own `Debug` prints source names only. Markers name a
+variable or setting, never a value or its length. `aho-corasick` becomes a
+direct dependency at the 1.x version already in `Cargo.lock` through `regex`,
+so no crate is added to the build.
+
+**Untrusted text reaching the agent.** A check is trusted, but what it prints
+often isn't: linters quote source lines, test runners print third-party
+assertion messages, and tools print pull-request text. That text now reaches
+the agent inside `failure`, including as the message of a koto-written finding.
+`message_source` tells koto's own sentences apart from lines lifted from the
+check's output. koto never interpolates finding fields into commands,
+templates or directives, and `failure` stays outside `output`, so routing,
+overrides and decider inputs can't see it. The `koto-user` skill tells agents
+that `failure` content is the check's output, not instructions, and that a
+`rule_ref` isn't to be fetched automatically.
 
 **Context reads.** `context_read` carries a SHA-256 of content, never content
-or size. A hash of a low-entropy value (a yes/no flag) could be guessed from
-the hash, but the same hash is already in `context_added` and in the store's
-manifest, so nothing new is disclosed.
+or size, and is written only for keys that pass the key grammar. The same hash
+is already in `context_added` and the store's manifest, so no value becomes
+easier to guess. Reads appended from a gate's child process never feed an
+advance-loop decision.
 
-**Injection through findings.** Finding fields are data: koto never
-interpolates them into commands, templates, or directive prose, and they reach
-the agent inside JSON string values. A malicious check could print misleading
-findings, but a check can already print anything it likes and decide the gate's
-outcome, so no trust boundary moves.
+**Log and response volume.** Finding strings, findings per event, rule-count
+keys and captured output are all capped, so one attempt adds a bounded amount
+to the log and one blocked condition a bounded amount to the response (the
+worst cases are stated under Gate-event schema). A template that loops a
+failing state still grows the log linearly with attempts, as it does today
+with `default_action_executed`.
 
-**Log volume as denial of service.** Bounds per event (50 findings, 4 KiB per
-stream) cap what one attempt can add. A template that loops a failing state
-grows the log linearly with attempts, as it does today with
-`default_action_executed`.
-
-**Concurrent appends.** Read events make concurrent appends from a tick and a
-`koto context get` more likely. The per-session append lock around "read last
-seq, write, fsync" closes the duplicate-seq hazard that already existed.
+**Concurrent appends.** Read events make it likelier that a tick and a
+`koto context get` append at once. Every append path takes an exclusive lock on
+a dedicated per-session sidecar file, held only around reading the last seq,
+writing and syncing and never while a command runs, so a gate's own
+`koto context get` can't wait on the tick that is running it, and the state-file
+lock a batch tick holds is untouched. The lock is per host; the cloud backend's
+cross-host ordering is unchanged. Where `flock` isn't available, appends
+proceed unlocked, as they do today.
 
 ## Consequences
 
@@ -787,5 +922,8 @@ seq, write, fsync" closes the duplicate-seq hazard that already existed.
   that don't want findings can skip the field.
 - The contract states the undercount case, and it requires an append failure
   on a single event, which already prints a warning.
+- The cloud-backend cost of a read event is the same append cost
+  `koto context add` already pays; a later change can batch read events into
+  the next append if it matters in practice.
 - The duplicated action output is bounded at 128 KiB and only on failure; the
   legacy keys can be retired in a later major release.
