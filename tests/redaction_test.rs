@@ -13,9 +13,11 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use koto::action::{run_shell_command, CommandEnv, FailureKind, MAX_ACTION_OUTPUT_BYTES};
-use koto::redact::Redactor;
+use koto::redact::{Redactor, MIN_VALUE_LEN};
 use serde_json::Value;
 
+/// The CLI's truncation note without its leading newline, so `ends_with`
+/// matches however the stream's last line ended.
 const TRUNCATION_NOTE: &str = "... [output truncated]";
 
 /// A value unique to this run, safe in a JSON string and a shell word.
@@ -126,10 +128,11 @@ fn action_output(resp: &Value) -> &Value {
     &found[0]["output"]
 }
 
-/// Assert no run of eight or more bytes of any value appears in `text`.
+/// Assert no run of `MIN_VALUE_LEN` or more bytes of any value appears in
+/// `text`.
 fn assert_absent(text: &str, values: &[&str], site: &str) {
     for value in values {
-        for len in (8..=value.len()).rev() {
+        for len in (MIN_VALUE_LEN..=value.len()).rev() {
             for start in 0..=value.len() - len {
                 let frag = &value[start..start + len];
                 assert!(
@@ -471,11 +474,13 @@ fn an_uncut_stderr_near_the_bound_is_not_marked_when_stdout_was_cut() {
 // ---------------------------------------------------------------------------
 
 fn env_with(name: &str, value: &str) -> CommandEnv {
-    CommandEnv::cleared(vec![
-        ("PATH".to_string(), "/usr/bin:/bin".to_string()),
-        (name.to_string(), value.to_string()),
-    ])
-    .with_redactor(Redactor::new([(name.to_string(), value.to_string())]))
+    CommandEnv::cleared(
+        vec![
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            (name.to_string(), value.to_string()),
+        ],
+        Redactor::new([(name.to_string(), value.to_string())]),
+    )
 }
 
 #[test]
@@ -546,7 +551,10 @@ fn with_no_known_values_exactly_the_bound_is_returned_uncut() {
         ),
         dir.path(),
         10,
-        &CommandEnv::cleared(vec![("PATH".to_string(), "/usr/bin:/bin".to_string())]),
+        &CommandEnv::cleared(
+            vec![("PATH".to_string(), "/usr/bin:/bin".to_string())],
+            Redactor::empty(),
+        ),
     );
     assert_eq!(out.stdout.len(), 65_536);
     assert!(out.stdout.bytes().all(|b| b == b'z'));

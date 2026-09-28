@@ -294,6 +294,16 @@ fn koto_cmd(dir: &Path) -> Command {
     std::fs::create_dir_all(&sessions).unwrap();
     let mut cmd = Command::cargo_bin("koto").unwrap();
     cmd.current_dir(dir);
+    // No decider settings from the developer's shell, as the bash twin
+    // (test/compat/failure-reporting-v0_14_1.sh) runs it: a set KOTO_DECIDER
+    // would change the response and read as a regression.
+    for name in [
+        "KOTO_DECIDER",
+        "KOTO_DECIDER_API_KEY",
+        "KOTO_DECIDER_ENDPOINT",
+    ] {
+        cmd.env_remove(name);
+    }
     cmd.env("KOTO_SESSIONS_BASE", sessions);
     cmd.env("HOME", dir);
     cmd

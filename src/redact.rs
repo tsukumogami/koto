@@ -110,6 +110,8 @@ pub fn safe_cut_len(bytes: &[u8], max: usize) -> usize {
             break;
         }
     }
+    // A UTF-8 character has at most three continuation bytes, so backing off
+    // more than three can only mean the bytes aren't UTF-8; stop there.
     let mut backed = 0;
     while cut > 0 && backed < 3 && (bytes[cut] & 0xC0) == 0x80 {
         cut -= 1;
@@ -223,12 +225,6 @@ impl std::fmt::Debug for Redactor {
     }
 }
 
-impl Default for Redactor {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
 /// The JSON string spellings of `value` that differ from it: as `serde_json`
 /// escapes it, and again with `/` written as `\/`.
 fn json_spellings(value: &str) -> Vec<String> {
@@ -333,8 +329,9 @@ impl Redactor {
                 })
                 .collect(),
             // The automaton only fails to build past internal size limits a
-            // handful of values can't reach; search directly rather than
-            // letting a value through.
+            // handful of values can't reach. It isn't provably unreachable
+            // (a config file can hold a value of any size), so fail closed:
+            // search directly rather than letting a value through.
             None => {
                 let mut out = Vec::new();
                 for (p, v) in self.values.iter().enumerate() {
@@ -435,6 +432,12 @@ pub fn redact_capture(
     }
 
     // The stream's true end is inside `raw` only when nothing was dropped.
+    // The tail is masked only when koto killed the process: then the stream
+    // may end mid-value. A stream that ended on its own and happens to end
+    // with the start of a known value (`ghp_...`, `https://...`) printed
+    // ordinary text, and masking it would put a marker where no credential
+    // was. The condition is on what the reader kept (`raw.len()`), not on
+    // `limit`: past the retention bound the true end isn't seen at all.
     let whole = raw_total <= raw.len();
     let spans = redactor.spans(raw, killed && whole);
 

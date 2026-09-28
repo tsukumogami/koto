@@ -7354,8 +7354,9 @@ mod tests {
         // Each stream carries its own flag: only a flagged one is marked.
         assert!(mark_truncated(cut.clone(), true).ends_with(TRUNCATION_NOTE));
         assert_eq!(mark_truncated(short.clone(), false), short);
-        // A stream shortened by redaction markers can be cut well short of
-        // the bound; its flag still marks it.
+        // A cut stream can end well short of the bound, when the final cut
+        // drops a marker that would straddle it whole; its flag still
+        // marks it.
         assert!(mark_truncated(short.clone(), true).ends_with(TRUNCATION_NOTE));
         // A stream that happens to sit at (or within three bytes of) the
         // bound without being cut is not marked.

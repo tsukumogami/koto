@@ -251,8 +251,10 @@ pub enum CaptureError {
     /// The command wrote nothing, or nothing but whitespace.
     Empty { key: String },
     /// The trimmed output holds a redaction marker: the command printed a
-    /// known credential, which koto replaced before anything read it.
-    /// `source` names where the credential came from, never its value.
+    /// known credential, which koto replaced before anything read it, or
+    /// printed marker-shaped text itself (`[REDACTED:FOO]`). `source` is the
+    /// name inside the first marker: where the credential came from, or
+    /// whatever the command wrote there. Never a credential's value.
     Redacted { key: String, source: String },
     /// The trimmed output is larger than [`MAX_CAPTURE_BYTES`].
     TooLarge { key: String, bytes: usize },
@@ -305,7 +307,8 @@ impl CaptureError {
 /// Prepare a command's stdout for delivery under `key`.
 ///
 /// The order is fixed (DESIGN-koto-runs-commands.md, "Capture delivery and its
-/// three failure cases"): trim, reject empty, reject a value holding a
+/// three failure cases", which this change extends to four): trim, reject
+/// empty, reject a value holding a
 /// redaction marker (DESIGN-koto-failure-reporting.md, Decision 5), reject
 /// oversize, then run the value through the same `validate_value` allowlist
 /// every declared variable passes. The marker check comes before the size and

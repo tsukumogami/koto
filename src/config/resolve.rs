@@ -86,11 +86,11 @@ pub fn load_config() -> Result<KotoConfig> {
 
     // Layer 3: env var overrides for credentials. The config-file values
     // they replace were recorded above, so redaction still searches for them.
-    if let Ok(val) = env::var("AWS_ACCESS_KEY_ID") {
+    if let Ok(val) = env::var(ENV_AWS_ACCESS_KEY_ID) {
         config.session.cloud.access_key = Some(val);
         config.secret_sources.access_key_from_env = true;
     }
-    if let Ok(val) = env::var("AWS_SECRET_ACCESS_KEY") {
+    if let Ok(val) = env::var(ENV_AWS_SECRET_ACCESS_KEY) {
         config.session.cloud.secret_key = Some(val);
         config.secret_sources.secret_key_from_env = true;
     }
@@ -447,9 +447,15 @@ pub const ENV_DECIDER_API_KEY: &str = "KOTO_DECIDER_API_KEY";
 /// searched for even when a config file fails to load.
 pub const ENV_SECRET_NAMES: [&str; 3] = [
     ENV_DECIDER_API_KEY,
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
+    ENV_AWS_ACCESS_KEY_ID,
+    ENV_AWS_SECRET_ACCESS_KEY,
 ];
+/// Env var that overrides `session.cloud.access_key`. Also a redaction
+/// marker's source name, so it's visible in captured output.
+pub const ENV_AWS_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
+/// Env var that overrides `session.cloud.secret_key`. Also a redaction
+/// marker's source name, so it's visible in captured output.
+pub const ENV_AWS_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
 /// Env var that sets the decider endpoint.
 pub const ENV_DECIDER_ENDPOINT: &str = "KOTO_DECIDER_ENDPOINT";
 

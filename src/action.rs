@@ -97,23 +97,23 @@ pub struct CommandEnv {
 }
 
 impl CommandEnv {
-    /// Exactly `vars`, in order, with nothing inherited from this process.
-    pub fn cleared(vars: Vec<(String, String)>) -> Self {
+    /// Exactly `vars`, in order, with nothing inherited from this process,
+    /// and `redactor` replacing known credentials in the output of every
+    /// command run under it.
+    ///
+    /// A tick gets its environment from
+    /// `crate::engine::command_env::for_tick`, which passes the tick's known
+    /// set; the redactor is required here so no environment can be built
+    /// without choosing one.
+    pub fn cleared(vars: Vec<(String, String)>, redactor: Redactor) -> Self {
         Self {
             vars,
             inherit: false,
             outcomes: Mutex::new(BTreeMap::new()),
-            redactor: Redactor::empty(),
+            redactor,
             #[cfg(test)]
             outputs: Mutex::new(BTreeMap::new()),
         }
-    }
-
-    /// This environment with `redactor` replacing known credentials in the
-    /// output of every command run under it.
-    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
-        self.redactor = redactor;
-        self
     }
 
     /// The redactor for output captured under this environment.
@@ -121,18 +121,22 @@ impl CommandEnv {
         &self.redactor
     }
 
-    /// This process's environment with `vars` applied on top: a session
-    /// created with `--legacy-environment`.
-    pub fn inherited(vars: Vec<(String, String)>) -> Self {
+    /// This process's environment with `vars` applied on top, for a session
+    /// created with `--legacy-environment`, redacting output against
+    /// `redactor` as [`CommandEnv::cleared`] does.
+    pub fn inherited(vars: Vec<(String, String)>, redactor: Redactor) -> Self {
         Self {
             inherit: true,
-            ..Self::cleared(vars)
+            ..Self::cleared(vars, redactor)
         }
     }
 
-    /// This process's environment unchanged, for callers outside a tick.
+    /// This process's environment unchanged, with no redaction: for callers
+    /// outside a tick, which have no known set. A tick's commands never run
+    /// under it; they use the environment
+    /// `crate::engine::command_env::for_tick` builds.
     pub fn inherit() -> Self {
-        Self::inherited(Vec::new())
+        Self::inherited(Vec::new(), Redactor::empty())
     }
 
     /// True when commands inherit this process's environment.
@@ -584,10 +588,13 @@ mod tests {
     #[test]
     fn a_cleared_environment_holds_only_what_it_sets() {
         let dir = tmp_dir();
-        let env = CommandEnv::cleared(vec![
-            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
-            ("KOTO_TEST_SET".to_string(), "yes".to_string()),
-        ]);
+        let env = CommandEnv::cleared(
+            vec![
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+                ("KOTO_TEST_SET".to_string(), "yes".to_string()),
+            ],
+            Redactor::empty(),
+        );
         // Names only: the child reports which of these it can see.
         let out = run_shell_command(
             "[ -n \"${PATH+x}\" ] && echo PATH; \
@@ -617,14 +624,22 @@ mod tests {
     #[test]
     fn the_shell_is_found_without_a_path() {
         let dir = tmp_dir();
-        let out = run_shell_command("echo ran", dir.path(), 5, &CommandEnv::cleared(vec![]));
+        let out = run_shell_command(
+            "echo ran",
+            dir.path(),
+            5,
+            &CommandEnv::cleared(vec![], Redactor::empty()),
+        );
         assert_eq!(out.stdout, "ran\n");
     }
 
     #[test]
     fn not_found_is_exit_127_or_the_shell_message() {
         let dir = tmp_dir();
-        let env = CommandEnv::cleared(vec![("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let env = CommandEnv::cleared(
+            vec![("PATH".to_string(), "/usr/bin:/bin".to_string())],
+            Redactor::empty(),
+        );
         let missing = run_shell_command("koto_no_such_command_xyz", dir.path(), 5, &env);
         assert!(looks_not_found(&missing), "{:?}", missing.exit_code);
         let wrapped = run_shell_command("koto_no_such_command_xyz; exit 3", dir.path(), 5, &env);
@@ -644,7 +659,10 @@ mod tests {
     #[test]
     fn outcomes_keep_the_last_run_of_each_label() {
         let dir = tmp_dir();
-        let env = CommandEnv::cleared(vec![("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let env = CommandEnv::cleared(
+            vec![("PATH".to_string(), "/usr/bin:/bin".to_string())],
+            Redactor::empty(),
+        );
         env.record("g", &run_shell_command("exit 1", dir.path(), 5, &env));
         env.record(
             "h",
@@ -660,7 +678,10 @@ mod tests {
 
     #[test]
     fn debug_shows_names_and_never_values() {
-        let env = CommandEnv::cleared(vec![("GH_TOKEN".to_string(), "marker-value".to_string())]);
+        let env = CommandEnv::cleared(
+            vec![("GH_TOKEN".to_string(), "marker-value".to_string())],
+            Redactor::empty(),
+        );
         let shown = format!("{:?}", env);
         assert!(shown.contains("GH_TOKEN"));
         assert!(!shown.contains("marker-value"));

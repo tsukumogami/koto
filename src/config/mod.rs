@@ -80,13 +80,13 @@ pub fn redaction_keys(config: &KotoConfig) -> Vec<(String, String)> {
         (
             &config.session.cloud.access_key,
             src.access_key_from_env,
-            "AWS_ACCESS_KEY_ID",
+            resolve::ENV_AWS_ACCESS_KEY_ID,
             "session.cloud.access_key",
         ),
         (
             &config.session.cloud.secret_key,
             src.secret_key_from_env,
-            "AWS_SECRET_ACCESS_KEY",
+            resolve::ENV_AWS_SECRET_ACCESS_KEY,
             "session.cloud.secret_key",
         ),
     ] {
