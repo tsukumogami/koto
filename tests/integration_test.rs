@@ -14,6 +14,11 @@ fn koto_cmd(dir: &Path) -> Command {
     // Override HOME so tests don't read the user's ~/.koto/config.toml
     // (which might set backend = "cloud" or other non-default values).
     cmd.env("HOME", dir);
+    // A host Claude Code session would make every append publish the
+    // `/workflows` location and log that write, adding events these tests
+    // don't expect.
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
+    cmd.env_remove("KOTO_WORKFLOWS_DIR");
     cmd
 }
 
