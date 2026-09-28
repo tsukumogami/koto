@@ -153,14 +153,17 @@ entry.
   rewind a batch retry writes on a child. A gate override is not an entry and
   clears nothing; re-ticking inside the same epoch clears nothing.
 - **R4.** A key written after the entry -- a `context_added` of that key with
-  a higher sequence number than the entry event -- is not cleared. Every
-  other declared key is removed from the context store.
+  a higher sequence number than the entry event, other than one a cloud sync
+  pull logged (writer `sync`) -- is not cleared. Every other declared key is
+  removed from the context store.
 - **R5.** koto decides what to clear from the event log alone. It reads no
   key's content or presence to decide, so clearing appends no `context_read`
   events.
 - **R6.** Each clearing appends exactly one `context_cleared` event carrying
   the state, the keys removed, and the sequence number of the entry it
-  belongs to. One entry produces at most one `context_cleared` event,
+  belongs to. It carries key names only, never values, hashes or sizes.
+  `entry_seq` names the entry on the epoch boundary (any entry, self-
+  transitions included), not the visit boundary. One entry produces at most one `context_cleared` event,
   however many ticks follow it. When every declared key was written after the
   entry, no event is appended.
 - **R7.** Clearing completes before koto runs the state's `default_action` or
@@ -204,9 +207,10 @@ entry.
 - **R12a.** A run that reports done or failed is taken at its word whenever
   it finishes, deadline or not. Only a pending answer at or past the deadline
   becomes the timeout in R15.
-- **R13.** A pending result blocks the state as a wait: its blocking condition
-  has category `temporal`, is not agent-actionable, carries no `failure`
-  object, and carries a `poll` object with `status: "pending"`,
+- **R13.** A pending result blocks the state as a wait: its outcome is
+  `pending` and its blocking condition has status `pending`, category
+  `temporal`, is not agent-actionable, carries no `failure` object and no
+  koto-written fallback finding, and carries a `poll` object with `status: "pending"`,
   `retry_after_secs` (the interval), `elapsed_secs` and `timeout_secs`. Its
   gate output is the command gate's usual `{"exit_code", "error"}`.
 - **R14.** A failed result is reported exactly as a failed command gate is
@@ -223,21 +227,27 @@ entry.
   no command runs, and no `gate_evaluated` (so no `poll` object) is appended
   for it while the override stands, which is until the next entry into the
   state. The override doesn't move the polling window.
-- **R16.** Each recorded evaluation is an attempt under the existing attempt
-  stamps. koto enforces no cap on polling attempts.
+- **R16.** The attempt is the evaluation where the poll resolves -- done,
+  failed or timed out. A pending evaluation carries no `attempt`,
+  `visit_attempt` or `rule_counts` and doesn't advance either count, so a
+  retry loop sees one attempt per CI result, not one per tick. koto enforces
+  no cap on polling attempts.
 - **R17.** koto knows nothing about any forge: no built-in GitHub gate, no
   credential handling. What "done" means is entirely the command's.
 
 ### Log, contract and compatibility
 
 - **R18.** `gate_evaluated` gains an optional `poll` object on polling gates:
-  `status` (`done`, `pending`, `failed` or `timed_out`), `evaluations` (runs in
-  this tick), `since` (RFC 3339, the window start in R12) and `elapsed_secs`
-  (from `since` to the end of the recorded run). A pending evaluation keeps outcome `failed`,
-  as an open request leg does, and a polling timeout uses the existing
-  `timed_out`, so the `outcome` enum gains no value.
-- **R19.** Every new field and event is optional or new, `schema_version`
-  stays 1, and each is documented in `docs/reference/session-feed.md`.
+  `status` (`done`, `pending`, `failed` or `timed_out`), `evaluations` (runs
+  since the window opened, summed across ticks), `since` (RFC 3339, the window
+  start in R12) and `elapsed_secs` (from `since` to the end of the recorded
+  run). A pending evaluation has the new outcome value `pending`, which only
+  sessions whose template declares a polling gate ever write. A polling
+  timeout keeps the existing `timed_out`, told apart from a per-run timeout by
+  `poll.status`.
+- **R19.** Every new field and event is optional or new, the one new
+  `outcome` value is emitted only by polling gates, `schema_version` stays 1,
+  and each is documented in `docs/reference/session-feed.md`.
 - **R20.** A template that declares neither `clear_on_entry` nor `poll`
   compiles to the same JSON and template hash as before and runs unchanged.
 - **R21.** koto v0.14.1 runs `koto status`, `koto next` and `koto context get`
@@ -279,7 +289,9 @@ entry.
 - [ ] Recording a gate override and re-ticking in the same epoch clears
   nothing and appends no `context_cleared`.
 - [ ] A key written with `koto context add` after the entry and before the
-  first tick survives that tick; a key written before the entry doesn't.
+  first tick survives that tick; a key written before the entry doesn't,
+  and neither does one whose only later write is a `context_added` with
+  writer `sync`.
 - [ ] A clearing appends no `context_read` event.
 - [ ] Ticking the state several times after one entry leaves exactly one
   `context_cleared` event for that entry.
@@ -302,9 +314,12 @@ entry.
 - [ ] A command killed by its per-run `timeout` yields outcome `timed_out`
   and a command that can't spawn yields `error`, both with `poll.status:
   "failed"` and category `corrective`, never pending.
-- [ ] A pending evaluation is logged with outcome `failed`, `poll.status:
-  "pending"`, the `evaluations` count, `since` and `elapsed_secs`, and every
-  evaluation in one epoch carries the same `since`.
+- [ ] A pending evaluation is logged with outcome `pending`, `poll.status:
+  "pending"`, `evaluations`, `since` and `elapsed_secs`, and with no
+  `attempt`, `visit_attempt`, `rule_counts` or fallback finding, even when
+  the command printed an error finding; every evaluation in one epoch
+  carries the same `since`, and the resolving evaluation's `evaluations` is
+  the total run count across the pending ticks before it.
 - [ ] A command that stays pending past `timeout_secs` across ticks yields
   outcome `timed_out`, `poll.status: "timed_out"` and a koto-written finding;
   one that reports done after the deadline passes; a new entry into the
@@ -312,7 +327,11 @@ entry.
 - [ ] Overriding a pending polling gate passes the state without running the
   command or appending `gate_evaluated`; a gate declared
   `overridable: false` refuses the override.
-- [ ] Each tick's recorded evaluation carries the next `attempt` number.
+- [ ] Three pending ticks followed by a done tick leave one `attempt`: the
+  done evaluation carries `attempt` one higher than the state's previous
+  resolved attempt, and the pending ones carry none.
+- [ ] Every fixture template without a polling gate produces logs with no
+  `pending` outcome, checked by the existing v0.14.1 compatibility job.
 - [ ] No gate source under `src/` names a forge or reads a credential for
   polling: a CI grep of the polling code for `github`, `gh ` and `token`
   finds nothing.
@@ -395,10 +414,15 @@ the window start can't be read off the first event's timestamp without
 drifting by up to `hold_secs`. Writing `since` on every evaluation makes the
 start explicit and survives a killed process after the first record.
 
-**Pending keeps outcome `failed`.** An open request leg already logs a failed
-`gate_evaluated` with a temporal blocking condition, and adding a value to
-the `outcome` enum would change a field consumers already read. The new
-`poll.status` field tells pending from failed.
+**Pending is its own outcome value.** `failed` means the check judged the
+work and found it bad; a pending tick judged nothing, and a downstream
+measurement consumer counting failed checks would otherwise count every tick
+of a CI wait as a failure. The cost is one value added to the `outcome` enum,
+which a reader pinned to the published list must add; only sessions whose
+template declares a polling gate ever write it, so templates without one stay
+byte-identical and their logs stay readable by koto v0.14.1. For the same
+reason a pending evaluation gets no fallback finding, no rule counts and no
+attempt number: the attempt is the evaluation where the poll resolves.
 
 ## Known Limitations
 
