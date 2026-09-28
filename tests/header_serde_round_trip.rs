@@ -289,6 +289,7 @@ fn command_environment_round_trips_and_is_omitted_when_absent() {
 
     header.command_environment = Some(CommandEnvironment {
         path: Some("/usr/bin:/bin".to_string()),
+        path_absent: Vec::new(),
         home: Some("/home/u".to_string()),
         xdg_config_home: None,
         pass: vec!["TMPDIR".to_string()],
@@ -303,6 +304,31 @@ fn command_environment_round_trips_and_is_omitted_when_absent() {
     assert!(
         record.get("legacy").is_none(),
         "legacy is omitted when false"
+    );
+    assert!(
+        record.get("path_absent").is_none(),
+        "path_absent is omitted when empty"
+    );
+}
+
+/// A record written before `path_absent` existed reads as one whose every
+/// `PATH` entry existed when it was recorded: the field defaults to empty.
+#[test]
+fn a_record_without_path_absent_reads_as_an_empty_list() {
+    let json = r#"{"schema_version":1,"workflow":"wf","template_hash":"h",
+        "created_at":"2026-01-01T00:00:00Z",
+        "command_environment":{"path":"/usr/bin:/opt/tool/bin","home":"/home/u","pass":["TMPDIR"]}}"#;
+    let header: StateFileHeader = serde_json::from_str(json).expect("older record");
+    let record = header.command_environment.unwrap();
+    assert!(record.path_absent.is_empty());
+    assert_eq!(record.path.as_deref(), Some("/usr/bin:/opt/tool/bin"));
+
+    let mut with_absent = record.clone();
+    with_absent.path_absent = vec!["/opt/tool/bin".to_string()];
+    let text = serde_json::to_string(&with_absent).unwrap();
+    assert_eq!(
+        serde_json::from_str::<koto::engine::types::CommandEnvironment>(&text).unwrap(),
+        with_absent
     );
 }
 

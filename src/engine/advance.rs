@@ -6393,6 +6393,7 @@ mod tests {
                 Ok(crate::gate::evaluate_gates_with_request_store(
                     gates,
                     dir.path(),
+                    &crate::action::CommandEnv::inherit(),
                     None,
                     None,
                     None,

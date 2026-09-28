@@ -1126,6 +1126,7 @@ fn extract_kind_from_submission(data: &serde_json::Value) -> Option<&str> {
 fn execute_with_polling<G>(
     command: &str,
     working_dir: &std::path::Path,
+    env: &crate::action::CommandEnv,
     polling: &crate::template::types::PollingConfig,
     gates: &std::collections::BTreeMap<String, crate::template::types::Gate>,
     evaluate_gates_fn: &G,
@@ -1153,7 +1154,7 @@ where
             };
         }
 
-        let output = crate::action::run_shell_command(command, working_dir, 30);
+        let output = crate::action::run_shell_command(command, working_dir, 30, env);
 
         // Check gates after each command execution.
         if !gates.is_empty() {
@@ -3553,6 +3554,9 @@ struct TickGates<'a> {
     overlay: &'a crate::engine::substitute::VariableOverlay,
     capture_names: &'a std::collections::BTreeMap<String, String>,
     execution_dir: &'a std::path::Path,
+    /// The environment every command this tick runs with, gates and actions
+    /// alike (DESIGN-koto-fixed-environment.md).
+    command_env: &'a crate::action::CommandEnv,
     context_store: &'a dyn ContextStore,
     session: &'a str,
     /// The request store `request-leg` gates read: the `~/.koto` root leg
@@ -3584,6 +3588,7 @@ impl TickGates<'_> {
         Ok(crate::gate::evaluate_gates_with_request_store(
             &substituted,
             self.execution_dir,
+            self.command_env,
             Some(self.context_store),
             Some(self.session),
             Some(children_eval),
@@ -3710,7 +3715,7 @@ fn handle_next(
 ) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
-        blocking_conditions_from_gates, environment_adopted_notice,
+        blocking_conditions_from_gates, command_environment_note, environment_adopted_notice,
         execution_anchor_adopted_notice, ErrorDetail, ExpectsSchema, IntegrationOutput,
         IntegrationUnavailableMarker, NextError, NextErrorCode, NextResponse, RECOVERY_POINTER,
     };
@@ -4329,6 +4334,25 @@ fn handle_next(
     // unreachable and costs the check nothing.
     let capture_names = compiled.capture_names().unwrap_or_default();
 
+    // The environment every command this tick runs with, built once so a
+    // gate, the `--to` guard and an action can't see different ones
+    // (DESIGN-koto-fixed-environment.md). The record is always present here:
+    // a session without one adopted it above. The stale list is a few `stat`
+    // calls; it only shapes the notes on the response.
+    let (command_env, stale_values) = match header.command_environment.as_ref() {
+        Some(record) => (
+            crate::engine::command_env::build_command_env(
+                record,
+                &compiled.pass_env,
+                &name,
+                backend.session_dir(&name).parent(),
+                |n| std::env::var(n).ok(),
+            ),
+            crate::engine::command_env::stale(record),
+        ),
+        None => (crate::action::CommandEnv::inherit(), Vec::new()),
+    };
+
     // The one gate evaluator this tick uses, wherever it evaluates gates.
     let tick_gates = TickGates {
         runtime_vars: &runtime_vars,
@@ -4336,6 +4360,7 @@ fn handle_next(
         overlay: &overlay,
         capture_names: &capture_names,
         execution_dir: &execution_dir,
+        command_env: &command_env,
         context_store,
         session: &name,
         request_root: dirs::home_dir().map(|home| home.join(".koto")),
@@ -4620,6 +4645,17 @@ fn handle_next(
                     .and_then(|p| discover_abandoned_leg(backend, &name, p, &events));
                 let resp = match &abandoned_leg {
                     Some(a) => resp.with_directive_prefix(&a.directive_prefix()),
+                    None => resp,
+                };
+
+                // What the recorded environment explains about this tick:
+                // a failure a stale value or a missing command accounts
+                // for, or stale values alone. On the response only; the
+                // guard's evidence is untouched.
+                let resp = match header.command_environment.as_ref().and_then(|record| {
+                    command_environment_note(&name, record, &stale_values, &command_env.failures())
+                }) {
+                    Some(note) => resp.with_directive_prefix(&note),
                     None => resp,
                 };
 
@@ -5289,12 +5325,14 @@ fn handle_next(
             execute_with_polling(
                 &command,
                 &wd,
+                tick_gates.command_env,
                 polling,
                 &state_gates,
                 &|gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
                     evaluate_gates_with_request_store(
                         gates,
                         &execution_dir,
+                        tick_gates.command_env,
                         Some(context_store),
                         Some(&name),
                         None, // children-complete not needed in polling loop
@@ -5304,8 +5342,12 @@ fn handle_next(
                 &shutdown,
             )
         } else {
-            crate::action::run_shell_command(&command, &wd, 30)
+            crate::action::run_shell_command(&command, &wd, 30, tick_gates.command_env)
         };
+        tick_gates.command_env.record(
+            &format!("the default action of state '{}'", state_name),
+            &output,
+        );
 
         // Truncate output, then mark whichever stream the runner had to cut.
         let stdout = mark_truncated(
@@ -5892,6 +5934,16 @@ fn handle_next(
             // (DESIGN-request-lifecycle.md Decision 4).
             let resp = match &abandoned_leg {
                 Some(a) => resp.with_directive_prefix(&a.directive_prefix()),
+                None => resp,
+            };
+
+            // The recorded environment's note (see the directed-transition
+            // path): on the response only, never in evidence or an action's
+            // captured output.
+            let resp = match header.command_environment.as_ref().and_then(|record| {
+                command_environment_note(&name, record, &stale_values, &command_env.failures())
+            }) {
+                Some(note) => resp.with_directive_prefix(&note),
                 None => resp,
             };
 

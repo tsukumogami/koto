@@ -4,15 +4,23 @@
 //! A session records three values at creation -- `PATH`, `HOME` and
 //! `XDG_CONFIG_HOME` -- and a list of names whose values are read live on
 //! every tick. Everything else is absent from a command's environment. This
-//! module owns the lists, the name rules, the `PATH` normalization and the
-//! building of a record from a process environment. It reads no file and
-//! spawns nothing.
+//! module owns the lists, the name rules, the `PATH` normalization, the
+//! building of a record from a process environment, the per-tick
+//! [`CommandEnv`] built from a record, and the stale check. It spawns
+//! nothing; the stale check is a few `stat` calls.
 //!
 //! Values are recorded only for the three fixed variables, which locate
 //! tools and configuration and hold no secret. The names on the default
 //! live list can carry credentials, so only their names are ever written.
 
+use std::path::Path;
+
+use crate::action::CommandEnv;
 use crate::engine::types::CommandEnvironment;
+
+/// The `PATH` a command gets when its session recorded none. Never the
+/// shell's built-in default, which in upstream bash ends in `.`.
+pub const UNSET_PATH: &str = "/usr/bin:/bin";
 
 /// Variables recorded by value when a session is created.
 pub const FIXED_NAMES: [&str; 3] = ["PATH", "HOME", "XDG_CONFIG_HOME"];
@@ -268,9 +276,19 @@ where
     };
     let home = absolute("HOME");
     let xdg_config_home = absolute("XDG_CONFIG_HOME");
+    let path_absent = path
+        .as_deref()
+        .map(|p| {
+            p.split(':')
+                .filter(|dir| !Path::new(dir).is_dir())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
 
     let record = CommandEnvironment {
         path,
+        path_absent,
         home,
         xdg_config_home,
         pass: DEFAULT_LIVE_NAMES.iter().map(|s| s.to_string()).collect(),
@@ -310,6 +328,105 @@ where
     drifted
 }
 
+/// The environment one tick's commands run with, built from the session's
+/// record.
+///
+/// A legacy record gives this process's environment plus `KOTO_TICK_SESSION`,
+/// which is koto's behaviour before records existed. Otherwise the result is,
+/// in order: the live value of each name in the record's list and the
+/// template's `pass_env` that `lookup` finds, leaving out refused names and the
+/// names koto sets; the three fixed values, `PATH` becoming [`UNSET_PATH`] when
+/// the record has none; then `KOTO_TICK_SESSION` and, when given,
+/// `KOTO_SESSIONS_BASE`. Nothing else reaches a command.
+pub fn build_command_env<F>(
+    record: &CommandEnvironment,
+    pass_env: &[String],
+    session: &str,
+    sessions_base: Option<&Path>,
+    lookup: F,
+) -> CommandEnv
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let tick = (
+        crate::engine::reentrancy::TICK_SESSION_ENV.to_string(),
+        session.to_string(),
+    );
+    if record.legacy {
+        return CommandEnv::inherited(vec![tick]);
+    }
+
+    let mut vars: Vec<(String, String)> = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for name in record.pass.iter().chain(pass_env.iter()) {
+        let name = name.as_str();
+        if seen.contains(&name)
+            || is_refused(name)
+            || FIXED_NAMES.contains(&name)
+            || KOTO_SET_NAMES.contains(&name)
+        {
+            continue;
+        }
+        seen.push(name);
+        if let Some(value) = lookup(name) {
+            vars.push((name.to_string(), value));
+        }
+    }
+
+    vars.push((
+        "PATH".to_string(),
+        record
+            .path
+            .clone()
+            .unwrap_or_else(|| UNSET_PATH.to_string()),
+    ));
+    if let Some(home) = &record.home {
+        vars.push(("HOME".to_string(), home.clone()));
+    }
+    if let Some(xdg) = &record.xdg_config_home {
+        vars.push(("XDG_CONFIG_HOME".to_string(), xdg.clone()));
+    }
+    vars.push(tick);
+    if let Some(base) = sessions_base {
+        vars.push((
+            "KOTO_SESSIONS_BASE".to_string(),
+            base.to_string_lossy().into_owned(),
+        ));
+    }
+    CommandEnv::cleared(vars)
+}
+
+/// The recorded values that no longer exist on disk: each `PATH` directory
+/// that existed when it was recorded, `HOME` and `XDG_CONFIG_HOME`, as (name,
+/// value) pairs in that order. A `PATH` entry that was already missing then is
+/// ordinary (a directory a tool manager would create) and never reported.
+///
+/// A legacy record is never stale; its commands use the caller's values.
+pub fn stale(record: &CommandEnvironment) -> Vec<(&'static str, String)> {
+    let mut missing = Vec::new();
+    if record.legacy {
+        return missing;
+    }
+    if let Some(path) = &record.path {
+        for dir in path.split(':') {
+            if !record.path_absent.iter().any(|a| a == dir) && !Path::new(dir).is_dir() {
+                missing.push(("PATH", dir.to_string()));
+            }
+        }
+    }
+    for (name, value) in [
+        ("HOME", &record.home),
+        ("XDG_CONFIG_HOME", &record.xdg_config_home),
+    ] {
+        if let Some(value) = value {
+            if !Path::new(value).exists() {
+                missing.push((name, value.clone()));
+            }
+        }
+    }
+    missing
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +438,78 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |name| map.get(name).cloned()
+    }
+
+    fn record(path: Option<&str>, pass: &[&str]) -> CommandEnvironment {
+        CommandEnvironment {
+            path: path.map(str::to_string),
+            path_absent: Vec::new(),
+            home: Some("/home/someone".to_string()),
+            xdg_config_home: None,
+            pass: pass.iter().map(|n| n.to_string()).collect(),
+            legacy: false,
+        }
+    }
+
+    #[test]
+    fn a_command_env_holds_listed_names_then_fixed_values_then_koto_s() {
+        let rec = record(Some("/opt/bin:/usr/bin"), &["LANG", "BASH_ENV", "HOME"]);
+        let lookup = env(&[
+            ("LANG", "C.UTF-8"),
+            ("BASH_ENV", "/tmp/evil"),
+            ("GH_DB", "live"),
+            ("UNLISTED", "x"),
+            ("HOME", "/somewhere/else"),
+            ("KOTO_TICK_SESSION", "spoofed"),
+        ]);
+        let pass_env = vec!["GH_DB".to_string(), "KOTO_TICK_SESSION".to_string()];
+        let built = build_command_env(&rec, &pass_env, "wf", Some(Path::new("/s")), lookup);
+        assert!(!built.inherits());
+        assert_eq!(built.get("LANG"), Some("C.UTF-8"));
+        assert_eq!(built.get("GH_DB"), Some("live"));
+        assert_eq!(built.get("BASH_ENV"), None);
+        assert_eq!(built.get("UNLISTED"), None);
+        assert_eq!(built.get("PATH"), Some("/opt/bin:/usr/bin"));
+        assert_eq!(built.get("HOME"), Some("/home/someone"));
+        assert_eq!(built.get("XDG_CONFIG_HOME"), None);
+        assert_eq!(built.get("KOTO_TICK_SESSION"), Some("wf"));
+        assert_eq!(built.get("KOTO_SESSIONS_BASE"), Some("/s"));
+    }
+
+    #[test]
+    fn an_unset_path_becomes_the_system_directories() {
+        let built = build_command_env(&record(None, &[]), &[], "wf", None, env(&[]));
+        assert_eq!(built.get("PATH"), Some(UNSET_PATH));
+        assert_eq!(built.get("KOTO_SESSIONS_BASE"), None);
+    }
+
+    #[test]
+    fn a_legacy_record_inherits_and_adds_the_tick_session() {
+        let mut rec = record(Some("/usr/bin"), &[]);
+        rec.legacy = true;
+        let built = build_command_env(&rec, &[], "wf", Some(Path::new("/s")), env(&[]));
+        assert!(built.inherits());
+        assert_eq!(built.get("KOTO_TICK_SESSION"), Some("wf"));
+        assert_eq!(built.get("PATH"), None);
+    }
+
+    #[test]
+    fn stale_names_missing_path_dirs_and_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().to_string_lossy().into_owned();
+        let gone = dir.path().join("gone").to_string_lossy().into_owned();
+        let mut rec = record(Some(&format!("{present}:{gone}")), &[]);
+        rec.home = Some(gone.clone());
+        rec.xdg_config_home = Some(present.clone());
+        assert_eq!(
+            stale(&rec),
+            vec![("PATH", gone.clone()), ("HOME", gone.clone())]
+        );
+        // An entry that was already missing when recorded isn't stale.
+        rec.path_absent = vec![gone.clone()];
+        assert_eq!(stale(&rec), vec![("HOME", gone)]);
+        rec.legacy = true;
+        assert!(stale(&rec).is_empty());
     }
 
     #[test]

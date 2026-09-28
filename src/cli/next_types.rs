@@ -234,6 +234,61 @@ pub fn environment_adopted_notice(
     )
 }
 
+/// Directive prefix naming what the session's recorded environment explains
+/// on this tick (DESIGN-koto-fixed-environment.md, Decision 2), or `None`.
+///
+/// `stale` is the recorded values missing on disk; `failures` is each gate or
+/// action whose last run failed, with whether it looked like a missing
+/// command. A failure is named when anything recorded is stale or the failure
+/// looks not-found; with nothing stale, the note shows the recorded `PATH` it
+/// ran under. Stale values with no failure get a notice of their own. Only the
+/// three recorded values ever appear, never another variable's.
+pub fn command_environment_note(
+    name: &str,
+    record: &crate::engine::types::CommandEnvironment,
+    stale: &[(&str, String)],
+    failures: &[(String, bool)],
+) -> Option<String> {
+    let remedy = format!(
+        "The record can't be changed; to run with different values, start a new session: \
+         `koto cancel --cleanup {name}`, then `koto init` again."
+    );
+    let stale_text = stale
+        .iter()
+        .map(|(var, value)| format!("{var} {value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let named: Vec<&str> = failures
+        .iter()
+        .filter(|(_, not_found)| *not_found || !stale.is_empty())
+        .map(|(label, _)| label.as_str())
+        .collect();
+    if !named.is_empty() {
+        let why = if stale.is_empty() {
+            format!(
+                "it ran under the session's recorded PATH={}",
+                record
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| crate::engine::command_env::UNSET_PATH.to_string())
+            )
+        } else {
+            format!("recorded values no longer exist: {stale_text}")
+        };
+        return Some(format!(
+            "[koto] {} failed in session '{name}', and {why}. {remedy}\n\n",
+            named.join(", ")
+        ));
+    }
+    if !stale.is_empty() {
+        return Some(format!(
+            "[koto] Session '{name}' recorded values that no longer exist: {stale_text}. \
+             Commands that need them will fail. {remedy}\n\n"
+        ));
+    }
+    None
+}
+
 impl NextResponse {
     /// Return this response with `result` set, when it is a `Terminal`.
     /// Every other variant is returned unchanged: only a terminal response

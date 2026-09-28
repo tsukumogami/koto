@@ -255,6 +255,12 @@ pub struct CommandEnvironment {
     /// at creation or when no entry survived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// The entries of `path` that weren't directories when it was recorded.
+    /// They stay in `path`, so a tool installed there later is found; the
+    /// stale check skips them, so only an entry removed after creation is
+    /// reported missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_absent: Vec<String>,
     /// `HOME` at creation; `None` when unset or not absolute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<String>,

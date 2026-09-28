@@ -1791,6 +1791,7 @@ Done.
     fn parent_record() -> crate::engine::types::CommandEnvironment {
         crate::engine::types::CommandEnvironment {
             path: Some("/parent-only/bin:/usr/bin".to_string()),
+            path_absent: Vec::new(),
             home: Some("/parent-only/home".to_string()),
             xdg_config_home: None,
             pass: vec!["TMPDIR".to_string()],

@@ -1,10 +1,12 @@
 //! Re-entrancy marking for `koto next`.
 //!
-//! A tick runs template commands as child processes, and those children
-//! inherit its environment. Before it runs anything, the tick stamps
-//! [`TICK_SESSION_ENV`] with the session it is advancing. A `koto next` that
-//! finds the stamp already set was started from inside a command an outer
-//! tick is running, and refuses.
+//! A tick runs template commands as child processes. Before it runs
+//! anything, the tick stamps [`TICK_SESSION_ENV`] with the session it is
+//! advancing, and every command's environment carries the stamp: koto sets it
+//! explicitly on each one, because a command no longer inherits the tick's
+//! environment (DESIGN-koto-fixed-environment.md). A `koto next` that finds
+//! the stamp already set was started from inside a command an outer tick is
+//! running, and refuses.
 //!
 //! The refusal is not about redundant work. A nested tick appends to the
 //! same event log the outer tick is halfway through processing. The outer
@@ -32,8 +34,12 @@ pub fn enclosing_tick() -> Option<String> {
     }
 }
 
-/// Stamp this process as advancing `session`, so every command it runs
-/// carries the marker.
+/// Stamp this process as advancing `session`.
+///
+/// Commands get the marker from the tick's command environment
+/// (`crate::engine::command_env::build_command_env`), which sets it on every
+/// command whether or not the session inherits this process's environment;
+/// the stamp here is what that value and anything else in the process read.
 ///
 /// The stamp lives for the rest of the process. Nothing clears it: a tick
 /// runs one session and then exits.

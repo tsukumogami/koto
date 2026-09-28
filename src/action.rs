@@ -2,10 +2,12 @@
 //! and output capture. Used by both gate evaluation and default action
 //! execution.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -53,6 +55,128 @@ impl FailureKind {
             FailureKind::WaitFailed => "wait_failed",
         }
     }
+}
+
+/// The shell every command runs under, by absolute path, so neither the
+/// ticking shell's `PATH` nor a decoy `sh` on it can pick a different one.
+pub const SHELL: &str = "/bin/sh";
+
+/// How the last run of one gate or action ended, as the tick's notes need it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandOutcome {
+    Passed,
+    /// `not_found` is true when the failure looks like a missing command.
+    Failed {
+        not_found: bool,
+    },
+}
+
+/// The environment one tick's commands run with (DESIGN-koto-fixed-environment.md).
+///
+/// Built once per tick by the engine and passed to every gate and action, so
+/// they can't disagree. It's never serialized, and its `Debug` form shows
+/// variable names only: values can carry credentials.
+///
+/// It also keeps how each gate or action last ended on this tick, so the tick
+/// can name a failure a stale record or a missing command explains without
+/// changing the gate's evidence.
+pub struct CommandEnv {
+    vars: Vec<(String, String)>,
+    inherit: bool,
+    outcomes: Mutex<BTreeMap<String, CommandOutcome>>,
+}
+
+impl CommandEnv {
+    /// Exactly `vars`, in order, with nothing inherited from this process.
+    pub fn cleared(vars: Vec<(String, String)>) -> Self {
+        Self {
+            vars,
+            inherit: false,
+            outcomes: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// This process's environment with `vars` applied on top: a session
+    /// created with `--legacy-environment`.
+    pub fn inherited(vars: Vec<(String, String)>) -> Self {
+        Self {
+            inherit: true,
+            ..Self::cleared(vars)
+        }
+    }
+
+    /// This process's environment unchanged, for callers outside a tick.
+    pub fn inherit() -> Self {
+        Self::inherited(Vec::new())
+    }
+
+    /// True when commands inherit this process's environment.
+    pub fn inherits(&self) -> bool {
+        self.inherit
+    }
+
+    /// The value set for `name`, if this value sets one.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.vars
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Record how the gate or action named `label` ended.
+    pub fn record(&self, label: &str, output: &CommandOutput) {
+        let outcome = if output.failure_kind.is_none() {
+            CommandOutcome::Passed
+        } else {
+            CommandOutcome::Failed {
+                not_found: looks_not_found(output),
+            }
+        };
+        if let Ok(mut map) = self.outcomes.lock() {
+            map.insert(label.to_string(), outcome);
+        }
+    }
+
+    /// Every gate or action whose last run on this tick failed, with whether
+    /// the failure looks like a missing command.
+    pub fn failures(&self) -> Vec<(String, bool)> {
+        match self.outcomes.lock() {
+            Ok(map) => map
+                .iter()
+                .filter_map(|(label, outcome)| match outcome {
+                    CommandOutcome::Failed { not_found } => Some((label.clone(), *not_found)),
+                    CommandOutcome::Passed => None,
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for CommandEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandEnv")
+            .field(
+                "names",
+                &self
+                    .vars
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field("inherit", &self.inherit)
+            .finish()
+    }
+}
+
+/// True when a failed command looks like it couldn't find a program: exit
+/// status 127, or the shell's message on stderr (`not found` from dash,
+/// `command not found` from bash). The message matters because a script whose
+/// inner command is missing usually exits with its own status.
+pub fn looks_not_found(output: &CommandOutput) -> bool {
+    output.failure_kind == Some(FailureKind::NonzeroExit)
+        && (output.exit_code == 127 || output.stderr.contains("not found"))
 }
 
 /// Output captured from a shell command execution.
@@ -146,24 +270,37 @@ fn append_note(stderr: String, note: String) -> String {
 
 /// Run a shell command with process-group isolation, timeout, and output capture.
 ///
-/// The command runs via `sh -c` in its own process group. If `timeout_secs` is 0,
+/// The command runs via `/bin/sh -c` in its own process group, with the
+/// environment `env` describes and standard input at end of file. A missing
+/// `/bin/sh` is reported as a spawn failure; there is no fallback to a `PATH`
+/// search. If `timeout_secs` is 0,
 /// a default of 30 seconds is used. On timeout the entire process group is killed.
 ///
 /// Both pipes are drained on their own threads for the whole life of the
 /// child, so a command emitting more than the kernel pipe buffer never
 /// blocks on write. Output retained before a timeout kill is returned with
 /// the timeout result rather than discarded.
-pub fn run_shell_command(command: &str, working_dir: &Path, timeout_secs: u32) -> CommandOutput {
+pub fn run_shell_command(
+    command: &str,
+    working_dir: &Path,
+    timeout_secs: u32,
+    env: &CommandEnv,
+) -> CommandOutput {
     let timeout = if timeout_secs == 0 {
         Duration::from_secs(DEFAULT_TIMEOUT_SECS)
     } else {
         Duration::from_secs(u64::from(timeout_secs))
     };
 
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
+    let mut cmd = Command::new(SHELL);
+    if !env.inherit {
+        cmd.env_clear();
+    }
+    cmd.envs(env.vars.iter().map(|(n, v)| (n, v)))
+        .arg("-c")
         .arg(command)
         .current_dir(working_dir)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -266,7 +403,7 @@ mod tests {
     #[test]
     fn captures_stdout() {
         let dir = tmp_dir();
-        let out = run_shell_command("echo hello", dir.path(), 5);
+        let out = run_shell_command("echo hello", dir.path(), 5, &CommandEnv::inherit());
         assert_eq!(out.exit_code, 0);
         assert_eq!(out.stdout.trim(), "hello");
         assert!(out.stderr.is_empty());
@@ -277,7 +414,7 @@ mod tests {
     #[test]
     fn captures_stderr() {
         let dir = tmp_dir();
-        let out = run_shell_command("echo oops >&2", dir.path(), 5);
+        let out = run_shell_command("echo oops >&2", dir.path(), 5, &CommandEnv::inherit());
         assert_eq!(out.exit_code, 0);
         assert!(out.stdout.is_empty());
         assert_eq!(out.stderr.trim(), "oops");
@@ -287,7 +424,7 @@ mod tests {
     #[test]
     fn captures_exit_code() {
         let dir = tmp_dir();
-        let out = run_shell_command("exit 42", dir.path(), 5);
+        let out = run_shell_command("exit 42", dir.path(), 5, &CommandEnv::inherit());
         assert_eq!(out.exit_code, 42);
         assert_eq!(out.failure_kind, Some(FailureKind::NonzeroExit));
     }
@@ -295,7 +432,7 @@ mod tests {
     #[test]
     fn timeout_returns_negative_exit_code() {
         let dir = tmp_dir();
-        let out = run_shell_command("sleep 60", dir.path(), 1);
+        let out = run_shell_command("sleep 60", dir.path(), 1, &CommandEnv::inherit());
         assert_eq!(out.exit_code, -1);
         assert!(out.stderr.contains("timed out"));
         assert_eq!(out.failure_kind, Some(FailureKind::TimedOut));
@@ -304,7 +441,12 @@ mod tests {
     #[test]
     fn timeout_keeps_output_written_before_the_kill() {
         let dir = tmp_dir();
-        let out = run_shell_command("echo partial; echo noticed >&2; sleep 60", dir.path(), 1);
+        let out = run_shell_command(
+            "echo partial; echo noticed >&2; sleep 60",
+            dir.path(),
+            1,
+            &CommandEnv::inherit(),
+        );
         assert_eq!(out.exit_code, -1);
         assert_eq!(out.failure_kind, Some(FailureKind::TimedOut));
         assert_eq!(out.stdout.trim(), "partial");
@@ -314,7 +456,12 @@ mod tests {
 
     #[test]
     fn spawn_failure_reports_spawn_failed() {
-        let out = run_shell_command("echo hi", Path::new("/nonexistent/dir/xyz_12345"), 5);
+        let out = run_shell_command(
+            "echo hi",
+            Path::new("/nonexistent/dir/xyz_12345"),
+            5,
+            &CommandEnv::inherit(),
+        );
         assert_eq!(out.exit_code, -1);
         assert_eq!(out.failure_kind, Some(FailureKind::SpawnFailed));
         assert!(out.stderr.contains("failed to spawn command"));
@@ -325,7 +472,7 @@ mod tests {
     fn runs_in_working_dir() {
         let dir = tmp_dir();
         std::fs::write(dir.path().join("marker.txt"), "found").unwrap();
-        let out = run_shell_command("cat marker.txt", dir.path(), 5);
+        let out = run_shell_command("cat marker.txt", dir.path(), 5, &CommandEnv::inherit());
         assert_eq!(out.exit_code, 0);
         assert_eq!(out.stdout.trim(), "found");
     }
@@ -333,7 +480,7 @@ mod tests {
     #[test]
     fn default_timeout_used_when_zero() {
         let dir = tmp_dir();
-        let out = run_shell_command("exit 0", dir.path(), 0);
+        let out = run_shell_command("exit 0", dir.path(), 0, &CommandEnv::inherit());
         assert_eq!(out.exit_code, 0);
     }
 
@@ -346,6 +493,7 @@ mod tests {
             "for i in $(seq 1 1024); do printf '%063d\\n' \"$i\"; done",
             dir.path(),
             10,
+            &CommandEnv::inherit(),
         );
         assert_eq!(out.exit_code, 0);
         assert_eq!(out.failure_kind, None);
@@ -360,6 +508,7 @@ mod tests {
             "for i in $(seq 1 4096); do printf '%063d\\n' \"$i\"; done",
             dir.path(),
             10,
+            &CommandEnv::inherit(),
         );
         assert_eq!(out.exit_code, 0);
         assert!(out.truncated);
@@ -373,11 +522,90 @@ mod tests {
             "for i in $(seq 1 4096); do printf '%063d\\n' \"$i\" >&2; done",
             dir.path(),
             10,
+            &CommandEnv::inherit(),
         );
         assert_eq!(out.exit_code, 0);
         assert!(out.truncated);
         assert_eq!(out.stderr.len(), MAX_ACTION_OUTPUT_BYTES);
         assert!(out.stdout.is_empty());
+    }
+
+    #[test]
+    fn a_cleared_environment_holds_only_what_it_sets() {
+        let dir = tmp_dir();
+        let env = CommandEnv::cleared(vec![
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("KOTO_TEST_SET".to_string(), "yes".to_string()),
+        ]);
+        // Names only: the child reports which of these it can see.
+        let out = run_shell_command(
+            "[ -n \"${PATH+x}\" ] && echo PATH; \
+             [ -n \"${KOTO_TEST_SET+x}\" ] && echo KOTO_TEST_SET; \
+             [ -n \"${HOME+x}\" ] && echo HOME; \
+             [ -n \"${CARGO+x}\" ] && echo CARGO; true",
+            dir.path(),
+            5,
+            &env,
+        );
+        assert_eq!(out.exit_code, 0, "{}", out.stderr);
+        assert_eq!(out.stdout, "PATH\nKOTO_TEST_SET\n");
+    }
+
+    #[test]
+    fn standard_input_is_at_end_of_file() {
+        let dir = tmp_dir();
+        let out = run_shell_command(
+            "if read -r line; then echo got; else echo eof; fi",
+            dir.path(),
+            5,
+            &CommandEnv::inherit(),
+        );
+        assert_eq!(out.stdout, "eof\n");
+    }
+
+    #[test]
+    fn the_shell_is_found_without_a_path() {
+        let dir = tmp_dir();
+        let out = run_shell_command("echo ran", dir.path(), 5, &CommandEnv::cleared(vec![]));
+        assert_eq!(out.stdout, "ran\n");
+    }
+
+    #[test]
+    fn not_found_is_exit_127_or_the_shell_message() {
+        let dir = tmp_dir();
+        let env = CommandEnv::cleared(vec![("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let missing = run_shell_command("koto_no_such_command_xyz", dir.path(), 5, &env);
+        assert!(looks_not_found(&missing), "{:?}", missing.exit_code);
+        let wrapped = run_shell_command("koto_no_such_command_xyz; exit 3", dir.path(), 5, &env);
+        assert_eq!(wrapped.exit_code, 3);
+        assert!(looks_not_found(&wrapped));
+        let plain = run_shell_command("exit 1", dir.path(), 5, &env);
+        assert!(!looks_not_found(&plain));
+    }
+
+    #[test]
+    fn outcomes_keep_the_last_run_of_each_label() {
+        let dir = tmp_dir();
+        let env = CommandEnv::cleared(vec![("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        env.record("g", &run_shell_command("exit 1", dir.path(), 5, &env));
+        env.record(
+            "h",
+            &run_shell_command("koto_no_such_command_xyz", dir.path(), 5, &env),
+        );
+        assert_eq!(
+            env.failures(),
+            vec![("g".to_string(), false), ("h".to_string(), true)]
+        );
+        env.record("g", &run_shell_command("true", dir.path(), 5, &env));
+        assert_eq!(env.failures(), vec![("h".to_string(), true)]);
+    }
+
+    #[test]
+    fn debug_shows_names_and_never_values() {
+        let env = CommandEnv::cleared(vec![("GH_TOKEN".to_string(), "marker-value".to_string())]);
+        let shown = format!("{:?}", env);
+        assert!(shown.contains("GH_TOKEN"));
+        assert!(!shown.contains("marker-value"));
     }
 
     #[test]
