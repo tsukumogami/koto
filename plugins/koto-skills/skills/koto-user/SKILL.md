@@ -494,7 +494,7 @@ The response shape includes batch-specific fields:
 
 - `scheduler.materialized_children` — the per-child dispatch ledger (use this for idempotent dispatch, not `spawned_this_tick`).
 - `scheduler.feedback.entries` — per-task outcome keyed by short name (`accepted`, `blocked`, `errored`, `already_running`, etc.).
-- `reserved_actions` — ready-to-run retry invocations, synthesized when the gate reports `any_failed`, `any_skipped`, or `any_spawn_failed`.
+- `reserved_actions` — ready-to-run retry invocations, synthesized when the gate reports `any_failed`, `any_skipped`, or `any_spawn_failed`: in the batching state, and in a later non-terminal state that routes `evidence.retry_failed` back to the batching state (the list then comes from the recorded batch).
 - `batch_final_view` — frozen snapshot attached to the terminal `done` response.
 - `synthetic: true` — marker on skip-marker children whose state was materialized directly (no worker ran).
 
