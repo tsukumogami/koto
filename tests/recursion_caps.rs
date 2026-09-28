@@ -41,6 +41,7 @@ use koto::session::state_file_name;
 /// optional parent_workflow.
 fn unassigned_child_header(workflow: &str, parent: Option<&str>) -> StateFileHeader {
     StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: workflow.to_string(),
         template_hash: "deadbeef".into(),

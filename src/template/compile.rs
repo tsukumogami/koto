@@ -30,6 +30,8 @@ struct SourceFrontmatter {
     variables: HashMap<String, SourceVariable>,
     #[serde(default)]
     states: HashMap<String, SourceState>,
+    #[serde(default)]
+    pass_env: Vec<String>,
 }
 
 /// YAML front-matter view of a variable declaration.
@@ -690,6 +692,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
         initial_state: fm.initial_state,
         variables,
         states: compiled_states,
+        pass_env: fm.pass_env,
     };
 
     // Run validation rules (includes evidence routing validation).
@@ -1228,6 +1231,68 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
+    }
+
+    // -----------------------------------------------------------------------
+    // pass_env: (DESIGN-koto-fixed-environment.md)
+    // -----------------------------------------------------------------------
+
+    mod pass_env {
+        use super::*;
+
+        const BASE: &str = "---\nname: t\nversion: \"1\"\ninitial_state: a\n\
+            PASS_ENV\
+            states:\n  a:\n    terminal: true\n---\n\n## a\n\nDone.\n";
+
+        fn source(pass_env: &str) -> String {
+            BASE.replace("PASS_ENV", pass_env)
+        }
+
+        #[test]
+        fn declared_names_compile_into_the_template() {
+            let f = write_temp(&source("pass_env: [GH_DB, EVAL_SCENARIO]\n"));
+            let t = compile(f.path(), true).unwrap();
+            assert_eq!(t.pass_env, vec!["GH_DB", "EVAL_SCENARIO"]);
+        }
+
+        #[test]
+        fn a_template_without_declarations_compiles_to_the_same_json() {
+            let f = write_temp(&source(""));
+            let t = compile(f.path(), true).unwrap();
+            let json = serde_json::to_value(&t).unwrap();
+            assert!(
+                json.get("pass_env").is_none(),
+                "no key, so the hash is unchanged"
+            );
+        }
+
+        #[test]
+        fn refused_and_malformed_names_are_errors() {
+            for bad in [
+                "BASH_ENV",
+                "ENV",
+                "BASH_FUNC_x",
+                "GIT_CONFIG_COUNT",
+                "GIT_SSH_COMMAND",
+                "GIT_ASKPASS",
+                "GH_CONFIG_DIR",
+                "\"1BAD\"",
+                "\"A-B\"",
+            ] {
+                let f = write_temp(&source(&format!("pass_env: [{bad}]\n")));
+                let err = compile(f.path(), true).unwrap_err().to_string();
+                assert!(err.contains("pass_env"), "{bad}: {err}");
+            }
+        }
+
+        #[test]
+        fn a_koto_supplied_name_warns() {
+            let f = write_temp(&source("pass_env: [PATH, KOTO_TICK_SESSION, GH_DB]\n"));
+            let t = compile(f.path(), true).unwrap();
+            let warnings = t.collect_pass_env_warnings();
+            assert_eq!(warnings.len(), 2, "{warnings:?}");
+            assert!(warnings.iter().all(|w| w.starts_with("W7:")));
+        }
     }
 
     // -----------------------------------------------------------------------

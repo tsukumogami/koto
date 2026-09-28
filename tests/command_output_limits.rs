@@ -13,7 +13,7 @@
 
 use assert_cmd::Command;
 use assert_fs::TempDir;
-use koto::action::{run_shell_command, FailureKind, MAX_ACTION_OUTPUT_BYTES};
+use koto::action::{run_shell_command, CommandEnv, FailureKind, MAX_ACTION_OUTPUT_BYTES};
 use koto::gate::{evaluate_gates, GateOutcome};
 use koto::template::types::Gate;
 use std::collections::BTreeMap;
@@ -45,10 +45,17 @@ fn koto_binary() -> PathBuf {
 }
 
 fn init_workflow(dir: &Path, name: &str, template: &str) {
+    init_workflow_in(koto_cmd(dir), dir, name, template);
+}
+
+/// `init_workflow` with the caller's command, for a session that must record
+/// something `koto_cmd` doesn't set, such as a `PATH`: a session's commands
+/// run with the `PATH` recorded at init, not the one a tick has.
+fn init_workflow_in(mut cmd: Command, dir: &Path, name: &str, template: &str) {
     let src = dir.join(format!("{}-template.md", name));
     std::fs::write(&src, template).unwrap();
 
-    let output = koto_cmd(dir)
+    let output = cmd
         .args(["init", name, "--template", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -277,7 +284,12 @@ fn gate_at_several_megabytes_is_judged_on_its_exit_status() {
 #[test]
 fn gate_command_output_is_bounded_and_flagged_as_truncated() {
     let dir = TempDir::new().unwrap();
-    let out = run_shell_command(&emit_command(SEVERAL_MEGABYTES, 0), dir.path(), 30);
+    let out = run_shell_command(
+        &emit_command(SEVERAL_MEGABYTES, 0),
+        dir.path(),
+        30,
+        &CommandEnv::inherit(),
+    );
 
     assert_eq!(out.exit_code, 0);
     assert_eq!(out.failure_kind, None);
@@ -320,7 +332,7 @@ fn gate_evaluator_does_not_report_a_loud_gate_as_timed_out() {
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), None, None, None);
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
         assert_eq!(
             results["loud"].outcome, expected,
             "exit {exit_code} at {bytes} bytes should map to {expected:?}"
@@ -487,7 +499,12 @@ fn action_output_below_the_bound_is_not_marked_truncated() {
 #[test]
 fn a_timed_out_command_still_delivers_the_output_it_produced() {
     let dir = TempDir::new().unwrap();
-    let out = run_shell_command("echo started; echo warned >&2; sleep 60", dir.path(), 1);
+    let out = run_shell_command(
+        "echo started; echo warned >&2; sleep 60",
+        dir.path(),
+        1,
+        &CommandEnv::inherit(),
+    );
 
     assert_eq!(out.failure_kind, Some(FailureKind::TimedOut));
     assert_eq!(out.stdout.trim(), "started");
@@ -578,10 +595,13 @@ All done.
 "#
     );
 
-    init_workflow(dir.path(), "nested-koto", &template);
+    // The nested `koto` is found through the session's recorded `PATH`, so
+    // the binary's directory goes on it at init.
+    let mut init = koto_cmd(dir.path());
+    init.env("PATH", &path);
+    init_workflow_in(init, dir.path(), "nested-koto", &template);
 
     let output = koto_cmd(dir.path())
-        .env("PATH", &path)
         .args(["next", "nested-koto"])
         .output()
         .unwrap();

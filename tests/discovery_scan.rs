@@ -41,6 +41,7 @@ const COORD: &str = "team-lead";
 /// Build a minimal `StateFileHeader` for the given workflow id.
 fn make_header(workflow: &str) -> StateFileHeader {
     StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: workflow.to_string(),
         template_hash: "deadbeef".into(),

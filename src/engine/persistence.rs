@@ -1301,6 +1301,7 @@ mod tests {
 
     fn make_header() -> StateFileHeader {
         StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "test-wf".to_string(),
             template_hash: "deadbeef".to_string(),

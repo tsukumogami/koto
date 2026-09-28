@@ -36,7 +36,7 @@ states:
 
 Required fields: `name`, `version`, `initial_state`, `states`.
 
-Optional fields: `description`, `variables`.
+Optional fields: `description`, `variables`, `pass_env` (environment variable names a gate or action command reads; see [`pass_env:`](#pass_env--variables-a-command-reads)).
 
 ### Variables
 
@@ -946,20 +946,20 @@ states:
 
 | Field | Required | Type | Meaning |
 |---|---|---|---|
-| `command` | Yes | string | The command line, passed to `sh -c` as a single string |
+| `command` | Yes | string | The command line, passed to `/bin/sh -c` as a single string |
 | `capture_stdout_as` | No | string | A name the command's trimmed stdout is delivered under, readable by later states |
 | `fallback` | No | string | Prose the agent reads when the action fails. Spliced onto `directive` after substitution, so write it as literal text |
 | `working_dir` | No | string | A **relative** path under the session's execution anchor. An absolute literal is a compile error |
 | `requires_confirmation` | No | bool | After a *successful* run, stop for confirmation before transitioning |
 | `polling` | No | map | `interval_secs` + `timeout_secs`. Re-runs the command on an interval, re-evaluating the state's gates between runs, until they pass or `timeout_secs` expires |
 
-**Invocation.** One `sh -c` argument, in its own process group, inheriting the environment of the `koto next` process. Every single run gets 30 seconds and that isn't configurable -- `polling`'s `timeout_secs` bounds how long koto keeps retrying, not how long one attempt may take. A command that can't finish in 30 seconds isn't one the engine can run. `{{VARIABLE}}` references are substituted in the shell-safe form before the shell sees the string; quote the reference when a value must stay one argument.
+**Invocation.** One `/bin/sh -c` argument, in its own process group, with standard input at end of file. It does not inherit the environment of the `koto next` process: it runs in a cleared environment holding the live values of koto's default list and the template's `pass_env:` names, the `PATH`, `HOME` and `XDG_CONFIG_HOME` recorded when the session was created, and `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`. See [`pass_env:`](#pass_env--variables-a-command-reads). Every single run gets 30 seconds and that isn't configurable -- `polling`'s `timeout_secs` bounds how long koto keeps retrying, not how long one attempt may take. A command that can't finish in 30 seconds isn't one the engine can run. `{{VARIABLE}}` references are substituted in the shell-safe form before the shell sees the string; quote the reference when a value must stay one argument.
 
 **When it runs.** Whenever the advance loop enters the state on a tick carrying no evidence for it. A tick that submits evidence skips the action -- which is how confirming doesn't re-run the command. Every other tick that reaches the state runs it again, gate-blocked retries and self-loops included, so the command must be safe to re-run (`mkdir -p`, not `mkdir`).
 
 **Where it runs.** At the session's execution anchor, not the directory `koto next` was typed in. `working_dir` moves one action to a subdirectory: an absolute value is refused before any join, then the value is joined to the anchor, then canonicalized and refused if it escaped via `..`. The anchor guarantees the directory a workflow's commands *start* in, checked on every tick. It does not bound what an authorized command can reach once running -- a command is still free to name absolute paths or change directory -- so don't author as if it did, and don't describe it to anyone else as if it did.
 
-**What it must not do.** Call `koto next`. A command runs inside a tick, and a tick started from inside one advances the session while the outer tick goes on reporting the state it started with -- the caller gets a wrong answer, not a missing one. koto refuses the nested call with the `nested_invocation` error code, so an author who reaches for it finds out immediately rather than shipping a workflow that lies. The refusal is scoped to the process tree, so it covers a tick on any session, not just this one. Every other `koto` subcommand is fine from a command; `koto context` reads and writes in particular are a supported pattern. This applies to command gates too. One caveat if you write a command that detaches: the marker is inherited and has no liveness, so a process that escapes the process-group kill at timeout keeps it and gets refused by a tick that already exited. The message names the way out; not leaving processes behind a command is the better answer.
+**What it must not do.** Call `koto next`. A command runs inside a tick, and a tick started from inside one advances the session while the outer tick goes on reporting the state it started with -- the caller gets a wrong answer, not a missing one. koto refuses the nested call with the `nested_invocation` error code, so an author who reaches for it finds out immediately rather than shipping a workflow that lies. The refusal is scoped to the process tree, so it covers a tick on any session, not just this one. Every other `koto` subcommand is fine from a command; `koto context` reads and writes in particular are a supported pattern. This applies to command gates too. One caveat if you write a command that detaches: koto sets the marker in every command's environment, whatever the command starts gets it too, and nothing checks that the tick is still running, so a process that escapes the process-group kill at timeout keeps it and gets refused by a tick that already exited. The message names the way out; not leaving processes behind a command is the better answer.
 
 **Its output.** Every run appends a `default_action_executed` event with the command, exit code, both streams, and a `truncated` flag; each stream is bounded at 64KB. On a successful run with no `capture_stdout_as`, that log entry is where the output ends -- the agent never sees it.
 
@@ -988,6 +988,42 @@ It covers a state's gates the same way, across every field a gate substitutes �
 One ordering follows from where the check sits, and it is worth knowing when you write a gate against a value the same state produces. A state's gates are resolved after its action has run, so a gate reading that action's own `capture_stdout_as` name resolves normally. Under a **polling** action it does not: the gates are resolved on the way in, before the command has finished, so the value cannot exist yet and the gate is refused. Write such a check into the state that consumes the value rather than the one that produces it.
 
 Lifetime: re-entering the producing state runs the command again and the later value wins; two states declaring the same name is a compile error; a `koto rewind` past the producing state **leaves the value in place**, because a rewind appends an event and truncates nothing; a captured value holding a `{{...}}` token is never re-expanded; and a capture is delivered on a tick that stops for confirmation as well as one that advances.
+
+### `pass_env:` — variables a command reads
+
+Gate and action commands don't see the caller's environment. Each runs in a cleared environment holding exactly:
+
+1. the live value, on each tick, of each name on koto's default list and each name the template declares in `pass_env:`, minus the refused names below;
+2. `PATH`, `HOME` and `XDG_CONFIG_HOME` as recorded when the session was created (an unset recorded `PATH` becomes `/usr/bin:/bin`);
+3. `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`, set by koto.
+
+The default list is `USER`, `LOGNAME`, `LANG`, `LANGUAGE`, `LC_ALL`, `LC_CTYPE`, `LC_COLLATE`, `LC_MESSAGES`, `LC_NUMERIC`, `LC_TIME`, `LC_MONETARY`, `TZ`, `TMPDIR`, `TERM`, `NO_COLOR`, `CI`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`, `HTTP_PROXY`, `http_proxy`, `HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `no_proxy`, `ALL_PROXY`, `all_proxy`. Nothing else: not `GH_REPO`, no `GIT_*`, no `AWS_*`, no other `KOTO_*`.
+
+**If a command reads any other variable, declare its name** in a top-level `pass_env:` list, or the command finds it unset:
+
+```yaml
+pass_env: [DEPLOY_TARGET, NPM_CONFIG_REGISTRY]
+states:
+  preflight:
+    gates:
+      target_set:
+        type: command
+        command: 'test -n "$DEPLOY_TARGET"'
+    transitions:
+      - target: done
+        when:
+          gates.target_set.exit_code: 0
+```
+
+Rules the compiler applies to each name:
+
+- It must match `^[A-Za-z_][A-Za-z0-9_]*$`. List names, not patterns or values.
+- A refused name is a compile error: `BASH_ENV`, `ENV`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `GH_CONFIG_DIR`, and any name starting `BASH_FUNC_` or `GIT_CONFIG`. These make the shell, `git` or `gh` run code or load configuration chosen by whoever ticks the session. koto also filters them at run time.
+- A name koto sets itself (`PATH`, `HOME`, `XDG_CONFIG_HOME`, `KOTO_TICK_SESSION`, `KOTO_SESSIONS_BASE`) compiles with warning **W7**, since koto's value wins and the declaration does nothing. Remove it.
+
+Declared values are read live on each tick and never written to the session, so declaring a token's name is safe. A template that declares nothing compiles to the same hash as before the field existed. A command can still set variables for itself (`GIT_DIR=/srv/mirror.git git log -1`).
+
+Author with two more facts in mind. `PATH` is recorded without its empty and relative entries (`.`, `node_modules/.bin`), so a command that relied on one must spell the path, such as `./node_modules/.bin/eslint`. And the record can't change after creation: a tool that moves off the recorded `PATH` fails until the session is replaced, and koto's response says so when it happens. For the full picture, including `koto init --legacy-environment` (this release only) and what the fixed environment does and doesn't protect against, see [What a command's environment is](../../../../../docs/guides/default-action-authoring.md#what-a-commands-environment-is).
 
 ### skip_if — automatic transitions
 
@@ -1362,6 +1398,7 @@ Batch authoring introduces error (E), warning (W), and runtime (R) rule IDs used
 | E | E-SKIP-AMBIGUOUS | Compile-time error on `skip_if` | `skip_if` values match zero or more than one conditional transition — ensure values satisfy exactly one `when` clause |
 | W | W1-W5 | Compile-time warnings on `materialize_children` / `failure` / `skipped_marker` | See [batch-authoring.md](batch-authoring.md) |
 | W | W6 | Compile-time warning on `present` matcher misuse | Fires when `"present"` appears outside `evidence.<field>` paths |
+| W | W7 | Compile-time warning on `pass_env:` | A declared name is one koto sets itself (`PATH`, `HOME`, `XDG_CONFIG_HOME`, `KOTO_TICK_SESSION`, `KOTO_SESSIONS_BASE`), so the declaration has no effect -- remove it |
 | W | W-SKIP-GATE-ABSENT | Compile-time warning on `skip_if` | A `gates.NAME.*` key references a gate not declared on the state — add the gate or fix the key |
 | F | F5 | Compile-time warning on child template reachability | Child template has no reachable `skipped_marker: true` terminal. See [batch-authoring.md](batch-authoring.md) |
 | R | R0-R9 | Pre-append runtime rules on a submitted task list | Validated in `koto next`. See [batch-workflows.md](../../koto-user/references/batch-workflows.md) |

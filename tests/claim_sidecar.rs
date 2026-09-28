@@ -83,6 +83,7 @@ fn fixture(child_id: &str, coord_id: &str) -> Fixture {
 
 fn base_header(workflow: &str) -> StateFileHeader {
     StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: workflow.to_string(),
         template_hash: "deadbeef".to_string(),

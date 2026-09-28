@@ -658,6 +658,7 @@ mod tests {
 
     fn make_header(name: &str, parent: Option<&str>) -> StateFileHeader {
         StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: name.to_string(),
             template_hash: "deadbeef".to_string(),

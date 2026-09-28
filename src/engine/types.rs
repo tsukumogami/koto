@@ -241,6 +241,49 @@ pub struct SessionStoreIdentity {
     pub base: PathBuf,
 }
 
+/// The environment a session's commands run with
+/// (`StateFileHeader.command_environment`).
+///
+/// Three values are recorded, because they locate the tools and the git
+/// and gh configuration a command uses and hold no secret. Every other
+/// variable is named in `pass` (or declared by the session's template) and
+/// read live on each tick; no value of those is ever recorded. See
+/// `crate::engine::command_env`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandEnvironment {
+    /// `PATH` with empty and relative entries dropped; `None` when unset
+    /// at creation or when no entry survived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The entries of `path` that weren't directories when it was recorded.
+    /// They stay in `path`, so a tool installed there later is found; the
+    /// stale check skips them, so only an entry removed after creation is
+    /// reported missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_absent: Vec<String>,
+    /// `HOME` at creation; `None` when unset or not absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
+    /// `XDG_CONFIG_HOME` at creation; `None` when unset or not absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xdg_config_home: Option<String>,
+    /// True when the recorded `home` didn't exist when it was recorded, so
+    /// the stale check never reports it: a new session would record the same
+    /// missing value, and the remedy would loop.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub home_absent: bool,
+    /// The same for the recorded `xdg_config_home`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub xdg_config_home_absent: bool,
+    /// The default live names of the koto release that made the record.
+    #[serde(default)]
+    pub pass: Vec<String>,
+    /// `koto init --legacy-environment`: commands run with the ticking
+    /// process's whole environment, as before this record existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy: bool,
+}
+
 /// Header line written as the first line of a state file.
 ///
 /// Contains metadata about the workflow log. Has no `seq` field -- it is
@@ -364,6 +407,18 @@ pub struct StateFileHeader {
     /// Additive field: omitted when None, defaults to None on old state files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<SessionOrigin>,
+
+    /// The environment this session's commands run with, recorded when
+    /// the session was created (DESIGN-koto-fixed-environment.md).
+    ///
+    /// Written by every `koto init` and copied from the parent by every
+    /// child spawn. `None` on state files written before the field
+    /// existed; such a session adopts a record on its first tick. Nothing
+    /// rewrites a record once written.
+    ///
+    /// Additive field: omitted when None, defaults to None on old state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_environment: Option<CommandEnvironment>,
 
     // ===== Request-store fields (Decision 1) =====
     //
@@ -807,6 +862,22 @@ pub enum EventPayload {
     /// exactly one of these can appear per session.
     ExecutionAnchorAdopted {
         anchor: PathBuf,
+    },
+    /// Emitted on the first tick of a session whose header carries no
+    /// `command_environment` -- a session created by a koto that recorded
+    /// none (DESIGN-koto-fixed-environment.md, R16). The tick records the
+    /// ticking process's fixed values and koto's default live names on the
+    /// header and appends this event, so the log shows when the record
+    /// arrived after the fact and which `PATH` entries were dropped.
+    ///
+    /// Carries the record itself, which holds no secret: the three fixed
+    /// values and a list of names. Normally one appears per session, because
+    /// the header field is what the next tick finds; a crash between the
+    /// event and the header write leaves one the next tick repeats.
+    EnvironmentAdopted {
+        environment: CommandEnvironment,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dropped: Vec<String>,
     },
     /// Emitted by `koto session rebind` when a developer deliberately
     /// moves a session's execution anchor (R13). Rebinding is the only
@@ -1375,6 +1446,7 @@ impl EventPayload {
             EventPayload::ChildCompleted { .. } => "child_completed",
             EventPayload::IntentUpdated { .. } => "intent_updated",
             EventPayload::ExecutionAnchorAdopted { .. } => "execution_anchor_adopted",
+            EventPayload::EnvironmentAdopted { .. } => "environment_adopted",
             EventPayload::ExecutionAnchorRebound { .. } => "execution_anchor_rebound",
             EventPayload::VariableCaptured { .. } => "variable_captured",
             EventPayload::VariablesRebound { .. } => "variables_rebound",
@@ -1657,6 +1729,14 @@ impl<'de> Deserialize<'de> for Event {
                 let p: ExecutionAnchorAdoptedPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
                 EventPayload::ExecutionAnchorAdopted { anchor: p.anchor }
+            }
+            "environment_adopted" => {
+                let p: EnvironmentAdoptedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::EnvironmentAdopted {
+                    environment: p.environment,
+                    dropped: p.dropped,
+                }
             }
             "execution_anchor_rebound" => {
                 let p: ExecutionAnchorReboundPayload = serde_json::from_value(payload_val.clone())
@@ -1948,6 +2028,13 @@ struct ExecutionAnchorAdoptedPayload {
 }
 
 #[derive(Deserialize)]
+struct EnvironmentAdoptedPayload {
+    environment: CommandEnvironment,
+    #[serde(default)]
+    dropped: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct ExecutionAnchorReboundPayload {
     #[serde(default)]
     from: Option<PathBuf>,
@@ -2162,6 +2249,7 @@ mod tests {
     #[test]
     fn header_parsing_round_trip() {
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "my-workflow".to_string(),
             template_hash: "abc123def456".to_string(),
@@ -2195,6 +2283,7 @@ mod tests {
     #[test]
     fn header_round_trip_with_parent_workflow() {
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "child-wf".to_string(),
             template_hash: "abc123def456".to_string(),
@@ -2240,6 +2329,7 @@ mod tests {
     #[test]
     fn header_round_trip_with_template_source_dir() {
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "wf".to_string(),
             template_hash: "hash".to_string(),
@@ -2278,6 +2368,7 @@ mod tests {
     #[test]
     fn header_none_template_source_dir_not_serialized() {
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "wf".to_string(),
             template_hash: "hash".to_string(),
@@ -2314,6 +2405,7 @@ mod tests {
     #[test]
     fn header_none_parent_workflow_not_serialized() {
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "wf".to_string(),
             template_hash: "hash".to_string(),
@@ -3103,6 +3195,7 @@ mod tests {
     #[test]
     fn header_session_id_round_trip() {
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "wf".to_string(),
             template_hash: "hash".to_string(),

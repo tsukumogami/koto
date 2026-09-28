@@ -25,6 +25,7 @@ fn init_parent_backend(dir: &std::path::Path, parent: &str) -> LocalBackend {
     backend.create(parent).expect("create parent");
 
     let header = StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: parent.to_string(),
         template_hash: "0".repeat(64),

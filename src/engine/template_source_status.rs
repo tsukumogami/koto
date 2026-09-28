@@ -239,6 +239,7 @@ mod tests {
 
     fn header_with_template_source_dir(dir: Option<PathBuf>) -> StateFileHeader {
         StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "test-workflow".to_string(),
             template_hash: "testhash".to_string(),

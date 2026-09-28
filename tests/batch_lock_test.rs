@@ -39,6 +39,7 @@ fn init_backend(dir: &std::path::Path, id: &str) -> LocalBackend {
     backend.create(id).expect("create session dir");
 
     let header = StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: id.to_string(),
         template_hash: "0".repeat(64),

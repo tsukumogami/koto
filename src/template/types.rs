@@ -68,6 +68,12 @@ pub struct CompiledTemplate {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub variables: BTreeMap<String, VariableDecl>,
     pub states: BTreeMap<String, TemplateState>,
+    /// Environment variable names this template's commands need, read live
+    /// on every tick in addition to koto's default list
+    /// (DESIGN-koto-fixed-environment.md). Skipped when empty so a template
+    /// that declares none keeps its compiled form and hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pass_env: Vec<String>,
 }
 
 /// A variable declaration in a compiled template.
@@ -1054,6 +1060,9 @@ impl CompiledTemplate {
                 self.initial_state
             ));
         }
+        for name in &self.pass_env {
+            crate::engine::command_env::validate_declared_name(name)?;
+        }
         // Collect the capture names before the per-state loop: a `{{KEY}}`
         // reference resolves against the union of the variables block, every
         // state's capture name, and the runtime names, and a state may read a
@@ -1602,6 +1611,11 @@ impl CompiledTemplate {
         // is used against a non-evidence path (e.g. `context.foo: present` or a
         // flat agent-evidence key). Same convention as W1-W5.
         for warning in self.collect_when_clause_warnings() {
+            eprintln!("warning: {}", warning);
+        }
+
+        // W7: a `pass_env:` name koto supplies itself has no effect.
+        for warning in self.collect_pass_env_warnings() {
             eprintln!("warning: {}", warning);
         }
 
@@ -2211,6 +2225,24 @@ impl CompiledTemplate {
         }
 
         Ok(())
+    }
+
+    /// Collect warning W7: a `pass_env:` name that koto supplies itself
+    /// (`PATH`, `HOME`, `XDG_CONFIG_HOME`, `KOTO_TICK_SESSION`,
+    /// `KOTO_SESSIONS_BASE`). koto's value always wins, so the declaration
+    /// does nothing.
+    pub fn collect_pass_env_warnings(&self) -> Vec<String> {
+        self.pass_env
+            .iter()
+            .filter(|n| crate::engine::command_env::is_koto_supplied(n))
+            .map(|n| {
+                format!(
+                    "W7: pass_env: {:?} is set by koto on every command, so declaring it has no effect\n  \
+                     remedy: remove it from pass_env",
+                    n
+                )
+            })
+            .collect()
     }
 
     /// Collect non-fatal warnings W1-W5 tied to `materialize_children`,
@@ -2921,6 +2953,7 @@ mod tests {
             },
         );
         CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "test".to_string(),
             version: "1.0".to_string(),
@@ -5851,6 +5884,7 @@ command: "./check.sh"
         states.insert("plan".to_string(), plan);
         states.insert("done".to_string(), done);
         CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "batch-parent".to_string(),
             version: "1.0".to_string(),

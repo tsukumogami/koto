@@ -122,6 +122,7 @@ mod tests {
         std::fs::create_dir_all(&session_dir).unwrap();
         let state_path = session_dir.join(state_file_name(workflow_name));
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: workflow_name.to_string(),
             template_hash: template_hash.to_string(),
@@ -324,6 +325,7 @@ mod tests {
         std::fs::create_dir_all(&session_dir).unwrap();
         let state_path = session_dir.join(state_file_name(workflow_name));
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: workflow_name.to_string(),
             template_hash: template_hash.to_string(),

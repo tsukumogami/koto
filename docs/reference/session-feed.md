@@ -37,6 +37,9 @@ header:
       type: string
       required: false
       nullable: true
+    command_environment:
+      type: object
+      required: false
 
 events:
   workflow_initialized:
@@ -319,6 +322,16 @@ events:
         type: string
         required: true
 
+  environment_adopted:
+    tier: 2
+    fields:
+      environment:
+        type: object
+        required: true
+      dropped:
+        type: array
+        required: false
+
   decider_consulted:
     tier: 2
     fields:
@@ -413,7 +426,12 @@ version signal.
       "base": "/home/user/.koto/sessions"
     }
   },
-  "execution_dir": "/home/user/src/koto"
+  "execution_dir": "/home/user/src/koto",
+  "command_environment": {
+    "path": "/home/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin",
+    "home": "/home/user",
+    "pass": ["USER", "LOGNAME", "LANG", "TMPDIR", "GH_TOKEN", "HTTPS_PROXY"]
+  }
 }
 ```
 
@@ -428,11 +446,34 @@ version signal.
 | `template_source_dir` | string | No | Absolute path to the directory containing the source template at init time. Absent for stdin/inline templates and older files. |
 | `template_source_file` | string | No | File name (no directory) of the source template `koto init` compiled the session from, such as `work-on.md`. Together with `template_hash` it is the session's template identity, which `koto request attach` compares against the template a request leg names. Absent for `--from-stdin` sessions and older files; a leg attach refuses such a session rather than guessing. |
 | `origin` | object | No | Where the session was started: `anchor` (the canonical execution anchor at creation) and `store` (`kind`, `"local"` or `"cloud"`, and `base`, the canonical sessions directory). Written by `koto init` and every child spawn. `koto init --attach-live` compares it against the caller's own record and refuses a same-named session from another worktree or store. Absent on older files; nothing backfills it, and `--attach-live` refuses such a session. |
+| `command_environment` | object | No | The environment record the session's commands run with: the recorded `PATH`, `HOME` and `XDG_CONFIG_HOME`, the default list of names read live, and the legacy flag. Described below. |
 | `execution_dir` | string | No | The session's execution anchor: the canonical absolute directory its ticks run gates and actions in. Recorded at `koto init` time from the process working directory, or from `--execution-dir`. A child copies its parent's value. Absent on files written before the field existed and on sessions created through `koto session start`; the first tick of such a session adopts the directory it is ticked from, writes it here, and records an `execution_anchor_adopted` event. Once recorded, `koto session rebind` is the only thing that changes it, and it records an `execution_anchor_rebound` event when it does. |
 
 `execution_dir` is where a session's commands *start*, not a boundary on what
 they reach. A command that runs is free to name absolute paths or change
 directory, and nothing in this contract stops it.
+
+`command_environment` is the environment record every command of the session
+runs with:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `path` | string | No | `PATH` at creation, with empty and relative entries dropped. Absent when it was unset, when no entry survived, or when it contained a credential's value. Commands then get `/usr/bin:/bin`. |
+| `path_absent` | array of strings | No | Entries of `path` that weren't directories when the record was made. They stay in `path`; the stale check skips them. Absent when empty. |
+| `home` | string | No | `HOME` at creation. Absent when unset, relative, or containing a credential's value. |
+| `xdg_config_home` | string | No | `XDG_CONFIG_HOME` at creation, under the same rules as `home`. |
+| `home_absent` | boolean | No | `true` when the recorded `home` didn't exist when the record was made; the stale check skips it. Absent when false. |
+| `xdg_config_home_absent` | boolean | No | The same for `xdg_config_home`. Absent when false. |
+| `pass` | array of strings | Yes | The default list of names whose live values reach commands, as it stood in the koto release that made the record. Names only. The example above shortens it. |
+| `legacy` | boolean | No | `true` when the session was created with `koto init --legacy-environment`, so its commands run with the ticking process's whole environment. Absent when false. |
+
+The field is written at `koto init`, copied from the parent into every child
+(including one made by `koto session start`), and never rewritten afterwards. It holds no value of any
+variable except the three above. Names a template declares in `pass_env:` aren't
+stored here; they come from the compiled template on each tick. The field is
+absent on sessions created by a koto that didn't record one; the first tick of
+such a session writes it and records an `environment_adopted` event. See
+[What a command's environment is](../guides/default-action-authoring.md#what-a-commands-environment-is).
 
 ## Event Envelope
 
@@ -1137,6 +1178,46 @@ bound to writes nothing, so consecutive events always differ.
 
 The event is appended before the header field is written, the same ordering
 `execution_anchor_adopted` uses and for the same reason.
+
+---
+
+#### `environment_adopted`
+
+Written once, on the first tick of a session whose header carries no
+`command_environment`: a session created by a koto that didn't record one. The
+tick records the ticking process's `PATH` (normalized), `HOME` and
+`XDG_CONFIG_HOME` and the default list of live names, writes them to the header,
+and appends this event. A session created by a koto that records at creation
+never produces it.
+
+```json
+{
+  "type": "environment_adopted",
+  "payload": {
+    "environment": {
+      "path": "/home/user/.cargo/bin:/home/user/.local/share/fnm/bin:/usr/bin:/bin",
+      "path_absent": ["/home/user/.local/share/fnm/bin"],
+      "home": "/home/user",
+      "pass": ["USER", "LOGNAME", "LANG", "TMPDIR", "GH_TOKEN", "HTTPS_PROXY"]
+    },
+    "dropped": ["", "node_modules/.bin"]
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `environment` | object | Yes | The record adopted, in the same shape as the header's `command_environment`: `path`, `path_absent`, `home` and `xdg_config_home` (each absent when not recorded), `pass`, and `legacy` (never set by adoption, so always absent). Matches what the same tick writes to the header. |
+| `dropped` | array of strings | No | The `PATH` entries normalization removed, in order. An empty entry appears as `""`. Absent when nothing was dropped. |
+
+The payload holds no value of any variable except the three recorded ones, and a
+value containing a credential's value was recorded unset before it got here. The
+first response after adoption carries a one-time notice on `directive` naming the
+recorded values and the dropped entries.
+
+The event is appended before the header field is written, so a crash between the
+two repeats the adoption on the next tick. Two of these in one log mean that
+crash, not a second record; the last one is what the header holds.
 
 ---
 

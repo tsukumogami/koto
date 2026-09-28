@@ -1824,6 +1824,7 @@ mod tests {
             state_map.insert(name.to_string(), state);
         }
         CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "test".to_string(),
             version: "1.0.0".to_string(),
@@ -6392,6 +6393,7 @@ mod tests {
                 Ok(crate::gate::evaluate_gates_with_request_store(
                     gates,
                     dir.path(),
+                    &crate::action::CommandEnv::inherit(),
                     None,
                     None,
                     None,

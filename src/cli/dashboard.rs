@@ -291,6 +291,7 @@ mod tests {
         use std::time::SystemTime;
         CachedSession {
             header: StateFileHeader {
+                command_environment: None,
                 schema_version: 1,
                 workflow: "test".to_string(),
                 template_hash: "abc".to_string(),

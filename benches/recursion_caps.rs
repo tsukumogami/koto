@@ -195,6 +195,7 @@ fn build_workspace(tmp: &Path, total: usize, seed: u64) -> (LocalBackend, PathBu
 
 fn base_header(id: &str, parent: Option<&str>) -> StateFileHeader {
     StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: id.to_string(),
         template_hash: "deadbeef".into(),

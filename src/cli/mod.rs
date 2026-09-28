@@ -173,6 +173,15 @@ pub enum Command {
         /// Every later `koto next` must run there or beneath it.
         #[arg(long, value_name = "DIR")]
         execution_dir: Option<String>,
+
+        /// Run this session's commands with the caller's whole
+        /// environment, as koto did before it recorded one. Recorded in
+        /// the session when it is created; no later command can set or
+        /// clear it, so with --attach-live on an existing session it has
+        /// no effect. Refused with --parent: a child takes its parent's
+        /// record. Temporary: the next release removes it.
+        #[arg(long)]
+        legacy_environment: bool,
     },
 
     /// Get the current state directive for a workflow
@@ -1117,6 +1126,7 @@ fn extract_kind_from_submission(data: &serde_json::Value) -> Option<&str> {
 fn execute_with_polling<G>(
     command: &str,
     working_dir: &std::path::Path,
+    env: &crate::action::CommandEnv,
     polling: &crate::template::types::PollingConfig,
     gates: &std::collections::BTreeMap<String, crate::template::types::Gate>,
     evaluate_gates_fn: &G,
@@ -1144,7 +1154,7 @@ where
             };
         }
 
-        let output = crate::action::run_shell_command(command, working_dir, 30);
+        let output = crate::action::run_shell_command(command, working_dir, 30, env);
 
         // Check gates after each command execution.
         if !gates.is_empty() {
@@ -1217,6 +1227,7 @@ pub fn run(app: App) -> Result<()> {
             parent,
             intent,
             execution_dir,
+            legacy_environment,
         } => {
             // Entry-flag usage errors come first, before any IO: they are
             // caller mistakes, and there is no leg yet to record them on.
@@ -1233,6 +1244,12 @@ pub fn run(app: App) -> Result<()> {
             if entry_flags_used && parent.is_some() {
                 init_entry::usage_error(
                     "--attach-live, --replace-terminal and --koto-leg can't be used with --parent",
+                );
+            }
+            if legacy_environment && parent.is_some() {
+                init_entry::usage_error(
+                    "--legacy-environment can't be used with --parent: a child takes its \
+                     parent's recorded environment",
                 );
             }
             let koto_leg = koto_leg.map(|raw| {
@@ -1313,6 +1330,7 @@ pub fn run(app: App) -> Result<()> {
                     &vars,
                     intent.as_deref(),
                     execution_dir.as_deref(),
+                    legacy_environment,
                 )
             } else {
                 let template = template.unwrap_or_else(|| {
@@ -1333,6 +1351,7 @@ pub fn run(app: App) -> Result<()> {
                             vars: &vars,
                             intent: intent.as_deref(),
                             execution_dir: execution_dir.as_deref(),
+                            legacy_environment,
                         },
                         &entry,
                     );
@@ -1345,6 +1364,7 @@ pub fn run(app: App) -> Result<()> {
                     parent.as_deref(),
                     intent.as_deref(),
                     execution_dir.as_deref(),
+                    legacy_environment,
                 )
             }
         }
@@ -1970,6 +1990,22 @@ fn stale_template_source_dir_clause(backend: &Backend, name: &str) -> Option<Str
     ))
 }
 
+/// Add an `environment` object to a `koto init` response when recording
+/// the session's environment dropped `PATH` entries or left a fixed value
+/// unset (DESIGN-koto-fixed-environment.md). `report` is what the header
+/// writer returned: `None` when the record was copied from a parent, so
+/// there is nothing to report. Names and path text only; no value of a
+/// credential-carrying variable.
+pub(crate) fn add_environment_report(
+    out: &mut serde_json::Value,
+    report: Option<&crate::engine::command_env::RecordReport>,
+) {
+    if let Some(report) = report.filter(|r| !r.is_empty()) {
+        out["environment"] = report.to_json();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_init(
     backend: &Backend,
     name: &str,
@@ -1978,6 +2014,7 @@ fn handle_init(
     parent: Option<&str>,
     intent: Option<&str>,
     execution_dir: Option<&Path>,
+    legacy_environment: bool,
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation.
     if let Err(msg) = crate::discover::validate_workflow_name(name) {
@@ -2034,7 +2071,7 @@ fn handle_init(
     // R8 spawn-time immutability snapshot is populated only by the
     // future batch scheduler, which calls this helper directly with
     // `Some(..)`.
-    if let Err(err) = init_child::init_child_from_parent_at(
+    let environment_report = match init_child::init_child_from_parent_at(
         backend,
         parent,
         name,
@@ -2043,57 +2080,61 @@ fn handle_init(
         &mut cache,
         None,
         execution_dir,
+        legacy_environment,
     ) {
-        match err.kind {
-            SpawnErrorKind::Collision => {
-                // Match the pre-check's error text so callers can rely
-                // on a stable "already exists" string regardless of
-                // which detector fired. The staleness clause (if any)
-                // is appended via the same shared helper the pre-check
-                // uses, so the clause itself is identical between the
-                // two paths even though their base messages differ.
-                let base = format!("workflow '{}' already exists", name);
-                let error = match stale_template_source_dir_clause(backend, name) {
-                    Some(clause) => format!("{}{}", base, clause),
-                    None => base,
-                };
-                exit_with_error(serde_json::json!({
-                    "error": error,
-                    "command": "init"
-                }));
-            }
-            _ => {
-                // Variable-resolution failures are caller errors (exit
-                // 2); everything else is a runtime/IO/compile failure
-                // (exit 1), matching the legacy implementation.
-                let is_var_error = matches!(err.kind, SpawnErrorKind::TemplateCompileFailed)
-                    && err
-                        .message
-                        .starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
-                let mut body = serde_json::json!({
-                    "error": if is_var_error {
-                        err.message
-                            .strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
-                            .unwrap_or(&err.message)
-                            .to_string()
-                    } else {
-                        err.message.clone()
-                    },
-                    "command": "init"
-                });
-                // A typed refusal (`invalid_var`, `duplicate_var`,
-                // `unknown_var`) adds its code and fields beside `error`.
-                if let (Some(var_error), Some(obj)) = (&err.var_error, body.as_object_mut()) {
-                    obj.extend(var_error.fields());
+        Ok(value) => value,
+        Err(err) => {
+            match err.kind {
+                SpawnErrorKind::Collision => {
+                    // Match the pre-check's error text so callers can rely
+                    // on a stable "already exists" string regardless of
+                    // which detector fired. The staleness clause (if any)
+                    // is appended via the same shared helper the pre-check
+                    // uses, so the clause itself is identical between the
+                    // two paths even though their base messages differ.
+                    let base = format!("workflow '{}' already exists", name);
+                    let error = match stale_template_source_dir_clause(backend, name) {
+                        Some(clause) => format!("{}{}", base, clause),
+                        None => base,
+                    };
+                    exit_with_error(serde_json::json!({
+                        "error": error,
+                        "command": "init"
+                    }));
                 }
-                if is_var_error {
-                    exit_with_error_code(body, 2);
-                } else {
-                    exit_with_error(body);
+                _ => {
+                    // Variable-resolution failures are caller errors (exit
+                    // 2); everything else is a runtime/IO/compile failure
+                    // (exit 1), matching the legacy implementation.
+                    let is_var_error = matches!(err.kind, SpawnErrorKind::TemplateCompileFailed)
+                        && err
+                            .message
+                            .starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
+                    let mut body = serde_json::json!({
+                        "error": if is_var_error {
+                            err.message
+                                .strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
+                                .unwrap_or(&err.message)
+                                .to_string()
+                        } else {
+                            err.message.clone()
+                        },
+                        "command": "init"
+                    });
+                    // A typed refusal (`invalid_var`, `duplicate_var`,
+                    // `unknown_var`) adds its code and fields beside `error`.
+                    if let (Some(var_error), Some(obj)) = (&err.var_error, body.as_object_mut()) {
+                        obj.extend(var_error.fields());
+                    }
+                    if is_var_error {
+                        exit_with_error_code(body, 2);
+                    } else {
+                        exit_with_error(body);
+                    }
                 }
             }
         }
-    }
+    };
 
     // If --intent was provided, append an IntentUpdated event. Otherwise,
     // record a default intent derived from the template so the session
@@ -2127,13 +2168,12 @@ fn handle_init(
             )
         })?;
 
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "name": name,
-            "state": initial_state
-        }))?
-    );
+    let mut out = serde_json::json!({
+        "name": name,
+        "state": initial_state
+    });
+    add_environment_report(&mut out, environment_report.as_ref());
+    println!("{}", serde_json::to_string(&out)?);
     Ok(())
 }
 
@@ -2159,6 +2199,7 @@ fn handle_init_inline(
     vars: &[String],
     intent: Option<&str>,
     execution_dir: Option<&Path>,
+    legacy_environment: bool,
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation. Guards
     // `<name>` against path traversal (no `/`, `..`, or `~`).
@@ -2186,34 +2227,44 @@ fn handle_init_inline(
         }));
     }
 
-    if let Err(e) =
-        init_child::init_inline_from_stdin_bytes(backend, name, source_bytes, vars, execution_dir)
-    {
-        // Variable-resolution failures are caller errors (exit 2); a
-        // strict-compile / validation failure or any I/O error is exit 1.
-        // The seam prefixes var-resolution errors so we can classify them
-        // the same way the file path does.
-        let msg = e.to_string();
-        let is_var_error = msg.starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
-        let mut body = serde_json::json!({
-            "error": if is_var_error {
-                msg.strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
-                    .unwrap_or(&msg)
-                    .to_string()
+    let environment_report = match init_child::init_inline_from_stdin_bytes(
+        backend,
+        name,
+        source_bytes,
+        vars,
+        execution_dir,
+        legacy_environment,
+    ) {
+        Ok(value) => value,
+        Err(e) => {
+            // Variable-resolution failures are caller errors (exit 2); a
+            // strict-compile / validation failure or any I/O error is exit 1.
+            // The seam prefixes var-resolution errors so we can classify them
+            // the same way the file path does.
+            let msg = e.to_string();
+            let is_var_error = msg.starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
+            let mut body = serde_json::json!({
+                "error": if is_var_error {
+                    msg.strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
+                        .unwrap_or(&msg)
+                        .to_string()
+                } else {
+                    msg.clone()
+                },
+                "command": "init"
+            });
+            if let (Some(var_error), Some(obj)) =
+                (e.downcast_ref::<VarError>(), body.as_object_mut())
+            {
+                obj.extend(var_error.fields());
+            }
+            if is_var_error {
+                exit_with_error_code(body, 2);
             } else {
-                msg.clone()
-            },
-            "command": "init"
-        });
-        if let (Some(var_error), Some(obj)) = (e.downcast_ref::<VarError>(), body.as_object_mut()) {
-            obj.extend(var_error.fields());
+                exit_with_error(body);
+            }
         }
-        if is_var_error {
-            exit_with_error_code(body, 2);
-        } else {
-            exit_with_error(body);
-        }
-    }
+    };
 
     // If --intent was provided, append an IntentUpdated event. Otherwise,
     // record a default intent derived from the template (R8).
@@ -2243,13 +2294,12 @@ fn handle_init_inline(
             )
         })?;
 
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "name": name,
-            "state": initial_state
-        }))?
-    );
+    let mut out = serde_json::json!({
+        "name": name,
+        "state": initial_state
+    });
+    add_environment_report(&mut out, environment_report.as_ref());
+    println!("{}", serde_json::to_string(&out)?);
     Ok(())
 }
 
@@ -3504,6 +3554,9 @@ struct TickGates<'a> {
     overlay: &'a crate::engine::substitute::VariableOverlay,
     capture_names: &'a std::collections::BTreeMap<String, String>,
     execution_dir: &'a std::path::Path,
+    /// The environment every command this tick runs with, gates and actions
+    /// alike (DESIGN-koto-fixed-environment.md).
+    command_env: &'a crate::action::CommandEnv,
     context_store: &'a dyn ContextStore,
     session: &'a str,
     /// The request store `request-leg` gates read: the `~/.koto` root leg
@@ -3535,6 +3588,7 @@ impl TickGates<'_> {
         Ok(crate::gate::evaluate_gates_with_request_store(
             &substituted,
             self.execution_dir,
+            self.command_env,
             Some(self.context_store),
             Some(self.session),
             Some(children_eval),
@@ -3661,9 +3715,9 @@ fn handle_next(
 ) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
-        blocking_conditions_from_gates, execution_anchor_adopted_notice, ErrorDetail,
-        ExpectsSchema, IntegrationOutput, IntegrationUnavailableMarker, NextError, NextErrorCode,
-        NextResponse, RECOVERY_POINTER,
+        blocking_conditions_from_gates, command_environment_note, environment_adopted_notice,
+        execution_anchor_adopted_notice, ErrorDetail, ExpectsSchema, IntegrationOutput,
+        IntegrationUnavailableMarker, NextError, NextErrorCode, NextResponse, RECOVERY_POINTER,
     };
     use crate::engine::advance::{
         advance_until_stop_with_decider, merge_epoch_evidence, ActionResult, AdvanceError,
@@ -3680,8 +3734,9 @@ fn handle_next(
 
     // 0. Refuse a nested tick before anything else runs.
     //
-    // koto next runs template commands as children, so they inherit the
-    // marker this tick is about to set. A koto next started from inside one
+    // koto next runs template commands as children, and each one gets the
+    // marker this tick is about to set (koto sets it in every command's
+    // environment, see `command_env::build_command_env`). A koto next started from inside one
     // of those commands would append to the event log the outer tick is
     // still working through; the outer tick would then finish against its
     // starting snapshot and report a state the session had already left
@@ -4059,6 +4114,99 @@ fn handle_next(
         }
     };
 
+    // Issue 13: epoch fence on CHILD-log writes. The fence applies
+    // ONLY to `--with-data` writes against a child workflow's log
+    // (header.parent_workflow.is_some()). Coordinator-side ticks
+    // against the parent workflow's own log are NOT under the fence
+    // per R43's wording ("every writer to a CHILD'S log"). The check
+    // fires BEFORE any persistence write so an on-mismatch rejection
+    // never leaves partial state on disk.
+    //
+    // A missing `--dispatch-epoch` flag on a child-log write is an
+    // implicit mismatch: a writer that does not present an epoch is
+    // rejected as if it had presented the wrong epoch. The
+    // SubagentStop hook (Issue 16's spawn helper) bakes the epoch at
+    // spawn time and threads it through; a hook that omits the flag
+    // is a bug, and the fence surfaces it.
+    //
+    // It runs before the command-environment adoption below, so a rejected
+    // writer never records an environment. It reads only the header, and
+    // `--to` excludes `--with-data`, so running it this early changes no
+    // outcome but the order of two refusals a displaced writer could hit.
+    if with_data.is_some() && crate::engine::epoch::fence_applies_to(&header) {
+        let child_sid = match crate::engine::types::ValidatedSessionId::new(&name) {
+            Ok(v) => v,
+            Err(e) => {
+                // ValidatedSessionId::new returns EngineError::InvalidSessionId,
+                // which has its own exit code (1). Defer to it.
+                let code = e.exit_code();
+                exit_with_error_code(
+                    serde_json::json!({
+                        "error": format!("{}", e),
+                        "command": "next"
+                    }),
+                    code,
+                );
+            }
+        };
+        if let Err(e) = crate::engine::epoch::validate_epoch(&child_sid, &header, dispatch_epoch) {
+            // EpochFenceViolation maps to exit 65 (EX_DATAERR) via
+            // EngineError::exit_code. Use the typed envelope so
+            // operators reading the error see the fence-mismatch
+            // shape and can program against it.
+            let code = e.exit_code();
+            let (expected, presented) = match &e {
+                EngineError::EpochFenceViolation {
+                    expected,
+                    presented,
+                    ..
+                } => (*expected, *presented),
+                _ => unreachable!("validate_epoch returns EpochFenceViolation only"),
+            };
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": {
+                        "code": "epoch_fence_violation",
+                        "message": format!("{}", e),
+                        "child_session_id": name,
+                        "expected_dispatch_epoch": expected,
+                        "presented_dispatch_epoch": presented,
+                    },
+                    "command": "next"
+                }),
+                code,
+            );
+        }
+    }
+
+    // The command environment (DESIGN-koto-fixed-environment.md, R16). A
+    // session created by a koto that recorded none adopts one here: past the
+    // epoch fence above, so a displaced writer can't set a record nothing
+    // can change afterwards, and before variables, the template, the `--to`
+    // guard or any gate or action, so every command this tick runs has a
+    // record behind it.
+    let mut environment_adopted: Option<(crate::engine::types::CommandEnvironment, Vec<String>)> =
+        None;
+    if header.command_environment.is_none() {
+        match init_child::adopt_command_environment(backend, &name) {
+            Ok((record, report)) => {
+                if let Some(report) = report {
+                    environment_adopted = Some((record.clone(), report.dropped_path_entries));
+                }
+                header.command_environment = Some(record);
+            }
+            Err(e) => {
+                let ne = NextError {
+                    code: NextErrorCode::PersistenceError,
+                    message: format!("failed to record the command environment: {}", e),
+                    details: vec![],
+                };
+                let json = serde_json::json!({"error": ne});
+                exit_with_error_code(json, ne.code.exit_code());
+            }
+        }
+    }
+
     // Construct variable bindings from the WorkflowInitialized event.
     // Re-validates values as defense in depth; exits with infrastructure error on failure.
     let variables = match Variables::from_events(&events) {
@@ -4172,7 +4320,7 @@ fn handle_next(
     //
     // The abandonment check is deliberately NOT hoisted alongside it:
     // its first delivery appends a record to the child's log, and the
-    // epoch fence below must reject a displaced writer before any
+    // epoch fence must reject a displaced writer before any
     // persistence call. Each directive funnel runs the check for itself,
     // past the fence.
     let leg_pointer =
@@ -4187,6 +4335,31 @@ fn handle_next(
     // unreachable and costs the check nothing.
     let capture_names = compiled.capture_names().unwrap_or_default();
 
+    // The environment every command this tick runs with, built once so a
+    // gate, the `--to` guard and an action can't see different ones
+    // (DESIGN-koto-fixed-environment.md). A session without a record adopted
+    // one above, so a missing record here is a defect; the tick refuses rather
+    // than running commands with the caller's environment. The stale list is a
+    // few `stat` calls; it only shapes the notes on the response.
+    let (command_env, stale_values) = match crate::engine::command_env::for_tick(
+        header.command_environment.as_ref(),
+        &compiled.pass_env,
+        &name,
+        backend.session_dir(&name).parent(),
+        |n| std::env::var(n).ok(),
+    ) {
+        Ok(built) => built,
+        Err(missing) => {
+            let ne = NextError {
+                code: NextErrorCode::PreconditionFailed,
+                message: format!("session '{}': {}", name, missing),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": ne});
+            exit_with_error_code(json, ne.code.exit_code());
+        }
+    };
+
     // The one gate evaluator this tick uses, wherever it evaluates gates.
     let tick_gates = TickGates {
         runtime_vars: &runtime_vars,
@@ -4194,6 +4367,7 @@ fn handle_next(
         overlay: &overlay,
         capture_names: &capture_names,
         execution_dir: &execution_dir,
+        command_env: &command_env,
         context_store,
         session: &name,
         request_root: dirs::home_dir().map(|home| home.join(".koto")),
@@ -4301,16 +4475,33 @@ fn handle_next(
             );
             if !blockers.is_empty() {
                 let quoted: Vec<String> = blockers.iter().map(|g| format!("'{}'", g)).collect();
+                // A guard gate that failed because the recorded environment is
+                // stale, or couldn't find its command, is named here too: this
+                // refusal is the only response the tick gives.
+                let environment_note = header
+                    .command_environment
+                    .as_ref()
+                    .and_then(|record| {
+                        command_environment_note(
+                            &name,
+                            record,
+                            &stale_values,
+                            &command_env.failures(),
+                        )
+                    })
+                    .map(|note| format!(". {}", note.trim_end()))
+                    .unwrap_or_default();
                 let err = NextError {
                     code: NextErrorCode::GateBlocked,
                     message: format!(
                         "cannot take --to '{}': the transition from '{}' depends on {} {} \
                          declared overridable: false, and the current result does not \
-                         satisfy that transition; nothing was recorded",
+                         satisfy that transition; nothing was recorded{}",
                         target,
                         current_state,
                         if blockers.len() == 1 { "gate" } else { "gates" },
-                        quoted.join(", ")
+                        quoted.join(", "),
+                        environment_note
                     ),
                     details: blockers
                         .iter()
@@ -4481,10 +4672,27 @@ fn handle_next(
                     None => resp,
                 };
 
-                // The anchor-adoption notice, spliced last so it is
-                // the first thing the agent reads: it reports a
-                // binding that was just created, which every later
-                // tick of this session is judged against.
+                // What the recorded environment explains about this tick:
+                // a failure a stale value or a missing command accounts
+                // for, or stale values alone. On the response only; the
+                // guard's evidence is untouched.
+                let resp = match header.command_environment.as_ref().and_then(|record| {
+                    command_environment_note(&name, record, &stale_values, &command_env.failures())
+                }) {
+                    Some(note) => resp.with_directive_prefix(&note),
+                    None => resp,
+                };
+
+                // The adoption notices, spliced last so they are the
+                // first thing the agent reads: each reports a binding
+                // that was just created, which every later tick of this
+                // session runs under. The anchor's is spliced after the
+                // environment's, so it reads first.
+                let resp = match &environment_adopted {
+                    Some((record, dropped)) => resp
+                        .with_directive_prefix(&environment_adopted_notice(&name, record, dropped)),
+                    None => resp,
+                };
                 let resp = match &anchor_adopted {
                     Some(anchor) => {
                         resp.with_directive_prefix(&execution_anchor_adopted_notice(&name, anchor))
@@ -4628,66 +4836,6 @@ fn handle_next(
             exit_with_error_code(json, ne.code.exit_code());
         }
     };
-
-    // Issue 13: epoch fence on CHILD-log writes. The fence applies
-    // ONLY to `--with-data` writes against a child workflow's log
-    // (header.parent_workflow.is_some()). Coordinator-side ticks
-    // against the parent workflow's own log are NOT under the fence
-    // per R43's wording ("every writer to a CHILD'S log"). The check
-    // fires BEFORE any persistence write so an on-mismatch rejection
-    // never leaves partial state on disk.
-    //
-    // A missing `--dispatch-epoch` flag on a child-log write is an
-    // implicit mismatch: a writer that does not present an epoch is
-    // rejected as if it had presented the wrong epoch. The
-    // SubagentStop hook (Issue 16's spawn helper) bakes the epoch at
-    // spawn time and threads it through; a hook that omits the flag
-    // is a bug, and the fence surfaces it.
-    if with_data.is_some() && crate::engine::epoch::fence_applies_to(&header) {
-        let child_sid = match crate::engine::types::ValidatedSessionId::new(&name) {
-            Ok(v) => v,
-            Err(e) => {
-                // ValidatedSessionId::new returns EngineError::InvalidSessionId,
-                // which has its own exit code (1). Defer to it.
-                let code = e.exit_code();
-                exit_with_error_code(
-                    serde_json::json!({
-                        "error": format!("{}", e),
-                        "command": "next"
-                    }),
-                    code,
-                );
-            }
-        };
-        if let Err(e) = crate::engine::epoch::validate_epoch(&child_sid, &header, dispatch_epoch) {
-            // EpochFenceViolation maps to exit 65 (EX_DATAERR) via
-            // EngineError::exit_code. Use the typed envelope so
-            // operators reading the error see the fence-mismatch
-            // shape and can program against it.
-            let code = e.exit_code();
-            let (expected, presented) = match &e {
-                EngineError::EpochFenceViolation {
-                    expected,
-                    presented,
-                    ..
-                } => (*expected, *presented),
-                _ => unreachable!("validate_epoch returns EpochFenceViolation only"),
-            };
-            exit_with_error_code(
-                serde_json::json!({
-                    "error": {
-                        "code": "epoch_fence_violation",
-                        "message": format!("{}", e),
-                        "child_session_id": name,
-                        "expected_dispatch_epoch": expected,
-                        "presented_dispatch_epoch": presented,
-                    },
-                    "command": "next"
-                }),
-                code,
-            );
-        }
-    }
 
     // Past the fence, so a displaced writer is rejected before the
     // notice's first delivery appends anything to the child's log.
@@ -5239,12 +5387,14 @@ fn handle_next(
             execute_with_polling(
                 &command,
                 &wd,
+                tick_gates.command_env,
                 polling,
                 &state_gates,
                 &|gates: &std::collections::BTreeMap<String, crate::template::types::Gate>| {
                     evaluate_gates_with_request_store(
                         gates,
                         &execution_dir,
+                        tick_gates.command_env,
                         Some(context_store),
                         Some(&name),
                         None, // children-complete not needed in polling loop
@@ -5254,8 +5404,12 @@ fn handle_next(
                 &shutdown,
             )
         } else {
-            crate::action::run_shell_command(&command, &wd, 30)
+            crate::action::run_shell_command(&command, &wd, 30, tick_gates.command_env)
         };
+        tick_gates.command_env.record(
+            &format!("the default action of state '{}'", state_name),
+            &output,
+        );
 
         // Truncate output, then mark whichever stream the runner had to cut.
         let stdout = mark_truncated(
@@ -5845,9 +5999,25 @@ fn handle_next(
                 None => resp,
             };
 
-            // The anchor-adoption notice, spliced last so it is the
-            // first thing the agent reads (see the directed-transition
-            // path for the same splice).
+            // The recorded environment's note (see the directed-transition
+            // path): on the response only, never in evidence or an action's
+            // captured output.
+            let resp = match header.command_environment.as_ref().and_then(|record| {
+                command_environment_note(&name, record, &stale_values, &command_env.failures())
+            }) {
+                Some(note) => resp.with_directive_prefix(&note),
+                None => resp,
+            };
+
+            // The adoption notices, spliced last so they are the first
+            // thing the agent reads (see the directed-transition path for
+            // the same splice and its order).
+            let resp = match &environment_adopted {
+                Some((record, dropped)) => {
+                    resp.with_directive_prefix(&environment_adopted_notice(&name, record, dropped))
+                }
+                None => resp,
+            };
             let resp = match &anchor_adopted {
                 Some(anchor) => {
                     resp.with_directive_prefix(&execution_anchor_adopted_notice(&name, anchor))
@@ -7368,6 +7538,7 @@ mod tests {
             },
         );
         CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: name.to_string(),
             version: "1.0".to_string(),
@@ -7425,6 +7596,7 @@ mod tests {
         dir: Option<std::path::PathBuf>,
     ) -> crate::engine::types::StateFileHeader {
         crate::engine::types::StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "test-workflow".to_string(),
             template_hash: "testhash".to_string(),
@@ -7554,6 +7726,7 @@ Done.
             &[],
             None,
             None,
+            false,
         )
         .expect("inline init");
 
@@ -7579,6 +7752,7 @@ Done.
             &[],
             Some("My explicit intent"),
             None,
+            false,
         )
         .expect("inline init");
 
@@ -7613,6 +7787,7 @@ Done.
             None,
             None,
             None,
+            false,
         )
         .expect("init should succeed");
 
@@ -7642,6 +7817,7 @@ Done.
             None,
             None,
             None,
+            false,
         )
         .expect("init should succeed");
 
@@ -7675,6 +7851,7 @@ Done.
             &[],
             None,
             None,
+            false,
         )
         .expect("inline init should succeed");
 
@@ -7726,6 +7903,7 @@ Done.
             None,
             None,
             None,
+            false,
         )
         .expect("init should succeed");
         std::fs::remove_dir_all(&tpl_subdir).unwrap();
@@ -8105,6 +8283,7 @@ Done.
             .init_state_file(
                 "child",
                 crate::engine::types::StateFileHeader {
+                    command_environment: None,
                     schema_version: 1,
                     workflow: "child".to_string(),
                     template_hash: "h".to_string(),
@@ -8149,6 +8328,7 @@ Done.
         let mut states = BTreeMap::new();
         states.insert("done".to_string(), TemplateState::default());
         let compiled = CompiledTemplate {
+            pass_env: Vec::new(),
             format_version: 1,
             name: "child".to_string(),
             version: "1".to_string(),

@@ -558,6 +558,7 @@ pub fn derive_label(session: &CachedSession, session_id: &str) -> String {
 /// Construct an empty `StateFileHeader` for error fallback cases.
 fn make_empty_header() -> StateFileHeader {
     StateFileHeader {
+        command_environment: None,
         schema_version: 0,
         workflow: String::new(),
         template_hash: String::new(),
@@ -962,6 +963,7 @@ mod tests {
 
     fn make_header(name: &str, parent: Option<&str>) -> StateFileHeader {
         StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: name.to_string(),
             template_hash: "deadbeef".to_string(),
@@ -1698,6 +1700,7 @@ mod tests {
 
         // Write a minimal header.
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: session_name.to_string(),
             template_hash: "hash".to_string(),

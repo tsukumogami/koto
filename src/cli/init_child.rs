@@ -371,7 +371,9 @@ pub fn init_child_from_parent(
         spawn_entry,
         None,
         None,
+        false,
     )
+    .map(|_| ())
 }
 
 /// [`init_child_from_parent`] with an explicit execution anchor.
@@ -391,7 +393,8 @@ pub fn init_child_from_parent_at(
     cache: &mut TemplateCompileCache,
     spawn_entry: Option<SpawnEntrySnapshot>,
     execution_dir: Option<&Path>,
-) -> Result<(), TaskSpawnError> {
+    legacy_environment: bool,
+) -> Result<Option<crate::engine::command_env::RecordReport>, TaskSpawnError> {
     init_child_core(
         backend,
         parent_name,
@@ -402,6 +405,7 @@ pub fn init_child_from_parent_at(
         spawn_entry,
         None,
         execution_dir,
+        legacy_environment,
     )
 }
 
@@ -439,7 +443,9 @@ pub fn init_child_as_skip_marker_from_parent(
         spawn_entry,
         Some(skipped_state_name),
         None,
+        false,
     )
+    .map(|_| ())
 }
 
 /// Canonical form of `path`, falling back to the path as given when it
@@ -487,6 +493,136 @@ fn resolve_execution_dir(
         .map(|cwd| canonical_or_verbatim(&cwd))
 }
 
+/// Resolve the environment record for a new session.
+///
+/// A child copies its parent's record (R8), whatever process spawns it,
+/// and the report is `None`: nothing was read from this process. A
+/// top-level session, or a child whose parent has no record yet (an older
+/// session that hasn't adopted one), records from this process and returns
+/// the report of what recording dropped or left unset, for the caller's
+/// response. A copied record keeps the parent's legacy flag;
+/// `legacy_environment` applies only when this process records (`koto init`
+/// refuses `--legacy-environment` with `--parent`).
+///
+/// A parent whose header can't be read is an error, not "no record": falling
+/// back to this process's environment would hand a child whatever the
+/// spawning tick's caller had, which is the channel R8 closes.
+pub(crate) fn resolve_command_environment(
+    backend: &dyn SessionBackend,
+    parent_name: Option<&str>,
+    legacy_environment: bool,
+) -> Result<
+    (
+        crate::engine::types::CommandEnvironment,
+        Option<crate::engine::command_env::RecordReport>,
+    ),
+    String,
+> {
+    if let Some(parent) = parent_name {
+        let header = backend.read_header(parent).map_err(|e| {
+            format!(
+                "could not read parent session '{}' to copy its command environment: {}",
+                parent, e
+            )
+        })?;
+        if let Some(inherited) = header.command_environment {
+            return Ok((inherited, None));
+        }
+    }
+    let (record, report) = crate::engine::command_env::record_from_process(legacy_environment);
+    Ok((record, Some(report)))
+}
+
+/// Name of the lock file, inside a session's directory, that serializes
+/// adoption of a command environment record.
+const ENVIRONMENT_LOCK_FILE: &str = "environment.lock";
+
+/// Give an older session a command environment record on its first tick
+/// (DESIGN-koto-fixed-environment.md; PRD R16).
+///
+/// Under an exclusive lock on the session's `environment.lock`, re-read the
+/// local header. If a record is already there -- another tick adopted first --
+/// return it with no report and write nothing. Otherwise record this process's
+/// fixed values and koto's default live names (never the legacy flag), append
+/// an `environment_adopted` event, rewrite the header, and push the state file.
+/// The event goes first so a crash between the two writes leaves a visible
+/// adoption the next tick repeats, not a silent one (the execution anchor's
+/// adoption uses the same order). The report is `Some` only when this call
+/// adopted.
+///
+/// Why a lock of its own: `lock_state_file` is non-blocking and is held across
+/// a batch parent's scheduling, so two ticks racing here would fail instead of
+/// waiting. This lock is held only for the few writes below.
+///
+/// The read is local (`read_events_local`) because a pulling read on the cloud
+/// backend would replace the local state file with the remote one inside the
+/// lock, discarding header changes this tick already made locally, such as an
+/// adopted execution anchor. The push afterwards is strict: a record nothing
+/// can change must reach the remote copy, or a later tick's pull would lose it
+/// and adopt again.
+pub(crate) fn adopt_command_environment(
+    backend: &dyn SessionBackend,
+    name: &str,
+) -> anyhow::Result<(
+    crate::engine::types::CommandEnvironment,
+    Option<crate::engine::command_env::RecordReport>,
+)> {
+    let dir = backend.session_dir(name);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(ENVIRONMENT_LOCK_FILE))
+        .with_context(|| format!("failed to open {} for {:?}", ENVIRONMENT_LOCK_FILE, name))?;
+    lock_exclusive(&lock)?;
+
+    let (header, _) = backend.read_events_local(name)?;
+    if let Some(existing) = header.command_environment {
+        return Ok((existing, None));
+    }
+
+    let (record, report) = crate::engine::command_env::record_from_process(false);
+    let payload = EventPayload::EnvironmentAdopted {
+        environment: record.clone(),
+        dropped: report.dropped_path_entries.clone(),
+    };
+    backend.append_event(name, &payload, &now_iso8601())?;
+    let state_path = dir.join(crate::session::state_file_name(name));
+    let written = record.clone();
+    crate::engine::claim::rewrite_header_atomically(&state_path, |mut h| {
+        h.command_environment = Some(written);
+        h
+    })?;
+    backend
+        .ensure_pushed(name)
+        .map_err(|e| anyhow::anyhow!("failed to push the adopted command environment: {}", e))?;
+    drop(lock);
+    Ok((record, Some(report)))
+}
+
+/// Take an exclusive advisory lock on `file`, blocking until it is free.
+#[cfg(unix)]
+fn lock_exclusive(file: &std::fs::File) -> anyhow::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: flock on a file descriptor this function borrows for the call;
+    // it neither closes nor retains the descriptor.
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if ret != 0 {
+        return Err(anyhow::anyhow!(
+            "failed to lock the session's command environment: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn lock_exclusive(_file: &std::fs::File) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(
+        "adopting a command environment needs flock, which is only available on Unix"
+    ))
+}
+
 /// The origin record for a session about to be created: its execution
 /// anchor and the store's identity.
 ///
@@ -521,7 +657,8 @@ fn init_child_core(
     spawn_entry: Option<SpawnEntrySnapshot>,
     override_initial_state: Option<&str>,
     execution_dir_override: Option<&Path>,
-) -> Result<(), TaskSpawnError> {
+    legacy_environment: bool,
+) -> Result<Option<crate::engine::command_env::RecordReport>, TaskSpawnError> {
     let cached = compile_with_cache(template_path, cache).map_err(|info| {
         let mut err = TaskSpawnError::new(child_name, info.kind, info.message);
         // Forward the resolved template path when resolution
@@ -586,7 +723,21 @@ fn init_child_core(
     // over both.
     let execution_dir = resolve_execution_dir(backend, parent_name, execution_dir_override);
 
+    // Record the environment the session's commands run with
+    // (DESIGN-koto-fixed-environment.md). A child copies its parent's
+    // record, as it copies the anchor above: it is created inside the
+    // parent's tick, whose process environment belongs to whoever ticked
+    // the parent. Unlike the anchor, an unreadable parent header is an
+    // error here -- falling back to this process would pass the ticking
+    // caller's environment to the child, the channel the record closes.
+    let (command_environment, environment_report) =
+        resolve_command_environment(backend, parent_name, legacy_environment).map_err(|msg| {
+            TaskSpawnError::new(child_name, SpawnErrorKind::IoError, msg)
+                .with_path(cached.source_path.clone())
+        })?;
+
     let mut header = StateFileHeader {
+        command_environment: Some(command_environment),
         schema_version: 1,
         workflow: child_name.to_string(),
         template_hash: cached.hash.clone(),
@@ -673,7 +824,7 @@ fn init_child_core(
         .init_state_file(child_name, header, initial_events)
         .map_err(|e| classify_session_error(child_name, e).with_path(cached.source_path.clone()))?;
 
-    Ok(())
+    Ok(environment_report)
 }
 
 /// Fixed filename for the human-readable source persisted by the inline
@@ -719,7 +870,8 @@ pub fn init_inline_into_session(
     source_path: &Path,
     vars: &[String],
     execution_dir_override: Option<&Path>,
-) -> anyhow::Result<()> {
+    legacy_environment: bool,
+) -> anyhow::Result<Option<crate::engine::command_env::RecordReport>> {
     // Create the session directory first: compile_cached_into would
     // create it too, but going through the backend also applies the
     // 0700 koto-root permissions and the session-id validation that
@@ -772,8 +924,12 @@ pub fn init_inline_into_session(
     let initial_state = compiled.initial_state.clone();
     let execution_dir = resolve_execution_dir(backend, None, execution_dir_override);
     let origin = origin_record(backend, execution_dir.as_deref());
+    let (command_environment, environment_report) =
+        resolve_command_environment(backend, None, legacy_environment)
+            .map_err(|msg| anyhow::anyhow!(msg))?;
 
     let header = StateFileHeader {
+        command_environment: Some(command_environment),
         schema_version: 1,
         workflow: name.to_string(),
         template_hash: hash,
@@ -841,7 +997,7 @@ pub fn init_inline_into_session(
         .init_state_file(name, header, initial_events)
         .map_err(|e| anyhow::anyhow!("failed to initialize inline session {:?}: {}", name, e))?;
 
-    Ok(())
+    Ok(environment_report)
 }
 
 /// Drive the full inline (`koto init --from-stdin`) flow from a raw byte
@@ -870,7 +1026,8 @@ pub fn init_inline_from_stdin_bytes(
     source_bytes: &[u8],
     vars: &[String],
     execution_dir_override: Option<&Path>,
-) -> anyhow::Result<()> {
+    legacy_environment: bool,
+) -> anyhow::Result<Option<crate::engine::command_env::RecordReport>> {
     use std::io::Write as _;
 
     // Materialize the stdin bytes to a private temp file. The compile
@@ -890,21 +1047,29 @@ pub fn init_inline_from_stdin_bytes(
     // Strict-compile into the session dir and start the session. On
     // failure the compiler error (element-named) propagates; we then tear
     // down the bare session directory so nothing half-built persists.
-    if let Err(e) =
-        init_inline_into_session(backend, name, tmp.path(), vars, execution_dir_override)
-    {
-        // Best-effort cleanup of the session dir init_inline_into_session
-        // created before compiling. `exists()` checks for the STATE FILE,
-        // which is absent on a compile failure, so the session is not
-        // registered — but the directory (and possibly the compiled
-        // artifact) may linger. Remove it. Ignore cleanup errors: the
-        // compile error is the one the caller must see.
-        let session_dir = backend.session_dir(name);
-        if session_dir.exists() {
-            let _ = std::fs::remove_dir_all(&session_dir);
+    let environment_report = match init_inline_into_session(
+        backend,
+        name,
+        tmp.path(),
+        vars,
+        execution_dir_override,
+        legacy_environment,
+    ) {
+        Ok(report) => report,
+        Err(e) => {
+            // Best-effort cleanup of the session dir init_inline_into_session
+            // created before compiling. `exists()` checks for the STATE FILE,
+            // which is absent on a compile failure, so the session is not
+            // registered — but the directory (and possibly the compiled
+            // artifact) may linger. Remove it. Ignore cleanup errors: the
+            // compile error is the one the caller must see.
+            let session_dir = backend.session_dir(name);
+            if session_dir.exists() {
+                let _ = std::fs::remove_dir_all(&session_dir);
+            }
+            return Err(e);
         }
-        return Err(e);
-    }
+    };
 
     // Compile + init succeeded: persist the readable source under the
     // FIXED filename. join() with a constant literal cannot escape the
@@ -927,7 +1092,7 @@ pub fn init_inline_from_stdin_bytes(
         let _ = std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o600));
     }
 
-    Ok(())
+    Ok(environment_report)
 }
 
 #[cfg(test)]
@@ -1015,6 +1180,7 @@ Done.
     fn seed_parent_anchored(backend: &LocalBackend, parent: &str, execution_dir: Option<PathBuf>) {
         backend.create(parent).expect("create parent dir");
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: parent.to_string(),
             template_hash: "0".repeat(64),
@@ -1346,7 +1512,8 @@ Done.
 
         let source = write_template(tpl_dir.path(), "inline.md", INLINE_TEMPLATE);
 
-        init_inline_into_session(&backend, "inline-wf", &source, &[], None).expect("inline init");
+        init_inline_into_session(&backend, "inline-wf", &source, &[], None, false)
+            .expect("inline init");
 
         let (header, events) = backend.read_events("inline-wf").expect("read events");
 
@@ -1405,7 +1572,8 @@ Done.
         let backend = backend_in(sessions.path());
 
         let source = write_template(tpl_dir.path(), "inline.md", INLINE_TEMPLATE);
-        init_inline_into_session(&backend, "inline-wf", &source, &[], None).expect("inline init");
+        init_inline_into_session(&backend, "inline-wf", &source, &[], None, false)
+            .expect("inline init");
 
         let (header, events) = backend.read_events("inline-wf").expect("read events");
         let session_dir = backend.session_dir("inline-wf");
@@ -1457,7 +1625,8 @@ Done.
         let backend = backend_in(sessions.path());
 
         let source = write_template(tpl_dir.path(), "inline.md", INLINE_TEMPLATE);
-        init_inline_into_session(&backend, "inline-old", &source, &[], None).expect("inline init");
+        init_inline_into_session(&backend, "inline-old", &source, &[], None, false)
+            .expect("inline init");
 
         backend
             .relocate("inline-old", "inline-new")
@@ -1524,7 +1693,8 @@ Done.
         let backend = backend_in(sessions.path());
 
         let input = INLINE_TEMPLATE.as_bytes();
-        init_inline_from_stdin_bytes(&backend, "inline-wf", input, &[], None).expect("inline init");
+        init_inline_from_stdin_bytes(&backend, "inline-wf", input, &[], None, false)
+            .expect("inline init");
 
         // Session started: state file exists.
         assert!(backend.exists("inline-wf"), "session must be registered");
@@ -1558,6 +1728,7 @@ Done.
             BAD_TARGET_TEMPLATE.as_bytes(),
             &[],
             None,
+            false,
         )
         .expect_err("strict validation must fail");
 
@@ -1615,6 +1786,150 @@ Done.
         );
     }
 
+    /// A record no process in this test could produce, so equality proves
+    /// it was copied from the parent.
+    fn parent_record() -> crate::engine::types::CommandEnvironment {
+        crate::engine::types::CommandEnvironment {
+            path: Some("/parent-only/bin:/usr/bin".to_string()),
+            path_absent: Vec::new(),
+            home_absent: false,
+            xdg_config_home_absent: false,
+            home: Some("/parent-only/home".to_string()),
+            xdg_config_home: None,
+            pass: vec!["TMPDIR".to_string()],
+            legacy: true,
+        }
+    }
+
+    fn seed_parent_with_environment(backend: &LocalBackend, parent: &str) {
+        seed_parent_anchored(backend, parent, None);
+        let state = backend
+            .session_dir(parent)
+            .join(crate::session::state_file_name(parent));
+        crate::engine::claim::rewrite_header_atomically(&state, |mut h| {
+            h.command_environment = Some(parent_record());
+            h
+        })
+        .expect("seed parent record");
+    }
+
+    #[test]
+    fn batch_retry_and_skip_marker_children_copy_the_parents_environment() {
+        // R8: every spawn path copies the parent's record rather than
+        // reading the spawning process's environment. Batch spawn and retry
+        // both go through init_child_from_parent; the skip marker has its
+        // own entry point.
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let tpl_dir = TempDir::new().expect("templates dir");
+        let backend = backend_in(sessions.path());
+        seed_parent_with_environment(&backend, "parent");
+        let template = write_template(tpl_dir.path(), "child.md", SIMPLE_TEMPLATE);
+        let mut cache = TemplateCompileCache::new();
+
+        init_child_from_parent(
+            &backend,
+            Some("parent"),
+            "parent.batch",
+            &template,
+            &["TASK_ID=1".to_string()],
+            &mut cache,
+            None,
+        )
+        .expect("batch child");
+        init_child_as_skip_marker_from_parent(
+            &backend,
+            Some("parent"),
+            "parent.skipped",
+            &template,
+            &["TASK_ID=2".to_string()],
+            &mut cache,
+            None,
+            "done",
+        )
+        .expect("skip-marker child");
+        init_child_from_parent_at(
+            &backend,
+            Some("parent"),
+            "parent.cli",
+            &template,
+            &["TASK_ID=3".to_string()],
+            &mut cache,
+            None,
+            None,
+            false,
+        )
+        .expect("--parent child");
+
+        for child in ["parent.batch", "parent.skipped", "parent.cli"] {
+            let header = backend.read_header(child).expect("read header");
+            assert_eq!(
+                header.command_environment,
+                Some(parent_record()),
+                "{child} must copy the parent's record"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_adoption_finds_the_first_record_and_writes_nothing() {
+        // The deterministic half of the race: whichever tick takes the lock
+        // second re-reads the header under it, finds the record, and appends
+        // no event.
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let backend = backend_in(sessions.path());
+        seed_parent_anchored(&backend, "old", None);
+
+        let (first, first_report) = adopt_command_environment(&backend, "old").expect("adopt");
+        assert!(first_report.is_some(), "the first call adopts");
+        let (second, second_report) = adopt_command_environment(&backend, "old").expect("re-adopt");
+        assert!(second_report.is_none(), "the second call finds the record");
+        assert_eq!(first, second);
+        assert!(!first.legacy, "adoption never sets the legacy flag");
+
+        let (_, events) = backend.read_events("old").expect("events");
+        let adopted = events
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::EnvironmentAdopted { .. }))
+            .count();
+        assert_eq!(adopted, 1);
+        assert_eq!(
+            backend.read_header("old").unwrap().command_environment,
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn the_record_survives_header_rewrites() {
+        let _cache = CacheGuard::new();
+        let sessions = TempDir::new().expect("sessions dir");
+        let backend = backend_in(sessions.path());
+        seed_parent_with_environment(&backend, "wf");
+        let state = backend
+            .session_dir("wf")
+            .join(crate::session::state_file_name("wf"));
+
+        // A claim write: read-modify-write of an unrelated field.
+        crate::engine::claim::rewrite_header_atomically(&state, |mut h| {
+            h.dispatch_epoch += 1;
+            h
+        })
+        .expect("claim-style rewrite");
+        assert_eq!(
+            backend.read_header("wf").unwrap().command_environment,
+            Some(parent_record())
+        );
+
+        // Rename and recover rewrite the identity fields in place.
+        crate::session::local::rewrite_header_identity(&backend.session_dir("wf"), "wf")
+            .expect("identity rewrite");
+        assert_eq!(
+            backend.read_header("wf").unwrap().command_environment,
+            Some(parent_record())
+        );
+    }
+
     #[test]
     fn top_level_session_records_the_current_directory() {
         let _cache = CacheGuard::new();
@@ -1666,6 +1981,7 @@ Done.
             &mut cache,
             None,
             Some(chosen.path()),
+            false,
         )
         .expect("init child");
 
@@ -1696,6 +2012,7 @@ Done.
             &mut cache,
             None,
             Some(&noisy),
+            false,
         )
         .expect("init");
 

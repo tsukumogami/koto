@@ -158,7 +158,7 @@ A failed *delivery* is a different thing and does not use this code. When the co
 
 #### A tick inside a tick (exit code 2)
 
-`koto next` runs a state's `default_action` and its command gates as child processes, and those children inherit the tick's environment. Before it runs anything, the tick exports `KOTO_TICK_SESSION` naming the session it is advancing. A `koto next` that finds that variable already set was started from inside one of those commands, and refuses:
+`koto next` runs a state's `default_action` and its command gates as child processes. Each one runs in the session's recorded command environment, not the tick's, and koto sets `KOTO_TICK_SESSION` in it, naming the session it is advancing (see [What a command's environment is](../guides/default-action-authoring.md#what-a-commands-environment-is)). A `koto next` that finds that variable already set was started from inside one of those commands, and refuses:
 
 ```json
 {"error":{"code":"nested_invocation","message":"koto next cannot run inside a command koto is running: this process inherited KOTO_TICK_SESSION from a tick on session 'my-workflow'. A nested tick advances the workflow while that tick goes on reporting the state it started with, so the caller is told the session is somewhere it has already left. If this is a template's command, remove the `koto next my-workflow` call -- the enclosing tick is what advances the session. If that tick has already exited and this process outlived it (a command that detaches with setsid or backgrounds itself does), clear the marker: `KOTO_TICK_SESSION= koto next my-workflow`.","details":[]}}

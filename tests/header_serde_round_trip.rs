@@ -11,6 +11,7 @@ use koto::engine::types::{AssignmentClaim, StateFileHeader};
 
 fn full_header() -> StateFileHeader {
     StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: "wf".to_string(),
         template_hash: "deadbeef".to_string(),
@@ -144,6 +145,7 @@ fn none_valued_request_store_fields_produce_no_keys_on_the_wire() {
     // introducing any of the new keys, so pre-request-store readers
     // see byte-identical output.
     let header = StateFileHeader {
+        command_environment: None,
         schema_version: 1,
         workflow: "wf".to_string(),
         template_hash: "h".to_string(),
@@ -268,4 +270,82 @@ fn assignment_claim_round_trips() {
     assert!(json.contains("\"claimed_at\":\"2026-05-24T00:00:01Z\""));
     let parsed: AssignmentClaim = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(claim, parsed);
+}
+
+// ---------------------------------------------------------------------------
+// command environment (DESIGN-koto-fixed-environment.md)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn command_environment_round_trips_and_is_omitted_when_absent() {
+    use koto::engine::types::CommandEnvironment;
+
+    let mut header = full_header();
+    let absent = serde_json::to_value(&header).unwrap();
+    assert!(
+        absent.get("command_environment").is_none(),
+        "an unrecorded session writes no key"
+    );
+
+    header.command_environment = Some(CommandEnvironment {
+        path: Some("/usr/bin:/bin".to_string()),
+        path_absent: Vec::new(),
+        home_absent: false,
+        xdg_config_home_absent: false,
+        home: Some("/home/u".to_string()),
+        xdg_config_home: None,
+        pass: vec!["TMPDIR".to_string()],
+        legacy: false,
+    });
+    let json = serde_json::to_string(&header).unwrap();
+    let back: StateFileHeader = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, header);
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let record = &value["command_environment"];
+    assert!(record.get("xdg_config_home").is_none());
+    assert!(
+        record.get("legacy").is_none(),
+        "legacy is omitted when false"
+    );
+    assert!(
+        record.get("path_absent").is_none(),
+        "path_absent is omitted when empty"
+    );
+}
+
+/// A record written before `path_absent` existed reads as one whose every
+/// `PATH` entry existed when it was recorded: the field defaults to empty.
+#[test]
+fn a_record_without_path_absent_reads_as_an_empty_list() {
+    let json = r#"{"schema_version":1,"workflow":"wf","template_hash":"h",
+        "created_at":"2026-01-01T00:00:00Z",
+        "command_environment":{"path":"/usr/bin:/opt/tool/bin","home":"/home/u","pass":["TMPDIR"]}}"#;
+    let header: StateFileHeader = serde_json::from_str(json).expect("older record");
+    let record = header.command_environment.unwrap();
+    assert!(record.path_absent.is_empty());
+    assert!(!record.home_absent && !record.xdg_config_home_absent);
+    assert_eq!(record.path.as_deref(), Some("/usr/bin:/opt/tool/bin"));
+
+    let mut with_absent = record.clone();
+    with_absent.path_absent = vec!["/opt/tool/bin".to_string()];
+    let text = serde_json::to_string(&with_absent).unwrap();
+    assert_eq!(
+        serde_json::from_str::<koto::engine::types::CommandEnvironment>(&text).unwrap(),
+        with_absent
+    );
+}
+
+/// A reader built before a field existed skips it: headers are not
+/// `deny_unknown_fields`, which is what keeps the record additive (R21).
+#[test]
+fn a_header_with_an_unknown_field_still_deserializes() {
+    let json = r#"{"schema_version":1,"workflow":"wf","template_hash":"h",
+        "created_at":"2026-01-01T00:00:00Z",
+        "command_environment":{"path":"/usr/bin","pass":[]},
+        "a_field_from_the_future":{"x":1}}"#;
+    let header: StateFileHeader = serde_json::from_str(json).expect("tolerant header");
+    assert_eq!(
+        header.command_environment.unwrap().path.as_deref(),
+        Some("/usr/bin")
+    );
 }

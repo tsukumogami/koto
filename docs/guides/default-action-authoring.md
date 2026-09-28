@@ -151,7 +151,7 @@ states:
 
 | Field | Required | Type | Meaning |
 |---|---|---|---|
-| `command` | Yes | string | The command line, passed to `sh -c` as a single string |
+| `command` | Yes | string | The command line, passed to `/bin/sh -c` as a single string |
 | `capture_stdout_as` | No | string | A name this command's trimmed stdout is delivered under, readable by later states. See Part 3 |
 | `fallback` | No | string | Prose the agent reads when the action fails. Written as literal text -- it is spliced after variable substitution and is never expanded, so a `{{KEY}}` reference in it is refused at compile time; put the reference in the state's directive instead |
 | `working_dir` | No | string | A **relative** path under the session's execution anchor. Absolute values are rejected |
@@ -160,10 +160,11 @@ states:
 
 ### How the command is invoked
 
-The string is handed to `sh -c` as one argument. Shell syntax works -- pipes, `&&`, redirection --
-because a shell is genuinely doing the parsing. The child is placed in its own process group, so
-a timeout kills the whole group rather than leaving orphans behind. It inherits the environment
-of the `koto next` process.
+The string is handed to `/bin/sh -c` as one argument. Shell syntax works -- pipes, `&&`,
+redirection -- because a shell is genuinely doing the parsing. The child is placed in its own
+process group, so a timeout kills the whole group rather than leaving orphans behind. It doesn't
+inherit the environment of the `koto next` process: it gets one koto builds from the session's
+record, described in [What a command's environment is](#what-a-commands-environment-is).
 
 **Every single run gets 30 seconds**, and that isn't configurable. On expiry the process group is
 killed and the failure reports `timed_out`. `polling` doesn't change this: `timeout_secs` bounds
@@ -221,6 +222,231 @@ shell word -- so an empty value renders as nothing and `key: "{{PREFIX}}note"` w
 prefix asks for `note`. A `context-matches` `pattern` escapes each value it substitutes, so the
 value matches itself and the regex you wrote around it is the only regex in play.
 
+### What a command's environment is
+
+This section covers every command koto runs for a session: a `default_action`, each attempt of a
+polled action, and every `command` gate. They all run the same way.
+
+The shell is `/bin/sh`, named by absolute path, so no `PATH` decides which program parses the
+command. Standard input is at end of file, so a command can't read whatever a caller pipes into
+`koto next`. The environment starts empty, and koto fills it once per tick, in this order:
+
+1. The **live value** of each name on koto's default list and each name the template declares in
+   `pass_env:`, read from the process running `koto next` on this tick. The refused names below
+   are left out. A name the caller hasn't set is simply absent.
+2. `PATH`, `HOME` and `XDG_CONFIG_HOME` **as recorded when the session was created**. A value
+   recorded unset stays unset, except `PATH`: an unset recorded `PATH` becomes `/usr/bin:/bin`.
+3. `KOTO_TICK_SESSION`, the session being ticked, and `KOTO_SESSIONS_BASE`, the directory that
+   holds the session directories, **set by koto**.
+
+The first step skips the recorded names and the ones koto sets, so neither a declared name nor
+the caller's own value can replace them. Nothing else reaches the command.
+
+The lists decide what koto passes in, not what a command may use. A command can still set a
+variable for itself, as in `GIT_DIR=/srv/mirror.git git log -1`.
+
+#### The default list
+
+These names reach every command by default, with whatever value the ticking process has:
+
+`USER`, `LOGNAME`, `LANG`, `LANGUAGE`, `LC_ALL`, `LC_CTYPE`, `LC_COLLATE`, `LC_MESSAGES`,
+`LC_NUMERIC`, `LC_TIME`, `LC_MONETARY`, `TZ`, `TMPDIR`, `TERM`, `NO_COLOR`, `CI`,
+`XDG_CACHE_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`, `SSL_CERT_FILE`,
+`SSL_CERT_DIR`, `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `GH_TOKEN`, `GITHUB_TOKEN`,
+`GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`, `HTTP_PROXY`, `http_proxy`,
+`HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `no_proxy`, `ALL_PROXY`, `all_proxy`.
+
+That's the whole list. `GH_REPO`, every `GIT_*` name, cloud credentials such as `AWS_*`, and
+`KOTO_*` names other than the two koto sets aren't on it. A session stores the list it was
+created with, so a later koto release that changes the list doesn't change what an existing
+session's commands see.
+
+Only the names are stored. The values are read live on each tick and never written to the
+session, which is why tokens and proxy URLs can be on the list.
+
+#### Declaring more names: `pass_env:`
+
+A template whose commands read a variable that isn't on the default list declares its name in a
+top-level `pass_env:` list:
+
+```yaml
+---
+name: deploy-check
+version: "1"
+initial_state: preflight
+pass_env: [DEPLOY_TARGET, NPM_CONFIG_REGISTRY]
+states:
+  preflight:
+    gates:
+      target_set:
+        type: command
+        command: 'test -n "$DEPLOY_TARGET"'
+    transitions:
+      - target: done
+        when:
+          gates.target_set.exit_code: 0
+  done:
+    terminal: true
+---
+```
+
+A declared name is treated like one on the default list: its live value is read on every tick,
+and the value is never recorded. The compiler checks each name:
+
+- It must match `^[A-Za-z_][A-Za-z0-9_]*$`. List names, not patterns or values.
+- A refused name (below) is a compile error.
+- A name koto supplies itself (`PATH`, `HOME`, `XDG_CONFIG_HOME`, `KOTO_TICK_SESSION`,
+  `KOTO_SESSIONS_BASE`) compiles with warning W7, because koto's value wins and the declaration
+  does nothing.
+
+A template that declares nothing compiles to the same form, and the same hash, as it did before
+`pass_env:` existed. An older koto ignores the key.
+
+#### Names that never reach a command
+
+`BASH_ENV`, `ENV`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `GH_CONFIG_DIR`, and every name that starts
+with `BASH_FUNC_` or `GIT_CONFIG` (`GIT_CONFIG`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0`,
+`GIT_CONFIG_GLOBAL`, and so on).
+
+Each one makes the shell source a file or import a function at start-up, or makes `git` or `gh`
+run a program or load configuration that whoever ticks the session chose. Declaring one in
+`pass_env:` is a compile error, and koto filters them out again when it builds the environment
+rather than trusting that the compiler caught them.
+
+#### The recorded values
+
+`koto init`, in every top-level form, records `PATH`, `HOME` and `XDG_CONFIG_HOME` from its own
+process, along with the default list. A child session copies its parent's record: batch children, retries, skip markers, `koto init --parent` and `koto session
+start --parent` never consult the process that spawned them. Only when the parent has no record
+yet does a child record from its own process.
+
+Recording cleans the values up first:
+
+- **`PATH` is normalized.** Empty entries (a leading, trailing or doubled `:`) and relative
+  entries (`.`, `bin`, `node_modules/.bin`, a literal `~/bin`) are dropped. Commands start at the
+  session's execution anchor, inside the repository being worked on, so a relative entry would
+  let a file committed to the branch stand in for a tool every gate runs. A `PATH` with no entry
+  left is recorded unset. A relative `HOME` or `XDG_CONFIG_HOME` is recorded unset too.
+- **A value that holds a credential is recorded unset.** If one of the three contains the value
+  of `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` or a proxy
+  variable (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, in either case), and that value is 8 or more
+  characters long, koto records the variable unset rather than write the credential down.
+- **Directories that don't exist yet stay.** A `PATH` entry that isn't a directory at recording
+  stays in `PATH`, so a tool installed there later is found, and is listed in the record's
+  `path_absent`, so the stale check below doesn't report it. A `HOME` or `XDG_CONFIG_HOME` that
+  doesn't exist at recording is kept too, and flagged (`home_absent`, `xdg_config_home_absent`)
+  so it isn't reported either.
+
+When recording dropped an entry or left a value unset, the `koto init` response carries an
+`environment` report. It names variables and gives the dropped entries, and never shows a
+credential:
+
+```json
+{"name":"demo","state":"start",
+ "environment":{"dropped_path_entries":["","node_modules/.bin"],
+                "unset":[{"variable":"HOME","reason":"credential"}]}}
+```
+
+`reason` is `not-absolute` or `credential`. A child that copied its parent's record has nothing to
+report, so its response carries no `environment` object.
+
+**The record can't be changed.** No command rewrites it, because a command that could would be the
+same bypass with an extra step. To run a session's commands with different values, start a new
+session: `koto cancel --cleanup <name>`, then `koto init` again.
+
+#### Opting out for this release: `--legacy-environment`
+
+`koto init --legacy-environment` creates a session whose commands run with the ticking process's
+whole environment, plus `KOTO_TICK_SESSION`, as koto did before it recorded anything. `/bin/sh`
+and the empty standard input still apply.
+
+The choice is made once, by whoever creates the session. It's stored in the record, children copy
+it, and no tick can set or clear it. With `--attach-live` on an existing session the flag has no
+effect, and with `--parent` it's refused, since a child takes its parent's record.
+
+**The flag will be removed in the next release**, once shirabe (the workflow skills plugin that
+runs koto sessions from its test harnesses) has migrated off it. After that there is no opt-out:
+declare what your commands need in `pass_env:`.
+
+#### Sessions created by an earlier koto
+
+A session that has no record adopts one on its first `koto next`, from the ticking process: its
+`PATH` (normalized), `HOME`, `XDG_CONFIG_HOME` and the default list, never the legacy flag. koto
+appends one `environment_adopted` event and prefixes that response's `directive` with a one-time
+notice:
+
+```
+[koto] Session 'demo' had no recorded command environment; its commands now run with PATH=/home/dev/.cargo/bin:/usr/bin:/bin, HOME=/home/dev, XDG_CONFIG_HOME=(unset). Dropped PATH entries that resolve relative to the working directory: node_modules/.bin. Other variables reach them only when koto's default list or the template's pass_env names them. The record can't be changed; start a new session to run with a different one.
+```
+
+The next tick finds the record and takes the ordinary path.
+
+#### When a recorded value goes stale
+
+Before commands run, each tick checks that the recorded `HOME`, `XDG_CONFIG_HOME` and each
+recorded `PATH` directory not in `path_absent` still exist. A value that was already missing at
+recording is flagged in the record and never reported, since a new session would record it just
+the same; any other missing value is stale. Tools move: a version manager removes an old version, a dev shell deletes
+its directory on exit.
+
+If a gate or action then fails, and either something is stale or the failure looks like a
+missing command (exit code 127, or the shell's own `: not found` or `command not found` on
+stderr), the response's `directive` opens with a note. It names what failed, the missing values
+or, when nothing is missing, the `PATH` the command ran under, and the remedy:
+
+```
+[koto] gate 'tests' failed in session 'demo', and recorded values no longer exist: PATH /home/dev/.nvm/versions/node/v20.1.0/bin. The record can't be changed; to run with different values, start a new session: `koto cancel --cleanup demo`, then `koto init` again.
+```
+
+A failing action is named as `the default action of state '<state>'`. Stale values with nothing
+failing get a shorter notice saying commands that need them will fail. A `--to` refused because a
+non-overridable gate failed carries the same note in its error message, since that refusal is the
+only response the tick gives.
+
+The note goes on the response only. Gate evidence is unchanged, so `when:` conditions and
+recorded overrides keep matching, and nothing is added to an action's captured output. A legacy
+session gets no note, because its commands use the caller's values.
+
+#### Attaching from a different shell
+
+`koto init --attach-live` compares the caller's normalized `PATH`, `HOME` and `XDG_CONFIG_HOME`
+with the record. When they differ it attaches anyway, prints one warning on stderr, and adds an
+`environment_drift` array to the response:
+
+```json
+{"name":"demo","state":"work","outcome":"attached","rebound":{},"environment_drift":["PATH"]}
+```
+
+Both name the variables and never a value. The warning is informational: the session's commands
+run with the recorded values whichever shell ticks it. A legacy session and a session with no
+record yet aren't compared.
+
+#### What this protects against, and what it doesn't
+
+It helps to separate two cases: an environment that differs by accident (another shell, an IDE
+terminal, an activated tool), and a caller who ticks the session and changes its environment on
+purpose, who is usually also the one who created it.
+
+| | An accidental environment | The ticking caller (usually also the creator) |
+|---|---|---|
+| A shim or version manager earlier on one shell's `PATH` | Served: the recorded `PATH` is used from every shell | Served for a one-tick change |
+| An exported function, `BASH_ENV`, `ENV` in the ticking shell | Served | Served |
+| `HOME`/`XDG_CONFIG_HOME` pointed at crafted git config for one tick | Served | Served |
+| `GIT_CONFIG*`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `GH_CONFIG_DIR` | Served | Served, including through `pass_env:` |
+| A shim already on `PATH` at creation | Frozen in and still read; consistency, not detection | Not served |
+| Choosing `PATH`, `HOME` or `--legacy-environment` at creation | -- | Not served: the creator chooses |
+| Changing a live value (`GH_HOST`, a token, `TMPDIR`, `SSL_CERT_FILE`, a declared name) | -- | Not served by design: these carry credentials or have no reproduced bypass |
+| Writing a binary into a user-writable directory on the recorded `PATH`, or editing `~/.gitconfig` under the recorded `HOME` in place | -- | Not served: that's file tampering |
+| Editing the session header or log | -- | Not served |
+
+What you get is this: a session's `PATH`, `HOME` and `XDG_CONFIG_HOME` can't change after
+creation, and shell and git or gh configuration injection names never reach its commands. It
+doesn't promise that an agent which also creates the session can't widen it. In this release
+that agent can pass `--legacy-environment`. Process attributes other than the environment, such as
+the umask and resource limits, are still inherited. The design document for this change,
+DESIGN-koto-fixed-environment.md, lists what was deferred and the evidence that would bring each
+item back.
+
 ### One command the engine refuses: `koto next`
 
 Automating a workflow's own bookkeeping by having a state tick itself looks like the obvious
@@ -230,14 +456,14 @@ the session all the way to its terminal state -- while the tick that spawned it 
 the snapshot it started with and answered `advanced: false` on the state the session had already
 left. The caller's view was wrong, not absent, so nothing surfaced an error.
 
-koto now refuses the nested call: it exports `KOTO_TICK_SESSION` before running anything, and a
-`koto next` that sees it fails with the `nested_invocation` code and exit 2, naming the session
+koto now refuses the nested call: it sets `KOTO_TICK_SESSION` in the environment of every command
+it runs, and a `koto next` that sees it fails with the `nested_invocation` code and exit 2, naming the session
 the marker came from. The refusal is scoped to the process tree rather than to one session name,
 so ticking a *different* workflow from a command is refused too -- a chain that ticks back into
 the outer session through a second one lands on the same defect.
 
-The marker is inherited and has no liveness behind it, which matters if you write a command that
-detaches. koto kills a timed-out command by its process group; a command that called `setsid` or
+Whatever the command starts gets the marker from it, and nothing behind the marker checks that
+the tick is still running, which matters if you write a command that detaches. koto kills a timed-out command by its process group; a command that called `setsid` or
 backgrounded itself is no longer in that group, so it survives the kill and keeps the marker for
 as long as it runs. A `koto next` it issues after the tick exits is refused by a tick that is
 already gone. The refusal message names the way out (`KOTO_TICK_SESSION= koto next <name>`), but
@@ -323,7 +549,7 @@ Route on `failure_kind`, never on the wording of a message:
 | `failure_kind` | Meaning |
 |---|---|
 | `nonzero_exit` | The command ran to completion and exited non-zero. The only kind carrying a real `exit_code` |
-| `spawn_failed` | The child could not be started -- the tool isn't installed, the path doesn't resolve, `working_dir` was rejected |
+| `spawn_failed` | The child could not be started -- `/bin/sh` couldn't be run, or `working_dir` was rejected. A tool the shell can't find is a `nonzero_exit` with exit code 127, since the shell itself started |
 | `timed_out` | The command exceeded its timeout and its process group was killed |
 | `wait_failed` | Waiting on the child failed, so no exit status was ever obtained |
 | `capture_failed` | The command exited zero, but its output could not be delivered under the declared name. See Part 3 |
@@ -659,6 +885,7 @@ happened to be current, which may not be the right one.
 - [Error codes and failure kinds](../reference/error-codes.md) -- the machine-readable
   vocabulary: error codes, exit codes, `failure_kind` values, and the anchoring refusals
 - [Session feed data contract](../reference/session-feed.md) -- `default_action_executed`,
-  `variable_captured`, `execution_anchor_adopted`, and `execution_anchor_rebound` payloads
+  `variable_captured`, `execution_anchor_adopted`, `execution_anchor_rebound`, and
+  `environment_adopted` payloads, and the header's `command_environment` record
 - [Template format](../../plugins/koto-skills/skills/koto-author/references/template-format.md) --
   the full template surface this action sits inside

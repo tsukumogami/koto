@@ -13,7 +13,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::action::{run_shell_command, CommandOutput, FailureKind};
+use crate::action::{run_shell_command, CommandEnv, CommandOutput, FailureKind};
 use crate::engine::request_store::{self, LegView, RequestStoreError, ValidatedRequestId};
 use crate::engine::types::{CloseDisposition, LegDisposition, LegResultSource, RequestState};
 use crate::session::context::ContextStore;
@@ -75,6 +75,7 @@ pub struct StructuredGateResult {
 pub fn evaluate_gates(
     gates: &BTreeMap<String, Gate>,
     working_dir: &Path,
+    env: &CommandEnv,
     context_store: Option<&dyn ContextStore>,
     session: Option<&str>,
     children_evaluator: Option<&dyn Fn(&Gate) -> StructuredGateResult>,
@@ -82,6 +83,7 @@ pub fn evaluate_gates(
     evaluate_gates_with_request_store(
         gates,
         working_dir,
+        env,
         context_store,
         session,
         children_evaluator,
@@ -99,6 +101,7 @@ pub fn evaluate_gates(
 pub fn evaluate_gates_with_request_store(
     gates: &BTreeMap<String, Gate>,
     working_dir: &Path,
+    env: &CommandEnv,
     context_store: Option<&dyn ContextStore>,
     session: Option<&str>,
     children_evaluator: Option<&dyn Fn(&Gate) -> StructuredGateResult>,
@@ -107,7 +110,7 @@ pub fn evaluate_gates_with_request_store(
     let mut results = BTreeMap::new();
     for (name, gate) in gates {
         let result = match gate.gate_type.as_str() {
-            GATE_TYPE_COMMAND => evaluate_command_gate(gate, working_dir),
+            GATE_TYPE_COMMAND => evaluate_command_gate(name, gate, working_dir, env),
             GATE_TYPE_REQUEST_LEG => evaluate_request_leg_gate(gate, request_root),
             GATE_TYPE_CONTEXT_EXISTS => evaluate_context_exists_gate(gate, context_store, session),
             GATE_TYPE_CONTEXT_MATCHES => {
@@ -533,8 +536,17 @@ fn evaluate_context_matches_gate(
     }
 }
 
-fn evaluate_command_gate(gate: &Gate, working_dir: &Path) -> StructuredGateResult {
-    let output = run_shell_command(&gate.command, working_dir, gate.timeout);
+/// Run a command gate in `env` and record how it ended there under `name`,
+/// for the tick's stale-record and not-found notes. The evidence is built from
+/// the output alone, so it doesn't change with the environment's bookkeeping.
+fn evaluate_command_gate(
+    name: &str,
+    gate: &Gate,
+    working_dir: &Path,
+    env: &CommandEnv,
+) -> StructuredGateResult {
+    let output = run_shell_command(&gate.command, working_dir, gate.timeout, env);
+    env.record(&format!("gate '{}'", name), &output);
     command_gate_result(output)
 }
 
@@ -663,7 +675,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("check".to_string(), make_gate("exit 0", 5));
 
-        let results = evaluate_gates(&gates, dir.path(), None, None, None);
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results["check"].outcome, GateOutcome::Passed);
         assert_eq!(results["check"].output["exit_code"], 0);
@@ -676,7 +688,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("check".to_string(), make_gate("exit 42", 5));
 
-        let results = evaluate_gates(&gates, dir.path(), None, None, None);
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results["check"].outcome, GateOutcome::Failed);
         assert_eq!(results["check"].output["exit_code"], 42);
@@ -689,7 +701,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("slow".to_string(), make_gate("sleep 60", 1));
 
-        let results = evaluate_gates(&gates, dir.path(), None, None, None);
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results["slow"].outcome, GateOutcome::TimedOut);
         assert_eq!(results["slow"].output["exit_code"], -1);
@@ -782,7 +794,7 @@ mod tests {
             ),
         );
 
-        let results = evaluate_gates(&gates, dir.path(), None, None, None);
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
         assert_eq!(results["loud"].outcome, GateOutcome::Passed);
         assert_eq!(results["loud"].output["exit_code"], 0);
     }
@@ -793,7 +805,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("bad".to_string(), make_gate("nonexistent_cmd_xyz_12345", 5));
 
-        let results = evaluate_gates(&gates, dir.path(), None, None, None);
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
         assert_eq!(results.len(), 1);
         // The shell itself exits 127 for command-not-found.
         assert_eq!(results["bad"].outcome, GateOutcome::Failed);
@@ -808,7 +820,7 @@ mod tests {
         gates.insert("fail".to_string(), make_gate("exit 1", 5));
         gates.insert("timeout".to_string(), make_gate("sleep 60", 1));
 
-        let results = evaluate_gates(&gates, dir.path(), None, None, None);
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
         assert_eq!(results.len(), 3);
         assert_eq!(results["pass"].outcome, GateOutcome::Passed);
         assert_eq!(results["fail"].outcome, GateOutcome::Failed);
@@ -825,7 +837,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("check_dir".to_string(), make_gate("test -f marker.txt", 5));
 
-        let results = evaluate_gates(&gates, dir.path(), None, None, None);
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
         assert_eq!(results["check_dir"].outcome, GateOutcome::Passed);
     }
 
@@ -837,7 +849,7 @@ mod tests {
         let mut gates = BTreeMap::new();
         gates.insert("quick".to_string(), make_gate("exit 0", 0));
 
-        let results = evaluate_gates(&gates, dir.path(), None, None, None);
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
         assert_eq!(results["quick"].outcome, GateOutcome::Passed);
     }
 
@@ -931,7 +943,14 @@ mod tests {
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"), None);
+        let results = evaluate_gates(
+            &gates,
+            dir.path(),
+            &CommandEnv::inherit(),
+            Some(&store),
+            Some("sess1"),
+            None,
+        );
         assert_eq!(results["research"].outcome, GateOutcome::Passed);
         assert_eq!(results["research"].output["exists"], true);
         assert_eq!(results["research"].output["error"], "");
@@ -961,7 +980,14 @@ mod tests {
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"), None);
+        let results = evaluate_gates(
+            &gates,
+            dir.path(),
+            &CommandEnv::inherit(),
+            Some(&store),
+            Some("sess1"),
+            None,
+        );
         assert_eq!(results["research"].outcome, GateOutcome::Failed);
         assert_eq!(results["research"].output["exists"], false);
         assert_eq!(results["research"].output["error"], "");
@@ -989,7 +1015,7 @@ mod tests {
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), None, None, None);
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
         assert_eq!(results["research"].outcome, GateOutcome::Error);
         assert_eq!(results["research"].output["exists"], false);
     }
@@ -1023,7 +1049,14 @@ mod tests {
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"), None);
+        let results = evaluate_gates(
+            &gates,
+            dir.path(),
+            &CommandEnv::inherit(),
+            Some(&store),
+            Some("sess1"),
+            None,
+        );
         assert_eq!(results["review"].outcome, GateOutcome::Passed);
         assert_eq!(results["review"].output["matches"], true);
         assert_eq!(results["review"].output["error"], "");
@@ -1058,7 +1091,14 @@ mod tests {
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"), None);
+        let results = evaluate_gates(
+            &gates,
+            dir.path(),
+            &CommandEnv::inherit(),
+            Some(&store),
+            Some("sess1"),
+            None,
+        );
         assert_eq!(results["review"].outcome, GateOutcome::Failed);
         assert_eq!(results["review"].output["matches"], false);
         assert_eq!(results["review"].output["error"], "");
@@ -1088,7 +1128,14 @@ mod tests {
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"), None);
+        let results = evaluate_gates(
+            &gates,
+            dir.path(),
+            &CommandEnv::inherit(),
+            Some(&store),
+            Some("sess1"),
+            None,
+        );
         assert_eq!(results["review"].outcome, GateOutcome::Failed);
         assert_eq!(results["review"].output["matches"], false);
     }
@@ -1115,7 +1162,7 @@ mod tests {
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), None, None, None);
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
         assert_eq!(results["review"].outcome, GateOutcome::Error);
         assert_eq!(results["review"].output["matches"], false);
     }
@@ -1145,7 +1192,14 @@ mod tests {
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"), None);
+        let results = evaluate_gates(
+            &gates,
+            dir.path(),
+            &CommandEnv::inherit(),
+            Some(&store),
+            Some("sess1"),
+            None,
+        );
         assert_eq!(results["status"].outcome, GateOutcome::Passed);
         assert_eq!(results["status"].output["matches"], true);
     }
@@ -1376,7 +1430,14 @@ mod tests {
             },
         );
 
-        let results = evaluate_gates(&gates, dir.path(), Some(&store), Some("sess1"), None);
+        let results = evaluate_gates(
+            &gates,
+            dir.path(),
+            &CommandEnv::inherit(),
+            Some(&store),
+            Some("sess1"),
+            None,
+        );
         assert_eq!(results.len(), 3);
         assert_eq!(results["cmd"].outcome, GateOutcome::Passed);
         assert_eq!(results["ctx_exists"].outcome, GateOutcome::Passed);
@@ -1589,7 +1650,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut gates = BTreeMap::new();
             gates.insert("leg".to_string(), gate("req-a", "scope"));
-            let results = evaluate_gates(&gates, dir.path(), None, None, None);
+            let results =
+                evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
             assert_eq!(results["leg"].outcome, GateOutcome::Error);
             assert!(
                 !results["leg"].output["error"]

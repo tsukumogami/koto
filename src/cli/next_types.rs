@@ -194,6 +194,105 @@ pub fn execution_anchor_adopted_notice(name: &str, anchor: &std::path::Path) -> 
     )
 }
 
+/// Directive prefix announcing that a session created by an earlier koto
+/// has adopted a command environment record on this tick
+/// (DESIGN-koto-fixed-environment.md, R16).
+///
+/// Shows the three recorded values, which hold no secret (a value carrying
+/// a credential was recorded unset), and the `PATH` entries recording
+/// dropped. Never shows a value of any other variable.
+pub fn environment_adopted_notice(
+    name: &str,
+    record: &crate::engine::types::CommandEnvironment,
+    dropped: &[String],
+) -> String {
+    let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "(unset)".to_string());
+    let dropped = if dropped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Dropped PATH entries that resolve relative to the working directory: {}.",
+            dropped
+                .iter()
+                .map(|e| if e.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    e.clone()
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "[koto] Session '{name}' had no recorded command environment; its commands now run \
+         with PATH={}, HOME={}, XDG_CONFIG_HOME={}.{dropped} Other variables reach them only \
+         when koto's default list or the template's pass_env names them. The record can't be \
+         changed; start a new session to run with a different one.\n\n",
+        show(&record.path),
+        show(&record.home),
+        show(&record.xdg_config_home),
+    )
+}
+
+/// Directive prefix naming what the session's recorded environment explains
+/// on this tick (DESIGN-koto-fixed-environment.md, Decision 2), or `None`.
+///
+/// `stale` is the recorded values missing on disk; `failures` is each gate or
+/// action whose last run failed, with whether it looked like a missing
+/// command. A failure is named when anything recorded is stale or the failure
+/// looks not-found; with nothing stale, the note shows the recorded `PATH` it
+/// ran under. Stale values with no failure get a notice of their own. Only the
+/// three recorded values ever appear, never another variable's. A legacy
+/// session's commands use the caller's environment, so it gets no note.
+pub fn command_environment_note(
+    name: &str,
+    record: &crate::engine::types::CommandEnvironment,
+    stale: &[(&str, String)],
+    failures: &[(String, bool)],
+) -> Option<String> {
+    if record.legacy {
+        return None;
+    }
+    let remedy = format!(
+        "The record can't be changed; to run with different values, start a new session: \
+         `koto cancel --cleanup {name}`, then `koto init` again."
+    );
+    let stale_text = stale
+        .iter()
+        .map(|(var, value)| format!("{var} {value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let named: Vec<&str> = failures
+        .iter()
+        .filter(|(_, not_found)| *not_found || !stale.is_empty())
+        .map(|(label, _)| label.as_str())
+        .collect();
+    if !named.is_empty() {
+        let why = if stale.is_empty() {
+            match &record.path {
+                Some(path) => format!("it ran under the session's recorded PATH={path}"),
+                None => format!(
+                    "the session recorded no PATH, so it ran with PATH={}",
+                    crate::engine::command_env::UNSET_PATH
+                ),
+            }
+        } else {
+            format!("recorded values no longer exist: {stale_text}")
+        };
+        return Some(format!(
+            "[koto] {} failed in session '{name}', and {why}. {remedy}\n\n",
+            named.join(", ")
+        ));
+    }
+    if !stale.is_empty() {
+        return Some(format!(
+            "[koto] Session '{name}' recorded values that no longer exist: {stale_text}. \
+             Commands that need them will fail. {remedy}\n\n"
+        ));
+    }
+    None
+}
+
 impl NextResponse {
     /// Return this response with `result` set, when it is a `Terminal`.
     /// Every other variant is returned unchanged: only a terminal response

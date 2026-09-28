@@ -482,6 +482,7 @@ pub(crate) struct InitArgs<'a> {
     pub vars: &'a [String],
     pub intent: Option<&'a str>,
     pub execution_dir: Option<&'a Path>,
+    pub legacy_environment: bool,
 }
 
 /// Run `koto init` with `--vars-file` or any entry flag.
@@ -647,7 +648,7 @@ fn create(
         }
     }
 
-    if let Err(err) = init_child::init_child_from_parent_at(
+    let environment_report = match init_child::init_child_from_parent_at(
         backend,
         None,
         name,
@@ -656,20 +657,25 @@ fn create(
         cache,
         None,
         args.execution_dir,
+        args.legacy_environment,
     ) {
-        let r = match err.kind {
-            SpawnErrorKind::Collision => {
-                let mut r = Refusal::new(None, format!("workflow '{}' already exists", name), 1);
-                r.reason = "already-exists".to_string();
-                r
-            }
-            _ => match &err.var_error {
-                Some(var_error) => Refusal::var(var_error),
-                None => Refusal::new(Some(&spawn_kind_code(&err.kind)), err.message.clone(), 1),
-            },
-        };
-        refuse(entry, r);
-    }
+        Ok(value) => value,
+        Err(err) => {
+            let r = match err.kind {
+                SpawnErrorKind::Collision => {
+                    let mut r =
+                        Refusal::new(None, format!("workflow '{}' already exists", name), 1);
+                    r.reason = "already-exists".to_string();
+                    r
+                }
+                _ => match &err.var_error {
+                    Some(var_error) => Refusal::var(var_error),
+                    None => Refusal::new(Some(&spawn_kind_code(&err.kind)), err.message.clone(), 1),
+                },
+            };
+            refuse(entry, r);
+        }
+    };
 
     if let Some(intent) = args.intent {
         if let Err(e) = crate::cli::session::handle_update(backend, name, intent) {
@@ -702,6 +708,7 @@ fn create(
         "state": state,
         "outcome": if replaced.is_some() { "replaced" } else { "created" },
     });
+    super::add_environment_report(&mut out, environment_report.as_ref());
     if let Some((old_state, terminal, result)) = replaced {
         out["replaced_state"] = terminal.unwrap_or(old_state).into();
         out["replaced_result"] = serde_json::to_value(result)?;
@@ -806,6 +813,21 @@ fn attach(
         refuse(entry, *r);
     }
 
+    // Drift in the fixed environment values is reported, never refused
+    // (DESIGN-koto-fixed-environment.md, R14): attach writes no record, and
+    // the session's commands run with the recorded values whoever ticks it.
+    // Names only, never values. A session with no record isn't compared; its
+    // next tick adopts one. A legacy session isn't compared either: its
+    // commands do run with the caller's environment, so there's nothing to
+    // warn about.
+    let environment_drift = existing
+        .header
+        .command_environment
+        .as_ref()
+        .filter(|record| !record.legacy)
+        .map(|record| crate::engine::command_env::drift(record, |n| std::env::var(n).ok()))
+        .unwrap_or_default();
+
     let plan = match validate_rebind(
         &existing.compiled,
         &facts.bindings,
@@ -850,6 +872,15 @@ fn attach(
         "outcome": "attached",
         "rebound": plan.changes,
     });
+    if !environment_drift.is_empty() {
+        eprintln!(
+            "warning: session '{}' recorded a different {} than this shell has; its commands \
+             run with the recorded values, not this shell's",
+            name,
+            environment_drift.join(", ")
+        );
+        out["environment_drift"] = serde_json::json!(environment_drift);
+    }
     if let Some((target, written)) = leg {
         out["leg"] = leg_json(target, written);
     }

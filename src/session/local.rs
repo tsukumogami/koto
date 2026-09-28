@@ -922,6 +922,7 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let state_path = session_dir.join(state_file_name(id));
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: id.to_string(),
             template_hash: "testhash".to_string(),
@@ -961,6 +962,7 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let state_path = session_dir.join(state_file_name(id));
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: id.to_string(),
             template_hash: "testhash".to_string(),
@@ -1523,6 +1525,7 @@ mod tests {
     /// Helper: build a minimal (header, events) bundle for a session id.
     fn sample_bundle(id: &str) -> (StateFileHeader, Vec<Event>) {
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: id.to_string(),
             template_hash: "testhash".to_string(),
@@ -1626,6 +1629,7 @@ mod tests {
                 // Each thread has a different event payload so that a
                 // silent overwrite would produce different content.
                 let header = StateFileHeader {
+                    command_environment: None,
                     schema_version: 1,
                     workflow: "race".to_string(),
                     template_hash: format!("hash-{}", i),
@@ -2075,6 +2079,7 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let state_path = session_dir.join(state_file_name(id));
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: id.to_string(),
             template_hash: "testhash".to_string(),
@@ -2218,6 +2223,7 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let state_path = session_dir.join(state_file_name("old-wf"));
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: 1,
             workflow: "old-wf".to_string(),
             template_hash: "testhash".to_string(),
