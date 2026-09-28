@@ -158,6 +158,17 @@ pub struct TemplateState {
     /// grammar lives in [`crate::template::result_map`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<BTreeMap<String, String>>,
+    /// Context keys koto removes whenever the workflow enters this state,
+    /// except on the session's first entry and except a key written since
+    /// the entry (DESIGN-koto-ci-wait-stale-keys.md Decisions 1 and 2).
+    ///
+    /// Each is a literal key: the compiler refuses a `{{VAR}}` reference, a
+    /// key outside the context-key grammar, a duplicate, the field on a
+    /// terminal state, and a key some transition assigns through
+    /// `context_assignments`. Omitted from the compiled JSON when empty, so
+    /// a template that doesn't declare it keeps its template hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clear_on_entry: Vec<String>,
 }
 
 /// Template-level declaration that a state fans out child workflows from an
@@ -1381,6 +1392,8 @@ impl CompiledTemplate {
                 )?;
             }
 
+            self.validate_clear_on_entry(state_name, state)?;
+
             // Validate a declared terminal result map.
             if let Some(result) = &state.result {
                 crate::template::result_map::validate_result_map(
@@ -1697,6 +1710,68 @@ impl CompiledTemplate {
             }
         }
         out
+    }
+
+    /// Validate one state's `clear_on_entry` list.
+    ///
+    /// Each key must be a literal context key: koto removes it from the store
+    /// on entry, so a runtime value must never be able to steer which key is
+    /// removed. A terminal state is never ticked again, so clearing there
+    /// would do nothing. A key a transition assigns is refused because an
+    /// older koto repairs the store from assignments it finds in the log and
+    /// doesn't know the clearing event, so it would restore the cleared value
+    /// (DESIGN-koto-ci-wait-stale-keys.md Decision 2).
+    fn validate_clear_on_entry(
+        &self,
+        state_name: &str,
+        state: &TemplateState,
+    ) -> Result<(), String> {
+        if state.clear_on_entry.is_empty() {
+            return Ok(());
+        }
+        if state.terminal {
+            return Err(format!(
+                "state {:?}: clear_on_entry is not allowed on a terminal state\n  \
+                 remedy: declare the keys on the state that is re-entered",
+                state_name
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for key in &state.clear_on_entry {
+            if key.contains("{{") {
+                return Err(format!(
+                    "state {:?}: clear_on_entry key {:?} contains a variable reference\n  \
+                     remedy: list literal context keys; the set of cleared keys is fixed at compile time",
+                    state_name, key
+                ));
+            }
+            if let Err(e) = crate::session::validate::validate_context_key(key) {
+                return Err(format!(
+                    "state {:?}: clear_on_entry key {:?} is not a valid context key: {}",
+                    state_name, key, e
+                ));
+            }
+            if !seen.insert(key.as_str()) {
+                return Err(format!(
+                    "state {:?}: clear_on_entry lists key {:?} more than once",
+                    state_name, key
+                ));
+            }
+            for (from, other) in &self.states {
+                for transition in &other.transitions {
+                    if transition.context_assignments.contains_key(key) {
+                        return Err(format!(
+                            "state {:?}: clear_on_entry key {:?} is also assigned by the transition \
+                             {:?} -> {:?}\n  \
+                             remedy: use a different key for the value the transition writes, or \
+                             stop clearing this one; an older koto restores assigned keys from the log",
+                            state_name, key, from, transition.target
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Validate every `decider` block on one state (`E-DECIDER-*`).
@@ -2932,6 +3007,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         states.insert(
@@ -2950,6 +3026,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         CompiledTemplate {
@@ -3300,6 +3377,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         assert!(
@@ -3465,6 +3543,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -3532,6 +3611,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -3589,6 +3669,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -3644,6 +3725,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         let state = t.states.get_mut("start").unwrap();
@@ -5176,6 +5258,7 @@ command: "./check.sh"
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         t
@@ -5351,6 +5434,7 @@ command: "./check.sh"
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -5478,6 +5562,7 @@ command: "./check.sh"
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -5864,6 +5949,7 @@ command: "./check.sh"
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         };
         let done = TemplateState {
             directive: "Done.".to_string(),
@@ -5879,6 +5965,7 @@ command: "./check.sh"
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         };
         let mut states = BTreeMap::new();
         states.insert("plan".to_string(), plan);
@@ -6052,6 +6139,7 @@ command: "./check.sh"
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         };
         t.states.insert("plan2".to_string(), plan2);
         let err = t.validate(true).unwrap_err();
@@ -6179,6 +6267,7 @@ command: "./check.sh"
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         };
         t.states.insert("blocked".to_string(), blocked);
         let warnings = t.collect_materialize_children_warnings();
@@ -6208,6 +6297,7 @@ command: "./check.sh"
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();
@@ -6281,6 +6371,7 @@ command: "./check.sh"
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();
@@ -6319,6 +6410,7 @@ command: "./check.sh"
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         };
         t.states.insert("failed".to_string(), failed);
         let warnings = t.collect_materialize_children_warnings();
@@ -6350,6 +6442,7 @@ command: "./check.sh"
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         };
         t.states.insert("failed".to_string(), failed);
         for (name, assign) in ["a", "b"].iter().zip(assigns) {
@@ -6377,6 +6470,7 @@ command: "./check.sh"
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             );
         }

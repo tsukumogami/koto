@@ -92,6 +92,9 @@ struct SourceState {
     /// type error; scalars are converted to strings in `compile`.
     #[serde(default)]
     result: Option<BTreeMap<String, serde_yaml_ng::Value>>,
+    /// Context keys cleared on every entry into the state after the first.
+    #[serde(default)]
+    clear_on_entry: Vec<String>,
 }
 
 /// YAML front-matter view of a `materialize_children` hook.
@@ -638,6 +641,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
                 skipped_marker: source_state.skipped_marker,
                 skip_if: compiled_skip_if,
                 result: compiled_result,
+                clear_on_entry: source_state.clear_on_entry.clone(),
             },
         );
     }
@@ -2998,6 +3002,113 @@ Done.
         let src = assignment_template("", "      - target: done");
         let json = serde_json::to_string(&compile_src(&src).unwrap()).unwrap();
         assert!(!json.contains("context_assignments"), "got: {json}");
+    }
+
+    // -------------------------------------------------------------------
+    // clear_on_entry (DESIGN-koto-ci-wait-stale-keys.md)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn clear_on_entry_compiles_into_the_state_in_declared_order() {
+        let src = assignment_template(
+            "    clear_on_entry: [review.json, notes/summary.md]\n",
+            "      - target: done",
+        );
+        let t = compile_src(&src).unwrap();
+        assert_eq!(
+            t.states["start"].clear_on_entry,
+            vec!["review.json".to_string(), "notes/summary.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn template_without_clear_on_entry_omits_the_field_from_compiled_json() {
+        let src = assignment_template("", "      - target: done");
+        let json = serde_json::to_string(&compile_src(&src).unwrap()).unwrap();
+        assert!(!json.contains("clear_on_entry"), "got: {json}");
+    }
+
+    #[test]
+    fn clear_on_entry_refuses_a_variable_reference() {
+        let src = assignment_template(
+            "    clear_on_entry: [\"{{TOPIC}}.json\"]\n",
+            "      - target: done",
+        );
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(err.contains("\"start\""), "state missing: {err}");
+        assert!(err.contains("{{TOPIC}}.json"), "key missing: {err}");
+        assert!(err.contains("variable reference"), "reason missing: {err}");
+    }
+
+    #[test]
+    fn clear_on_entry_refuses_a_key_outside_the_context_key_grammar() {
+        for bad in ["/lead.md", "a//b", "../up", "a b"] {
+            let src = assignment_template(
+                &format!("    clear_on_entry: [\"{bad}\"]\n"),
+                "      - target: done",
+            );
+            let err = compile_src(&src).unwrap_err().to_string();
+            assert!(err.contains("\"start\""), "{bad}: state missing: {err}");
+            assert!(
+                err.contains("not a valid context key"),
+                "{bad}: reason missing: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_on_entry_refuses_a_duplicate_key() {
+        let src = assignment_template(
+            "    clear_on_entry: [review.json, review.json]\n",
+            "      - target: done",
+        );
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(err.contains("\"start\""), "state missing: {err}");
+        assert!(err.contains("\"review.json\""), "key missing: {err}");
+        assert!(err.contains("more than once"), "reason missing: {err}");
+    }
+
+    #[test]
+    fn clear_on_entry_refuses_a_terminal_state() {
+        let src = r#"---
+name: assign
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+    clear_on_entry: [review.json]
+---
+
+## start
+
+Work.
+
+## done
+
+Done.
+"#;
+        let err = compile_src(src).unwrap_err().to_string();
+        assert!(err.contains("\"done\""), "state missing: {err}");
+        assert!(err.contains("terminal"), "reason missing: {err}");
+    }
+
+    #[test]
+    fn clear_on_entry_refuses_a_key_a_transition_assigns() {
+        let src = assignment_template(
+            "    clear_on_entry: [outcome]\n",
+            "      - target: done\n        context_assignments:\n          outcome: landed",
+        );
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(
+            err.contains("\"start\" -> \"done\""),
+            "transition missing: {err}"
+        );
+        assert!(err.contains("\"outcome\""), "key missing: {err}");
+        assert!(err.contains("also assigned"), "reason missing: {err}");
     }
 
     #[test]

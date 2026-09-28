@@ -112,6 +112,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         states.insert(
@@ -130,6 +131,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         CompiledTemplate {
@@ -189,6 +191,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         let t = CompiledTemplate {
@@ -251,6 +254,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         states.insert(
@@ -269,6 +273,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         states.insert(
@@ -287,6 +292,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
 
@@ -386,6 +392,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
 
@@ -421,6 +428,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         states.insert(
@@ -443,6 +451,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         states.insert(
@@ -465,6 +474,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         states.insert(
@@ -483,6 +493,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
 

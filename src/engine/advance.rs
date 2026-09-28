@@ -2384,6 +2384,7 @@ mod tests {
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         }
     }
 
@@ -3068,6 +3069,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3086,6 +3088,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3107,6 +3110,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3125,6 +3129,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -3198,6 +3203,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -3259,6 +3265,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -3309,6 +3316,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -3384,6 +3392,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -3491,6 +3500,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3509,6 +3519,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3527,6 +3538,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -3622,6 +3634,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3640,6 +3653,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3658,6 +3672,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -3752,6 +3767,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3770,6 +3786,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -3862,6 +3879,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3880,6 +3898,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -4053,6 +4072,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -4071,6 +4091,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -4122,6 +4143,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -4180,6 +4202,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ));
         }
@@ -4200,6 +4223,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         ));
 
@@ -4243,6 +4267,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -4287,6 +4312,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -4305,6 +4331,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -4323,6 +4350,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -4371,6 +4399,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -4389,6 +4418,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -4407,6 +4437,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -4568,6 +4599,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )])
     }
@@ -4681,6 +4713,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
         let appended = std::cell::RefCell::new(Vec::new());
@@ -4738,6 +4771,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -4799,6 +4833,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -4845,6 +4880,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -4937,6 +4973,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -4955,6 +4992,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ])
@@ -5242,6 +5280,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -5307,6 +5346,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -5325,6 +5365,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -5390,6 +5431,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -5408,6 +5450,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -5529,6 +5572,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -5547,6 +5591,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -5624,6 +5669,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -5642,6 +5688,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -5896,6 +5943,7 @@ mod tests {
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         };
         let template = make_template(vec![
             (
@@ -5923,6 +5971,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             ("merged", terminal("Merged.")),
@@ -6011,6 +6060,7 @@ mod tests {
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         };
         let template = make_template(vec![
             (
@@ -6038,6 +6088,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             ("merged", terminal("Merged.")),
@@ -6108,6 +6159,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -6126,6 +6178,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -6238,6 +6291,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -6256,6 +6310,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -6344,6 +6399,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -6362,6 +6418,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -6477,6 +6534,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             ("complete", {
@@ -6572,6 +6630,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             ("complete", {
@@ -6733,6 +6792,7 @@ mod tests {
                         Some(m)
                     },
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -6751,6 +6811,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -6847,6 +6908,7 @@ mod tests {
                         Some(m)
                     },
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -6865,6 +6927,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -7260,6 +7323,7 @@ mod tests {
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         }
     }
 

@@ -2060,6 +2060,7 @@ mod tests {
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         }
     }
 
