@@ -2035,10 +2035,21 @@ pub struct ChildGateEntry {
     /// Per-child outcome. Matches [`TaskOutcome`] serialization: one of
     /// `success | failure | skipped | pending | blocked | spawn_failed`.
     pub outcome: TaskOutcome,
-    /// Failure mode string for failed children: `"state_name"` or
-    /// `"state_name:failure_reason"`. Omitted for non-failed outcomes.
+    /// Name of the failure state a failed child ended in. Omitted for
+    /// non-failed outcomes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_mode: Option<String>,
+    /// Why a failed child failed: the `failure_reason` recorded with the
+    /// child's result on its terminal tick (see
+    /// [`crate::engine::terminal_result::failure_reason_for_current_run`]),
+    /// or else its state name, with `reason_source` saying which. It is the field `koto status` has
+    /// always shown for a failed task, so the gate output,
+    /// `batch_final_view` and the status batch view share one shape.
+    /// Omitted for non-failed outcomes. A view frozen before this field
+    /// existed gains the state name on read through
+    /// [`BatchFinalView::from_gate_output`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Direct upstream blocker name for skipped children. Omitted when
     /// not skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2123,11 +2134,21 @@ impl BatchFinalView {
     /// [`build_children_complete_output`]. Returns `None` when the
     /// shape does not match (e.g., the gate reported an `error`
     /// outcome). Used at `BatchFinalized` append time to freeze the
-    /// live gate output into a serializable payload.
+    /// live gate output into a serializable payload, and again whenever a
+    /// frozen view is read, where it also brings a view frozen by an older
+    /// koto up to the current shape (a failed child's `reason`).
     pub fn from_gate_output(value: &serde_json::Value) -> Option<Self> {
         let obj = value.as_object()?;
         let children_val = obj.get("children")?;
-        let children: Vec<ChildGateEntry> = serde_json::from_value(children_val.clone()).ok()?;
+        let mut children: Vec<ChildGateEntry> =
+            serde_json::from_value(children_val.clone()).ok()?;
+        // A view frozen before failed children carried `reason` has only
+        // `failure_mode`; give it the same `reason` a fresh view has.
+        for child in &mut children {
+            if child.outcome == TaskOutcome::Failure && child.reason.is_none() {
+                child.reason = child.failure_mode.clone();
+            }
+        }
         Some(BatchFinalView {
             total: obj.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
             completed: obj.get("completed").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
@@ -2233,6 +2254,10 @@ pub fn build_children_complete_output(
     // unreadable log or template is not in this set, and for those the
     // parent's copy stays a usable fallback.
     let mut own_log_authoritative: HashSet<String> = HashSet::new();
+    // The `failure_reason` each on-disk child recorded with its current
+    // arrival's result (koto#278), keyed like `result_by_session` and read
+    // under the same rule; see the inlining loop below.
+    let mut failure_reason_by_session: HashMap<String, String> = HashMap::new();
     match backend.list() {
         Ok(sessions) => {
             let child_prefix = format!("{}.", parent_name);
@@ -2275,6 +2300,13 @@ pub fn build_children_complete_output(
                     own_log_authoritative.insert(info.id.clone());
                 }
                 let (terminal, failure, skipped_marker) = flags.unwrap_or((false, false, false));
+                if let Some(reason) =
+                    crate::engine::terminal_result::recorded_failure_reason_for_current_arrival(
+                        &child_events,
+                    )
+                {
+                    failure_reason_by_session.insert(info.id.clone(), reason);
+                }
                 let spawn_entry = child_events.iter().find_map(|e| match &e.payload {
                     EventPayload::WorkflowInitialized { spawn_entry, .. } => spawn_entry.clone(),
                     _ => None,
@@ -2365,6 +2397,14 @@ pub fn build_children_complete_output(
     // (DESIGN-request-store-converge.md Decision 3 / 4). Latest event
     // per child wins, mirroring `event_snapshots`.
     let mut result_by_child: HashMap<String, WorkflowResult> = HashMap::new();
+    // The parent's copy of each child's recorded `failure_reason`, keyed like
+    // `result_by_child` but superseded differently: the latest record
+    // decides even when it has none, so a record without a reason clears an
+    // earlier one. A result is always present on a current record, so
+    // keeping an earlier one costs nothing; a reason is often absent, and
+    // keeping the earlier one would show a retried child's first-run reason
+    // for a later failure that gave none.
+    let mut failure_reason_by_child: HashMap<String, String> = HashMap::new();
     for ev in events {
         // Skip events from superseded epochs.
         if let Some(boundary) = epoch_boundary {
@@ -2378,6 +2418,7 @@ pub fn build_children_complete_output(
             outcome,
             final_state,
             result,
+            failure_reason,
         } = &ev.payload
         {
             event_snapshots.insert(task_name.clone(), (*outcome, final_state.clone()));
@@ -2392,6 +2433,14 @@ pub fn build_children_complete_output(
                 .or_insert_with(|| child_name.clone());
             if let Some(r) = result {
                 result_by_child.insert(child_name.clone(), r.clone());
+            }
+            match failure_reason {
+                Some(reason) => {
+                    failure_reason_by_child.insert(child_name.clone(), reason.clone());
+                }
+                None => {
+                    failure_reason_by_child.remove(child_name);
+                }
             }
         }
     }
@@ -2525,6 +2574,23 @@ pub fn build_children_complete_output(
         }) {
             entry.result = Some(r.clone());
         }
+        // A failed child whose result recorded a `failure_reason` reports it
+        // in place of its state name, read from the same source as the
+        // result and for the same reason. `failure_mode` keeps the state
+        // name, which is what it has always meant.
+        if matches!(entry.outcome, TaskOutcome::Failure) {
+            let recorded = failure_reason_by_session.get(&entry.name).or_else(|| {
+                if own_log_authoritative.contains(&entry.name) {
+                    None
+                } else {
+                    failure_reason_by_child.get(&entry.name)
+                }
+            });
+            if let Some(reason) = recorded {
+                entry.reason = Some(reason.clone());
+                entry.reason_source = Some("failure_reason".to_string());
+            }
+        }
         // A `Skipped` child with no evidence never produces an
         // auto-promoted result via the dual-source dereference above (it
         // had no terminal evidence to promote, and may have been spawned
@@ -2645,6 +2711,9 @@ fn child_entry_to_json(entry: &ChildGateEntry) -> serde_json::Value {
     if let Some(fm) = &entry.failure_mode {
         obj.insert("failure_mode".to_string(), serde_json::json!(fm));
     }
+    if let Some(r) = &entry.reason {
+        obj.insert("reason".to_string(), serde_json::json!(r));
+    }
     if let Some(sb) = &entry.skipped_because {
         obj.insert("skipped_because".to_string(), serde_json::json!(sb));
     }
@@ -2723,6 +2792,7 @@ fn build_entries_from_tasks(
             complete,
             outcome,
             failure_mode: None,
+            reason: None,
             skipped_because: None,
             blocked_by: None,
             skipped_because_chain: Vec::new(),
@@ -2732,11 +2802,12 @@ fn build_entries_from_tasks(
 
         match outcome {
             TaskOutcome::Failure => {
-                // failure_mode projection: state_name only (v1 does not
-                // peek into the child's failure_reason context key from
-                // the gate evaluator path).
+                // The state name, as both failure_mode and the fallback
+                // reason. A failure_reason the child wrote replaces the
+                // reason in build_children_complete_output.
                 if let Some(s) = snap {
                     entry.failure_mode = Some(s.current_state.clone());
+                    entry.reason = entry.failure_mode.clone();
                 }
                 entry.reason_source = Some("state_name".to_string());
             }
@@ -2905,6 +2976,7 @@ fn build_entries_from_disk(
             complete: snap.terminal,
             outcome,
             failure_mode: None,
+            reason: None,
             skipped_because: None,
             blocked_by: None,
             skipped_because_chain: Vec::new(),
@@ -2914,6 +2986,7 @@ fn build_entries_from_disk(
         match outcome {
             TaskOutcome::Failure => {
                 entry.failure_mode = Some(snap.current_state.clone());
+                entry.reason = entry.failure_mode.clone();
                 entry.reason_source = Some("state_name".to_string());
             }
             TaskOutcome::Skipped => {
@@ -2927,6 +3000,16 @@ fn build_entries_from_disk(
 }
 
 // --------- BatchFinalized helpers (Issue #17) ----------------------
+
+/// Render a frozen `BatchFinalized` view in the current shape. A view
+/// frozen by an older koto passes through [`BatchFinalView::from_gate_output`],
+/// which adds what it lacks (a failed child's `reason`); a value that does
+/// not parse as a view is returned unchanged.
+pub fn normalize_frozen_view(view: &serde_json::Value) -> serde_json::Value {
+    BatchFinalView::from_gate_output(view)
+        .and_then(|v| serde_json::to_value(v).ok())
+        .unwrap_or_else(|| view.clone())
+}
 
 /// Return the most recent `BatchFinalized` event in `events`, if any.
 ///
@@ -3000,12 +3083,21 @@ pub fn should_append_batch_finalized(
 }
 
 /// The part of a batch view that identifies its outcome: each listed
-/// child's name and outcome, sorted by name. Result text, child states and
-/// the other fields are left out, because a view rebuilt after a child's
-/// log was cleaned up reads them from the parent's copy and need not match
-/// byte for byte what was recorded while the child was on disk.
-fn batch_outcomes(view: &serde_json::Value) -> Vec<(String, String)> {
-    let mut outcomes: Vec<(String, String)> = view
+/// child's name, outcome and `reason_source`, sorted by name. Result text,
+/// child states and the other fields are left out, because a view rebuilt
+/// after a child's log was cleaned up reads them from the parent's copy and
+/// need not match byte for byte what was recorded while the child was on
+/// disk. The reason text is left out for the same reason, and so that a view
+/// frozen before `reason` existed does not count as a changed batch.
+///
+/// `reason_source` is in because a tick can see a failed child between its
+/// terminal transition and the append that records its result and
+/// `failure_reason`; the view frozen then says `state_name`. When the record
+/// lands, the source becomes `failure_reason` and the batch is recorded again
+/// with the reason the child gave (koto#278). A view frozen by an older koto
+/// already carries `reason_source`, so upgrading does not re-record it.
+fn batch_outcomes(view: &serde_json::Value) -> Vec<(String, String, String)> {
+    let mut outcomes: Vec<(String, String, String)> = view
         .get("children")
         .and_then(|c| c.as_array())
         .map(|children| {
@@ -3018,7 +3110,7 @@ fn batch_outcomes(view: &serde_json::Value) -> Vec<(String, String)> {
                             .unwrap_or_default()
                             .to_string()
                     };
-                    (field("name"), field("outcome"))
+                    (field("name"), field("outcome"), field("reason_source"))
                 })
                 .collect()
         })
@@ -3680,6 +3772,7 @@ mod tests {
                 complete: true,
                 outcome: TaskOutcome::Success,
                 failure_mode: None,
+                reason: None,
                 skipped_because: None,
                 blocked_by: None,
                 skipped_because_chain: Vec::new(),
@@ -3692,6 +3785,7 @@ mod tests {
                 complete: false,
                 outcome: TaskOutcome::SpawnFailed,
                 failure_mode: None,
+                reason: None,
                 skipped_because: None,
                 blocked_by: None,
                 skipped_because_chain: Vec::new(),
@@ -3721,6 +3815,7 @@ mod tests {
                 complete: true,
                 outcome: TaskOutcome::Success,
                 failure_mode: None,
+                reason: None,
                 skipped_because: None,
                 blocked_by: None,
                 skipped_because_chain: Vec::new(),
@@ -3733,6 +3828,7 @@ mod tests {
                 complete: true,
                 outcome: TaskOutcome::Failure,
                 failure_mode: Some("failed".to_string()),
+                reason: Some("failed".to_string()),
                 skipped_because: None,
                 blocked_by: None,
                 skipped_because_chain: Vec::new(),
@@ -3895,16 +3991,18 @@ mod tests {
         // - failed: state_name
         // - skipped: skipped
         // - spawn_failed: not_spawned
-        // - (failure_reason variant is populated by the scheduler/
-        //   batch view path, not the gate-output path in v1; the
-        //   vocabulary is pinned by the design so agents can route on
-        //   it deterministically.)
+        // - failed with a recorded failure_reason: failure_reason. That
+        //   value is set by build_children_complete_output from the
+        //   child's recorded result (koto#278), not by the entry builders
+        //   this test drives, so only its JSON round-trip is checked here;
+        //   tests/batch_failure_reason_test.rs covers it end to end.
         let entry_state_name = ChildGateEntry {
             name: "p.a".to_string(),
             state: "failed".to_string(),
             complete: true,
             outcome: TaskOutcome::Failure,
             failure_mode: Some("failed".to_string()),
+            reason: Some("failed".to_string()),
             skipped_because: None,
             blocked_by: None,
             skipped_because_chain: Vec::new(),
@@ -3917,6 +4015,7 @@ mod tests {
             complete: true,
             outcome: TaskOutcome::Skipped,
             failure_mode: None,
+            reason: None,
             skipped_because: Some("p.a".to_string()),
             blocked_by: None,
             skipped_because_chain: vec!["p.a".to_string()],
@@ -3929,6 +4028,7 @@ mod tests {
             complete: false,
             outcome: TaskOutcome::SpawnFailed,
             failure_mode: None,
+            reason: None,
             skipped_because: None,
             blocked_by: None,
             skipped_because_chain: Vec::new(),
@@ -3948,8 +4048,8 @@ mod tests {
                 entry.name
             );
         }
-        // The failure_reason variant is a documented value the scheduler
-        // path emits; verify its JSON round-trip through ChildGateEntry.
+        // The failure_reason variant: verify its JSON round-trip through
+        // ChildGateEntry.
         let entry_failure_reason = ChildGateEntry {
             reason_source: Some("failure_reason".to_string()),
             result: None,
@@ -4414,6 +4514,40 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_childs_reason_arriving_late_records_the_batch_again() {
+        // A tick saw the child's terminal transition before its recorded
+        // failure_reason: the view froze with the state name. Once the record
+        // lands the source changes and the batch is recorded again (koto#278).
+        let mut early = view_of(&[("p.A", "failure")]);
+        early["children"][0]["reason_source"] = serde_json::json!("state_name");
+        early["children"][0]["reason"] = serde_json::json!("failed");
+        let events = vec![bf_event_for(5, "plan", early.clone())];
+        let mut late = early.clone();
+        late["children"][0]["reason_source"] = serde_json::json!("failure_reason");
+        late["children"][0]["reason"] = serde_json::json!("disk full");
+        assert!(should_append_batch_finalized(
+            &events,
+            "plan",
+            &tasks_a(),
+            true,
+            &late
+        ));
+
+        // A view frozen before `reason` existed has the same source as one
+        // read now, so upgrading records nothing new.
+        let mut old = early.clone();
+        old["children"][0].as_object_mut().unwrap().remove("reason");
+        let events = vec![bf_event_for(5, "plan", old)];
+        assert!(!should_append_batch_finalized(
+            &events,
+            "plan",
+            &tasks_a(),
+            true,
+            &early
+        ));
+    }
+
+    #[test]
     fn find_most_recent_batch_finalized_returns_latest() {
         let events = vec![
             bf_event(5, "2026-04-14T10:00:00Z"),
@@ -4813,6 +4947,7 @@ mod tests {
                 outcome,
                 final_state: final_state.to_string(),
                 result: None,
+                failure_reason: None,
             },
             idempotency_hash: None,
         }
@@ -4895,6 +5030,7 @@ mod tests {
                         summary: "alpha evaluated 42".to_string(),
                         payload: Some(serde_json::json!({"score": 42})),
                     }),
+                    failure_reason: None,
                 },
                 "2026-01-01T00:00:02Z",
             )
@@ -5086,6 +5222,7 @@ mod tests {
                     summary: "LIVE child-log result".to_string(),
                     payload: Some(serde_json::json!({"score": 99})),
                 },
+                failure_reason: None,
             },
         );
         // Also append a ChildCompleted to the parent carrying a DIFFERENT
@@ -5103,6 +5240,7 @@ mod tests {
                         summary: "STALE parent copy".to_string(),
                         payload: None,
                     }),
+                    failure_reason: None,
                 },
                 "2026-01-01T00:00:04Z",
             )
@@ -5179,6 +5317,7 @@ mod tests {
                         summary: "completed at done".to_string(),
                         payload: None,
                     }),
+                    failure_reason: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -5210,6 +5349,73 @@ mod tests {
         );
         assert_eq!(output["outstanding"], serde_json::json!([]), "{output}");
         assert!(passes, "the gate passes once the result matches: {output}");
+    }
+
+    /// A cleaned-up failed child's reason comes from the parent's latest
+    /// `ChildCompleted`, and a later record without one clears it: a child
+    /// that failed with a reason, was retried, failed again without one and
+    /// was then cleaned up reports its state name, not the first run's
+    /// reason (koto#278).
+    #[test]
+    fn a_cleaned_up_childs_reason_is_its_latest_records() {
+        let failed = |seq: u64, reason: Option<&str>| {
+            (
+                EventPayload::ChildCompleted {
+                    child_name: "p.t".to_string(),
+                    task_name: "t".to_string(),
+                    outcome: TerminalOutcome::Failure,
+                    final_state: "failed".to_string(),
+                    result: Some(WorkflowResult {
+                        status: TerminalOutcome::Failure,
+                        summary: "failed at failed".to_string(),
+                        payload: None,
+                    }),
+                    failure_reason: reason.map(str::to_string),
+                },
+                format!("2026-01-01T00:00:0{seq}Z"),
+            )
+        };
+        let mut states = BTreeMap::new();
+        states.insert("wait".to_string(), TemplateState::default());
+        let template = CompiledTemplate {
+            format_version: 1,
+            name: "p".to_string(),
+            version: "1".to_string(),
+            description: String::new(),
+            initial_state: "wait".to_string(),
+            variables: BTreeMap::new(),
+            states,
+        };
+        let gate_entry = |records: &[(EventPayload, String)]| {
+            let tmp = TempDir::new().unwrap();
+            let backend =
+                crate::session::local::LocalBackend::with_base_dir(tmp.path().to_path_buf());
+            backend
+                .init_state_file("p", child_header_for("", "p"), vec![])
+                .unwrap();
+            for (payload, ts) in records {
+                backend.append_event("p", payload, ts).unwrap();
+            }
+            let (_, parent_events) = backend.read_events("p").unwrap();
+            let (_, output) = build_children_complete_output(
+                &backend,
+                "p",
+                &parent_events,
+                &template,
+                "wait",
+                None,
+            );
+            output["children"][0].clone()
+        };
+
+        let entry = gate_entry(&[failed(1, Some("first run"))]);
+        assert_eq!(entry["reason"], "first run", "{entry}");
+        assert_eq!(entry["reason_source"], "failure_reason", "{entry}");
+
+        let entry = gate_entry(&[failed(1, Some("first run")), failed(2, None)]);
+        assert_eq!(entry["reason"], "failed", "{entry}");
+        assert_eq!(entry["reason_source"], "state_name", "{entry}");
+        assert_eq!(entry["failure_mode"], "failed", "{entry}");
     }
 
     #[test]
@@ -5254,6 +5460,7 @@ mod tests {
                         summary: "parent fallback used".to_string(),
                         payload: None,
                     }),
+                    failure_reason: None,
                 },
                 "2026-01-01T00:00:02Z",
             )
@@ -5376,6 +5583,7 @@ mod tests {
                         summary: "parent fallback used".to_string(),
                         payload: None,
                     }),
+                    failure_reason: None,
                 },
                 "2026-01-01T00:00:02Z",
             )
@@ -5521,6 +5729,7 @@ mod tests {
                     outcome,
                     final_state: final_state.to_string(),
                     result,
+                    failure_reason: None,
                 },
                 ts,
             )
@@ -6156,6 +6365,7 @@ mod tests {
                 outcome: TerminalOutcome::Success,
                 final_state: "done".to_string(),
                 result: None,
+                failure_reason: None,
             },
             idempotency_hash: None,
         };

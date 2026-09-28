@@ -122,10 +122,9 @@ pub struct TaskView {
     /// two surfaces share the same canonical name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_source: Option<String>,
-    /// Human-readable reason string for failures. For `Failure` this
-    /// is the child's terminal state name (v1 fallback) or its
-    /// `failure_reason` context key when present. Omitted for
-    /// non-failed outcomes.
+    /// Why a failed task failed, copied from the gate entry's `reason`:
+    /// the child's `failure_reason` from its current run, or its
+    /// terminal state name. Omitted for non-failed outcomes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Direct blocker for skipped tasks — the composed
@@ -287,13 +286,11 @@ fn build_active_view(
             .get("reason_source")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let reason = match outcome {
-            TaskOutcome::Failure => child_obj
-                .get("failure_mode")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            _ => None,
-        };
+        // Only a failed entry carries `reason`.
+        let reason = child_obj
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let skip_reason = child_obj
             .get("skipped_because")
             .and_then(|v| v.as_str())
@@ -397,10 +394,6 @@ fn build_final_view(
             } else {
                 false
             };
-            let reason = match entry.outcome {
-                TaskOutcome::Failure => entry.failure_mode.clone(),
-                _ => None,
-            };
             TaskView {
                 name: entry.name.clone(),
                 task_name: short,
@@ -409,7 +402,7 @@ fn build_final_view(
                 outcome: entry.outcome,
                 synthetic,
                 reason_source: entry.reason_source.clone(),
-                reason,
+                reason: entry.reason.clone(),
                 skip_reason: entry.skipped_because.clone(),
                 skipped_because_chain: entry.skipped_because_chain.clone(),
             }
@@ -632,6 +625,7 @@ mod tests {
                     complete: true,
                     outcome: TaskOutcome::Success,
                     failure_mode: None,
+                    reason: None,
                     skipped_because: None,
                     blocked_by: None,
                     skipped_because_chain: vec![],
@@ -644,6 +638,7 @@ mod tests {
                     complete: true,
                     outcome: TaskOutcome::Failure,
                     failure_mode: Some("failed".to_string()),
+                    reason: Some("failed".to_string()),
                     skipped_because: None,
                     blocked_by: None,
                     skipped_because_chain: vec![],
@@ -656,6 +651,7 @@ mod tests {
                     complete: true,
                     outcome: TaskOutcome::Skipped,
                     failure_mode: None,
+                    reason: None,
                     skipped_because: Some("p.B".to_string()),
                     blocked_by: None,
                     skipped_because_chain: vec!["p.B".to_string()],

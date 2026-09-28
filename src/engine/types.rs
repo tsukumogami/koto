@@ -781,6 +781,13 @@ pub enum EventPayload {
         /// `None`, so pre-feature parent logs round-trip unchanged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<WorkflowResult>,
+        /// Copy of the `failure_reason` the child's own
+        /// [`RequestStoreResult`](EventPayload::RequestStoreResult) recorded,
+        /// for a child that ended in a failure state having written one
+        /// (koto#278). The batch gate falls back to it once the child's
+        /// log is gone. Additive field, omitted from the wire when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure_reason: Option<String>,
     },
     /// Emitted by `koto session update --intent` to update the workflow's
     /// stated goal concurrently with execution. Multiple events may appear;
@@ -865,6 +872,15 @@ pub enum EventPayload {
     /// recognized type, which is a deserialization failure).
     RequestStoreResult {
         result: WorkflowResult,
+        /// The `failure_reason` context key the session wrote during the
+        /// run that ended in this failure state, one line and bounded
+        /// (koto#278). A parent's batch view reports it as the failed
+        /// child's `reason`. Resolved once, with the result, so a later
+        /// context write does not change it. `None` for a success or
+        /// skipped terminal, or when no reason was written. Additive
+        /// field, omitted from the wire when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure_reason: Option<String>,
     },
     /// Emitted on a request's own log when the request is created
     /// (wire `type: "request.created"`).
@@ -1629,6 +1645,7 @@ impl<'de> Deserialize<'de> for Event {
                     outcome: p.outcome,
                     final_state: p.final_state,
                     result: p.result,
+                    failure_reason: p.failure_reason,
                 }
             }
             "intent_updated" => {
@@ -1667,7 +1684,10 @@ impl<'de> Deserialize<'de> for Event {
             "request_store.result" => {
                 let p: RequestStoreResultPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
-                EventPayload::RequestStoreResult { result: p.result }
+                EventPayload::RequestStoreResult {
+                    result: p.result,
+                    failure_reason: p.failure_reason,
+                }
             }
             "request.created" => {
                 let p: RequestCreatedPayload = serde_json::from_value(payload_val.clone())
@@ -1913,6 +1933,8 @@ struct ChildCompletedPayload {
     final_state: String,
     #[serde(default)]
     result: Option<WorkflowResult>,
+    #[serde(default)]
+    failure_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1946,6 +1968,8 @@ struct VariablesReboundPayload {
 #[derive(Deserialize)]
 struct RequestStoreResultPayload {
     result: WorkflowResult,
+    #[serde(default)]
+    failure_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3730,6 +3754,7 @@ mod tests {
                     summary: "skipped upstream".to_string(),
                     payload: None,
                 },
+                failure_reason: None,
             },
             idempotency_hash: None,
         };
@@ -3739,7 +3764,7 @@ mod tests {
         assert_eq!(val["payload"]["result"]["status"], "skipped");
         let back: Event = serde_json::from_str(&json).unwrap();
         match back.payload {
-            EventPayload::RequestStoreResult { result } => {
+            EventPayload::RequestStoreResult { result, .. } => {
                 assert_eq!(result.status, TerminalOutcome::Skipped);
                 assert_eq!(result.summary, "skipped upstream");
             }
@@ -4177,6 +4202,7 @@ mod tests {
                     summary: "alpha done".to_string(),
                     payload: None,
                 }),
+                failure_reason: None,
             },
             idempotency_hash: None,
         };
