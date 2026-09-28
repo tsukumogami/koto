@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   When a koto check fails, the agent running the workflow gets too little to
   act on. A failing command gate reaches it as a bare exit code: koto reads the
@@ -25,7 +25,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-koto-failure-reporting](docs/briefs/BRIEF-koto-failure-reporting.md); carried in Absorbed Brief.
 
