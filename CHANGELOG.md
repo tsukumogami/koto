@@ -202,6 +202,59 @@ to `0.9.x`).
 
 ### Changed
 
+- **Gates and default actions run in an environment fixed when the session
+  is created (koto#261).** Until now every command gate and default action
+  ran as `sh -c` with the whole environment of whatever process called `koto
+  next`, so a shim first on one shell's `PATH`, an exported shell function, or
+  a `HOME` whose `.gitconfig` defines an alias could change a gate's verdict,
+  even on a gate marked `overridable: false`. Now every command runs as
+  `/bin/sh -c`, with standard input at end of file, in a cleared environment
+  holding only: the live value, on each tick, of each name on koto's default
+  list and each name the template declares in `pass_env:`; then `PATH`, `HOME`
+  and `XDG_CONFIG_HOME` as recorded when the session was created (an unset
+  `PATH` becomes `/usr/bin:/bin`); then `KOTO_TICK_SESSION` and
+  `KOTO_SESSIONS_BASE`, set by koto. The default list covers the user and
+  locale names, `TZ`, `TMPDIR`, `TERM`, `CI`, the XDG directories, TLS
+  certificate paths, `SSH_AUTH_SOCK`, the `gh` and GitHub token and host
+  names, and the proxy variables; the exact list is published in
+  [What a command's environment is](docs/guides/default-action-authoring.md#what-a-commands-environment-is).
+  `koto init` (every top-level form) makes the record, and a child, including
+  one from `koto session start`, copies its parent's. `PATH` loses its empty and relative
+  entries, a recorded value that contains a token's value is recorded unset,
+  and the `koto init` response reports both in a new `environment` object. The
+  record can't be changed; the remedy for a wrong one is a new session (`koto
+  cancel --cleanup <name>`, then `koto init`). A session created by an earlier
+  koto adopts a record on its first `koto next`, from the ticking process,
+  with an `environment_adopted` event and a one-time notice on the directive.
+
+  A template declares extra names in a new top-level `pass_env:` list. Their
+  values are read live and never recorded. `BASH_ENV`, `ENV`,
+  `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `GH_CONFIG_DIR`, and names starting
+  `BASH_FUNC_` or `GIT_CONFIG` can never be passed: declaring one is a compile
+  error, and koto filters them again at run time. Declaring a name koto sets
+  itself compiles with warning W7.
+
+  When a gate or action fails and a recorded value no longer exists, or the
+  command wasn't found (exit 127, or the shell's `not found` message), the
+  `koto next` response's directive opens with a note naming the gate or
+  action, the missing values or the recorded `PATH`, and the remedy. Stale
+  values with no failure get a notice, and a refused `--to` carries the note in
+  its message. Gate evidence and action output are unchanged. `koto init
+  --attach-live` from a shell whose `PATH`, `HOME` or `XDG_CONFIG_HOME`
+  differs from the record still attaches, prints one stderr warning, and adds
+  `environment_drift` to its output, naming the variables and never their
+  values.
+
+  **Breaking for templates whose commands read other variables.** A gate or
+  action that reads a variable outside the default list now finds it unset.
+  Declare the name in the template's `pass_env:`, or, for this release only,
+  create the session with `koto init --legacy-environment`, which records that
+  the session's commands run with the caller's whole environment as before.
+  The flag is set only at creation, is refused with `--parent`, and **will be
+  removed in the next release**, once shirabe's test harnesses have migrated
+  off it. A gate that relied on `.` or another relative `PATH` entry must spell
+  the path.
+
 - **A session that reaches a failure terminal is kept, and keeping a session
   no longer withholds its result.** A tick that lands a session in a state
   declared `failure: true` no longer removes it, root or child, with or without

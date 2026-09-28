@@ -128,6 +128,8 @@ The category: **does the command's risk live in a bad success, or only in a bad 
 
 An action must also be safe to re-run -- it fires on every tick that enters the state without evidence, gate-blocked retries and self-loops included.
 
+Gates and actions run in a cleared environment, not the caller's: the `PATH`, `HOME` and `XDG_CONFIG_HOME` recorded at `koto init`, koto's default list of live names (locale, `TMPDIR`, `GH_TOKEN`, proxies and a few more), and `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`. If a command reads any other variable, declare its name in the template's top-level `pass_env:` list, or it's unset at run time. The exact lists and the compile rules are in the template format guide's `pass_env:` section.
+
 The [`default_action` authoring guide](../../../../docs/guides/default-action-authoring.md) carries the rule in full, with worked examples on both sides, the burden-of-proof rule for a classification that turns on an unchecked claim, and the failure, capture, and anchoring mechanics. The [template format guide](references/template-format.md) carries the field schema. Read the rule before you write your first action.
 
 ## Reference material
@@ -135,7 +137,7 @@ The [`default_action` authoring guide](../../../../docs/guides/default-action-au
 The skill bundles reference material, loaded during specific states:
 
 - **Template format guide** (`${CLAUDE_SKILL_DIR}/references/template-format.md`) -- read during state_design and template_drafting. Covers structure (Layer 1), evidence routing (Layer 2), and advanced features (Layer 3). Read only the layers you need.
-- **`default_action` authoring guide** (`docs/guides/default-action-authoring.md` in the koto repository) -- read before declaring a state's `default_action`. Covers which commands the engine may run, the field schema, the failure path and its `failure_kind` vocabulary, `capture_stdout_as`, and execution anchoring.
+- **`default_action` authoring guide** (`docs/guides/default-action-authoring.md` in the koto repository) -- read before declaring a state's `default_action`. Covers which commands the engine may run, the field schema, the failure path and its `failure_kind` vocabulary, the environment a command runs with (`pass_env:`), `capture_stdout_as`, and execution anchoring.
 - **Decider declarations** (the "Decider declarations on accepts fields" section of the template format guide, and `docs/guides/decider-authoring.md` in the koto repository) -- read when a state stops only to ask the agent a closed question (an `enum` or `boolean` answer judged from stored inputs). Covers the `decider` block, the four modes, the escape, inputs and byte budgets, the one-question-per-state rule, the `E-DECIDER-FLOOR` rule, what the declaration hash covers, promotion through `koto decider report`, and which answers should never be promoted. Ship every answer in `shadow` or `never`. koto v0.12.2 ignores the block, so a template with declarations keeps working unchanged on older koto.
 - **Batch authoring guide** (`${CLAUDE_SKILL_DIR}/references/batch-authoring.md`) -- read when your workflow fans out a dynamic task list to child workers. Covers `materialize_children`, the `failure_reason` convention (W5), the `skipped_marker` child-template requirement (F5), aggregate-boolean routing (W4), and two-hat coordinators.
 - **Example templates** (`${CLAUDE_SKILL_DIR}/references/examples/`) -- read during state_design. Pick the one matching your complexity:

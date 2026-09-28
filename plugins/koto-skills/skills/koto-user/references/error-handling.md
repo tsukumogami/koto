@@ -150,8 +150,7 @@ Check that the directory is the one you meant.
 ## Nested tick refusals
 
 `koto next` runs a state's `default_action` and its command gates as child processes, and
-they inherit its environment. Before it runs anything, a tick exports
-`KOTO_TICK_SESSION` naming the session it is advancing. A `koto next` that finds that
+sets `KOTO_TICK_SESSION`, naming the session it is advancing, in the environment of each one. A `koto next` that finds that
 variable already set was started from inside one of those commands, and refuses:
 
 ```json
@@ -176,8 +175,9 @@ command. The enclosing tick is what advances the session.
 
 ### When the tick named in the message is already gone
 
-The marker is a plain inherited environment variable. Nothing behind it checks whether the
-tick still exists, and the message does not claim it does.
+The marker is a plain environment variable, and anything the command starts gets it from
+the command. Nothing behind it checks whether the tick still exists, and the message does not
+claim it does.
 
 That matters for one case. koto kills a timed-out command by its process group, and a
 command that detached itself first — `setsid`, or a backgrounded subshell — is no longer in
@@ -210,7 +210,7 @@ searching stderr for "timed out" is what the key exists to replace.
 |---|---|
 | `nonzero_exit` | The command ran to completion and exited non-zero. |
 | `timed_out` | The command did not finish within its timeout, so its process group was killed. Whatever it wrote before the kill is still reported. |
-| `spawn_failed` | No child process was ever started. Also covers an action refused before the spawn: a `working_dir` that is absolute, or one that resolves outside the session's execution anchor. |
+| `spawn_failed` | No child process was ever started: `/bin/sh` itself couldn't be run. Also covers an action refused before the spawn: a `working_dir` that is absolute, or one that resolves outside the session's execution anchor. A tool the shell can't find is not this kind; it's `nonzero_exit` with exit code 127. |
 | `wait_failed` | The child started but waiting on it failed, so no exit status was ever obtained. |
 | `capture_failed` | The command exited zero but its stdout could not be delivered under the state's `capture_stdout_as` name. Action failures only; a gate has nothing to capture. The `capture_error` object alongside it names the case: `empty`, `too_large`, or `disallowed_character`. |
 
@@ -227,6 +227,54 @@ The vocabulary is the same on both surfaces it appears on. What sits beside it i
   timeout still carries its `{"error": "timed_out"}`.
 
 See `response-shapes.md` scenario (k) for the full failed-action response.
+
+---
+
+## Command environment notes
+
+Gates and actions don't run with your shell's environment. Each runs as `/bin/sh -c` in a
+cleared environment: the live values of koto's default list of names and the names the
+template declares in `pass_env:`, the `PATH`, `HOME` and `XDG_CONFIG_HOME` recorded when the
+session was created, and `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`. The record can't be
+changed. None of the three messages below is an error envelope or changes `action`, and none
+of them alters gate evidence or action output. Keep dispatching on `action` as usual.
+
+**The stale-record note.** When a gate or action fails and either a recorded value no longer
+exists or the failure looks like a missing command (exit code 127, or the shell's `: not
+found` or `command not found` on stderr), `directive` opens with:
+
+```
+[koto] gate 'tests' failed in session 'demo', and recorded values no longer exist: PATH /home/dev/.nvm/versions/node/v20.1.0/bin. The record can't be changed; to run with different values, start a new session: `koto cancel --cleanup demo`, then `koto init` again.
+```
+
+When nothing is missing it says instead that the command ran under the session's recorded
+`PATH`, and shows it. An action is named `the default action of state '<state>'`. A recorded
+value that's gone with nothing failing gets a shorter notice. A `--to` refused by a
+non-overridable gate (`gate_blocked`) carries the same note inside its error message.
+
+Don't re-tick hoping it clears; it won't. Exporting a different `PATH` in your shell doesn't
+help either, since commands use the recorded one. Either put the tool back where the note
+says, or start a new session with the right environment: `koto cancel --cleanup <name>`, then
+`koto init` again from a shell where the tool is on `PATH`. Ask the user before discarding a
+session that holds work.
+
+**The adoption notice.** A session created by an earlier koto has no record. Its first
+`koto next` records one from your process and opens `directive` once with `[koto] Session
+'<name>' had no recorded command environment; its commands now run with PATH=..., HOME=...,
+XDG_CONFIG_HOME=...`, plus any dropped `PATH` entries. Read the values: they're what every
+later tick's commands use. If they're wrong (you ticked from an unusual shell), the remedy is
+the same new session.
+
+**`environment_drift` on attach.** `koto init --attach-live` from a shell whose `PATH`,
+`HOME` or `XDG_CONFIG_HOME` differs from the record still attaches. It prints one `warning:`
+line on stderr and adds `"environment_drift": ["PATH", ...]` to the output, naming variables
+and never values. It's informational: the session's commands keep using the recorded values.
+Act on it only if a gate later fails with the stale-record note.
+
+**A variable a command needs is missing.** A gate that reads a variable outside the default
+list finds it unset, which usually shows up as an ordinary gate failure with nothing from koto
+explaining it. That's a template fix: the author declares the name in `pass_env:`. Report it
+rather than working around it.
 
 ---
 

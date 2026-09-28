@@ -199,7 +199,7 @@ A state can declare a `default_action` — a command koto runs itself on enterin
 | `failure_kind` | Meaning | What you do |
 |---|---|---|
 | `nonzero_exit` | The command ran and exited non-zero. The only kind carrying a real `exit_code`. | Read `stderr` and fix what the command is complaining about, then re-tick. |
-| `spawn_failed` | No child process started — the tool isn't installed, the path doesn't resolve, or the action's `working_dir` was rejected. | Fix the environment or escalate; re-ticking unchanged won't help. |
+| `spawn_failed` | No child process started — `/bin/sh` couldn't be run, or the action's `working_dir` was rejected. (A tool the shell can't find is `nonzero_exit` with exit code 127; see [The environment commands run with](#the-environment-commands-run-with).) | Fix the environment or escalate; re-ticking unchanged won't help. |
 | `timed_out` | The command exceeded its 30-second timeout and its process group was killed. Whatever it printed before the kill is still reported. | Check whether the command is hung on something external before retrying. |
 | `wait_failed` | The child started but waiting on it failed, so no exit status was obtained. | Treat as infrastructure; report it. |
 | `capture_failed` | The command exited zero, but its stdout couldn't be delivered under the state's `capture_stdout_as` name. A `capture_error` object names the case: `empty`, `too_large`, or `disallowed_character`. | The command produced the wrong shape of output. This is a template problem — report it rather than working around it. |
@@ -236,6 +236,16 @@ A session created before anchoring existed has no recorded directory. Its first 
 It doesn't refuse and it doesn't adopt silently. Check that the directory it names is the one you meant before you keep ticking — the adopted directory is simply whatever tree was current. The notice appears once; the next tick takes the ordinary path.
 
 **Anchoring is not containment, sandboxing, or isolation.** It guarantees the directory a workflow's commands *start* in. It does not bound what a command can reach once running: a command can name absolute paths or change directory, and nothing here stops it. Don't rely on it as a safety boundary, and don't describe it to a user as one.
+
+## The environment commands run with
+
+Gates and actions don't see your shell's environment. `koto init` records `PATH`, `HOME` and `XDG_CONFIG_HOME` once, and every command runs as `/bin/sh -c` in a cleared environment: those recorded values, the live values of koto's default names (locale, `TMPDIR`, `GH_TOKEN`, proxies and the like) and of names the template lists in `pass_env:`, and `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`. Changing `PATH` in your shell doesn't change what a gate sees, and the record can't be changed. Three things can appear on a response because of this; none changes `action`, so keep dispatching as usual:
+
+- **An adoption notice**, once, on the first tick of a session an earlier koto created: `[koto] Session '<name>' had no recorded command environment; its commands now run with PATH=..., HOME=..., XDG_CONFIG_HOME=...`. Check the values look like your normal shell's.
+- **A stale-record note** opening `directive` when a gate or action failed and a recorded value is gone or the command wasn't found (exit 127). It names the gate or action, the missing value or the recorded `PATH`, and the remedy. Re-ticking won't fix it. Restore the tool where the note says, or, with the user's agreement if the session holds work, start a new session: `koto cancel --cleanup <name>`, then `koto init` again from a shell that has the tool.
+- **`environment_drift`** in `koto init --attach-live` output (plus a stderr `warning:`), naming variables whose values differ from the record. The attach succeeded; commands still use the recorded values. Ignore it unless a gate later fails with the stale-record note.
+
+A gate failing because a variable it reads is unset, with no note from koto, usually means the template didn't declare that name in `pass_env:`. Report it to the template's author. Details and exact messages are in [error-handling.md](references/error-handling.md#command-environment-notes).
 
 ## Resuming a session
 
@@ -589,7 +599,7 @@ Read these on demand, not upfront. The sections above cover the common path. Con
 
 **"nested_invocation"** — a `koto next` ran from inside a command koto itself was running. koto refuses it: a nested tick would advance the session while the tick that spawned it kept reporting the state it started with. If you hit this from a template's `default_action` or command gate, that call has to come out — the enclosing tick is what advances the session.
 
-**"nested_invocation" when no tick is running** — the marker is an inherited environment variable with no liveness behind it, so a process that outlived its tick keeps it. A command that detaches (`setsid`, a backgrounded subshell) escapes the process-group kill koto uses at timeout and carries `KOTO_TICK_SESSION` for as long as it lives, so a `koto next` it runs minutes later is refused in the name of a tick that exited long ago. The message names the session, which is your clue: if `koto status` on that session shows nothing in progress, clear the marker and re-run — `KOTO_TICK_SESSION= koto next <name>`. Don't clear it reflexively. Inside a command that really is running under a tick, clearing it re-opens the defect the refusal exists to stop.
+**"nested_invocation" when no tick is running** — koto sets the marker in every command's environment, anything the command starts gets it too, and nothing behind it checks that the tick is still running, so a process that outlived its tick keeps it. A command that detaches (`setsid`, a backgrounded subshell) escapes the process-group kill koto uses at timeout and carries `KOTO_TICK_SESSION` for as long as it lives, so a `koto next` it runs minutes later is refused in the name of a tick that exited long ago. The message names the session, which is your clue: if `koto status` on that session shows nothing in progress, clear the marker and re-run — `KOTO_TICK_SESSION= koto next <name>`. Don't clear it reflexively. Inside a command that really is running under a tick, clearing it re-opens the defect the refusal exists to stop.
 
 **A blocking condition named `__action__`** — the state's own `default_action` command failed; the state's gates never ran. Read `output.failure_kind` to decide what to do, and the front of `directive` for the author's fallback instructions. See [When a default action fails](#when-a-default-action-fails).
 
