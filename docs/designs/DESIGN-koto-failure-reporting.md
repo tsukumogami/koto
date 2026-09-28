@@ -364,7 +364,8 @@ or size. The process that performs the read appends it, through the same path
 inside a tick doesn't collide with the tick's lock. Gate reads are held on the
 evaluation result, outside `output`, and appended just before that
 evaluation's `gate_evaluated`; an evaluation that isn't recorded (a polling
-re-evaluation) drops them.
+re-evaluation) drops them. koto writes `access` on every read it logs, so
+"absent means `content`" only covers events from other writers.
 
 `context_added` and `context_removed` gain an optional `writer` (`agent`,
 `transition`, `koto`, `sync`). The three silent writers now append
@@ -758,6 +759,8 @@ skip it like any `tier: 2` event:
 | `hash` | string | no | Lowercase hex SHA-256 of the content, present exactly when `present` is true. |
 | `access` | string | no | `content` or `presence` (a context-exists gate or `koto context exists`). Absent means `content`. |
 | `gate` | string | no | The gate's name when `reader` is `gate`. |
+
+A presence read of a key that exists but has neither stored metadata nor readable content has no hash to record, so it logs nothing rather than a `present: true` event without `hash`.
 
 **Reserved and aligned names.** The contract reserves the field name
 `escalation` on `gate_evaluated` and `default_action_executed` for a later

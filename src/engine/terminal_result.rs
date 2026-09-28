@@ -153,7 +153,7 @@ pub fn failure_reason_for_current_run(
                     .ok()
                     .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
             ),
-            EventPayload::ContextRemoved { key } if key == FAILURE_REASON_KEY => Some(None),
+            EventPayload::ContextRemoved { key, .. } if key == FAILURE_REASON_KEY => Some(None),
             _ => None,
         })
         .flatten()?;

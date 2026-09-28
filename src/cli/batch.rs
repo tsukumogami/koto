@@ -3231,13 +3231,31 @@ pub(crate) fn finalize_batch_if_complete(
     }
     // Persist batch_final_view to the context store so agents can retrieve
     // it via `koto context get <wf> batch_final_view` without parsing the
-    // event log or terminal response.
+    // event log or terminal response. koto is the writer, and the write is
+    // logged right after it lands, best-effort.
     if let Ok(serialized) = serde_json::to_string_pretty(&view_json) {
-        if let Err(e) = context_store.add(parent_name, "batch_final_view", serialized.as_bytes()) {
-            eprintln!(
-                "warning: failed to write batch_final_view to context: {}",
-                e
-            );
+        use crate::session::context_log::{
+            added_event, append_to_session_best_effort, WRITER_KOTO,
+        };
+        match context_store.add_with_writer(
+            parent_name,
+            "batch_final_view",
+            serialized.as_bytes(),
+            WRITER_KOTO,
+        ) {
+            Ok(()) => {
+                append_to_session_best_effort(
+                    backend,
+                    parent_name,
+                    &added_event("batch_final_view", serialized.as_bytes(), WRITER_KOTO),
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to write batch_final_view to context: {}",
+                    e
+                );
+            }
         }
     }
 }

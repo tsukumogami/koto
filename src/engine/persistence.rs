@@ -158,6 +158,9 @@ pub fn append_event_in<H: LogHeader>(
         !matches!(payload, EventPayload::Unknown { .. }),
         "Unknown events must not be passed to append_event"
     );
+    // Held from reading the last seq until the line is synced, so two
+    // processes appending at once can't both take the same seq.
+    let _append_lock = AppendLock::acquire(path);
     let next_seq = next_seq_after_header::<H>(path)?;
 
     let event = Event {
@@ -330,6 +333,10 @@ pub fn append_event_idempotent_in<H: LogHeader>(
     // file; concurrent readers via `read_events` do NOT take a lock and
     // are unaffected (advisory).
     let _guard = acquire_state_flock(path)?;
+    // The append lock every append path shares, held through the seq read,
+    // the scan and the write, so a plain `append_event` from another process
+    // can't take the seq this append is about to use.
+    let _append_lock = AppendLock::acquire(path);
 
     // Check the header first, so a log that is missing, empty or headerless
     // is refused whether or not the scan below finds a prior event. Doing it
@@ -401,6 +408,58 @@ pub fn append_event_idempotent_in<H: LogHeader>(
         .map_err(|e| anyhow::anyhow!("failed to sync state file {}: {}", path.display(), e))?;
 
     Ok(AppendOutcome::Written { seq: next_seq })
+}
+
+/// File name of the per-log append lock, a sidecar in the log's directory.
+/// It holds no data.
+pub const APPEND_LOCK_FILE: &str = "append.lock";
+
+/// An exclusive `flock` on the sidecar [`APPEND_LOCK_FILE`] beside a log,
+/// released on drop.
+///
+/// Every append path takes it, and only around reading the last seq, writing
+/// the line and syncing it: never while a command runs, so a gate's own
+/// `koto context get` can't wait on the tick that is running it. It is a
+/// dedicated file rather than the log itself, so it never contends with the
+/// state-file lock a batch tick holds for the whole tick.
+///
+/// Where the lock can't be had -- no `flock` on this platform, a directory
+/// the sidecar can't be created in, a filesystem that refuses the call --
+/// the append proceeds unlocked, as appends did before the lock existed.
+struct AppendLock {
+    #[cfg(unix)]
+    _file: Option<std::fs::File>,
+}
+
+impl AppendLock {
+    #[cfg(unix)]
+    fn acquire(log: &Path) -> Self {
+        use std::os::fd::AsRawFd;
+        let Some(dir) = log.parent() else {
+            return AppendLock { _file: None };
+        };
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(APPEND_LOCK_FILE))
+        {
+            Ok(f) => f,
+            Err(_) => return AppendLock { _file: None },
+        };
+        // SAFETY: `fd` is borrowed from `file`, which outlives the call.
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if ret != 0 {
+            return AppendLock { _file: None };
+        }
+        AppendLock { _file: Some(file) }
+    }
+
+    #[cfg(not(unix))]
+    fn acquire(_log: &Path) -> Self {
+        AppendLock {}
+    }
 }
 
 /// Acquire an exclusive `flock(LOCK_EX)` on the state file. The lock
@@ -1887,6 +1946,7 @@ mod tests {
             key: key.to_string(),
             hash: "abc".to_string(),
             size: 1,
+            writer: None,
         }
     }
 

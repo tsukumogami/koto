@@ -18,6 +18,7 @@ use crate::findings::{
     LOG_FINDINGS_CAP,
 };
 use crate::gate::{GateOutcome, StructuredGateResult};
+use crate::session::context_log::{append_best_effort, READER_GATE};
 use crate::template::types::{
     is_is_set_matcher, is_present_matcher, ActionDecl, CompiledTemplate, TemplateState,
     ACTION_CONDITION_NAME, EVIDENCE_NAMESPACE, GATES_EVIDENCE_NAMESPACE, VARS_NAMESPACE,
@@ -268,6 +269,7 @@ fn action_condition(
         failure: Some(failure),
         findings,
         duration_ms: None,
+        context_reads: Vec::new(),
     };
     fill_effect_landed(result.all_findings_mut(), false);
 
@@ -1574,6 +1576,15 @@ where
                         check,
                         streams: logged_streams(result),
                     };
+                    // The gate's own context reads come immediately before
+                    // its `gate_evaluated`, best-effort: a read that can't be
+                    // logged never fails the tick.
+                    for read in &result.context_reads {
+                        let read_event =
+                            read.clone()
+                                .into_event(READER_GATE, &state, Some(gate_name.as_str()));
+                        append_best_effort(&read_event, |p| append_event(p));
+                    }
                     append_event(&gate_evaluated_payload)
                         .map_err(AdvanceError::PersistenceError)?;
                     gate_results.insert(gate_name.clone(), result.clone());
@@ -7213,6 +7224,7 @@ mod tests {
             failure: Some(failure),
             findings,
             duration_ms: Some(7),
+            context_reads: Vec::new(),
         }
     }
 
@@ -7259,6 +7271,86 @@ mod tests {
             payload,
             idempotency_hash: None,
         }
+    }
+
+    /// A failing gate that read `note` (absent) and `other` (present).
+    fn gate_with_reads() -> StructuredGateResult {
+        let mut result = failing_gate_result("lint", vec![]);
+        result.context_reads = vec![
+            crate::session::context_log::ContextReadRecord::content("note", None).unwrap(),
+            crate::session::context_log::ContextReadRecord::content("other", Some(b"x")).unwrap(),
+        ];
+        result
+    }
+
+    fn run_with_reads(appended: &mut Vec<EventPayload>) -> Result<AdvanceResult, AdvanceError> {
+        let template = make_template(vec![("check", gated_state(&["lint"]))]);
+        let mut append = |p: &EventPayload| -> Result<(), String> {
+            appended.push(p.clone());
+            Ok(())
+        };
+        let gates = |_: &BTreeMap<String, crate::template::types::Gate>| {
+            let mut out = BTreeMap::new();
+            out.insert("lint".to_string(), gate_with_reads());
+            Ok(out)
+        };
+        advance_until_stop(
+            "check",
+            &template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &gates,
+            &unavailable_integration,
+            &noop_action,
+            &VariableOverlay::new(),
+            &AtomicBool::new(false),
+        )
+    }
+
+    #[test]
+    fn a_gates_reads_are_appended_immediately_before_its_gate_evaluated() {
+        let mut appended = Vec::new();
+        run_with_reads(&mut appended).unwrap();
+        let types: Vec<&str> = appended.iter().map(|p| p.type_name()).collect();
+        assert_eq!(
+            types,
+            vec!["context_read", "context_read", "gate_evaluated"]
+        );
+        match &appended[0] {
+            EventPayload::ContextRead {
+                key,
+                reader,
+                state,
+                present,
+                hash,
+                gate,
+                ..
+            } => {
+                assert_eq!(key, "note");
+                assert_eq!(reader, "gate");
+                assert_eq!(state, "check");
+                assert!(!present);
+                assert_eq!(*hash, None);
+                assert_eq!(gate.as_deref(), Some("lint"));
+            }
+            other => panic!("expected a read, got {other:?}"),
+        }
+    }
+
+    /// With the reads' appends failing, the tick ends exactly as it does
+    /// when they land, and the gate's own record is still written.
+    #[test]
+    fn failing_read_appends_leave_the_tick_unchanged() {
+        let mut logged = Vec::new();
+        let expected = run_with_reads(&mut logged).unwrap();
+
+        let _hook = crate::session::context_log::fail_best_effort_appends();
+        let mut appended = Vec::new();
+        let result = run_with_reads(&mut appended).unwrap();
+        assert_eq!(result, expected);
+        let types: Vec<&str> = appended.iter().map(|p| p.type_name()).collect();
+        assert_eq!(types, vec!["gate_evaluated"]);
     }
 
     #[test]

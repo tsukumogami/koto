@@ -31,15 +31,32 @@ const MAX_WALK_HOPS: u32 = 1000;
 
 /// Publish `dir` as `session_id`'s `/workflows` location.
 ///
-/// Writes the reserved key through [`ContextStore::add`], which does **not**
-/// append an event -- so publishing neither perturbs the session's event log
-/// nor re-enters the commit funnel.
+/// Writes the reserved key with writer `koto`, then appends a
+/// `context_added` event naming that writer to the session's log,
+/// best-effort: a failed append warns and still leaves the location
+/// published. That append goes through the commit funnel, and when
+/// publishing happens during a materialization,
+/// [`materialize_after_commit`](super::materialize_after_commit)'s
+/// re-entrancy guard keeps it from materializing again.
 pub fn publish_location(
+    backend: &dyn SessionBackend,
     store: &dyn ContextStore,
     session_id: &str,
     dir: &str,
 ) -> anyhow::Result<()> {
-    store.add(session_id, PUBLISH_LOCATION_KEY, dir.as_bytes())
+    use crate::session::context_log::{added_event, append_to_session_best_effort, WRITER_KOTO};
+    store.add_with_writer(
+        session_id,
+        PUBLISH_LOCATION_KEY,
+        dir.as_bytes(),
+        WRITER_KOTO,
+    )?;
+    append_to_session_best_effort(
+        backend,
+        session_id,
+        &added_event(PUBLISH_LOCATION_KEY, dir.as_bytes(), WRITER_KOTO),
+    );
+    Ok(())
 }
 
 /// Whether `session_id` already has a published location in its own store.
@@ -139,7 +156,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = LocalBackend::with_base_dir(tmp.path().to_path_buf());
         init_session(&backend, "solo", None);
-        publish_location(&backend, "solo", "/tmp/wf/solo").unwrap();
+        publish_location(&backend, &backend, "solo", "/tmp/wf/solo").unwrap();
 
         let got = resolve_publish_location(&backend, &backend, "solo");
         assert_eq!(got, Some(PathBuf::from("/tmp/wf/solo")));
@@ -152,7 +169,7 @@ mod tests {
         init_session(&backend, "root", None);
         init_session(&backend, "child", Some("root"));
         // Only the ancestor published; the child inherits via the walk.
-        publish_location(&backend, "root", "/tmp/wf/root").unwrap();
+        publish_location(&backend, &backend, "root", "/tmp/wf/root").unwrap();
 
         let got = resolve_publish_location(&backend, &backend, "child");
         assert_eq!(got, Some(PathBuf::from("/tmp/wf/root")));
@@ -165,8 +182,8 @@ mod tests {
         init_session(&backend, "root", None);
         init_session(&backend, "mid", Some("root"));
         init_session(&backend, "leaf", Some("mid"));
-        publish_location(&backend, "root", "/tmp/wf/root").unwrap();
-        publish_location(&backend, "mid", "/tmp/wf/mid").unwrap();
+        publish_location(&backend, &backend, "root", "/tmp/wf/root").unwrap();
+        publish_location(&backend, &backend, "mid", "/tmp/wf/mid").unwrap();
 
         // The nearer ancestor (mid) wins over the farther one (root).
         let got = resolve_publish_location(&backend, &backend, "leaf");

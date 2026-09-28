@@ -562,11 +562,25 @@ fn a_submission_during_the_call_wins_and_the_answer_is_not_applied() {
         vec![
             ("evidence_submitted".to_string(), String::new()),
             ("transitioned".to_string(), "rethink".to_string()),
+            // The consultation's context input read, logged just before it.
+            ("context_read".to_string(), String::new()),
             ("decider_consulted".to_string(), String::new()),
         ],
         "{}",
         h.raw_log()
     );
+    // The input was read while the session stood in `review`, and that is
+    // the state the read names, though the agent had moved it on by the
+    // time the read was logged.
+    let decider_reads: Vec<Value> = h
+        .events_of("context_read")
+        .into_iter()
+        .filter(|e| e["payload"]["reader"] == "decider")
+        .collect();
+    assert_eq!(decider_reads.len(), 1, "{}", h.raw_log());
+    assert_eq!(decider_reads[0]["payload"]["state"], "review");
+    assert_eq!(decider_reads[0]["payload"]["access"], "content");
+    assert_eq!(decider_reads[0]["payload"]["present"], true);
 
     // The session is where the agent put it.
     let out = h.next(h.koto());

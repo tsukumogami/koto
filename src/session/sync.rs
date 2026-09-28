@@ -175,7 +175,10 @@ pub fn push_context_key(
 ///
 /// Compares the hash in the remote manifest against the local manifest.
 /// If they differ (or the key is missing locally), downloads the content
-/// and writes it via `local.add()`.
+/// and writes it locally with writer `sync`.
+///
+/// Returns whether it wrote the local store, so the caller can log the
+/// write (a `context_added` with `writer: "sync"`).
 pub fn pull_context_if_newer(
     local: &LocalBackend,
     bucket: &Bucket,
@@ -183,23 +186,23 @@ pub fn pull_context_if_newer(
     session: &str,
     key: &str,
     cache: &ManifestCache,
-) {
+) -> bool {
     let manifest_key = format!("{}/{}/ctx/manifest.json", prefix, session);
     let remote_manifest = match fetch_remote_manifest(bucket, &manifest_key, session, cache) {
         Some(m) => m,
-        None => return,
+        None => return false,
     };
 
     let remote_meta = match remote_manifest.keys.get(key) {
         Some(m) => m,
-        None => return, // Key doesn't exist remotely.
+        None => return false, // Key doesn't exist remotely.
     };
 
     // Check if local hash matches remote hash.
     let local_manifest = local.read_manifest(session).unwrap_or_default();
     if let Some(local_meta) = local_manifest.keys.get(key) {
         if local_meta.hash == remote_meta.hash {
-            return; // Hashes match, no download needed.
+            return false; // Hashes match, no download needed.
         }
     }
 
@@ -212,7 +215,7 @@ pub fn pull_context_if_newer(
                 "warning: cloud sync: failed to download context key '{}': {}",
                 key, e
             );
-            return;
+            return false;
         }
     };
     if response.status_code() != 200 {
@@ -221,16 +224,38 @@ pub fn pull_context_if_newer(
             response.status_code(),
             key
         );
-        return;
+        return false;
     }
 
-    // Write locally via the local backend's add method.
-    if let Err(e) = local.add(session, key, response.bytes()) {
-        eprintln!(
-            "warning: cloud sync: failed to write downloaded key '{}': {}",
-            key, e
-        );
+    // Write locally, naming the pull as the writer.
+    match local.add_with_writer(
+        session,
+        key,
+        response.bytes(),
+        crate::session::context_log::WRITER_SYNC,
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "warning: cloud sync: failed to write downloaded key '{}': {}",
+                key, e
+            );
+            false
+        }
     }
+}
+
+/// The remote manifest's metadata for `key`, if the remote store has it.
+pub fn remote_key_meta(
+    bucket: &Bucket,
+    prefix: &str,
+    session: &str,
+    key: &str,
+    cache: &ManifestCache,
+) -> Option<crate::session::context::KeyMeta> {
+    let manifest_key = format!("{}/{}/ctx/manifest.json", prefix, session);
+    let mut manifest = fetch_remote_manifest(bucket, &manifest_key, session, cache)?;
+    manifest.keys.remove(key)
 }
 
 /// Delete a context key from S3 and upload the updated manifest.

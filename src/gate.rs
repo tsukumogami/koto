@@ -21,6 +21,7 @@ use crate::findings::{
 };
 use crate::redact::{redact_str, Redactor};
 use crate::session::context::ContextStore;
+use crate::session::context_log::ContextReadRecord;
 use crate::template::types::{
     Gate, GATE_TYPE_CHILDREN_COMPLETE, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS,
     GATE_TYPE_CONTEXT_MATCHES, GATE_TYPE_REQUEST_LEG, SUPPORTED_GATE_TYPES,
@@ -76,6 +77,12 @@ pub struct StructuredGateResult {
     /// milliseconds. `None` for gates that run no command.
     #[serde(skip)]
     pub duration_ms: Option<u64>,
+    /// The context reads a context gate performed, held here rather than in
+    /// `output` so routing never sees them. The advance loop appends them
+    /// as `context_read` events just before this evaluation's
+    /// `gate_evaluated`; an evaluation that isn't recorded drops them.
+    #[serde(skip)]
+    pub context_reads: Vec<ContextReadRecord>,
 }
 
 impl StructuredGateResult {
@@ -123,6 +130,7 @@ impl Default for StructuredGateResult {
             failure: None,
             findings: Vec::new(),
             duration_ms: None,
+            context_reads: Vec::new(),
         }
     }
 }
@@ -517,16 +525,22 @@ fn evaluate_context_exists_gate(
     if let Some(result) = unusable_key_result(&gate.key, "exists") {
         return result;
     }
-    if store.ctx_exists(sess, &gate.key) {
+    let present = store.ctx_exists(sess, &gate.key);
+    let context_reads = ContextReadRecord::presence(store, sess, &gate.key, present)
+        .into_iter()
+        .collect();
+    if present {
         StructuredGateResult {
             outcome: GateOutcome::Passed,
             output: serde_json::json!({"exists": true, "error": ""}),
+            context_reads,
             ..Default::default()
         }
     } else {
         StructuredGateResult {
             outcome: GateOutcome::Failed,
             output: serde_json::json!({"exists": false, "error": ""}),
+            context_reads,
             ..Default::default()
         }
     }
@@ -572,7 +586,10 @@ fn evaluate_context_matches_gate(
     session: Option<&str>,
 ) -> (StructuredGateResult, bool) {
     let mut key_absent = false;
-    let result = context_matches_result(gate, context_store, session, &mut key_absent);
+    let mut reads = Vec::new();
+    let mut result =
+        context_matches_result(gate, context_store, session, &mut key_absent, &mut reads);
+    result.context_reads = reads;
     (result, key_absent)
 }
 
@@ -581,6 +598,7 @@ fn context_matches_result(
     context_store: Option<&dyn ContextStore>,
     session: Option<&str>,
     key_absent: &mut bool,
+    reads: &mut Vec<ContextReadRecord>,
 ) -> StructuredGateResult {
     let (store, sess) = match (context_store, session) {
         (Some(s), Some(n)) => (s, n),
@@ -618,7 +636,12 @@ fn context_matches_result(
             ..Default::default()
         };
     }
-    let content = match store.get(sess, &gate.key) {
+    let fetched = store.get(sess, &gate.key);
+    reads.extend(ContextReadRecord::content(
+        &gate.key,
+        fetched.as_deref().ok(),
+    ));
+    let content = match fetched {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(s) => s,
             Err(_) => {
@@ -733,6 +756,7 @@ fn command_gate_result(
             failure: None,
             findings: check.findings,
             duration_ms,
+            context_reads: Vec::new(),
         };
     };
     let (outcome, evidence) = match kind {
@@ -765,6 +789,7 @@ fn command_gate_result(
         failure: Some(failure),
         findings,
         duration_ms,
+        context_reads: Vec::new(),
     }
 }
 

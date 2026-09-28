@@ -497,8 +497,15 @@ impl LocalBackend {
     }
 }
 
-impl ContextStore for LocalBackend {
-    fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
+impl LocalBackend {
+    /// Write `content` under `key`, recording `writer` in the manifest.
+    fn add_as(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: Option<&str>,
+    ) -> anyhow::Result<()> {
         validate_context_key(key)?;
 
         let ctx_dir = self.ctx_dir(session);
@@ -537,6 +544,7 @@ impl ContextStore for LocalBackend {
                 created_at: now_iso8601(),
                 size: content.len() as u64,
                 hash: sha256_hex(content),
+                writer: writer.map(str::to_string),
             },
         );
         self.write_manifest(session, &manifest)?;
@@ -545,6 +553,29 @@ impl ContextStore for LocalBackend {
         Self::release_flock(&manifest_lock);
 
         Ok(())
+    }
+}
+
+impl ContextStore for LocalBackend {
+    fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
+        self.add_as(session, key, content, None)
+    }
+
+    fn add_with_writer(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        self.add_as(session, key, content, Some(writer))
+    }
+
+    fn meta(&self, session: &str, key: &str) -> Option<KeyMeta> {
+        if validate_context_key(key).is_err() {
+            return None;
+        }
+        self.read_manifest(session).ok()?.keys.remove(key)
     }
 
     fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {

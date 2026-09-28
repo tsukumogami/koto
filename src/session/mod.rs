@@ -1,5 +1,6 @@
 pub mod cloud;
 pub mod context;
+pub mod context_log;
 pub mod local;
 pub mod recover;
 pub mod sync;
@@ -612,6 +613,26 @@ impl ContextStore for Backend {
         match self {
             Backend::Local(b) => b.add(session, key, content),
             Backend::Cloud(b) => b.add(session, key, content),
+        }
+    }
+
+    fn add_with_writer(
+        &self,
+        session: &str,
+        key: &str,
+        content: &[u8],
+        writer: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.add_with_writer(session, key, content, writer),
+            Backend::Cloud(b) => b.add_with_writer(session, key, content, writer),
+        }
+    }
+
+    fn meta(&self, session: &str, key: &str) -> Option<context::KeyMeta> {
+        match self {
+            Backend::Local(b) => b.meta(session, key),
+            Backend::Cloud(b) => b.meta(session, key),
         }
     }
 

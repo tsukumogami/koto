@@ -48,6 +48,7 @@ use crate::engine::persistence::instructions_delivered_this_window;
 use crate::engine::substitute::bindings_from_events;
 use crate::engine::types::{Event, EventPayload};
 use crate::session::context::ContextStore;
+use crate::session::context_log::{ContextReadRecord, READER_DECIDER};
 use crate::session::SessionBackend;
 use crate::template::decider::DeciderInputSource;
 use crate::template::types::TemplateState;
@@ -85,6 +86,9 @@ pub struct CliDeciderPort<'a> {
     session_id: Option<String>,
     recorded: usize,
     ledger_root: Option<PathBuf>,
+    /// `context_read` events for the context inputs the last consultation
+    /// read, until the engine takes them.
+    pending_reads: Vec<EventPayload>,
 }
 
 impl<'a> CliDeciderPort<'a> {
@@ -111,6 +115,7 @@ impl<'a> CliDeciderPort<'a> {
             session_id: None,
             recorded: 0,
             ledger_root: None,
+            pending_reads: Vec::new(),
         }
     }
 
@@ -192,10 +197,15 @@ impl<'a> CliDeciderPort<'a> {
     /// budget. Sources are closed: a context-store key (with `{{KEY}}`
     /// references substituted) or a template variable or capture. Nothing
     /// else in the session is read.
+    ///
+    /// Each context input read is pushed onto `reads`, including one that
+    /// found the key absent, so it can be logged whether or not assembly
+    /// went on to succeed.
     fn assemble_inputs(
         &self,
         fields: &[DeclaredField<'_>],
         events: &[Event],
+        reads: &mut Vec<ContextReadRecord>,
     ) -> Result<AssembledInputs, InputUnavailable> {
         let bindings = bindings_from_events(events);
         let mut out = AssembledInputs::new();
@@ -208,10 +218,9 @@ impl<'a> CliDeciderPort<'a> {
                 let content = match &input.source {
                     DeciderInputSource::Context(raw_key) => {
                         let key = (self.render)(raw_key);
-                        let bytes = self
-                            .context_store
-                            .get(&self.session, &key)
-                            .map_err(|_| InputUnavailable::Unset)?;
+                        let fetched = self.context_store.get(&self.session, &key);
+                        reads.extend(ContextReadRecord::content(&key, fetched.as_deref().ok()));
+                        let bytes = fetched.map_err(|_| InputUnavailable::Unset)?;
                         if bytes.len() > budget {
                             return Err(InputUnavailable::OverBudget);
                         }
@@ -392,8 +401,13 @@ impl DeciderPort for CliDeciderPort<'_> {
         let guard = VisitGuard::new(lock);
         let directive_bytes = self.directive_bytes(req.state, req.template_state, &events);
 
-        let request = self
-            .assemble_inputs(req.fields, &events)
+        let mut reads = Vec::new();
+        let assembled = self.assemble_inputs(req.fields, &events, &mut reads);
+        self.pending_reads = reads
+            .into_iter()
+            .map(|r| r.into_event(READER_DECIDER, req.state, None))
+            .collect();
+        let request = assembled
             .ok()
             .and_then(|inputs| build_request(req.fields, inputs.as_map()).ok());
         let Some(request) = request else {
@@ -442,6 +456,10 @@ impl DeciderPort for CliDeciderPort<'_> {
         self.recorded += 1;
         let record = LedgerRecord::consulted(&self.session, self.session_id.as_deref(), c.clone());
         append_or_warn(self.ledger_root.as_deref(), &record);
+    }
+
+    fn take_context_reads(&mut self) -> Vec<EventPayload> {
+        std::mem::take(&mut self.pending_reads)
     }
 }
 
@@ -907,6 +925,7 @@ d
         // Anything else the engine reports is not a consultation.
         p.recorded(&EventPayload::ContextRemoved {
             key: "k".to_string(),
+            writer: None,
         });
         let body = std::fs::read_to_string(crate::decider::ledger::ledger_path(&root)).unwrap();
         let lines: Vec<&str> = body.lines().collect();

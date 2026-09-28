@@ -827,8 +827,11 @@ Records when a named integration (external system call) ran during a state.
 
 #### `context_added`
 
-Emitted by `koto context add` after a context artifact is stored. All `context_added`
-events with `seq < transition.seq` were available before that transition.
+Emitted after a context artifact is stored: by `koto context add`, and by
+koto itself when it writes a key of its own (the batch final view, the
+published `/workflows` location) or pulls a newer copy of a key from cloud
+storage. All `context_added` events with `seq < transition.seq` were available
+before that transition.
 
 ```json
 {

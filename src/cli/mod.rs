@@ -850,7 +850,7 @@ fn handle_workflows_action(action: WorkflowsAction) -> Result<()> {
                     )
                 })?,
             };
-            crate::workflows_surface::publish_location(&backend, &session_id, &dir)?;
+            crate::workflows_surface::publish_location(&backend, &backend, &session_id, &dir)?;
             Ok(())
         }
     }
@@ -1568,8 +1568,15 @@ pub fn run(app: App) -> Result<()> {
                     key,
                     to_file,
                 } => {
-                    context::restore_assigned(store, &backend, &session, &key);
-                    if let Err(e) = context::handle_get(store, &session, &key, to_file.as_deref()) {
+                    let events = context::restore_assigned(store, &backend, &session, &key);
+                    if let Err(e) = context::handle_get(
+                        store,
+                        &backend,
+                        events.as_deref(),
+                        &session,
+                        &key,
+                        to_file.as_deref(),
+                    ) {
                         exit_with_error_code(
                             serde_json::json!({
                                 "error": e.to_string(),
@@ -1585,8 +1592,9 @@ pub fn run(app: App) -> Result<()> {
                     // caller that branches on success-versus-failure is
                     // unaffected; exit 2 is "not a key at all", which koto
                     // already uses for input the caller must fix.
-                    context::restore_assigned(store, &backend, &session, &key);
-                    match context::handle_exists(store, &session, &key) {
+                    let events = context::restore_assigned(store, &backend, &session, &key);
+                    match context::handle_exists(store, &backend, events.as_deref(), &session, &key)
+                    {
                         context::KeyPresence::Present => std::process::exit(0),
                         context::KeyPresence::Absent => std::process::exit(1),
                         context::KeyPresence::Unusable(reason) => {
@@ -2794,18 +2802,26 @@ fn terminal_record(
             already_recorded: true,
         };
     }
-    let result =
-        resolve_terminal_result(backend, context_store, name, compiled, final_state, &events);
+    // This is the recording path, so its context reads are logged (`reader:
+    // "result"`), the `failure_reason` read included. `koto status` resolves
+    // read-only through `resolve_terminal_result` directly and logs nothing.
+    let recording = crate::session::context_log::RecordingStore::new(context_store);
+    let result = resolve_terminal_result(backend, &recording, name, compiled, final_state, &events);
     let failure_reason = match result.status {
         crate::engine::types::TerminalOutcome::Failure => {
             crate::engine::terminal_result::failure_reason_for_current_run(
-                context_store,
-                name,
-                &events,
+                &recording, name, &events,
             )
         }
         _ => None,
     };
+    crate::session::context_log::append_reads(
+        backend,
+        name,
+        recording.into_reads(),
+        crate::session::context_log::READER_RESULT,
+        final_state,
+    );
     TerminalRecord {
         result,
         failure_reason,

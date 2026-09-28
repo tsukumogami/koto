@@ -854,7 +854,9 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rationale: Option<String>,
     },
-    /// Emitted when a context artifact is successfully stored via `koto context add`.
+    /// Emitted when a context artifact is stored: by `koto context add`, and
+    /// by koto's own writes to the store (the batch final view, the
+    /// published `/workflows` location, a cloud pull).
     ContextAdded {
         /// The context key under which the artifact was stored.
         key: String,
@@ -862,6 +864,11 @@ pub enum EventPayload {
         hash: String,
         /// Size of the artifact content in bytes.
         size: u64,
+        /// Who wrote the key: `agent`, `koto` or `sync` (an open
+        /// vocabulary). Absent on events written before writers were
+        /// recorded, which read as an unknown writer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writer: Option<String>,
     },
     /// Emitted when a context key is removed via `koto context remove`.
     ///
@@ -873,6 +880,35 @@ pub enum EventPayload {
     ContextRemoved {
         /// The context key that was removed.
         key: String,
+        /// Who removed the key (`agent` for `koto context remove`). Absent on
+        /// events written before writers were recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writer: Option<String>,
+    },
+    /// One logged read of a context key. Never carries content or size: a
+    /// present key's `hash` is what joins the read to the write that
+    /// produced it (the latest write of the key below this event's `seq`
+    /// whose hash matches).
+    ContextRead {
+        /// The key read.
+        key: String,
+        /// Who read it: `gate`, `cli`, `result` or `decider` (an open
+        /// vocabulary).
+        reader: String,
+        /// The workflow's current state at the read.
+        state: String,
+        /// Whether the key existed.
+        present: bool,
+        /// Lowercase hex SHA-256 of the content; present exactly when
+        /// `present` is true.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hash: Option<String>,
+        /// `content` or `presence`; absent means `content`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        access: Option<String>,
+        /// The gate's name when `reader` is `gate`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gate: Option<String>,
     },
     WorkflowCancelled {
         state: String,
@@ -1620,6 +1656,7 @@ impl EventPayload {
             EventPayload::Rewound { .. } => "rewound",
             EventPayload::ContextAdded { .. } => "context_added",
             EventPayload::ContextRemoved { .. } => "context_removed",
+            EventPayload::ContextRead { .. } => "context_read",
             EventPayload::WorkflowCancelled { .. } => "workflow_cancelled",
             EventPayload::DefaultActionExecuted { .. } => "default_action_executed",
             EventPayload::DecisionRecorded { .. } => "decision_recorded",
@@ -1815,12 +1852,29 @@ impl<'de> Deserialize<'de> for Event {
                     key: p.key,
                     hash: p.hash,
                     size: p.size,
+                    writer: lenient_string(p.writer),
                 }
             }
             "context_removed" => {
                 let p: ContextRemovedPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
-                EventPayload::ContextRemoved { key: p.key }
+                EventPayload::ContextRemoved {
+                    key: p.key,
+                    writer: lenient_string(p.writer),
+                }
+            }
+            "context_read" => {
+                let p: ContextReadPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::ContextRead {
+                    key: p.key,
+                    reader: p.reader,
+                    state: p.state,
+                    present: p.present,
+                    hash: p.hash,
+                    access: p.access,
+                    gate: p.gate,
+                }
             }
             "workflow_cancelled" => {
                 let p: WorkflowCancelledPayload = serde_json::from_value(payload_val.clone())
@@ -2122,11 +2176,35 @@ struct ContextAddedPayload {
     key: String,
     hash: String,
     size: u64,
+    #[serde(default)]
+    writer: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct ContextRemovedPayload {
     key: String,
+    #[serde(default)]
+    writer: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct ContextReadPayload {
+    key: String,
+    reader: String,
+    state: String,
+    present: bool,
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
+    access: Option<String>,
+    #[serde(default)]
+    gate: Option<String>,
+}
+
+/// A string field read leniently: anything but a string reads as absent
+/// rather than failing the whole log.
+fn lenient_string(v: Option<serde_json::Value>) -> Option<String> {
+    v.as_ref().and_then(|v| v.as_str()).map(str::to_string)
 }
 
 #[derive(Deserialize)]
@@ -3533,6 +3611,7 @@ mod tests {
                 hash: "abc123def456abc123def456abc123def456abc123def456abc123def456abc12345"
                     .to_string(),
                 size: 1024,
+                writer: None,
             },
             idempotency_hash: None,
         };
@@ -3550,8 +3629,53 @@ mod tests {
             key: "scope.md".to_string(),
             hash: "abc".to_string(),
             size: 42,
+            writer: None,
         };
         assert_eq!(p.type_name(), "context_added");
+    }
+
+    // ===== Context reads and writers =====
+
+    /// An event written before writers were recorded keeps its exact bytes
+    /// through a read and a re-serialization, and reads as no writer.
+    #[test]
+    fn pre_writer_context_events_round_trip_byte_identical() {
+        for line in [
+            r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"context_added","payload":{"key":"k","hash":"ab","size":2}}"#,
+            r#"{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"context_removed","payload":{"key":"k"}}"#,
+        ] {
+            let e: Event = serde_json::from_str(line).unwrap();
+            match &e.payload {
+                EventPayload::ContextAdded { writer, .. }
+                | EventPayload::ContextRemoved { writer, .. } => assert_eq!(*writer, None),
+                other => panic!("unexpected payload {other:?}"),
+            }
+            assert_eq!(serde_json::to_string(&e).unwrap(), line);
+        }
+    }
+
+    #[test]
+    fn writer_round_trips_and_a_non_string_writer_reads_as_absent() {
+        let line = r#"{"seq":3,"timestamp":"t","type":"context_added","payload":{"key":"k","hash":"ab","size":2,"writer":"sync"}}"#;
+        let e: Event = serde_json::from_str(line).unwrap();
+        assert_eq!(serde_json::to_string(&e).unwrap(), line);
+        let odd = r#"{"seq":3,"timestamp":"t","type":"context_removed","payload":{"key":"k","writer":7}}"#;
+        let e: Event = serde_json::from_str(odd).unwrap();
+        assert!(matches!(
+            e.payload,
+            EventPayload::ContextRemoved { writer: None, .. }
+        ));
+    }
+
+    #[test]
+    fn context_read_round_trips_with_optional_fields_omitted() {
+        let absent = r#"{"seq":5,"timestamp":"t","type":"context_read","payload":{"key":"k","reader":"cli","state":"s","present":false}}"#;
+        let e: Event = serde_json::from_str(absent).unwrap();
+        assert_eq!(e.payload.type_name(), "context_read");
+        assert_eq!(serde_json::to_string(&e).unwrap(), absent);
+        let gate = r#"{"seq":6,"timestamp":"t","type":"context_read","payload":{"key":"k","reader":"gate","state":"s","present":true,"hash":"ab","access":"presence","gate":"g"}}"#;
+        let e: Event = serde_json::from_str(gate).unwrap();
+        assert_eq!(serde_json::to_string(&e).unwrap(), gate);
     }
 
     // ===== Issue 4: --rationale on directed_transition and rewound =====

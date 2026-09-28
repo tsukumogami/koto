@@ -18,9 +18,19 @@
 # by `koto context add`, and a `koto context get`. The log must hold every
 # event listed in EVENT_CHECKS, including the fields the check events gained
 # (attempt stamps, findings, rule_counts, duration_ms and a failed command
-# gate's leading stdout/stderr).
+# gate's leading stdout/stderr) and the context events (the reads a gate and
+# `koto context get` log, and the writer `koto context add` records).
 # v0.14.1 must then run `koto status`, `koto next` and `koto context get` on
 # that session, exit 0, and report the state the new build reports.
+#
+# Context writers: a second session (fixtures/failure-reporting-context.md)
+# has a transition assign the published-location key, then koto itself
+# overwrites the key (`koto workflows publish`), which it now logs as a
+# `context_added` with writer koto. Its log must hold every event in
+# WRITER_CHECKS, and v0.14.1's `koto context get` of the key must return the
+# koto-written value: an older koto repairs the store from the log, and must
+# not restore the stale assigned value over a later koto write. A write with
+# writer sync needs cloud storage and isn't reachable here.
 #
 # To cover a new event kind, make the session emit it (SESSION STEPS below)
 # and add a line to EVENT_CHECKS. The self-test picks the new line up.
@@ -28,6 +38,12 @@
 # COMPAT_MUTATION breaks things on purpose, to show the checks bite:
 #   drop-event:N     delete the log lines matching EVENT_CHECKS[N] (one
 #                    mutation per entry) before the checks read the log
+#   drop-writer-event:N
+#                    the same for WRITER_CHECKS[N], in the second session's log
+#   hide-koto-write  after the event checks, point koto's write of the
+#                    published-location key at another key (keeping its seq),
+#                    so only the v0.14.1 read can notice: with no later write
+#                    of the key in the log it restores the stale assigned value
 #   strip-field:K    delete payload field K from every check event that
 #                    carries it (one mutation per STRIPPED_FIELDS entry), so
 #                    the events stay but a check-event field goes missing
@@ -43,6 +59,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 FIXTURE="$SCRIPT_DIR/fixtures/failure-reporting-findings.md"
+CONTEXT_FIXTURE="$SCRIPT_DIR/fixtures/failure-reporting-context.md"
 FLOOR_VERSION="0.14.1"
 
 # Fixture template directories, relative to the repository root.
@@ -67,6 +84,15 @@ EVENT_CHECKS=(
   'gate rule_counts|.type? == "gate_evaluated" and .payload.rule_counts.E501.visit == 2 and .payload.rule_counts.E501.session == 2'
   'gate captured streams|.type? == "gate_evaluated" and ((.payload.stdout // "") | contains("build-stdout-line")) and ((.payload.stderr // "") | contains("build-stderr-line")) and .payload.duration_ms >= 0'
   'default_action findings and rule_counts|.type? == "default_action_executed" and .payload.attempt == 1 and (.payload.findings // [] | map(select(.rule_id == "W291")) | length) == 1 and .payload.rule_counts.__action__.session == 1 and .payload.duration_ms >= 0'
+  'context add writer|.type? == "context_added" and .payload.key == "review_note" and .payload.writer == "agent"'
+  'context read by a gate|.type? == "context_read" and .payload.reader == "gate" and .payload.gate == "note" and .payload.key == "review_note" and .payload.access == "presence" and .payload.state == "review"'
+  'context read by koto context get|.type? == "context_read" and .payload.reader == "cli" and .payload.key == "review_note" and .payload.present == true and ((.payload.hash // "") | test("^[0-9a-f]{64}$"))'
+)
+
+# Events the context-writers session must leave in its log, as above.
+WRITER_CHECKS=(
+  'transition assignment|.type? == "transitioned" and .payload.context_assignments["workflows/publish-location"] == "stale-from-transition"'
+  'koto write|.type? == "context_added" and .payload.key == "workflows/publish-location" and .payload.writer == "koto"'
 )
 
 # Fields the check events gained, as "field|jq filter selecting the events
@@ -80,6 +106,8 @@ STRIPPED_FIELDS=(
   'duration_ms|.type? == "gate_evaluated" or .type? == "default_action_executed"'
   'stdout|.type? == "gate_evaluated"'
   'stderr|.type? == "gate_evaluated"'
+  'writer|.type? == "context_added"'
+  'hash|.type? == "context_read"'
 )
 
 REVIEW_NOTE="compat review note: looks good"
@@ -98,10 +126,14 @@ mutations() {
   for i in "${!EVENT_CHECKS[@]}"; do
     echo "drop-event:$i"
   done
+  for i in "${!WRITER_CHECKS[@]}"; do
+    echo "drop-writer-event:$i"
+  done
   for i in "${!STRIPPED_FIELDS[@]}"; do
     echo "strip-field:${STRIPPED_FIELDS[$i]%%|*}"
   done
   echo drop-transition
+  echo hide-koto-write
   echo template-drift
 }
 
@@ -144,6 +176,7 @@ done
 
 command -v jq >/dev/null 2>&1 || fail "jq is not on PATH"
 [ -f "$FIXTURE" ] || fail "fixture $FIXTURE is missing"
+[ -f "$CONTEXT_FIXTURE" ] || fail "fixture $CONTEXT_FIXTURE is missing"
 
 floor_version="$("$KOTO_FLOOR_BIN" version 2>&1)" || fail "floor version: '$KOTO_FLOOR_BIN version' failed"
 case "$floor_version" in
@@ -262,20 +295,41 @@ pass "the new build reports current state $NEW_STATE"
 LOG_FILE="$(find "$HOME_DIR" "$WORK_DIR" -name 'koto-wf.state.jsonl' -type f | head -n 1)"
 [ -n "$LOG_FILE" ] || fail "session: no koto-wf.state.jsonl was written"
 
+# Context writers: a transition assigns the published-location key, then koto
+# overwrites it.
+cp "$CONTEXT_FIXTURE" "$WORK_DIR/failure-reporting-context.md"
+new_koto init wf2 --template "$WORK_DIR/failure-reporting-context.md" >/dev/null 2>"$SCRATCH/init2.err" \
+  || fail "session: koto init wf2 failed: $(cat "$SCRATCH/init2.err")"
+out="$(new_koto next wf2 --with-data '{"step": "go"}' 2>&1)" \
+  || fail "session: wf2 transition failed: $out"
+[ "$(printf '%s' "$out" | jq -r '.state')" = "hold" ] || fail "session: wf2 expected hold, got: $out"
+PUBLISHED_DIR="$WORK_DIR/published-workflows"
+new_koto workflows publish --session wf2 --dir "$PUBLISHED_DIR" \
+  || fail "session: koto workflows publish failed"
+got="$(new_koto context get wf2 workflows/publish-location)" \
+  || fail "session: koto context get of the published location failed"
+[ "$got" = "$PUBLISHED_DIR" ] || fail "session: the published location reads '$got'"
+pass "session: koto overwrote a transition-assigned key"
+
+LOG_FILE2="$(find "$HOME_DIR" "$WORK_DIR" -name 'koto-wf2.state.jsonl' -type f | head -n 1)"
+[ -n "$LOG_FILE2" ] || fail "session: no koto-wf2.state.jsonl was written"
+
 # --- log mutations (self-test only) ------------------------------------------
 
 # drop_lines FILTER: delete every log line the jq filter selects, leaving the
 # bytes of every other line as they are.
+# drop_lines FILTER [LOG]: the same for LOG instead of the main session's log.
 drop_lines() {
-  local filter="$1" tmp="$LOG_FILE.mut" line
+  local filter="$1" log="${2:-$LOG_FILE}" tmp line
+  tmp="$log.mut"
   : >"$tmp"
   while IFS= read -r line || [ -n "$line" ]; do
     if printf '%s' "$line" | jq -e "$filter" >/dev/null 2>&1; then
       continue
     fi
     printf '%s\n' "$line" >>"$tmp"
-  done <"$LOG_FILE"
-  mv "$tmp" "$LOG_FILE"
+  done <"$log"
+  mv "$tmp" "$log"
 }
 
 # strip_field KEY FILTER: delete .payload.KEY from every log line the jq
@@ -307,6 +361,11 @@ case "$MUTATION" in
     echo "MUTATION: deleting log lines for '${entry%%|*}'"
     drop_lines "${entry#*|}"
     ;;
+  drop-writer-event:*)
+    entry="${WRITER_CHECKS[${MUTATION#drop-writer-event:}]}"
+    echo "MUTATION: deleting wf2 log lines for '${entry%%|*}'"
+    drop_lines "${entry#*|}" "$LOG_FILE2"
+    ;;
   drop-transition)
     last_seq="$(jq -s '[.[] | select(.type? == "transitioned") | .seq] | max' "$LOG_FILE")"
     [ "$last_seq" != "null" ] || fail "self-test: the log holds no transitioned event to drop"
@@ -323,6 +382,14 @@ for entry in "${EVENT_CHECKS[@]}"; do
   n="$(jq -s "[.[] | select($filter)] | length" "$LOG_FILE")" \
     || fail "events: the filter for '$label' did not run"
   [ "$n" -ge 1 ] || fail "events: the log holds no event for '$label'"
+  pass "events: $label ($n)"
+done
+for entry in "${WRITER_CHECKS[@]}"; do
+  label="${entry%%|*}"
+  filter="${entry#*|}"
+  n="$(jq -s "[.[] | select($filter)] | length" "$LOG_FILE2")" \
+    || fail "events: the filter for '$label' did not run"
+  [ "$n" -ge 1 ] || fail "events: the wf2 log holds no event for '$label'"
   pass "events: $label ($n)"
 done
 
@@ -358,5 +425,26 @@ pass "v$FLOOR_VERSION koto next reads the log (state $state)"
 out="$(floor_koto context get wf review_note 2>&1)" || fail "floor: koto context get exited non-zero: $out"
 [ "$out" = "$REVIEW_NOTE" ] || fail "floor: koto context get returned '$out'"
 pass "v$FLOOR_VERSION koto context get returns the note the new build stored"
+
+if [ "$MUTATION" = "hide-koto-write" ]; then
+  echo "MUTATION: pointing koto's write of the published-location key at another key"
+  tmp="$LOG_FILE2.mut"
+  : >"$tmp"
+  while IFS= read -r line || [ -n "$line" ]; do
+    if printf '%s' "$line" | jq -e "${WRITER_CHECKS[1]#*|}" >/dev/null 2>&1; then
+      printf '%s' "$line" | jq -c '.payload.key = "unrelated-key"' >>"$tmp"
+      continue
+    fi
+    printf '%s\n' "$line" >>"$tmp"
+  done <"$LOG_FILE2"
+  mv "$tmp" "$LOG_FILE2"
+fi
+out="$(floor_koto status wf2 2>&1)" || fail "floor: koto status wf2 exited non-zero: $out"
+reject_errors "koto status wf2" "$out"
+out="$(floor_koto context get wf2 workflows/publish-location 2>&1)" \
+  || fail "floor: koto context get of the published location exited non-zero: $out"
+[ "$out" = "$PUBLISHED_DIR" ] \
+  || fail "floor: v$FLOOR_VERSION restored '$out' over koto's later write of the key"
+pass "v$FLOOR_VERSION keeps koto's write over the stale transition value"
 
 pass "all checks passed"
