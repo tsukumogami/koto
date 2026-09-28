@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 absorbed: docs/briefs/BRIEF-koto-fixed-environment.md
 source_issue: 261
 problem: |
@@ -24,7 +24,7 @@ goals: |
 
 ## Status
 
-In Progress
+Done
 
 Absorbed [BRIEF](docs/briefs/BRIEF-koto-fixed-environment.md); carried in Absorbed Brief.
 
@@ -497,5 +497,5 @@ details are design decisions.
 
 ## Downstream Artifacts
 
-- `docs/designs/DESIGN-koto-fixed-environment.md` (planned) -- the technical
+- `docs/designs/current/DESIGN-koto-fixed-environment.md` (planned) -- the technical
   approach, alternatives and compatibility story.
