@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 absorbed: docs/briefs/BRIEF-koto-fixed-environment.md
 source_issue: 261
 problem: |
@@ -23,7 +23,7 @@ goals: |
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF](docs/briefs/BRIEF-koto-fixed-environment.md); carried in Absorbed Brief.
 
@@ -160,24 +160,30 @@ still change between ticks.
 
 ### Functional: what a session records
 
-- **R1. Three values are fixed at creation.** Every session koto creates
-  records the values of `PATH`, `HOME` and `XDG_CONFIG_HOME` as they are in
-  the creating invocation's environment; a variable unset at creation is
-  recorded as unset. Together these are the session's fixed variables. This
-  covers `koto init` in every form (plain, `--vars-file`, `--replace-terminal`,
-  `--koto-leg`, `--from-stdin`) and `koto session start`.
+- **R1. Values fixed at creation.** Every session koto creates records the
+  values, as they are in the creating invocation's environment, of the fixed
+  variables: `PATH`, `HOME`, `XDG_CONFIG_HOME`, and a documented set of other
+  variables that locate tools, configuration or caches and can't hold a
+  secret -- user name, locale, time zone, temporary directory, terminal, the
+  XDG cache directory, and the CA-bundle paths. A variable unset at creation is
+  recorded as unset. The recorded `PATH` has empty and relative entries
+  removed, since those resolve inside whatever directory a command starts in;
+  the design specifies the normalization. This covers `koto init` in every form
+  (plain, `--vars-file`, `--replace-terminal`, `--koto-leg`, `--from-stdin`)
+  and `koto session start`.
 - **R2. Names, never values, for everything else.** Besides the fixed
-  variables, a session records a set of variable names (the pass list). It
-  records no value of any pass-list variable, in its header, its event log, or
-  any other file in its session directory.
+  variables, a session records a set of variable names (the pass list) whose
+  values are read live. koto writes no value of any pass-list variable, in its
+  header, its event log, or any other file in its session directory. (A
+  command that prints a value itself has its output recorded as evidence, as
+  today; that's the command's doing, not koto's.)
 - **R3. The default pass list.** Every session's pass list contains a default
   set of names fixed by the koto release that created it and published in the
-  documentation as an exact list. The set covers what koto itself and ordinary
-  developer tools need to run a command: user and locale, temporary directory,
-  terminal, time zone, `gh` and `git` authentication tokens, the Linux
-  keyring's D-Bus session, the ssh agent, HTTP proxy and CA-bundle settings,
-  the other XDG base directories, and koto's own session store and cache
-  locations. It does not include `GH_REPO`, `GH_HOST`, or any `GIT_*` name.
+  documentation as an exact list. It holds the variables that can carry a
+  secret or name a live socket: `gh` and `git` authentication tokens, the
+  Linux keyring's D-Bus session and runtime directory, the ssh agent, and HTTP
+  proxy settings. It does not include `GH_REPO`, `GH_HOST`, or any `GIT_*`
+  name.
 - **R4. Templates can add names.** A template can declare additional names its
   commands need. A session created from it has them in its pass list.
 - **R5. Callers can add names at creation, two ways.** A caller can add names
@@ -188,13 +194,20 @@ still change between ticks.
   created or attached, never on a tick.
 - **R6. Names that are never passed.** koto refuses, at template compile time
   and at `koto init`, any attempt to add one of these names to a pass list:
-  the fixed variables (`PATH`, `HOME`, `XDG_CONFIG_HOME`); the shell start-up
-  and injection names `BASH_ENV`, `ENV`, `BASH_FUNC_*`, `SHELLOPTS`,
-  `BASHOPTS`, `PS4`, `CDPATH`; the dynamic-loader names `LD_*`, `DYLD_*`,
-  `GCONV_PATH`; the tool code-injection names `GIT_CONFIG*`, `GIT_EXEC_PATH`,
-  `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GH_CONFIG_DIR`;
-  and `KOTO_TICK_SESSION`, which koto sets itself. This list is closed for this
-  release. A name must also match `^[A-Za-z_][A-Za-z0-9_]*$`; a pattern or
+  every fixed variable (R1); the shell start-up and injection names
+  `BASH_ENV`, `ENV`, `BASH_FUNC_*`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `CDPATH`;
+  the dynamic-loader and locale-path names `LD_*`, `DYLD_*`, `GCONV_PATH`,
+  `LOCPATH`, `NLSPATH`, `TZDIR`; the names that make `git`, `gh` or `ssh`
+  load configuration, read other data, or run a program of the caller's
+  choosing -- every `GIT_*` name except `GIT_CEILING_DIRECTORIES`,
+  `GIT_TERMINAL_PROMPT` and the four `GIT_AUTHOR_*`/`GIT_COMMITTER_*` name and
+  email variables, plus `SSH_ASKPASS`, `GH_CONFIG_DIR`, `GH_EDITOR`,
+  `GH_PAGER`, `GH_BROWSER`, `EDITOR`, `VISUAL`, `PAGER`, `BROWSER`,
+  `XDG_DATA_HOME`; and every `KOTO_*` name, since koto sets
+  `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE` itself. A caller-added item
+  equal to the value of a variable set in the creating process is refused
+  too, so a pasted token can't be recorded as a name, and a refusal never
+  echoes the rejected text. This list is closed for this release. A name must also match `^[A-Za-z_][A-Za-z0-9_]*$`; a pattern or
   wildcard is not a name.
 - **R7. The record is readable in the log.** Creating a session, or adopting a
   record under R17, appends one event to its log carrying the fixed variables'
@@ -202,8 +215,9 @@ still change between ticks.
   commands run with.
 - **R8. Children inherit.** A child session -- batch spawn, retry, skip
   marker, `koto init --parent`, `koto session start` under a parent -- copies
-  its parent's recorded fixed variables and pass list rather than recording
-  its own from the ticking process.
+  its parent's recorded fixed variables and caller-added names rather than
+  recording its own from the ticking process, and adds the names its own
+  template declares. A caller can't add names when creating a child.
 
 ### Functional: how commands run
 
@@ -212,7 +226,11 @@ still change between ticks.
   polling attempt -- starts with an empty environment to which koto adds
   exactly: each fixed variable recorded as set, with its recorded value; each
   pass-list name set in the ticking process, with its live value; and
-  `KOTO_TICK_SESSION` set to the name of the session being ticked.
+  `KOTO_TICK_SESSION` set to the name of the session being ticked, and
+  `KOTO_SESSIONS_BASE` set to the base of the session store the tick is
+  operating on, so a `koto` a command runs reaches the same store. When the
+  recorded `PATH` is unset, koto sets a fixed default that contains no
+  relative entry. A command's standard input is empty.
 - **R10. Shell-injected behaviour doesn't reach commands.** As a consequence
   of R6 and R9, an exported shell function, `BASH_ENV`, `ENV` and every other
   R6 name set in the ticking process are absent from a command's environment.
@@ -221,21 +239,23 @@ still change between ticks.
   the ticking process's `PATH` nor the recorded one decides which shell runs.
 - **R12. The nested-tick refusal survives.** A `koto next` started from inside
   a command a tick is running is still refused with `nested_invocation`.
-- **R13. A missing tool is named.** When a command exits 127, its gate or
-  action evidence adds a note stating that the command ran under the session's
+- **R13. A missing tool is named.** When a command exits 127, the `koto next`
+  response carries a note stating that the command ran under the session's
   recorded `PATH`, giving that value, and saying that the recorded `PATH` can't
   be changed: the tool must be made available on it, or the session replaced
   by a new one. The note is built from the exit status alone; koto doesn't
-  search for the tool.
+  search for the tool, and a gate's recorded evidence is unchanged.
 
 ### Functional: attach and rebind
 
-- **R14. Attach refuses a different fixed variable.** `koto init
-  --attach-live` on a session whose recorded value of any fixed variable
-  differs from the caller's refuses with code `environment_mismatch`, exit 2,
-  naming the variable and its recorded and requested values, and changes
-  nothing. Under `--koto-leg` the refusal is recorded on the leg with reason
-  `environment-mismatch:<VARIABLE>`.
+- **R14. Attach refuses a different tool location.** `koto init
+  --attach-live` on a session whose recorded `PATH` (compared after the same
+  normalization), `HOME` or `XDG_CONFIG_HOME` differs from the caller's
+  refuses with code `environment_mismatch`, exit 2, printing the variable and
+  its recorded and requested values, and changes nothing. Under `--koto-leg`
+  the refusal is recorded on the leg with reason
+  `environment-mismatch:<VARIABLE>`, naming the variable without its values.
+  The other fixed variables are not compared; they simply stay as recorded.
 - **R15. Attach doesn't change the pass list.** When an attaching caller adds
   names by either R5 mechanism, the set of names it adds must equal the set
   the session recorded from its creator's R5 input; otherwise attach refuses
@@ -265,8 +285,9 @@ still change between ticks.
 - **R20. The limit is stated.** The documentation for gates, default actions
   and the session lifecycle states that this closes the environment channel
   only, and names what stays open: an agent that edits the files a gate reads,
-  the session directory, or the binaries on the recorded `PATH`; and the live
-  values of pass-list variables, which remain caller-controlled.
+  the session directory, or the binaries on the recorded `PATH`; the live
+  values of pass-list variables, which remain caller-controlled; and process
+  attributes other than the environment (umask, resource limits).
 - **R21. The behaviour change is announced.** The CHANGELOG's Unreleased
   section calls out the behaviour change for release notes, names
   `environment_mismatch`, and says what a template or user relying on a
@@ -327,7 +348,7 @@ still change between ticks.
       name ending `_TOKEN`, `_SECRET`, `_KEY` or `_PASSWORD`) set to unique
       marker values at `koto init` and at a tick, the session's log and
       header contain none of the markers, and the record event carries values
-      only for `PATH`, `HOME` and `XDG_CONFIG_HOME`.
+      only for the documented fixed variables.
 - [ ] No template field, `koto init` flag or environment variable documented
       for this feature causes a variable outside the fixed variables, the
       pass list and `KOTO_TICK_SESSION` to reach a command; the feature's
@@ -350,8 +371,17 @@ still change between ticks.
 - [ ] A gate command that calls `koto context get` reaches the same session
       store as the ticking process.
 - [ ] A gate whose command isn't found under the recorded `PATH` fails with
-      evidence carrying the R13 note: the recorded `PATH` value and the
-      statement that it can't be changed.
+      the same evidence shape as before, and the `koto next` response carries
+      the R13 note: the recorded `PATH` value and the statement that it can't
+      be changed.
+- [ ] A gate command reading standard input sees end of file even when
+      `koto next` is run with input piped to it.
+- [ ] A session created with a `PATH` holding only empty and relative entries
+      records `PATH` as unset, and its commands run with koto's fixed default
+      `PATH`, so a tool file in the execution anchor is not found by bare
+      name.
+- [ ] With `TMPDIR`, `XDG_CACHE_HOME` or `SSL_CERT_FILE` changed between
+      `koto init` and a tick, a gate command sees the value from `koto init`.
 - [ ] A tick whose own `PATH` has no `sh` on it, and a tick whose `PATH` puts a
       decoy `sh` that exits 0 first, both run the session's commands with the
       real shell.
@@ -423,7 +453,7 @@ The compatibility cost is carried by the default pass list (R3) and the two
 ways to add names (R4, R5), which research showed cover shirabe's templates and
 harnesses.
 
-### D2. `PATH`, `HOME` and `XDG_CONFIG_HOME` are fixed; everything else is a name read live
+### D2. Values that locate tools are fixed; names that can hold secrets are read live
 
 koto issue #261 proposed fixing `PATH` alone. Research showed that a live
 `HOME` is as strong a channel as a live `PATH` for the gates that matter: `git`
@@ -435,16 +465,30 @@ constraint -- no secret value in session state -- while closing the channel.
 Every harness studied sets `HOME` before its first `koto init` and keeps it,
 so fixing it breaks none of them.
 
-Snapshotting other values was rejected: it writes secrets into a readable log,
-and shirabe's engine tests change stub variables' values between ticks.
+The design's security review extended the same reasoning to the other
+variables that locate a tool's inputs and can't hold a secret -- the cache and
+CA-bundle paths, locale, time zone, temporary directory, terminal, user name.
+A live `XDG_CACHE_HOME` can hand a tool a prepared cache (Go's test cache
+lives under it) and a live `SSL_CERT_FILE` plus a proxy can forge API
+responses, so those values are recorded too. Only names that can carry a
+secret or a live socket are read live. `HOME` and the two tool-locating
+variables are the only fixed values an attach compares, because a difference
+in them changes which tools and configuration run; a difference in, say,
+`TERM` doesn't, so it isn't a reason to refuse.
+
+Snapshotting the remaining values was rejected: it writes secrets into a
+readable log, and shirabe's engine tests change stub variables' values between
+ticks.
 
 ### D3. Two lists: excluded by default, and refused outright
 
-`GH_REPO`, `GH_HOST` and `GIT_*` names like `GIT_DIR` redirect which
-repository, host or tree a tool reads, so they stay out of the default set; a
-template or caller that needs one (a GitHub Enterprise user's `GH_HOST`) adds
-it. Names that inject code or change how the shell and loader start (R6) can't
-be added at all, because adding one would reopen the channel this PRD closes.
+`GH_REPO` and `GH_HOST` redirect which repository or host `gh` reads, so they
+stay out of the default set; a template or caller that needs one (a GitHub
+Enterprise user's `GH_HOST`) adds it. Names that inject code, redirect what
+`git` reads, or change how the shell and loader start (R6) can't be added at
+all, because adding one would reopen the channel this PRD closes. `git` has
+too many such variables to list one by one, so R6 refuses its whole prefix
+and allows back the few that only set identity or prompting.
 R6's list is closed so that two implementations refuse the same names.
 
 ### D4. Older sessions adopt on first tick
