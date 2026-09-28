@@ -67,6 +67,7 @@ mod tests {
     #[test]
     fn state_file_header_resolves_and_constructs() {
         let h = StateFileHeader {
+            command_environment: None,
             schema_version: CURRENT_SCHEMA_VERSION,
             workflow: "test".into(),
             template_hash: "deadbeef".into(),
@@ -210,6 +211,7 @@ mod tests {
     #[test]
     fn path_buf_used_for_template_source_dir() {
         let h = StateFileHeader {
+            command_environment: None,
             schema_version: CURRENT_SCHEMA_VERSION,
             workflow: "x".into(),
             template_hash: "x".into(),
@@ -277,6 +279,7 @@ mod tests {
         // Build a minimal header + initial event, then atomically
         // initialize the session's state file.
         let header = StateFileHeader {
+            command_environment: None,
             schema_version: CURRENT_SCHEMA_VERSION,
             workflow: session_id.into(),
             template_hash: "deadbeef".into(),
