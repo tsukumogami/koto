@@ -167,6 +167,15 @@ run_runner "skill-a:silent" skill-a
 expect_rc "session with no transcript fails as ungraded" 2
 expect_out "missing transcript is named" "left no transcript"
 
+# A suite with no evals must not compare zero graded to zero expected and pass.
+make_skill skill-empty
+echo '{"evals": []}' >"$WORK/plugins/stub-plugin/skills/skill-empty/evals/evals.json"
+run_runner "" skill-empty
+expect_rc "suite with no evals is refused" 3
+if [ ! -s "$STUB_LOG" ]; then ok "suite with no evals starts no session"
+else not_ok "suite with no evals starts no session"; fi
+rm -rf "$WORK/plugins/stub-plugin/skills/skill-empty"
+
 # --- how the session is started --------------------------------------------
 run_runner "skill-a:pass" skill-a
 LOG=$(head -n1 "$STUB_LOG")

@@ -159,7 +159,13 @@ prep_skill_evals() {
   local iter_dir="$workspace/iteration-$iteration"
 
   local eval_count
-  eval_count=$(python3 -c "import json; print(len(json.load(open('$evals_file'))['evals']))")
+  eval_count=$(python3 -c "import json; print(len(json.load(open('$evals_file'))['evals']))" 2>/dev/null)
+  # A suite with no evals would compare zero graded against zero expected and
+  # pass, so it is refused before a session starts.
+  if ! [ "${eval_count:-0}" -gt 0 ] 2>/dev/null; then
+    echo "Error: $evals_file defines no evals (or is not valid JSON with an \"evals\" list)"
+    return 3
+  fi
 
   echo "=== Preparing evals for skill: $skill_name ==="
   echo "  Evals file: $evals_file"
@@ -168,7 +174,7 @@ prep_skill_evals() {
   echo "  Output: $iter_dir"
   echo ""
 
-  python3 << PYEOF
+  if ! python3 << PYEOF
 import json, os, shutil
 
 with open("$evals_file") as f:
@@ -216,11 +222,16 @@ for eval_item in data["evals"]:
 
 print(f"\nPrepared {len(data['evals'])} eval directories.")
 PYEOF
+  then
+    echo "Error: could not prepare the eval workspace from $evals_file"
+    return 3
+  fi
 
-  # Return values for callers
-  echo "$iter_dir" > /tmp/run-evals-iter-dir
-  echo "$eval_count" > /tmp/run-evals-eval-count
-  echo "$iteration" > /tmp/run-evals-iteration
+  # Return values for callers, as globals: prep runs in the caller's shell, and
+  # shared files would let two runs on one host read each other's values.
+  PREP_ITER_DIR="$iter_dir"
+  PREP_EVAL_COUNT="$eval_count"
+  PREP_ITERATION="$iteration"
 }
 
 run_skill_evals() {
@@ -233,9 +244,9 @@ run_skill_evals() {
   prep_skill_evals "$skill_name" || return $?
 
   local iter_dir eval_count iteration
-  iter_dir=$(cat /tmp/run-evals-iter-dir)
-  eval_count=$(cat /tmp/run-evals-eval-count)
-  iteration=$(cat /tmp/run-evals-iteration)
+  iter_dir="$PREP_ITER_DIR"
+  eval_count="$PREP_EVAL_COUNT"
+  iteration="$PREP_ITERATION"
 
   # Step 2: Build tier-specific instructions for each eval
   local fixtures_bin="$skill_dir/evals/fixtures/bin"
@@ -308,9 +319,10 @@ Follow the skill-creator workflow for running and evaluating test cases:
 - Step 3: Capture timing data (total_tokens, duration_ms) to timing.json in each run directory.
 - Step 4: Run the aggregation and generate the viewer to $viewer using --static mode.
 
-Keep every file you and your agents write inside the repository at $REPO_ROOT or
-the scratch directory $scratch. Write and Edit are denied anywhere else, and
-shell commands must not write outside those two directories either.
+Put every file you and your agents create inside the repository at $REPO_ROOT or
+the scratch directory $scratch: the Write and Edit tools are denied anywhere
+else, and your TMPDIR is the scratch directory. Tools the evals run (koto, gh)
+keep their own state where they normally do.
 
 This is iteration $iteration for the $skill_name skill.
 PROMPT
@@ -353,6 +365,11 @@ PROMPT
 validate_results() {
   local iter_dir="$1"
   local expected_count="$2"
+  # Zero expected would let zero graded pass.
+  if ! [ "${expected_count:-0}" -gt 0 ] 2>/dev/null; then
+    echo "  NO EVALS EXPECTED: the suite defines no evals ('$expected_count'), so nothing can be graded."
+    return 2
+  fi
   local graded=0
   local missing_outputs=()
   local missing_grading=()
@@ -390,7 +407,7 @@ with open('$eval_dir/with_skill/grading.json') as f:
     g = json.load(f)
 # Handle both formats: {expectations: [...]} and bare [...]
 exps = g if isinstance(g, list) else g.get('expectations', [])
-p = sum(1 for e in exps if e.get('passed', False))
+p = sum(1 for e in exps if e.get('passed') is True)
 print(f'{len(exps)} {p}')
 " 2>/dev/null || echo "0 0")
       local total passed
@@ -445,12 +462,17 @@ with open('$gfile') as f:
     g = json.load(f)
 exps = g if isinstance(g, list) else g.get('expectations', [])
 for e in exps:
-    if not e.get('passed', False):
+    if e.get('passed') is not True:
         print(f'    [$ename] FAIL: {e.get(\"text\", \"unknown\")}')
         if e.get('evidence'):
             print(f'           {e[\"evidence\"]}')
 " 2>/dev/null
     done
+    # Failed assertions decide the status; an ungraded eval beside them is
+    # still named so it isn't lost.
+    if [ "$graded" -lt "$expected_count" ]; then
+      echo "  Also ungraded: only $graded of the $expected_count evals produced a grade."
+    fi
     return 1
   fi
 
@@ -531,9 +553,9 @@ case "$1" in
       echo "Usage: $0 --prep-only <skill-name>"
       exit 1
     fi
-    prep_skill_evals "$2"
+    prep_skill_evals "$2" || exit $?
     skill_dir=$(resolve_skill_dir "$2")
-    iter_dir=$(cat /tmp/run-evals-iter-dir)
+    iter_dir="$PREP_ITER_DIR"
     echo ""
     echo "Workspace ready. To run evals interactively:"
     echo "  Use /skill-creator in Claude Code with this workspace: $iter_dir"

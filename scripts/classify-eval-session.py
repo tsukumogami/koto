@@ -16,7 +16,9 @@ NotebookEdit call came back and was not a permission denial. A command that
 ran and exited nonzero still ran. Subagent calls count, since they appear in
 the same stream. A session whose init message reports plan mode did not
 execute, whatever ran: plan mode lets read-only commands through and writes
-its own plan file.
+its own plan file. A session outside plan mode that ran something and then
+stopped at ExitPlanMode is counted as executed: that reads as exit 2 rather
+than 4, never as a pass, so the rarer case isn't worth a rule of its own.
 
 Usage:
   classify-eval-session.py report <transcript> <requested-mode>
@@ -124,6 +126,7 @@ def classify(events):
         "executing_calls_ran": len(ran),
         "permission_denials": len(denied),
         "result_subtype": (result or {}).get("subtype"),
+        "result_is_error": bool((result or {}).get("is_error")),
         "result_text": (result or {}).get("result") or "",
     }
 
@@ -145,13 +148,15 @@ def report(summary, transcript, requested):
 
     print("")
     print("  NESTED SESSION DID NOT EXECUTE")
-    print("  The claude session this runner started stopped in plan mode, or ran no")
-    print("  command and wrote no file, so no eval ran. The runner or the host is at")
-    print("  fault, not the skill under test: its grades are absent, not failing.")
+    print("  The claude session this runner started stopped in plan mode, ran no")
+    print("  command and wrote no file, or ended in an error before running anything,")
+    print("  so no eval ran. The runner or the host is at fault, not the skill under")
+    print("  test: its grades are absent, not failing.")
     print(f"    Permission mode in effect: {summary['permission_mode'] or 'unknown (no init message)'}")
     print(f"    Permission mode requested: {requested}"
           + (" (something on this host overrode the runner's flag)" if overridden else ""))
-    print(f"    Session result: {summary['result_subtype'] or 'none'}")
+    print(f"    Session result: {summary['result_subtype'] or 'none'}"
+          + (", reported as an error: " + summary["result_text"][:200] if summary["result_is_error"] else ""))
     print(f"    Tool calls: {summary['tool_calls']} ({summary['executing_calls']} that run"
           f" commands or change files, {summary['executing_calls_ran']} of them ran)")
     print(f"    Permission denials: {summary['permission_denials']}")
