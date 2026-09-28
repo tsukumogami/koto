@@ -373,6 +373,7 @@ pub fn init_child_from_parent(
         None,
         false,
     )
+    .map(|_| ())
 }
 
 /// [`init_child_from_parent`] with an explicit execution anchor.
@@ -393,7 +394,7 @@ pub fn init_child_from_parent_at(
     spawn_entry: Option<SpawnEntrySnapshot>,
     execution_dir: Option<&Path>,
     legacy_environment: bool,
-) -> Result<(), TaskSpawnError> {
+) -> Result<Option<crate::engine::command_env::RecordReport>, TaskSpawnError> {
     init_child_core(
         backend,
         parent_name,
@@ -444,6 +445,7 @@ pub fn init_child_as_skip_marker_from_parent(
         None,
         false,
     )
+    .map(|_| ())
 }
 
 /// Canonical form of `path`, falling back to the path as given when it
@@ -493,26 +495,42 @@ fn resolve_execution_dir(
 
 /// Resolve the environment record for a new session.
 ///
-/// A child copies its parent's record (R8), whatever process spawns it. A
+/// A child copies its parent's record (R8), whatever process spawns it,
+/// and the report is `None`: nothing was read from this process. A
 /// top-level session, or a child whose parent has no record yet (an older
-/// session that hasn't adopted one), records from this process. A copied
-/// record keeps the parent's legacy flag; `legacy_environment` applies only
-/// when this process records.
+/// session that hasn't adopted one), records from this process and returns
+/// the report of what recording dropped or left unset, for the caller's
+/// response. A copied record keeps the parent's legacy flag;
+/// `legacy_environment` applies only when this process records (`koto init`
+/// refuses `--legacy-environment` with `--parent`).
+///
+/// A parent whose header can't be read is an error, not "no record": falling
+/// back to this process's environment would hand a child whatever the
+/// spawning tick's caller had, which is the channel R8 closes.
 pub(crate) fn resolve_command_environment(
     backend: &dyn SessionBackend,
     parent_name: Option<&str>,
     legacy_environment: bool,
-) -> crate::engine::types::CommandEnvironment {
+) -> Result<
+    (
+        crate::engine::types::CommandEnvironment,
+        Option<crate::engine::command_env::RecordReport>,
+    ),
+    String,
+> {
     if let Some(parent) = parent_name {
-        if let Some(inherited) = backend
-            .read_header(parent)
-            .ok()
-            .and_then(|h| h.command_environment)
-        {
-            return inherited;
+        let header = backend.read_header(parent).map_err(|e| {
+            format!(
+                "could not read parent session '{}' to copy its command environment: {}",
+                parent, e
+            )
+        })?;
+        if let Some(inherited) = header.command_environment {
+            return Ok((inherited, None));
         }
     }
-    crate::engine::command_env::record_from_process(legacy_environment).0
+    let (record, report) = crate::engine::command_env::record_from_process(legacy_environment);
+    Ok((record, Some(report)))
 }
 
 /// The origin record for a session about to be created: its execution
@@ -550,7 +568,7 @@ fn init_child_core(
     override_initial_state: Option<&str>,
     execution_dir_override: Option<&Path>,
     legacy_environment: bool,
-) -> Result<(), TaskSpawnError> {
+) -> Result<Option<crate::engine::command_env::RecordReport>, TaskSpawnError> {
     let cached = compile_with_cache(template_path, cache).map_err(|info| {
         let mut err = TaskSpawnError::new(child_name, info.kind, info.message);
         // Forward the resolved template path when resolution
@@ -620,7 +638,11 @@ fn init_child_core(
     // record, like the anchor above: it is created inside the parent's
     // tick, whose process environment belongs to whoever ticked the
     // parent.
-    let command_environment = resolve_command_environment(backend, parent_name, legacy_environment);
+    let (command_environment, environment_report) =
+        resolve_command_environment(backend, parent_name, legacy_environment).map_err(|msg| {
+            TaskSpawnError::new(child_name, SpawnErrorKind::IoError, msg)
+                .with_path(cached.source_path.clone())
+        })?;
 
     let mut header = StateFileHeader {
         command_environment: Some(command_environment),
@@ -710,7 +732,7 @@ fn init_child_core(
         .init_state_file(child_name, header, initial_events)
         .map_err(|e| classify_session_error(child_name, e).with_path(cached.source_path.clone()))?;
 
-    Ok(())
+    Ok(environment_report)
 }
 
 /// Fixed filename for the human-readable source persisted by the inline
@@ -757,7 +779,7 @@ pub fn init_inline_into_session(
     vars: &[String],
     execution_dir_override: Option<&Path>,
     legacy_environment: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<crate::engine::command_env::RecordReport>> {
     // Create the session directory first: compile_cached_into would
     // create it too, but going through the backend also applies the
     // 0700 koto-root permissions and the session-id validation that
@@ -810,13 +832,12 @@ pub fn init_inline_into_session(
     let initial_state = compiled.initial_state.clone();
     let execution_dir = resolve_execution_dir(backend, None, execution_dir_override);
     let origin = origin_record(backend, execution_dir.as_deref());
+    let (command_environment, environment_report) =
+        resolve_command_environment(backend, None, legacy_environment)
+            .map_err(|msg| anyhow::anyhow!(msg))?;
 
     let header = StateFileHeader {
-        command_environment: Some(resolve_command_environment(
-            backend,
-            None,
-            legacy_environment,
-        )),
+        command_environment: Some(command_environment),
         schema_version: 1,
         workflow: name.to_string(),
         template_hash: hash,
@@ -884,7 +905,7 @@ pub fn init_inline_into_session(
         .init_state_file(name, header, initial_events)
         .map_err(|e| anyhow::anyhow!("failed to initialize inline session {:?}: {}", name, e))?;
 
-    Ok(())
+    Ok(environment_report)
 }
 
 /// Drive the full inline (`koto init --from-stdin`) flow from a raw byte
@@ -914,7 +935,7 @@ pub fn init_inline_from_stdin_bytes(
     vars: &[String],
     execution_dir_override: Option<&Path>,
     legacy_environment: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<crate::engine::command_env::RecordReport>> {
     use std::io::Write as _;
 
     // Materialize the stdin bytes to a private temp file. The compile
@@ -934,7 +955,7 @@ pub fn init_inline_from_stdin_bytes(
     // Strict-compile into the session dir and start the session. On
     // failure the compiler error (element-named) propagates; we then tear
     // down the bare session directory so nothing half-built persists.
-    if let Err(e) = init_inline_into_session(
+    let environment_report = match init_inline_into_session(
         backend,
         name,
         tmp.path(),
@@ -942,18 +963,21 @@ pub fn init_inline_from_stdin_bytes(
         execution_dir_override,
         legacy_environment,
     ) {
-        // Best-effort cleanup of the session dir init_inline_into_session
-        // created before compiling. `exists()` checks for the STATE FILE,
-        // which is absent on a compile failure, so the session is not
-        // registered — but the directory (and possibly the compiled
-        // artifact) may linger. Remove it. Ignore cleanup errors: the
-        // compile error is the one the caller must see.
-        let session_dir = backend.session_dir(name);
-        if session_dir.exists() {
-            let _ = std::fs::remove_dir_all(&session_dir);
+        Ok(report) => report,
+        Err(e) => {
+            // Best-effort cleanup of the session dir init_inline_into_session
+            // created before compiling. `exists()` checks for the STATE FILE,
+            // which is absent on a compile failure, so the session is not
+            // registered — but the directory (and possibly the compiled
+            // artifact) may linger. Remove it. Ignore cleanup errors: the
+            // compile error is the one the caller must see.
+            let session_dir = backend.session_dir(name);
+            if session_dir.exists() {
+                let _ = std::fs::remove_dir_all(&session_dir);
+            }
+            return Err(e);
         }
-        return Err(e);
-    }
+    };
 
     // Compile + init succeeded: persist the readable source under the
     // FIXED filename. join() with a constant literal cannot escape the
@@ -976,7 +1000,7 @@ pub fn init_inline_from_stdin_bytes(
         let _ = std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o600));
     }
 
-    Ok(())
+    Ok(environment_report)
 }
 
 #[cfg(test)]

@@ -308,10 +308,16 @@ dropped }` (wire name `environment_adopted`) is appended when an older session
 adopts, so the log shows when a record arrived after the fact and what was
 dropped. No event is emitted at creation; it would duplicate the header line.
 
-**Creation paths.** Both header writers take an `EnvironmentSource`: `Record`
-(from the invoking process, with `legacy` from the flag) or `Inherit(parent)`.
-`--legacy-environment` is accepted on every top-level `koto init` form and
-refused with `--parent`, since a child takes its parent's record.
+**Creation paths.** Both header writers call one helper,
+`resolve_command_environment`, which copies the parent's record when there is
+a parent that has one, and otherwise records from the invoking process (with
+`legacy` from the flag). It returns the recording report only when it
+recorded, and the `koto init` response carries that report, so a response
+never describes a record other than the one written. A parent whose header
+can't be read is an error rather than "no record". `--legacy-environment` is
+accepted on every top-level `koto init` form, has no effect when attaching to
+an existing session, and is refused with `--parent`, since a child takes its
+parent's record.
 
 **Children** -- batch spawn, retry, skip marker, `koto init --parent`, `koto
 session start` -- copy the parent's record through a
@@ -477,7 +483,7 @@ cost of a permanent record visible instead of silent.
 | `CommandEnv` | `src/action.rs` | Runtime type; `run_shell_command` takes it |
 | Environment module | new `src/engine/command_env.rs` | Default and refused lists, name validation, `PATH` normalization, credential check, record building, stale check, `CommandEnv` builder |
 | Template compiler | `src/template/compile.rs`, `types.rs` | `pass_env:` parsing, validation and warning, compiled field |
-| Header writers | `src/cli/init_child.rs` | `EnvironmentSource` into `init_child_core` and `init_inline_into_session`; `resolve_command_environment` for children |
+| Header writers | `src/cli/init_child.rs` | `resolve_command_environment` (parent's record, else this process's) in `init_child_core` and `init_inline_into_session`, returning the recording report |
 | Entry flags | `src/cli/mod.rs`, `src/cli/init_entry.rs` | `--legacy-environment` on top-level forms, refused with `--parent`; attach drift report beside `check_origin` |
 | Session start | `src/cli/session.rs` | Inherit from the parent, or record from the process when the parent has none |
 | Tick | `src/cli/mod.rs` | Adoption after the anchor check and epoch fence, under the lock; stale check; build `CommandEnv` once; pass it to every gate evaluation and both action sites; adoption, stale and not-found notes |
@@ -586,8 +592,9 @@ What shirabe must change (proposed; shirabe does the work):
 
 1. **The record.** `CommandEnvironment`, the environment module (lists,
    validation, normalization, credential check, builder), `pass_env:` in the
-   compiler, `--legacy-environment`, recording through `EnvironmentSource` in
-   both header writers, children and `koto session start`. Commands still run
+   compiler, `--legacy-environment`, recording through
+   `resolve_command_environment` in both header writers, children and
+   `koto session start`. Commands still run
    as today; sessions start carrying a record.
 2. **Adoption and attach.** Adoption in `koto next` after the epoch fence and
    under the lock, with `environment_adopted` and its notice; the attach

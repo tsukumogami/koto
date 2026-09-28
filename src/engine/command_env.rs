@@ -357,6 +357,16 @@ mod tests {
     }
 
     #[test]
+    fn every_credential_carrier_is_a_default_live_name() {
+        // The check compares fixed values against these variables' live
+        // values; a carrier that isn't on the default list would never be
+        // passed to a command, so checking it would guard nothing.
+        for name in CREDENTIAL_CARRIERS {
+            assert!(DEFAULT_LIVE_NAMES.contains(name), "{name}");
+        }
+    }
+
+    #[test]
     fn relative_and_empty_path_entries_are_dropped() {
         let n = normalize_path(":/usr/bin:.:bin::node_modules/.bin:~/bin:/bin:");
         assert_eq!(n.path.as_deref(), Some("/usr/bin:/bin"));

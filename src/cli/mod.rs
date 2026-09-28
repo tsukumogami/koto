@@ -176,8 +176,10 @@ pub enum Command {
 
         /// Run this session's commands with the caller's whole
         /// environment, as koto did before it recorded one. Recorded in
-        /// the session at init; no later command can set or clear it.
-        /// Temporary: the next release removes it.
+        /// the session when it is created; no later command can set or
+        /// clear it, so with --attach-live on an existing session it has
+        /// no effect. Refused with --parent: a child takes its parent's
+        /// record. Temporary: the next release removes it.
         #[arg(long)]
         legacy_environment: bool,
     },
@@ -1987,14 +1989,17 @@ fn stale_template_source_dir_clause(backend: &Backend, name: &str) -> Option<Str
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Add an `environment` object to a `koto init` response when recording
-/// this process's environment dropped `PATH` entries or left a fixed value
-/// unset (DESIGN-koto-fixed-environment.md). Names and path text only; no
-/// value of a credential-carrying variable.
-pub(crate) fn add_environment_report(out: &mut serde_json::Value, legacy_environment: bool) {
-    let (_, report) = crate::engine::command_env::record_from_process(legacy_environment);
-    if !report.is_empty() {
+/// the session's environment dropped `PATH` entries or left a fixed value
+/// unset (DESIGN-koto-fixed-environment.md). `report` is what the header
+/// writer returned: `None` when the record was copied from a parent, so
+/// there is nothing to report. Names and path text only; no value of a
+/// credential-carrying variable.
+pub(crate) fn add_environment_report(
+    out: &mut serde_json::Value,
+    report: Option<&crate::engine::command_env::RecordReport>,
+) {
+    if let Some(report) = report.filter(|r| !r.is_empty()) {
         out["environment"] = report.to_json();
     }
 }
@@ -2065,7 +2070,7 @@ fn handle_init(
     // R8 spawn-time immutability snapshot is populated only by the
     // future batch scheduler, which calls this helper directly with
     // `Some(..)`.
-    if let Err(err) = init_child::init_child_from_parent_at(
+    let environment_report = match init_child::init_child_from_parent_at(
         backend,
         parent,
         name,
@@ -2076,56 +2081,59 @@ fn handle_init(
         execution_dir,
         legacy_environment,
     ) {
-        match err.kind {
-            SpawnErrorKind::Collision => {
-                // Match the pre-check's error text so callers can rely
-                // on a stable "already exists" string regardless of
-                // which detector fired. The staleness clause (if any)
-                // is appended via the same shared helper the pre-check
-                // uses, so the clause itself is identical between the
-                // two paths even though their base messages differ.
-                let base = format!("workflow '{}' already exists", name);
-                let error = match stale_template_source_dir_clause(backend, name) {
-                    Some(clause) => format!("{}{}", base, clause),
-                    None => base,
-                };
-                exit_with_error(serde_json::json!({
-                    "error": error,
-                    "command": "init"
-                }));
-            }
-            _ => {
-                // Variable-resolution failures are caller errors (exit
-                // 2); everything else is a runtime/IO/compile failure
-                // (exit 1), matching the legacy implementation.
-                let is_var_error = matches!(err.kind, SpawnErrorKind::TemplateCompileFailed)
-                    && err
-                        .message
-                        .starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
-                let mut body = serde_json::json!({
-                    "error": if is_var_error {
-                        err.message
-                            .strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
-                            .unwrap_or(&err.message)
-                            .to_string()
-                    } else {
-                        err.message.clone()
-                    },
-                    "command": "init"
-                });
-                // A typed refusal (`invalid_var`, `duplicate_var`,
-                // `unknown_var`) adds its code and fields beside `error`.
-                if let (Some(var_error), Some(obj)) = (&err.var_error, body.as_object_mut()) {
-                    obj.extend(var_error.fields());
+        Ok(value) => value,
+        Err(err) => {
+            match err.kind {
+                SpawnErrorKind::Collision => {
+                    // Match the pre-check's error text so callers can rely
+                    // on a stable "already exists" string regardless of
+                    // which detector fired. The staleness clause (if any)
+                    // is appended via the same shared helper the pre-check
+                    // uses, so the clause itself is identical between the
+                    // two paths even though their base messages differ.
+                    let base = format!("workflow '{}' already exists", name);
+                    let error = match stale_template_source_dir_clause(backend, name) {
+                        Some(clause) => format!("{}{}", base, clause),
+                        None => base,
+                    };
+                    exit_with_error(serde_json::json!({
+                        "error": error,
+                        "command": "init"
+                    }));
                 }
-                if is_var_error {
-                    exit_with_error_code(body, 2);
-                } else {
-                    exit_with_error(body);
+                _ => {
+                    // Variable-resolution failures are caller errors (exit
+                    // 2); everything else is a runtime/IO/compile failure
+                    // (exit 1), matching the legacy implementation.
+                    let is_var_error = matches!(err.kind, SpawnErrorKind::TemplateCompileFailed)
+                        && err
+                            .message
+                            .starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
+                    let mut body = serde_json::json!({
+                        "error": if is_var_error {
+                            err.message
+                                .strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
+                                .unwrap_or(&err.message)
+                                .to_string()
+                        } else {
+                            err.message.clone()
+                        },
+                        "command": "init"
+                    });
+                    // A typed refusal (`invalid_var`, `duplicate_var`,
+                    // `unknown_var`) adds its code and fields beside `error`.
+                    if let (Some(var_error), Some(obj)) = (&err.var_error, body.as_object_mut()) {
+                        obj.extend(var_error.fields());
+                    }
+                    if is_var_error {
+                        exit_with_error_code(body, 2);
+                    } else {
+                        exit_with_error(body);
+                    }
                 }
             }
         }
-    }
+    };
 
     // If --intent was provided, append an IntentUpdated event. Otherwise,
     // record a default intent derived from the template so the session
@@ -2163,9 +2171,7 @@ fn handle_init(
         "name": name,
         "state": initial_state
     });
-    if parent.is_none() {
-        add_environment_report(&mut out, legacy_environment);
-    }
+    add_environment_report(&mut out, environment_report.as_ref());
     println!("{}", serde_json::to_string(&out)?);
     Ok(())
 }
@@ -2220,7 +2226,7 @@ fn handle_init_inline(
         }));
     }
 
-    if let Err(e) = init_child::init_inline_from_stdin_bytes(
+    let environment_report = match init_child::init_inline_from_stdin_bytes(
         backend,
         name,
         source_bytes,
@@ -2228,31 +2234,36 @@ fn handle_init_inline(
         execution_dir,
         legacy_environment,
     ) {
-        // Variable-resolution failures are caller errors (exit 2); a
-        // strict-compile / validation failure or any I/O error is exit 1.
-        // The seam prefixes var-resolution errors so we can classify them
-        // the same way the file path does.
-        let msg = e.to_string();
-        let is_var_error = msg.starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
-        let mut body = serde_json::json!({
-            "error": if is_var_error {
-                msg.strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
-                    .unwrap_or(&msg)
-                    .to_string()
+        Ok(value) => value,
+        Err(e) => {
+            // Variable-resolution failures are caller errors (exit 2); a
+            // strict-compile / validation failure or any I/O error is exit 1.
+            // The seam prefixes var-resolution errors so we can classify them
+            // the same way the file path does.
+            let msg = e.to_string();
+            let is_var_error = msg.starts_with(init_child::VAR_RESOLUTION_MSG_PREFIX);
+            let mut body = serde_json::json!({
+                "error": if is_var_error {
+                    msg.strip_prefix(init_child::VAR_RESOLUTION_MSG_PREFIX)
+                        .unwrap_or(&msg)
+                        .to_string()
+                } else {
+                    msg.clone()
+                },
+                "command": "init"
+            });
+            if let (Some(var_error), Some(obj)) =
+                (e.downcast_ref::<VarError>(), body.as_object_mut())
+            {
+                obj.extend(var_error.fields());
+            }
+            if is_var_error {
+                exit_with_error_code(body, 2);
             } else {
-                msg.clone()
-            },
-            "command": "init"
-        });
-        if let (Some(var_error), Some(obj)) = (e.downcast_ref::<VarError>(), body.as_object_mut()) {
-            obj.extend(var_error.fields());
+                exit_with_error(body);
+            }
         }
-        if is_var_error {
-            exit_with_error_code(body, 2);
-        } else {
-            exit_with_error(body);
-        }
-    }
+    };
 
     // If --intent was provided, append an IntentUpdated event. Otherwise,
     // record a default intent derived from the template (R8).
@@ -2286,7 +2297,7 @@ fn handle_init_inline(
         "name": name,
         "state": initial_state
     });
-    add_environment_report(&mut out, legacy_environment);
+    add_environment_report(&mut out, environment_report.as_ref());
     println!("{}", serde_json::to_string(&out)?);
     Ok(())
 }

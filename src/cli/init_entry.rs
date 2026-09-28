@@ -648,7 +648,7 @@ fn create(
         }
     }
 
-    if let Err(err) = init_child::init_child_from_parent_at(
+    let environment_report = match init_child::init_child_from_parent_at(
         backend,
         None,
         name,
@@ -659,19 +659,23 @@ fn create(
         args.execution_dir,
         args.legacy_environment,
     ) {
-        let r = match err.kind {
-            SpawnErrorKind::Collision => {
-                let mut r = Refusal::new(None, format!("workflow '{}' already exists", name), 1);
-                r.reason = "already-exists".to_string();
-                r
-            }
-            _ => match &err.var_error {
-                Some(var_error) => Refusal::var(var_error),
-                None => Refusal::new(Some(&spawn_kind_code(&err.kind)), err.message.clone(), 1),
-            },
-        };
-        refuse(entry, r);
-    }
+        Ok(value) => value,
+        Err(err) => {
+            let r = match err.kind {
+                SpawnErrorKind::Collision => {
+                    let mut r =
+                        Refusal::new(None, format!("workflow '{}' already exists", name), 1);
+                    r.reason = "already-exists".to_string();
+                    r
+                }
+                _ => match &err.var_error {
+                    Some(var_error) => Refusal::var(var_error),
+                    None => Refusal::new(Some(&spawn_kind_code(&err.kind)), err.message.clone(), 1),
+                },
+            };
+            refuse(entry, r);
+        }
+    };
 
     if let Some(intent) = args.intent {
         if let Err(e) = crate::cli::session::handle_update(backend, name, intent) {
@@ -704,7 +708,7 @@ fn create(
         "state": state,
         "outcome": if replaced.is_some() { "replaced" } else { "created" },
     });
-    super::add_environment_report(&mut out, args.legacy_environment);
+    super::add_environment_report(&mut out, environment_report.as_ref());
     if let Some((old_state, terminal, result)) = replaced {
         out["replaced_state"] = terminal.unwrap_or(old_state).into();
         out["replaced_result"] = serde_json::to_value(result)?;

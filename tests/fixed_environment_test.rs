@@ -445,13 +445,20 @@ fn a_child_of_an_unrecorded_parent_records_from_its_own_process() {
     assert!(env.record("old").is_null());
 
     let child_path = format!("/opt/child/bin:{SYSTEM_PATH}");
+    let child_path_with_relative = format!("/opt/child/bin:.:{SYSTEM_PATH}");
     let r = env.run(
-        &[("PATH", &child_path)],
+        &[("PATH", &child_path_with_relative)],
         &["init", "old.kid", "--template", &tpl, "--parent", "old"],
     );
     assert!(r.success, "{}", r.stderr);
+    // This child recorded from its own process, so the response reports
+    // what recording dropped.
+    assert_eq!(
+        r.json["environment"]["dropped_path_entries"],
+        serde_json::json!(["."])
+    );
     let r = env.run(
-        &[("PATH", &child_path)],
+        &[("PATH", &child_path_with_relative)],
         &["session", "start", "old.started", "--parent", "old"],
     );
     assert!(r.success, "{}", r.stderr);
