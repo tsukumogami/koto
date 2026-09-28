@@ -397,9 +397,7 @@ pub fn prepare_capture(key: &str, stdout: &str) -> Result<String, CaptureError> 
 /// was delivered, and `Ok(Some(conditions))` when delivery failed and the tick
 /// must stop at this state with an `__action__` condition.
 ///
-/// `check` is borrowed, and cloned only into a failure's condition: on
-/// delivery the caller still holds it, since a passing action's findings
-/// are the check's to record on `default_action_executed`.
+/// `check` is borrowed, and cloned only into a failure's condition.
 ///
 /// The event and the overlay are written in the same step, so the durable
 /// record and the view the rest of this tick reads can never disagree. The
@@ -701,7 +699,8 @@ where
 /// That is one of the two things that make a finding's `effect_landed`
 /// true (DESIGN-koto-failure-reporting.md, Components): the change this
 /// invocation attempted was recorded. The other, a `default_action` that
-/// exited 0 and delivered its capture, the loop sees for itself. Every
+/// exited 0 (and delivered its capture, if it declares one), the loop sees
+/// for itself. Every
 /// finding a check left without its own `effect_landed` gets the answer
 /// before it leaves the loop.
 #[allow(clippy::too_many_arguments)]
@@ -830,8 +829,8 @@ where
         // Whether the change attempted on this entry to the state was
         // recorded: evidence this invocation submitted for the starting state
         // (before any transition), or a `default_action` that exited 0 and
-        // delivered its capture (set below). Fills `effect_landed` on the
-        // findings of this state's checks.
+        // delivered its capture if it declares one (set below). Fills
+        // `effect_landed` on the findings of this state's gates.
         let mut effect_landed = evidence_recorded && !advanced;
 
         // 5. Action execution (if state has default_action)
@@ -844,7 +843,7 @@ where
                     stdout,
                     stderr,
                     truncated,
-                    mut check,
+                    check,
                     ..
                 } => {
                     // Deliver the capture, if the state declared a name, and
@@ -867,11 +866,13 @@ where
                         });
                     }
                     effect_landed = true;
-                    // The action passed, so its findings go on no response,
-                    // but they are still the check's: `check` holds every
-                    // one, uncapped, for the `default_action_executed`
-                    // record.
-                    fill_effect_landed(check.findings.iter_mut(), effect_landed);
+                    // The action passed, so its findings go on no response
+                    // and, for now, nowhere else: `default_action_executed`
+                    // is appended in the caller's closure and carries no
+                    // findings. The log work (DESIGN-koto-failure-reporting.md,
+                    // Issue 3) moves that append into this loop, where
+                    // `effect_landed` is known, and fills it on `check`'s
+                    // findings there.
                 }
                 ActionResult::Skipped => {
                     // Continue to gate evaluation

@@ -609,7 +609,7 @@ level is `error`, and its message is the last non-blank line of stderr, or else 
 stdout line that isn't a finding line, or else a sentence koto writes from the outcome, such as
 `command exited with status 1` or `context key 'review_note' is not set`. On a timeout the message
 is koto's own `command timed out after N seconds` note. The message is folded onto one line and cut
-to 500 characters. A script that prints `boom` and exits 1 gets exactly one finding:
+to 500 characters, then held to the 1,000-byte message cap below. A script that prints `boom` and exits 1 gets exactly one finding:
 
 ```json
 {"rule_id":"lint","level":"error","message":"boom","effect_landed":false,"message_source":"output"}
@@ -651,7 +651,8 @@ passes whatever it printed, and its response carries no `failure`.
 
 Every finding carries `effect_landed`. Unless the check states it, koto sets it to `true` when the
 invocation that ran the check recorded the evidence the agent submitted for the state, or when the
-state's `default_action` exited 0 and delivered its capture, and to `false` otherwise.
+state's `default_action` exited 0 (and delivered its capture, if it declares one), and to `false`
+otherwise.
 
 `message_source` says where a finding's message came from: `check` for a line the check printed,
 `output` for a koto-written finding whose message is a line of the check's output, and `koto` for
@@ -663,8 +664,8 @@ A response keeps at most 100 findings per condition in the order they were print
 koto-written one when there is one, and sets `findings_truncated` when it dropped any. **Print
 errors before warnings.** A check that prints a hundred warnings, then its only error, and fails
 shows the agent a failed status and warnings only, with `findings_truncated: true`. koto adds no
-finding of its own, because the check did report an error; the error is still in the captured
-output, the session log and the per-rule counts, but the agent's list doesn't show it.
+finding of its own, because the check did report an error. koto keeps every finding the check
+printed, and the error is still in the captured output, but the agent's list doesn't show it.
 
 Check authors own what their scripts print. koto replaces the credentials it knows about before
 any of this output reaches the response or the log, but it can't recognize a secret it wasn't

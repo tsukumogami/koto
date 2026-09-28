@@ -8,15 +8,15 @@
 //! corrective check whose findings hold no `error` gets one more, written by
 //! [`fallback_finding`] from its last line of output or from koto's own
 //! description of the outcome. [`build_failure`] keeps a failed check's
-//! parsed findings whole and the fallback separate; the capped lists the
-//! response and the log carry are derived from the two.
+//! parsed findings whole and the fallback separate; the capped list the
+//! response carries is derived from the two.
 //!
 //! Every string in a finding has been redacted and is capped after
 //! redaction, never splitting a marker or a character.
 
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::redact::{redact_str, RedactedText, Redactor};
+use crate::redact::{fold_one_line, redact_str, safe_cut_len, RedactedText, Redactor};
 
 /// The bytes a finding line starts with.
 pub const FINDING_PREFIX: &str = "::koto-finding::";
@@ -25,8 +25,11 @@ pub const FINDING_PREFIX: &str = "::koto-finding::";
 /// koto-written finding included.
 pub const RESPONSE_FINDINGS_CAP: usize = 100;
 
-/// Most findings a check event records in the session log, the koto-written
-/// finding included.
+/// Most findings a check event will record in the session log, the
+/// koto-written finding included. Nothing records findings yet: the check
+/// events gain them in the follow-up log work
+/// (DESIGN-koto-failure-reporting.md, Issue 3), which applies this cap
+/// through [`cap_findings`]. Only tests read it until then.
 pub const LOG_FINDINGS_CAP: usize = 50;
 
 /// Longest `rule_id`, in bytes, after redaction.
@@ -41,21 +44,34 @@ pub const RULE_REF_MAX_BYTES: usize = 512;
 /// Longest `message`, in bytes, after redaction.
 pub const MESSAGE_MAX_BYTES: usize = 1000;
 
+/// Longest koto-written message, in characters, after it is folded onto one
+/// line (the same bound as a terminal `failure_reason`). The
+/// [`MESSAGE_MAX_BYTES`] cap applies after this fold.
+pub const FALLBACK_MESSAGE_MAX_CHARS: usize = 500;
+
 /// The line the CLI's truncation note adds to a cut `default_action` stream.
 /// It is koto's bookkeeping, not the check's output, so it is never chosen
 /// as a koto-written finding's message.
 pub const TRUNCATION_NOTE_LINE: &str = "... [output truncated]";
 
 /// A finding's severity. It never changes a check's outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+///
+/// koto only ever writes `error`, `warning` and `info`, but the vocabulary is
+/// open on read: a value a later koto writes deserializes as
+/// [`FindingLevel::Other`] and serializes back unchanged, so an older reader
+/// never rejects a record over it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FindingLevel {
     Error,
     Warning,
     Info,
+    /// A level this koto doesn't know. koto never produces it.
+    Other(String),
 }
 
 impl FindingLevel {
+    /// The level a check may print, or `None` for anything else. Unlike
+    /// deserialization, the finding-line grammar is closed.
     fn parse(s: &str) -> Option<Self> {
         match s {
             "error" => Some(FindingLevel::Error),
@@ -64,11 +80,36 @@ impl FindingLevel {
             _ => None,
         }
     }
+
+    /// The wire value.
+    pub fn as_str(&self) -> &str {
+        match self {
+            FindingLevel::Error => "error",
+            FindingLevel::Warning => "warning",
+            FindingLevel::Info => "info",
+            FindingLevel::Other(s) => s,
+        }
+    }
+}
+
+impl Serialize for FindingLevel {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for FindingLevel {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(FindingLevel::parse(&s).unwrap_or(FindingLevel::Other(s)))
+    }
 }
 
 /// Where a finding's message came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+///
+/// Open on read, like [`FindingLevel`]: an unknown value deserializes as
+/// [`MessageSource::Other`] and serializes back unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageSource {
     /// The check printed the finding.
     Check,
@@ -76,10 +117,42 @@ pub enum MessageSource {
     Output,
     /// koto wrote the finding and its message.
     Koto,
+    /// A source this koto doesn't know. koto never produces it.
+    Other(String),
 }
 
-/// One finding, as the response and the log carry it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+impl MessageSource {
+    /// The wire value.
+    pub fn as_str(&self) -> &str {
+        match self {
+            MessageSource::Check => "check",
+            MessageSource::Output => "output",
+            MessageSource::Koto => "koto",
+            MessageSource::Other(s) => s,
+        }
+    }
+}
+
+impl Serialize for MessageSource {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for MessageSource {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "check" => MessageSource::Check,
+            "output" => MessageSource::Output,
+            "koto" => MessageSource::Koto,
+            _ => MessageSource::Other(s),
+        })
+    }
+}
+
+/// One finding, as the response carries it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Finding {
     pub rule_id: String,
     pub level: FindingLevel,
@@ -92,8 +165,11 @@ pub struct Finding {
     pub column: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_ref: Option<String>,
-    /// The check's own claim when it made one; otherwise the advance loop
-    /// fills it in before the finding leaves the engine.
+    /// The check's own claim when it made one. Otherwise the advance loop
+    /// fills it in on every finding a response returns: `true` when this
+    /// invocation recorded evidence for the state, or when the state's
+    /// `default_action` exited 0 (and delivered its capture, if it declares
+    /// one); `false` otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effect_landed: Option<bool>,
     pub message_source: MessageSource,
@@ -136,9 +212,9 @@ impl CheckOutput {
 /// the captured output.
 ///
 /// The parsed findings sit beside it, whole and uncapped (on
-/// `StructuredGateResult::findings`), so the capped lists the response and
-/// the log carry are both derived views, and the fallback stays addressable
-/// rather than merged into a list. The response's `failure` object is
+/// `StructuredGateResult::findings`), so the capped list the response
+/// carries is a derived view, and the fallback stays addressable rather than
+/// merged into a list. The response's `failure` object is
 /// [`GateFailure::response`].
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GateFailure {
@@ -280,8 +356,8 @@ pub fn decode_line(line: &str) -> Option<Finding> {
 
 /// Redact a decoded string and cap it at `max` bytes.
 ///
-/// The stdout it came from was already redacted, but JSON escaping (`A`,
-/// `\/`) can spell a known value the raw-byte pass couldn't see, so the
+/// The stdout it came from was already redacted, but JSON escaping (a `\u`
+/// escape such as `\u0041` for `A`, or `\/` for `/`) can spell a known value the raw-byte pass couldn't see, so the
 /// decoded value goes through the redactor again before the cap.
 fn redact_field(value: &str, max: usize, redactor: &Redactor) -> String {
     redact_str(value, redactor).cut_bytes(max).0.into_string()
@@ -340,8 +416,12 @@ fn last_stdout_line(stdout: &str, truncated: bool) -> Option<&str> {
 /// the advance loop. The message is the first of: the last non-blank line of
 /// stderr (koto's own note when `captured` says stderr ends with one); the
 /// last non-blank stdout line that isn't a finding line; `sentence`, koto's
-/// description of the outcome. It is folded onto one line and cut to 500
-/// characters, as a terminal `failure_reason` is.
+/// description of the outcome. It is folded onto one line and cut to
+/// [`FALLBACK_MESSAGE_MAX_CHARS`] (500) characters, ending in `...`, as a
+/// terminal `failure_reason` is. The result is then held to
+/// [`MESSAGE_MAX_BYTES`] (1,000) like any message: 500 multibyte characters
+/// can exceed it, and such a message loses its `...` and ends at the last
+/// whole character (or whole marker) that fits.
 pub fn fallback_finding(check: &str, output: Option<&CheckOutput>, sentence: &str) -> Finding {
     let from_output = output.and_then(|o| {
         if let Some(line) = last_stderr_line(&o.captured.stderr) {
@@ -356,13 +436,13 @@ pub fn fallback_finding(check: &str, output: Option<&CheckOutput>, sentence: &st
             .map(|line| (line, MessageSource::Output))
     });
     let (text, message_source) = from_output.unwrap_or((sentence, MessageSource::Koto));
-    let folded =
-        crate::engine::terminal_result::one_line_reason(text).unwrap_or_else(|| check.to_string());
-    let (message, _) = RedactedText::koto_note(folded).cut_bytes(MESSAGE_MAX_BYTES);
+    let mut message =
+        fold_one_line(text, FALLBACK_MESSAGE_MAX_CHARS).unwrap_or_else(|| check.to_string());
+    message.truncate(safe_cut_len(message.as_bytes(), MESSAGE_MAX_BYTES));
     Finding {
         rule_id: check.to_string(),
         level: FindingLevel::Error,
-        message: message.into_string(),
+        message,
         path: None,
         line: None,
         column: None,
@@ -630,7 +710,7 @@ mod tests {
     fn decoded_strings_are_redacted_again() {
         let value = "sekrit-value-123";
         let red = Redactor::new([("KOTO_T".to_string(), value.to_string())]);
-        // `s` spells the leading `s`, which the raw-byte pass can't see.
+        // `\u0073` spells the leading `s`, which the raw-byte pass can't see.
         let escaped = format!("\\u0073{}", &value[1..]);
         let stdout = text(&format!(
             "{}\n",
@@ -800,6 +880,64 @@ mod tests {
         let json = serde_json::to_value(&f).unwrap();
         assert!(json.get("captured").is_none());
         assert_eq!(json["findings_truncated"], false);
+    }
+
+    #[test]
+    fn a_finding_round_trips_through_json() {
+        let finding = Finding {
+            rule_id: "E501".to_string(),
+            level: FindingLevel::Warning,
+            message: "line too long".to_string(),
+            path: Some("src/app.py".to_string()),
+            line: Some(12),
+            column: Some(89),
+            rule_ref: Some("https://docs.example.org/rules/E501".to_string()),
+            effect_landed: Some(false),
+            message_source: MessageSource::Output,
+        };
+        let json = serde_json::to_value(&finding).unwrap();
+        assert_eq!(json["level"], "warning");
+        assert_eq!(json["message_source"], "output");
+        let back: Finding = serde_json::from_value(json).unwrap();
+        assert_eq!(back, finding);
+
+        // Absent optional fields stay absent.
+        let bare = fallback_finding("g", None, "s");
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json.get("path").is_none());
+        let back: Finding = serde_json::from_value(json).unwrap();
+        assert_eq!(back, bare);
+    }
+
+    #[test]
+    fn an_unknown_level_or_source_reads_and_writes_back_unchanged() {
+        let json = serde_json::json!({
+            "rule_id": "R", "level": "critical", "message": "m",
+            "message_source": "plugin",
+        });
+        let f: Finding = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(f.level, FindingLevel::Other("critical".to_string()));
+        assert_eq!(f.message_source, MessageSource::Other("plugin".to_string()));
+        assert_eq!(serde_json::to_value(&f).unwrap(), json);
+
+        // The finding-line grammar stays closed: a check can't print one.
+        assert!(
+            decode_line(&line(r#"{"rule_id":"R","level":"critical","message":"m"}"#)).is_none()
+        );
+    }
+
+    #[test]
+    fn a_multibyte_fallback_is_held_to_the_byte_cap() {
+        // 497 three-byte characters plus `...` is 1,494 bytes; the byte cap
+        // keeps the 333 whole characters that fit in 1,000.
+        let f = respond("g", Some(output("", &"€".repeat(600))), "s");
+        let m = &f.findings[0].message;
+        assert!(m.len() <= MESSAGE_MAX_BYTES);
+        assert_eq!(m.chars().count(), MESSAGE_MAX_BYTES / 3);
+        assert!(
+            m.chars().all(|c| c == '€'),
+            "the `...` is past the byte cap"
+        );
     }
 
     #[test]

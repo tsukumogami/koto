@@ -120,6 +120,32 @@ pub fn safe_cut_len(bytes: &[u8], max: usize) -> usize {
     cut
 }
 
+/// Fold `raw` onto one line and bound it: every run of whitespace, line
+/// breaks included, becomes one space, and text longer than `max_chars`
+/// characters is cut to that many, the last three replaced by `...`, never
+/// inside a redaction marker (one that would straddle the cut is dropped
+/// whole). Empty or all-whitespace text is `None`.
+///
+/// `max_chars` must be at least 3.
+pub fn fold_one_line(raw: &str, max_chars: usize) -> Option<String> {
+    let folded = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if folded.is_empty() {
+        return None;
+    }
+    if folded.chars().count() <= max_chars {
+        return Some(folded);
+    }
+    let at = folded
+        .char_indices()
+        .nth(max_chars - 3)
+        .map(|(byte, _)| byte)
+        .unwrap_or(folded.len());
+    let end = safe_cut_len(folded.as_bytes(), at);
+    let mut cut = folded[..end].to_string();
+    cut.push_str("...");
+    Some(cut)
+}
+
 /// Text that has been through redaction, or that koto wrote itself.
 ///
 /// The field is private and the only constructors are this module's

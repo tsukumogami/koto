@@ -68,8 +68,8 @@ pub struct StructuredGateResult {
     #[serde(skip)]
     pub failure: Option<GateFailure>,
     /// Every finding the check printed, in emission order and uncapped,
-    /// whatever the outcome. The response's and the log's capped lists are
-    /// derived from these and `failure`'s fallback.
+    /// whatever the outcome. The response's capped list is derived from
+    /// these and `failure`'s fallback.
     #[serde(skip)]
     pub findings: Vec<Finding>,
 }
@@ -92,8 +92,12 @@ impl StructuredGateResult {
     }
 
     /// At most `cap` findings in emission order with the fallback last, and
-    /// whether a parsed finding was dropped. The log uses
-    /// [`LOG_FINDINGS_CAP`](crate::findings::LOG_FINDINGS_CAP).
+    /// whether a parsed finding was dropped.
+    ///
+    /// Nothing outside tests calls this yet: it is the view the check
+    /// events will record at
+    /// [`LOG_FINDINGS_CAP`](crate::findings::LOG_FINDINGS_CAP) once the log
+    /// work (DESIGN-koto-failure-reporting.md, Issue 3) gives them findings.
     pub fn capped_findings(&self, cap: usize) -> (Vec<Finding>, bool) {
         crate::findings::cap_findings(&self.findings, self.fallback().cloned(), cap)
     }
