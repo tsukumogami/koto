@@ -122,7 +122,7 @@ Entry outcomes:
 | `any_skipped` | ≥ 1 skipped | Fine-grained routing. |
 | `any_spawn_failed` | ≥ 1 spawn failure | Fine-grained routing; folded into `needs_attention`. |
 
-Per-child entries in `output.children[]` mirror the data in `materialized_children` but from the gate-observer's perspective. Failed children carry a `reason` string, a `failure_mode` holding the same string, and `reason_source` (one of `failure_reason`, `state_name`, `skipped`, `not_spawned`) so agents can tell where the reason came from. Read `reason`: it is the name `batch_final_view` and `koto status` use too, so one reader works on all three. `failure_mode` stays for consumers that already read it.
+Per-child entries in `output.children[]` mirror the data in `materialized_children` but from the gate-observer's perspective. Failed children carry a `reason` string, `reason_source` saying where it came from, and `failure_mode`, the name of the failure state the child ended in. `reason` is the child's `failure_reason` context key when the child wrote one during its current run (`reason_source: "failure_reason"`), and the failure state's name otherwise (`reason_source: "state_name"`, and then `reason` equals `failure_mode`). A reason written before a `retry_failed` or `koto rewind` restarted the child doesn't count. koto puts the text on one line, replacing each run of whitespace and line breaks with one space, and cuts anything longer than 500 characters to 500, the last three being `...`. Read `reason`: `batch_final_view` and `koto status` use the same name and value, so one reader works on all three. (`reason_source` is `skipped` or `not_spawned` on skipped and spawn-failed children, which carry no `reason`.)
 
 ## Converging: reading child results
 

@@ -123,10 +123,9 @@ pub struct TaskView {
     /// two surfaces share the same canonical name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_source: Option<String>,
-    /// Human-readable reason string for failures. For `Failure` this
-    /// is the child's terminal state name (v1 fallback) or its
-    /// `failure_reason` context key when present. Omitted for
-    /// non-failed outcomes.
+    /// Why a failed task failed, copied from the gate entry's `reason`:
+    /// the child's `failure_reason` from its current run, or its
+    /// terminal state name. Omitted for non-failed outcomes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Direct blocker for skipped tasks — the composed

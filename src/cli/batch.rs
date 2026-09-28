@@ -2036,16 +2036,17 @@ pub struct ChildGateEntry {
     /// Per-child outcome. Matches [`TaskOutcome`] serialization: one of
     /// `success | failure | skipped | pending | blocked | spawn_failed`.
     pub outcome: TaskOutcome,
-    /// Failure mode string for failed children: `"state_name"` or
-    /// `"state_name:failure_reason"`. Omitted for non-failed outcomes.
+    /// Name of the failure state a failed child ended in. Omitted for
+    /// non-failed outcomes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_mode: Option<String>,
-    /// Human-readable reason for a failed child, the same string as
-    /// `failure_mode`. It is the field `koto status` has always shown for
-    /// a failed task, so the gate output, `batch_final_view` and the
-    /// status batch view share one shape. `reason_source` names where it
-    /// came from. Omitted for non-failed outcomes. A view frozen before
-    /// this field existed gains it on read through
+    /// Why a failed child failed: the `failure_reason` it wrote during its
+    /// current run (see `current_failure_reason`), or else its state name,
+    /// with `reason_source` saying which. It is the field `koto status` has
+    /// always shown for a failed task, so the gate output,
+    /// `batch_final_view` and the status batch view share one shape.
+    /// Omitted for non-failed outcomes. A view frozen before this field
+    /// existed gains the state name on read through
     /// [`BatchFinalView::from_gate_output`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -2835,9 +2836,9 @@ fn build_entries_from_tasks(
 
         match outcome {
             TaskOutcome::Failure => {
-                // failure_mode projection: state_name only (v1 does not
-                // peek into the child's failure_reason context key from
-                // the gate evaluator path).
+                // The state name, as both failure_mode and the fallback
+                // reason. A failure_reason the child wrote replaces the
+                // reason in build_children_complete_output.
                 if let Some(s) = snap {
                     entry.failure_mode = Some(s.current_state.clone());
                     entry.reason = entry.failure_mode.clone();

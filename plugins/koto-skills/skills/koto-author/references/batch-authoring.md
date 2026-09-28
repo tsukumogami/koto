@@ -82,40 +82,40 @@ W4 and F5 are the two rules most likely to bite first-time batch authors. W4 pre
 
 ## The `failure_reason` convention (W5)
 
-When a worker enters a terminal state with `failure: true`, the parent's batch view exposes a per-child `reason`. That reason comes from one of three places, in priority order:
+When a worker ends in a terminal state with `failure: true`, the parent's batch view gives it a `reason`. The reason is the worker's `failure_reason` context key, when the worker wrote one during its current run, with `reason_source: "failure_reason"`. Otherwise it is the failure state's name, with `reason_source: "state_name"`. `failure_mode` is always the state name. The parent sees the same `reason` in the `children-complete` gate output, in `batch_final_view` and in `koto status`.
 
-1. The `failure_reason` context key written by the terminal state's `accepts` block.
-2. A `default_action` that writes `failure_reason`.
-3. A `context_assignments` entry on a transition into the terminal state.
+Evidence alone writes nothing to context. A worker that submits `{"status": "blocked", "failure_reason": "API quota exhausted"}` has told koto the reason only if something stores it. Two things do:
 
-A child that reaches a `failure: true` terminal keeps its session, so the reason stays readable after the failure: a coordinator reads it with `koto context get <parent>.<task> failure_reason`, and the parent can `retry_failed` the child. The child's result reaches the parent on the terminal tick either way.
+- a `context_assignments` entry on the transition that takes the evidence;
+- `koto context add <parent>.<task> failure_reason`, run by the worker or by a `default_action`, before or after the failure.
 
-Without any of these, the reason falls back to the state name, and the parent sees `reason_source: "state_name"` instead of `reason_source: "failure_reason"`. W5 warns at compile time when no path writing `failure_reason` is declared, so the author notices before the first failed run. It checks (1) and (3); for (3) every transition into the terminal must assign `failure_reason`, since one edge that doesn't reaches the terminal with no reason. A `default_action` write (2) isn't detected, so a template relying on it still sees W5.
-
-The assignment form looks like this:
+The assignment form, on the state where the worker submits the evidence:
 
 ```yaml
-transitions:
-  - target: done_blocked
-    when:
-      status: blocked
-    context_assignments:
-      failure_reason: "blocked: ${evidence.detail}"
-```
-
-The simplest satisfying pattern is to accept `failure_reason` as an evidence field on the failure state:
-
-```yaml
-done_blocked:
-  terminal: true
-  failure: true
+working:
   accepts:
+    status:
+      type: enum
+      values: [complete, blocked]
+      required: true
     failure_reason:
       type: string
-      required: true
+      required: false
+  transitions:
+    - target: done_blocked
+      when:
+        status: blocked
+      context_assignments:
+        failure_reason: "${evidence.failure_reason}"
 ```
 
-The worker submits `{"status": "blocked", "failure_reason": "API quota exhausted"}`, and the parent's batch view renders `reason: "API quota exhausted"` with `reason_source: "failure_reason"`.
+The worker submits `{"status": "blocked", "failure_reason": "API quota exhausted"}`, and the parent's batch view shows `reason: "API quota exhausted"` with `reason_source: "failure_reason"`.
+
+Put the assignment on the edge out of the state that takes the evidence, not further along. Evidence belongs to the state it was submitted to. If `blocked` leads to an intermediate state that auto-advances to `done_blocked` in the same tick, an assignment of `${evidence.failure_reason}` on that intermediate state's edge resolves to an empty string, even when the intermediate state declares the field in its own `accepts`. The empty value replaces the reason the first edge stored, and the parent falls back to the state name.
+
+koto reads only what the worker wrote during its current run. After `retry_failed` or `koto rewind` restarts the worker, a reason from the earlier run no longer counts, even though the context key still holds it. The latest write wins: a later empty value, or `koto context remove`, leaves no reason. The text is folded onto one line, with each run of whitespace and line breaks becoming one space, and anything longer than 500 characters is cut to 500, ending in `...`. The full text stays readable with `koto context get <parent>.<task> failure_reason`, since a child that reaches a `failure: true` terminal keeps its session.
+
+W5 warns at compile time when a `failure: true` terminal has no declared path writing `failure_reason`. It is satisfied when every transition into the terminal assigns `failure_reason`, or when the terminal state's `accepts` declares the field. A `default_action` or a worker's `koto context add` isn't detected, so a template relying on one still sees W5. Declaring `failure_reason` in the terminal state's own `accepts` silences W5 but doesn't write the key, because a terminal state takes no evidence. Use the assignment form above.
 
 ## F5: child templates need a `skipped_marker` state
 
