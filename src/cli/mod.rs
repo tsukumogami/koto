@@ -4533,16 +4533,10 @@ fn handle_next(
                 };
                 // A directed move into a state that routes a retry offers it
                 // on this response too, as an arrival by advance does
-                // (koto#277). The batch it names was recorded just above.
-                //
-                // The field is appended to the serialized object rather than
-                // spliced through a `serde_json::Value`, which would sort the
-                // keys: a directed response keeps the struct's key order, and
-                // one with nothing to offer stays byte-identical to what it
-                // was (tests/next_response_baseline.rs).
+                // (koto#277). This must run after `finalize_batch_if_complete`
+                // above: the offer is built from the batch that call records.
                 // The log is read only for a target that can offer one, so
                 // other directed moves cost no extra read.
-                let mut body = serde_json::to_string(&resp)?;
                 let retryable = if crate::cli::batch::state_may_offer_retry(&compiled, target) {
                     let post_events = backend
                         .read_events(&name)
@@ -4558,14 +4552,24 @@ fn handle_next(
                 } else {
                     Vec::new()
                 };
-                if !retryable.is_empty() && body.ends_with('}') {
-                    let actions = crate::cli::retry::synthesize_reserved_actions(&name, &retryable);
-                    body.pop();
-                    body.push_str(",\"reserved_actions\":");
-                    body.push_str(&serde_json::to_string(&actions)?);
-                    body.push('}');
+                // Serialized through a flattening wrapper rather than a
+                // `serde_json::Value`, which would sort the keys: the response
+                // keeps its own key order, and one with nothing to offer stays
+                // byte-identical to what it was (tests/next_response_baseline.rs).
+                #[derive(serde::Serialize)]
+                struct DirectedResponse<'a> {
+                    #[serde(flatten)]
+                    resp: &'a next_types::NextResponse,
+                    #[serde(skip_serializing_if = "Vec::is_empty")]
+                    reserved_actions: Vec<crate::cli::retry::ReservedAction>,
                 }
-                println!("{}", body);
+                let out = DirectedResponse {
+                    resp: &resp,
+                    reserved_actions: crate::cli::retry::synthesize_reserved_actions(
+                        &name, &retryable,
+                    ),
+                };
+                println!("{}", serde_json::to_string(&out)?);
                 // The delivery record is appended only after printing --
                 // see the natural-advancement path for the crash-
                 // direction rationale. Non-fatal on error: the response
@@ -6062,7 +6066,10 @@ fn handle_next(
                 // stopped outside a batching state -- typically one that
                 // left the batching state as the batch completed. A state
                 // that routes a retry still offers one, from the batch
-                // recorded before the parent got here.
+                // recorded before the parent got here. This arm also sees a
+                // scheduler outcome other than `Scheduled` in a batching
+                // state; the helper returns nothing for a state that declares
+                // `materialize_children`, so that case still offers nothing.
                 _ => crate::cli::batch::retryable_children_after_batch(
                     &bf_post_events,
                     &compiled,

@@ -4627,7 +4627,14 @@ mod tests {
                 ..TemplateState::default()
             },
         );
-        states.insert("report".to_string(), TemplateState::default());
+        // Takes evidence but routes no retry.
+        states.insert(
+            "report".to_string(),
+            TemplateState {
+                accepts: some_accepts(),
+                ..TemplateState::default()
+            },
+        );
         let template = CompiledTemplate {
             format_version: 1,
             name: "p".to_string(),
@@ -4671,6 +4678,21 @@ mod tests {
         let mut retried = recorded.clone();
         retried.push(retry_evidence_event(7, "2026-04-14T10:05:00Z"));
         assert!(offered(&retried, "analyze").is_empty());
+
+        // So does a rewind of the parent.
+        let mut rewound = recorded.clone();
+        rewound.push(Event {
+            seq: 8,
+            timestamp: "2026-04-14T10:06:00Z".to_string(),
+            event_type: "rewound".to_string(),
+            payload: EventPayload::Rewound {
+                from: "analyze".to_string(),
+                to: "plan".to_string(),
+                rationale: None,
+            },
+            idempotency_hash: None,
+        });
+        assert!(offered(&rewound, "analyze").is_empty());
 
         // No recorded batch, nothing to offer.
         assert!(offered(&[], "analyze").is_empty());

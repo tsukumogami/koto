@@ -195,7 +195,7 @@ Two kinds of state carry it:
 | `applies_to` | Short task names to retry: children whose outcome is `failure`, `skipped`, or `spawn_failed`. In a state reached after the batch, only those that have a session on disk. |
 | `invocation` | POSIX-safe ready-to-run command string. Copy and run as-is. |
 
-Reserved-action evidence bypasses the state's `accepts` validator — it's not `expects.fields` content. Read `reserved_actions` and submit the `invocation` directly; don't try to cram `retry_failed` into a normal evidence submission alongside other keys.
+The `retry_failed` key is reserved evidence: it isn't validated against the state's `accepts` fields and isn't part of `expects.fields`, although the state still has to accept evidence at all for `--with-data` to be taken. Read `reserved_actions` and submit the `invocation` directly; don't try to cram `retry_failed` into a normal evidence submission alongside other keys.
 
 ## `retry_failed` mechanics
 
