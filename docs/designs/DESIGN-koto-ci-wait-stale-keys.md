@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 problem: |
   koto has no gate that can answer "not yet" and no way to drop a state's
   context keys when the workflow comes back to it, so templates keep prose
@@ -38,7 +38,7 @@ user_visible_surface: true
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
