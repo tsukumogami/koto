@@ -258,7 +258,7 @@ pub fn handle_list(store: &dyn ContextStore, session: &str, prefix: Option<&str>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::context_log::fail_best_effort_appends;
+    use crate::session::context_log::{fail_best_effort_appends, take_warnings};
     use crate::session::local::LocalBackend;
     use crate::session::state_file_name;
 
@@ -357,8 +357,13 @@ mod tests {
         std::fs::write(&input, b"content").unwrap();
         let out = dir.path().join("out.txt");
         let _hook = fail_best_effort_appends();
+        take_warnings();
 
+        // `add` makes no best-effort append of its own (its `context_added`
+        // is a required write), so the hook has nothing to refuse and `add`
+        // warns about nothing.
         handle_add(&backend, &backend, "s", "k", Some(input.to_str().unwrap())).unwrap();
+        assert_eq!(take_warnings(), Vec::<String>::new());
         let events = restore_assigned(&backend, &backend, "s", "k");
         handle_get(
             &backend,
@@ -375,12 +380,59 @@ mod tests {
             KeyPresence::Present
         ));
         assert!(handle_get(&backend, &backend, events.as_deref(), "s", "absent", None).is_err());
+        let refused = "test hook: append refused";
+        assert_eq!(
+            take_warnings(),
+            vec![
+                format!("warning: failed to record context_read for context key \"k\": {refused}"),
+                format!("warning: failed to record context_read for context key \"k\": {refused}"),
+                format!(
+                    "warning: failed to record context_read for context key \"absent\": {refused}"
+                ),
+            ]
+        );
 
         assert_eq!(event_types(&backend), vec!["transitioned", "context_added"]);
         assert_eq!(
             backend.meta("s", "k").unwrap().writer.as_deref(),
             Some(WRITER_AGENT)
         );
+    }
+
+    /// A store that says every key exists but has no metadata and no
+    /// readable content for any of them.
+    struct Hashless;
+
+    impl ContextStore for Hashless {
+        fn add(&self, _: &str, _: &str, _: &[u8]) -> Result<()> {
+            anyhow::bail!("read-only")
+        }
+        fn get(&self, _: &str, _: &str) -> Result<Vec<u8>> {
+            anyhow::bail!("unreadable")
+        }
+        fn ctx_exists(&self, _: &str, _: &str) -> bool {
+            true
+        }
+        fn remove(&self, _: &str, _: &str) -> Result<()> {
+            anyhow::bail!("read-only")
+        }
+        fn list_keys(&self, _: &str, _: Option<&str>) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// `koto context exists` on a key with no hash to be had still answers
+    /// present, and appends nothing to the log.
+    #[test]
+    fn exists_on_a_key_with_no_hash_logs_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = session(dir.path());
+        let (_, events) = backend.read_events("s").unwrap();
+        assert!(matches!(
+            handle_exists(&Hashless, &backend, Some(&events), "s", "k"),
+            KeyPresence::Present
+        ));
+        assert_eq!(event_types(&backend), vec!["transitioned"]);
     }
 
     #[test]

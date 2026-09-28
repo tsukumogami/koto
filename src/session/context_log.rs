@@ -222,12 +222,29 @@ fn warn_unrecorded(payload: &EventPayload, error: &str) {
         }
         _ => "",
     };
-    eprintln!(
+    let warning = format!(
         "warning: failed to record {} for context key {:?}: {}",
         payload.type_name(),
         key,
         error
     );
+    #[cfg(test)]
+    WARNINGS.with(|w| w.borrow_mut().push(warning.clone()));
+    eprintln!("{warning}");
+}
+
+#[cfg(test)]
+thread_local! {
+    static WARNINGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test hook: the warnings [`append_best_effort`] wrote to stderr on this
+/// thread since the last call, exactly as written, in order. Lets an
+/// in-process test assert the warning text, which the test harness's stderr
+/// capture doesn't expose.
+#[cfg(test)]
+pub fn take_warnings() -> Vec<String> {
+    WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()))
 }
 
 /// [`append_best_effort`] to `session`'s log through `backend`.
@@ -364,5 +381,69 @@ mod tests {
             Ok::<(), String>(())
         }));
         assert!(!called, "the hook refuses before the append runs");
+        assert_eq!(
+            take_warnings(),
+            vec![
+                "warning: failed to record context_read for context key \"k\": disk full",
+                "warning: failed to record context_read for context key \"k\": test hook: append refused",
+            ]
+        );
+    }
+
+    /// A store that answers `ctx_exists` with `present` for every key, holds
+    /// no metadata, and returns `content` from `get` (an error when `None`).
+    struct NoMeta {
+        present: bool,
+        content: Option<&'static [u8]>,
+    }
+
+    impl ContextStore for NoMeta {
+        fn add(&self, _: &str, _: &str, _: &[u8]) -> anyhow::Result<()> {
+            anyhow::bail!("read-only")
+        }
+        fn get(&self, _: &str, _: &str) -> anyhow::Result<Vec<u8>> {
+            match self.content {
+                Some(c) => Ok(c.to_vec()),
+                None => anyhow::bail!("unreadable"),
+            }
+        }
+        fn ctx_exists(&self, _: &str, _: &str) -> bool {
+            self.present
+        }
+        fn remove(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            anyhow::bail!("read-only")
+        }
+        fn list_keys(&self, _: &str, _: Option<&str>) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A key the store says is present, with neither metadata nor readable
+    /// content, yields no record at all: logging it would mean a
+    /// `present: true` read with no `hash`. The controls show the same store
+    /// does yield a record once content is readable, and for an absent key.
+    #[test]
+    fn a_present_key_with_no_hash_to_be_had_logs_no_presence_read() {
+        let hashless = NoMeta {
+            present: true,
+            content: None,
+        };
+        assert!(hashless.meta("s", "k").is_none());
+        assert_eq!(ContextReadRecord::presence(&hashless, "s", "k", true), None);
+
+        let readable = NoMeta {
+            present: true,
+            content: Some(b"hello"),
+        };
+        let r = ContextReadRecord::presence(&readable, "s", "k", true).unwrap();
+        assert_eq!(r.hash, Some(sha256_hex(b"hello")));
+
+        let absent = NoMeta {
+            present: false,
+            content: None,
+        };
+        let r = ContextReadRecord::presence(&absent, "s", "k", false).unwrap();
+        assert!(!r.present);
+        assert_eq!(r.hash, None);
     }
 }

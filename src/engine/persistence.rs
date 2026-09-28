@@ -468,9 +468,30 @@ impl AppendLock {
 /// Used by [`append_event_idempotent`] to serialize the read-then-write
 /// window so concurrent identical retries collapse to a single write
 /// rather than racing past the hash scan.
+///
+/// # Lock order and the invariant it relies on
+///
+/// [`append_event_idempotent_in`] takes this lock first and the sidecar
+/// [`AppendLock`] second. This is the same file
+/// [`SessionBackend::lock_state_file`](crate::session::SessionBackend::lock_state_file)
+/// locks for a whole batch tick, and `flock` locks belong to the open file,
+/// not the process: a thread holding that tick lock that reached this
+/// blocking call on the same state file would wait on itself forever. No
+/// production caller does -- the only idempotent append today writes a
+/// request store's log, a different file -- and nothing may start to: an
+/// idempotent append to a session's state file must not run on a thread
+/// holding that session's tick lock. Debug builds check this with
+/// [`held_state_locks`] and panic instead of hanging.
 #[cfg(unix)]
 fn acquire_state_flock(path: &Path) -> anyhow::Result<std::fs::File> {
     use std::os::fd::AsRawFd;
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        !held_state_locks::held_by_this_thread(path),
+        "acquire_state_flock on {} while this thread holds its lock_state_file lock \
+         would deadlock",
+        path.display()
+    );
     // Open without `create`: a log is created when its session is created,
     // and a lock open that created the file would leave an empty log behind
     // for the header check in `next_seq_after_header` to refuse.
@@ -504,6 +525,53 @@ fn acquire_state_flock(_path: &Path) -> anyhow::Result<std::fs::File> {
     // unlikely in koto's single-coordinator model; falling through
     // produces correct semantics in the no-contention case.
     Err(anyhow::anyhow!("flock not available on this platform"))
+}
+
+/// Debug-build record of which threads hold a
+/// [`SessionBackend::lock_state_file`](crate::session::SessionBackend::lock_state_file)
+/// lock on which state file, so [`acquire_state_flock`] can refuse the
+/// same-thread re-lock that would deadlock. Release builds carry none of it.
+#[cfg(debug_assertions)]
+pub(crate) mod held_state_locks {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::thread::ThreadId;
+
+    static HELD: Mutex<Vec<(ThreadId, PathBuf)>> = Mutex::new(Vec::new());
+
+    fn identity(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// Marks `path` as locked by the current thread until dropped. Dropping
+    /// it on another thread still removes the right entry.
+    #[derive(Debug)]
+    pub(crate) struct Held {
+        entry: (ThreadId, PathBuf),
+    }
+
+    pub(crate) fn hold(path: &Path) -> Held {
+        let entry = (std::thread::current().id(), identity(path));
+        if let Ok(mut held) = HELD.lock() {
+            held.push(entry.clone());
+        }
+        Held { entry }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            if let Ok(mut held) = HELD.lock() {
+                if let Some(i) = held.iter().position(|e| *e == self.entry) {
+                    held.swap_remove(i);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn held_by_this_thread(path: &Path) -> bool {
+        let entry = (std::thread::current().id(), identity(path));
+        HELD.lock().map(|h| h.contains(&entry)).unwrap_or(false)
+    }
 }
 
 /// Extract the session id (workflow name) from a state file path.

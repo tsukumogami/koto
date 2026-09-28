@@ -7346,11 +7346,20 @@ mod tests {
         let expected = run_with_reads(&mut logged).unwrap();
 
         let _hook = crate::session::context_log::fail_best_effort_appends();
+        crate::session::context_log::take_warnings();
         let mut appended = Vec::new();
         let result = run_with_reads(&mut appended).unwrap();
         assert_eq!(result, expected);
         let types: Vec<&str> = appended.iter().map(|p| p.type_name()).collect();
         assert_eq!(types, vec!["gate_evaluated"]);
+        // Each refused read warns on stderr, naming its key.
+        assert_eq!(
+            crate::session::context_log::take_warnings(),
+            vec![
+                "warning: failed to record context_read for context key \"note\": test hook: append refused",
+                "warning: failed to record context_read for context key \"other\": test hook: append refused",
+            ]
+        );
     }
 
     #[test]

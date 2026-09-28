@@ -383,7 +383,11 @@ impl SessionBackend for LocalBackend {
             return Err(SessionError::Io(err));
         }
 
-        Ok(SessionLock { _file: file })
+        Ok(SessionLock {
+            _file: file,
+            #[cfg(debug_assertions)]
+            _held: persistence::held_state_locks::hold(&path),
+        })
     }
 
     #[cfg(not(unix))]
@@ -1906,6 +1910,54 @@ mod tests {
             "second acquire must be non-blocking (took {:?})",
             elapsed
         );
+    }
+
+    /// An idempotent append to a state file this thread holds the tick lock
+    /// on would block on itself forever; debug builds panic instead. A plain
+    /// append under the guard is fine, and once the guard drops the
+    /// idempotent append goes through.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn idempotent_append_under_the_same_threads_tick_lock_panics_instead_of_hanging() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        let (header, events) = sample_bundle("wf");
+        backend.init_state_file("wf", header, events).unwrap();
+        let path = backend.base_dir.join("wf").join(state_file_name("wf"));
+        let payload = EventPayload::ContextRemoved {
+            key: "k".to_string(),
+            writer: None,
+        };
+
+        let guard = backend.lock_state_file("wf").unwrap();
+        backend
+            .append_event("wf", &payload, "2026-01-01T00:00:00Z")
+            .expect("a plain append takes only the sidecar lock");
+        let caught = std::panic::catch_unwind(|| {
+            persistence::append_event_idempotent(
+                &path,
+                &payload,
+                "2026-01-01T00:00:00Z",
+                "s",
+                Some("h"),
+            )
+        });
+        let message = caught.expect_err("must panic, not deadlock or succeed");
+        let message = message
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(message.contains("would deadlock"), "{message}");
+        drop(guard);
+
+        persistence::append_event_idempotent(
+            &path,
+            &payload,
+            "2026-01-01T00:00:00Z",
+            "s",
+            Some("h"),
+        )
+        .expect("with the guard gone the idempotent append goes through");
     }
 
     /// scenario-4 continuation: dropping the guard releases the lock,
