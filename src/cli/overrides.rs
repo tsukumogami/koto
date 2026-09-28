@@ -684,6 +684,7 @@ mod tests {
                     timestamp: ts.clone(),
                     check: Default::default(),
                     streams: None,
+                    poll: None,
                 },
                 idempotency_hash: None,
             },

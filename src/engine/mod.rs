@@ -20,6 +20,7 @@ pub mod leg_pointer;
 pub mod name_grammar;
 pub mod path_resolution;
 pub mod persistence;
+pub mod poll;
 pub mod reentrancy;
 pub mod request_store;
 #[cfg(unix)]

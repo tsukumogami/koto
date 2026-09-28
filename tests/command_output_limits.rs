@@ -329,6 +329,7 @@ fn gate_evaluator_does_not_report_a_loud_gate_as_timed_out() {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 

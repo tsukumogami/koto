@@ -42,6 +42,47 @@ pub enum GateOutcome {
     TimedOut,
     /// The command could not be spawned or an OS error occurred.
     Error,
+    /// A polling gate's command reported that the check hasn't settled yet
+    /// (DESIGN-koto-ci-wait-stale-keys.md Decision 6). Nothing was judged:
+    /// a pending result carries no `failure`, no fallback finding, no rule
+    /// counts and no attempt number. Only polling gates produce it.
+    Pending,
+}
+
+/// Where a polling gate stood after a tick's evaluations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollStatus {
+    Done,
+    Pending,
+    Failed,
+    TimedOut,
+}
+
+impl PollStatus {
+    /// The value logged as `poll.status` and returned in the response.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PollStatus::Done => "done",
+            PollStatus::Pending => "pending",
+            PollStatus::Failed => "failed",
+            PollStatus::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// A polling gate's state after this tick, beside its result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PollReport {
+    pub status: PollStatus,
+    /// Runs since the polling window opened, summed across ticks.
+    pub evaluations: u64,
+    /// The window start: the first run of this gate since the latest entry
+    /// into the state (RFC 3339).
+    pub since: String,
+    /// Seconds from `since` to the end of the recorded run.
+    pub elapsed_secs: u64,
+    pub interval_secs: u32,
+    pub timeout_secs: u32,
 }
 
 /// Structured result of evaluating a single gate.
@@ -83,6 +124,10 @@ pub struct StructuredGateResult {
     /// `gate_evaluated`; an evaluation that isn't recorded drops them.
     #[serde(skip)]
     pub context_reads: Vec<ContextReadRecord>,
+    /// For a polling gate: where the poll stood after this tick. Beside
+    /// `output`, never in it, so routing never sees it.
+    #[serde(skip)]
+    pub poll: Option<PollReport>,
 }
 
 impl StructuredGateResult {
@@ -131,6 +176,7 @@ impl Default for StructuredGateResult {
             findings: Vec::new(),
             duration_ms: None,
             context_reads: Vec::new(),
+            poll: None,
         }
     }
 }
@@ -757,6 +803,7 @@ fn command_gate_result(
             findings: check.findings,
             duration_ms,
             context_reads: Vec::new(),
+            poll: None,
         };
     };
     let (outcome, evidence) = match kind {
@@ -790,6 +837,7 @@ fn command_gate_result(
         findings,
         duration_ms,
         context_reads: Vec::new(),
+        poll: None,
     }
 }
 
@@ -817,7 +865,7 @@ fn with_context_failure(
             .filter(|e| !e.trim().is_empty())
             .map(str::to_string)
             .unwrap_or_else(sentence),
-        GateOutcome::Failed | GateOutcome::TimedOut => sentence(),
+        GateOutcome::Failed | GateOutcome::TimedOut | GateOutcome::Pending => sentence(),
     };
     let text = redact_str(&text, redactor);
     let (findings, failure) = build_failure(name, None, &text);

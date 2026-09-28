@@ -1056,6 +1056,38 @@ pub struct BlockingCondition {
     /// findings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<FailureResponse>,
+    /// For a polling gate: where the poll stands
+    /// (DESIGN-koto-ci-wait-stale-keys.md). `retry_after_secs` is present
+    /// only while the gate is pending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll: Option<PollResponse>,
+}
+
+/// A polling gate's `poll` object on its blocking condition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PollResponse {
+    /// `pending`, `failed` or `timed_out` (a passing gate doesn't block).
+    pub status: String,
+    /// On a pending gate: how long to wait before ticking again, the gate's
+    /// `interval_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u32>,
+    /// Seconds since the polling window opened.
+    pub elapsed_secs: u64,
+    /// The gate's `timeout_secs`.
+    pub timeout_secs: u32,
+}
+
+impl PollResponse {
+    fn from_report(report: &crate::gate::PollReport) -> Self {
+        let pending = report.status == crate::gate::PollStatus::Pending;
+        PollResponse {
+            status: report.status.as_str().to_string(),
+            retry_after_secs: pending.then_some(report.interval_secs),
+            elapsed_secs: report.elapsed_secs,
+            timeout_secs: report.timeout_secs,
+        }
+    }
 }
 
 /// Output from a default action that requires confirmation.
@@ -1138,6 +1170,7 @@ pub fn blocking_conditions_from_gates(
                 GateOutcome::Failed => "failed",
                 GateOutcome::TimedOut => "timed_out",
                 GateOutcome::Error => "error",
+                GateOutcome::Pending => "pending",
             };
             if name == ACTION_CONDITION_NAME {
                 return Some(BlockingCondition {
@@ -1148,23 +1181,31 @@ pub fn blocking_conditions_from_gates(
                     agent_actionable: false,
                     output: result.output.clone(),
                     failure: result.response_failure(),
+                    poll: None,
                 });
             }
             let condition_type = gate_defs
                 .get(name)
                 .map(|g| g.gate_type.clone())
                 .unwrap_or_else(|| "command".to_string());
-            let category = crate::gate::gate_blocking_category(&condition_type).to_string();
+            // A pending polling gate is a wait, whatever its type's default.
+            let pending = result.outcome == GateOutcome::Pending;
+            let category = if pending {
+                "temporal".to_string()
+            } else {
+                crate::gate::gate_blocking_category(&condition_type).to_string()
+            };
             // An override is the action this flag advertises, so a gate that
             // refuses overrides is never agent-actionable, whatever its defaults.
-            let agent_actionable = gate_defs
-                .get(name)
-                .map(|g| {
-                    g.overridable
-                        && (g.override_default.is_some()
-                            || built_in_default(&g.gate_type).is_some())
-                })
-                .unwrap_or(false);
+            let agent_actionable = !pending
+                && gate_defs
+                    .get(name)
+                    .map(|g| {
+                        g.overridable
+                            && (g.override_default.is_some()
+                                || built_in_default(&g.gate_type).is_some())
+                    })
+                    .unwrap_or(false);
             Some(BlockingCondition {
                 name: name.clone(),
                 condition_type,
@@ -1173,6 +1214,7 @@ pub fn blocking_conditions_from_gates(
                 agent_actionable,
                 output: result.output.clone(),
                 failure: result.response_failure(),
+                poll: result.poll.as_ref().map(PollResponse::from_report),
             })
         })
         .collect()
@@ -1482,6 +1524,7 @@ mod tests {
                     agent_actionable: false,
                     output: serde_json::json!({"exit_code": 1, "error": ""}),
                     failure: None,
+                    poll: None,
                 },
                 BlockingCondition {
                     name: "lint_check".to_string(),
@@ -1491,6 +1534,7 @@ mod tests {
                     agent_actionable: false,
                     output: serde_json::json!({"exit_code": -1, "error": "timed_out"}),
                     failure: None,
+                    poll: None,
                 },
             ],
             unassigned_children: vec![],
@@ -1996,6 +2040,7 @@ mod tests {
             agent_actionable: false,
             output: serde_json::json!({"exit_code": 1, "error": ""}),
             failure: None,
+            poll: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&cond).unwrap();

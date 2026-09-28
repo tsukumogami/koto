@@ -270,6 +270,7 @@ fn action_condition(
         findings,
         duration_ms: None,
         context_reads: Vec::new(),
+        poll: None,
     };
     fill_effect_landed(result.all_findings_mut(), false);
 
@@ -775,6 +776,19 @@ fn check_fields(
         rule_counts,
         rule_counts_truncated,
         duration_ms: result.duration_ms,
+    }
+}
+
+/// The check fields of a pending polling gate's `gate_evaluated`: its
+/// findings and run time, for the log only, and no attempt stamp or rule
+/// counts, now or later (DESIGN-koto-ci-wait-stale-keys.md Decision 6).
+fn pending_check_fields(result: &StructuredGateResult) -> CheckEventFields {
+    let (findings, findings_truncated) = result.capped_findings(LOG_FINDINGS_CAP);
+    CheckEventFields {
+        findings,
+        findings_truncated,
+        duration_ms: result.duration_ms,
+        ..CheckEventFields::default()
     }
 }
 
@@ -1561,6 +1575,7 @@ where
                 // any `GateEvaluated` event is appended: nothing ran, so there
                 // is no gate result to report and nothing for a `when` clause
                 // to route on (Issue #225).
+                let first_run_start = std::time::SystemTime::now();
                 let mut evaluated = match evaluate_gates(&gates_to_evaluate) {
                     Ok(results) => results,
                     Err(refusal) => {
@@ -1578,11 +1593,21 @@ where
                         });
                     }
                 };
+                // Polling gates hold and re-run while pending, then settle
+                // into done, pending, failed or timed out
+                // (DESIGN-koto-ci-wait-stale-keys.md Decisions 4-6).
+                crate::engine::poll::settle(
+                    &mut evaluated,
+                    &gates_to_evaluate,
+                    &tick_log.borrow(),
+                    &state,
+                    first_run_start,
+                    evaluate_gates,
+                    shutdown,
+                );
                 for result in evaluated.values_mut() {
                     fill_effect_landed(result.all_findings_mut(), effect_landed);
                 }
-                let stamp =
-                    *entry_stamp.get_or_insert_with(|| attempt_stamp(&tick_log.borrow(), &state));
                 for (gate_name, result) in &evaluated {
                     gate_evidence_map.insert(gate_name.clone(), result.output.clone());
                     let outcome_str = match result.outcome {
@@ -1590,11 +1615,22 @@ where
                         GateOutcome::Failed => "failed",
                         GateOutcome::TimedOut => "timed_out",
                         GateOutcome::Error => "error",
+                        GateOutcome::Pending => "pending",
                     };
-                    // Every gate of this entry carries the same stamp. Rule
-                    // counts are per check, so one gate's event never feeds
-                    // another's counts within the attempt.
-                    let check = check_fields(result, gate_name, stamp, &tick_log.borrow(), &state);
+                    // Every resolved gate of this entry carries the same
+                    // stamp. Rule counts are per check, so one gate's event
+                    // never feeds another's counts within the attempt. A
+                    // pending polling gate judged nothing: it carries no
+                    // stamp and no rule counts, and doesn't create an
+                    // attempt, so the attempt is the evaluation where the
+                    // poll resolves.
+                    let check = if result.outcome == GateOutcome::Pending {
+                        pending_check_fields(result)
+                    } else {
+                        let stamp = *entry_stamp
+                            .get_or_insert_with(|| attempt_stamp(&tick_log.borrow(), &state));
+                        check_fields(result, gate_name, stamp, &tick_log.borrow(), &state)
+                    };
                     let gate_evaluated_payload = EventPayload::GateEvaluated {
                         state: state.clone(),
                         gate: gate_name.clone(),
@@ -1603,6 +1639,15 @@ where
                         timestamp: now_iso8601(),
                         check,
                         streams: logged_streams(result),
+                        poll: result
+                            .poll
+                            .as_ref()
+                            .map(|p| crate::engine::types::PollRecord {
+                                status: p.status.as_str().to_string(),
+                                evaluations: p.evaluations,
+                                since: p.since.clone(),
+                                elapsed_secs: p.elapsed_secs,
+                            }),
                     };
                     // The gate's own context reads come immediately before
                     // its `gate_evaluated`, best-effort: a read that can't be
@@ -7331,6 +7376,7 @@ mod tests {
             findings,
             duration_ms: Some(7),
             context_reads: Vec::new(),
+            poll: None,
         }
     }
 
@@ -7665,6 +7711,7 @@ mod tests {
                     ..Default::default()
                 },
                 streams: None,
+                poll: None,
             },
         )];
         let result = advance_until_stop(
@@ -7759,6 +7806,7 @@ mod tests {
                             ..Default::default()
                         },
                         streams: None,
+                        poll: None,
                     },
                 )
             })

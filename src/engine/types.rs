@@ -659,6 +659,21 @@ impl<'de> Deserialize<'de> for RuleCounts {
     }
 }
 
+/// A polling gate's record on its `gate_evaluated` event
+/// (DESIGN-koto-ci-wait-stale-keys.md).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PollRecord {
+    /// `done`, `pending`, `failed` or `timed_out` (an open vocabulary).
+    pub status: String,
+    /// Runs since the polling window opened, summed across ticks.
+    pub evaluations: u64,
+    /// The window start (RFC 3339): the first run of the gate since the
+    /// latest entry into the state.
+    pub since: String,
+    /// Seconds from `since` to the end of the recorded run.
+    pub elapsed_secs: u64,
+}
+
 /// The fields every check event (`gate_evaluated`, `default_action_executed`)
 /// gained with failure reporting (DESIGN-koto-failure-reporting.md,
 /// Gate-event schema). All are optional and serialized only when present, so
@@ -965,6 +980,10 @@ pub enum EventPayload {
         /// bytes of each redacted stream.
         #[serde(flatten)]
         streams: Option<LoggedStreams>,
+        /// On a polling gate: where the poll stood when this evaluation was
+        /// recorded. Omitted on every other gate.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        poll: Option<PollRecord>,
     },
     GateOverrideRecorded {
         state: String,
@@ -1941,6 +1960,10 @@ impl<'de> Deserialize<'de> for Event {
                     timestamp: p.timestamp,
                     check: CheckEventFields::from_payload(payload_val),
                     streams: LoggedStreams::from_payload(payload_val),
+                    poll: payload_val
+                        .get("poll")
+                        .filter(|v| !v.is_null())
+                        .and_then(|v| serde_json::from_value(v.clone()).ok()),
                 }
             }
             "gate_override_recorded" => {
@@ -2459,11 +2482,14 @@ pub struct MachineState {
 ///
 /// Implemented without an external time crate to keep the binary self-contained.
 pub fn now_iso8601() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    iso8601_at(std::time::SystemTime::now())
+}
 
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+/// Format `t` as `YYYY-MM-DDTHH:MM:SS.mmmZ`, the form [`now_iso8601`] writes.
+pub fn iso8601_at(t: std::time::SystemTime) -> String {
+    use std::time::UNIX_EPOCH;
+
+    let duration = t.duration_since(UNIX_EPOCH).unwrap_or_default();
 
     let secs = duration.as_secs();
     let millis = duration.subsec_millis();
@@ -3120,6 +3146,7 @@ mod tests {
                 timestamp: "2026-04-01T00:00:00Z".to_string(),
                 check: Default::default(),
                 streams: None,
+                poll: None,
             },
             idempotency_hash: None,
         };
@@ -3141,6 +3168,7 @@ mod tests {
             timestamp: "2026-04-01T00:00:00Z".to_string(),
             check: Default::default(),
             streams: None,
+            poll: None,
         };
         assert_eq!(p.type_name(), "gate_evaluated");
     }
