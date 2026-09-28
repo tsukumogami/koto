@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 problem: |
   A failed koto check tells the agent almost nothing: a failing command gate
   reaches it as a bare exit code because koto discards the output it already
@@ -31,7 +31,7 @@ user_visible_surface: true
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
@@ -535,7 +535,10 @@ template field. A consumer that ignores the new fields sees today's koto.
   `#[serde(skip)]` so its serialized form and existing literal constructions
   change only by `..Default::default()`; `command_gate_result` fills `failure`
   for command gates whose outcome isn't `passed`; context gates fill it with
-  their fallback finding and push their reads onto `context_reads`.
+  their fallback finding and push their reads onto `context_reads`. A passing
+  command gate's parsed findings ride on a third skipped field, `findings`, so
+  the advance loop can log them on `gate_evaluated` (R8) without putting a
+  `failure` on the response.
 - **`src/engine/advance.rs`.** In-tick event list; attempt stamp per state
   entry; `effect_landed` filled on every finding the check left unset (true
   when this invocation appended `evidence_submitted` for the state, or the
