@@ -156,9 +156,13 @@ space and anything over 500 characters is cut to 497 plus `...`.
 
 The response keeps the first 100 findings in emission order, or the first 99
 plus the fallback when there is one; the log keeps 50 (49 plus the fallback).
-Per-rule counts use every parsed finding, not the capped list. The guide tells
-authors to print errors before warnings, since a check that prints its only
-error after its hundredth finding shows the agent warnings plus the fallback.
+Per-rule counts use every parsed finding, not the capped list. The fallback is
+also judged over every parsed finding, so a check that prints 100 warnings, then
+its only error, and fails gets no fallback, and the cap drops the error: the
+agent sees a failed status and 100 warnings with `findings_truncated: true`,
+while the error stays in the captured output, the session log and the per-rule
+counts. The guide tells authors to print errors before warnings for this
+reason.
 
 #### Alternatives Considered
 

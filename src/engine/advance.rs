@@ -10,7 +10,7 @@ use crate::engine::decider::{consult_at_stop, DeciderPort, StopContext, StopOutc
 use crate::engine::persistence::derive_overrides;
 use crate::engine::substitute::{GateCaptureRefusal, VariableOverlay};
 use crate::engine::types::{now_iso8601, Event, EventPayload};
-use crate::findings::{build_failure, fill_effect_landed, CheckOutput, GateFailure};
+use crate::findings::{build_failure, fill_effect_landed, CheckOutput, Finding, GateFailure};
 use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::template::types::{
     is_is_set_matcher, is_present_matcher, ActionDecl, CompiledTemplate, TemplateState,
@@ -225,7 +225,7 @@ fn action_condition(
     stderr: &str,
     truncated: bool,
     capture_error: Option<serde_json::Value>,
-    mut failure: GateFailure,
+    (findings, failure): (Vec<Finding>, GateFailure),
 ) -> BTreeMap<String, StructuredGateResult> {
     let mut output = serde_json::Map::new();
     output.insert("state".to_string(), serde_json::json!(state));
@@ -244,18 +244,16 @@ fn action_condition(
     // A failed action landed nothing: its command failed, or its output
     // could not be delivered. Evidence can't have landed either, since
     // evidence on the state skips the action.
-    fill_effect_landed(failure.findings.iter_mut(), false);
+    let mut result = StructuredGateResult {
+        outcome,
+        output: serde_json::Value::Object(output),
+        failure: Some(failure),
+        findings,
+    };
+    fill_effect_landed(result.all_findings_mut(), false);
 
     let mut map = BTreeMap::new();
-    map.insert(
-        ACTION_CONDITION_NAME.to_string(),
-        StructuredGateResult {
-            outcome,
-            output: serde_json::Value::Object(output),
-            failure: Some(failure),
-            findings: Vec::new(),
-        },
-    );
+    map.insert(ACTION_CONDITION_NAME.to_string(), result);
     map
 }
 
@@ -399,6 +397,10 @@ pub fn prepare_capture(key: &str, stdout: &str) -> Result<String, CaptureError> 
 /// was delivered, and `Ok(Some(conditions))` when delivery failed and the tick
 /// must stop at this state with an `__action__` condition.
 ///
+/// `check` is borrowed, and cloned only into a failure's condition: on
+/// delivery the caller still holds it, since a passing action's findings
+/// are the check's to record on `default_action_executed`.
+///
 /// The event and the overlay are written in the same step, so the durable
 /// record and the view the rest of this tick reads can never disagree. The
 /// event goes first: a value the rest of the tick can see but the log does not
@@ -411,7 +413,7 @@ fn deliver_capture<F>(
     stdout: &str,
     stderr: &str,
     truncated: bool,
-    check: CheckOutput,
+    check: &CheckOutput,
     overlay: &VariableOverlay,
     append_event: &mut F,
 ) -> Result<Option<BTreeMap<String, StructuredGateResult>>, AdvanceError>
@@ -432,7 +434,13 @@ where
             Ok(None)
         }
         Err(error) => Ok(Some(capture_failure_conditions(
-            state, command, stdout, stderr, truncated, &error, check,
+            state,
+            command,
+            stdout,
+            stderr,
+            truncated,
+            &error,
+            check.clone(),
         ))),
     }
 }
@@ -836,7 +844,7 @@ where
                     stdout,
                     stderr,
                     truncated,
-                    check,
+                    mut check,
                     ..
                 } => {
                     // Deliver the capture, if the state declared a name, and
@@ -848,7 +856,7 @@ where
                         &stdout,
                         &stderr,
                         truncated,
-                        check,
+                        &check,
                         overlay,
                         append_event,
                     )? {
@@ -859,6 +867,11 @@ where
                         });
                     }
                     effect_landed = true;
+                    // The action passed, so its findings go on no response,
+                    // but they are still the check's: `check` holds every
+                    // one, uncapped, for the `default_action_executed`
+                    // record.
+                    fill_effect_landed(check.findings.iter_mut(), effect_landed);
                 }
                 ActionResult::Skipped => {
                     // Continue to gate evaluation
@@ -973,7 +986,7 @@ where
                         &stdout,
                         &stderr,
                         truncated,
-                        check,
+                        &check,
                         overlay,
                         append_event,
                     )? {
@@ -1089,12 +1102,7 @@ where
                     }
                 };
                 for result in evaluated.values_mut() {
-                    let findings = result
-                        .failure
-                        .iter_mut()
-                        .flat_map(|f| f.findings.iter_mut())
-                        .chain(result.findings.iter_mut());
-                    fill_effect_landed(findings, effect_landed);
+                    fill_effect_landed(result.all_findings_mut(), effect_landed);
                 }
                 for (gate_name, result) in &evaluated {
                     gate_evidence_map.insert(gate_name.clone(), result.output.clone());

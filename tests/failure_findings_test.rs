@@ -344,6 +344,43 @@ fn the_response_keeps_100_findings_with_the_fallback_last() {
     assert_eq!(f[99]["level"], "error");
 }
 
+/// The fallback is judged over every parsed finding, so an error printed
+/// after 100 warnings suppresses it even though the cap drops that error:
+/// the agent sees warnings only, truncated, on a failed check. This is why
+/// the guide says to print errors first.
+#[test]
+fn an_error_after_100_warnings_is_cut_and_adds_no_fallback() {
+    let env = Env::new();
+    let body = "i=0\nwhile [ $i -lt 100 ]; do\n  printf '::koto-finding::{\"rule_id\":\"W%d\",\"level\":\"warning\",\"message\":\"w\"}\\n' $i\n  i=$((i+1))\ndone\necho '::koto-finding::{\"rule_id\":\"E1\",\"level\":\"error\",\"message\":\"e\"}'\nexit 1\n";
+    let resp = gate_run(&env, body);
+    assert_eq!(condition(&resp, "lint")["status"], "failed");
+    let f = findings(&resp, "lint");
+    assert_eq!(f.len(), 100);
+    assert_eq!(failure(&resp, "lint")["findings_truncated"], true);
+    assert!(
+        f.iter().all(|x| x["level"] == "warning"),
+        "no error and no fallback reach the response: {resp}"
+    );
+    assert_eq!(f[99]["rule_id"], "W99");
+    // The error is still in the captured output.
+    let stdout = failure(&resp, "lint")["captured"]["stdout"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(stdout.contains(r#""rule_id":"E1""#), "{stdout}");
+}
+
+#[test]
+fn a_finding_line_on_stderr_is_not_parsed() {
+    let env = Env::new();
+    let resp = gate_run(&env, &format!("echo '{GUIDE_E501}' >&2\nexit 1\n"));
+    let f = findings(&resp, "lint");
+    assert_eq!(f.len(), 1, "only koto's fallback: {resp}");
+    assert_eq!(f[0]["rule_id"], "lint");
+    assert_eq!(f[0]["message_source"], "output");
+    assert_eq!(f[0]["message"], GUIDE_E501);
+}
+
 #[test]
 fn a_known_value_spelled_with_a_json_escape_does_not_reach_a_finding() {
     let mut env = Env::new();
@@ -691,6 +728,61 @@ fn effect_landed_is_true_only_when_this_invocation_recorded_evidence() {
     let again = env.next();
     let f = findings(&again, "lint");
     assert_eq!(f[1]["effect_landed"], false, "{again}");
+}
+
+/// Evidence counts toward `effect_landed` only before the tick's first
+/// transition: evidence that moves the session on says nothing about the
+/// next state's checks.
+#[test]
+fn evidence_that_transitions_does_not_land_the_next_state_s_effect() {
+    let env = Env::new();
+    let cmd = env.script("check.sh", "echo still-broken\nexit 1\n");
+    let template = format!(
+        r#"---
+name: moved
+version: "1.0"
+initial_state: start
+states:
+  start:
+    accepts:
+      decision:
+        type: enum
+        required: true
+        values: [go]
+    transitions:
+      - target: work
+        when:
+          decision: go
+  work:
+    gates:
+      lint:
+        type: command
+        command: '{cmd}'
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## start
+
+Start.
+
+## work
+
+Work.
+
+## done
+
+Done.
+"#
+    );
+    env.init(&template);
+    let resp = env.next_with(&["--with-data", r#"{"decision":"go"}"#]);
+    assert_eq!(resp["state"], "work", "{resp}");
+    let f = findings(&resp, "lint");
+    assert_eq!(f.len(), 1, "{resp}");
+    assert_eq!(f[0]["effect_landed"], false, "{resp}");
 }
 
 #[test]

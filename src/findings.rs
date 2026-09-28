@@ -7,8 +7,9 @@
 //! doesn't match the grammar is ordinary output and stays that way. A failed
 //! corrective check whose findings hold no `error` gets one more, written by
 //! [`fallback_finding`] from its last line of output or from koto's own
-//! description of the outcome. [`build_failure`] assembles what the response
-//! returns for a failed check: the findings, capped, and the captured output.
+//! description of the outcome. [`build_failure`] keeps a failed check's
+//! parsed findings whole and the fallback separate; the capped lists the
+//! response and the log carry are derived from the two.
 //!
 //! Every string in a finding has been redacted and is capped after
 //! redaction, never splitting a marker or a character.
@@ -130,14 +131,46 @@ impl CheckOutput {
     }
 }
 
-/// The `failure` object a failed corrective check returns beside its
-/// unchanged `output`.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// What koto adds to a failed corrective check beyond the findings it
+/// parsed: the finding koto wrote when none of them has level `error`, and
+/// the captured output.
+///
+/// The parsed findings sit beside it, whole and uncapped (on
+/// `StructuredGateResult::findings`), so the capped lists the response and
+/// the log carry are both derived views, and the fallback stays addressable
+/// rather than merged into a list. The response's `failure` object is
+/// [`GateFailure::response`].
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct GateFailure {
-    pub findings: Vec<Finding>,
-    pub findings_truncated: bool,
+    /// The koto-written finding; `None` when a parsed finding has level
+    /// `error`.
+    pub fallback: Option<Finding>,
     /// Present for command gates and `default_action`; context gates run no
     /// command and have nothing to capture.
+    pub captured: Option<Captured>,
+}
+
+impl GateFailure {
+    /// The `failure` object the response returns beside the check's
+    /// unchanged `output`: `parsed` and the fallback, capped at
+    /// [`RESPONSE_FINDINGS_CAP`] with the fallback last.
+    pub fn response(&self, parsed: &[Finding]) -> FailureResponse {
+        let (findings, findings_truncated) =
+            cap_findings(parsed, self.fallback.clone(), RESPONSE_FINDINGS_CAP);
+        FailureResponse {
+            findings,
+            findings_truncated,
+            captured: self.captured.clone(),
+        }
+    }
+}
+
+/// The `failure` object a failed corrective check returns in a `koto next`
+/// response.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FailureResponse {
+    pub findings: Vec<Finding>,
+    pub findings_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub captured: Option<Captured>,
 }
@@ -171,8 +204,8 @@ fn stdout_lines(stdout: &str, truncated: bool) -> Vec<(&str, bool)> {
 /// is ordinary output.
 ///
 /// The grammar: [`FINDING_PREFIX`] at the start of the line, then one JSON
-/// object, then nothing but trailing spaces or tabs (one carriage return is
-/// allowed among them). Required keys: `rule_id` (non-empty string),
+/// object, then nothing but trailing spaces or tabs, and at most one
+/// carriage return as the line's very last byte. Required keys: `rule_id` (non-empty string),
 /// `level` (`error`, `warning` or `info`), `message` (string). Optional:
 /// `path`, `line` (integer >= 1, only with `path`), `column` (integer >= 1,
 /// only with `line`), `rule_ref`, `effect_landed` (boolean). `null` is
@@ -186,7 +219,8 @@ pub fn decode_line(line: &str) -> Option<Finding> {
     let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<serde_json::Value>();
     let value = stream.next()?.ok()?;
     let tail = &rest[stream.byte_offset()..];
-    if !tail.chars().all(|c| c == ' ' || c == '\t' || c == '\r') || tail.matches('\r').count() > 1 {
+    let tail = tail.strip_suffix('\r').unwrap_or(tail);
+    if !tail.chars().all(|c| c == ' ' || c == '\t') {
         return None;
     }
     let obj = value.as_object()?;
@@ -357,27 +391,37 @@ pub fn cap_findings(
     (kept, truncated)
 }
 
-/// The `failure` object for a failed corrective check.
+/// Judge what a failed corrective check reported: its parsed findings,
+/// returned whole, and the [`GateFailure`] beside them.
 ///
 /// `output` is the command's output for a command gate or `default_action`,
-/// and `None` for a context gate. The fallback finding is added when no
-/// parsed finding has level `error`; the list is capped at
-/// [`RESPONSE_FINDINGS_CAP`].
-pub fn build_failure(check: &str, output: Option<CheckOutput>, sentence: &str) -> GateFailure {
-    let parsed: &[Finding] = output
+/// and `None` for a context gate. The fallback finding is written when no
+/// parsed finding has level `error` -- judged over all of them, not only
+/// those a capped list keeps.
+pub fn build_failure(
+    check: &str,
+    output: Option<CheckOutput>,
+    sentence: &str,
+) -> (Vec<Finding>, GateFailure) {
+    let has_error = output
         .as_ref()
-        .map(|o| o.findings.as_slice())
-        .unwrap_or(&[]);
-    let fallback = if parsed.iter().any(|f| f.level == FindingLevel::Error) {
-        None
-    } else {
-        Some(fallback_finding(check, output.as_ref(), sentence))
-    };
-    let (findings, findings_truncated) = cap_findings(parsed, fallback, RESPONSE_FINDINGS_CAP);
-    GateFailure {
-        findings,
-        findings_truncated,
-        captured: output.map(|o| o.captured),
+        .is_some_and(|o| o.findings.iter().any(|f| f.level == FindingLevel::Error));
+    let fallback = (!has_error).then(|| fallback_finding(check, output.as_ref(), sentence));
+    match output {
+        Some(o) => (
+            o.findings,
+            GateFailure {
+                fallback,
+                captured: Some(o.captured),
+            },
+        ),
+        None => (
+            Vec::new(),
+            GateFailure {
+                fallback,
+                captured: None,
+            },
+        ),
     }
 }
 
@@ -391,6 +435,89 @@ mod tests {
 
     fn line(json: &str) -> String {
         format!("{FINDING_PREFIX}{json}")
+    }
+
+    /// The response's `failure` object for a failed check.
+    fn respond(check: &str, output: Option<CheckOutput>, sentence: &str) -> FailureResponse {
+        let (parsed, failure) = build_failure(check, output, sentence);
+        failure.response(&parsed)
+    }
+
+    fn numbered(level: &str, prefix: &str, range: std::ops::Range<usize>) -> String {
+        range
+            .map(|i| {
+                format!(
+                    "{}\n",
+                    line(&format!(
+                        r#"{{"rule_id":"{prefix}{i}","level":"{level}","message":"m"}}"#
+                    ))
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_failure_keeps_every_parsed_finding_and_the_fallback_apart() {
+        let stdout = numbered("warning", "W", 0..150);
+        let (parsed, failure) = build_failure("g", Some(output(&stdout, "boom")), "s");
+        assert_eq!(parsed.len(), 150, "the parsed list is never capped");
+        assert_eq!(parsed[149].rule_id, "W149");
+        let fallback = failure.fallback.as_ref().expect("no error, so a fallback");
+        assert_eq!(fallback.rule_id, "g");
+        assert_eq!(fallback.message, "boom");
+        assert!(parsed
+            .iter()
+            .all(|f| f.message_source == MessageSource::Check));
+        assert!(failure.captured.is_some());
+
+        // The views derive from the two: 99 + fallback for the response,
+        // 49 + fallback for the log.
+        let view = failure.response(&parsed);
+        assert_eq!(view.findings.len(), RESPONSE_FINDINGS_CAP);
+        assert_eq!(view.findings.last(), Some(fallback));
+        assert!(view.findings_truncated);
+        let (log, cut) = cap_findings(&parsed, failure.fallback.clone(), LOG_FINDINGS_CAP);
+        assert_eq!(log.len(), LOG_FINDINGS_CAP);
+        assert_eq!(log[48].rule_id, "W48");
+        assert_eq!(log.last(), Some(fallback));
+        assert!(cut);
+    }
+
+    #[test]
+    fn an_error_past_the_cap_suppresses_the_fallback_but_stays_in_the_parsed_list() {
+        let stdout = format!(
+            "{}{}",
+            numbered("warning", "W", 0..100),
+            numbered("error", "E", 0..1)
+        );
+        let (parsed, failure) = build_failure("g", Some(output(&stdout, "")), "s");
+        assert_eq!(parsed.len(), 101);
+        assert_eq!(parsed[100].rule_id, "E0");
+        assert_eq!(parsed[100].level, FindingLevel::Error);
+        assert!(failure.fallback.is_none());
+        let view = failure.response(&parsed);
+        assert_eq!(view.findings.len(), RESPONSE_FINDINGS_CAP);
+        assert!(view.findings_truncated);
+        assert!(view
+            .findings
+            .iter()
+            .all(|f| f.level == FindingLevel::Warning));
+    }
+
+    #[test]
+    fn the_response_view_serializes_as_the_failure_object() {
+        let finding = line(r#"{"rule_id":"E1","level":"error","message":"e"}"#);
+        let view = respond("g", Some(output(&format!("{finding}\n"), "")), "s");
+        let json = serde_json::to_value(&view).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["captured", "findings", "findings_truncated"]);
+        assert_eq!(json["findings"][0]["rule_id"], "E1");
     }
 
     fn output(stdout: &str, stderr: &str) -> CheckOutput {
@@ -438,11 +565,14 @@ mod tests {
     }
 
     #[test]
-    fn trailing_whitespace_and_one_carriage_return_are_allowed() {
+    fn trailing_whitespace_and_one_final_carriage_return_are_allowed() {
         let base = r#"{"rule_id":"R","level":"warning","message":"m"}"#;
         assert!(decode_line(&line(&format!("{base}  \t"))).is_some());
         assert!(decode_line(&line(&format!("{base}\r"))).is_some());
-        assert!(decode_line(&line(&format!("{base} \r "))).is_some());
+        assert!(decode_line(&line(&format!("{base} \t\r"))).is_some());
+        // The carriage return must be the very last byte.
+        assert!(decode_line(&line(&format!("{base} \r "))).is_none());
+        assert!(decode_line(&line(&format!("{base}\r\t"))).is_none());
         assert!(decode_line(&line(&format!("{base}\r\r"))).is_none());
         assert!(decode_line(&line(&format!("{base} x"))).is_none());
         assert!(decode_line(&line(&format!("{base}{base}"))).is_none());
@@ -562,18 +692,18 @@ mod tests {
 
     #[test]
     fn fallback_prefers_stderr_then_stdout_then_the_sentence() {
-        let f = build_failure("lint", Some(output("out-line\n", "err-line\n")), "s");
+        let f = respond("lint", Some(output("out-line\n", "err-line\n")), "s");
         assert_eq!(f.findings.len(), 1);
         assert_eq!(f.findings[0].message, "err-line");
         assert_eq!(f.findings[0].message_source, MessageSource::Output);
         assert_eq!(f.findings[0].rule_id, "lint");
         assert_eq!(f.findings[0].level, FindingLevel::Error);
 
-        let f = build_failure("lint", Some(output("out-line\n\n  \n", " \n")), "s");
+        let f = respond("lint", Some(output("out-line\n\n  \n", " \n")), "s");
         assert_eq!(f.findings[0].message, "out-line");
 
         let finding = line(r#"{"rule_id":"W1","level":"warning","message":"w"}"#);
-        let f = build_failure(
+        let f = respond(
             "lint",
             Some(output(&format!("plain\n{finding}\n"), "")),
             "command exited with status 1",
@@ -582,7 +712,7 @@ mod tests {
         assert_eq!(f.findings[0].rule_id, "W1");
         assert_eq!(f.findings[1].message, "plain", "finding lines are skipped");
 
-        let f = build_failure("lint", Some(output("", "")), "command exited with status 1");
+        let f = respond("lint", Some(output("", "")), "command exited with status 1");
         assert_eq!(f.findings[0].message, "command exited with status 1");
         assert_eq!(f.findings[0].message_source, MessageSource::Koto);
     }
@@ -591,14 +721,14 @@ mod tests {
     fn a_koto_note_on_stderr_is_koto_sourced() {
         let mut o = output("partial\n", "err\ncommand timed out after 1 seconds");
         o.stderr_ends_with_note = true;
-        let f = build_failure("slow", Some(o), "unused");
+        let f = respond("slow", Some(o), "unused");
         assert_eq!(f.findings[0].message, "command timed out after 1 seconds");
         assert_eq!(f.findings[0].message_source, MessageSource::Koto);
     }
 
     #[test]
     fn the_truncation_note_is_never_the_message() {
-        let f = build_failure(
+        let f = respond(
             "__action__",
             Some(output(
                 "real line\n... [output truncated]",
@@ -611,7 +741,7 @@ mod tests {
 
     #[test]
     fn a_long_line_folds_to_500_characters() {
-        let f = build_failure("g", Some(output("", &"x".repeat(600))), "s");
+        let f = respond("g", Some(output("", &"x".repeat(600))), "s");
         let m = &f.findings[0].message;
         assert_eq!(m.chars().count(), 500);
         assert!(m.ends_with("..."));
@@ -620,14 +750,14 @@ mod tests {
     #[test]
     fn the_500_character_fold_never_splits_a_marker() {
         let line = format!("{}[REDACTED:GH_TOKEN] tail", "x".repeat(490));
-        let f = build_failure("g", Some(output("", &line)), "s");
+        let f = respond("g", Some(output("", &line)), "s");
         assert_eq!(f.findings[0].message, format!("{}...", "x".repeat(490)));
     }
 
     #[test]
     fn an_error_finding_means_no_fallback() {
         let finding = line(r#"{"rule_id":"E1","level":"error","message":"e"}"#);
-        let f = build_failure("g", Some(output(&format!("{finding}\n"), "boom")), "s");
+        let f = respond("g", Some(output(&format!("{finding}\n"), "boom")), "s");
         assert_eq!(f.findings.len(), 1);
         assert_eq!(f.findings[0].rule_id, "E1");
         assert!(!f.findings_truncated);
@@ -641,7 +771,7 @@ mod tests {
             ))
         };
         let stdout: String = (0..150).map(|i| format!("{}\n", warn(i))).collect();
-        let f = build_failure("g", Some(output(&stdout, "boom")), "s");
+        let f = respond("g", Some(output(&stdout, "boom")), "s");
         assert_eq!(f.findings.len(), RESPONSE_FINDINGS_CAP);
         assert!(f.findings_truncated);
         assert_eq!(f.findings[98].rule_id, "W98");
@@ -653,7 +783,7 @@ mod tests {
             ))
         };
         let stdout: String = (0..150).map(|i| format!("{}\n", err(i))).collect();
-        let f = build_failure("g", Some(output(&stdout, "")), "s");
+        let f = respond("g", Some(output(&stdout, "")), "s");
         assert_eq!(f.findings.len(), RESPONSE_FINDINGS_CAP);
         assert_eq!(f.findings[99].rule_id, "E99");
         assert!(f.findings_truncated);
@@ -664,7 +794,7 @@ mod tests {
 
     #[test]
     fn a_context_failure_has_no_captured_output() {
-        let f = build_failure("ctx", None, "context key 'k' is not set");
+        let f = respond("ctx", None, "context key 'k' is not set");
         assert!(f.captured.is_none());
         assert_eq!(f.findings[0].message, "context key 'k' is not set");
         let json = serde_json::to_value(&f).unwrap();

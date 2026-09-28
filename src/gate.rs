@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::action::{run_shell_command, CommandEnv, CommandOutput, FailureKind};
 use crate::engine::request_store::{self, LegView, RequestStoreError, ValidatedRequestId};
 use crate::engine::types::{CloseDisposition, LegDisposition, LegResultSource, RequestState};
-use crate::findings::{build_failure, Captured, CheckOutput, Finding, GateFailure};
+use crate::findings::{
+    build_failure, Captured, CheckOutput, FailureResponse, Finding, GateFailure,
+};
 use crate::redact::{redact_str, Redactor};
 use crate::session::context::ContextStore;
 use crate::template::types::{
@@ -59,15 +61,48 @@ pub struct StructuredGateResult {
     pub outcome: GateOutcome,
     /// Gate-type-specific structured output for evidence injection.
     pub output: serde_json::Value,
-    /// Findings and captured output, on a failed corrective check: a command
-    /// or context gate, or the `__action__` condition. `None` on a pass and
-    /// for gate types that report no findings.
+    /// koto's fallback finding and the captured output, on a failed
+    /// corrective check: a command or context gate, or the `__action__`
+    /// condition. `None` on a pass and for gate types that report no
+    /// findings.
     #[serde(skip)]
     pub failure: Option<GateFailure>,
-    /// The findings a passing command gate printed, which never reach the
-    /// response but are the check's to record.
+    /// Every finding the check printed, in emission order and uncapped,
+    /// whatever the outcome. The response's and the log's capped lists are
+    /// derived from these and `failure`'s fallback.
     #[serde(skip)]
     pub findings: Vec<Finding>,
+}
+
+impl StructuredGateResult {
+    /// koto's fallback finding, when this failed check has one.
+    pub fn fallback(&self) -> Option<&Finding> {
+        self.failure.as_ref().and_then(|f| f.fallback.as_ref())
+    }
+
+    /// Every finding: the parsed ones, uncapped, then the fallback.
+    pub fn all_findings(&self) -> impl Iterator<Item = &Finding> {
+        self.findings.iter().chain(self.fallback())
+    }
+
+    /// [`all_findings`](Self::all_findings), mutably.
+    pub fn all_findings_mut(&mut self) -> impl Iterator<Item = &mut Finding> {
+        let fallback = self.failure.as_mut().and_then(|f| f.fallback.as_mut());
+        self.findings.iter_mut().chain(fallback)
+    }
+
+    /// At most `cap` findings in emission order with the fallback last, and
+    /// whether a parsed finding was dropped. The log uses
+    /// [`LOG_FINDINGS_CAP`](crate::findings::LOG_FINDINGS_CAP).
+    pub fn capped_findings(&self, cap: usize) -> (Vec<Finding>, bool) {
+        crate::findings::cap_findings(&self.findings, self.fallback().cloned(), cap)
+    }
+
+    /// The response's `failure` object, when this is a failed check that
+    /// reports one.
+    pub fn response_failure(&self) -> Option<FailureResponse> {
+        self.failure.as_ref().map(|f| f.response(&self.findings))
+    }
 }
 
 /// A passing result with `null` output. Exists so a literal construction
@@ -673,8 +708,9 @@ pub fn command_outcome_sentence(kind: FailureKind, exit_code: i32) -> String {
 /// `failure_kind` key; the passing and failing shapes are unchanged, which
 /// keeps recorded gate evidence and overrides comparable byte for byte.
 ///
-/// The findings and captured streams go beside `output`, never in it: on a
-/// failure in `failure`, on a pass in `findings`.
+/// The findings and captured streams go beside `output`, never in it: every
+/// parsed finding in `findings` whatever the outcome, and on a failure the
+/// fallback and captured streams in `failure`.
 fn command_gate_result(
     name: &str,
     output: CommandOutput,
@@ -712,11 +748,12 @@ fn command_gate_result(
         ),
     };
     let sentence = command_outcome_sentence(kind, output.exit_code);
+    let (findings, failure) = build_failure(name, Some(check), &sentence);
     StructuredGateResult {
         outcome,
         output: evidence,
-        failure: Some(build_failure(name, Some(check), &sentence)),
-        findings: Vec::new(),
+        failure: Some(failure),
+        findings,
     }
 }
 
@@ -747,7 +784,9 @@ fn with_context_failure(
         GateOutcome::Failed | GateOutcome::TimedOut => sentence(),
     };
     let text = redact_str(&text, redactor);
-    result.failure = Some(build_failure(name, None, &text));
+    let (findings, failure) = build_failure(name, None, &text);
+    result.findings = findings;
+    result.failure = Some(failure);
     result
 }
 
@@ -929,7 +968,7 @@ mod tests {
         assert_eq!(captured.stdout, output.stdout);
         assert_eq!(captured.stderr, output.stderr);
         assert_eq!(
-            failure.findings[0].message,
+            results["check"].fallback().unwrap().message,
             "err [REDACTED:GH_TOKEN] [REDACTED:GH_DB]"
         );
     }
@@ -948,11 +987,16 @@ mod tests {
         let captured = failure.captured.as_ref().expect("captured output");
         assert!(captured.stdout.is_empty());
         assert!(captured.stderr.starts_with("failed to spawn command"));
-        assert_eq!(failure.findings.len(), 1);
-        assert_eq!(failure.findings[0].message, captured.stderr.trim());
+        assert!(result.findings.is_empty());
+        let fallback = result.fallback().expect("a fallback");
+        assert_eq!(fallback.message, captured.stderr.trim());
         assert_eq!(
-            failure.findings[0].message_source,
+            fallback.message_source,
             crate::findings::MessageSource::Koto
+        );
+        assert_eq!(
+            result.response_failure().unwrap().findings,
+            std::slice::from_ref(fallback)
         );
     }
 
@@ -981,6 +1025,46 @@ mod tests {
     }
 
     #[test]
+    fn a_failing_gate_keeps_every_parsed_finding_and_its_fallback_apart() {
+        let dir = tmp_dir();
+        let mut gates = BTreeMap::new();
+        gates.insert(
+            "check".to_string(),
+            make_gate(
+                r#"i=0; while [ $i -lt 120 ]; do echo "::koto-finding::{\"rule_id\":\"W$i\",\"level\":\"warning\",\"message\":\"m\"}"; i=$((i+1)); done; echo boom >&2; exit 1"#,
+                10,
+            ),
+        );
+        let results = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
+        let mut result = results["check"].clone();
+        assert_eq!(result.outcome, GateOutcome::Failed);
+        assert_eq!(result.findings.len(), 120, "parsed findings are uncapped");
+        assert_eq!(result.fallback().unwrap().message, "boom");
+        assert_eq!(result.all_findings().count(), 121);
+        assert_eq!(result.all_findings().last(), result.fallback());
+
+        let (log, log_cut) = result.capped_findings(crate::findings::LOG_FINDINGS_CAP);
+        assert_eq!(log.len(), 50);
+        assert_eq!(log[48].rule_id, "W48");
+        assert_eq!(log[49].rule_id, "check");
+        assert!(log_cut);
+
+        let view = result.response_failure().unwrap();
+        assert_eq!(view.findings.len(), 100);
+        assert_eq!(view.findings[99].rule_id, "check");
+        assert!(view.findings_truncated);
+
+        for f in result.all_findings_mut() {
+            f.effect_landed = Some(false);
+        }
+        assert!(result
+            .findings
+            .iter()
+            .all(|f| f.effect_landed == Some(false)));
+        assert_eq!(result.fallback().unwrap().effect_landed, Some(false));
+    }
+
+    #[test]
     fn an_erroring_context_gate_uses_its_own_error_text() {
         let dir = tmp_dir();
         let store = MockContextStore::new();
@@ -1006,13 +1090,14 @@ mod tests {
         );
         let bad = &with_store["bad_regex"];
         assert_eq!(bad.outcome, GateOutcome::Error);
-        let message = &bad.failure.as_ref().unwrap().findings[0].message;
+        let message = &bad.fallback().unwrap().message;
         assert!(message.starts_with("invalid regex pattern:"), "{message}");
         assert!(bad.failure.as_ref().unwrap().captured.is_none());
+        assert!(bad.findings.is_empty());
 
         let without = evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None);
         assert_eq!(
-            without["no_store"].failure.as_ref().unwrap().findings[0].message,
+            without["no_store"].fallback().unwrap().message,
             "context-exists gate requires a context store and session"
         );
         // A passing context gate carries nothing.

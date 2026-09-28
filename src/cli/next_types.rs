@@ -4,7 +4,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::batch_error::BatchError;
-use crate::findings::GateFailure;
+use crate::findings::FailureResponse;
 use crate::gate::{built_in_default, GateOutcome, StructuredGateResult};
 use crate::template::types::{Gate, TemplateState, ACTION_CONDITION_NAME, FIELD_TYPE_TASKS};
 
@@ -1055,7 +1055,7 @@ pub struct BlockingCondition {
     /// Absent for temporal conditions and for gate types that report no
     /// findings.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure: Option<GateFailure>,
+    pub failure: Option<FailureResponse>,
 }
 
 /// Output from a default action that requires confirmation.
@@ -1125,7 +1125,7 @@ pub fn blocking_conditions_from_gates(
                     category: "corrective".to_string(),
                     agent_actionable: false,
                     output: result.output.clone(),
-                    failure: result.failure.clone(),
+                    failure: result.response_failure(),
                 });
             }
             let condition_type = gate_defs
@@ -1150,7 +1150,7 @@ pub fn blocking_conditions_from_gates(
                 category,
                 agent_actionable,
                 output: result.output.clone(),
-                failure: result.failure.clone(),
+                failure: result.response_failure(),
             })
         })
         .collect()

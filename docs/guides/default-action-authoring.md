@@ -635,9 +635,10 @@ A check that knows more can say so. Print one line per finding to **stdout**, st
 | `effect_landed` | boolean | no | The check's own claim that the change it judged was recorded |
 
 The rules are strict so that ordinary output is never mistaken for a finding. The prefix has to be
-the first thing on the line, the JSON object has to be the only thing after it (trailing spaces and
-one carriage return are allowed), and `null` counts as absent. A missing required key, a wrong type,
-an empty `rule_id`, an unknown `level`, or a `line` without a `path` makes the whole line ordinary
+the first thing on the line, the JSON object has to be the only thing after it (trailing spaces or
+tabs are allowed, and one carriage return as the line's last character), and `null` counts as
+absent. A missing required key, a wrong type, an empty `rule_id`, an unknown `level`, a `line`
+without a `path`, or a `column` without a `line` makes the whole line ordinary
 output: it stays in `captured.stdout` and isn't reported as a finding. Keys koto doesn't know are
 ignored, so the format can grow. Standard error is never read for finding lines. Finding lines
 stay in the captured text too, so the agent sees them in place. When stdout is cut at 64KB, its
@@ -660,8 +661,10 @@ redaction marker.
 
 A response keeps at most 100 findings per condition in the order they were printed, 99 plus the
 koto-written one when there is one, and sets `findings_truncated` when it dropped any. **Print
-errors before warnings.** A check that prints its only error after a hundred warnings shows the
-agent warnings and koto's fallback, and the error is lost.
+errors before warnings.** A check that prints a hundred warnings, then its only error, and fails
+shows the agent a failed status and warnings only, with `findings_truncated: true`. koto adds no
+finding of its own, because the check did report an error; the error is still in the captured
+output, the session log and the per-rule counts, but the agent's list doesn't show it.
 
 Check authors own what their scripts print. koto replaces the credentials it knows about before
 any of this output reaches the response or the log, but it can't recognize a secret it wasn't
