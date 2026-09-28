@@ -166,7 +166,12 @@ This is reading results, distinct from the completion / outcome classification c
 
 ## `reserved_actions`: the retry-discovery surface
 
-When the aggregate shows `any_failed`, `any_skipped`, or `any_spawn_failed`, the response carries a top-level `reserved_actions` array. Every entry is a ready-to-run retry plan:
+When the aggregate shows `any_failed`, `any_skipped`, or `any_spawn_failed`, the response carries a top-level `reserved_actions` array. Every entry is a ready-to-run retry plan.
+
+Two kinds of state carry it:
+
+- **The batching state** (the one declaring `materialize_children`), on every tick where the batch has retryable children.
+- **A state reached after the batch that routes a retry**: a non-terminal state with a transition guarded on `evidence.retry_failed`, like the coordinator example's `analyze_failures`. There the list comes from the most recently recorded batch (`batch_final_view`), starting on the tick that completed the batch and moved the parent on. It appears on every tick in that state until a `retry_failed` or a rewind starts the batch over. A state with no `evidence.retry_failed` route, or a terminal state, never carries it, because a retry there has nowhere to go.
 
 ```json
 {

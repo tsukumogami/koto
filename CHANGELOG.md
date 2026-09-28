@@ -231,6 +231,22 @@ to `0.9.x`).
 
 ### Fixed
 
+- **A failed batch offers its retry after the parent leaves the batching
+  state (koto#277).** `reserved_actions` was built only from the batch
+  scheduler, which runs only in a state that declares
+  `materialize_children`. A coordinator that routes out of that state on the
+  tick its batch completes -- the koto-author example routes to
+  `analyze_failures` on `all_complete` and `needs_attention` -- stopped where
+  the scheduler never runs, so the response had no `reserved_actions`, and the
+  example's instruction to copy `reserved_actions[0].invocation` could not be
+  followed. Now a non-terminal state with a transition guarded on
+  `evidence.retry_failed` carries `reserved_actions` for the most recently
+  recorded batch's failed, skipped and spawn-failed children, on the tick that
+  arrives there and on every later tick, until a `retry_failed` or a rewind
+  starts the batch over. The response shape is unchanged; it appears in more
+  places. A state without that route, and a terminal state, still carries
+  none.
+
 - **A failed child's `reason` is the `failure_reason` it wrote, on every
   batch surface (koto#278).** The koto-user batch reference said a failed
   child in the `children-complete` output has a `reason` string, but only

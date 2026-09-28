@@ -6024,7 +6024,17 @@ fn handle_next(
                     })
                     .map(|mc| mc.task.clone())
                     .collect(),
-                _ => Vec::new(),
+                // koto#277: the scheduler didn't run here, because the tick
+                // stopped outside a batching state -- typically one that
+                // left the batching state as the batch completed. A state
+                // that routes a retry still offers one, from the batch
+                // recorded before the parent got here.
+                _ => crate::cli::batch::retryable_children_after_batch(
+                    &bf_post_events,
+                    &compiled,
+                    final_state,
+                    &name,
+                ),
             };
             if !retryable_children.is_empty() {
                 let actions =

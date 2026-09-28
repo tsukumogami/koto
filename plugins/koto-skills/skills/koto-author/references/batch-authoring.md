@@ -158,6 +158,8 @@ transitions:
 
 Routing only on `all_complete: true` fires W4 — an outright failure still satisfies `all_complete`, so the parent would slide past the retry window into the clean-completion branch. The `needs_attention` conjunct is what silences it.
 
+The state the `needs_attention` branch leads to is where the agent decides whether to retry. Give it a transition guarded on `evidence.retry_failed: present` that routes back to the batching state, as the example's `analyze_failures` does. That transition is also what makes koto offer the retry there: a non-terminal state that routes `evidence.retry_failed` gets `reserved_actions` on its responses, built from the batch that just completed, even though the scheduler that normally builds them only runs in the batching state. A state without that route gets no `reserved_actions`.
+
 **Why not the more readable `all_success: true` / `needs_attention: true` pair?**
 Because it doesn't compile. Mutual exclusivity is checked syntactically: two
 conditional transitions must share at least one `when` field whose values differ.
