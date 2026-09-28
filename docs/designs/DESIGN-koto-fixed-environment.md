@@ -340,9 +340,11 @@ the default list no longer reach commands.
 **Attach**, beside `check_origin` in `src/cli/init_entry.rs`, compares the
 caller's normalized `PATH`, `HOME` and `XDG_CONFIG_HOME` with the record. A
 difference attaches as before; the attach response gains an
-`environment_drift` array of `{variable, recorded, caller}` and one line on
-stderr saying commands run with the recorded values. Nothing is written to a
-request leg. An unrecorded session isn't compared.
+`environment_drift` array naming the differing variables, and one line on
+stderr names them and says commands run with the recorded values. Neither
+names a value, recorded or caller's, the same rule as the `koto init`
+response. Nothing is written to a request leg. An unrecorded session isn't
+compared; its next tick adopts a record.
 
 **At run time**, a `CommandEnv` -- ordered name-value pairs, never serialized,
 defined in `src/action.rs`, built by the engine -- is made once per tick. For a

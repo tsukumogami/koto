@@ -109,8 +109,9 @@ refuses nothing.
   copy the adopted record; a child spawned before the upgrade adopts on its
   own first tick.
 - Attach with a different `PATH`, `HOME` or `XDG_CONFIG_HOME` attaches, its
-  response carries `environment_drift` entries with both values, and one line
-  goes to stderr; a `PATH` differing only in dropped entries reports no drift;
+  response carries `environment_drift` naming the variables and one line goes
+  to stderr naming them, neither printing a value; a `PATH` differing only in
+  dropped entries reports no drift;
   nothing is written to a request leg; an unrecorded session is not compared.
 - `koto session rebind` moves the anchor and leaves the record unchanged.
 

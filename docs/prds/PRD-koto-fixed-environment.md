@@ -250,9 +250,9 @@ suite keeps passing while the long-term route to add names is decided.
 - **R14. Attach warns on drift and refuses nothing.** `koto init
   --attach-live` compares the caller's normalized `PATH`, `HOME` and
   `XDG_CONFIG_HOME` with the record. A difference attaches as before; the
-  response carries each differing variable with its recorded and caller
-  values and says commands run with the recorded ones. No environment
-  difference refuses an attach.
+  response names each differing variable, never its value, and a warning
+  says commands run with the recorded values. No environment difference
+  refuses an attach.
 - **R15. No verb changes the record.** `koto session rebind` moves the
   execution anchor and leaves the record unchanged. Nothing rewrites a record
   once written. The remedy for a stale record is a new session.
@@ -375,9 +375,10 @@ suite keeps passing while the long-term route to add names is decided.
 ### Attach
 
 - [ ] `koto init --attach-live` with a different `PATH`, `HOME` or
-      `XDG_CONFIG_HOME` attaches, and its response names each differing
-      variable with both values; a `PATH` differing only in dropped entries
-      reports no difference.
+      `XDG_CONFIG_HOME` attaches, and its response and warning name each
+      differing variable and print neither the recorded nor the caller's
+      value; a `PATH` differing only in dropped entries reports no
+      difference.
 - [ ] `koto session rebind` moves the anchor and leaves the record unchanged.
 
 ### Older sessions
