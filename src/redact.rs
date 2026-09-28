@@ -128,6 +128,7 @@ pub fn safe_cut_len(bytes: &[u8], max: usize) -> usize {
 ///
 /// `max_chars` must be at least 3.
 pub fn fold_one_line(raw: &str, max_chars: usize) -> Option<String> {
+    debug_assert!(max_chars >= 3, "fold_one_line needs room for its `...`");
     let folded = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     if folded.is_empty() {
         return None;

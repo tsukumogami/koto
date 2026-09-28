@@ -11,10 +11,14 @@
 # the same cache path, and so the same template hash, under v0.14.1 and the
 # new build.
 #
-# Event log: the new build drives the session in fixtures/failure-reporting.md
-# through a failing then passing command gate, a failing then succeeding
-# default_action, a context-exists gate satisfied by `koto context add`, and a
-# `koto context get`. The log must hold every event listed in EVENT_CHECKS.
+# Event log: the new build drives the session in
+# fixtures/failure-reporting-findings.md through a command gate that prints a
+# finding and fails twice before passing, a default_action that prints a
+# warning finding and fails before succeeding, a context-exists gate satisfied
+# by `koto context add`, and a `koto context get`. The log must hold every
+# event listed in EVENT_CHECKS, including the fields the check events gained
+# (attempt stamps, findings, rule_counts, duration_ms and a failed command
+# gate's leading stdout/stderr).
 # v0.14.1 must then run `koto status`, `koto next` and `koto context get` on
 # that session, exit 0, and report the state the new build reports.
 #
@@ -24,6 +28,9 @@
 # COMPAT_MUTATION breaks things on purpose, to show the checks bite:
 #   drop-event:N     delete the log lines matching EVENT_CHECKS[N] (one
 #                    mutation per entry) before the checks read the log
+#   strip-field:K    delete payload field K from every check event that
+#                    carries it (one mutation per STRIPPED_FIELDS entry), so
+#                    the events stay but a check-event field goes missing
 #   drop-transition  delete the last `transitioned` event, so v0.14.1 sees a
 #                    different current state than the new build reported
 #   template-drift   the new build compiles an edited copy of one template
@@ -35,7 +42,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-FIXTURE="$SCRIPT_DIR/fixtures/failure-reporting.md"
+FIXTURE="$SCRIPT_DIR/fixtures/failure-reporting-findings.md"
 FLOOR_VERSION="0.14.1"
 
 # Fixture template directories, relative to the repository root.
@@ -55,6 +62,24 @@ EVENT_CHECKS=(
   'failing default_action|.type? == "default_action_executed" and .payload.exit_code != 0'
   'succeeding default_action|.type? == "default_action_executed" and .payload.exit_code == 0'
   'context add|.type? == "context_added" and .payload.key == "review_note"'
+  'attempt stamps|.type? == "gate_evaluated" and .payload.gate == "tests" and .payload.attempt == 2 and .payload.visit_attempt == 2'
+  'gate findings|.type? == "gate_evaluated" and .payload.outcome == "failed" and (.payload.findings // [] | map(select(.rule_id == "E501" and .message_source == "check")) | length) == 1'
+  'gate rule_counts|.type? == "gate_evaluated" and .payload.rule_counts.E501.visit == 2 and .payload.rule_counts.E501.session == 2'
+  'gate captured streams|.type? == "gate_evaluated" and ((.payload.stdout // "") | contains("build-stdout-line")) and ((.payload.stderr // "") | contains("build-stderr-line")) and .payload.duration_ms >= 0'
+  'default_action findings and rule_counts|.type? == "default_action_executed" and .payload.attempt == 1 and (.payload.findings // [] | map(select(.rule_id == "W291")) | length) == 1 and .payload.rule_counts.__action__.session == 1 and .payload.duration_ms >= 0'
+)
+
+# Fields the check events gained, as "field|jq filter selecting the events
+# that carry it". A strip-field mutation deletes each one in turn, and one of
+# the EVENT_CHECKS entries above has to notice.
+STRIPPED_FIELDS=(
+  'attempt|.type? == "gate_evaluated" or .type? == "default_action_executed"'
+  'visit_attempt|.type? == "gate_evaluated" or .type? == "default_action_executed"'
+  'findings|.type? == "gate_evaluated" or .type? == "default_action_executed"'
+  'rule_counts|.type? == "gate_evaluated" or .type? == "default_action_executed"'
+  'duration_ms|.type? == "gate_evaluated" or .type? == "default_action_executed"'
+  'stdout|.type? == "gate_evaluated"'
+  'stderr|.type? == "gate_evaluated"'
 )
 
 REVIEW_NOTE="compat review note: looks good"
@@ -72,6 +97,9 @@ mutations() {
   local i
   for i in "${!EVENT_CHECKS[@]}"; do
     echo "drop-event:$i"
+  done
+  for i in "${!STRIPPED_FIELDS[@]}"; do
+    echo "strip-field:${STRIPPED_FIELDS[$i]%%|*}"
   done
   echo drop-transition
   echo template-drift
@@ -206,8 +234,10 @@ new_next() {
 new_koto init wf --template "$TEMPLATE" >/dev/null 2>"$SCRATCH/init.err" \
   || fail "session: koto init failed: $(cat "$SCRATCH/init.err")"
 
-# Command gate: fails (prints to both streams, exits 1), then passes.
+# Command gate: fails twice (prints a finding and a line to each stream,
+# exits 1), then passes.
 new_next "failing command gate" build gate_blocked
+new_next "failing command gate, second attempt" build gate_blocked
 touch "$WORK_DIR/ready"
 # The gate passes and the tick moves on to setup, whose default_action fails.
 new_next "passing command gate, failing default_action" setup gate_blocked
@@ -248,7 +278,30 @@ drop_lines() {
   mv "$tmp" "$LOG_FILE"
 }
 
+# strip_field KEY FILTER: delete .payload.KEY from every log line the jq
+# filter selects, leaving the bytes of every other line as they are.
+strip_field() {
+  local key="$1" filter="$2" tmp="$LOG_FILE.mut" line
+  : >"$tmp"
+  while IFS= read -r line || [ -n "$line" ]; do
+    if printf '%s' "$line" | jq -e "$filter" >/dev/null 2>&1; then
+      printf '%s' "$line" | jq -c --arg k "$key" 'del(.payload[$k])' >>"$tmp"
+      continue
+    fi
+    printf '%s\n' "$line" >>"$tmp"
+  done <"$LOG_FILE"
+  mv "$tmp" "$LOG_FILE"
+}
+
 case "$MUTATION" in
+  strip-field:*)
+    key="${MUTATION#strip-field:}"
+    for entry in "${STRIPPED_FIELDS[@]}"; do
+      [ "${entry%%|*}" = "$key" ] || continue
+      echo "MUTATION: deleting '$key' from every event it can appear on"
+      strip_field "$key" "${entry#*|}"
+    done
+    ;;
   drop-event:*)
     entry="${EVENT_CHECKS[${MUTATION#drop-event:}]}"
     echo "MUTATION: deleting log lines for '${entry%%|*}'"

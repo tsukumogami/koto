@@ -304,7 +304,8 @@ The response gains an optional top-level `attempts` object when
 state, and `rules`, keyed first by check (the gate's name, or `__action__`)
 and then by rule id, each `{visit, session}`, for every check and rule pair
 with a non-zero visit count, including pairs reported on earlier attempts of
-this visit, at most 100 pairs with a `rules_truncated` flag when more exist.
+this visit, at most 100 pairs with a `rules_truncated` flag when more exist
+(the most recently counted pairs are the ones kept).
 A passing or evidence-only response is byte-identical to today's.
 
 Internally, `StructuredGateResult` (`src/gate.rs`) gains a typed
@@ -709,7 +710,8 @@ type. Conventions the contract states once for all of these fields:
 
 **`default_action_executed`** gains `attempt`, `visit_attempt`, `findings`,
 `findings_truncated`, `rule_counts` and `duration_ms`, with the same meanings;
-its check name for `rule_counts` is `__action__`. Its existing
+its check name for `rule_counts` is `__action__`. For an action with `polling:`, `duration_ms`
+covers the whole polling loop. Its existing
 `stdout`, `stderr` and `truncated` keep their definition (leading 64 KiB per
 stream) and now carry redacted text.
 

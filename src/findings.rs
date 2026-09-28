@@ -25,11 +25,8 @@ pub const FINDING_PREFIX: &str = "::koto-finding::";
 /// koto-written finding included.
 pub const RESPONSE_FINDINGS_CAP: usize = 100;
 
-/// Most findings a check event will record in the session log, the
-/// koto-written finding included. Nothing records findings yet: the check
-/// events gain them in the follow-up log work
-/// (DESIGN-koto-failure-reporting.md, Issue 3), which applies this cap
-/// through [`cap_findings`]. Only tests read it until then.
+/// Most findings a check event records in the session log, the
+/// koto-written finding included, applied through [`cap_findings`].
 pub const LOG_FINDINGS_CAP: usize = 50;
 
 /// Longest `rule_id`, in bytes, after redaction.
@@ -47,7 +44,8 @@ pub const MESSAGE_MAX_BYTES: usize = 1000;
 /// Longest koto-written message, in characters, after it is folded onto one
 /// line (the same bound as a terminal `failure_reason`). The
 /// [`MESSAGE_MAX_BYTES`] cap applies after this fold.
-pub const FALLBACK_MESSAGE_MAX_CHARS: usize = 500;
+pub const FALLBACK_MESSAGE_MAX_CHARS: usize =
+    crate::engine::terminal_result::FAILURE_REASON_MAX_CHARS;
 
 /// The line the CLI's truncation note adds to a cut `default_action` stream.
 /// It is koto's bookkeeping, not the check's output, so it is never chosen

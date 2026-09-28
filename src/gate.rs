@@ -72,6 +72,10 @@ pub struct StructuredGateResult {
     /// these and `failure`'s fallback.
     #[serde(skip)]
     pub findings: Vec<Finding>,
+    /// For a command gate: the command's wall-clock run time in
+    /// milliseconds. `None` for gates that run no command.
+    #[serde(skip)]
+    pub duration_ms: Option<u64>,
 }
 
 impl StructuredGateResult {
@@ -94,10 +98,8 @@ impl StructuredGateResult {
     /// At most `cap` findings in emission order with the fallback last, and
     /// whether a parsed finding was dropped.
     ///
-    /// Nothing outside tests calls this yet: it is the view the check
-    /// events will record at
-    /// [`LOG_FINDINGS_CAP`](crate::findings::LOG_FINDINGS_CAP) once the log
-    /// work (DESIGN-koto-failure-reporting.md, Issue 3) gives them findings.
+    /// The check events record this view at
+    /// [`LOG_FINDINGS_CAP`](crate::findings::LOG_FINDINGS_CAP).
     pub fn capped_findings(&self, cap: usize) -> (Vec<Finding>, bool) {
         crate::findings::cap_findings(&self.findings, self.fallback().cloned(), cap)
     }
@@ -119,6 +121,7 @@ impl Default for StructuredGateResult {
             output: serde_json::Value::Null,
             failure: None,
             findings: Vec::new(),
+            duration_ms: None,
         }
     }
 }
@@ -721,12 +724,14 @@ fn command_gate_result(
     redactor: &Redactor,
 ) -> StructuredGateResult {
     let check = check_output(&output, redactor);
+    let duration_ms = Some(output.duration_ms);
     let Some(kind) = output.failure_kind else {
         return StructuredGateResult {
             outcome: GateOutcome::Passed,
             output: serde_json::json!({"exit_code": 0, "error": ""}),
             failure: None,
             findings: check.findings,
+            duration_ms,
         };
     };
     let (outcome, evidence) = match kind {
@@ -758,6 +763,7 @@ fn command_gate_result(
         output: evidence,
         failure: Some(failure),
         findings,
+        duration_ms,
     }
 }
 
@@ -1151,6 +1157,7 @@ mod tests {
             stderr_truncated: false,
             truncated: false,
             stderr_ends_with_note: kind != FailureKind::NonzeroExit,
+            duration_ms: 0,
         }
     }
 
@@ -1211,6 +1218,7 @@ mod tests {
             stderr_truncated: false,
             truncated: false,
             stderr_ends_with_note: false,
+            duration_ms: 0,
         });
         assert_eq!(result.outcome, GateOutcome::Passed);
         assert_eq!(

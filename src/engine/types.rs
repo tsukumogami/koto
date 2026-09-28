@@ -584,6 +584,178 @@ impl SpawnEntrySnapshot {
     }
 }
 
+/// Most keys a check event's `rule_counts` holds.
+pub const LOG_RULE_COUNTS_CAP: usize = 50;
+
+/// Longest leading copy of each stream a failed command gate's
+/// `gate_evaluated` records, in bytes of redacted UTF-8.
+pub const LOG_STREAM_MAX_BYTES: usize = 4096;
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// One rule's attempt counts on one check: the attempts on the state in the
+/// current visit, and in the session, on which that check failed and
+/// reported the rule at `error`, including the attempt that carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RuleCount {
+    pub visit: u64,
+    pub session: u64,
+}
+
+/// A check event's `rule_counts`: rule id to [`RuleCount`], in the order the
+/// check first reported each rule.
+///
+/// Serialized as a JSON object. Kept as a list so koto writes the keys in the
+/// order first reported; the object's key order carries no meaning, and
+/// reading an event back (through `serde_json::Value`) sorts them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuleCounts(pub Vec<(String, RuleCount)>);
+
+impl RuleCounts {
+    /// The counts stored for `rule_id`, if any.
+    pub fn get(&self, rule_id: &str) -> Option<RuleCount> {
+        self.0.iter().find(|(r, _)| r == rule_id).map(|(_, c)| *c)
+    }
+
+    /// Whether no rule is counted.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Serialize for RuleCounts {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (rule, count) in &self.0 {
+            map.serialize_entry(rule, count)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for RuleCounts {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = RuleCounts;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an object of rule ids to {visit, session}")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut access: M,
+            ) -> Result<RuleCounts, M::Error> {
+                let mut entries = Vec::new();
+                while let Some((rule, count)) = access.next_entry::<String, RuleCount>()? {
+                    entries.push((rule, count));
+                }
+                Ok(RuleCounts(entries))
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+/// The fields every check event (`gate_evaluated`, `default_action_executed`)
+/// gained with failure reporting (DESIGN-koto-failure-reporting.md,
+/// Gate-event schema). All are optional and serialized only when present, so
+/// an event without them is byte-identical to one written before they
+/// existed.
+///
+/// Read tolerantly: [`CheckEventFields::from_payload`] drops a field whose
+/// value it can't read rather than rejecting the event, so a damaged
+/// optional field never makes a log unreadable.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct CheckEventFields {
+    /// The state's session attempt number. The same on every check event of
+    /// one attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u64>,
+    /// The state's attempt number in the current visit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visit_attempt: Option<u64>,
+    /// The check's findings, at most
+    /// [`LOG_FINDINGS_CAP`](crate::findings::LOG_FINDINGS_CAP), the
+    /// koto-written one last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<crate::findings::Finding>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub findings_truncated: bool,
+    /// On a failed check that reported a rule at `error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_counts: Option<RuleCounts>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rule_counts_truncated: bool,
+    /// Wall-clock run time of the check's command, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+impl CheckEventFields {
+    /// Read the fields out of a raw event payload, keeping each one that
+    /// parses and dropping each one that doesn't.
+    pub fn from_payload(payload: &serde_json::Value) -> Self {
+        fn field<T: serde::de::DeserializeOwned>(v: &serde_json::Value, key: &str) -> Option<T> {
+            v.get(key)
+                .filter(|x| !x.is_null())
+                .and_then(|x| serde_json::from_value(x.clone()).ok())
+        }
+        let findings: Vec<crate::findings::Finding> = payload
+            .get("findings")
+            .and_then(|f| f.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|f| serde_json::from_value(f.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        CheckEventFields {
+            attempt: field(payload, "attempt"),
+            visit_attempt: field(payload, "visit_attempt"),
+            findings,
+            findings_truncated: field(payload, "findings_truncated").unwrap_or(false),
+            rule_counts: field(payload, "rule_counts"),
+            rule_counts_truncated: field(payload, "rule_counts_truncated").unwrap_or(false),
+            duration_ms: field(payload, "duration_ms"),
+        }
+    }
+}
+
+/// The leading bytes of a failed command gate's streams, as
+/// `gate_evaluated` records them beside its unchanged `output`.
+///
+/// Each stream is at most [`LOG_STREAM_MAX_BYTES`] of redacted text, cut on
+/// a character and marker boundary. A truncation flag is `true` when the
+/// logged text holds less than the command printed, whether the capture
+/// bound or the log cut removed it, and is omitted when `false`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct LoggedStreams {
+    pub stdout: String,
+    pub stderr: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stdout_truncated: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stderr_truncated: bool,
+}
+
+impl LoggedStreams {
+    /// Read the streams out of a raw payload: present when both strings are.
+    fn from_payload(payload: &serde_json::Value) -> Option<Self> {
+        let stdout = payload.get("stdout")?.as_str()?.to_string();
+        let stderr = payload.get("stderr")?.as_str()?.to_string();
+        let flag = |k: &str| payload.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+        Some(LoggedStreams {
+            stdout,
+            stderr,
+            stdout_truncated: flag("stdout_truncated"),
+            stderr_truncated: flag("stderr_truncated"),
+        })
+    }
+}
+
 /// Type-specific payload for each event variant.
 ///
 /// Each variant's inner fields are serialized directly as the `payload`
@@ -719,6 +891,10 @@ pub enum EventPayload {
         /// the field and deserialize as `false`.
         #[serde(default)]
         truncated: bool,
+        /// The attempt stamp, findings, rule counts (check `__action__`)
+        /// and duration. Each is omitted when absent.
+        #[serde(flatten)]
+        check: CheckEventFields,
     },
     DecisionRecorded {
         state: String,
@@ -730,6 +906,14 @@ pub enum EventPayload {
         output: serde_json::Value,
         outcome: String,
         timestamp: String,
+        /// The attempt stamp, findings, rule counts and duration. Each is
+        /// omitted when absent.
+        #[serde(flatten)]
+        check: CheckEventFields,
+        /// On a command gate whose outcome isn't `passed`: the leading
+        /// bytes of each redacted stream.
+        #[serde(flatten)]
+        streams: Option<LoggedStreams>,
     },
     GateOverrideRecorded {
         state: String,
@@ -1656,6 +1840,7 @@ impl<'de> Deserialize<'de> for Event {
                     stdout: p.stdout,
                     stderr: p.stderr,
                     truncated: p.truncated,
+                    check: CheckEventFields::from_payload(payload_val),
                 }
             }
             "decision_recorded" => {
@@ -1675,6 +1860,8 @@ impl<'de> Deserialize<'de> for Event {
                     output: p.output,
                     outcome: p.outcome,
                     timestamp: p.timestamp,
+                    check: CheckEventFields::from_payload(payload_val),
+                    streams: LoggedStreams::from_payload(payload_val),
                 }
             }
             "gate_override_recorded" => {
@@ -2784,6 +2971,7 @@ mod tests {
                 stdout: "Switched to a new branch 'feature'\n".to_string(),
                 stderr: String::new(),
                 truncated: false,
+                check: Default::default(),
             },
             idempotency_hash: None,
         };
@@ -2803,6 +2991,7 @@ mod tests {
             stdout: String::new(),
             stderr: "err".to_string(),
             truncated: false,
+            check: Default::default(),
         };
         assert_eq!(p.type_name(), "default_action_executed");
     }
@@ -2819,6 +3008,8 @@ mod tests {
                 output: serde_json::json!({"exit_code": 0, "error": ""}),
                 outcome: "passed".to_string(),
                 timestamp: "2026-04-01T00:00:00Z".to_string(),
+                check: Default::default(),
+                streams: None,
             },
             idempotency_hash: None,
         };
@@ -2838,8 +3029,64 @@ mod tests {
             output: serde_json::Value::Null,
             outcome: "passed".to_string(),
             timestamp: "2026-04-01T00:00:00Z".to_string(),
+            check: Default::default(),
+            streams: None,
         };
         assert_eq!(p.type_name(), "gate_evaluated");
+    }
+
+    /// Check events written before failure reporting read and write back
+    /// byte for byte: every added field is omitted when absent.
+    #[test]
+    fn check_events_without_the_new_fields_are_byte_identical() {
+        for line in [
+            r#"{"seq":3,"timestamp":"t","type":"gate_evaluated","payload":{"state":"s","gate":"g","output":{"error":"","exit_code":1},"outcome":"failed","timestamp":"t"}}"#,
+            r#"{"seq":4,"timestamp":"t","type":"default_action_executed","payload":{"state":"s","command":"c","exit_code":0,"stdout":"o","stderr":"","truncated":false}}"#,
+        ] {
+            let e: Event = serde_json::from_str(line).unwrap();
+            assert_eq!(serde_json::to_string(&e).unwrap(), line);
+        }
+    }
+
+    #[test]
+    fn check_event_fields_round_trip() {
+        let line = r#"{"seq":3,"timestamp":"t","type":"gate_evaluated","payload":{"state":"s","gate":"g","output":{"error":"","exit_code":1},"outcome":"failed","timestamp":"t","attempt":2,"visit_attempt":1,"findings":[{"rule_id":"Z9","level":"error","message":"m","effect_landed":false,"message_source":"check"}],"findings_truncated":true,"rule_counts":{"A1":{"visit":1,"session":1},"Z9":{"visit":1,"session":2}},"rule_counts_truncated":true,"duration_ms":12,"stdout":"out","stderr":"","stdout_truncated":true}}"#;
+        let e: Event = serde_json::from_str(line).unwrap();
+        assert_eq!(serde_json::to_string(&e).unwrap(), line);
+        let EventPayload::GateEvaluated { check, streams, .. } = &e.payload else {
+            panic!("{e:?}");
+        };
+        assert_eq!(check.attempt, Some(2));
+        assert_eq!(
+            check.rule_counts.as_ref().unwrap().get("Z9"),
+            Some(RuleCount {
+                visit: 1,
+                session: 2
+            })
+        );
+        let streams = streams.as_ref().unwrap();
+        assert!(streams.stdout_truncated && !streams.stderr_truncated);
+    }
+
+    /// A damaged optional field is dropped, not fatal: the event and every
+    /// other field still read.
+    #[test]
+    fn a_malformed_check_event_field_is_dropped_not_fatal() {
+        let line = r#"{"seq":3,"timestamp":"t","type":"default_action_executed","payload":{"state":"s","command":"c","exit_code":1,"stdout":"","stderr":"","truncated":false,"attempt":"two","visit_attempt":1,"findings":[{"rule_id":"R","level":"shout","message":"m","effect_landed":false,"message_source":"elsewhere"},{"nope":1}],"rule_counts":[1,2],"duration_ms":-5}}"#;
+        let e: Event = serde_json::from_str(line).unwrap();
+        let EventPayload::DefaultActionExecuted { check, .. } = &e.payload else {
+            panic!("{e:?}");
+        };
+        assert_eq!(check.attempt, None);
+        assert_eq!(check.visit_attempt, Some(1));
+        assert_eq!(
+            check.findings.len(),
+            1,
+            "the unknown level is kept, the broken entry dropped"
+        );
+        assert_eq!(check.findings[0].level.as_str(), "shout");
+        assert_eq!(check.rule_counts, None);
+        assert_eq!(check.duration_ms, None);
     }
 
     #[test]

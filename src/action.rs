@@ -244,6 +244,9 @@ pub struct CommandOutput {
     /// True when stderr's last line is a note koto wrote (a timeout, spawn,
     /// wait or polling note) rather than something the command printed.
     pub stderr_ends_with_note: bool,
+    /// Wall-clock milliseconds from spawning the command to its exit or
+    /// kill: the span the timeout covers.
+    pub duration_ms: u64,
 }
 
 /// What one reader thread produced: the retained bytes and how many the
@@ -320,6 +323,11 @@ fn append_note(mut stderr: RedactedText, note: String) -> RedactedText {
     }
 }
 
+/// Milliseconds since `started`, saturating.
+pub fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Run a shell command with process-group isolation, timeout, and output capture.
 ///
 /// The command runs via `/bin/sh -c` in its own process group, with the
@@ -365,6 +373,7 @@ pub fn run_shell_command(
         });
     }
 
+    let started = std::time::Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -377,6 +386,7 @@ pub fn run_shell_command(
                 stderr_truncated: false,
                 truncated: false,
                 stderr_ends_with_note: true,
+                duration_ms: elapsed_ms(started),
             };
         }
     };
@@ -409,6 +419,7 @@ pub fn run_shell_command(
         // Reap the child so we don't leave a zombie.
         let _ = child.wait();
     }
+    let duration_ms = elapsed_ms(started);
 
     // Redact once, after both readers finish and before anything decodes,
     // cuts or reads the output. A killed process may have stopped mid-value.
@@ -429,6 +440,7 @@ pub fn run_shell_command(
                 stderr_truncated,
                 truncated,
                 stderr_ends_with_note: false,
+                duration_ms,
             }
         }
         Ok(None) => CommandOutput {
@@ -440,6 +452,7 @@ pub fn run_shell_command(
             stderr_truncated,
             truncated,
             stderr_ends_with_note: true,
+            duration_ms,
         },
         Err(_) => CommandOutput {
             exit_code: -1,
@@ -450,6 +463,7 @@ pub fn run_shell_command(
             stderr_truncated,
             truncated,
             stderr_ends_with_note: true,
+            duration_ms,
         },
     }
 }

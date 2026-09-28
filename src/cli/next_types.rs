@@ -1088,6 +1088,28 @@ pub struct ErrorDetail {
     pub reason: String,
 }
 
+/// Add the top-level `attempts` object to a serialized response envelope,
+/// the way `leg` is added: only when there are counts and the response has
+/// a non-empty `blocking_conditions` list
+/// (DESIGN-koto-failure-reporting.md, Decision 3). A passing or
+/// evidence-only response is left byte-identical.
+pub fn attach_attempts(
+    envelope: &mut serde_json::Map<String, serde_json::Value>,
+    attempts: Option<&crate::engine::advance::AttemptCounts>,
+) -> Result<(), serde_json::Error> {
+    let Some(attempts) = attempts else {
+        return Ok(());
+    };
+    let blocked = envelope
+        .get("blocking_conditions")
+        .and_then(|b| b.as_array())
+        .is_some_and(|b| !b.is_empty());
+    if blocked {
+        envelope.insert("attempts".to_string(), serde_json::to_value(attempts)?);
+    }
+    Ok(())
+}
+
 /// Convert gate evaluation results into a list of blocking conditions.
 ///
 /// Passed gates are excluded. Each non-passing gate produces a `BlockingCondition`

@@ -664,8 +664,9 @@ A response keeps at most 100 findings per condition in the order they were print
 koto-written one when there is one, and sets `findings_truncated` when it dropped any. **Print
 errors before warnings.** A check that prints a hundred warnings, then its only error, and fails
 shows the agent a failed status and warnings only, with `findings_truncated: true`. koto adds no
-finding of its own, because the check did report an error. koto keeps every finding the check
-printed, and the error is still in the captured output, but the agent's list doesn't show it.
+finding of its own, because the check did report an error. The error is still in the captured
+output, and it still raises that rule's count in the session log (`rule_counts` on the check's
+event) and in the response's `attempts`, but the agent's list of findings doesn't show it.
 
 Check authors own what their scripts print. koto replaces the credentials it knows about before
 any of this output reaches the response or the log, but it can't recognize a secret it wasn't

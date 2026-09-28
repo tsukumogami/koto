@@ -1,0 +1,83 @@
+{
+  "format_version": 1,
+  "name": "compat-failure-reporting-findings",
+  "version": "1.0",
+  "description": "Walks a session through a command gate that reports a finding and fails twice before passing, a default action that reports a warning and fails before succeeding, and a context-exists gate, so the log holds every check-event field the failure-reporting compatibility check reads",
+  "initial_state": "build",
+  "states": {
+    "build": {
+      "directive": "Build the change and run the tests.",
+      "transitions": [
+        {
+          "target": "setup"
+        }
+      ],
+      "gates": {
+        "tests": {
+          "type": "command",
+          "command": "printf '%s\\n' '::koto-finding::{\"rule_id\":\"E501\",\"level\":\"error\",\"message\":\"line too long\",\"path\":\"src/app.py\",\"line\":12}'; echo build-stdout-line; echo build-stderr-line >&2; test -f ready"
+        }
+      }
+    },
+    "done": {
+      "directive": "Shipped.",
+      "terminal": true
+    },
+    "held": {
+      "directive": "Held back.",
+      "terminal": true
+    },
+    "review": {
+      "directive": "Wait for the review note.",
+      "transitions": [
+        {
+          "target": "wrapup"
+        }
+      ],
+      "gates": {
+        "note": {
+          "type": "context-exists",
+          "key": "review_note"
+        }
+      }
+    },
+    "setup": {
+      "directive": "Prepare the workspace.",
+      "transitions": [
+        {
+          "target": "review"
+        }
+      ],
+      "default_action": {
+        "command": "printf '%s\\n' '::koto-finding::{\"rule_id\":\"W291\",\"level\":\"warning\",\"message\":\"trailing whitespace\"}'; echo setup-stdout-line; echo setup-stderr-line >&2; test -f setup-ok"
+      }
+    },
+    "wrapup": {
+      "directive": "Decide whether to ship.",
+      "transitions": [
+        {
+          "target": "done",
+          "when": {
+            "verdict": "ship"
+          }
+        },
+        {
+          "target": "held",
+          "when": {
+            "verdict": "hold"
+          }
+        }
+      ],
+      "accepts": {
+        "verdict": {
+          "field_type": "enum",
+          "required": true,
+          "values": [
+            "ship",
+            "hold"
+          ]
+        }
+      }
+    }
+  }
+}

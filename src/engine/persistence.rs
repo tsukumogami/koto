@@ -1215,7 +1215,7 @@ fn epoch_slice<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
 /// re-sent instructions it already holds. Any rewind does open one: a rewind is
 /// an instruction to redo the work rather than to continue it, and the agent it
 /// addresses needs the procedure again.
-fn delivery_window<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
+pub(crate) fn delivery_window<'a>(events: &'a [Event], current_state: &str) -> &'a [Event] {
     entry_slice(events, current_state, Boundary::ArrivalFromElsewhere)
 }
 
@@ -2353,6 +2353,8 @@ mod tests {
                 output,
                 outcome: "failed".to_string(),
                 timestamp: "2026-04-01T00:00:00Z".to_string(),
+                check: Default::default(),
+                streams: None,
             },
         )
     }
@@ -2851,6 +2853,7 @@ mod tests {
                     stdout: "hi\n".to_string(),
                     stderr: String::new(),
                     truncated: false,
+                    check: Default::default(),
                 },
             ),
             make_event(
@@ -2913,6 +2916,8 @@ mod tests {
                 output: serde_json::json!({}),
                 outcome: outcome.to_string(),
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
+                check: Default::default(),
+                streams: None,
             },
         )
     }

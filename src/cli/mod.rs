@@ -982,6 +982,7 @@ fn polling_interrupted() -> crate::action::CommandOutput {
         stderr_truncated: false,
         truncated: false,
         stderr_ends_with_note: true,
+        duration_ms: 0,
     }
 }
 
@@ -5331,22 +5332,24 @@ fn handle_next(
             // then canonicalize and refuse an escape
             // (DESIGN-koto-runs-commands.md Decision 8). A rejection is an
             // action failure under Decision 3 -- same stop, same response
-            // shape, same `fallback` prose. No `DefaultActionExecuted` event
-            // is appended, because no command ran: the failure is reported as
-            // a spawn failure, which is what it is.
+            // shape, same `fallback` prose. `spawned: false` tells the advance
+            // loop no command ran, so it appends no `DefaultActionExecuted`
+            // event and counts no attempt: the failure is reported as a spawn
+            // failure, which is what it is.
             let substituted =
                 substitute_plain(&action.working_dir, &runtime_vars, &variables, &overlay);
             match resolve_action_working_dir(&execution_dir, &substituted) {
                 Ok(dir) => dir,
                 Err(message) => {
                     // Nothing ran, so koto's refusal is the whole of stderr.
+                    // The message can quote a substituted value, so it goes
+                    // through the redactor before anything reads it.
+                    let message =
+                        crate::redact::redact_str(&message, tick_gates.command_env.redactor());
                     let check = crate::findings::CheckOutput {
                         findings: Vec::new(),
                         captured: crate::findings::Captured {
-                            stderr: crate::redact::redact_str(
-                                &message,
-                                tick_gates.command_env.redactor(),
-                            ),
+                            stderr: message.clone(),
                             ..Default::default()
                         },
                         stderr_ends_with_note: true,
@@ -5356,15 +5359,19 @@ fn handle_next(
                         failure_kind: crate::action::FailureKind::SpawnFailed,
                         exit_code: -1,
                         stdout: String::new(),
-                        stderr: message,
+                        stderr: message.into_string(),
                         truncated: false,
                         check,
+                        duration_ms: 0,
+                        spawned: false,
                     };
                 }
             }
         };
 
-        // Execute: polling or one-shot.
+        // Execute: polling or one-shot. The run time covers the whole
+        // polling loop for a polling action, as its timeout does.
+        let started = std::time::Instant::now();
         let output = if let Some(polling) = &action.polling {
             // For polling, we need to evaluate gates inside the loop.
             // Look up the state's gates from the compiled template.
@@ -5450,16 +5457,10 @@ fn handle_next(
             output.stderr_truncated,
         );
 
-        // Append DefaultActionExecuted event.
-        let event_payload = EventPayload::DefaultActionExecuted {
-            state: state_name.to_string(),
-            command: command.clone(),
-            exit_code: output.exit_code,
-            stdout: stdout.clone(),
-            stderr: stderr.clone(),
-            truncated: output.truncated,
-        };
-        let _ = backend.append_event(&name, &event_payload, &now_iso8601());
+        let duration_ms = crate::action::elapsed_ms(started);
+
+        // The advance loop appends `DefaultActionExecuted` from what this
+        // returns, once it knows the findings, counts and capture result.
 
         // The findings and streams the `failure` object carries: the runner's
         // capture itself, without the truncation note added above.
@@ -5480,6 +5481,8 @@ fn handle_next(
                 stderr,
                 truncated: output.truncated,
                 check,
+                duration_ms,
+                spawned: true,
             };
         }
 
@@ -5491,6 +5494,7 @@ fn handle_next(
                 stderr,
                 truncated: output.truncated,
                 check,
+                duration_ms,
             }
         } else {
             ActionResult::Executed {
@@ -5500,6 +5504,7 @@ fn handle_next(
                 stderr,
                 truncated: output.truncated,
                 check,
+                duration_ms,
             }
         }
     };
@@ -5543,7 +5548,7 @@ fn handle_next(
         decider_port
             .as_mut()
             .map(|p| p as &mut dyn crate::engine::decider::DeciderPort),
-        evidence_recorded,
+        crate::engine::advance::AdvanceOptions { evidence_recorded },
     );
     drop(decider_port);
 
@@ -5595,6 +5600,7 @@ fn handle_next(
         Ok(advance_result) => {
             let final_state = &advance_result.final_state;
             let advanced = advance_result.advanced;
+            let attempts = advance_result.attempts.clone();
 
             let final_template_state = match compiled.states.get(final_state) {
                 Some(s) => s,
@@ -6322,6 +6328,10 @@ fn handle_next(
             if let Some(abandoned) = &abandoned_leg {
                 envelope.insert("leg_abandoned".to_string(), abandoned.sibling());
             }
+            // The blocked state's attempt counts, beside `leg` and only on a
+            // response with blocking conditions
+            // (DESIGN-koto-failure-reporting.md, Decision 3).
+            next_types::attach_attempts(&mut envelope, attempts.as_ref())?;
 
             println!(
                 "{}",
