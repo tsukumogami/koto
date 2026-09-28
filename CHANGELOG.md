@@ -240,10 +240,13 @@ to `0.9.x`).
   the scheduler never runs, so the response had no `reserved_actions`, and the
   example's instruction to copy `reserved_actions[0].invocation` could not be
   followed. Now a non-terminal state with a transition guarded on
-  `evidence.retry_failed` carries `reserved_actions` for the most recently
-  recorded batch's failed, skipped and spawn-failed children, on the tick that
-  arrives there and on every later tick, until a `retry_failed` or a rewind
-  starts the batch over. The response shape is unchanged; it appears in more
+  `evidence.retry_failed` back to the batching state carries
+  `reserved_actions` for the most recently recorded batch's failed, skipped
+  and spawn-failed children that have a session, on the response that
+  arrives there (by advance or by `koto next --to`) and on every later tick,
+  until a `retry_failed` or a rewind starts the batch over. A dependent
+  skipped because its upstream failed is left out when it has no skip marker
+  yet; retrying the upstream brings it back. The response shape is unchanged; it appears in more
   places. A state without that route, and a terminal state, still carries
   none.
 

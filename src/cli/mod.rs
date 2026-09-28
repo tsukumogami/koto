@@ -4531,7 +4531,32 @@ fn handle_next(
                         .with_retention(next_types::Retention { reason: retention }),
                     None => resp,
                 };
-                println!("{}", serde_json::to_string(&resp)?);
+                // A directed move into a state that routes a retry offers it
+                // on this response too, as an arrival by advance does
+                // (koto#277). The batch it names was recorded just above.
+                let mut out = serde_json::to_value(&resp)?;
+                if let Some(obj) = out.as_object_mut() {
+                    let post_events = backend
+                        .read_events(&name)
+                        .map(|(_, evts)| evts)
+                        .unwrap_or_default();
+                    let retryable = crate::cli::batch::retryable_children_after_batch(
+                        &post_events,
+                        &compiled,
+                        target,
+                        &name,
+                        &|child| backend.exists(child),
+                    );
+                    if !retryable.is_empty() {
+                        let actions =
+                            crate::cli::retry::synthesize_reserved_actions(&name, &retryable);
+                        obj.insert(
+                            "reserved_actions".to_string(),
+                            serde_json::to_value(&actions)?,
+                        );
+                    }
+                }
+                println!("{}", serde_json::to_string(&out)?);
                 // The delivery record is appended only after printing --
                 // see the natural-advancement path for the crash-
                 // direction rationale. Non-fatal on error: the response
@@ -6034,6 +6059,7 @@ fn handle_next(
                     &compiled,
                     final_state,
                     &name,
+                    &|child| backend.exists(child),
                 ),
             };
             if !retryable_children.is_empty() {

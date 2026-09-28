@@ -54,6 +54,14 @@ fn run_ok(dir: &Path, args: &[&str]) -> serde_json::Value {
 /// Copy the example pair into `dir`, init `coord` from the coordinator, and
 /// submit one task, `task-1`.
 fn start_example_batch(dir: &Path) {
+    let tasks = serde_json::json!({
+        "tasks": [{"name": "task-1", "waits_on": [], "vars": {"ISSUE_NUMBER": "1"}}]
+    });
+    start_example_batch_with(dir, &tasks);
+}
+
+/// Copy the example pair into `dir`, init `coord`, and submit `tasks`.
+fn start_example_batch_with(dir: &Path, tasks: &serde_json::Value) {
     let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join(EXAMPLES);
     for name in ["batch-coordinator.md", "batch-worker.md"] {
         std::fs::copy(examples.join(name), dir.join(name)).unwrap();
@@ -70,11 +78,21 @@ fn start_example_batch(dir: &Path) {
             "plan_path=plan.md",
         ],
     );
-    let tasks = serde_json::json!({
-        "tasks": [{"name": "task-1", "waits_on": [], "vars": {"ISSUE_NUMBER": "1"}}]
-    });
-    // The gate blocks while the child runs, which exits non-zero.
+    // The gate blocks while the children run, which exits non-zero.
     run_koto(dir, &["next", "coord", "--with-data", &tasks.to_string()]);
+}
+
+fn drive(dir: &Path, child: &str, data: serde_json::Value) {
+    run_ok(
+        dir,
+        &[
+            "next",
+            child,
+            "--no-cleanup",
+            "--with-data",
+            &data.to_string(),
+        ],
+    );
 }
 
 fn fail_task_1(dir: &Path) {
@@ -288,4 +306,64 @@ fn a_state_that_does_not_route_a_retry_is_not_offered_one() {
     let json = run_ok(dir, &["next", "coord"]);
     assert_eq!(json["state"], "report", "{json}");
     assert!(json.get("reserved_actions").is_none(), "{json}");
+}
+
+#[test]
+fn a_failed_task_with_a_dependent_is_retried_by_its_offered_invocation() {
+    // t1 fails, t2 waits on it and is skipped, t3 succeeds. The tick that
+    // completes the batch leaves the batching state, so no skip marker is
+    // written for t2; the offer names only t1, and retrying t1 brings t2
+    // back through the scheduler.
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let tasks = serde_json::json!({
+        "tasks": [
+            {"name": "t1", "waits_on": [], "vars": {"ISSUE_NUMBER": "1"}},
+            {"name": "t2", "waits_on": ["t1"], "vars": {"ISSUE_NUMBER": "2"}},
+            {"name": "t3", "waits_on": [], "vars": {"ISSUE_NUMBER": "3"}},
+        ]
+    });
+    start_example_batch_with(dir, &tasks);
+    drive(
+        dir,
+        "coord.t1",
+        serde_json::json!({"status": "blocked", "failure_reason": "tests red"}),
+    );
+    drive(dir, "coord.t3", serde_json::json!({"status": "complete"}));
+
+    let json = run_ok(dir, &["next", "coord"]);
+    assert_eq!(json["state"], "analyze_failures", "{json}");
+    let action = retry_action(&json);
+    assert_eq!(action["applies_to"], serde_json::json!(["t1"]), "{json}");
+
+    let retried = run_invocation(dir, action["invocation"].as_str().unwrap());
+    assert_eq!(retried["state"], "plan_and_await", "{retried}");
+
+    // t1 succeeds on retry; the scheduler then spawns t2, which succeeds.
+    drive(dir, "coord.t1", serde_json::json!({"status": "complete"}));
+    run_koto(dir, &["next", "coord"]);
+    drive(dir, "coord.t2", serde_json::json!({"status": "complete"}));
+    let done = run_ok(dir, &["next", "coord", "--no-cleanup"]);
+    assert_eq!(done["state"], "summarize", "{done}");
+    assert_eq!(done["batch_final_view"]["all_success"], true, "{done}");
+}
+
+#[test]
+fn a_directed_move_into_analyze_failures_offers_the_retry() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    start_example_batch(dir);
+    fail_task_1(dir);
+
+    // Leave the batching state with `--to` before any tick has seen the
+    // batch complete: the directed exit records the batch and offers the
+    // retry on its own response.
+    let json = run_ok(dir, &["next", "coord", "--to", "analyze_failures"]);
+    assert_eq!(json["state"], "analyze_failures", "{json}");
+    let action = retry_action(&json);
+    assert_eq!(
+        action["applies_to"],
+        serde_json::json!(["task-1"]),
+        "{json}"
+    );
 }

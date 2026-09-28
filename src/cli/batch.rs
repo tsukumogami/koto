@@ -3253,48 +3253,69 @@ pub(crate) fn finalize_batch_if_complete(
 /// never runs, so without this its response offered no retry at all.
 ///
 /// Returns the short task names whose outcome in the most recent
-/// `BatchFinalized` view is `failure`, `skipped` or `spawn_failed`, but only
-/// when all of these hold, and an empty list otherwise:
+/// `BatchFinalized` view is `failure`, `skipped` or `spawn_failed` and whose
+/// session exists (`child_exists`, given the composed `<parent>.<task>`
+/// name), but only when all of these hold, and an empty list otherwise:
 ///
 /// - `state` declares no `materialize_children` (there, the scheduler's
-///   own list answers) and is not terminal (a terminal takes no evidence);
-/// - `state` has a transition guarded on `evidence.retry_failed`, so the
-///   template routes a retry from it -- a later state that has moved on
-///   from the batch is not offered one;
+///   own list answers), is not terminal, and has an `accepts` block (koto
+///   refuses `--with-data` for a state without one, so the invocation could
+///   not be submitted);
+/// - `state` has a transition guarded on `evidence.retry_failed` whose
+///   target is the batching state that recorded the batch, so the template
+///   routes a retry of that batch from here -- a state that has moved on,
+///   or that retries a different batch, is not offered one;
 /// - no `retry_failed` submission or `Rewound` came after that view, which
 ///   would have started the batch over.
+///
+/// The existence filter matters because `retry_failed` rejects a name with
+/// no session on disk. A dependent that the batch marked skipped has none
+/// when the parent left the batching state on the completing tick, since the
+/// scheduler that writes skip markers never ran; retrying its failed
+/// upstream is enough, and the scheduler re-materializes the dependent when
+/// the retry routes back.
 pub fn retryable_children_after_batch(
     events: &[Event],
     template: &CompiledTemplate,
     state: &str,
     parent_name: &str,
+    child_exists: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
     let Some(template_state) = template.states.get(state) else {
         return Vec::new();
     };
-    if template_state.terminal || template_state.materialize_children.is_some() {
-        return Vec::new();
-    }
-    let routes_retry = template_state.transitions.iter().any(|t| {
-        t.when
-            .as_ref()
-            .is_some_and(|w| w.contains_key("evidence.retry_failed"))
-    });
-    if !routes_retry {
+    if template_state.terminal
+        || template_state.materialize_children.is_some()
+        || template_state.accepts.is_none()
+    {
         return Vec::new();
     }
     let Some(bf) = find_most_recent_batch_finalized(events) else {
         return Vec::new();
     };
+    let EventPayload::BatchFinalized {
+        state: batch_state,
+        view,
+        ..
+    } = &bf.payload
+    else {
+        return Vec::new();
+    };
+    let routes_retry_to_batch = template_state.transitions.iter().any(|t| {
+        &t.target == batch_state
+            && t.when
+                .as_ref()
+                .is_some_and(|w| w.contains_key("evidence.retry_failed"))
+    });
+    if !routes_retry_to_batch {
+        return Vec::new();
+    }
     if events
         .iter()
         .any(|e| e.seq > bf.seq && is_batch_invalidator(e))
     {
         return Vec::new();
     }
-    let EventPayload::BatchFinalized { view, .. } = &bf.payload else {
-        return Vec::new();
-    };
     let Some(view) = BatchFinalView::from_gate_output(view) else {
         return Vec::new();
     };
@@ -3305,7 +3326,7 @@ pub fn retryable_children_after_batch(
             matches!(
                 c.outcome,
                 TaskOutcome::Failure | TaskOutcome::Skipped | TaskOutcome::SpawnFailed
-            )
+            ) && child_exists(&c.name)
         })
         .map(|c| c.name.strip_prefix(&prefix).unwrap_or(&c.name).to_string())
         .collect()
@@ -4550,8 +4571,8 @@ mod tests {
     }
 
     /// koto#277: the retry offered outside the batching state comes from the
-    /// most recent recorded batch, and is withdrawn once a retry or a rewind
-    /// has started that batch over.
+    /// most recent recorded batch, names only children that exist, and is
+    /// withdrawn once a retry or a rewind has started that batch over.
     #[test]
     fn retryable_children_after_batch_follows_the_recorded_batch() {
         let when = |key: &str| {
@@ -4559,15 +4580,35 @@ mod tests {
             w.insert(key.to_string(), serde_json::json!("present"));
             Some(w)
         };
+        let retry_to = |target: &str| crate::template::types::Transition {
+            target: target.to_string(),
+            when: when("evidence.retry_failed"),
+            context_assignments: BTreeMap::new(),
+        };
+        let some_accepts = || Some(BTreeMap::new());
         let mut states = BTreeMap::new();
         states.insert(
             "analyze".to_string(),
             TemplateState {
-                transitions: vec![crate::template::types::Transition {
-                    target: "plan".to_string(),
-                    when: when("evidence.retry_failed"),
-                    context_assignments: BTreeMap::new(),
-                }],
+                transitions: vec![retry_to("plan")],
+                accepts: some_accepts(),
+                ..TemplateState::default()
+            },
+        );
+        // Routes a retry, but to a different batching state.
+        states.insert(
+            "elsewhere".to_string(),
+            TemplateState {
+                transitions: vec![retry_to("other_plan")],
+                accepts: some_accepts(),
+                ..TemplateState::default()
+            },
+        );
+        // Routes a retry to the right state but takes no evidence.
+        states.insert(
+            "gate_only".to_string(),
+            TemplateState {
+                transitions: vec![retry_to("plan")],
                 ..TemplateState::default()
             },
         );
@@ -4590,20 +4631,34 @@ mod tests {
             ]
         });
         let recorded = vec![bf_event_for(5, "plan", view)];
+        let all_exist = |_: &str| true;
+        let offered = |events: &[Event], state: &str| {
+            retryable_children_after_batch(events, &template, state, "p", &all_exist)
+        };
         assert_eq!(
-            retryable_children_after_batch(&recorded, &template, "analyze", "p"),
+            offered(&recorded, "analyze"),
             vec!["A".to_string(), "C".to_string()]
         );
-        // A state with no retry route is not offered one.
-        assert!(retryable_children_after_batch(&recorded, &template, "report", "p").is_empty());
+        // A skipped dependent with no session (no skip marker was written)
+        // is left out; retrying its upstream brings it back.
+        let only_a = |name: &str| name == "p.A";
+        assert_eq!(
+            retryable_children_after_batch(&recorded, &template, "analyze", "p", &only_a),
+            vec!["A".to_string()]
+        );
+        // No retry route, a route to another batching state, or no accepts
+        // block: nothing is offered.
+        assert!(offered(&recorded, "report").is_empty());
+        assert!(offered(&recorded, "elsewhere").is_empty());
+        assert!(offered(&recorded, "gate_only").is_empty());
 
         // A retry after the recorded batch starts it over.
         let mut retried = recorded.clone();
         retried.push(retry_evidence_event(7, "2026-04-14T10:05:00Z"));
-        assert!(retryable_children_after_batch(&retried, &template, "analyze", "p").is_empty());
+        assert!(offered(&retried, "analyze").is_empty());
 
         // No recorded batch, nothing to offer.
-        assert!(retryable_children_after_batch(&[], &template, "analyze", "p").is_empty());
+        assert!(offered(&[], "analyze").is_empty());
     }
 
     #[test]
