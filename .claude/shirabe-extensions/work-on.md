@@ -31,7 +31,15 @@ run, so it stays short; the reasons are in its commit history.
 - `test/functional/**` -> `make -C test/functional test-functional` (not in PR CI: the Go feature suite)
 - `benches/**`, `Cargo.toml`, `Cargo.lock` -> `cargo bench --no-run` (not in PR CI: `cargo test` does not build bench targets)
 - `.tsuku-recipes/**` -> `tsuku validate .tsuku-recipes/koto.toml` (not in PR CI: CI's step calls `tsuku recipe validate`, a subcommand tsuku does not have, and skips; it checks structure only, so a download or checksum change passes it)
-- `.github/**` other than `.github/pull_request_template.md`, `install.sh`, `scripts/**` other than
+- `.github/workflows/validate.yml`, `.github/workflows/lifecycle.yml`,
+  `.github/workflows/run-evals.yml`, `.github/workflows/validate-pr-body.yml` ->
+  `SHELLCHECK_OPTS=--severity=warning actionlint` (not in PR CI; `tsuku install actionlint`;
+  lints every workflow, so it can't pass having checked nothing). These four run on every pull
+  request that changes them, so the PR's own CI runs the changed logic. A person still reviews
+  it: the PR description's reviewer part (below `---`) carries a `## Workflow changes` section
+  naming each changed workflow and what its logic now does. That section is where a person
+  reviews it, instead of the run stopping here.
+- `.github/**` other than `.github/pull_request_template.md` and the four workflows above, `install.sh`, `scripts/**` other than
   `scripts/check-evals-exist.sh` and the three run-evals files above, `.release/**`, `.goreleaser.yaml`, `.cargo/**`,
   `plugins/koto-skills/hooks/*.sh`, `.claude/settings.json` -> no local check exists. Still run
   every other selected command; if one fails the outcome is failed, otherwise it is cannot-verify:
