@@ -307,6 +307,52 @@ transitions:
 
 See [evidence-routing-workflow.md](examples/evidence-routing-workflow.md) for a full compilable template using this pattern.
 
+### Routing on a variable's value
+
+A `vars.NAME` key in a `when` clause can name a value. The transition fires when the variable holds exactly that value, so koto takes the branch instead of directive prose asking the agent to read the variable and choose:
+
+```yaml
+variables:
+  MODE:
+    values: [auto, interactive]
+    default: interactive
+
+states:
+  confirm:
+    transitions:
+      - target: proceed
+        when:
+          vars.MODE: auto
+      - target: ask_author
+        when:
+          vars.MODE: interactive
+```
+
+When one of a state's value routes matches, the state advances as soon as it's entered, without asking for evidence, and the agent never sees its directive. A value condition combines with the clause's other keys by AND, like any other key, so `{vars.MODE: auto, verdict: approve}` fires only when both hold.
+
+Matching rules:
+
+- The comparison is exact: case-sensitive, no trimming. `Auto` doesn't match `auto`.
+- The value must be a string. Quote one YAML would read as a boolean or a number: `vars.MERGE: "true"`, not `vars.MERGE: true`.
+- An empty or unset variable matches no value. Test emptiness with `vars.NAME: {is_set: false}`, which keeps working as before.
+- When the variable matches none of a state's value routes, the state behaves as it does when no conditional transition matches: the unconditional fallback fires if evidence was just submitted, and otherwise koto asks for evidence and returns the directive.
+- The same condition in a `skip_if` map means the same thing.
+
+The compiler checks every value route against the variable's declaration, so a typo fails at compile time rather than leaving a route that never fires:
+
+| Code | Refuses |
+|------|---------|
+| `E-VAR-ROUTE-UNDECLARED` | a route on a name the `variables:` block doesn't declare |
+| `E-VAR-ROUTE-VALUE` | a value the variable can't hold: empty, not a string, outside the value allowlist, or refused by its `values:` or `pattern:` |
+| `E-VAR-ROUTE-CAPTURE` | a route on a capture's value; a later state can overwrite a capture (`{is_set: true}` on one is fine) |
+| `E-VAR-ROUTE-OVERLAP` | two routes out of one state that one value could satisfy, including a value route beside an `{is_set: true}` route on the same variable |
+
+Declare `values:` (or `pattern:`) on a variable you route on: without one the compiler can check the variable's name but not the value, and `koto init` refuses a value outside it before any session exists.
+
+Which variables a route may read. A declared variable without `rebind: true` is fixed at `koto init`, so a route on it is decided by the value the run started with. A `rebind: true` variable can change when a later invocation attaches to the session; the attach logs a `variables_rebound` event with the new and old values, and routes resolved after it see the new value. A transition taken on a value route records the variable and value in its event's `vars_matched` field.
+
+To vary only the text a run reads, you don't need a route: a directive can name a file through a variable (`read references/{{ARM}}.md`), since `{{VAR}}` is substituted into directives.
+
 ### Decider declarations on accepts fields
 
 An `enum` or `boolean` field can carry a `decider` block that declares the field as a decision a typed decider could answer from the inputs you name. This section covers the block's syntax, its defaults, and the compile rules. Everything lives inside the field, so an older koto that doesn't know the block drops it and treats the field as an ordinary one.
@@ -1206,6 +1252,22 @@ states:
       - target: create_branch
 ```
 
+**Template variable value** — skip based on the value a variable holds (see [Routing on a variable's value](#routing-on-a-variables-value)):
+
+```yaml
+states:
+  confirm:
+    skip_if:
+      vars.MODE: auto
+    transitions:
+      - target: proceed
+        when:
+          vars.MODE: auto
+      - target: ask_author
+        when:
+          vars.MODE: interactive
+```
+
 **Direct evidence value** — skip when a specific piece of evidence is already present in the workflow's merged state:
 
 ```yaml
@@ -1515,8 +1577,8 @@ states:
 A variable counts as "set" when its value is a non-empty string. Variables that are absent or have an empty string default are "not set".
 
 The compiler enforces:
-- `vars.*` keys must use `{is_set: true}` or `{is_set: false}` as the value. Equality matchers (e.g., `vars.FOO: "bar"`) are rejected.
-- The variable name after `vars.` must be declared in the template's `variables` block.
+- A `vars.*` key takes `{is_set: true}`, `{is_set: false}`, or a string value. A string is a value route, with its own checks: see [Routing on a variable's value](#routing-on-a-variables-value).
+- The variable name after `vars.` must be declared in the template's `variables` block (or, for `is_set`, be a capture).
 - `{is_set: true}` and `{is_set: false}` on the same field are disjoint (no mutual exclusivity conflict). Two identical `{is_set: true}` conditions on different transitions are flagged as conflicting.
 
 ### `deny_unknown_fields` narrowed to source templates

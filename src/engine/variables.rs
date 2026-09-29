@@ -192,8 +192,8 @@ pub fn check_value(var: &str, decl: &VariableDecl, value: &str) -> Result<(), Va
 pub struct RebindPlan {
     /// New values, keyed by variable. This is the `variables_rebound` payload.
     pub changes: BTreeMap<String, String>,
-    /// The values those variables held before, for a caller that reports
-    /// the change.
+    /// The values those variables held before. [`apply_rebind`] records them
+    /// as the event's `previous` field, beside the new values.
     pub previous: BTreeMap<String, String>,
 }
 
@@ -319,6 +319,7 @@ pub fn apply_rebind(
         session,
         &EventPayload::VariablesRebound {
             variables: plan.changes.clone(),
+            previous: plan.previous.clone(),
         },
         &now_iso8601(),
     )?;
@@ -567,6 +568,18 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+        // The event carries the old value beside the new one.
+        match &last.payload {
+            EventPayload::VariablesRebound {
+                variables,
+                previous,
+            } => {
+                assert_eq!(variables.get("MERGE").map(String::as_str), Some("true"));
+                assert_eq!(previous.get("MERGE").map(String::as_str), Some("false"));
+                assert_eq!(previous.len(), 1);
+            }
+            other => panic!("expected variables_rebound, got {:?}", other),
+        }
     }
 
     #[test]

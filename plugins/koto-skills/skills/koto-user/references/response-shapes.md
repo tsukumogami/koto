@@ -117,6 +117,10 @@ are blocking.
 - `options` is omitted entirely when the template has no conditional transitions. If
   absent, there is only a fallback transition and all evidence values lead to the same
   next state.
+- A `when` key starting with `vars.` (for example `"vars.MODE": "auto"`) is a condition
+  on a template variable, not evidence you submit. koto reads it from the session's
+  current variables (the values set at `koto init`, or re-applied by a later attach for a
+  `rebind: true` variable); don't put it in `--with-data`.
 - `details` is omitted once it's already been delivered since you last arrived at
   this phase, unless `--full` is passed.
 
@@ -304,6 +308,10 @@ transitions completed.
   `condition_type` value and have `skip_if_matched` absent.
 - Consecutive `skip_if` states chain within a single call. If the landing state also has
   a `skip_if` whose conditions match, the engine advances again before returning.
+- A state can also advance on entry without any `skip_if` when its transitions route on
+  a template variable's value (`vars.MODE: auto` in a `when` clause). The response looks
+  the same: `advanced: true` and the landing state. In the event log such a transition
+  carries a `vars_matched` map naming each variable and the value it matched.
 - The shape of the landing state determines the action: `evidence_required`,
   `gate_blocked`, `done`, etc. `advanced: true` is the only `skip_if`-specific signal in
   the response itself.

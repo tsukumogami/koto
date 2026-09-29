@@ -1608,6 +1608,7 @@ mod tests {
                     condition_type: "initial".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
                 idempotency_hash: None,
             },

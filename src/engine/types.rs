@@ -818,6 +818,16 @@ pub enum EventPayload {
         /// Additive field: omitted when `None` so pre-feature logs round-trip.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_assignments: Option<BTreeMap<String, String>>,
+        /// The value conditions (`vars.NAME: <string>`) that selected this
+        /// transition: each variable name mapped to the value it matched.
+        /// Read from the taken edge's `when` clause and, on a `skip_if`
+        /// advance, the `skip_if` map too. `is_set` conditions aren't
+        /// recorded.
+        ///
+        /// Additive field: omitted when `None`, so a transition that didn't
+        /// route on a value, and every pre-feature log, serializes as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vars_matched: Option<BTreeMap<String, String>>,
     },
     EvidenceSubmitted {
         state: String,
@@ -1181,6 +1191,11 @@ pub enum EventPayload {
     /// [`Unknown`](EventPayload::Unknown) and keeps reading the log.
     VariablesRebound {
         variables: BTreeMap<String, String>,
+        /// The values the changed variables held before this rebind, keyed
+        /// like `variables`. Additive: omitted when empty, so a log written
+        /// before the field existed round-trips unchanged.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        previous: BTreeMap<String, String>,
     },
     /// Carries the auto-promoted [`WorkflowResult`] envelope on a child's
     /// own session log (wire `type: "request_store.result"`, in the
@@ -1842,6 +1857,7 @@ impl<'de> Deserialize<'de> for Event {
                     condition_type: p.condition_type,
                     skip_if_matched: p.skip_if_matched,
                     context_assignments: p.context_assignments,
+                    vars_matched: p.vars_matched,
                 }
             }
             "evidence_submitted" => {
@@ -2055,6 +2071,7 @@ impl<'de> Deserialize<'de> for Event {
                     .map_err(serde::de::Error::custom)?;
                 EventPayload::VariablesRebound {
                     variables: p.variables,
+                    previous: p.previous,
                 }
             }
             "request_store.result" => {
@@ -2204,6 +2221,8 @@ struct TransitionedPayload {
     skip_if_matched: Option<BTreeMap<String, serde_json::Value>>,
     #[serde(default)]
     context_assignments: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    vars_matched: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -2390,6 +2409,8 @@ struct VariableCapturedPayload {
 #[derive(Deserialize)]
 struct VariablesReboundPayload {
     variables: BTreeMap<String, String>,
+    #[serde(default)]
+    previous: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -2978,6 +2999,7 @@ mod tests {
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
                 context_assignments: None,
+                vars_matched: None,
             },
             idempotency_hash: None,
         };
@@ -3001,6 +3023,7 @@ mod tests {
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
                 context_assignments: Some(assignments),
+                vars_matched: None,
             },
             idempotency_hash: None,
         };
@@ -3035,6 +3058,7 @@ mod tests {
             condition_type: "auto".to_string(),
             skip_if_matched: None,
             context_assignments: None,
+            vars_matched: None,
         };
         assert_eq!(p.type_name(), "transitioned");
 
@@ -4057,7 +4081,7 @@ mod tests {
         let json = r#"{"seq":7,"timestamp":"2026-01-01T00:00:00Z","type":"variables_rebound","payload":{"variables":{"MAX_ROUNDS":"5","MERGE":"true"}}}"#;
         let event: Event = serde_json::from_str(json).unwrap();
         match &event.payload {
-            EventPayload::VariablesRebound { variables } => {
+            EventPayload::VariablesRebound { variables, .. } => {
                 assert_eq!(variables.get("MERGE").map(String::as_str), Some("true"));
                 assert_eq!(variables.len(), 2);
             }
@@ -4065,6 +4089,46 @@ mod tests {
         }
         assert_eq!(event.payload.type_name(), "variables_rebound");
         assert_eq!(serde_json::to_string(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn variables_rebound_with_previous_roundtrips_byte_for_byte() {
+        use super::{Event, EventPayload};
+        let json = r#"{"seq":7,"timestamp":"2026-01-01T00:00:00Z","type":"variables_rebound","payload":{"variables":{"MERGE":"true"},"previous":{"MERGE":"false"}}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        match &event.payload {
+            EventPayload::VariablesRebound { previous, .. } => {
+                assert_eq!(previous.get("MERGE").map(String::as_str), Some("false"));
+            }
+            other => panic!("expected a variables_rebound payload, got {:?}", other),
+        }
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn transitioned_vars_matched_roundtrips_and_is_omitted_when_none() {
+        use super::{Event, EventPayload};
+        let json = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"route","to":"fast","condition_type":"auto","vars_matched":{"MODE":"auto"}}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        match &event.payload {
+            EventPayload::Transitioned { vars_matched, .. } => {
+                let matched = vars_matched.as_ref().expect("vars_matched");
+                assert_eq!(matched.get("MODE").map(String::as_str), Some("auto"));
+            }
+            other => panic!("expected a transitioned payload, got {:?}", other),
+        }
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+
+        let plain = r#"{"seq":3,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":"route","to":"fast","condition_type":"auto"}}"#;
+        let event: Event = serde_json::from_str(plain).unwrap();
+        assert!(matches!(
+            event.payload,
+            EventPayload::Transitioned {
+                vars_matched: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&event).unwrap(), plain);
     }
 
     #[test]

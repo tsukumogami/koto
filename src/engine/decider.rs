@@ -662,6 +662,7 @@ mod tests {
             condition_type: "auto".to_string(),
             skip_if_matched: None,
             context_assignments: None,
+            vars_matched: None,
         }
     }
 
@@ -1056,6 +1057,77 @@ mod tests {
 
     fn names(events: &[EventPayload]) -> Vec<&'static str> {
         events.iter().map(|e| e.type_name()).collect()
+    }
+
+    /// `s1` routes a decider-answered `go` by the value of `MODE`: to `last`
+    /// under `auto`, to `parked` under `interactive`.
+    fn value_routed_decider() -> CompiledTemplate {
+        let src = format!(
+            "---\nname: vr\nversion: \"1.0\"\ninitial_state: s1\nvariables:\n  NOTE:\n    description: n\n    default: x\n  MODE:\n    description: m\n    values: [auto, interactive]\n    default: interactive\nstates:\n  s1:\n    accepts:\n      verdict:\n        type: enum\n        values: [go, hold]\n        required: true\n        description: \"Go on?\"\n        decider: {decider}\n    transitions:\n      - target: last\n        when:\n          verdict: go\n          vars.MODE: auto\n      - target: parked\n        when:\n          verdict: go\n          vars.MODE: interactive\n      - target: parked\n        when:\n          verdict: hold\n  parked:\n    accepts:\n      ok:\n        type: boolean\n        required: true\n        description: ok\n    transitions:\n      - target: done\n        when:\n          ok: true\n  last:\n    accepts:\n      ok:\n        type: boolean\n        required: true\n        description: ok\n    transitions:\n      - target: done\n        when:\n          ok: true\n  done:\n    terminal: true\n---\n\n## s1\n\ns\n\n## parked\n\np\n\n## last\n\nl\n\n## done\n\nd\n",
+            decider = DECIDER.replace("GO_MODE", "auto"),
+        );
+        compile_src(&src)
+    }
+
+    fn run_with_mode(
+        tpl: &CompiledTemplate,
+        mode: &str,
+        port: &mut FakePort,
+    ) -> (AdvanceResult, Vec<EventPayload>) {
+        let log: RefCell<Vec<EventPayload>> = RefCell::new(Vec::new());
+        let counter = Rc::clone(&port.appended);
+        let mut append = |p: &EventPayload| -> Result<(), String> {
+            log.borrow_mut().push(p.clone());
+            counter.set(counter.get() + 1);
+            Ok(())
+        };
+        let gates = |_: &BTreeMap<String, Gate>| -> Result<
+            BTreeMap<String, StructuredGateResult>,
+            GateCaptureRefusal,
+        > { Ok(BTreeMap::new()) };
+        let integration =
+            |_: &str| -> Result<Value, IntegrationError> { Err(IntegrationError::Unavailable) };
+        let action = |_: &str, _: &ActionDecl, _: bool| ActionResult::Skipped;
+        let overlay = VariableOverlay::new();
+        overlay.insert("MODE", mode);
+        overlay.insert("NOTE", "x");
+        let shutdown = AtomicBool::new(false);
+        let result = advance_until_stop_with_decider(
+            "s1",
+            tpl,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &gates,
+            &integration,
+            &action,
+            &overlay,
+            &shutdown,
+            Some(port as &mut dyn DeciderPort),
+        )
+        .expect("advance");
+        (result, log.into_inner())
+    }
+
+    #[test]
+    fn a_decider_answer_goes_where_the_variable_value_allows() {
+        // Value routing adds no way for a decider to route: the answer
+        // supplies `verdict`, the variable still picks between the two `go`
+        // edges, and the transition records the value that did.
+        let tpl = value_routed_decider();
+        for (mode, want) in [("interactive", "parked"), ("auto", "last")] {
+            let mut port = FakePort::new(vec![GO]);
+            let (r, events) = run_with_mode(&tpl, mode, &mut port);
+            assert_eq!(r.final_state, want, "MODE={}", mode);
+            let matched = events
+                .iter()
+                .find_map(|e| match e {
+                    EventPayload::Transitioned { vars_matched, .. } => vars_matched.clone(),
+                    _ => None,
+                })
+                .expect("a transitioned event with vars_matched");
+            assert_eq!(matched.get("MODE").map(String::as_str), Some(mode));
+        }
     }
 
     fn consultation(events: &[EventPayload]) -> &DeciderConsultation {

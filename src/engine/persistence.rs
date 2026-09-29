@@ -1612,6 +1612,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
         ];
@@ -1651,6 +1652,7 @@ mod tests {
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
                 context_assignments: None,
+                vars_matched: None,
             },
         );
         let e4 = make_event(
@@ -1661,6 +1663,7 @@ mod tests {
                 condition_type: "gate".to_string(),
                 skip_if_matched: None,
                 context_assignments: None,
+                vars_matched: None,
             },
         );
 
@@ -1738,6 +1741,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -1748,6 +1752,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
         ];
@@ -1773,6 +1778,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -1783,6 +1789,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -1838,6 +1845,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -1861,6 +1869,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -1913,6 +1922,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -1936,6 +1946,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -1988,6 +1999,7 @@ mod tests {
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
                 context_assignments: None,
+                vars_matched: None,
             },
             "2026-01-01T00:00:01Z",
         )
@@ -2200,6 +2212,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
         ];
@@ -2235,6 +2248,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
         ];
@@ -2270,6 +2284,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
         ];
@@ -2321,6 +2336,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -2370,6 +2386,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -2390,6 +2407,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -2428,6 +2446,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             // A decision tagged with a different state name should be ignored.
@@ -2524,6 +2543,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_override_event(2, "review", "ci-passes"),
@@ -2548,6 +2568,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_override_event(2, "review", "ci-passes"),
@@ -2559,6 +2580,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -2591,6 +2613,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_override_event(2, "other_state", "some-gate"),
@@ -2602,6 +2625,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_override_event(4, "review", "ci-passes"),
@@ -2630,6 +2654,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             // Mismatched state field: should be excluded.
@@ -2658,6 +2683,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_override_event(2, "review", "ci-passes"),
@@ -2669,6 +2695,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_override_event(4, "deploy", "smoke-test"),
@@ -2705,6 +2732,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_gate_evaluated_event(
@@ -2737,6 +2765,7 @@ mod tests {
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
                 context_assignments: None,
+                vars_matched: None,
             },
         )];
 
@@ -2756,6 +2785,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_gate_evaluated_event(
@@ -2772,6 +2802,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -2812,6 +2843,7 @@ mod tests {
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
                 context_assignments: None,
+                vars_matched: None,
             },
         )];
         let counts = derive_visit_counts(&events);
@@ -2830,6 +2862,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -2840,6 +2873,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -2905,6 +2939,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -3019,6 +3054,7 @@ mod tests {
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
                 context_assignments: None,
+                vars_matched: None,
             },
         )
     }

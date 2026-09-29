@@ -638,6 +638,7 @@ d
                             condition_type: "auto".to_string(),
                             skip_if_matched: None,
                             context_assignments: None,
+                            vars_matched: None,
                         },
                     ),
                 ],
@@ -811,6 +812,7 @@ d
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -878,6 +880,7 @@ d
             condition_type: "auto".to_string(),
             skip_if_matched: None,
             context_assignments: None,
+            vars_matched: None,
         };
         let cases: Vec<(&str, Vec<EventPayload>, bool)> = vec![
             ("nothing moved", vec![], false),
@@ -968,6 +971,7 @@ d
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             )
         };

@@ -405,6 +405,67 @@ jobs:
       - name: Check that log and ledger mutations make it fail
         run: test/compat/decider-checks-v0_14_1.sh --self-test
 
+  value-routing-compat-v0-14-1:
+    # Proves koto v0.14.1 reads a session log the PR's koto writes while a
+    # template routes on variable values: value routes in `when` and
+    # `skip_if`, their `vars_matched` records, and a rebind's `previous`
+    # value. Same pinned installer as the jobs above; no secret is needed.
+    name: Value Routing Compat (koto v0.14.1)
+    runs-on: ubuntu-latest
+    env:
+      KOTO_FLOOR_VERSION: v0.14.1
+      # Commit the v0.14.1 tag points to, and the SHA-256 of its install.sh.
+      KOTO_INSTALLER_COMMIT: 8a84f91a59edc330e611640c115067daf51e7ff7
+      KOTO_INSTALLER_SHA256: 5f8c62f618f8181fa4b48e0e600e1208dddd1f0dab668a73e1b52ae7b52ba319
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Require sha256sum
+        run: |
+          if ! command -v sha256sum >/dev/null 2>&1; then
+            echo "::error::sha256sum is not on PATH; the koto installer can't be verified"
+            exit 1
+          fi
+
+      - name: Install koto v0.14.1 through the pinned installer
+        run: |
+          set -euo pipefail
+          installer="$RUNNER_TEMP/koto-install.sh"
+          curl -fsSL -o "$installer" \
+            "https://raw.githubusercontent.com/tsukumogami/koto/${KOTO_INSTALLER_COMMIT}/install.sh"
+          if ! echo "${KOTO_INSTALLER_SHA256}  ${installer}" | sha256sum -c -; then
+            echo "::error::install.sh at ${KOTO_INSTALLER_COMMIT} does not match the recorded SHA-256"
+            exit 1
+          fi
+          install_dir="$RUNNER_TEMP/koto-floor"
+          KOTO_INSTALL_DIR="$install_dir" bash "$installer" --version="$KOTO_FLOOR_VERSION" --no-modify-path
+          KOTO_FLOOR_BIN="$install_dir/bin/koto"
+          reported="$("$KOTO_FLOOR_BIN" version)"
+          echo "$reported"
+          case "$reported" in
+            "koto ${KOTO_FLOOR_VERSION#v} "*|"koto ${KOTO_FLOOR_VERSION#v}") ;;
+            *)
+              echo "::error::$KOTO_FLOOR_BIN reports '$reported', expected koto ${KOTO_FLOOR_VERSION#v}"
+              exit 1
+              ;;
+          esac
+          echo "KOTO_FLOOR_BIN=$KOTO_FLOOR_BIN" >> "$GITHUB_ENV"
+
+      - name: Build the PR's koto
+        run: |
+          cargo build --release
+          echo "KOTO_NEW_BIN=$GITHUB_WORKSPACE/target/release/koto" >> "$GITHUB_ENV"
+
+      - name: Run the v0.14.1 compatibility check
+        run: test/compat/value-routing-v0_14_1.sh
+
+      - name: Check that log mutations make it fail
+        run: test/compat/value-routing-v0_14_1.sh --self-test
+
   poll-forge-neutral:
     # The polling gate and clear-on-entry code stay free of any forge and of
     # credentials: koto runs the command a template names and nothing else.
@@ -511,7 +572,7 @@ jobs:
 
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, stability-tests, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, poll-forge-neutral, audit, tsuku-distributed-install, cloud-integration]
+    needs: [check-artifacts, unit-tests, stability-tests, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, poll-forge-neutral, audit, tsuku-distributed-install, cloud-integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -527,6 +588,7 @@ jobs:
              [ "${{ needs.failure-reporting-compat-v0-14-1.result }}" = "failure" ] || \
              [ "${{ needs.ci-wait-stale-keys-compat-v0-14-1.result }}" = "failure" ] || \
              [ "${{ needs.decider-checks-compat-v0-14-1.result }}" = "failure" ] || \
+             [ "${{ needs.value-routing-compat-v0-14-1.result }}" = "failure" ] || \
              [ "${{ needs.poll-forge-neutral.result }}" = "failure" ] || \
              [ "${{ needs.audit.result }}" = "failure" ] || \
              [ "${{ needs.cloud-integration.result }}" = "failure" ] || \

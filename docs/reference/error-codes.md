@@ -367,6 +367,46 @@ warning: W-SKIP-GATE-ABSENT: state "check": skip_if key "gates.ci.exit_code" ref
 
 Fix: add the referenced gate name to the state's `gates` block, or correct the `skip_if` key.
 
+#### value routing diagnostic codes
+
+A `vars.NAME: <value>` condition routes on a variable's value, in a `when` clause or a `skip_if` map. Four compile-time errors refuse a value route that could never fire or can't be told apart from another. Each fails compilation and names the state and the variable; the first three also name where the condition sits and the value, and the overlap error names the two transitions. An `{is_set: true|false}` condition is not a value route and keeps its own rules.
+
+**E-VAR-ROUTE-UNDECLARED (error)**: the condition names a variable the template's `variables:` block doesn't declare.
+
+```
+E-VAR-ROUTE-UNDECLARED: state "route" transition to "fast": when clause routes on undeclared variable "MDOE"
+  remedy: declare "MDOE" in the template's variables block, or correct the name
+```
+
+Fix: correct the name, or declare the variable.
+
+**E-VAR-ROUTE-VALUE (error)**: the value is one the variable can never hold, so the route could never fire: it's empty, it isn't a string (an unquoted `true` or `3`), it holds a character `koto init` refuses, or the variable's `values:` or `pattern:` refuses it.
+
+```
+E-VAR-ROUTE-VALUE: state "route" transition to "fast": when clause routes on "MODE" = "atuo", which koto init would refuse (values:[auto,interactive]); the route could never fire
+  remedy: use a value the variable accepts, or widen its constraint
+```
+
+Fix: use a value the variable accepts. Quote a value YAML would read as a boolean or a number (`vars.MERGE: "true"`), and test for an empty variable with `{is_set: false}`.
+
+**E-VAR-ROUTE-CAPTURE (error)**: the condition routes on the value of a capture (a `capture_stdout_as` name). A later state can overwrite a capture, so a route can't depend on its value. `{is_set: true}` on a capture is still allowed.
+
+```
+E-VAR-ROUTE-CAPTURE: state "route" transition to "fast": when clause routes on the value of "SHA", a capture; a later state can overwrite a capture, so a route can't read its value
+  remedy: declare the value as a variable, or test the capture with {"is_set": true}
+```
+
+Fix: route on a declared variable, or test the capture's presence instead.
+
+**E-VAR-ROUTE-OVERLAP (error)**: two conditional transitions out of one state share a `vars.*` key that one of them gives a value, and nothing else in the two clauses tells them apart, so one variable value could satisfy both. Two routes naming the same value overlap, and so do a value route and an `{is_set: true}` route on the same variable. A value route and an `{is_set: false}` route don't.
+
+```
+E-VAR-ROUTE-OVERLAP: state "route": transitions to "fast" and "slow" can both match one value of "vars.MODE"
+  remedy: give the two routes different values, or add a key that tells them apart
+```
+
+Fix: give the routes different values, or add another key (an evidence field, say) whose values differ between them.
+
 #### decider diagnostic codes
 
 A `decider` block on an `accepts` field has these compile-time errors. Each fails compilation, and each message names the state, the field, and the value where one applies. None of them is relaxed by `--allow-legacy-gates`. A misspelled key inside the block isn't one of these codes: it fails as invalid YAML, and the message names the key (for example ``unknown field `thresold` ``).

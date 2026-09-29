@@ -8718,14 +8718,16 @@ fn vars_is_set_routes_to_unset_branch_when_not_provided() {
     );
 }
 
+/// A string on a `vars.*` key is a value condition (value routing): it
+/// compiles when the variable can hold the value, and a non-string value is
+/// refused with `E-VAR-ROUTE-VALUE`.
 #[test]
-fn compile_rejects_equality_matcher_on_vars_key() {
+fn compile_accepts_value_matcher_and_rejects_non_string_on_vars_key() {
     let dir = TempDir::new().unwrap();
-    let src = dir.path().join("bad-vars.md");
-    std::fs::write(
-        &src,
-        r#"---
-name: bad-vars-workflow
+    let template = |value: &str| {
+        format!(
+            r#"---
+name: vars-value-workflow
 version: "1.0"
 initial_state: start
 variables:
@@ -8737,7 +8739,7 @@ states:
     transitions:
       - target: done
         when:
-          vars.FOO: "bar"
+          vars.FOO: {value}
   done:
     terminal: true
 ---
@@ -8749,22 +8751,33 @@ Check FOO.
 ## done
 
 Done.
-"#,
-    )
-    .unwrap();
+"#
+        )
+    };
 
+    let good = dir.path().join("vars-value.md");
+    std::fs::write(&good, template("\"bar\"")).unwrap();
     let output = koto_cmd(dir.path())
-        .args(["template", "compile", src.to_str().unwrap()])
+        .args(["template", "compile", good.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
-        !output.status.success(),
-        "compile should fail for equality matcher on vars.* key"
+        output.status.success(),
+        "a value condition on a declared variable should compile; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
+
+    let bad = dir.path().join("vars-bool.md");
+    std::fs::write(&bad, template("true")).unwrap();
+    let output = koto_cmd(dir.path())
+        .args(["template", "compile", bad.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "an unquoted boolean should fail");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("only supports existence matching"),
-        "error should mention existence matching; got: {}",
+        stdout.contains("E-VAR-ROUTE-VALUE"),
+        "error should carry E-VAR-ROUTE-VALUE; got: {}",
         stdout
     );
 }

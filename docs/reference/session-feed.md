@@ -77,6 +77,9 @@ events:
       context_assignments:
         type: object
         required: false
+      vars_matched:
+        type: object
+        required: false
 
   directed_transition:
     tier: 1
@@ -404,6 +407,9 @@ events:
       variables:
         type: object
         required: true
+      previous:
+        type: object
+        required: false
 
   execution_anchor_adopted:
     tier: 2
@@ -747,7 +753,7 @@ Marks the birth of a session. Written once at `koto init` time.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `template_path` | string | Yes | Path to the compiled template JSON in koto's cache directory. |
-| `variables` | object | No | Variable bindings active at init time. String-to-string map. Absent when no variables were set. |
+| `variables` | object | No | Variable bindings active at init time. String-to-string map holding every declared variable, with the value passed, its default, or the empty string. Absent when the template declares no variables. A declared variable without `rebind: true` keeps this value for the whole session. |
 | `spawn_entry` | object | No | Present only for batch-spawned child sessions. Carries `template` (source path), `vars` (bindings), and `waits_on` (sorted dependency list). Absent for top-level sessions. |
 
 ---
@@ -775,6 +781,26 @@ Records every automatic or evidence-driven state change. The primary workflow pr
 | `condition_type` | string | Yes | Transition trigger: `"auto"`, `"gate"`, or `"skip_if"`. |
 | `skip_if_matched` | object | No | Present when `condition_type` is `"skip_if"`. Carries the key-value pairs from the `skip_if` map that triggered the transition. |
 | `context_assignments` | object | No | The taken edge's `context_assignments`, resolved when the transition fired: each context key mapped to the string value written. Absent when the edge declares none. |
+| `vars_matched` | object | No | The value conditions that selected this transition: each variable name mapped to the value it matched, from the taken edge's `when` clause and, when `condition_type` is `"skip_if"`, from the `skip_if` map too. `{is_set: ...}` conditions aren't recorded. Absent on a transition that didn't route on a variable's value. |
+
+A value route (`vars.MODE: auto` in a `when` clause) is how a template sends a
+run down the path its variable chose, so `vars_matched` is the record a reader
+groups runs by:
+
+```json
+{
+  "type": "transitioned",
+  "payload": {
+    "from": "route",
+    "to": "fast",
+    "condition_type": "auto",
+    "vars_matched": {"MODE": "auto"}
+  }
+}
+```
+
+The field is additive and optional; an older koto build ignores it and keeps
+reading the log.
 
 The event is the durable record of an assignment: the values ride the same
 append as the transition, and the context store is written from them right
@@ -1492,6 +1518,9 @@ changes afterwards, and nothing but an accepted attach writes it.
   "payload": {
     "variables": {
       "MERGE": "true"
+    },
+    "previous": {
+      "MERGE": "false"
     }
   }
 }
@@ -1500,6 +1529,7 @@ changes afterwards, and nothing but an accepted attach writes it.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `variables` | object | Yes | The variables this attach changed, each mapped to its new value. A `rebind: true` variable whose value didn't change is left out, and an attach that changes nothing appends no event. |
+| `previous` | object | No | The value each changed variable held before this attach, keyed like `variables`. Together with `workflow_initialized.variables` it gives a variable's whole history: its value at init, then each change with its old and new value. Absent on logs written before the field existed. |
 
 Consumers fold these in event order together with `workflow_initialized` and
 `variable_captured`: the later of two rebinds wins, and the new value is what
