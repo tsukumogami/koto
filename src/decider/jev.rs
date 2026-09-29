@@ -307,6 +307,19 @@ pub fn decode_response(
     Ok(DecisionResponse {
         model: sanitize_model(root.get("model")),
         answers: out,
+        usage: decode_usage(root.get("usage")),
+    })
+}
+
+/// Jev's `usage`: `input_tokens` and `output_tokens` as whole numbers. Kept
+/// only when both are there; anything else in the object is ignored, and a
+/// missing or malformed `usage` is not an error, since the answer is still
+/// usable without it.
+fn decode_usage(raw: Option<&Value>) -> Option<super::types::Usage> {
+    let obj = raw?.as_object()?;
+    Some(super::types::Usage {
+        input_tokens: obj.get("input_tokens")?.as_u64()?,
+        output_tokens: obj.get("output_tokens")?.as_u64()?,
     })
 }
 
@@ -473,6 +486,31 @@ mod tests {
             other => panic!("{:?}", other),
         }
         assert_eq!(r.answers["ready"], Answer::Proposition { p_true: 0.7 });
+        assert_eq!(
+            r.usage,
+            Some(super::super::types::Usage {
+                input_tokens: 10,
+                output_tokens: 2
+            })
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_usage_is_not_an_error() {
+        for usage in [
+            Value::Null,
+            json!("lots"),
+            json!({"input_tokens": 10}),
+            json!({"input_tokens": -1, "output_tokens": 2}),
+        ] {
+            let mut v = ok_body();
+            v["usage"] = usage.clone();
+            let r = decode(&v).unwrap();
+            assert_eq!(r.usage, None, "{}", usage);
+        }
+        let mut v = ok_body();
+        v.as_object_mut().unwrap().remove("usage");
+        assert_eq!(decode(&v).unwrap().usage, None);
     }
 
     #[test]

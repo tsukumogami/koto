@@ -16,6 +16,7 @@
 //!   promotion eligibility behind `koto decider report`.
 //! - [`build_decider`]: the only production constructor of a provider.
 
+pub mod check;
 pub mod evaluate;
 #[cfg(test)]
 pub mod fake;

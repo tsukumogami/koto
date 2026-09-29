@@ -106,7 +106,11 @@ fn parse_line(bytes: &[u8]) -> Line {
     };
     match value.get("kind").and_then(Value::as_str) {
         None => return Line::Malformed,
-        Some("consulted") | Some("answered") | Some("directed_exit") => {}
+        Some("consulted")
+        | Some("answered")
+        | Some("directed_exit")
+        | Some("checked")
+        | Some("check_overridden") => {}
         Some(_) => return Line::UnknownKind,
     }
     match serde_json::from_value::<LedgerRecord>(value) {

@@ -648,6 +648,7 @@ d
         DecisionResponse {
             model: "m".to_string(),
             answers,
+            usage: None,
         }
     }
 

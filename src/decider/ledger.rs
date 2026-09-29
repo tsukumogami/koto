@@ -136,6 +136,47 @@ pub struct DirectedExitRecord {
     pub target: String,
 }
 
+/// One consultation of one decider-check criterion: the envelope plus every
+/// [`DeciderCheck`](super::check::DeciderCheck) field
+/// (DESIGN-koto-decider-checks.md, Decision 5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckedRecord {
+    #[serde(flatten)]
+    pub envelope: RecordEnvelope,
+    #[serde(flatten)]
+    pub check: super::check::DeciderCheck,
+    /// `true` when `probabilities` was dropped to fit the line bound.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub trimmed: bool,
+}
+
+/// What an override of a blocking decider check moved past, for one
+/// criterion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckOverrideKind {
+    /// The criterion was failing on a verdict: the override is a candidate
+    /// false fail for whoever judges the criterion's accuracy.
+    CandidateFalseFail,
+    /// The criterion was unanswered: the override moved past a checker
+    /// fault, not a judgment.
+    OverriddenUnanswered,
+}
+
+/// `koto overrides record` moving past one blocking decider-check criterion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckOverriddenRecord {
+    #[serde(flatten)]
+    pub envelope: RecordEnvelope,
+    pub state: String,
+    /// The visit the overridden consultation belongs to.
+    pub visit_seq: u64,
+    pub gate: String,
+    pub rule_id: String,
+    pub declaration_hash: String,
+    pub override_kind: CheckOverrideKind,
+}
+
 /// One ledger line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -143,6 +184,8 @@ pub enum LedgerRecord {
     Consulted(ConsultedRecord),
     Answered(AnsweredRecord),
     DirectedExit(DirectedExitRecord),
+    Checked(CheckedRecord),
+    CheckOverridden(CheckOverriddenRecord),
 }
 
 impl LedgerRecord {
@@ -152,7 +195,45 @@ impl LedgerRecord {
             LedgerRecord::Consulted(_) => "consulted",
             LedgerRecord::Answered(_) => "answered",
             LedgerRecord::DirectedExit(_) => "directed_exit",
+            LedgerRecord::Checked(_) => "checked",
+            LedgerRecord::CheckOverridden(_) => "check_overridden",
         }
+    }
+
+    /// A `checked` record stamped now.
+    pub fn checked(
+        session: &str,
+        session_id: Option<&str>,
+        check: super::check::DeciderCheck,
+    ) -> Self {
+        LedgerRecord::Checked(CheckedRecord {
+            envelope: RecordEnvelope::now(session, session_id),
+            check,
+            trimmed: false,
+        })
+    }
+
+    /// A `check_overridden` record stamped now.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_overridden(
+        session: &str,
+        session_id: Option<&str>,
+        state: &str,
+        visit_seq: u64,
+        gate: &str,
+        rule_id: &str,
+        declaration_hash: &str,
+        kind: CheckOverrideKind,
+    ) -> Self {
+        LedgerRecord::CheckOverridden(CheckOverriddenRecord {
+            envelope: RecordEnvelope::now(session, session_id),
+            state: state.to_string(),
+            visit_seq,
+            gate: gate.to_string(),
+            rule_id: rule_id.to_string(),
+            declaration_hash: declaration_hash.to_string(),
+            override_kind: kind,
+        })
     }
 
     /// A `consulted` record stamped now.
@@ -219,26 +300,37 @@ pub fn render_line(record: &LedgerRecord) -> Result<String> {
     if fits(&line) {
         return Ok(line);
     }
-    let LedgerRecord::Consulted(c) = record else {
-        anyhow::bail!(
+    // Probabilities are the one droppable part: a trimmed line keeps the
+    // outcome, which is what the report counts.
+    let trimmed = match record {
+        LedgerRecord::Consulted(c) => {
+            let mut t = c.clone();
+            for field in t.consultation.fields.values_mut() {
+                field.probabilities.clear();
+            }
+            t.trimmed = true;
+            LedgerRecord::Consulted(t)
+        }
+        LedgerRecord::Checked(c) => {
+            let mut t = c.clone();
+            t.check.probabilities.clear();
+            t.trimmed = true;
+            LedgerRecord::Checked(t)
+        }
+        _ => anyhow::bail!(
             "{} record is {} bytes, over the {}-byte line bound",
             record.kind(),
             line.len() + 1,
             MAX_LEDGER_LINE_BYTES
-        );
+        ),
     };
-    let mut trimmed = c.clone();
-    for field in trimmed.consultation.fields.values_mut() {
-        field.probabilities.clear();
-    }
-    trimmed.trimmed = true;
-    let line = serde_json::to_string(&LedgerRecord::Consulted(trimmed))
-        .context("failed to serialize ledger record")?;
+    let line = serde_json::to_string(&trimmed).context("failed to serialize ledger record")?;
     if fits(&line) {
         return Ok(line);
     }
     anyhow::bail!(
-        "consulted record is {} bytes without probabilities, over the {}-byte line bound",
+        "{} record is {} bytes without probabilities, over the {}-byte line bound",
+        record.kind(),
         line.len() + 1,
         MAX_LEDGER_LINE_BYTES
     )
@@ -316,6 +408,86 @@ mod tests {
             endpoint_origin: SettingOrigin::Default,
             fields,
         }
+    }
+
+    fn check(rule_ref: &str) -> crate::decider::check::DeciderCheck {
+        use crate::decider::check::{DeciderCheck, RecordedOutcome};
+        DeciderCheck {
+            state: "review".into(),
+            visit_seq: 7,
+            gate: "comments".into(),
+            rule_id: "comment_reason".into(),
+            rule_ref: rule_ref.into(),
+            declaration_hash: "d".repeat(64),
+            mode: crate::template::decider_check::CheckMode::Veto,
+            threshold: 0.9,
+            outcome: RecordedOutcome::Fail,
+            reason: None,
+            blocked: true,
+            provider: "jev".into(),
+            model: "jev-1".into(),
+            probabilities: [("pass", 0.01), ("fail", 0.97), ("unclear", 0.02)]
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect(),
+            input_sha256: Some("a".repeat(64)),
+            input_bytes: Some(120),
+            input_tokens: Some(300),
+            output_tokens: Some(3),
+            attempts: 1,
+            latency_ms: 250,
+            error_class: None,
+            endpoint_origin: Some(SettingOrigin::Default),
+        }
+    }
+
+    #[test]
+    fn checked_and_check_overridden_round_trip_and_parse() {
+        let checked = LedgerRecord::checked("wf", Some("sid"), check("ref"));
+        let overridden = LedgerRecord::check_overridden(
+            "wf",
+            Some("sid"),
+            "review",
+            7,
+            "comments",
+            "comment_reason",
+            &"d".repeat(64),
+            CheckOverrideKind::CandidateFalseFail,
+        );
+        let mut body = String::new();
+        for r in [&checked, &overridden] {
+            let line = render_line(r).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["kind"], r.kind());
+            body.push_str(&line);
+            body.push('\n');
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&render_line(&overridden).unwrap()).unwrap();
+        assert_eq!(v["kind"], "check_overridden");
+        assert_eq!(v["override_kind"], "candidate_false_fail");
+        let read = crate::decider::report::parse_ledger(body.as_bytes());
+        assert_eq!(read.malformed, 0);
+        assert_eq!(read.unknown_kind, 0);
+        assert_eq!(read.records, vec![checked, overridden]);
+    }
+
+    #[test]
+    fn an_oversized_checked_line_drops_its_probabilities_first() {
+        // A rule_ref near the finding bound plus a long hash pushes the line
+        // past 4 KiB only with a padded rule_ref; build one that fits only
+        // once the probabilities go.
+        let mut c = check("r");
+        let base = render_line(&LedgerRecord::checked("wf", None, c.clone()))
+            .unwrap()
+            .len();
+        let probs = serde_json::to_string(&c.probabilities).unwrap().len();
+        c.rule_ref = "x".repeat(MAX_LEDGER_LINE_BYTES - base - 1 + probs / 2);
+        let line = render_line(&LedgerRecord::checked("wf", None, c)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["trimmed"], true);
+        assert!(v.get("probabilities").is_none());
+        assert_eq!(v["outcome"], "fail");
     }
 
     fn one_field() -> DeciderConsultation {
@@ -529,7 +701,7 @@ mod tests {
             .lines()
             .map(|l| match serde_json::from_str::<LedgerRecord>(l).unwrap() {
                 LedgerRecord::Consulted(c) => c.consultation.visit_seq,
-                LedgerRecord::Answered(_) | LedgerRecord::DirectedExit(_) => panic!("kind"),
+                _ => panic!("kind"),
             })
             .collect();
         assert_eq!(seqs.len(), n);

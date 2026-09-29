@@ -263,7 +263,7 @@ one per criterion, holding the fields R24 lists. The ledger gains a
 `checked` record (the envelope plus the same fields) and, written by
 `koto overrides record` when the overridden gate is a decider check with
 blocking criteria, one `check_overridden` record per blocking criterion,
-with `kind` `candidate_false_fail` or `overridden_unanswered`.
+with `override_kind` `candidate_false_fail` or `overridden_unanswered`.
 `koto overrides record` doesn't evaluate anything to write these: it reads
 the gate's latest `gate_evaluated` output for the two lists, and takes each
 criterion's `visit_seq` and `declaration_hash` from the latest
@@ -522,7 +522,7 @@ can't be judged.
 
 The ledger `checked` record adds the envelope (`v`, `at`, `session`,
 `session_id`). The ledger `check_overridden` record holds the envelope,
-`state`, `visit_seq`, `gate`, `rule_id`, `declaration_hash` and `kind`
+`state`, `visit_seq`, `gate`, `rule_id`, `declaration_hash` and `override_kind`
 (`candidate_false_fail` or `overridden_unanswered`).
 
 A criterion's `rule_id` is opaque to koto and declared by the template, but
@@ -546,7 +546,7 @@ must be that registry's id for the rule. A consumer keys decider rates by
 | `gate_evaluated` (decider check) | `outcome` | `passed`, `failed`, `error` | always | `failed` is a violation; `error` is a checker fault; shadow is always `passed`. |
 | `gate_evaluated` (decider check) | `output.failed`, `output.unanswered` | arrays of `rule_id` | always | The blocking criteria by kind; empty in shadow. |
 | `gate_evaluated` (decider check) | finding `message_source` value `decider` | string | on a fail finding | The finding's message came from a decider verdict. |
-| ledger `check_overridden` | `kind` | `candidate_false_fail`, `overridden_unanswered` | always | What an override moved past. |
+| ledger `check_overridden` | `override_kind` | `candidate_false_fail`, `overridden_unanswered` | always | What an override moved past. |
 
 ### Data flow for one gate evaluation
 

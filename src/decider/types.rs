@@ -209,6 +209,16 @@ pub struct DecisionResponse {
     pub model: String,
     /// Keyed by field name.
     pub answers: BTreeMap<String, Answer>,
+    /// Token counts the provider reported, when it reported them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+/// Token counts a provider reported for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 /// The answer to one question.
