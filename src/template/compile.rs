@@ -10,9 +10,10 @@ use super::decider::{
 };
 use super::types::{
     default_failure_policy, ActionDecl, CompiledTemplate, FailurePolicy, FieldSchema, Gate,
-    MaterializeChildrenSpec, PollingConfig, TemplateState, Transition, VariableDecl,
-    GATE_TYPE_CHILDREN_COMPLETE, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS,
-    GATE_TYPE_CONTEXT_MATCHES, GATE_TYPE_REQUEST_LEG, SUPPORTED_GATE_TYPES,
+    MaterializeChildrenSpec, PollSpec, PollingConfig, TemplateState, Transition, VariableDecl,
+    DEFAULT_PENDING_EXIT_CODE, GATE_TYPE_CHILDREN_COMPLETE, GATE_TYPE_COMMAND,
+    GATE_TYPE_CONTEXT_EXISTS, GATE_TYPE_CONTEXT_MATCHES, GATE_TYPE_REQUEST_LEG,
+    SUPPORTED_GATE_TYPES,
 };
 
 /// YAML front-matter structure of a template source file.
@@ -92,6 +93,11 @@ struct SourceState {
     /// type error; scalars are converted to strings in `compile`.
     #[serde(default)]
     result: Option<BTreeMap<String, serde_yaml_ng::Value>>,
+    /// Context keys cleared on every entry into the state after the first.
+    /// An `Option` so an explicit empty list can be refused rather than
+    /// read as "not declared".
+    #[serde(default)]
+    clear_on_entry: Option<Vec<String>>,
 }
 
 /// YAML front-matter view of a `materialize_children` hook.
@@ -474,6 +480,9 @@ struct SourceGate {
     /// `expect` with an error that names the state and gate.
     #[serde(default)]
     expect: Option<serde_yaml_ng::Value>,
+    /// Re-evaluation settings; allowed on `command` gates only.
+    #[serde(default)]
+    poll: Option<SourcePollSpec>,
     /// Every key the fields above don't name. `SourceState` uses
     /// `deny_unknown_fields`, but serde's error for it surfaces only as the
     /// outer "failed to parse front-matter" context, which names neither the
@@ -482,6 +491,20 @@ struct SourceGate {
     /// can't compile and quietly leave the gate overridable.
     #[serde(flatten)]
     unknown: BTreeMap<String, serde_yaml_ng::Value>,
+}
+
+/// A gate's `poll:` block in source YAML.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourcePollSpec {
+    #[serde(default)]
+    interval_secs: u32,
+    #[serde(default)]
+    timeout_secs: u32,
+    #[serde(default)]
+    hold_secs: u32,
+    #[serde(default)]
+    pending_exit_code: Option<i32>,
 }
 
 /// The keys a gate declaration may carry, listed in unknown-key errors.
@@ -498,6 +521,7 @@ const SOURCE_GATE_KEYS: &[&str] = &[
     "request",
     "leg",
     "expect",
+    "poll",
 ];
 
 /// Compile a YAML/Markdown template source file to a FormatVersion=1 CompiledTemplate.
@@ -617,6 +641,14 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
                 .as_ref()
                 .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
 
+        if matches!(&source_state.clear_on_entry, Some(keys) if keys.is_empty()) {
+            return Err(anyhow!(
+                "state {:?}: clear_on_entry must list at least one key\n  \
+                 remedy: list the keys to clear, or remove the field",
+                state_name
+            ));
+        }
+
         let compiled_result = match &source_state.result {
             Some(map) => Some(compile_result_map(state_name, map)?),
             None => None,
@@ -638,6 +670,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
                 skipped_marker: source_state.skipped_marker,
                 skip_if: compiled_skip_if,
                 result: compiled_result,
+                clear_on_entry: source_state.clear_on_entry.clone().unwrap_or_default(),
             },
         );
     }
@@ -912,6 +945,14 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
             gate_name
         ));
     }
+    if source.poll.is_some() && source.gate_type != GATE_TYPE_COMMAND {
+        return Err(anyhow!(
+            "state {:?} gate {:?}: poll is only allowed on a command gate, not on {:?}",
+            state_name,
+            gate_name,
+            source.gate_type
+        ));
+    }
     match source.gate_type.as_str() {
         GATE_TYPE_COMMAND => {
             if source.command.is_empty() {
@@ -934,6 +975,12 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: source.poll.as_ref().map(|p| PollSpec {
+                    interval_secs: p.interval_secs,
+                    timeout_secs: p.timeout_secs,
+                    hold_secs: p.hold_secs,
+                    pending_exit_code: p.pending_exit_code.unwrap_or(DEFAULT_PENDING_EXIT_CODE),
+                }),
             })
         }
         GATE_TYPE_CONTEXT_EXISTS => {
@@ -957,6 +1004,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             })
         }
         GATE_TYPE_CONTEXT_MATCHES => {
@@ -987,6 +1035,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             })
         }
         GATE_TYPE_CHILDREN_COMPLETE => {
@@ -1026,6 +1075,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             })
         }
         GATE_TYPE_REQUEST_LEG => {
@@ -1046,6 +1096,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 request: source.request.clone(),
                 leg: source.leg.clone(),
                 expect,
+                poll: None,
             };
             super::types::validate_request_leg_gate(state_name, gate_name, &gate)
                 .map_err(|e| anyhow!(e))?;
@@ -2998,6 +3049,256 @@ Done.
         let src = assignment_template("", "      - target: done");
         let json = serde_json::to_string(&compile_src(&src).unwrap()).unwrap();
         assert!(!json.contains("context_assignments"), "got: {json}");
+    }
+
+    // -------------------------------------------------------------------
+    // clear_on_entry (DESIGN-koto-ci-wait-stale-keys.md)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn clear_on_entry_compiles_into_the_state_in_declared_order() {
+        let src = assignment_template(
+            "    clear_on_entry: [review.json, notes/summary.md]\n",
+            "      - target: done",
+        );
+        let t = compile_src(&src).unwrap();
+        assert_eq!(
+            t.states["start"].clear_on_entry,
+            vec!["review.json".to_string(), "notes/summary.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn template_without_clear_on_entry_omits_the_field_from_compiled_json() {
+        let src = assignment_template("", "      - target: done");
+        let json = serde_json::to_string(&compile_src(&src).unwrap()).unwrap();
+        assert!(!json.contains("clear_on_entry"), "got: {json}");
+    }
+
+    #[test]
+    fn clear_on_entry_refuses_a_variable_reference() {
+        let src = assignment_template(
+            "    clear_on_entry: [\"{{TOPIC}}.json\"]\n",
+            "      - target: done",
+        );
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(err.contains("\"start\""), "state missing: {err}");
+        assert!(err.contains("{{TOPIC}}.json"), "key missing: {err}");
+        assert!(err.contains("variable reference"), "reason missing: {err}");
+    }
+
+    #[test]
+    fn clear_on_entry_refuses_a_key_outside_the_context_key_grammar() {
+        for bad in ["/lead.md", "a//b", "../up", "a b"] {
+            let src = assignment_template(
+                &format!("    clear_on_entry: [\"{bad}\"]\n"),
+                "      - target: done",
+            );
+            let err = compile_src(&src).unwrap_err().to_string();
+            assert!(err.contains("\"start\""), "{bad}: state missing: {err}");
+            assert!(
+                err.contains("not a valid context key"),
+                "{bad}: reason missing: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_on_entry_refuses_an_empty_list() {
+        let src = assignment_template("    clear_on_entry: []\n", "      - target: done");
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(err.contains("\"start\""), "state missing: {err}");
+        assert!(err.contains("at least one key"), "reason missing: {err}");
+    }
+
+    #[test]
+    fn clear_on_entry_refuses_a_duplicate_key() {
+        let src = assignment_template(
+            "    clear_on_entry: [review.json, review.json]\n",
+            "      - target: done",
+        );
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(err.contains("\"start\""), "state missing: {err}");
+        assert!(err.contains("\"review.json\""), "key missing: {err}");
+        assert!(err.contains("more than once"), "reason missing: {err}");
+    }
+
+    #[test]
+    fn clear_on_entry_refuses_a_terminal_state() {
+        let src = r#"---
+name: assign
+version: "1.0"
+initial_state: start
+states:
+  start:
+    transitions:
+      - target: done
+  done:
+    terminal: true
+    clear_on_entry: [review.json]
+---
+
+## start
+
+Work.
+
+## done
+
+Done.
+"#;
+        let err = compile_src(src).unwrap_err().to_string();
+        assert!(err.contains("\"done\""), "state missing: {err}");
+        assert!(err.contains("terminal"), "reason missing: {err}");
+    }
+
+    #[test]
+    fn clear_on_entry_refuses_a_key_a_transition_assigns() {
+        let src = assignment_template(
+            "    clear_on_entry: [outcome]\n",
+            "      - target: done\n        context_assignments:\n          outcome: landed",
+        );
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(
+            err.contains("\"start\" -> \"done\""),
+            "transition missing: {err}"
+        );
+        assert!(err.contains("\"outcome\""), "key missing: {err}");
+        assert!(err.contains("also assigned"), "reason missing: {err}");
+    }
+
+    // -------------------------------------------------------------------
+    // poll on command gates (DESIGN-koto-ci-wait-stale-keys.md)
+    // -------------------------------------------------------------------
+
+    /// A `start` state with one gate `ci` of `gate_type` carrying `poll_yaml`
+    /// (at poll-field indentation) and optional `extra` state YAML.
+    fn poll_template(gate_type: &str, gate_body: &str, poll_yaml: &str, extra: &str) -> String {
+        assignment_template(
+            &format!(
+                "    gates:\n      ci:\n        type: {gate_type}\n{gate_body}        poll:\n{poll_yaml}{extra}"
+            ),
+            "      - target: done\n        when:\n          gates.ci.exit_code: 0",
+        )
+    }
+
+    const CMD: &str = "        command: ./ci-status.sh\n";
+
+    #[test]
+    fn poll_compiles_onto_a_command_gate_with_defaults_filled() {
+        let src = poll_template(
+            "command",
+            CMD,
+            "          interval_secs: 30\n          timeout_secs: 3600\n",
+            "",
+        );
+        let t = compile_src(&src).unwrap();
+        let poll = t.states["start"].gates["ci"].poll.clone().unwrap();
+        assert_eq!(
+            poll,
+            PollSpec {
+                interval_secs: 30,
+                timeout_secs: 3600,
+                hold_secs: 0,
+                pending_exit_code: 75,
+            }
+        );
+    }
+
+    #[test]
+    fn poll_keeps_a_declared_hold_and_pending_code() {
+        let src = poll_template(
+            "command",
+            CMD,
+            "          interval_secs: 5\n          timeout_secs: 60\n          hold_secs: 60\n          pending_exit_code: 8\n",
+            "",
+        );
+        let poll = compile_src(&src).unwrap().states["start"].gates["ci"]
+            .poll
+            .clone()
+            .unwrap();
+        assert_eq!((poll.hold_secs, poll.pending_exit_code), (60, 8));
+    }
+
+    #[test]
+    fn gate_without_poll_omits_the_field_from_compiled_json() {
+        let src = assignment_template(
+            CI_GATE,
+            "      - target: done\n        when:\n          gates.ci.exit_code: 0",
+        );
+        let json = serde_json::to_string(&compile_src(&src).unwrap()).unwrap();
+        assert!(!json.contains("\"poll\""), "got: {json}");
+    }
+
+    #[test]
+    fn poll_is_refused_on_a_gate_that_is_not_a_command_gate() {
+        let src = assignment_template(
+            "    gates:\n      ci:\n        type: context-exists\n        key: note\n        poll:\n          interval_secs: 1\n          timeout_secs: 5\n",
+            "      - target: done\n        when:\n          gates.ci.exists: true",
+        );
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(
+            err.contains("\"start\" gate \"ci\""),
+            "location missing: {err}"
+        );
+        assert!(
+            err.contains("only allowed on a command gate"),
+            "reason missing: {err}"
+        );
+    }
+
+    #[test]
+    fn poll_refuses_out_of_range_settings() {
+        let cases = [
+            ("          interval_secs: 0\n          timeout_secs: 5\n", "interval_secs must be at least 1"),
+            ("          interval_secs: 1\n          timeout_secs: 0\n", "timeout_secs must be at least 1"),
+            (
+                "          interval_secs: 1\n          timeout_secs: 5\n          hold_secs: 6\n",
+                "hold_secs (6) must not exceed timeout_secs (5)",
+            ),
+            (
+                "          interval_secs: 1\n          timeout_secs: 5\n          pending_exit_code: 0\n",
+                "pending_exit_code must be between 1 and 255",
+            ),
+            (
+                "          interval_secs: 1\n          timeout_secs: 5\n          pending_exit_code: 256\n",
+                "pending_exit_code must be between 1 and 255",
+            ),
+        ];
+        for (poll, want) in cases {
+            let src = poll_template("command", CMD, poll, "");
+            let err = compile_src(&src).unwrap_err().to_string();
+            assert!(
+                err.contains("\"start\" gate \"ci\""),
+                "{want}: location missing: {err}"
+            );
+            assert!(err.contains(want), "{want}: got: {err}");
+        }
+    }
+
+    #[test]
+    fn poll_refuses_an_unknown_key() {
+        let src = poll_template(
+            "command",
+            CMD,
+            "          interval_secs: 1\n          timeout_secs: 5\n          intervall: 3\n",
+            "",
+        );
+        assert!(compile_src(&src).is_err());
+    }
+
+    #[test]
+    fn poll_is_refused_beside_a_polling_default_action() {
+        let src = poll_template(
+            "command",
+            CMD,
+            "          interval_secs: 1\n          timeout_secs: 5\n",
+            "    default_action:\n      command: ./build.sh\n      polling:\n        interval_secs: 1\n        timeout_secs: 5\n",
+        );
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(
+            err.contains("default_action declares polling"),
+            "got: {err}"
+        );
     }
 
     #[test]

@@ -576,7 +576,7 @@ fn event_kind(event: &Event) -> Option<&str> {
 /// The format is `YYYY-MM-DDTHH:MM:SS.sssZ`. We parse it back via a
 /// tiny inline parser rather than pulling chrono so the wake module
 /// stays minimal.
-fn parse_rfc3339_millis(ts: &str) -> Option<SystemTime> {
+pub(crate) fn parse_rfc3339_millis(ts: &str) -> Option<SystemTime> {
     // Expected format: YYYY-MM-DDTHH:MM:SS.sssZ or YYYY-MM-DDTHH:MM:SSZ
     let bytes = ts.as_bytes();
     if bytes.len() < 20 || bytes[bytes.len() - 1] != b'Z' {

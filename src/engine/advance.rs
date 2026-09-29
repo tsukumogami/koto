@@ -270,6 +270,7 @@ fn action_condition(
         findings,
         duration_ms: None,
         context_reads: Vec::new(),
+        poll: None,
     };
     fill_effect_landed(result.all_findings_mut(), false);
 
@@ -778,6 +779,19 @@ fn check_fields(
     }
 }
 
+/// The check fields of a pending polling gate's `gate_evaluated`: its
+/// findings and run time, for the log only, and no attempt stamp or rule
+/// counts, now or later (DESIGN-koto-ci-wait-stale-keys.md Decision 6).
+fn pending_check_fields(result: &StructuredGateResult) -> CheckEventFields {
+    let (findings, findings_truncated) = result.capped_findings(LOG_FINDINGS_CAP);
+    CheckEventFields {
+        findings,
+        findings_truncated,
+        duration_ms: result.duration_ms,
+        ..CheckEventFields::default()
+    }
+}
+
 /// The leading [`LOG_STREAM_MAX_BYTES`] of each captured stream, for a
 /// command gate whose outcome isn't `passed`. `None` for a passing gate and
 /// for gates that capture nothing.
@@ -915,7 +929,8 @@ pub enum IntegrationError {
 /// The loop iterates states, checking each against stopping conditions in order:
 /// 1. Signal received (shutdown flag)
 /// 2. Chain limit check
-/// 3. Terminal state
+/// 3. Terminal state, then clearing the state's `clear_on_entry` keys when an
+///    entry still owes it
 /// 4. Integration declared (invoke runner)
 /// 5. Action execution (if state has default_action)
 /// 6. Gates (evaluate all, stop if any fail)
@@ -923,7 +938,15 @@ pub enum IntegrationError {
 /// 8. Transition resolution (match evidence against conditions)
 ///
 /// I/O operations are injected as closures for testability:
-/// - `append_event`: persist a state transition event
+/// - `append_event`: persist an event. **A `ContextCleared` payload is a
+///   request, not only a record:** the loop asks for a state's
+///   `clear_on_entry` keys to be cleared by appending it, and the closure must
+///   perform the clearing -- remove the keys from the context store, then
+///   record the event -- or fail. `koto next` does this through
+///   [`crate::engine::clear_on_entry::apply_from_log`]. A closure that only
+///   records the event leaves the stale keys in place, and the log then says
+///   they were cleared, so every production caller must route this payload to
+///   the context store.
 /// - `evaluate_gates`: run gate commands and return results
 /// - `invoke_integration`: call an integration runner
 /// - `execute_action`: run a default action command
@@ -1184,6 +1207,25 @@ where
                 advanced,
                 stop_reason: StopReason::Terminal,
             });
+        }
+
+        // 3a. Clear the state's `clear_on_entry` keys for this entry, before
+        // anything that reads context -- the integration, the action and the
+        // gates -- runs. Decided from the log alone. The append is the
+        // clearing: the caller's append closure removes the keys from the
+        // store before it records the event, and a removal it can't make
+        // fails the tick with nothing recorded, so the next tick retries it.
+        // A state entered on an earlier tick (a rewind, a `--to`, a crash
+        // between the entry and its clearing) is caught here too.
+        if !template_state.clear_on_entry.is_empty() {
+            let pending = crate::engine::clear_on_entry::pending_clearing(
+                &tick_log.borrow(),
+                &state,
+                &template_state.clear_on_entry,
+            );
+            if let Some(clearing) = pending {
+                append_event(&clearing.event()).map_err(AdvanceError::PersistenceError)?;
+            }
         }
 
         // 4. Integration check
@@ -1533,6 +1575,7 @@ where
                 // any `GateEvaluated` event is appended: nothing ran, so there
                 // is no gate result to report and nothing for a `when` clause
                 // to route on (Issue #225).
+                let first_run_start = std::time::SystemTime::now();
                 let mut evaluated = match evaluate_gates(&gates_to_evaluate) {
                     Ok(results) => results,
                     Err(refusal) => {
@@ -1550,11 +1593,21 @@ where
                         });
                     }
                 };
+                // Polling gates hold and re-run while pending, then settle
+                // into done, pending, failed or timed out
+                // (DESIGN-koto-ci-wait-stale-keys.md Decisions 4-6).
+                crate::engine::poll::settle(
+                    &mut evaluated,
+                    &gates_to_evaluate,
+                    &tick_log.borrow(),
+                    &state,
+                    first_run_start,
+                    evaluate_gates,
+                    shutdown,
+                );
                 for result in evaluated.values_mut() {
                     fill_effect_landed(result.all_findings_mut(), effect_landed);
                 }
-                let stamp =
-                    *entry_stamp.get_or_insert_with(|| attempt_stamp(&tick_log.borrow(), &state));
                 for (gate_name, result) in &evaluated {
                     gate_evidence_map.insert(gate_name.clone(), result.output.clone());
                     let outcome_str = match result.outcome {
@@ -1562,11 +1615,22 @@ where
                         GateOutcome::Failed => "failed",
                         GateOutcome::TimedOut => "timed_out",
                         GateOutcome::Error => "error",
+                        GateOutcome::Pending => "pending",
                     };
-                    // Every gate of this entry carries the same stamp. Rule
-                    // counts are per check, so one gate's event never feeds
-                    // another's counts within the attempt.
-                    let check = check_fields(result, gate_name, stamp, &tick_log.borrow(), &state);
+                    // Every resolved gate of this entry carries the same
+                    // stamp. Rule counts are per check, so one gate's event
+                    // never feeds another's counts within the attempt. A
+                    // pending polling gate judged nothing: it carries no
+                    // stamp and no rule counts, and doesn't create an
+                    // attempt, so the attempt is the evaluation where the
+                    // poll resolves.
+                    let check = if result.outcome == GateOutcome::Pending {
+                        pending_check_fields(result)
+                    } else {
+                        let stamp = *entry_stamp
+                            .get_or_insert_with(|| attempt_stamp(&tick_log.borrow(), &state));
+                        check_fields(result, gate_name, stamp, &tick_log.borrow(), &state)
+                    };
                     let gate_evaluated_payload = EventPayload::GateEvaluated {
                         state: state.clone(),
                         gate: gate_name.clone(),
@@ -1575,6 +1639,15 @@ where
                         timestamp: now_iso8601(),
                         check,
                         streams: logged_streams(result),
+                        poll: result
+                            .poll
+                            .as_ref()
+                            .map(|p| crate::engine::types::PollRecord {
+                                status: p.status.as_str().to_string(),
+                                evaluations: p.evaluations,
+                                since: p.since.clone(),
+                                elapsed_secs: p.elapsed_secs,
+                            }),
                     };
                     // The gate's own context reads come immediately before
                     // its `gate_evaluated`, best-effort: a read that can't be
@@ -2384,6 +2457,7 @@ mod tests {
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         }
     }
 
@@ -3068,6 +3142,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3086,6 +3161,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3107,6 +3183,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3125,6 +3202,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -3179,6 +3257,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -3198,6 +3277,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -3259,6 +3339,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -3309,6 +3390,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -3362,6 +3444,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -3384,6 +3467,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -3462,6 +3546,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -3491,6 +3576,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3509,6 +3595,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3527,6 +3614,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -3593,6 +3681,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -3622,6 +3711,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3640,6 +3730,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3658,6 +3749,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -3725,6 +3817,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -3752,6 +3845,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3770,6 +3864,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -3842,6 +3937,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -3862,6 +3958,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -3880,6 +3977,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -4053,6 +4151,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -4071,6 +4170,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -4122,6 +4222,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -4180,6 +4281,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ));
         }
@@ -4200,6 +4302,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         ));
 
@@ -4243,6 +4346,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -4287,6 +4391,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -4305,6 +4410,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -4323,6 +4429,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -4371,6 +4478,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -4389,6 +4497,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -4407,6 +4516,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -4568,6 +4678,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )])
     }
@@ -4681,6 +4792,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
         let appended = std::cell::RefCell::new(Vec::new());
@@ -4738,6 +4850,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -4799,6 +4912,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -4845,6 +4959,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -4937,6 +5052,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -4955,6 +5071,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ])
@@ -5051,6 +5168,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -5090,6 +5208,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -5223,6 +5342,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -5242,6 +5362,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         )]);
 
@@ -5307,6 +5428,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -5325,6 +5447,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -5390,6 +5513,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -5408,6 +5532,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -5468,6 +5593,7 @@ mod tests {
             request: String::new(),
             leg: String::new(),
             expect: None,
+            poll: None,
         }
     }
 
@@ -5529,6 +5655,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -5547,6 +5674,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -5624,6 +5752,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -5642,6 +5771,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -5896,6 +6026,7 @@ mod tests {
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         };
         let template = make_template(vec![
             (
@@ -5923,6 +6054,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             ("merged", terminal("Merged.")),
@@ -6011,6 +6143,7 @@ mod tests {
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         };
         let template = make_template(vec![
             (
@@ -6038,6 +6171,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             ("merged", terminal("Merged.")),
@@ -6088,6 +6222,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -6108,6 +6243,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -6126,6 +6262,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -6218,6 +6355,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -6238,6 +6376,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -6256,6 +6395,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -6324,6 +6464,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -6344,6 +6485,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -6362,6 +6504,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -6456,6 +6599,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -6477,6 +6621,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             ("complete", {
@@ -6548,6 +6693,7 @@ mod tests {
                 request: String::new(),
                 leg: String::new(),
                 expect: None,
+                poll: None,
             },
         );
 
@@ -6572,6 +6718,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             ("complete", {
@@ -6733,6 +6880,7 @@ mod tests {
                         Some(m)
                     },
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -6751,6 +6899,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -6847,6 +6996,7 @@ mod tests {
                         Some(m)
                     },
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
             (
@@ -6865,6 +7015,7 @@ mod tests {
                     skipped_marker: false,
                     skip_if: None,
                     result: None,
+                    clear_on_entry: Vec::new(),
                 },
             ),
         ]);
@@ -7225,6 +7376,7 @@ mod tests {
             findings,
             duration_ms: Some(7),
             context_reads: Vec::new(),
+            poll: None,
         }
     }
 
@@ -7260,6 +7412,7 @@ mod tests {
             skipped_marker: false,
             skip_if: None,
             result: None,
+            clear_on_entry: Vec::new(),
         }
     }
 
@@ -7558,6 +7711,7 @@ mod tests {
                     ..Default::default()
                 },
                 streams: None,
+                poll: None,
             },
         )];
         let result = advance_until_stop(
@@ -7652,6 +7806,7 @@ mod tests {
                             ..Default::default()
                         },
                         streams: None,
+                        poll: None,
                     },
                 )
             })

@@ -145,6 +145,15 @@ The line must start with `::koto-finding::` and hold exactly one JSON object. `r
 
 The [`default_action` authoring guide](../../../../docs/guides/default-action-authoring.md) carries the rule in full, with worked examples on both sides, the burden-of-proof rule for a classification that turns on an unchecked claim, and the failure, capture, and anchoring mechanics. The [template format guide](references/template-format.md) carries the field schema. Read the rule before you write your first action.
 
+### Waiting on a check, and retries that start clean
+
+Two protocol steps an agent used to do from prose are koto's to do:
+
+- **Waiting on a check that settles later** (CI on a pull request): declare `poll:` on the `command` gate. The command exits 0 when done, a pending code (75 by default) while it's still running, anything else when it failed. koto re-runs it on an interval within `hold_secs` of a tick, reports pending to the agent as a temporal wait with `retry_after_secs`, and times out after `timeout_secs`. Don't write "poll CI until it's green" into a directive.
+- **Retries that must not see the last attempt's verdict**: declare `clear_on_entry: [keys]` on the state a retry loop returns to. koto removes those keys whenever the workflow enters the state again (not on the first entry), before the state's action and gates run. Don't write remove-then-verify blocks into a directive.
+
+The [template format guide](references/template-format.md) has both field schemas and their compile rules.
+
 ## Reference material
 
 The skill bundles reference material, loaded during specific states:

@@ -518,6 +518,7 @@ mod tests {
             timestamp: "2026-01-01T00:01:00Z".to_string(),
             check: Default::default(),
             streams: None,
+            poll: None,
         };
         backend
             .append_event(id, &payload, "2026-01-01T00:01:00Z")

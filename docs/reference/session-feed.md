@@ -210,6 +210,19 @@ events:
         type: string
         required: false
 
+  context_cleared:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      keys:
+        type: array
+        required: true
+      entry_seq:
+        type: integer
+        required: true
+
   context_read:
     tier: 2
     fields:
@@ -310,7 +323,7 @@ events:
       outcome:
         type: string
         required: true
-        enum: ["passed", "failed", "timed_out", "error"]
+        enum: ["passed", "failed", "timed_out", "error", "pending"]
       timestamp:
         type: string
         required: true
@@ -347,6 +360,9 @@ events:
         required: false
       stderr_truncated:
         type: boolean
+        required: false
+      poll:
+        type: object
         required: false
 
   child_completed:
@@ -987,6 +1003,49 @@ recover it.
 
 ---
 
+#### `context_cleared`
+
+Records one clearing of a state's `clear_on_entry` keys: koto removed them
+from the context store because the workflow entered the state again. One event
+per entry, however many keys it names and however many ticks follow; never one
+per key. koto decides what to clear from the log alone and reads no key to
+decide, so a clearing brings no `context_read` with it.
+
+```json
+{
+  "type": "context_cleared",
+  "payload": {
+    "state": "implementation",
+    "keys": ["review_results.json", "summary.md"],
+    "entry_seq": 41
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `state` | string | Yes | The state whose entry was cleared. |
+| `keys` | array of strings | Yes | The keys removed, in the order the template declares them. Names only, never values, hashes or sizes. A declared key written after the entry (by a `context_added` whose writer isn't `sync`) is kept and isn't listed. |
+| `entry_seq` | integer | Yes | The `seq` of the entry event this clearing belongs to: the `transitioned`, `directed_transition` or `rewound` event into `state`. |
+
+Which entries clear: every entry into a declaring state except the session's
+first (`koto init`'s `transitioned` with no `from`), self-transitions included.
+A gate override is not an entry and clears nothing. `entry_seq` therefore marks
+an epoch, not a visit: a visit (the `visit_attempt` window) opens only on an
+arrival from a different state or a rewind, so one visit can hold several
+clearings. The visit a clearing belongs to is the one opened by the latest
+arrival-from-elsewhere or `rewound` event at or before `entry_seq`; when the
+event at `entry_seq` is itself such an arrival, the clearing opens that visit,
+and when it's a self-transition, `visit_attempt` keeps counting across it.
+
+A store removal that fails records no event; the next tick clears again. A
+key's removal is also a supersession for any reader that rebuilds the store
+from the log: a `context_cleared` naming a key supersedes an earlier write of
+it exactly as a `context_removed` does. koto never clears a key a transition
+assigns, so an older koto, which skips this event, has nothing to restore.
+
+---
+
 #### `context_read`
 
 Records one read of a context key. It never carries the key's content or
@@ -1225,7 +1284,7 @@ same gate in the same state (e.g., during a polling sequence).
 | `state` | string | Yes | State containing the gate. |
 | `gate` | string | Yes | Gate identifier. |
 | `output` | object | Yes | Gate evaluator output. Schema is gate-type-specific. Unchanged by the fields below. |
-| `outcome` | string | Yes | `"passed"`, `"failed"`, `"timed_out"` or `"error"`. `timed_out` is a command gate that ran past its timeout; `error` is a gate that couldn't be evaluated, such as a command that couldn't be spawned or waited on, or a context gate whose key or pattern is unusable. |
+| `outcome` | string | Yes | `"passed"`, `"failed"`, `"timed_out"`, `"error"` or `"pending"`. `timed_out` is a command gate that ran past its timeout, or a polling gate still pending when its window ran out; `error` is a gate that couldn't be evaluated, such as a command that couldn't be spawned or waited on, or a context gate whose key or pattern is unusable. `pending` is a polling gate whose command said the check hasn't settled: nothing was judged. Only a template that declares a polling gate writes it. |
 | `timestamp` | string | Yes | RFC 3339 UTC timestamp. Matches the outer envelope `timestamp`. |
 | `attempt` | integer | No | The state's session attempt number, at least 1. The same on every check event of one attempt; never resets. |
 | `visit_attempt` | integer | No | The state's attempt number in the current visit, at least 1. Present whenever `attempt` is. |
@@ -1238,6 +1297,7 @@ same gate in the same state (e.g., during a polling sequence).
 | `stderr` | string | No | The same for standard error. Present whenever `stdout` is. |
 | `stdout_truncated` | boolean | No | `true` when `stdout` holds less than the command printed, whether koto's 64 KiB capture bound or the 4,096-byte log cut removed it. Absent means `false`. |
 | `stderr_truncated` | boolean | No | The same for `stderr`. |
+| `poll` | object | No | On a polling gate's evaluation: where the poll stood. See [Polling gates](#polling-gates). |
 
 The fields from `attempt` down are described in
 [Check Findings and Attempts](#check-findings-and-attempts). They're absent on
@@ -1739,6 +1799,44 @@ one check event: 50 findings of about 2.2 KiB each, 8 KiB of gate output, and
 condition's `failure` adds at most about 350 KiB: 100 findings and 128 KiB of
 captured output. Both figures are before JSON escaping, which can enlarge
 strings holding control characters.
+
+### Polling gates
+
+A `command` gate that declares `poll:` can answer "not yet": its command exits
+with the gate's pending code (75 unless the template sets another) while the
+check it watches hasn't settled. Each tick runs the command at least once, may
+re-run it within the template's `hold_secs`, and records one `gate_evaluated`
+for the gate: the tick's last run. Its `poll` object:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `status` | string | `done`, `pending`, `failed` or `timed_out`. Open vocabulary. |
+| `evaluations` | integer >= 1 | Command runs since the polling window opened, summed across ticks. On the evaluation that resolves the poll, the total cost of the wait. |
+| `since` | string (RFC 3339) | The window start: the first run of this gate since the latest entry into the state. The same on every evaluation in one window; a new entry, self-transitions included, opens a new window. |
+| `elapsed_secs` | integer >= 0 | Seconds from `since` to the end of the recorded run. |
+
+- **Pending.** `outcome` is `pending` and `poll.status` is `pending`. The
+  check judged nothing, so the event carries no `attempt`, no
+  `visit_attempt`, no `rule_counts` (now or in any later version) and no
+  koto-written fallback finding. Findings the command printed are logged, for
+  the log only.
+- **Resolved.** The evaluation where the poll settles takes the attempt: exit
+  0 is `outcome: passed` with `poll.status: done`; the pending code at or past
+  the window's end is `outcome: timed_out` with `poll.status: timed_out` and
+  koto's finding `command still pending after N seconds`; anything else is a
+  failed command gate as always, with `poll.status: failed`. A run killed by
+  the gate's own per-run `timeout` keeps `outcome: timed_out` but has
+  `poll.status: failed`: the command never answered.
+- **Attempts across a wait.** A pending evaluation doesn't advance `attempt`
+  or `visit_attempt`, so retries and fix loops see one attempt per CI result,
+  not one per tick. Another gate of the same state that resolves on a pending
+  tick keeps its stamp: a failed gate on that tick takes attempt N and the
+  polling gate, when it resolves later, takes N+1.
+
+The attributes a consumer can export from this section and
+[`context_cleared`](#context_cleared): `gate_evaluated.outcome` value
+`pending`; `gate_evaluated.poll.status`, `.evaluations`, `.since` and
+`.elapsed_secs`; `context_cleared.state`, `.keys` and `.entry_seq`.
 
 ### Reserved and aligned names
 

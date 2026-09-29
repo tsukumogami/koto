@@ -1300,6 +1300,7 @@ mod tests {
                 timestamp: "2026-01-01T00:00:02Z".to_string(),
                 check: Default::default(),
                 streams: None,
+                poll: None,
             },
             "2026-01-01T00:00:02Z",
         )
@@ -1329,6 +1330,7 @@ mod tests {
                 timestamp: "2026-01-01T00:00:02Z".to_string(),
                 check: Default::default(),
                 streams: None,
+                poll: None,
             },
             "2026-01-01T00:00:02Z",
         )

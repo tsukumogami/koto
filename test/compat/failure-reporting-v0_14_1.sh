@@ -403,6 +403,12 @@ for entry in "${WRITER_CHECKS[@]}"; do
   pass "events: $label ($n)"
 done
 
+# A template without a polling gate never writes the `pending` outcome, which
+# only polling gates emit (DESIGN-koto-ci-wait-stale-keys.md Decision 6).
+n="$(jq -s '[.[] | select(.type? == "gate_evaluated" and .payload.outcome == "pending")] | length' "$LOG_FILE")"
+[ "$n" -eq 0 ] || fail "events: a template without a polling gate logged $n pending evaluations"
+pass "events: no pending outcome from a template without a polling gate"
+
 # --- v0.14.1 reads the log ---------------------------------------------------
 
 floor_koto() {

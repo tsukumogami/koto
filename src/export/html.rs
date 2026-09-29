@@ -93,6 +93,7 @@ mod tests {
                             request: String::new(),
                             leg: String::new(),
                             expect: None,
+                            poll: None,
                         },
                     );
                     g
@@ -105,6 +106,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         states.insert(
@@ -127,6 +129,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         states.insert(
@@ -149,6 +152,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         states.insert(
@@ -167,6 +171,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
 
@@ -266,6 +271,7 @@ mod tests {
                 skipped_marker: false,
                 skip_if: None,
                 result: None,
+                clear_on_entry: Vec::new(),
             },
         );
         let t = CompiledTemplate {

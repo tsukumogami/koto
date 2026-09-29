@@ -9,7 +9,8 @@
 //!
 //! For each key the latest event that touched it decides what the store should
 //! hold. An assignment is superseded by a later `koto context add` or
-//! `koto context remove` of the same key, and supersedes an earlier one, which
+//! `koto context remove` of the same key, or a `clear_on_entry` clearing
+//! that names it, and supersedes an earlier one, which
 //! is the same last-write-wins rule `koto context add` already follows.
 
 use std::collections::BTreeMap;
@@ -51,6 +52,13 @@ pub fn outstanding_assignments(events: &[Event]) -> BTreeMap<String, String> {
             }
             EventPayload::ContextAdded { key, .. } | EventPayload::ContextRemoved { key, .. } => {
                 latest.insert(key.clone(), None);
+            }
+            // A `clear_on_entry` clearing removed these keys; it supersedes
+            // an earlier assignment exactly as a `koto context remove` does.
+            EventPayload::ContextCleared { keys, .. } => {
+                for key in keys {
+                    latest.insert(key.clone(), None);
+                }
             }
             _ => {}
         }
@@ -172,6 +180,24 @@ mod tests {
         *store.fail_writes.lock().unwrap() = false;
         reconcile(&store, "s", &events, Some("outcome")).unwrap();
         assert_eq!(store.get("s", "outcome").unwrap(), b"landed");
+    }
+
+    #[test]
+    fn a_clearing_supersedes_an_assignment_of_a_key_it_names() {
+        let events = vec![
+            transitioned(1, &[("a", "x"), ("b", "y")]),
+            event(
+                2,
+                EventPayload::ContextCleared {
+                    state: "b".to_string(),
+                    keys: vec!["a".to_string()],
+                    entry_seq: 1,
+                },
+            ),
+        ];
+        let outstanding = outstanding_assignments(&events);
+        assert_eq!(outstanding.get("a"), None);
+        assert_eq!(outstanding.get("b").map(String::as_str), Some("y"));
     }
 
     #[test]
