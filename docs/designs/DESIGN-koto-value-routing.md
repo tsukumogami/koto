@@ -156,10 +156,24 @@ transition fired, and the extra event costs a log line on every routed step.
 the same four checks on it.** The shared matcher already serves both
 evaluators, so one change fixes both. The one known template with such an
 entry (shirabe's `/work-on` `entry` state) keeps compiling, because its
-variable is declared, and starts matching; its `skip_if` also needs
-`mode: plan_backed` in evidence, so when it fires it picks the transition
-evidence resolution would have picked anyway, logged as `skip_if` rather than
-`auto`.
+variable is declared, and starts matching.
+
+What that changes for runs of it, precisely: the condition is
+`skip_if: {vars.ISSUE_SOURCE: plan_outline, mode: plan_backed}`, and the
+state's `when` routes send `mode: plan_backed` to `plan_context_injection`.
+Plan-backed children get `ISSUE_SOURCE=plan_outline` as a variable from
+shirabe's `plan-to-tasks.sh`, but no `mode` evidence, so on arrival the
+`skip_if` can't hold and the state still asks the agent for `mode`, as today.
+It can hold only after the agent submits `mode: plan_backed` on a run whose
+`ISSUE_SOURCE` is `plan_outline`, and then it resolves to
+`plan_context_injection`, the target evidence resolution picks for that
+submission today. No run changes path or skips a state it didn't skip
+before. The one difference is the record: that transition is logged with
+`condition_type: "skip_if"`, `skip_if_matched` and `vars_matched` instead of
+`condition_type: "auto"`. Activating it is therefore safe, and matches what
+the entry reads as meaning. For shirabe's adoption: if the intent was to skip
+the `mode` question for outline children, the `mode: plan_backed` key has to
+come out of the `skip_if`, which is a change in shirabe, not here.
 
 **Alternative: refuse value conditions in `skip_if`.** Rejected: it would
 break that template's compile for no gain, and leave one spelling meaning
