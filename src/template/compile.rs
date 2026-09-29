@@ -1168,12 +1168,13 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
 /// Compile a `decider-check` gate (DESIGN-koto-decider-checks.md, Decision
 /// 1), resolving every default.
 ///
-/// Only what the compiled types can't represent fails here: a key a gate or
-/// criterion doesn't take, a value of the wrong type, an unknown mode,
-/// `poll`, and `overridable: false`. Bounds and required text are checked on
-/// the compiled form by [`validate_spec`](super::decider_check::validate_spec)
-/// through `CompiledTemplate::validate`, so a cached template gets the same
-/// checks.
+/// What the compiled types can't represent fails only here: a key a gate or
+/// criterion doesn't take, a value of the wrong type, and an unknown mode.
+/// `poll`, `overridable: false` and an empty command are refused here for
+/// the source-level message and again in `CompiledTemplate::validate` for a
+/// cached template. Bounds and required text are checked on the compiled
+/// form by [`validate_spec`](super::decider_check::validate_spec) through
+/// `CompiledTemplate::validate` alone.
 fn compile_decider_check(
     state_name: &str,
     gate_name: &str,

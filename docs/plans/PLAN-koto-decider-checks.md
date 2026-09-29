@@ -50,9 +50,10 @@ defaults resolved, and every malformed declaration is refused with its own
 byte-identically.
 
 **Acceptance Criteria**:
-- [ ] `GATE_TYPE_DECIDER_CHECK` is supported; `Gate` gains `max_bytes`,
-      `label` and `criteria`, each skipped when empty, and
-      `Gate::substitutable_fields` names them (only `command` substitutes).
+- [ ] `GATE_TYPE_DECIDER_CHECK` is supported; the source keys `max_bytes`,
+      `label` and `criteria` compile into one optional `Gate.decider_check`
+      field, skipped when absent, and `Gate::substitutable_fields` names it
+      (only `command` substitutes).
 - [ ] A compiled criterion with nothing optional declared has mode `shadow`,
       threshold 0.9, and the check a budget of 2,560 and label `artifact`.
 - [ ] Each refusal in the PRD's compile acceptance criteria (missing

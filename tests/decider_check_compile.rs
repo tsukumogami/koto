@@ -10,6 +10,28 @@ use koto::template::compile::compile;
 use koto::template::decider_check::{CheckMode, DEFAULT_CHECK_LABEL, DEFAULT_CHECK_MAX_BYTES};
 use koto::template::types::{CompiledTemplate, GATE_TYPE_DECIDER_CHECK};
 
+#[test]
+fn schema_and_built_in_default_cover_the_type() {
+    use koto::template::types::{gate_type_builtin_default, gate_type_schema, GateSchemaFieldType};
+    let schema = gate_type_schema(GATE_TYPE_DECIDER_CHECK).expect("schema");
+    assert_eq!(
+        schema,
+        &[
+            ("failed", GateSchemaFieldType::Array),
+            ("unanswered", GateSchemaFieldType::Array),
+            ("error", GateSchemaFieldType::Str),
+        ]
+    );
+    let compile_time = gate_type_builtin_default(GATE_TYPE_DECIDER_CHECK).expect("default");
+    let runtime = koto::gate::built_in_default(GATE_TYPE_DECIDER_CHECK).expect("default");
+    assert_eq!(compile_time, runtime);
+    assert_eq!(
+        compile_time,
+        serde_json::json!({"failed": [], "unanswered": [], "error": ""})
+    );
+    assert!(koto::template::types::SUPPORTED_GATE_TYPES.contains(&GATE_TYPE_DECIDER_CHECK));
+}
+
 fn compile_src(src: &str) -> Result<CompiledTemplate, String> {
     let mut f = tempfile::Builder::new().suffix(".md").tempfile().unwrap();
     f.write_all(src.as_bytes()).unwrap();
