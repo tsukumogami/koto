@@ -88,6 +88,10 @@ through `koto init`, `koto next` and an attach, on a fixture template.
 - [ ] A state with a decider-declared field and value routes never moves to
   a target the variable's value doesn't allow; existing `E-DECIDER-FLOOR`
   tests pass unchanged.
+- [ ] A fixture copying shirabe `/work-on`'s `entry` state (its source
+  commit noted in the fixture) compiles, and after `mode: plan_backed` is
+  submitted it reaches `plan_context_injection` both with `ISSUE_SOURCE`
+  set to `plan_outline` (logged as `skip_if`) and unset (logged as `auto`).
 
 **Dependencies**: Blocked by <<ISSUE:1>>
 

@@ -174,6 +174,10 @@ before. The one difference is the record: that transition is logged with
 the entry reads as meaning. For shirabe's adoption: if the intent was to skip
 the `mode` question for outline children, the `mode: plan_backed` key has to
 come out of the `skip_if`, which is a change in shirabe, not here.
+shirabe's `/work-on` `entry` state is the one known live user of the
+activated form, so shirabe's koto-floor raise should mention it when shirabe
+adopts this release. A test compiles a copy of that state and pins that it
+reaches the same target with and without `ISSUE_SOURCE` set.
 
 **Alternative: refuse value conditions in `skip_if`.** Rejected: it would
 break that template's compile for no gain, and leave one spelling meaning
