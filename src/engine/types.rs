@@ -3558,6 +3558,9 @@ mod tests {
             directive_bytes: 88,
             endpoint_origin: crate::decider::SettingOrigin::Default,
             fields,
+            input_tokens: None,
+            output_tokens: None,
+            unread_usage_attempts: 0,
         }
     }
 

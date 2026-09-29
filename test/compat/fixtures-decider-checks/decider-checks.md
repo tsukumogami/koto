@@ -1,8 +1,12 @@
 ---
 name: compat-decider-checks
 version: "1.0"
-description: A veto decider check the compat job fails, overrides, and leaves behind.
+description: A veto decider check the compat job fails, overrides, and leaves behind, then a shadow routing consultation.
 initial_state: review
+variables:
+  WORK_NOTE:
+    description: What the routing decider reads at work
+    default: "compat work note"
 states:
   review:
     gates:
@@ -26,6 +30,12 @@ states:
         type: boolean
         required: true
         description: Is the work finished?
+        decider:
+          answers:
+            true: {description: "The work is finished."}
+            false: {description: "More work remains."}
+          inputs:
+            - {var: WORK_NOTE, label: note}
     transitions:
       - target: done
         when:

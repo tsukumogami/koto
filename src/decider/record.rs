@@ -152,6 +152,19 @@ pub struct DeciderConsultation {
     pub endpoint_origin: SettingOrigin,
     /// Keyed by field name.
     pub fields: BTreeMap<String, FieldConsultation>,
+    /// Input tokens of the billed answer: a 2xx answer, including one koto
+    /// couldn't use. Absent when no billed answer's usage was read, and on
+    /// records written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Output tokens, likewise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Billed answers whose usage couldn't be read, so an undercount of the
+    /// two counts above is visible rather than guessed. Written on every
+    /// record; absent on records written before it existed, which read as 0.
+    #[serde(default)]
+    pub unread_usage_attempts: u32,
 }
 
 #[cfg(test)]
@@ -179,6 +192,9 @@ mod tests {
             directive_bytes: 42,
             endpoint_origin: SettingOrigin::Env,
             fields,
+            input_tokens: None,
+            output_tokens: None,
+            unread_usage_attempts: 0,
         }
     }
 
@@ -253,6 +269,7 @@ mod tests {
                 "outcome",
                 "provider",
                 "state",
+                "unread_usage_attempts",
                 "visit_seq",
             ]
         );

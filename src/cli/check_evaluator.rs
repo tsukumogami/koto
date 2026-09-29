@@ -18,19 +18,20 @@
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::action::{run_shell_command, CommandEnv};
-use crate::cli::decider_port::{input_sha256, DECIDER_LOCK_FILE};
+use crate::cli::decider_port::{input_sha256, try_decider_lock, LockHold};
 use crate::decider::check::{
     blocks, build_check_request, effective_check_mode, is_retryable, reason_for_error,
     recorded_probabilities, verdict, CheckOutcome, DeciderCheck, UnansweredReason,
 };
 use crate::decider::ledger::{append_or_warn, LedgerRecord};
-use crate::decider::types::{Decider, ErrorClass, GlobalMode, LabelledInput, SettingOrigin};
+use crate::decider::types::{
+    Decider, DecisionRequest, ErrorClass, GlobalMode, SettingOrigin, UsageTally,
+};
 use crate::engine::decider::MAX_CONSULTATIONS_PER_CALL;
 use crate::engine::persistence::{arrival_index, derive_state_from_log};
 use crate::engine::types::{Event, EventPayload};
@@ -129,9 +130,11 @@ pub fn without_checks(
 /// override didn't move past it and it gets none; `overridden_unanswered`
 /// survives only in ledgers written before that rule. Each record takes its
 /// visit and declaration hash from the latest `decider_checked` for that
-/// criterion in the log; a reused verdict appended none, but the
-/// consultation it reused is there. A criterion with no such record gets
-/// none.
+/// criterion in the current visit to `state`, the visit the override applies
+/// to; a reused verdict appended none, but the consultation it reused is in
+/// the same visit. A criterion with no such record in this visit gets none,
+/// even when an earlier visit has one: that consultation isn't what the
+/// override moved past.
 pub fn override_records(
     events: &[Event],
     state: &str,
@@ -140,31 +143,36 @@ pub fn override_records(
     session: &str,
     session_id: Option<&str>,
 ) -> Vec<LedgerRecord> {
-    use crate::decider::ledger::CheckOverrideKind;
+    use crate::decider::ledger::OverriddenCriterion;
+    let visit = match arrival_index(events, state) {
+        Some(i) => &events[i + 1..],
+        None => events,
+    };
     let mut out = Vec::new();
     let ids = actual_output["failed"]
         .as_array()
         .cloned()
         .unwrap_or_default();
     for rule_id in ids.iter().filter_map(|v| v.as_str()) {
-        let latest = events.iter().rev().find_map(|e| match &e.payload {
+        let latest = visit.iter().rev().find_map(|e| match &e.payload {
             EventPayload::DeciderChecked(c)
                 if c.state == state && c.gate == gate && c.rule_id == rule_id =>
             {
-                Some((c.visit_seq, c.declaration_hash.clone()))
+                Some((c.visit_seq, c.declaration_hash.as_str()))
             }
             _ => None,
         });
-        if let Some((visit_seq, hash)) = latest {
+        if let Some((visit_seq, declaration_hash)) = latest {
             out.push(LedgerRecord::check_overridden(
                 session,
                 session_id,
-                state,
-                visit_seq,
-                gate,
-                rule_id,
-                &hash,
-                CheckOverrideKind::CandidateFalseFail,
+                OverriddenCriterion {
+                    state,
+                    visit_seq,
+                    gate,
+                    rule_id,
+                    declaration_hash,
+                },
             ));
         }
     }
@@ -199,36 +207,15 @@ pub const MISSING_SPEC: &str = "missing_spec";
 /// be read, so neither the state nor the visit is known.
 pub const LOG_UNREADABLE: &str = "log_unreadable";
 
-/// Held while one gate's criteria are consulted. Closing the file releases
-/// the `flock`.
-struct LockHold {
-    _file: File,
-}
-
 /// What one consultation produced before it becomes a record.
 struct Consulted {
     outcome: CheckOutcome,
     probabilities: BTreeMap<String, f64>,
     model: String,
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    unread_usage_attempts: u32,
+    usage: UsageTally,
     attempts: u32,
     latency_ms: u64,
     error_class: Option<ErrorClass>,
-}
-
-impl Consulted {
-    /// Add one billed answer's usage, or count it as unread.
-    fn add_usage(&mut self, usage: Option<crate::decider::types::Usage>) {
-        match usage {
-            Some(u) => {
-                self.input_tokens = Some(self.input_tokens.unwrap_or(0) + u.input_tokens);
-                self.output_tokens = Some(self.output_tokens.unwrap_or(0) + u.output_tokens);
-            }
-            None => self.unread_usage_attempts += 1,
-        }
-    }
 }
 
 impl Consulted {
@@ -238,9 +225,7 @@ impl Consulted {
             outcome,
             probabilities: BTreeMap::new(),
             model: UNKNOWN_MODEL.to_string(),
-            input_tokens: None,
-            output_tokens: None,
-            unread_usage_attempts: 0,
+            usage: UsageTally::default(),
             attempts: 0,
             latency_ms: 0,
             error_class: None,
@@ -331,42 +316,17 @@ impl<'a> CliCheckEvaluator<'a> {
         }
     }
 
-    #[cfg(unix)]
     fn try_lock(&self) -> Option<LockHold> {
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::io::AsRawFd;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(
-                self.backend
-                    .session_dir(self.session)
-                    .join(DECIDER_LOCK_FILE),
-            )
-            .ok()?;
-        // SAFETY: `fd` is borrowed from `file`, which outlives the call.
-        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if ret != 0 {
-            return None;
-        }
-        Some(LockHold { _file: file })
-    }
-
-    #[cfg(not(unix))]
-    fn try_lock(&self) -> Option<LockHold> {
-        let _ = OpenOptions::new;
-        None
+        try_decider_lock(&self.backend.session_dir(self.session))
     }
 
     /// Evaluate the `decider-check` gate `name` (already substituted), whose
     /// criteria's declaration hashes are `hashes`, in declaration order.
     pub fn evaluate(&self, name: &str, gate: &Gate, hashes: &[String]) -> StructuredGateResult {
-        // A validated template always has a spec, but a compiled one read
-        // back from JSON isn't revalidated. With nothing to grade against,
-        // the check passes and says why; it never blocks.
+        // Defence in depth: loading a compiled template refuses a decider
+        // check with no spec (E-DECIDER-CHECK-SPEC), so only a gate built
+        // in memory reaches this. With nothing to grade against, the check
+        // passes and says why; it never blocks.
         let Some(spec) = gate.decider_check.as_ref() else {
             return pass_result(&[], MISSING_SPEC, Vec::new(), None);
         };
@@ -374,6 +334,14 @@ impl<'a> CliCheckEvaluator<'a> {
         self.env.record(&format!("gate '{}'", name), &output);
         let duration_ms = Some(output.duration_ms);
         let slice = output.stdout.as_str();
+        // One request per criterion, in declaration order. Each carries the
+        // same labelled slice, and the recorded input hash is taken from the
+        // requests themselves, so it is always the hash of what is sent.
+        let requests: Vec<DecisionRequest> = spec
+            .criteria
+            .iter()
+            .map(|c| build_check_request(c, &spec.label, slice))
+            .collect();
 
         // What the slice decides before anything is asked.
         let (early, input) = if output.failure_kind.is_some() {
@@ -382,16 +350,12 @@ impl<'a> CliCheckEvaluator<'a> {
                 None,
             )
         } else if slice.trim().is_empty() {
+            // Empty or only whitespace: nothing to ask about.
             (Some(CheckOutcome::NotGraded), None)
         } else {
-            let input = Some((
-                // The labelled input every criterion's request carries.
-                input_sha256(&[LabelledInput {
-                    label: spec.label.clone(),
-                    content: slice.to_string(),
-                }]),
-                slice.len() as u64,
-            ));
+            let input = requests
+                .first()
+                .map(|r| (input_sha256(&r.inputs), slice.len() as u64));
             if output.stdout_truncated || slice.len() > spec.max_bytes as usize {
                 (
                     Some(CheckOutcome::Unanswered(UnansweredReason::OverBudget)),
@@ -440,7 +404,7 @@ impl<'a> CliCheckEvaluator<'a> {
         let visit_events = visit_index.map(|i| &events[i + 1..]).unwrap_or(events);
 
         let mut graded = Vec::with_capacity(spec.criteria.len());
-        for (i, criterion) in spec.criteria.iter().enumerate() {
+        for (i, (criterion, request)) in spec.criteria.iter().zip(&requests).enumerate() {
             let hash = hashes.get(i).cloned().unwrap_or_default();
             let mode = effective_check_mode(criterion.mode, self.global);
             let reused = input.as_ref().and_then(|(sha, _)| {
@@ -455,7 +419,7 @@ impl<'a> CliCheckEvaluator<'a> {
                 }
                 (None, None, Some(_)) => {
                     let c = if self.budget.try_take() {
-                        self.consult(criterion, &spec.label, slice)
+                        self.consult(criterion, request)
                     } else {
                         Consulted::unsent(CheckOutcome::Unanswered(UnansweredReason::CapSpent))
                     };
@@ -482,9 +446,9 @@ impl<'a> CliCheckEvaluator<'a> {
                     probabilities: recorded_probabilities(&c.probabilities),
                     input_sha256: input.as_ref().map(|(sha, _)| sha.clone()),
                     input_bytes: input.as_ref().map(|(_, n)| *n),
-                    input_tokens: c.input_tokens,
-                    output_tokens: c.output_tokens,
-                    unread_usage_attempts: c.unread_usage_attempts,
+                    input_tokens: c.usage.input_tokens,
+                    output_tokens: c.usage.output_tokens,
+                    unread_usage_attempts: c.usage.unread_attempts,
                     attempts: c.attempts,
                     latency_ms: c.latency_ms,
                     error_class: c.error_class,
@@ -517,20 +481,18 @@ impl<'a> CliCheckEvaluator<'a> {
     fn consult(
         &self,
         criterion: &crate::template::decider_check::CheckCriterion,
-        label: &str,
-        slice: &str,
+        request: &DecisionRequest,
     ) -> Consulted {
-        let request = build_check_request(criterion, label, slice);
         let mut c = Consulted::unsent(CheckOutcome::Unanswered(UnansweredReason::ProviderError));
         while c.attempts < MAX_ATTEMPTS {
             c.attempts += 1;
             let started = Instant::now();
-            let answer = self.decider.decide(&request);
+            let answer = self.decider.decide(request);
             c.latency_ms += started.elapsed().as_millis() as u64;
             match answer {
                 Ok(response) => {
                     c.model = response.model.clone();
-                    c.add_usage(response.usage);
+                    c.usage.add(response.usage);
                     let (outcome, probabilities) =
                         verdict(&response, &criterion.rule_id, criterion.threshold);
                     c.outcome = outcome;
@@ -548,7 +510,10 @@ impl<'a> CliCheckEvaluator<'a> {
                     // status or a transport failure generally isn't, and
                     // carries no usage to read.
                     if e.responded {
-                        c.add_usage(e.usage);
+                        c.usage.add(e.usage);
+                        if let Some(model) = e.model {
+                            c.model = model.0;
+                        }
                     }
                     c.error_class = Some(e.class);
                     c.outcome = CheckOutcome::Unanswered(reason_for_error(e.class));
@@ -848,6 +813,89 @@ mod tests {
             assert!(r.failure.is_none() && r.findings.is_empty());
             assert_eq!(decider.calls(), 0, "nothing is asked without a visit");
         }
+    }
+
+    /// Log events from JSON lines, numbered from 1.
+    fn log(lines: &[serde_json::Value]) -> Vec<Event> {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let mut l = l.clone();
+                l["seq"] = serde_json::json!(i as u64 + 1);
+                l["timestamp"] = serde_json::json!("2026-01-01T00:00:00Z");
+                serde_json::from_value(l).unwrap()
+            })
+            .collect()
+    }
+
+    fn arrive(from: Option<&str>, to: &str) -> serde_json::Value {
+        serde_json::json!({"type": "transitioned",
+            "payload": {"from": from, "to": to, "condition_type": "auto"}})
+    }
+
+    fn checked(visit_seq: u64, hash: &str) -> serde_json::Value {
+        serde_json::json!({"type": "decider_checked", "payload": {
+            "state": "review", "visit_seq": visit_seq, "gate": "comments",
+            "rule_id": "r", "rule_ref": "ref", "declaration_hash": hash,
+            "mode": "veto", "threshold": 0.9, "outcome": "fail", "blocked": true,
+            "provider": "jev", "model": "m", "attempts": 1, "latency_ms": 1}})
+    }
+
+    fn overridden(events: &[Event]) -> Vec<(u64, String)> {
+        override_records(
+            events,
+            "review",
+            "comments",
+            &serde_json::json!({"failed": ["r"], "unanswered": [], "error": ""}),
+            "wf",
+            None,
+        )
+        .into_iter()
+        .map(|r| match r {
+            LedgerRecord::CheckOverridden(c) => {
+                assert_eq!(
+                    c.override_kind,
+                    crate::decider::ledger::CheckOverrideKind::CandidateFalseFail
+                );
+                (c.visit_seq, c.declaration_hash)
+            }
+            other => panic!("unexpected record {:?}", other),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn an_override_names_the_consultation_of_the_current_visit_only() {
+        let init = serde_json::json!({"type": "workflow_initialized",
+            "payload": {"template_path": "t.json", "variables": {}}});
+        // Visit 1 (seq 2) failed r and was left; visit 2 (seq 5) failed it
+        // again. The override names visit 2's consultation.
+        let two_visits = log(&[
+            init.clone(),
+            arrive(None, "review"),
+            checked(2, "old"),
+            arrive(Some("review"), "work"),
+            arrive(Some("work"), "review"),
+            checked(5, "new"),
+        ]);
+        assert_eq!(overridden(&two_visits), vec![(5, "new".to_string())]);
+
+        // The current visit has no consultation of r: an earlier visit's is
+        // not what the override moved past, so nothing is written. Looking
+        // across the whole log would name visit 1 here.
+        let stale = log(&[
+            init.clone(),
+            arrive(None, "review"),
+            checked(2, "old"),
+            arrive(Some("review"), "work"),
+            arrive(Some("work"), "review"),
+        ]);
+        assert_eq!(overridden(&stale), vec![]);
+
+        // One visit: its consultation.
+        let one = log(&[init, arrive(None, "review"), checked(2, "only")]);
+        assert_eq!(overridden(&one), vec![(2, "only".to_string())]);
     }
 
     #[test]

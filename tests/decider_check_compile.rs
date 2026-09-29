@@ -406,6 +406,94 @@ fn compiled_json_round_trips_and_validates_from_cache() {
 }
 
 #[test]
+fn a_compiled_check_with_no_spec_is_refused_on_load() {
+    let t = expect_ok(&template(
+        &check("g", &[criterion("r")], ""),
+        PLAIN_TRANSITIONS,
+    ));
+    let mut json = serde_json::to_value(&t).unwrap();
+    // The control: the same JSON with the spec loads.
+    serde_json::from_value::<CompiledTemplate>(json.clone()).unwrap();
+
+    let gate = json["states"]["review"]["gates"]["g"]
+        .as_object_mut()
+        .unwrap();
+    assert!(gate.remove("decider_check").is_some());
+    let text = serde_json::to_string_pretty(&json).unwrap();
+    let e = serde_json::from_str::<CompiledTemplate>(&text)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.starts_with("E-DECIDER-CHECK-SPEC: state \"review\" check \"g\": the compiled template"),
+        "{}",
+        e
+    );
+
+    // `koto template validate` on the file refuses it with the same code.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.json");
+    std::fs::write(&path, &text).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_koto"))
+        .args(["template", "validate"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("E-DECIDER-CHECK-SPEC"), "{}", stdout);
+
+    // Any other gate type without a decider_check key is untouched.
+    let mut plain = serde_json::to_value(&t).unwrap();
+    let g = plain["states"]["review"]["gates"]["g"]
+        .as_object_mut()
+        .unwrap();
+    g.remove("decider_check");
+    g.insert("type".into(), serde_json::json!("command"));
+    serde_json::from_value::<CompiledTemplate>(plain).unwrap();
+}
+
+/// Loading never changes a template: every compiled snapshot, and a
+/// template with a decider check, read back and written again is the same
+/// bytes, so the same `template_hash`.
+#[test]
+fn a_template_that_compiles_today_loads_back_to_the_same_bytes() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut seen = 0;
+    let mut dirs = vec![root.join("tests/fixtures/compiled-snapshots")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let t: CompiledTemplate =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
+            assert_eq!(
+                serde_json::to_string_pretty(&t).unwrap(),
+                text,
+                "{}",
+                path.display()
+            );
+            seen += 1;
+        }
+    }
+    assert!(seen >= 10, "only {} snapshots read", seen);
+
+    let t = expect_ok(&template(
+        &check("g", &[criterion("r"), criterion("s")], ""),
+        PLAIN_TRANSITIONS,
+    ));
+    let text = serde_json::to_string_pretty(&t).unwrap();
+    let back: CompiledTemplate = serde_json::from_str(&text).unwrap();
+    assert_eq!(serde_json::to_string_pretty(&back).unwrap(), text);
+}
+
+#[test]
 fn every_decider_check_code_the_compiler_emits_is_documented() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut codes = std::collections::BTreeSet::new();

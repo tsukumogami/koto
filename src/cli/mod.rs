@@ -779,6 +779,12 @@ fn validate_compiled_template(path: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
+/// The root the decider ledger is written under (`~/.koto`), or `None` when
+/// there is no home directory, in which case each ledger write warns.
+pub(super) fn ledger_root() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".koto"))
+}
+
 /// Load a compiled template from a cache path.
 fn load_compiled_template(path: &str) -> anyhow::Result<CompiledTemplate> {
     let content = std::fs::read_to_string(path)
@@ -4489,7 +4495,7 @@ fn handle_next(
             &execution_dir,
             &command_env,
         )
-        .with_ledger_root(dirs::home_dir().map(|h| h.join(".koto")))
+        .with_ledger_root(ledger_root())
         // Every tick that consults waits for the lock; an evaluator built
         // without this tries it once.
         .with_lock_wait(crate::cli::check_evaluator::lock_wait_for(
@@ -4718,10 +4724,7 @@ fn handle_next(
             current_template_state.accepts.as_ref(),
             target,
         ) {
-            crate::decider::ledger::append_or_warn(
-                dirs::home_dir().map(|h| h.join(".koto")).as_deref(),
-                &record,
-            );
+            crate::decider::ledger::append_or_warn(ledger_root().as_deref(), &record);
         }
 
         // Dispatch on the new (target) state, skip gate evaluation.
@@ -5273,10 +5276,7 @@ fn handle_next(
                 data.as_object()
                     .expect("validate_evidence guarantees object input"),
             ) {
-                crate::decider::ledger::append_or_warn(
-                    dirs::home_dir().map(|h| h.join(".koto")).as_deref(),
-                    &record,
-                );
+                crate::decider::ledger::append_or_warn(ledger_root().as_deref(), &record);
             }
         }
     }
@@ -5712,7 +5712,7 @@ fn handle_next(
                     Box::new(render_for_decider),
                     full,
                 )
-                .with_ledger_root(dirs::home_dir().map(|h| h.join(".koto")))
+                .with_ledger_root(ledger_root())
                 .with_budget(consult_budget.clone())
             })
         } else {

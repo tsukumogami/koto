@@ -448,8 +448,10 @@ fn a_failed_first_attempt_then_an_answer_uses_the_answer() {
 
 #[test]
 fn a_failed_attempt_reports_no_tokens() {
-    // A body koto can't read carries no usage it could trust, so only the
-    // answer that was read contributes tokens.
+    // A 2xx body koto can't parse is billed but has no usage to read: it
+    // adds no tokens and counts under unread_usage_attempts (see
+    // a_billed_answer_with_no_readable_usage_is_counted_as_unread), so only
+    // the answer that was read contributes tokens.
     let h = harness(&check_template(&criterion("r", "veto")), SLICE);
     h.stub.push(Reply::raw(200, "not json"));
     h.stub.push(fail("r"));
@@ -939,6 +941,22 @@ fn a_billed_answer_koto_cannot_use_still_counts_its_tokens() {
     assert_eq!(c["input_tokens"], 140);
     assert_eq!(c["output_tokens"], 4);
     assert_eq!(c["unread_usage_attempts"], 0);
+
+    // When no attempt is usable, the record still names the model the
+    // billed answers were charged on, next to their tokens.
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    for _ in 0..2 {
+        h.stub.push(Reply::json(&json!({
+            "model": "jev-billed-9", "answers": {"r": {"type": "choice"}},
+            "usage": {"input_tokens": 40, "output_tokens": 1}
+        })));
+    }
+    run(&h, "auto");
+    let c = &checks(&h)[0];
+    assert_eq!(c["outcome"], "unanswered", "{}", c);
+    assert_eq!(c["provider"], "jev", "{}", c);
+    assert_eq!(c["model"], "jev-billed-9", "{}", c);
+    assert_eq!(c["input_tokens"], 80, "{}", c);
 }
 
 #[test]
@@ -1182,6 +1200,59 @@ fn declared_type_ok(value: &Value, ty: &str) -> bool {
     }
 }
 
+/// Every field the contract marks `required: true` for `ty` is in
+/// `payload`, and every value of a field with an `enum` is one of its
+/// members. The check above only looks at the keys koto wrote, so without
+/// this a dropped required field or a new outcome value would pass it.
+fn assert_required_and_enums(spec: &Value, ty: &str, payload: &Value) {
+    let fields = spec["events"][ty]["fields"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{} has no fields in the contract", ty));
+    for (name, decl) in fields {
+        if decl["required"] == true {
+            assert!(
+                payload.get(name.as_str()).is_some(),
+                "{}.{} is required by the contract but koto didn't write it: {}",
+                ty,
+                name,
+                payload
+            );
+        }
+        if let (Some(members), Some(value)) = (decl["enum"].as_array(), payload.get(name.as_str()))
+        {
+            assert!(
+                members.contains(value),
+                "{}.{} wrote {} outside its enum {:?}",
+                ty,
+                name,
+                value,
+                members
+            );
+        }
+    }
+}
+
+#[test]
+fn the_required_and_enum_check_bites() {
+    let spec = feed_spec();
+    let good = json!({
+        "state": "review", "visit_seq": 2, "gate": "comments", "rule_id": "r",
+        "rule_ref": "x", "declaration_hash": "h", "mode": "veto", "threshold": 0.9,
+        "outcome": "fail", "blocked": true, "provider": "jev", "model": "m",
+        "attempts": 1, "latency_ms": 1
+    });
+    assert_required_and_enums(&spec, "decider_checked", &good);
+    let mut dropped = good.clone();
+    dropped.as_object_mut().unwrap().remove("blocked");
+    let mut widened = good.clone();
+    widened["outcome"] = json!("maybe");
+    for bad in [dropped, widened] {
+        let caught =
+            std::panic::catch_unwind(|| assert_required_and_enums(&spec, "decider_checked", &bad));
+        assert!(caught.is_err(), "not caught: {}", bad);
+    }
+}
+
 #[test]
 fn every_key_a_decider_check_writes_is_in_the_contract_and_validate_feed_accepts_the_log() {
     // One session with a fail (probabilities, tokens), and one with an
@@ -1215,6 +1286,7 @@ fn every_key_a_decider_check_writes_is_in_the_contract_and_validate_feed_accepts
             );
             seen.insert(format!("{}.{}", ty, key));
         }
+        assert_required_and_enums(&spec, ty, &e["payload"]);
     }
     for key in [
         "decider_checked.probabilities",
@@ -1246,28 +1318,112 @@ fn every_key_a_decider_check_writes_is_in_the_contract_and_validate_feed_accepts
 
 #[test]
 fn overriding_a_check_that_blocks_nothing_writes_no_override_record() {
-    // A shadow criterion never blocks, so an override finds nothing listed.
-    let h = harness(&looping_template(&criterion("r", "shadow")), SLICE);
-    run(&h, "auto");
-    h.stub.push(fail("r"));
-    run_with(&h, "auto", r#"{"go": true}"#);
-    let out = h
-        .koto()
-        .args([
-            "overrides",
-            "record",
-            WF,
-            "--gate",
-            "comments",
-            "--rationale",
-            "x",
-        ])
-        .output()
+    // A shadow criterion never blocks, and a veto criterion that passed or
+    // escaped didn't either, so an override finds nothing listed as failed
+    // and writes nothing. The veto fail is the control: the same steps
+    // write exactly one record, so the empty cases aren't empty by accident.
+    for (mode, reply, want) in [
+        ("shadow", fail("r"), 0),
+        ("veto", pass("r"), 0),
+        ("veto", escape("r"), 0),
+        ("veto", fail("r"), 1),
+    ] {
+        let h = harness(&looping_template(&criterion("r", mode)), SLICE);
+        run(&h, "auto");
+        h.stub.push(reply);
+        run_with(&h, "auto", r#"{"go": true}"#);
+        let out = h
+            .koto()
+            .args([
+                "overrides",
+                "record",
+                WF,
+                "--gate",
+                "comments",
+                "--rationale",
+                "x",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", describe(&out));
+        let written: Vec<Value> = ledger(&h)
+            .into_iter()
+            .filter(|l| l["kind"] == "check_overridden")
+            .collect();
+        assert_eq!(written.len(), want, "{} {:?}", mode, written);
+        for line in &written {
+            assert_eq!(line["override_kind"], "candidate_false_fail", "{}", line);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// a compiled check with no spec
+// ---------------------------------------------------------------------------
+
+/// Rewrite the session's cached compiled template with `edit`, and the
+/// header's `template_hash` to match, as a template written by some other
+/// build would stand: the hash check passes and only the content is wrong.
+fn rewrite_cached_template(h: &Harness, edit: impl FnOnce(&mut Value)) {
+    let state = h.state_path();
+    let raw = std::fs::read_to_string(&state).unwrap();
+    let mut lines: Vec<String> = raw.lines().map(String::from).collect();
+    let init = lines
+        .iter()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|e| e["type"] == "workflow_initialized")
         .unwrap();
-    assert!(out.status.success(), "{}", describe(&out));
-    assert!(
-        !ledger(&h).iter().any(|l| l["kind"] == "check_overridden"),
-        "{:?}",
-        ledger(&h)
-    );
+    let path = init["payload"]["template_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut compiled: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    edit(&mut compiled);
+    let bytes = serde_json::to_string_pretty(&compiled).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let mut header: Value = serde_json::from_str(&lines[0]).unwrap();
+    header["template_hash"] = json!(koto::cache::sha256_hex(bytes.as_bytes()));
+    lines[0] = serde_json::to_string(&header).unwrap();
+    std::fs::write(&state, lines.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn a_session_whose_cached_check_lost_its_spec_is_refused_on_resume() {
+    // The control: the same rewrite with the spec left in place resumes, so
+    // the refusal below is the missing spec and nothing about the rewrite.
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    rewrite_cached_template(&h, |_| {});
+    h.stub.push(pass("r"));
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    rewrite_cached_template(&h, |t| {
+        let gate = t["states"]["review"]["gates"]["comments"]
+            .as_object_mut()
+            .unwrap();
+        assert!(gate.remove("decider_check").is_some(), "{:?}", gate);
+    });
+    let log = h.raw_log();
+    // Opted in or not: the refusal comes before the tick decides whether
+    // checks run at all, so a user who can't consult is refused too.
+    for mode in ["auto", "off"] {
+        let mut cmd = h.koto_mode(mode);
+        cmd.args(["next", WF, "--no-cleanup"]);
+        let out = cmd.output().unwrap();
+        assert!(!out.status.success(), "{}: {}", mode, describe(&out));
+        let body = json_out(&out);
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("E-DECIDER-CHECK-SPEC: state \"review\" check \"comments\""),
+            "{}: {}",
+            mode,
+            body
+        );
+        assert_eq!(body["error"]["code"], "template_error", "{}", body);
+    }
+    // Nothing was asked and nothing appended: the session did not resume.
+    assert_eq!(h.stub.request_count(), 0);
+    assert_eq!(h.raw_log(), log);
 }

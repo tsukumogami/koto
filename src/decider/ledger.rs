@@ -178,6 +178,18 @@ pub struct CheckOverriddenRecord {
     pub override_kind: CheckOverrideKind,
 }
 
+/// The criterion a [`LedgerRecord::check_overridden`] record names: the
+/// consultation of it the override moved past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverriddenCriterion<'a> {
+    pub state: &'a str,
+    /// The visit the overridden consultation belongs to.
+    pub visit_seq: u64,
+    pub gate: &'a str,
+    pub rule_id: &'a str,
+    pub declaration_hash: &'a str,
+}
+
 /// One ledger line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -214,26 +226,25 @@ impl LedgerRecord {
         })
     }
 
-    /// A `check_overridden` record stamped now.
-    #[allow(clippy::too_many_arguments)]
+    /// A `check_overridden` record stamped now, for an override that moved
+    /// past `criterion`'s failed verdict: always
+    /// [`CheckOverrideKind::CandidateFalseFail`]. Only a fail blocks, so
+    /// that is the only kind an override can earn; there is deliberately no
+    /// way to write [`CheckOverrideKind::OverriddenUnanswered`], which
+    /// survives only so ledgers from older builds still read.
     pub fn check_overridden(
         session: &str,
         session_id: Option<&str>,
-        state: &str,
-        visit_seq: u64,
-        gate: &str,
-        rule_id: &str,
-        declaration_hash: &str,
-        kind: CheckOverrideKind,
+        criterion: OverriddenCriterion<'_>,
     ) -> Self {
         LedgerRecord::CheckOverridden(CheckOverriddenRecord {
             envelope: RecordEnvelope::now(session, session_id),
-            state: state.to_string(),
-            visit_seq,
-            gate: gate.to_string(),
-            rule_id: rule_id.to_string(),
-            declaration_hash: declaration_hash.to_string(),
-            override_kind: kind,
+            state: criterion.state.to_string(),
+            visit_seq: criterion.visit_seq,
+            gate: criterion.gate.to_string(),
+            rule_id: criterion.rule_id.to_string(),
+            declaration_hash: criterion.declaration_hash.to_string(),
+            override_kind: CheckOverrideKind::CandidateFalseFail,
         })
     }
 
@@ -408,6 +419,9 @@ mod tests {
             directive_bytes: 300,
             endpoint_origin: SettingOrigin::Default,
             fields,
+            input_tokens: None,
+            output_tokens: None,
+            unread_usage_attempts: 0,
         }
     }
 
@@ -446,15 +460,17 @@ mod tests {
     #[test]
     fn checked_and_check_overridden_round_trip_and_parse() {
         let checked = LedgerRecord::checked("wf", Some("sid"), check("ref"));
+        let hash = "d".repeat(64);
         let overridden = LedgerRecord::check_overridden(
             "wf",
             Some("sid"),
-            "review",
-            7,
-            "comments",
-            "comment_reason",
-            &"d".repeat(64),
-            CheckOverrideKind::CandidateFalseFail,
+            OverriddenCriterion {
+                state: "review",
+                visit_seq: 7,
+                gate: "comments",
+                rule_id: "comment_reason",
+                declaration_hash: &hash,
+            },
         );
         let mut body = String::new();
         for r in [&checked, &overridden] {

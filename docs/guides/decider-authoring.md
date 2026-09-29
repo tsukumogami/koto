@@ -550,7 +550,7 @@ can't `poll:`. The compile errors are the `E-DECIDER-CHECK-*` codes in
 | `fail`: likewise for fail | blocks; a finding names the criterion | recorded only |
 | `escape`: anything else, a tie included | doesn't block | recorded only |
 | unanswered: no usable answer after one retry, over budget, the command failed, the per-call cap spent, or another `koto next` holding the lock past the wait | doesn't block; listed under the check's `output.unanswered`, no finding | recorded only |
-| not graded: the slice is empty | doesn't block | recorded only |
+| not graded: the slice is empty or only whitespace | doesn't block | recorded only |
 
 A criterion acts in veto only when the template says `veto` and the user's
 effective decider mode is `auto`; under `shadow`, or when a project's
@@ -563,21 +563,24 @@ but it doesn't block either: the gate passes, the check's output keeps the
 criterion under `unanswered`, and its `decider_checked` records outcome
 `unanswered` with the reason and `blocked: false`. The next evaluation in
 the visit asks again. A check that can't grade anything at all passes and
-says why in `output.error`: `missing_spec` for a gate with no spec (only a
-compiled template read back from JSON can have one), `log_unreadable` when
-the session log can't be read, with every veto criterion listed as
-unanswered. When another `koto next` holds the session's decider lock, the
+says why in `output.error`: `log_unreadable` when the session log can't be
+read, with every veto criterion listed as unanswered. A compiled template
+whose check has lost its spec never gets that far: koto refuses to load it
+(`E-DECIDER-CHECK-SPEC`), so no session starts or resumes on it. When another `koto next` holds the session's decider lock, the
 evaluation waits for it, up to 17 seconds at the default timeout and never
 more than 60, so running two ticks at once doesn't get past a check.
 
 A blocking check stops the state even when it accepts evidence, so the
 agent's own evidence can't route around a veto on its own work. The way past
 a wrong verdict is `koto overrides record <session> --gate <check>
---rationale <why>`, which holds for the rest of the visit and is recorded as a
-candidate false fail against each failed criterion. An unanswered criterion
-never blocked, so an override records nothing for it; ledgers from older
-builds also hold `overridden_unanswered` lines, which still read. Within one visit an unchanged slice reuses its verdict
-without asking again; a changed slice, or a new visit, is asked afresh.
+--rationale <why>`, which holds for the rest of the visit. The ledger has two
+kinds of override record. koto writes a `candidate_false_fail` against each
+criterion that failed in the current visit, the only kind that blocks. The
+other, `overridden_unanswered`, marked an override of a criterion that got no
+verdict; koto no longer writes it, since an unanswered criterion never
+blocks, but ledgers from older builds hold it and it still reads. Within one
+visit an unchanged slice reuses its verdict without asking again; a changed
+slice, or a new visit, is asked afresh.
 
 ### What's recorded for a check
 

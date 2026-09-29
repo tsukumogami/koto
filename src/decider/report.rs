@@ -160,10 +160,11 @@ pub fn read_ledger(path: &Path) -> std::io::Result<LedgerRead> {
 // The ledger report
 // ---------------------------------------------------------------------------
 
-/// Which questions to report and whether custom endpoints count.
+/// Which questions and decider checks to report, and whether custom
+/// endpoints count.
 #[derive(Debug, Clone, Default)]
 pub struct ReportOptions {
-    /// Report only questions on this state.
+    /// Report only questions and decider checks on this state.
     pub state: Option<String>,
     /// Count consultations from a user or env endpoint toward eligibility.
     pub include_custom_endpoints: bool,
@@ -1746,6 +1747,9 @@ mod tests {
                 directive_bytes: 100,
                 endpoint_origin: SettingOrigin::Default,
                 fields: [("verdict".to_string(), fc)].into_iter().collect(),
+                input_tokens: None,
+                output_tokens: None,
+                unread_usage_attempts: 0,
             },
         )
     }

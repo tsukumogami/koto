@@ -31,7 +31,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
@@ -60,10 +60,41 @@ pub const DECIDER_LOCK_FILE: &str = "decider.lock";
 /// runtime names, then the tick's overlay, then the log's bindings.
 pub type Render<'a> = Box<dyn Fn(&str) -> String + 'a>;
 
-/// Held for the length of one consultation. Closing the file releases
-/// the `flock`.
-struct LockHold {
+/// `decider.lock`, held for the length of one consultation (or one decider
+/// check's criteria). Closing the file releases the `flock`.
+pub struct LockHold {
     _file: File,
+}
+
+/// Take `<session_dir>/decider.lock` without waiting. `None` on contention
+/// or any error. The routing decider's port and the check evaluator both
+/// take it through here.
+#[cfg(unix)]
+pub fn try_decider_lock(session_dir: &Path) -> Option<LockHold> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(session_dir.join(DECIDER_LOCK_FILE))
+        .ok()?;
+    // SAFETY: `fd` is borrowed from `file`, which outlives the call.
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        return None;
+    }
+    Some(LockHold { _file: file })
+}
+
+/// No `flock` off Unix: the lock is never taken.
+#[cfg(not(unix))]
+pub fn try_decider_lock(_session_dir: &Path) -> Option<LockHold> {
+    let _ = OpenOptions::new;
+    None
 }
 
 /// Why an input couldn't be assembled. Never carries input content.
@@ -147,38 +178,10 @@ impl<'a> CliDeciderPort<'a> {
         self.recorded
     }
 
-    fn lock_path(&self) -> PathBuf {
-        self.backend
-            .session_dir(&self.session)
-            .join(DECIDER_LOCK_FILE)
-    }
-
     /// Take `decider.lock` without waiting. `None` on contention or any
     /// error: a loser never waits and never consults.
-    #[cfg(unix)]
     fn try_lock(&self) -> Option<LockHold> {
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::io::AsRawFd;
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(self.lock_path())
-            .ok()?;
-        // SAFETY: `fd` is borrowed from `file`, which outlives the call.
-        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if ret != 0 {
-            return None;
-        }
-        Some(LockHold { _file: file })
-    }
-
-    #[cfg(not(unix))]
-    fn try_lock(&self) -> Option<LockHold> {
-        None
+        try_decider_lock(&self.backend.session_dir(&self.session))
     }
 
     /// Byte length of the directive and details the opted-out `koto next`
@@ -444,7 +447,7 @@ impl DeciderPort for CliDeciderPort<'_> {
         let latency_ms = started.elapsed().as_millis() as u64;
         let result = match answer {
             Ok(response) => ConsultResult::Answered(response),
-            Err(e) => ConsultResult::Failed(e.class),
+            Err(e) => ConsultResult::Failed(e),
         };
         // The call ran without the state file locked, so an agent's
         // `koto next --with-data` may have moved the session meanwhile.
@@ -794,6 +797,9 @@ d
                     directive_bytes: 0,
                     endpoint_origin: SettingOrigin::Default,
                     fields: BTreeMap::new(),
+                    input_tokens: None,
+                    output_tokens: None,
+                    unread_usage_attempts: 0,
                 }),
                 "2026-01-01T00:00:01Z",
             )
@@ -927,6 +933,9 @@ d
             directive_bytes: 0,
             endpoint_origin: SettingOrigin::Default,
             fields: BTreeMap::new(),
+            input_tokens: None,
+            output_tokens: None,
+            unread_usage_attempts: 0,
         })
     }
 

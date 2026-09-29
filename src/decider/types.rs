@@ -221,6 +221,31 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
+/// The usage of every billed answer in one consultation, as its record
+/// carries it. The routing decider and decider checks both keep it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageTally {
+    /// Summed over the billed answers whose usage was read; `None` until one
+    /// was.
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// Billed answers whose usage couldn't be read.
+    pub unread_attempts: u32,
+}
+
+impl UsageTally {
+    /// Add one billed answer's usage, or count it as unread.
+    pub fn add(&mut self, usage: Option<Usage>) {
+        match usage {
+            Some(u) => {
+                self.input_tokens = Some(self.input_tokens.unwrap_or(0) + u.input_tokens);
+                self.output_tokens = Some(self.output_tokens.unwrap_or(0) + u.output_tokens);
+            }
+            None => self.unread_attempts += 1,
+        }
+    }
+}
+
 /// The answer to one question.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -299,6 +324,23 @@ pub struct DeciderError {
     /// The token counts that answer reported, when they could be read.
     /// Counts only: never any part of the answer.
     pub usage: Option<Usage>,
+    /// The model build that answer named, already sanitized, when it named
+    /// one, so a record that counts the answer's tokens can say which model
+    /// they were billed on. `None` for every other error.
+    pub model: Option<AnswerModel>,
+}
+
+/// A model name read from an answer koto couldn't use. It is recorded the
+/// way a usable answer's model is, but it came from the response body, so
+/// its `Debug` never prints it: a `DeciderError`'s `Debug` and `Display`
+/// stay free of anything the provider sent.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AnswerModel(pub String);
+
+impl fmt::Debug for AnswerModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AnswerModel(..)")
+    }
 }
 
 impl DeciderError {
@@ -336,10 +378,11 @@ impl DeciderError {
     }
 
     /// Mark this error as coming from a 2xx answer koto couldn't use, with
-    /// the usage that answer reported, if any.
-    pub fn with_response_usage(mut self, usage: Option<Usage>) -> Self {
+    /// the usage and the (sanitized) model that answer reported, if any.
+    pub fn with_response_usage(mut self, usage: Option<Usage>, model: Option<String>) -> Self {
         self.responded = true;
         self.usage = usage;
+        self.model = model.map(AnswerModel);
         self
     }
 
@@ -360,6 +403,7 @@ impl DeciderError {
             detail,
             responded: false,
             usage: None,
+            model: None,
         }
     }
 }

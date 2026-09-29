@@ -1672,6 +1672,143 @@ fn provider_and_model_are_recorded() {
     assert_eq!(h.consultations()[0]["model"], "unknown");
 }
 
+/// The routing decider counts tokens the way a decider check does: every
+/// billed answer's usage, including a 2xx answer koto couldn't use, one
+/// whose usage couldn't be read counted as unread, and nothing for an
+/// answer that wasn't billed. The provider and the model are on the same
+/// record as the tokens, so the spend can be priced.
+#[test]
+fn routing_counts_every_billed_answer_with_its_provider_and_model() {
+    let usage = json!({"input_tokens": 120, "output_tokens": 4});
+    let usable = json!({"verdict": {"type": "choice",
+        "probabilities": {"proceed": 0.95, "exit": 0.03, "unclear": 0.02}}});
+    /// (reply, (input, output) tokens, unread, model, error_class)
+    type Case = (
+        Reply,
+        Option<(u64, u64)>,
+        u64,
+        &'static str,
+        Option<&'static str>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            Reply::json(&json!({"model": "jev-test-1.2.3", "answers": usable, "usage": usage})),
+            Some((120, 4)),
+            0,
+            "jev-test-1.2.3",
+            None,
+        ),
+        // Usage the answer carries but koto can't read: `{}`.
+        (go(), None, 1, "jev-test-1.2.3", None),
+        // A 2xx answer to a question nobody asked: billed, so its tokens
+        // and its model are kept.
+        (
+            Reply::json(
+                &json!({"model": "jev-test-1.2.3", "answers": {"other": {}}, "usage": usage}),
+            ),
+            Some((120, 4)),
+            0,
+            "jev-test-1.2.3",
+            Some("mismatched"),
+        ),
+        // A 2xx body that isn't JSON: billed, nothing readable.
+        (
+            Reply::raw(200, "not json"),
+            None,
+            1,
+            "unknown",
+            Some("malformed"),
+        ),
+        // A non-2xx status isn't billed and adds nothing.
+        (Reply::status(503), None, 0, "unknown", Some("http_status")),
+    ];
+    for (reply, tokens, unread, model, error_class) in cases {
+        let h = ready(&standard("shadow", "shadow"), vec![reply]);
+        h.next_mode("shadow");
+        let c = &h.consultations()[0];
+        let label = c.to_string();
+        assert_eq!(c["provider"], "jev", "{}", label);
+        assert_eq!(c["model"], model, "{}", label);
+        assert_eq!(c["error_class"].as_str(), error_class, "{}", label);
+        match tokens {
+            Some((i, o)) => {
+                assert_eq!(c["input_tokens"], i, "{}", label);
+                assert_eq!(c["output_tokens"], o, "{}", label);
+            }
+            None => {
+                assert!(c.get("input_tokens").is_none(), "{}", label);
+                assert!(c.get("output_tokens").is_none(), "{}", label);
+            }
+        }
+        // Written on every record, zero included.
+        assert_eq!(c["unread_usage_attempts"], unread, "{}", label);
+        assert_consulted_meets_the_contract(c);
+
+        // The ledger's `consulted` line carries the same accounting.
+        let ledger =
+            std::fs::read_to_string(h.home().join(".koto").join("_decider_ledger.jsonl")).unwrap();
+        let line: Value = ledger
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|l| l["kind"] == "consulted")
+            .unwrap_or_else(|| panic!("no consulted line: {}", ledger));
+        for key in [
+            "input_tokens",
+            "output_tokens",
+            "unread_usage_attempts",
+            "provider",
+            "model",
+        ] {
+            assert_eq!(line.get(key), c.get(key), "ledger {}: {}", key, line);
+        }
+    }
+}
+
+/// Every key a `decider_consulted` payload carries is declared in the
+/// session-feed contract with its type, every required field is there, and
+/// `outcome` is one of the declared values.
+fn assert_consulted_meets_the_contract(payload: &Value) {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/reference/session-feed.md");
+    let text = std::fs::read_to_string(path).unwrap();
+    let rest = text.strip_prefix("---\n").unwrap();
+    let spec: Value = serde_yaml_ng::from_str(&rest[..rest.find("\n---\n").unwrap()]).unwrap();
+    let fields = spec["events"]["decider_consulted"]["fields"]
+        .as_object()
+        .unwrap();
+    for (key, value) in payload.as_object().unwrap() {
+        let ty = fields
+            .get(key)
+            .and_then(|d| d["type"].as_str())
+            .unwrap_or_else(|| panic!("decider_consulted.{} is not declared", key));
+        let ok = match ty {
+            "string" => value.is_string(),
+            "integer" => value.is_u64() || value.is_i64(),
+            "object" => value.is_object(),
+            _ => true,
+        };
+        assert!(
+            ok,
+            "decider_consulted.{} declared {} but is {}",
+            key, ty, value
+        );
+    }
+    for (name, decl) in fields {
+        if decl["required"] == true {
+            assert!(payload.get(name).is_some(), "{} missing: {}", name, payload);
+        }
+        if let (Some(members), Some(v)) = (decl["enum"].as_array(), payload.get(name)) {
+            assert!(
+                members.contains(v),
+                "{} = {} outside {:?}",
+                name,
+                v,
+                members
+            );
+        }
+    }
+}
+
 #[test]
 fn the_record_holds_no_input_key_or_response_text() {
     const RESPONSE_MARKER: &str = "RESPONSE-TEXT-0b9d";

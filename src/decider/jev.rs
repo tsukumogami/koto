@@ -107,8 +107,11 @@ impl Decider for JevDecider {
             return Err(DeciderError::http_status(status));
         }
         // A 2xx answer koto can't use was still billed: keep its usage (the
-        // token counts, nothing else) on the error.
-        decode_response(req, &bytes).map_err(|e| e.with_response_usage(usage_of_body(&bytes)))
+        // token counts) and the model it named on the error, nothing else.
+        decode_response(req, &bytes).map_err(|e| {
+            let (usage, model) = billing_of_body(&bytes);
+            e.with_response_usage(usage, model)
+        })
     }
 }
 
@@ -313,11 +316,14 @@ pub fn decode_response(
     })
 }
 
-/// The `usage` of a response body koto couldn't otherwise use, when the
-/// body is a JSON object carrying one.
-fn usage_of_body(body: &[u8]) -> Option<super::types::Usage> {
-    let root: Value = serde_json::from_slice(body).ok()?;
-    decode_usage(root.get("usage"))
+/// The `usage` and the sanitized `model` of a response body koto couldn't
+/// otherwise use, each when the body is a JSON object carrying one.
+fn billing_of_body(body: &[u8]) -> (Option<super::types::Usage>, Option<String>) {
+    let Ok(root) = serde_json::from_slice::<Value>(body) else {
+        return (None, None);
+    };
+    let model = Some(sanitize_model(root.get("model"))).filter(|m| m != UNKNOWN_MODEL);
+    (decode_usage(root.get("usage")), model)
 }
 
 /// Jev's `usage`: `input_tokens` and `output_tokens` as whole numbers. Kept
