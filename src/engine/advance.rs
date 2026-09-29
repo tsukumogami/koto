@@ -271,6 +271,7 @@ fn action_condition(
         duration_ms: None,
         context_reads: Vec::new(),
         poll: None,
+        decider_checks: Vec::new(),
     };
     fill_effect_landed(result.all_findings_mut(), false);
 
@@ -1658,6 +1659,15 @@ where
                                 .into_event(READER_GATE, &state, Some(gate_name.as_str()));
                         append_best_effort(&read_event, |p| append_event(p));
                     }
+                    // A decider check's consultations come immediately
+                    // before its `gate_evaluated`. Unlike a context read,
+                    // each is the only record of a paid consultation and of
+                    // its verdict, so a failed append fails the tick, as the
+                    // `gate_evaluated` append does.
+                    for check in &result.decider_checks {
+                        append_event(&EventPayload::DeciderChecked(check.clone()))
+                            .map_err(AdvanceError::PersistenceError)?;
+                    }
                     append_event(&gate_evaluated_payload)
                         .map_err(AdvanceError::PersistenceError)?;
                     gate_results.insert(gate_name.clone(), result.clone());
@@ -1688,7 +1698,20 @@ where
                 // transition matches.
                 //
                 // If neither condition holds, return GateBlocked immediately.
-                if template_state.accepts.is_none() && !has_gates_routing {
+                //
+                // A blocking decider check is the exception to the evidence
+                // fallback (DESIGN-koto-decider-checks.md, Decision 3): it is
+                // a veto on the agent's own work, so the agent's evidence must
+                // not route past it. It blocks whatever the state accepts,
+                // and `koto overrides record` is the way past.
+                let decider_check_blocks = gate_results.iter().any(|(name, r)| {
+                    r.outcome != GateOutcome::Passed
+                        && template_state.gates.get(name).is_some_and(|g| {
+                            g.gate_type == crate::template::types::GATE_TYPE_DECIDER_CHECK
+                        })
+                });
+                if decider_check_blocks || (template_state.accepts.is_none() && !has_gates_routing)
+                {
                     return Ok(AdvanceResult {
                         attempts: None,
                         final_state: state,
@@ -7222,6 +7245,7 @@ mod tests {
                     None,
                     None,
                     Some(root),
+                    None,
                 ))
             };
             let result = advance_until_stop(
@@ -7392,6 +7416,7 @@ mod tests {
             duration_ms: Some(7),
             context_reads: Vec::new(),
             poll: None,
+            decider_checks: Vec::new(),
         }
     }
 

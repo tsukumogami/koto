@@ -1361,6 +1361,12 @@ pub enum EventPayload {
     ///
     /// Declared before `InstructionsDelivered` for the reason given there.
     DeciderConsulted(crate::decider::record::DeciderConsultation),
+    /// One consultation of one decider-check criterion
+    /// (DESIGN-koto-decider-checks.md, Decision 5), appended immediately
+    /// before its gate's `gate_evaluated`. A reused verdict appends none.
+    /// Additive: an older build lands it in `Unknown`, and a payload this
+    /// build can't parse does the same rather than failing the read.
+    DeciderChecked(crate::decider::check::DeciderCheck),
     InstructionsDelivered {
         /// The phase whose instructions the response carried.
         state: String,
@@ -1714,6 +1720,7 @@ impl EventPayload {
             EventPayload::RequestLegAbandoned { .. } => "request.leg_abandoned",
             EventPayload::RequestClosed { .. } => "request.closed",
             EventPayload::DeciderConsulted(_) => "decider_consulted",
+            EventPayload::DeciderChecked(_) => "decider_checked",
             EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
             EventPayload::Unknown { .. } => "unknown",
         }
@@ -2121,6 +2128,19 @@ impl<'de> Deserialize<'de> for Event {
                     request_id: p.request_id,
                     disposition: p.disposition,
                     issued_by: p.issued_by,
+                }
+            }
+            "decider_checked" => {
+                // As for decider_consulted: a payload this build can't read
+                // degrades to `Unknown`.
+                match serde_json::from_value::<crate::decider::check::DeciderCheck>(
+                    payload_val.clone(),
+                ) {
+                    Ok(c) => EventPayload::DeciderChecked(c),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
                 }
             }
             "decider_consulted" => {
@@ -3515,6 +3535,54 @@ mod tests {
             endpoint_origin: crate::decider::SettingOrigin::Default,
             fields,
         }
+    }
+
+    #[test]
+    fn decider_checked_round_trips_and_degrades_to_unknown() {
+        use crate::decider::check::{DeciderCheck, RecordedOutcome, UnansweredReason};
+        let p = EventPayload::DeciderChecked(DeciderCheck {
+            state: "review".into(),
+            visit_seq: 2,
+            gate: "comments".into(),
+            rule_id: "comment_reason".into(),
+            rule_ref: "ref".into(),
+            declaration_hash: "h".into(),
+            mode: crate::template::decider_check::CheckMode::Veto,
+            threshold: 0.9,
+            outcome: RecordedOutcome::Unanswered,
+            reason: Some(UnansweredReason::CapSpent),
+            blocked: true,
+            provider: "jev".into(),
+            model: "unknown".into(),
+            probabilities: BTreeMap::new(),
+            input_sha256: Some("a".repeat(64)),
+            input_bytes: Some(34),
+            input_tokens: None,
+            output_tokens: None,
+            attempts: 0,
+            latency_ms: 0,
+            error_class: None,
+            endpoint_origin: None,
+        });
+        assert_eq!(p.type_name(), "decider_checked");
+        let e = Event {
+            seq: 4,
+            timestamp: "2026-09-29T10:00:00Z".to_string(),
+            event_type: p.type_name().to_string(),
+            payload: p,
+            idempotency_hash: None,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "decider_checked");
+        assert_eq!(v["payload"]["reason"], "cap_spent");
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+
+        // A payload this build can't read lands in Unknown.
+        let line = r#"{"seq":9,"timestamp":"2026-09-29T10:00:00Z","type":"decider_checked","payload":{"state":"x"}}"#;
+        let ev: Event = serde_json::from_str(line).unwrap();
+        assert!(matches!(ev.payload, EventPayload::Unknown { .. }));
     }
 
     #[test]

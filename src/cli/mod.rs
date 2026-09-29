@@ -1,6 +1,7 @@
 pub mod batch;
 pub mod batch_error;
 pub mod batch_view;
+pub mod check_evaluator;
 pub mod context;
 pub mod dashboard;
 pub mod dashboard_data;
@@ -3627,6 +3628,10 @@ struct TickGates<'a> {
     /// promotion writes to. `None` without a home directory, which the gate
     /// reports as an error rather than a pass.
     request_root: Option<std::path::PathBuf>,
+    /// The decider-check evaluator, present only when the user is opted in
+    /// and a provider was built; otherwise the template view the tick uses
+    /// has no decider checks to evaluate.
+    checks: Option<&'a crate::cli::check_evaluator::CliCheckEvaluator<'a>>,
 }
 
 #[cfg(unix)]
@@ -3642,6 +3647,9 @@ impl TickGates<'_> {
         std::collections::BTreeMap<String, crate::gate::StructuredGateResult>,
         crate::engine::substitute::GateCaptureRefusal,
     > {
+        // Each criterion's declaration hash covers the command as the
+        // template wrote it, so it is taken before substitution.
+        let hashes = crate::cli::check_evaluator::declaration_hashes(gates);
         let substituted = substitute_gate_fields(
             gates,
             self.runtime_vars,
@@ -3649,6 +3657,23 @@ impl TickGates<'_> {
             self.overlay,
             self.capture_names,
         )?;
+        let check_eval = |name: &str, gate: &crate::template::types::Gate| {
+            match self.checks {
+                Some(evaluator) => evaluator.evaluate(
+                    name,
+                    gate,
+                    hashes.get(name).map(Vec::as_slice).unwrap_or(&[]),
+                ),
+                // Unreachable through `koto next`, whose template view drops
+                // decider checks when there is no evaluator; a pass is the
+                // safe answer for a check that can only veto.
+                None => crate::gate::StructuredGateResult {
+                    outcome: crate::gate::GateOutcome::Passed,
+                    output: crate::template::types::decider_check_default_output(),
+                    ..Default::default()
+                },
+            }
+        };
         Ok(crate::gate::evaluate_gates_with_request_store(
             &substituted,
             self.execution_dir,
@@ -3657,6 +3682,7 @@ impl TickGates<'_> {
             Some(self.session),
             Some(children_eval),
             self.request_root.as_deref(),
+            Some(&check_eval),
         ))
     }
 }
@@ -4357,6 +4383,26 @@ fn handle_next(
         }
     };
 
+    // Decider checks (DESIGN-koto-decider-checks.md, Decision 4). A user who
+    // can't consult -- not opted in, or no provider could be built -- gets a
+    // view of the template with every decider check removed, for the whole
+    // tick, so the state behaves exactly as if none were declared. The view
+    // is built only when the template declares one.
+    let has_decider_checks = crate::cli::check_evaluator::declares_checks(&compiled);
+    let check_provider = if has_decider_checks && decider_settings.opted_in() {
+        crate::decider::build_decider(&decider_settings)
+    } else {
+        None
+    };
+    let compiled = if has_decider_checks && check_provider.is_none() {
+        crate::cli::check_evaluator::without_checks(compiled)
+    } else {
+        compiled
+    };
+    // The per-call consultation cap, shared by the routing decider's port and
+    // the check evaluator.
+    let consult_budget = crate::cli::check_evaluator::ConsultBudget::new();
+
     // Check for reserved variable name collisions in the template.
     for reserved in crate::cli::vars::RESERVED_VARIABLE_NAMES {
         if compiled.variables.contains_key(*reserved) {
@@ -4429,6 +4475,23 @@ fn handle_next(
         }
     };
 
+    let check_evaluator = check_provider.map(|provider| {
+        crate::cli::check_evaluator::CliCheckEvaluator::new(
+            backend,
+            &name,
+            provider,
+            crate::engine::decider::effective_global_mode(
+                decider_settings.user_mode(),
+                decider_settings.project_mode(),
+            ),
+            decider_settings.endpoint_origin(),
+            consult_budget.clone(),
+            &execution_dir,
+            &command_env,
+        )
+        .with_ledger_root(dirs::home_dir().map(|h| h.join(".koto")))
+    });
+
     // The one gate evaluator this tick uses, wherever it evaluates gates.
     let tick_gates = TickGates {
         runtime_vars: &runtime_vars,
@@ -4440,6 +4503,7 @@ fn handle_next(
         context_store,
         session: &name,
         request_root: dirs::home_dir().map(|home| home.join(".koto")),
+        checks: check_evaluator.as_ref(),
     };
 
     // 4. Handle --to (directed transition) -- single-shot, no advancement loop
@@ -5544,6 +5608,11 @@ fn handle_next(
                         Some(&name),
                         None, // children-complete not needed in polling loop
                         tick_gates.request_root.as_deref(),
+                        // Nor a decider check: this loop's evaluations are
+                        // unrecorded, so a check passes here without
+                        // consulting, and the advance loop's recorded
+                        // evaluation that follows consults it.
+                        None,
                     )
                 },
                 &shutdown,
@@ -5639,6 +5708,7 @@ fn handle_next(
                     full,
                 )
                 .with_ledger_root(dirs::home_dir().map(|h| h.join(".koto")))
+                .with_budget(consult_budget.clone())
             })
         } else {
             None

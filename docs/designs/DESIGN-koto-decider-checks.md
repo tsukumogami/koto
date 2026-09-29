@@ -191,6 +191,15 @@ The engine never sees a provider, a lock or the ledger (D6), and a decider
 check is evaluated wherever the advance loop evaluates gates, with no new
 loop step.
 
+The engine does change in one place. A failed gate on a state that accepts
+evidence normally falls through to the transition resolver, so evidence
+matching a conditional transition still routes: the gate is one way
+forward and the evidence another. For a decider check that would let the
+agent's own evidence walk around a veto on the agent's own work, so a
+blocking decider check stops the state whether or not it accepts evidence
+(R11), and `koto overrides record` is the way past (R22). Every other gate
+keeps the evidence fallback.
+
 #### Alternatives considered
 
 - **An engine-side consultation step through the routing `DeciderPort`.**
@@ -514,7 +523,7 @@ can't be judged.
 | `input_sha256` | string | no | SHA-256 of the labelled slice, as the routing decider hashes inputs; present whenever the extraction produced output. |
 | `input_bytes` | integer | no | Byte length of the redacted slice; present with `input_sha256`. |
 | `attempts` | integer | yes | Provider attempts made: 0, 1 or 2. |
-| `input_tokens` | integer | no | Input tokens the provider reported, summed over attempts. Jev reports them under `usage`; absent when no attempt reported usage. |
+| `input_tokens` | integer | no | Input tokens the provider reported, summed over the attempts whose answer koto could read (a failed attempt's body is discarded unread, so it reports none). Jev reports them under `usage`; absent when no attempt reported usage. |
 | `output_tokens` | integer | no | Output tokens, likewise. Jev reports no cache fields; a provider that does can add them later as optional fields. |
 | `latency_ms` | integer | yes | Total wall time of the attempts. |
 | `error_class` | string | no | The last attempt's error class, when it failed. |

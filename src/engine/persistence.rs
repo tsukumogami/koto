@@ -1306,6 +1306,15 @@ pub(crate) fn any_entry_index(events: &[Event], current_state: &str) -> Option<u
     entry_index(events, current_state, Boundary::AnyEntry)
 }
 
+/// Index of the event that opened `current_state`'s current visit: the last
+/// arrival from a different state, or rewind, naming it. A self-transition
+/// doesn't open one. The [`Boundary::ArrivalFromElsewhere`] boundary
+/// [`delivery_window`] and the `visit_attempt` stamp cut at, exposed so a
+/// decider check's `visit_seq` comes from the same rule.
+pub(crate) fn arrival_index(events: &[Event], current_state: &str) -> Option<usize> {
+    entry_index(events, current_state, Boundary::ArrivalFromElsewhere)
+}
+
 /// [`epoch_slice`], for tests outside this module that pin the visit
 /// boundary against it.
 #[cfg(test)]

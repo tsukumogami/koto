@@ -115,6 +115,9 @@ pub enum MessageSource {
     Output,
     /// koto wrote the finding and its message.
     Koto,
+    /// A decider's verdict on a decider-check criterion produced the
+    /// finding (DESIGN-koto-decider-checks.md, Decision 5).
+    Decider,
     /// A source this koto doesn't know. koto never produces it.
     Other(String),
 }
@@ -126,6 +129,7 @@ impl MessageSource {
             MessageSource::Check => "check",
             MessageSource::Output => "output",
             MessageSource::Koto => "koto",
+            MessageSource::Decider => "decider",
             MessageSource::Other(s) => s,
         }
     }
@@ -144,6 +148,7 @@ impl<'de> Deserialize<'de> for MessageSource {
             "check" => MessageSource::Check,
             "output" => MessageSource::Output,
             "koto" => MessageSource::Koto,
+            "decider" => MessageSource::Decider,
             _ => MessageSource::Other(s),
         })
     }

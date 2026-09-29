@@ -86,6 +86,8 @@ pub struct CliDeciderPort<'a> {
     session_id: Option<String>,
     recorded: usize,
     ledger_root: Option<PathBuf>,
+    /// The per-call consultation cap shared with decider checks, when set.
+    budget: Option<crate::cli::check_evaluator::ConsultBudget>,
     /// `context_read` events for the context inputs the last consultation
     /// read, until the engine takes them.
     pending_reads: Vec<EventPayload>,
@@ -115,6 +117,7 @@ impl<'a> CliDeciderPort<'a> {
             session_id: None,
             recorded: 0,
             ledger_root: None,
+            budget: None,
             pending_reads: Vec::new(),
         }
     }
@@ -122,6 +125,12 @@ impl<'a> CliDeciderPort<'a> {
     /// Write `consulted` records to the ledger under `koto_root`
     /// (`~/.koto`). `None` means there is no home directory: each record
     /// then produces a warning instead of a line.
+    /// Share the per-call consultation cap with decider checks.
+    pub fn with_budget(mut self, budget: crate::cli::check_evaluator::ConsultBudget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
     pub fn with_ledger_root(mut self, koto_root: Option<PathBuf>) -> Self {
         self.ledger_root = koto_root;
         self
@@ -423,6 +432,13 @@ impl DeciderPort for CliDeciderPort<'_> {
         };
         let sha = input_sha256(&request.inputs);
 
+        // The per-call cap is shared with decider checks; a slot is taken
+        // only for a request about to be sent.
+        if let Some(budget) = &self.budget {
+            if !budget.try_take() {
+                return ConsultReply::Skipped;
+            }
+        }
         let started = Instant::now();
         let answer = self.decider.decide(&request);
         let latency_ms = started.elapsed().as_millis() as u64;
