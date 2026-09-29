@@ -22,16 +22,13 @@ states:
       - target: work
         when:
           vars.MODE: interactive
+  # The only edge is unconditional, so the ARM value on this transition's
+  # vars_matched can come only from the skip_if map.
   arm_check:
     skip_if:
       vars.ARM: with-rule
     transitions:
       - target: work
-        when:
-          vars.ARM: with-rule
-      - target: work
-        when:
-          vars.ARM: without-rule
   work:
     accepts:
       note:
