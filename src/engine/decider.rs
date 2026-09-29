@@ -20,7 +20,9 @@ use crate::config::resolve::DeciderSettings;
 use crate::decider::evaluate::{evaluate, EffectiveModes};
 use crate::decider::record::{ConsultationOutcome, DeciderConsultation, FieldConsultation};
 use crate::decider::request::{declared_fields, DeclaredField};
-use crate::decider::types::{DecisionResponse, ErrorClass, GlobalMode, SettingOrigin};
+use crate::decider::types::{
+    DeciderError, DecisionResponse, GlobalMode, SettingOrigin, UsageTally,
+};
 use crate::engine::advance::{conditional_match_indices, AdvanceError};
 use crate::engine::evidence::validate_evidence;
 use crate::engine::persistence::{any_entry_index, derive_state_from_log};
@@ -160,8 +162,9 @@ pub struct ConsultRequest<'a> {
 pub enum ConsultResult {
     /// A declared input was unset or over its byte budget; nothing was sent.
     InputUnavailable,
-    /// The provider call failed.
-    Failed(ErrorClass),
+    /// The provider call failed. A 2xx answer koto couldn't use is one of
+    /// these too, and was billed: the error carries its usage and model.
+    Failed(DeciderError),
     /// The provider answered. The engine still evaluates the answer.
     Answered(DecisionResponse),
 }
@@ -437,13 +440,27 @@ where
     };
 
     let mut model = UNKNOWN_MODEL.to_string();
+    // Token accounting, as a decider check keeps it: every billed answer's
+    // usage counts, including a 2xx answer koto couldn't use, and one whose
+    // usage couldn't be read is counted as unread. A non-2xx status or a
+    // transport failure was not billed and adds nothing.
+    let mut usage = UsageTally::default();
     let mut apply: Option<(Map<String, Value>, (usize, String))> = None;
     let (mut outcome, error_class, recorded_fields) = match result {
         ConsultResult::InputUnavailable => {
             (ConsultationOutcome::InputUnavailable, None, unevaluated())
         }
-        ConsultResult::Failed(class) => (ConsultationOutcome::Error, Some(class), unevaluated()),
+        ConsultResult::Failed(e) => {
+            if e.responded {
+                usage.add(e.usage);
+                if let Some(m) = e.model {
+                    model = m;
+                }
+            }
+            (ConsultationOutcome::Error, Some(e.class), unevaluated())
+        }
         ConsultResult::Answered(response) => {
+            usage.add(response.usage);
             model = response.model.clone();
             let mut eff = EffectiveModes::new();
             for (field, values) in &modes {
@@ -503,6 +520,9 @@ where
         directive_bytes,
         endpoint_origin,
         fields: recorded_fields,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        unread_usage_attempts: usage.unread_attempts,
     });
     // The inputs the consultation read come just before it, best-effort.
     for read in port.take_context_reads() {
@@ -592,6 +612,7 @@ fn applicable_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decider::types::ErrorClass;
     use crate::engine::types::Event;
 
     // -- effective_mode ---------------------------------------------------
@@ -679,6 +700,9 @@ mod tests {
             directive_bytes: 1,
             endpoint_origin: SettingOrigin::Default,
             fields: BTreeMap::new(),
+            input_tokens: None,
+            output_tokens: None,
+            unread_usage_attempts: 0,
         })
     }
 
@@ -947,7 +971,7 @@ mod tests {
             let result = match self.replies.pop_front().expect("unscripted consult") {
                 Scripted::Skip => return ConsultReply::Skipped,
                 Scripted::Input => ConsultResult::InputUnavailable,
-                Scripted::Fail(c) => ConsultResult::Failed(c),
+                Scripted::Fail(c) => ConsultResult::Failed(DeciderError::new(c, "scripted")),
                 Scripted::Answer(go, hold, unclear) => {
                     let mut answers = BTreeMap::new();
                     answers.insert(

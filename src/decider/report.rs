@@ -1746,6 +1746,9 @@ mod tests {
                 directive_bytes: 100,
                 endpoint_origin: SettingOrigin::Default,
                 fields: [("verdict".to_string(), fc)].into_iter().collect(),
+                input_tokens: None,
+                output_tokens: None,
+                unread_usage_attempts: 0,
             },
         )
     }

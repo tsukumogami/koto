@@ -811,7 +811,8 @@ A check only ever vetoes. A criterion in `veto`, for a user whose effective
 decider mode is `auto`, blocks the state on a `fail` verdict only. A
 missing or malformed verdict never blocks: the criterion is listed under the
 check's `output.unanswered` and recorded with its reason, and it is never
-read as a pass. A pass, an escape and an empty slice never block, and a pass
+read as a pass. A pass, an escape and an empty or whitespace-only slice (not
+graded, nothing asked) never block, and a pass
 never advances anything. In `shadow` nothing blocks and every verdict
 is recorded. For users who aren't opted in, the state behaves as if the check
 weren't declared. A blocking check stops the state even when it accepts
@@ -822,8 +823,11 @@ needs `rule_ref`, `question`, `pass`, `fail` and `escape`; at most four
 criteria across a state's decider checks, each `rule_id` once; a decider check
 can't be `overridable: false`, can't `poll:`, and no `when`, `skip_if` or
 context assignment may read its output. `max_bytes`, `label` and `criteria`
-belong to decider checks only. The full reference is
-`docs/guides/decider-authoring.md` ("Checking the agent's work").
+belong to decider checks only. koto also refuses to load a compiled template
+whose decider check has lost its criteria (`E-DECIDER-CHECK-SPEC`), so a
+session never starts or resumes on it; compile the template again from its
+source. The full reference is `docs/guides/decider-authoring.md` ("Checking
+the agent's work").
 
 ### Findings: telling the agent why a check failed
 

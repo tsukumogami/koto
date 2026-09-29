@@ -99,7 +99,8 @@ pub enum CheckOutcome {
     /// no value won at its threshold.
     Escape,
     Unanswered(UnansweredReason),
-    /// The slice was empty: nothing to ask about, nothing sent.
+    /// The slice was empty or only whitespace: nothing to ask about,
+    /// nothing sent.
     NotGraded,
 }
 
@@ -350,6 +351,10 @@ impl DeciderCheck {
             RecordedOutcome::Fail => CheckOutcome::Fail,
             RecordedOutcome::Escape => CheckOutcome::Escape,
             RecordedOutcome::NotGraded => CheckOutcome::NotGraded,
+            // koto sets `reason` on every unanswered record it writes (the
+            // reason comes from the same `CheckOutcome` as the outcome, in
+            // `CheckOutcome::recorded`). Only a hand-edited or foreign line
+            // lacks one, and that reads as the most generic cause.
             RecordedOutcome::Unanswered => {
                 CheckOutcome::Unanswered(self.reason.unwrap_or(UnansweredReason::ProviderError))
             }

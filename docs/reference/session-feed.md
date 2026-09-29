@@ -478,6 +478,15 @@ events:
       fields:
         type: object
         required: true
+      input_tokens:
+        type: integer
+        required: false
+      output_tokens:
+        type: integer
+        required: false
+      unread_usage_attempts:
+        type: integer
+        required: false
 
   decider_checked:
     tier: 2
@@ -1429,15 +1438,20 @@ logs `stdout` or `stderr`, since its output is the agent's own text. Its
   are only in `decider_checked`.
 
 `output.error` is `""` unless the check couldn't grade anything, and then the
-event is `passed` and no `decider_checked` precedes it: `missing_spec` when
-the gate has no decider-check spec (the lists are empty), or `log_unreadable`
+event is `passed` and no `decider_checked` precedes it: `log_unreadable`
 when the session log couldn't be read (every veto criterion is listed under
-`unanswered`). Consumers MUST tolerate other values.
+`unanswered`). The evaluator keeps a `missing_spec` value (the lists empty)
+for a gate with no decider-check spec as a defence in depth, but loading a
+compiled template refuses such a gate (`E-DECIDER-CHECK-SPEC`), so a session
+never reaches it. Consumers MUST tolerate other values.
 
 Logs from koto before this rule may hold a decider check's event with outcome
 `error` (no criterion failed, a veto criterion got no verdict) and koto's own
 finding, `rule_id` the gate's name, `message_source` `koto`, message beginning
-`no verdict was read`. koto no longer writes it; readers keep accepting it.
+`no verdict was read`. koto no longer writes it. No reader handles it
+specially: such logs still parse, and still validate against this contract,
+because an `error` outcome and a koto finding are ordinary values of fields
+it already declares.
 
 Each consultation's `decider_checked` event comes immediately before this
 event.
@@ -1674,6 +1688,9 @@ template declares a `decider` block, and at most once per visit to a state.
     "latency_ms": 212,
     "directive_bytes": 318,
     "endpoint_origin": "default",
+    "input_tokens": 240,
+    "output_tokens": 4,
+    "unread_usage_attempts": 0,
     "fields": {
       "verdict": {
         "declaration_hash": "9c2d...71f0",
@@ -1695,7 +1712,7 @@ template declares a `decider` block, and at most once per visit to a state.
 | `state` | string | Yes | The state consulted. |
 | `visit_seq` | integer | Yes | The `seq` of the event that began this visit to the state. A visit is consulted at most once. |
 | `provider` | string | Yes | The provider name, such as `"jev"`. |
-| `model` | string | Yes | The model build the provider reported, or `"unknown"`. |
+| `model` | string | Yes | The model build the provider reported, or `"unknown"`. A 2xx answer koto couldn't use still names its model when it named one, so an event that carries tokens says which model they were billed on. |
 | `input_sha256` | string | No | SHA-256 of the assembled inputs. Absent when they couldn't be assembled. |
 | `outcome` | string | Yes | `"applied"`, `"not_applied"`, `"input_unavailable"`, or `"error"`. |
 | `error_class` | string | No | How the provider call failed, present only with `"error"`. Consumers MUST tolerate values they don't recognize. |
@@ -1703,6 +1720,9 @@ template declares a `decider` block, and at most once per visit to a state.
 | `directive_bytes` | integer | Yes | Byte length of the directive and details the agent would have received for this state. |
 | `endpoint_origin` | string | No | Where the endpoint came from: `"default"`, `"user"`, or `"env"`. |
 | `fields` | object | Yes | Keyed by declared field. Each holds its `declaration_hash`, the effective `modes`, `probabilities` rounded to four places (absent when there was no usable answer), `winning`, `confidence`, `threshold`, `at_threshold`, and a per-field `outcome`. |
+| `input_tokens` | integer | No | Input tokens the provider reported for a billed answer: any 2xx answer, including one koto couldn't use (`outcome` `"error"`). Only the answer's usage counts are read. Absent when no usage could be read, including for a non-2xx status or a transport failure, which aren't billed. Counted as `decider_checked` counts them. |
+| `output_tokens` | integer | No | Output tokens, likewise. |
+| `unread_usage_attempts` | integer | No | Billed answers whose usage couldn't be read (0 or 1, since the routing decider makes one attempt), the size of any remaining undercount. Written on every event; absent only on events from before it existed, which read as 0. |
 
 The event carries no input content and no credentials: inputs appear only as
 `input_sha256`, and the API key, the response body, and error text are never
@@ -1771,7 +1791,7 @@ appends none.
 | `reason` | string | No | With `unanswered` only: `provider_error`, `unreadable_response`, `over_budget`, `extraction_failed`, `cap_spent` or `busy`. |
 | `blocked` | boolean | Yes | Whether this criterion blocked the state. Only a veto `fail` does; an `unanswered` outcome is always `false`. Logs from older koto may hold `true` on a veto `unanswered`. |
 | `provider` | string | Yes | The provider name, such as `"jev"`. |
-| `model` | string | Yes | The model build the provider reported, or `"unknown"` when no answer named one. |
+| `model` | string | Yes | The model build the provider reported, or `"unknown"` when no answer named one. A 2xx answer koto couldn't use counts as naming its model. |
 | `probabilities` | object | No | `pass`, `fail` and `unclear`, each rounded to four places. Present when an answer was read. |
 | `input_sha256` | string | No | SHA-256 of the labelled slice, hashed as the routing decider hashes its inputs. Present whenever the extraction produced output. |
 | `input_bytes` | integer | No | Byte length of the redacted slice. Present with `input_sha256`. |
@@ -1784,7 +1804,7 @@ appends none.
 | `endpoint_origin` | string | No | Which configuration layer supplied the endpoint: `"default"`, `"user"` or `"env"`. A label, never a URL, host, query string or credential. |
 
 **Not graded and escape** are both "not checkable" and stay distinct: `not_graded` means
-the slice was empty, so nothing was asked and nothing sent; `escape` means the
+the slice was empty or only whitespace, so nothing was asked and nothing sent; `escape` means the
 decider read the slice and answered that it can't be judged, or no value won
 at its threshold. **`unanswered`** is a checker fault, never a judgment about
 the agent's work, and it never blocks.

@@ -289,3 +289,63 @@ fn a_pair_sharing_no_vars_key_keeps_the_old_message() {
 fn a_skip_if_value_selects_the_route_with_the_same_value() {
     expect_ok(&template(TWO_ROUTES, "    skip_if:\n      vars.MODE: auto"));
 }
+
+/// The first line of a compile error, without anything the caller wraps
+/// around the validator's message.
+fn first_line_from(err: &str, start: &str) -> String {
+    let at = err
+        .find(start)
+        .unwrap_or_else(|| panic!("{:?} not in: {}", start, err));
+    err[at..].lines().next().unwrap().to_string()
+}
+
+#[test]
+fn both_vars_error_families_name_the_variable_the_same_way() {
+    // An `{is_set: ...}` condition on an undeclared name: the older family.
+    let err = compile_src(&template(
+        "      - target: fast
+        when:
+          vars.NOPE:
+            is_set: true",
+        "",
+    ))
+    .unwrap_err();
+    assert_eq!(
+        first_line_from(&err, "state "),
+        "state \"route\" transition to \"fast\": when clause references undeclared variable \
+         \"NOPE\"; add it to the template's variables block"
+    );
+
+    // A value route: the E-VAR-ROUTE-* family, in a `when` clause and in a
+    // `skip_if` map.
+    let err = expect_err(
+        &template(
+            "      - target: fast
+        when:
+          vars.MODE: \"\"",
+            "",
+        ),
+        "E-VAR-ROUTE-VALUE",
+    );
+    assert_eq!(
+        first_line_from(&err, "E-VAR-ROUTE-VALUE"),
+        "E-VAR-ROUTE-VALUE: state \"route\" transition to \"fast\": when clause value for \
+         variable \"MODE\" is empty; an empty variable counts as not set and matches no value"
+    );
+    let err = expect_err(
+        &template(
+            "      - target: fast
+        when:
+          verdict: approve
+      - target: slow",
+            "    skip_if:
+      vars.MODE: atuo",
+        ),
+        "E-VAR-ROUTE-VALUE",
+    );
+    assert_eq!(
+        first_line_from(&err, "E-VAR-ROUTE-VALUE"),
+        "E-VAR-ROUTE-VALUE: state \"route\": skip_if routes on variable \"MODE\" = \"atuo\", \
+         which koto init would refuse (values:[auto,interactive]); the route could never fire"
+    );
+}

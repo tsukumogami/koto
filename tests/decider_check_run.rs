@@ -448,8 +448,10 @@ fn a_failed_first_attempt_then_an_answer_uses_the_answer() {
 
 #[test]
 fn a_failed_attempt_reports_no_tokens() {
-    // A body koto can't read carries no usage it could trust, so only the
-    // answer that was read contributes tokens.
+    // A 2xx body koto can't parse is billed but has no usage to read: it
+    // adds no tokens and counts under unread_usage_attempts (see
+    // a_billed_answer_with_no_readable_usage_is_counted_as_unread), so only
+    // the answer that was read contributes tokens.
     let h = harness(&check_template(&criterion("r", "veto")), SLICE);
     h.stub.push(Reply::raw(200, "not json"));
     h.stub.push(fail("r"));
@@ -939,6 +941,22 @@ fn a_billed_answer_koto_cannot_use_still_counts_its_tokens() {
     assert_eq!(c["input_tokens"], 140);
     assert_eq!(c["output_tokens"], 4);
     assert_eq!(c["unread_usage_attempts"], 0);
+
+    // When no attempt is usable, the record still names the model the
+    // billed answers were charged on, next to their tokens.
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    for _ in 0..2 {
+        h.stub.push(Reply::json(&json!({
+            "model": "jev-billed-9", "answers": {"r": {"type": "choice"}},
+            "usage": {"input_tokens": 40, "output_tokens": 1}
+        })));
+    }
+    run(&h, "auto");
+    let c = &checks(&h)[0];
+    assert_eq!(c["outcome"], "unanswered", "{}", c);
+    assert_eq!(c["provider"], "jev", "{}", c);
+    assert_eq!(c["model"], "jev-billed-9", "{}", c);
+    assert_eq!(c["input_tokens"], 80, "{}", c);
 }
 
 #[test]
@@ -1270,4 +1288,75 @@ fn overriding_a_check_that_blocks_nothing_writes_no_override_record() {
         "{:?}",
         ledger(&h)
     );
+}
+
+// ---------------------------------------------------------------------------
+// a compiled check with no spec
+// ---------------------------------------------------------------------------
+
+/// Rewrite the session's cached compiled template with `edit`, and the
+/// header's `template_hash` to match, as a template written by some other
+/// build would stand: the hash check passes and only the content is wrong.
+fn rewrite_cached_template(h: &Harness, edit: impl FnOnce(&mut Value)) {
+    let state = h.state_path();
+    let raw = std::fs::read_to_string(&state).unwrap();
+    let mut lines: Vec<String> = raw.lines().map(String::from).collect();
+    let init = lines
+        .iter()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|e| e["type"] == "workflow_initialized")
+        .unwrap();
+    let path = init["payload"]["template_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut compiled: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    edit(&mut compiled);
+    let bytes = serde_json::to_string_pretty(&compiled).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let mut header: Value = serde_json::from_str(&lines[0]).unwrap();
+    header["template_hash"] = json!(koto::cache::sha256_hex(bytes.as_bytes()));
+    lines[0] = serde_json::to_string(&header).unwrap();
+    std::fs::write(&state, lines.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn a_session_whose_cached_check_lost_its_spec_is_refused_on_resume() {
+    // The control: the same rewrite with the spec left in place resumes, so
+    // the refusal below is the missing spec and nothing about the rewrite.
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    rewrite_cached_template(&h, |_| {});
+    h.stub.push(pass("r"));
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    rewrite_cached_template(&h, |t| {
+        let gate = t["states"]["review"]["gates"]["comments"]
+            .as_object_mut()
+            .unwrap();
+        assert!(gate.remove("decider_check").is_some(), "{:?}", gate);
+    });
+    let log = h.raw_log();
+    // Opted in or not: the refusal comes before the tick decides whether
+    // checks run at all, so a user who can't consult is refused too.
+    for mode in ["auto", "off"] {
+        let mut cmd = h.koto_mode(mode);
+        cmd.args(["next", WF, "--no-cleanup"]);
+        let out = cmd.output().unwrap();
+        assert!(!out.status.success(), "{}: {}", mode, describe(&out));
+        let body = json_out(&out);
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("E-DECIDER-CHECK-SPEC: state \"review\" check \"comments\""),
+            "{}: {}",
+            mode,
+            body
+        );
+        assert_eq!(body["error"]["code"], "template_error", "{}", body);
+    }
+    // Nothing was asked and nothing appended: the session did not resume.
+    assert_eq!(h.stub.request_count(), 0);
+    assert_eq!(h.raw_log(), log);
 }

@@ -1672,6 +1672,72 @@ fn provider_and_model_are_recorded() {
     assert_eq!(h.consultations()[0]["model"], "unknown");
 }
 
+/// The routing decider counts tokens the way a decider check does: every
+/// billed answer's usage, including a 2xx answer koto couldn't use, one
+/// whose usage couldn't be read counted as unread, and nothing for an
+/// answer that wasn't billed. The provider and the model are on the same
+/// record as the tokens, so the spend can be priced.
+#[test]
+fn routing_counts_every_billed_answer_with_its_provider_and_model() {
+    let usage = json!({"input_tokens": 120, "output_tokens": 4});
+    let usable = json!({"verdict": {"type": "choice",
+        "probabilities": {"proceed": 0.95, "exit": 0.03, "unclear": 0.02}}});
+    // (reply, tokens, unread, model, error_class)
+    let cases: Vec<(Reply, Option<(u64, u64)>, u64, &str, Option<&str>)> = vec![
+        (
+            Reply::json(&json!({"model": "jev-test-1.2.3", "answers": usable, "usage": usage})),
+            Some((120, 4)),
+            0,
+            "jev-test-1.2.3",
+            None,
+        ),
+        // Usage the answer carries but koto can't read: `{}`.
+        (go(), None, 1, "jev-test-1.2.3", None),
+        // A 2xx answer to a question nobody asked: billed, so its tokens
+        // and its model are kept.
+        (
+            Reply::json(
+                &json!({"model": "jev-test-1.2.3", "answers": {"other": {}}, "usage": usage}),
+            ),
+            Some((120, 4)),
+            0,
+            "jev-test-1.2.3",
+            Some("mismatched"),
+        ),
+        // A 2xx body that isn't JSON: billed, nothing readable.
+        (
+            Reply::raw(200, "not json"),
+            None,
+            1,
+            "unknown",
+            Some("malformed"),
+        ),
+        // A non-2xx status isn't billed and adds nothing.
+        (Reply::status(503), None, 0, "unknown", Some("http_status")),
+    ];
+    for (reply, tokens, unread, model, error_class) in cases {
+        let h = ready(&standard("shadow", "shadow"), vec![reply]);
+        h.next_mode("shadow");
+        let c = &h.consultations()[0];
+        let label = c.to_string();
+        assert_eq!(c["provider"], "jev", "{}", label);
+        assert_eq!(c["model"], model, "{}", label);
+        assert_eq!(c["error_class"].as_str(), error_class, "{}", label);
+        match tokens {
+            Some((i, o)) => {
+                assert_eq!(c["input_tokens"], i, "{}", label);
+                assert_eq!(c["output_tokens"], o, "{}", label);
+            }
+            None => {
+                assert!(c.get("input_tokens").is_none(), "{}", label);
+                assert!(c.get("output_tokens").is_none(), "{}", label);
+            }
+        }
+        // Written on every record, zero included.
+        assert_eq!(c["unread_usage_attempts"], unread, "{}", label);
+    }
+}
+
 #[test]
 fn the_record_holds_no_input_key_or_response_text() {
     const RESPONSE_MARKER: &str = "RESPONSE-TEXT-0b9d";

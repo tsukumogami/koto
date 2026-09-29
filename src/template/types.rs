@@ -67,6 +67,10 @@ pub struct CompiledTemplate {
     pub initial_state: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub variables: BTreeMap<String, VariableDecl>,
+    /// Read through [`deserialize_states`], which refuses a decider check
+    /// with no spec (`E-DECIDER-CHECK-SPEC`). Written as before, so the
+    /// compiled JSON and its hash don't change.
+    #[serde(deserialize_with = "deserialize_states")]
     pub states: BTreeMap<String, TemplateState>,
     /// Environment variable names this template's commands need, read live
     /// on every tick in addition to koto's default list
@@ -74,6 +78,56 @@ pub struct CompiledTemplate {
     /// that declares none keeps its compiled form and hash.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pass_env: Vec<String>,
+}
+
+/// The error code a compiled template gets when one of its `decider-check`
+/// gates has no `decider_check` spec.
+pub const E_DECIDER_CHECK_SPEC: &str = "E-DECIDER-CHECK-SPEC";
+
+/// The load-time refusal for a compiled `decider-check` gate with no spec,
+/// or `None` when the gate is fine.
+///
+/// The compiler never writes such a gate: it refuses a check with no
+/// criteria (`E-DECIDER-CHECK-FIELD`). But koto reads compiled JSON back
+/// from the cache and a session's own directory without recompiling, so a
+/// gate that lost its spec would otherwise load and then pass at run time
+/// as a check with nothing to grade. It is a malformed template, not a
+/// verdict the decider failed to give, so it is refused before any session
+/// starts or resumes on it.
+pub fn missing_decider_check_spec(
+    state_name: &str,
+    gate_name: &str,
+    gate: &Gate,
+) -> Option<String> {
+    if gate.gate_type != GATE_TYPE_DECIDER_CHECK || gate.decider_check.is_some() {
+        return None;
+    }
+    Some(format!(
+        "{}: state {:?} check {:?}: the compiled template has a decider check with no \
+         decider_check spec, so there is nothing to grade\n  \
+         remedy: compile the template again from its source",
+        E_DECIDER_CHECK_SPEC, state_name, gate_name
+    ))
+}
+
+/// Read a compiled template's `states`, refusing any `decider-check` gate
+/// with no spec ([`missing_decider_check_spec`]). Every place koto loads a
+/// compiled template goes through `Deserialize`, so this one check covers
+/// `koto init`, `koto next` on a session already in flight, and every other
+/// reader.
+fn deserialize_states<'de, D>(deserializer: D) -> Result<BTreeMap<String, TemplateState>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let states = BTreeMap::<String, TemplateState>::deserialize(deserializer)?;
+    for (state_name, state) in &states {
+        for (gate_name, gate) in &state.gates {
+            if let Some(refusal) = missing_decider_check_spec(state_name, gate_name, gate) {
+                return Err(serde::de::Error::custom(refusal));
+            }
+        }
+    }
+    Ok(states)
 }
 
 /// A variable declaration in a compiled template.
@@ -806,12 +860,9 @@ pub fn is_present_matcher(value: &serde_json::Value) -> bool {
     value.as_str() == Some(PRESENT_MATCHER_VALUE)
 }
 
-/// Namespace for template variable conditions in `when` clauses and
+/// Prefix of every template variable condition in `when` clauses and
 /// `skip_if` maps. Keys like `vars.MY_VAR` reference declared template
 /// variables.
-pub const VARS_NAMESPACE: &str = "vars";
-
-/// [`VARS_NAMESPACE`] with its separator: the prefix of every `vars.*` key.
 pub const VARS_PREFIX: &str = "vars.";
 
 /// Whether two `when` values for the same key can never both hold.
@@ -1607,7 +1658,7 @@ impl CompiledTemplate {
                 for (field, value) in skip_conditions {
                     if field.starts_with(VARS_PREFIX) && is_is_set_matcher(value).is_none() {
                         self.validate_vars_condition(
-                            state_name, "skip_if", "skip_if", field, value, &captures,
+                            state_name, None, "skip_if", field, value, &captures,
                         )?;
                     }
                 }
@@ -3013,6 +3064,12 @@ impl CompiledTemplate {
     /// Validate one `vars.<name>` condition, in a `when` clause or a
     /// `skip_if` map.
     ///
+    /// `target` is the transition a `when` clause guards, `None` for a
+    /// `skip_if` map; `clause` names where the condition sits (`when clause`
+    /// or `skip_if`). Every message names the variable by its bare name,
+    /// except the malformed-key one, which has no variable to name and
+    /// quotes the key.
+    ///
     /// `{is_set: bool}` keeps its rule (Issue #141): the name must be a
     /// declared variable or a capture. A string is a value condition and
     /// must name a declared variable (`E-VAR-ROUTE-UNDECLARED`), not a
@@ -3023,18 +3080,22 @@ impl CompiledTemplate {
     fn validate_vars_condition(
         &self,
         state_name: &str,
-        site: &str,
-        location: &str,
+        target: Option<&str>,
+        clause: &str,
         field: &str,
         value: &serde_json::Value,
         captures: &BTreeMap<String, String>,
     ) -> Result<(), String> {
+        let at = match target {
+            Some(t) => format!("state {:?} transition to {:?}", state_name, t),
+            None => format!("state {:?}", state_name),
+        };
         let var_name = match field.strip_prefix(VARS_PREFIX) {
             Some(name) if !name.is_empty() && !name.contains('.') => name,
             _ => {
                 return Err(format!(
-                    "state {:?}: {} key {:?} has invalid format; expected \"vars.<VARIABLE_NAME>\"",
-                    state_name, location, field
+                    "{}: {} key {:?} has invalid format; expected \"vars.<VARIABLE_NAME>\"",
+                    at, clause, field
                 ));
             }
         };
@@ -3047,42 +3108,42 @@ impl CompiledTemplate {
             // in this check.
             if !self.variables.contains_key(var_name) && !captures.contains_key(var_name) {
                 return Err(format!(
-                    "state {:?} {}: {} references undeclared variable {:?}; \
+                    "{}: {} references undeclared variable {:?}; \
                      add it to the template's variables block",
-                    state_name, site, location, var_name
+                    at, clause, var_name
                 ));
             }
             return Ok(());
         }
         let Some(wanted) = vars_value_matcher(value) else {
             return Err(format!(
-                "E-VAR-ROUTE-VALUE: state {:?} {}: {} value for {:?} must be a string or \
+                "E-VAR-ROUTE-VALUE: {}: {} value for variable {:?} must be a string or \
                  {{\"is_set\": true|false}}, not {}\n  \
                  remedy: quote the value (\"true\", \"3\"), or use {{\"is_set\": ...}}",
-                state_name, site, location, field, value
+                at, clause, var_name, value
             ));
         };
         let Some(decl) = self.variables.get(var_name) else {
             if captures.contains_key(var_name) {
                 return Err(format!(
-                    "E-VAR-ROUTE-CAPTURE: state {:?} {}: {} routes on the value of {:?}, \
+                    "E-VAR-ROUTE-CAPTURE: {}: {} routes on the value of {:?}, \
                      a capture; a later state can overwrite a capture, so a route can't read its value\n  \
                      remedy: declare the value as a variable, or test the capture with {{\"is_set\": true}}",
-                    state_name, site, location, var_name
+                    at, clause, var_name
                 ));
             }
             return Err(format!(
-                "E-VAR-ROUTE-UNDECLARED: state {:?} {}: {} routes on undeclared variable {:?}\n  \
+                "E-VAR-ROUTE-UNDECLARED: {}: {} routes on undeclared variable {:?}\n  \
                  remedy: declare {:?} in the template's variables block, or correct the name",
-                state_name, site, location, var_name, var_name
+                at, clause, var_name, var_name
             ));
         };
         if wanted.is_empty() {
             return Err(format!(
-                "E-VAR-ROUTE-VALUE: state {:?} {}: {} value for {:?} is empty; \
+                "E-VAR-ROUTE-VALUE: {}: {} value for variable {:?} is empty; \
                  an empty variable counts as not set and matches no value\n  \
                  remedy: test emptiness with {{\"is_set\": false}}",
-                state_name, site, location, field
+                at, clause, var_name
             ));
         }
         if let Err(refusal) = crate::engine::variables::check_value(var_name, decl, wanted) {
@@ -3091,10 +3152,10 @@ impl CompiledTemplate {
                 other => other.to_string(),
             };
             return Err(format!(
-                "E-VAR-ROUTE-VALUE: state {:?} {}: {} routes on {:?} = {:?}, which koto init \
+                "E-VAR-ROUTE-VALUE: {}: {} routes on variable {:?} = {:?}, which koto init \
                  would refuse ({}); the route could never fire\n  \
                  remedy: use a value the variable accepts, or widen its constraint",
-                state_name, site, location, var_name, wanted, constraint
+                at, clause, var_name, wanted, constraint
             ));
         }
         Ok(())
@@ -3190,11 +3251,10 @@ impl CompiledTemplate {
 
             // Issue #141 and value routing: every vars.<name> entry is either
             // the {is_set: bool} matcher or a value the variable can hold.
-            let site = format!("transition to {:?}", transition.target);
             for (field, value) in &vars_fields {
                 self.validate_vars_condition(
                     state_name,
-                    &site,
+                    Some(&transition.target),
                     "when clause",
                     field,
                     value,

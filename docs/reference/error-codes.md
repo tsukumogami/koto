@@ -369,7 +369,7 @@ Fix: add the referenced gate name to the state's `gates` block, or correct the `
 
 #### value routing diagnostic codes
 
-A `vars.NAME: <value>` condition routes on a variable's value, in a `when` clause or a `skip_if` map. Four compile-time errors refuse a value route that could never fire or can't be told apart from another. Each fails compilation and names the state and the variable; the first three also name where the condition sits and the value, and the overlap error names the two transitions. An `{is_set: true|false}` condition is not a value route and keeps its own rules.
+A `vars.NAME: <value>` condition routes on a variable's value, in a `when` clause or a `skip_if` map. Four compile-time errors refuse a value route that could never fire or can't be told apart from another. Each fails compilation and names the state and the variable; the first three also name where the condition sits and the value, and the overlap error names the two transitions. An `{is_set: true|false}` condition is not a value route and keeps its own rules. The examples below are for a `when` clause; for a `skip_if` map the message starts `state "route": skip_if` instead. Every message names the variable by its bare name (`"MODE"`), the same way the `{is_set: ...}` errors do.
 
 **E-VAR-ROUTE-UNDECLARED (error)**: the condition names a variable the template's `variables:` block doesn't declare.
 
@@ -383,7 +383,7 @@ Fix: correct the name, or declare the variable.
 **E-VAR-ROUTE-VALUE (error)**: the value is one the variable can never hold, so the route could never fire: it's empty, it isn't a string (an unquoted `true` or `3`), it holds a character `koto init` refuses, or the variable's `values:` or `pattern:` refuses it.
 
 ```
-E-VAR-ROUTE-VALUE: state "route" transition to "fast": when clause routes on "MODE" = "atuo", which koto init would refuse (values:[auto,interactive]); the route could never fire
+E-VAR-ROUTE-VALUE: state "route" transition to "fast": when clause routes on variable "MODE" = "atuo", which koto init would refuse (values:[auto,interactive]); the route could never fire
   remedy: use a value the variable accepts, or widen its constraint
 ```
 
@@ -583,6 +583,15 @@ E-DECIDER-CHECK-POLL: state "review" check "g": poll is not allowed on a decider
 E-DECIDER-CHECK-ROUTE: state "review" check "comments": the when clause on the transition to "done" reads the check's output; a decider check never routes
   remedy: route on something else; the check can only block
 ```
+
+**E-DECIDER-CHECK-SPEC (error)**: a compiled template has a `decider-check` gate with no `decider_check` spec, so there is nothing to grade. The compiler never writes one (a source check with no criteria is `E-DECIDER-CHECK-FIELD`), but koto reads compiled JSON back from the cache and a session's directory without recompiling it. Every load refuses it: `koto init`, `koto next` on a session already in flight, `koto template validate` and every other command that reads the compiled template. The session never starts or resumes on it, and it is never read as a check that passed. A template that compiles today loads unchanged, with the same hash.
+
+```
+E-DECIDER-CHECK-SPEC: state "review" check "comments": the compiled template has a decider check with no decider_check spec, so there is nothing to grade
+  remedy: compile the template again from its source
+```
+
+Fix: compile the template again from its source with this koto. A session whose cached template has lost its spec can't be resumed; start a new one.
 
 ---
 
