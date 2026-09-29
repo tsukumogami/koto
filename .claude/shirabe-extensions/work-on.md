@@ -31,17 +31,35 @@ run, so it stays short; the reasons are in its commit history.
 - `test/functional/**` -> `make -C test/functional test-functional` (not in PR CI: the Go feature suite)
 - `benches/**`, `Cargo.toml`, `Cargo.lock` -> `cargo bench --no-run` (not in PR CI: `cargo test` does not build bench targets)
 - `.tsuku-recipes/**` -> `tsuku validate .tsuku-recipes/koto.toml` (not in PR CI: CI's step calls `tsuku recipe validate`, a subcommand tsuku does not have, and skips; it checks structure only, so a download or checksum change passes it)
-- `.github/workflows/validate.yml`, `.github/workflows/lifecycle.yml`,
-  `.github/workflows/run-evals.yml`, `.github/workflows/validate-pr-body.yml` ->
-  `SHELLCHECK_OPTS=--severity=warning actionlint` (not in PR CI; `tsuku install actionlint`;
-  lints every workflow, so it can't pass having checked nothing). These four run on every pull
-  request that changes them, so the PR's own CI runs the changed logic. A person still reviews
-  it: the PR description's reviewer part (below `---`) carries a `## Workflow changes` section
-  naming each changed workflow and what its logic now does. That section is where a person
-  reviews it, instead of the run stopping here.
-- `.github/**` other than `.github/pull_request_template.md` and the four workflows above, `install.sh`, `scripts/**` other than
-  `scripts/check-evals-exist.sh` and the three run-evals files above, `.release/**`, `.goreleaser.yaml`, `.cargo/**`,
-  `plugins/koto-skills/hooks/*.sh`, `.claude/settings.json` -> no local check exists. Still run
+- `.github/workflows/validate.yml`, `.github/workflows/run-evals.yml` -> both of, with
+  `actionlint` and `yq` installed first (`tsuku install actionlint yq`; if either can't be
+  installed, the outcome is cannot-verify):
+  - A reservation check. It prints a line for each change a person must still approve: a changed
+    `on:` block, an added or removed line naming `secrets.`, `permissions:` or
+    `pull_request_target`, an `|| echo`, `|| true` or `|| :` fallback, a job dropped from the
+    `validate` job's `needs:`, or a base it can't read. If it prints anything, the outcome is
+    cannot-verify, as for the next entry, not failed. Adding a job, and adding it to `needs:`,
+    prints nothing.
+    `B=$(git merge-base origin/main HEAD) && N=$(git show "$B:.github/workflows/validate.yml" | yq '.jobs.validate.needs[]') && test -n "$N" || echo "cannot read the base's validate needs"; for f in validate run-evals; do w=.github/workflows/$f.yml; test "$(git show "$B:$w" | yq -o=json -I=0 '.on')" = "$(yq -o=json -I=0 '.on' "$w")" || echo "$w: trigger changed"; done; git diff "$B" -- .github/workflows/validate.yml .github/workflows/run-evals.yml | grep -vE '^(\+\+\+|---) ' | grep -E '^[-+].*(secrets\.|permissions:|pull_request_target|\|\| *(echo|true|:))'; for j in $N; do yq -e ".jobs.validate.needs[] | select(. == \"$j\")" .github/workflows/validate.yml >/dev/null 2>&1 || echo "dropped from the validate job's needs: $j"; done`
+  - `SHELLCHECK_OPTS=--severity=warning actionlint` (not run by CI). It lints every workflow's
+    syntax, expressions and `run:` shell. It doesn't check what a workflow's logic does.
+
+  A workflow qualifies for this entry when its `pull_request` trigger has no `paths:` filter, or
+  one that lists its own file. Every pull request to `main` that changes it then runs the changed
+  version in that PR's CI, which is what exercises its logic. A PR against another base runs
+  neither workflow, and `validate.yml`'s `check-artifacts` and `cloud-integration` jobs skip drafts.
+  `validate.yml` passes storage secrets to `cloud-integration`, and a same-repository branch's
+  run uses the edited file, so the reservation check keeps any change to that exposure with a
+  person. `lifecycle.yml` and `validate-pr-body.yml` don't qualify: they call shirabe's reusable
+  workflows at `@main`, so a PR's CI never runs changed logic for them. The PR's reviewer reads a
+  `## Workflow changes` section in the reviewer part of the description (below `---`). It names
+  each changed workflow and what its logic now does, and states any change to secrets,
+  permissions or `needs:` (or "None"). A maintainer approves it before merge. A new workflow stays
+  in the next entry until someone checks its `on:` block against this rule and adds it here.
+- `.github/**` (except `.github/pull_request_template.md` and the two workflows in the previous
+  entry); `install.sh`; `scripts/**` (except `scripts/check-evals-exist.sh` and the three
+  run-evals files above); `.release/**`; `.goreleaser.yaml`; `.cargo/**`;
+  `plugins/koto-skills/hooks/*.sh`; `.claude/settings.json` -> no local check exists. Still run
   every other selected command; if one fails the outcome is failed, otherwise it is cannot-verify:
   no command here checks what these files do and most are not read by PR CI either, so the run
   stops for a person to check them. (shirabe's schema has no form for such an entry yet:
