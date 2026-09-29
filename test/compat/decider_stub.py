@@ -9,7 +9,8 @@ Choice questions are answered with the criterion named by --choice (or the
 first criterion when that one wasn't offered) at probability 0.95, the rest
 sharing 0.05. Proposition ("noul") questions are answered with 0.5, which
 no threshold accepts. Each request's path and question names are appended
-to --log as one JSON line.
+to --log as one JSON line. Every answer carries `"usage": {}` (unreadable),
+or, with --usage IN,OUT, those input and output token counts.
 """
 
 import argparse
@@ -49,7 +50,12 @@ def main():
     parser.add_argument("--key", required=True)
     parser.add_argument("--log", required=True)
     parser.add_argument("--choice", default="auto")
+    parser.add_argument("--usage", default=None)
     args = parser.parse_args()
+    usage = {}
+    if args.usage:
+        tokens_in, tokens_out = (int(n) for n in args.usage.split(","))
+        usage = {"input_tokens": tokens_in, "output_tokens": tokens_out}
 
     class Handler(BaseHTTPRequestHandler):
         def reply(self, status, body):
@@ -75,7 +81,7 @@ def main():
                 return
             with open(args.log, "a") as log:
                 log.write(json.dumps({"path": self.path, "questions": sorted(questions)}) + "\n")
-            self.reply(200, {"model": "compat-stub-1.0.0", "answers": answers, "usage": {}})
+            self.reply(200, {"model": "compat-stub-1.0.0", "answers": answers, "usage": usage})
 
         def log_message(self, fmt, *a):
             pass

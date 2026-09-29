@@ -269,6 +269,7 @@ mod tests {
                 "outcome",
                 "provider",
                 "state",
+                "unread_usage_attempts",
                 "visit_seq",
             ]
         );

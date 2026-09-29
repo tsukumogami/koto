@@ -512,7 +512,7 @@ impl<'a> CliCheckEvaluator<'a> {
                     if e.responded {
                         c.usage.add(e.usage);
                         if let Some(model) = e.model {
-                            c.model = model;
+                            c.model = model.0;
                         }
                     }
                     c.error_class = Some(e.class);
@@ -813,6 +813,89 @@ mod tests {
             assert!(r.failure.is_none() && r.findings.is_empty());
             assert_eq!(decider.calls(), 0, "nothing is asked without a visit");
         }
+    }
+
+    /// Log events from JSON lines, numbered from 1.
+    fn log(lines: &[serde_json::Value]) -> Vec<Event> {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let mut l = l.clone();
+                l["seq"] = serde_json::json!(i as u64 + 1);
+                l["timestamp"] = serde_json::json!("2026-01-01T00:00:00Z");
+                serde_json::from_value(l).unwrap()
+            })
+            .collect()
+    }
+
+    fn arrive(from: Option<&str>, to: &str) -> serde_json::Value {
+        serde_json::json!({"type": "transitioned",
+            "payload": {"from": from, "to": to, "condition_type": "auto"}})
+    }
+
+    fn checked(visit_seq: u64, hash: &str) -> serde_json::Value {
+        serde_json::json!({"type": "decider_checked", "payload": {
+            "state": "review", "visit_seq": visit_seq, "gate": "comments",
+            "rule_id": "r", "rule_ref": "ref", "declaration_hash": hash,
+            "mode": "veto", "threshold": 0.9, "outcome": "fail", "blocked": true,
+            "provider": "jev", "model": "m", "attempts": 1, "latency_ms": 1}})
+    }
+
+    fn overridden(events: &[Event]) -> Vec<(u64, String)> {
+        override_records(
+            events,
+            "review",
+            "comments",
+            &serde_json::json!({"failed": ["r"], "unanswered": [], "error": ""}),
+            "wf",
+            None,
+        )
+        .into_iter()
+        .map(|r| match r {
+            LedgerRecord::CheckOverridden(c) => {
+                assert_eq!(
+                    c.override_kind,
+                    crate::decider::ledger::CheckOverrideKind::CandidateFalseFail
+                );
+                (c.visit_seq, c.declaration_hash)
+            }
+            other => panic!("unexpected record {:?}", other),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn an_override_names_the_consultation_of_the_current_visit_only() {
+        let init = serde_json::json!({"type": "workflow_initialized",
+            "payload": {"template_path": "t.json", "variables": {}}});
+        // Visit 1 (seq 2) failed r and was left; visit 2 (seq 5) failed it
+        // again. The override names visit 2's consultation.
+        let two_visits = log(&[
+            init.clone(),
+            arrive(None, "review"),
+            checked(2, "old"),
+            arrive(Some("review"), "work"),
+            arrive(Some("work"), "review"),
+            checked(5, "new"),
+        ]);
+        assert_eq!(overridden(&two_visits), vec![(5, "new".to_string())]);
+
+        // The current visit has no consultation of r: an earlier visit's is
+        // not what the override moved past, so nothing is written. Looking
+        // across the whole log would name visit 1 here.
+        let stale = log(&[
+            init.clone(),
+            arrive(None, "review"),
+            checked(2, "old"),
+            arrive(Some("review"), "work"),
+            arrive(Some("work"), "review"),
+        ]);
+        assert_eq!(overridden(&stale), vec![]);
+
+        // One visit: its consultation.
+        let one = log(&[init, arrive(None, "review"), checked(2, "only")]);
+        assert_eq!(overridden(&one), vec![(2, "only".to_string())]);
     }
 
     #[test]

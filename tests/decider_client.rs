@@ -632,6 +632,27 @@ fn errors_carry_no_key_body_or_userinfo() {
     assert_clean(&err);
 }
 
+/// A billed 2xx answer koto can't use keeps the model it named, so the
+/// record of its tokens can name the model, but the error's `Debug` and
+/// `Display` still carry nothing the provider sent.
+#[test]
+fn an_unusable_answer_keeps_its_model_out_of_the_error_text() {
+    let (got, _) = decide_with(Reply::json(&json!({
+        "model": MARKER,
+        "answers": {MARKER: {"type": "noul", "noul": 0.5}},
+        "usage": {"input_tokens": 7, "output_tokens": 1}
+    })));
+    let err = got.unwrap_err();
+    assert_clean(&err);
+    assert!(err.responded);
+    assert_eq!(err.model.as_ref().map(|m| m.0.as_str()), Some(MARKER));
+    assert_eq!(err.usage.map(|u| u.input_tokens), Some(7));
+
+    // A non-2xx status names no model.
+    let (got, _) = decide_with(Reply::raw(500, MARKER));
+    assert!(got.unwrap_err().model.is_none());
+}
+
 /// Runs only as a child of `http_401_prints_one_fixed_stderr_line`.
 #[test]
 fn stderr_child_401() {

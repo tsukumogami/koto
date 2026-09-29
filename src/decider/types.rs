@@ -327,7 +327,20 @@ pub struct DeciderError {
     /// The model build that answer named, already sanitized, when it named
     /// one, so a record that counts the answer's tokens can say which model
     /// they were billed on. `None` for every other error.
-    pub model: Option<String>,
+    pub model: Option<AnswerModel>,
+}
+
+/// A model name read from an answer koto couldn't use. It is recorded the
+/// way a usable answer's model is, but it came from the response body, so
+/// its `Debug` never prints it: a `DeciderError`'s `Debug` and `Display`
+/// stay free of anything the provider sent.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AnswerModel(pub String);
+
+impl fmt::Debug for AnswerModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AnswerModel(..)")
+    }
 }
 
 impl DeciderError {
@@ -369,7 +382,7 @@ impl DeciderError {
     pub fn with_response_usage(mut self, usage: Option<Usage>, model: Option<String>) -> Self {
         self.responded = true;
         self.usage = usage;
-        self.model = model;
+        self.model = model.map(AnswerModel);
         self
     }
 

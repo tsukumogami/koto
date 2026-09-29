@@ -1682,8 +1682,15 @@ fn routing_counts_every_billed_answer_with_its_provider_and_model() {
     let usage = json!({"input_tokens": 120, "output_tokens": 4});
     let usable = json!({"verdict": {"type": "choice",
         "probabilities": {"proceed": 0.95, "exit": 0.03, "unclear": 0.02}}});
-    // (reply, tokens, unread, model, error_class)
-    let cases: Vec<(Reply, Option<(u64, u64)>, u64, &str, Option<&str>)> = vec![
+    /// (reply, (input, output) tokens, unread, model, error_class)
+    type Case = (
+        Reply,
+        Option<(u64, u64)>,
+        u64,
+        &'static str,
+        Option<&'static str>,
+    );
+    let cases: Vec<Case> = vec![
         (
             Reply::json(&json!({"model": "jev-test-1.2.3", "answers": usable, "usage": usage})),
             Some((120, 4)),
@@ -1735,6 +1742,52 @@ fn routing_counts_every_billed_answer_with_its_provider_and_model() {
         }
         // Written on every record, zero included.
         assert_eq!(c["unread_usage_attempts"], unread, "{}", label);
+        assert_consulted_meets_the_contract(c);
+    }
+}
+
+/// Every key a `decider_consulted` payload carries is declared in the
+/// session-feed contract with its type, every required field is there, and
+/// `outcome` is one of the declared values.
+fn assert_consulted_meets_the_contract(payload: &Value) {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/reference/session-feed.md");
+    let text = std::fs::read_to_string(path).unwrap();
+    let rest = text.strip_prefix("---\n").unwrap();
+    let spec: Value = serde_yaml_ng::from_str(&rest[..rest.find("\n---\n").unwrap()]).unwrap();
+    let fields = spec["events"]["decider_consulted"]["fields"]
+        .as_object()
+        .unwrap();
+    for (key, value) in payload.as_object().unwrap() {
+        let ty = fields
+            .get(key)
+            .and_then(|d| d["type"].as_str())
+            .unwrap_or_else(|| panic!("decider_consulted.{} is not declared", key));
+        let ok = match ty {
+            "string" => value.is_string(),
+            "integer" => value.is_u64() || value.is_i64(),
+            "object" => value.is_object(),
+            _ => true,
+        };
+        assert!(
+            ok,
+            "decider_consulted.{} declared {} but is {}",
+            key, ty, value
+        );
+    }
+    for (name, decl) in fields {
+        if decl["required"] == true {
+            assert!(payload.get(name).is_some(), "{} missing: {}", name, payload);
+        }
+        if let (Some(members), Some(v)) = (decl["enum"].as_array(), payload.get(name)) {
+            assert!(
+                members.contains(v),
+                "{} = {} outside {:?}",
+                name,
+                v,
+                members
+            );
+        }
     }
 }
 

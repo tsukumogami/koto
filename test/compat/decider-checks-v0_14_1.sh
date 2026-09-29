@@ -8,16 +8,20 @@
 #     test/compat/decider-checks-v0_14_1.sh [--self-test]
 #
 # Session: the new build drives fixtures-decider-checks/decider-checks.md
-# against the loopback stub (decider_stub.py answering "fail"), opted in at
-# `auto`. The veto criterion blocks review, the check is overridden, and the
-# session moves on to work, a state with no decider check. A second session,
-# nv, points at an endpoint nothing listens on: the criterion gets no
-# verdict, which never blocks, so its gate passes with the criterion under
-# output.unanswered and the session moves on to work on its own. The log must hold
-# every event in EVENT_CHECKS, and the new build's `koto template
-# validate-feed` must accept it against docs/reference/session-feed.md. The
-# ledger must hold a `checked` and a `check_overridden` line, which the new
-# build's `koto decider report` tallies.
+# against the loopback stub (decider_stub.py answering "fail" and reporting
+# 50 input and 2 output tokens), opted in at `auto`. The veto criterion
+# blocks review, the check is overridden, and the session moves on to work, a
+# state with no decider check whose field the routing decider answers in
+# shadow, so its `decider_consulted` carries the answer's tokens and model. A
+# second session, nv, points at an endpoint nothing listens on: the criterion
+# gets no verdict, which never blocks, so its gate passes with the criterion
+# under output.unanswered and the session moves on to work on its own, where
+# the routing consultation fails to connect and bills nothing. The logs must
+# hold every event in EVENT_CHECKS and NV_EVENT_CHECKS, and the new build's
+# `koto template validate-feed` must accept them against
+# docs/reference/session-feed.md. The ledger must hold a `checked` and a
+# `check_overridden` line, which the new build's `koto decider report`
+# tallies.
 #
 # v0.14.1 can't compile a template with a decider check, so it is handed the
 # session after it left the check: it must run `koto status` and `koto next`
@@ -32,6 +36,8 @@
 #   drop-event:N       delete the log lines matching EVENT_CHECKS[N]
 #   drop-nv-event:N    delete nv's log lines matching NV_EVENT_CHECKS[N]
 #   strip-field:K      delete payload field K from the events that carry it
+#   alter-value:N      change one value as ALTERED_VALUES[N] says, leaving
+#                      every key in place
 #   drop-ledger:KIND   delete the ledger's lines of kind KIND
 #   drop-transition    delete the last `transitioned` event
 # --self-test runs the script clean, then once per mutation, and passes only
@@ -53,6 +59,7 @@ EVENT_CHECKS=(
   'decider_checked for the failed criterion|.type? == "decider_checked" and .payload.gate == "comments" and .payload.rule_id == "comment_reason" and .payload.outcome == "fail" and .payload.mode == "veto" and .payload.blocked == true and (.payload.visit_seq | type) == "number" and (.payload.declaration_hash | type) == "string" and (.payload.input_sha256 | type) == "string"'
   'gate_evaluated for the failed check|.type? == "gate_evaluated" and .payload.gate == "comments" and .payload.outcome == "failed" and .payload.output.failed == ["comment_reason"] and .payload.output.unanswered == [] and .payload.findings[0].message_source == "decider" and (.payload | has("stdout") | not)'
   'the override of the check|.type? == "gate_override_recorded" and .payload.gate == "comments" and .payload.actual_output.failed == ["comment_reason"]'
+  'decider_consulted with the billed tokens and model|.type? == "decider_consulted" and .payload.state == "work" and .payload.input_tokens == 50 and .payload.output_tokens == 2 and .payload.unread_usage_attempts == 0 and .payload.provider == "jev" and .payload.model == "compat-stub-1.0.0"'
 )
 
 # Events the no-verdict session must leave in its log: a pass that keeps
@@ -60,12 +67,24 @@ EVENT_CHECKS=(
 NV_EVENT_CHECKS=(
   'decider_checked for the unanswered criterion|.type? == "decider_checked" and .payload.rule_id == "comment_reason" and .payload.outcome == "unanswered" and .payload.reason == "provider_error" and .payload.mode == "veto" and .payload.blocked == false'
   'gate_evaluated passing with the criterion unanswered|.type? == "gate_evaluated" and .payload.gate == "comments" and .payload.outcome == "passed" and .payload.output.failed == [] and .payload.output.unanswered == ["comment_reason"] and (.payload | has("findings") | not)'
+  'decider_consulted that billed nothing|.type? == "decider_consulted" and .payload.state == "work" and .payload.outcome == "error" and .payload.error_class == "connect" and (.payload | has("input_tokens") | not) and .payload.unread_usage_attempts == 0'
 )
 
-# Required fields of the new event, as "field|jq filter selecting the events".
+# Required fields of the new event, and the usage field written on every
+# consultation, as "field|jq filter selecting the events".
 STRIPPED_FIELDS=(
   'visit_seq|.type? == "decider_checked"'
   'outcome|.type? == "decider_checked"'
+  'unread_usage_attempts|.type? == "decider_consulted"'
+)
+
+# Values changed in place, every key kept, as "label|log|jq filter selecting
+# the events|jq program". log is wf or nv.
+ALTERED_VALUES=(
+  'a failed verdict read as a pass|wf|.type? == "decider_checked"|.payload.outcome = "pass"'
+  'a no-verdict criterion marked as blocking|nv|.type? == "decider_checked"|.payload.blocked = true'
+  'the passing gate forgets its unanswered criterion|nv|.type? == "gate_evaluated" and .payload.gate == "comments"|.payload.output.unanswered = []'
+  'the routing tokens miscounted|wf|.type? == "decider_consulted"|.payload.input_tokens = 49'
 )
 
 LEDGER_KINDS=(checked check_overridden)
@@ -89,6 +108,9 @@ mutations() {
   done
   for i in "${!STRIPPED_FIELDS[@]}"; do
     echo "strip-field:${STRIPPED_FIELDS[$i]%%|*}"
+  done
+  for i in "${!ALTERED_VALUES[@]}"; do
+    echo "alter-value:$i"
   done
   for i in "${LEDGER_KINDS[@]}"; do
     echo "drop-ledger:$i"
@@ -162,7 +184,7 @@ mkdir -p "$HOME_DIR" "$WORK_DIR"
 cp "$FIXTURE" "$WORK_DIR/decider-checks.md"
 printf 'let total = a + b; // add a and b\n' >"$WORK_DIR/slice.txt"
 
-python3 "$STUB" --port-file "$SCRATCH/port" --key "$KEY" --log "$SCRATCH/stub.log" --choice fail &
+python3 "$STUB" --port-file "$SCRATCH/port" --key "$KEY" --log "$SCRATCH/stub.log" --choice fail --usage 50,2 &
 STUB_PID=$!
 for _ in $(seq 1 100); do
   [ -s "$SCRATCH/port" ] && break
@@ -258,7 +280,23 @@ case "$MUTATION" in
       [ "${entry%%|*}" = "$key" ] || continue
       echo "MUTATION: deleting '$key' from every event it can appear on"
       rewrite_lines "$LOG_FILE" "${entry#*|}" "del(.payload[\"$key\"])"
+      rewrite_lines "$NV_LOG" "${entry#*|}" "del(.payload[\"$key\"])"
     done
+    ;;
+  alter-value:*)
+    entry="${ALTERED_VALUES[${MUTATION#alter-value:}]}"
+    label="${entry%%|*}"; rest="${entry#*|}"
+    which="${rest%%|*}"; rest="${rest#*|}"
+    filter="${rest%%|*}"; program="${rest#*|}"
+    case "$which" in
+      wf) target="$LOG_FILE" ;;
+      nv) target="$NV_LOG" ;;
+      *) fail "alter-value: unknown log '$which'" ;;
+    esac
+    echo "MUTATION: $label"
+    before="$(cksum <"$target")"
+    rewrite_lines "$target" "$filter" "$program"
+    [ "$before" != "$(cksum <"$target")" ] || fail "alter-value: '$label' changed nothing"
     ;;
   drop-ledger:*)
     kind="${MUTATION#drop-ledger:}"

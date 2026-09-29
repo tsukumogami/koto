@@ -454,7 +454,7 @@ where
             if e.responded {
                 usage.add(e.usage);
                 if let Some(m) = e.model {
-                    model = m;
+                    model = m.0;
                 }
             }
             (ConsultationOutcome::Error, Some(e.class), unevaluated())

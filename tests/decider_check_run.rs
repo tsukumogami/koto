@@ -1200,6 +1200,59 @@ fn declared_type_ok(value: &Value, ty: &str) -> bool {
     }
 }
 
+/// Every field the contract marks `required: true` for `ty` is in
+/// `payload`, and every value of a field with an `enum` is one of its
+/// members. The check above only looks at the keys koto wrote, so without
+/// this a dropped required field or a new outcome value would pass it.
+fn assert_required_and_enums(spec: &Value, ty: &str, payload: &Value) {
+    let fields = spec["events"][ty]["fields"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{} has no fields in the contract", ty));
+    for (name, decl) in fields {
+        if decl["required"] == true {
+            assert!(
+                payload.get(name.as_str()).is_some(),
+                "{}.{} is required by the contract but koto didn't write it: {}",
+                ty,
+                name,
+                payload
+            );
+        }
+        if let (Some(members), Some(value)) = (decl["enum"].as_array(), payload.get(name.as_str()))
+        {
+            assert!(
+                members.contains(value),
+                "{}.{} wrote {} outside its enum {:?}",
+                ty,
+                name,
+                value,
+                members
+            );
+        }
+    }
+}
+
+#[test]
+fn the_required_and_enum_check_bites() {
+    let spec = feed_spec();
+    let good = json!({
+        "state": "review", "visit_seq": 2, "gate": "comments", "rule_id": "r",
+        "rule_ref": "x", "declaration_hash": "h", "mode": "veto", "threshold": 0.9,
+        "outcome": "fail", "blocked": true, "provider": "jev", "model": "m",
+        "attempts": 1, "latency_ms": 1
+    });
+    assert_required_and_enums(&spec, "decider_checked", &good);
+    let mut dropped = good.clone();
+    dropped.as_object_mut().unwrap().remove("blocked");
+    let mut widened = good.clone();
+    widened["outcome"] = json!("maybe");
+    for bad in [dropped, widened] {
+        let caught =
+            std::panic::catch_unwind(|| assert_required_and_enums(&spec, "decider_checked", &bad));
+        assert!(caught.is_err(), "not caught: {}", bad);
+    }
+}
+
 #[test]
 fn every_key_a_decider_check_writes_is_in_the_contract_and_validate_feed_accepts_the_log() {
     // One session with a fail (probabilities, tokens), and one with an
@@ -1233,6 +1286,7 @@ fn every_key_a_decider_check_writes_is_in_the_contract_and_validate_feed_accepts
             );
             seen.insert(format!("{}.{}", ty, key));
         }
+        assert_required_and_enums(&spec, ty, &e["payload"]);
     }
     for key in [
         "decider_checked.probabilities",
@@ -1264,30 +1318,43 @@ fn every_key_a_decider_check_writes_is_in_the_contract_and_validate_feed_accepts
 
 #[test]
 fn overriding_a_check_that_blocks_nothing_writes_no_override_record() {
-    // A shadow criterion never blocks, so an override finds nothing listed.
-    let h = harness(&looping_template(&criterion("r", "shadow")), SLICE);
-    run(&h, "auto");
-    h.stub.push(fail("r"));
-    run_with(&h, "auto", r#"{"go": true}"#);
-    let out = h
-        .koto()
-        .args([
-            "overrides",
-            "record",
-            WF,
-            "--gate",
-            "comments",
-            "--rationale",
-            "x",
-        ])
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{}", describe(&out));
-    assert!(
-        !ledger(&h).iter().any(|l| l["kind"] == "check_overridden"),
-        "{:?}",
-        ledger(&h)
-    );
+    // A shadow criterion never blocks, and a veto criterion that passed or
+    // escaped didn't either, so an override finds nothing listed as failed
+    // and writes nothing. The veto fail is the control: the same steps
+    // write exactly one record, so the empty cases aren't empty by accident.
+    for (mode, reply, want) in [
+        ("shadow", fail("r"), 0),
+        ("veto", pass("r"), 0),
+        ("veto", escape("r"), 0),
+        ("veto", fail("r"), 1),
+    ] {
+        let h = harness(&looping_template(&criterion("r", mode)), SLICE);
+        run(&h, "auto");
+        h.stub.push(reply);
+        run_with(&h, "auto", r#"{"go": true}"#);
+        let out = h
+            .koto()
+            .args([
+                "overrides",
+                "record",
+                WF,
+                "--gate",
+                "comments",
+                "--rationale",
+                "x",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", describe(&out));
+        let written: Vec<Value> = ledger(&h)
+            .into_iter()
+            .filter(|l| l["kind"] == "check_overridden")
+            .collect();
+        assert_eq!(written.len(), want, "{} {:?}", mode, written);
+        for line in &written {
+            assert_eq!(line["override_kind"], "candidate_false_fail", "{}", line);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
