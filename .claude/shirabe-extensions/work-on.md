@@ -31,9 +31,39 @@ run, so it stays short; the reasons are in its commit history.
 - `test/functional/**` -> `make -C test/functional test-functional` (not in PR CI: the Go feature suite)
 - `benches/**`, `Cargo.toml`, `Cargo.lock` -> `cargo bench --no-run` (not in PR CI: `cargo test` does not build bench targets)
 - `.tsuku-recipes/**` -> `tsuku validate .tsuku-recipes/koto.toml` (not in PR CI: CI's step calls `tsuku recipe validate`, a subcommand tsuku does not have, and skips; it checks structure only, so a download or checksum change passes it)
-- `.github/**` other than `.github/pull_request_template.md`, `install.sh`, `scripts/**` other than
-  `scripts/check-evals-exist.sh` and the three run-evals files above, `.release/**`, `.goreleaser.yaml`, `.cargo/**`,
-  `plugins/koto-skills/hooks/*.sh`, `.claude/settings.json` -> no local check exists. Still run
+- `.github/workflows/validate.yml`, `.github/workflows/run-evals.yml` -> both of, with
+  `actionlint`, `yq` and `jq` installed first (`tsuku install actionlint yq jq`; if any can't be
+  installed, the outcome is cannot-verify):
+  - `scripts/check-workflow-reservations.sh`. It exits 1, printing why, for each change a person
+    must still approve, and exit 1 here means cannot-verify, as for the next entry, not failed.
+    It flags a changed trigger. It flags any change to a job that uses secrets, compared whole,
+    step bodies included. It flags an added or removed line naming `secrets`, `permissions:`,
+    `pull_request_target`, `continue-on-error`, an `if:` with `false`, an `|| echo`, `true`, `:`,
+    `exit` or `{` fallback, or a call to another workflow. It flags a job dropped from the
+    `validate` job's `needs:`, a needed job whose result that job doesn't check, and an
+    unreadable base. Adding an ordinary job, in `needs:` and the result check, passes. It doesn't
+    judge other logic, such as a rewritten `if:` or a job without secrets that stops testing
+    anything. The reviewer reads that in the section below.
+  - `SHELLCHECK_OPTS=--severity=warning actionlint` (not run by CI). It lints every workflow's
+    syntax, expressions and `run:` shell. It doesn't check what a workflow's logic does.
+
+  A workflow qualifies for this entry when its `pull_request` trigger has no `paths:` filter, or
+  one that lists its own file. Every pull request to `main` that changes it then runs the changed
+  version in that PR's CI, which is what exercises its logic. A PR against another base runs
+  neither workflow, and `validate.yml`'s `check-artifacts` and `cloud-integration` jobs skip drafts.
+  `validate.yml` passes storage secrets to `cloud-integration`, and a same-repository branch's
+  run uses the edited file, so the check keeps any change to that job with a person.
+  `lifecycle.yml` and `validate-pr-body.yml` don't qualify: they call shirabe's reusable
+  workflows at `@main`, so a PR's CI never runs changed logic for them. The PR's reviewer reads a
+  `## Workflow changes` section in the reviewer part of the description (below `---`). It names
+  each changed workflow and what its logic now does, and states any change to secrets,
+  permissions or `needs:` (or "None"). A maintainer approves it before merge. A new workflow stays
+  in the next entry until someone checks its `on:` block against this rule and adds it here. The
+  check script itself is under `scripts/**`, so a change to it stays with a person too.
+- `.github/**` (except `.github/pull_request_template.md` and the two workflows in the previous
+  entry); `install.sh`; `scripts/**` (except `scripts/check-evals-exist.sh` and the three
+  run-evals files above); `.release/**`; `.goreleaser.yaml`; `.cargo/**`;
+  `plugins/koto-skills/hooks/*.sh`; `.claude/settings.json` -> no local check exists. Still run
   every other selected command; if one fails the outcome is failed, otherwise it is cannot-verify:
   no command here checks what these files do and most are not read by PR CI either, so the run
   stops for a person to check them. (shirabe's schema has no form for such an entry yet:
