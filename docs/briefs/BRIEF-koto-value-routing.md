@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Draft
+status: Accepted
 problem: |
   A template can hold a variable's value but can't route on it: a `when`
   clause only asks whether `vars.NAME` is set. Branching on the value
@@ -23,10 +23,13 @@ motivating_context: |
 
 ## Status
 
-Draft
+Accepted
 
 Framing for the downstream PRD. The requirements, the matcher syntax, and
-the compile-time checks are the PRD's and the design's to settle.
+the compile-time checks are the PRD's and the design's to settle. Two
+questions this brief left open, whether the canary needs value routing at
+all and whether a routed variable must be immutable after init, are
+resolved in the PRD's decisions.
 
 ## Problem Statement
 
@@ -100,8 +103,8 @@ A maintainer running a canary wants some runs to include an instruction and
 others to omit it, then compare the two groups. They start each run with a
 variable set at `koto init` to one arm or the other. Whether the split is a
 value route to a different state or a directive that names a different
-reference file through the variable is the design's call (see Open
-Questions); either way koto takes the split rather than the agent, and the
+reference file through the variable is the design's call, made against
+how koto substitutes variables into directives today; either way koto takes the split rather than the agent, and the
 maintainer groups finished runs by the arm each one started with. How the arm
 is assigned belongs to the canary feature, not this one.
 
@@ -136,14 +139,6 @@ is assigned belongs to the canary feature, not this one.
   assigns its variable.
 - Conditional text inside a directive. koto routes between states; it
   doesn't template directive prose on a condition.
-
-## Open Questions
-
-- Does the canary need value routing at all, or does substituting a
-  variable into the directive's reference-file path already cover it? The
-  design answers this against the current substitution behavior.
-- Must a routed variable be immutable after init, or is logging every change
-  enough? The PRD states the requirement and the design picks.
 
 ## References
 
