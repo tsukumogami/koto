@@ -483,6 +483,121 @@ before you start collecting, and expect a reworded question to start over.
   `expects.fields.<field>.value_descriptions` and the decider receives them as
   its criteria. A description that helps one helps the other.
 
+## Checking the agent's work
+
+Everything above is about a decider answering a routing question. A
+`decider-check` gate asks it something else: whether a slice of what the
+agent produced meets a few closed criteria, such as "every comment this
+change adds gives a reason". It can only object. A criterion in veto blocks
+the state and tells the agent which rule it broke; a pass never advances
+anything. The design is `docs/designs/DESIGN-koto-decider-checks.md`.
+
+### Declaring a check
+
+```yaml
+states:
+  review:
+    gates:
+      comment_reasons:
+        type: decider-check
+        command: "git diff --unified=2 --no-color {{BASE}} -- ':(exclude)*.md'"
+        timeout: 20
+        max_bytes: 2560
+        label: change
+        criteria:
+          comment_reason:
+            rule_ref: "https://github.com/tsukumogami/shirabe/blob/main/skills/work-on/references/phases/phase-4-implementation.md"
+            question: "Does every comment this change adds record why the code is shaped this way, rather than restating what the code does?"
+            pass: "Each added comment gives a reason, constraint, or rejected alternative that the code can't show."
+            fail: "At least one added comment restates what the code does, or its reason is only a restatement."
+            escape: "The change adds no comment, or it can't be judged."
+            mode: shadow
+    transitions:
+      - target: done
+```
+
+- `command` prints the slice to grade. It runs like a command gate's (the
+  session's working directory, its fixed environment, `timeout` seconds,
+  30 by default, and the same variable substitution), and its output passes
+  through koto's capture redactor before anything reads it. Print the narrow
+  text a criterion judges, never whole files: the redactor replaces known
+  credentials, not a secret that happens to be in the text.
+- `max_bytes` (1 to 8,192, default 2,560) bounds the redacted slice. A slice
+  over it is never truncated: nothing is sent and the criterion is
+  unanswered. The default is the range the accuracy evidence was measured on.
+- `label` (default `artifact`) names the slice in the request.
+- Each criterion is keyed by its `rule_id`, an opaque id unique on the
+  state, and needs a `rule_ref` pointing at the rule's text, the `question`,
+  and what `pass`, `fail` and `escape` mean. `threshold` defaults to 0.9;
+  `mode` is `shadow` (the default) or `veto`. A state holds at most four
+  criteria across its checks.
+
+Every word the decider reads as a question comes from the template. The
+slice is sent only as a labelled input, and nothing the agent submitted as
+evidence is sent. Each criterion is asked in its own request, the
+configuration the accuracy evidence measured.
+
+A decider check never routes: no `when` clause, `skip_if` condition or
+context assignment may read its output. It is always overridable, and it
+can't `poll:`. The compile errors are the `E-DECIDER-CHECK-*` codes in
+`docs/reference/error-codes.md`.
+
+### What each outcome does
+
+| Outcome | Veto | Shadow |
+|---------|------|--------|
+| `pass`: pass is strictly the most likely and at least the threshold | doesn't block, advances nothing | the same |
+| `fail`: likewise for fail | blocks; a finding names the criterion | recorded only |
+| `escape`: anything else, a tie included | doesn't block | recorded only |
+| unanswered: no usable answer after one retry, over budget, the command failed, the per-call cap spent, or another `koto next` holding the lock | blocks; a finding named for the check says no verdict was read | recorded only |
+| not graded: the slice is empty | doesn't block | recorded only |
+
+A criterion acts in veto only when the template says `veto` and the user's
+effective decider mode is `auto`; under `shadow`, or when a project's
+`.koto/config.toml` lowers the mode to `shadow`, every criterion runs in
+shadow. Users who aren't opted in never run the command: the state behaves
+as if the check weren't declared.
+
+A blocking check stops the state even when it accepts evidence, so the
+agent's own evidence can't route around a veto on its own work. The way past
+a wrong verdict is `koto overrides record <session> --gate <check>
+--rationale <why>`, which holds for the rest of the visit and is recorded as a
+candidate false fail. Within one visit an unchanged slice reuses its verdict
+without asking again; a changed slice, or a new visit, is asked afresh.
+
+### What's recorded for a check
+
+Each consultation appends a `decider_checked` event just before the gate's
+`gate_evaluated`, and a `checked` line to `~/.koto/_decider_ledger.jsonl`:
+the criterion, its declaration hash, the effective mode, the probabilities,
+the outcome, the model, a hash and length of the slice, the token counts, and
+the attempts. An override of a blocking check adds one `check_overridden`
+line per blocking criterion. None of them holds the slice. `koto decider
+report` tallies them per criterion; a criterion that escapes on everything
+shows as a no-op there, not as silent approval. The field lists are in
+`docs/reference/session-feed.md`.
+
+The declaration hash covers the `rule_id`, the question, the three
+descriptions, and the check's command (as written, before substitution),
+budget and label. Changing a mode, a threshold or a `rule_ref` keeps it.
+
+### The two demonstrated criteria
+
+`tests/fixtures/decider_checks/` ships two checks in shadow, from shirabe's
+Jev accuracy spike: `comment_reason` (a comment gives a reason, not a
+restatement) and `ac_binary` (an acceptance criterion can be answered yes or
+no). In the spike's choice-form runs, neither let a bad or adversarial
+fixture through. Two cautions carry over. The spike asked about one item at
+a time, and graded a comment with its code as two inputs; these fixtures ask
+about every item a change adds in one slice, so the measured numbers are a
+guide rather than a guarantee. And the numbers belong to one model build on
+inputs under about 2.5 KB. Keep criteria in shadow and read the report
+before any goes to veto.
+
+A template that declares a decider check needs a koto that knows the gate
+type; older koto refuses it at compile time. Templates without one are
+unaffected.
+
 ## Compatibility with older koto
 
 Everything a declaration adds lives inside the field, and koto v0.12.2 drops

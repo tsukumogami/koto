@@ -998,3 +998,119 @@ fn the_report_tallies_each_criterion() {
     );
     assert!(text.contains("1 candidate false fails"), "{}", text);
 }
+
+// ---------------------------------------------------------------------------
+// the session-feed contract
+// ---------------------------------------------------------------------------
+
+/// The contract's frontmatter.
+fn feed_spec() -> Value {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/reference/session-feed.md");
+    let text = std::fs::read_to_string(path).unwrap();
+    let rest = text.strip_prefix("---\n").unwrap();
+    let end = rest.find("\n---\n").unwrap();
+    serde_yaml_ng::from_str(&rest[..end]).unwrap()
+}
+
+fn declared_type_ok(value: &Value, ty: &str) -> bool {
+    match ty {
+        "string" => value.is_string(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "boolean" => value.is_boolean(),
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "any" => true,
+        _ => false,
+    }
+}
+
+#[test]
+fn every_key_a_decider_check_writes_is_in_the_contract_and_validate_feed_accepts_the_log() {
+    // One session with a fail (probabilities, tokens), and one with an
+    // unanswered consultation (reason, error_class), cover every field.
+    let h = harness(&check_template(&criteria(&["a", "b"], "veto")), SLICE);
+    h.stub.push(fail("a"));
+    h.stub.push(Reply::status(401));
+    run(&h, "auto");
+
+    let spec = feed_spec();
+    let mut seen = std::collections::BTreeSet::new();
+    for e in h.events() {
+        let ty = e["type"].as_str().unwrap();
+        if ty != "decider_checked"
+            && !(ty == "gate_evaluated" && e["payload"]["gate"] == "comments")
+        {
+            continue;
+        }
+        for (key, value) in e["payload"].as_object().unwrap() {
+            let declared = &spec["events"][ty]["fields"][key.as_str()]["type"];
+            let declared = declared
+                .as_str()
+                .unwrap_or_else(|| panic!("{}.{} is not declared", ty, key));
+            assert!(
+                declared_type_ok(value, declared),
+                "{}.{} declared {} but koto wrote {}",
+                ty,
+                key,
+                declared,
+                value
+            );
+            seen.insert(format!("{}.{}", ty, key));
+        }
+    }
+    for key in [
+        "decider_checked.probabilities",
+        "decider_checked.input_tokens",
+        "decider_checked.unread_usage_attempts",
+        "decider_checked.reason",
+        "decider_checked.error_class",
+        "decider_checked.endpoint_origin",
+        "gate_evaluated.findings",
+    ] {
+        assert!(seen.contains(key), "the scenario never wrote {}", key);
+    }
+
+    let header: Value = serde_json::from_str(h.raw_log().lines().next().unwrap()).unwrap();
+    assert_eq!(header["schema_version"], 1);
+
+    let out = h
+        .koto()
+        .args(["template", "validate-feed"])
+        .arg(h.state_path())
+        .env(
+            "KOTO_FEED_SPEC",
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/reference/session-feed.md"),
+        )
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+}
+
+#[test]
+fn overriding_a_check_that_blocks_nothing_writes_no_override_record() {
+    // A shadow criterion never blocks, so an override finds nothing listed.
+    let h = harness(&looping_template(&criterion("r", "shadow")), SLICE);
+    run(&h, "auto");
+    h.stub.push(fail("r"));
+    run_with(&h, "auto", r#"{"go": true}"#);
+    let out = h
+        .koto()
+        .args([
+            "overrides",
+            "record",
+            WF,
+            "--gate",
+            "comments",
+            "--rationale",
+            "x",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        !ledger(&h).iter().any(|l| l["kind"] == "check_overridden"),
+        "{:?}",
+        ledger(&h)
+    );
+}

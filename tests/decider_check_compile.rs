@@ -404,3 +404,37 @@ fn compiled_json_round_trips_and_validates_from_cache() {
     let e = bad.validate(true).unwrap_err();
     assert!(e.starts_with("E-DECIDER-CHECK-OVERRIDABLE"), "{}", e);
 }
+
+#[test]
+fn every_decider_check_code_the_compiler_emits_is_documented() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut codes = std::collections::BTreeSet::new();
+    for file in [
+        "src/template/compile.rs",
+        "src/template/types.rs",
+        "src/template/decider_check.rs",
+    ] {
+        let text = std::fs::read_to_string(root.join(file)).unwrap();
+        let mut rest = text.as_str();
+        while let Some(i) = rest.find("E-DECIDER-CHECK-") {
+            let tail = &rest[i..];
+            let end = tail
+                .find(|c: char| !(c.is_ascii_uppercase() || c == '-'))
+                .unwrap_or(tail.len());
+            let code = tail[..end].trim_end_matches('-');
+            if code.len() > "E-DECIDER-CHECK-".len() {
+                codes.insert(code.to_string());
+            }
+            rest = &tail[end..];
+        }
+    }
+    assert!(codes.len() >= 10, "{:?}", codes);
+    let doc = std::fs::read_to_string(root.join("docs/reference/error-codes.md")).unwrap();
+    for code in &codes {
+        assert!(
+            doc.contains(&format!("**{} (error)**", code)),
+            "{} is not documented in docs/reference/error-codes.md",
+            code
+        );
+    }
+}

@@ -473,6 +473,81 @@ events:
         type: object
         required: true
 
+  decider_checked:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      visit_seq:
+        type: integer
+        required: true
+      gate:
+        type: string
+        required: true
+      rule_id:
+        type: string
+        required: true
+      rule_ref:
+        type: string
+        required: true
+      declaration_hash:
+        type: string
+        required: true
+      mode:
+        type: string
+        required: true
+        enum: ["shadow", "veto"]
+      threshold:
+        type: any
+        required: true
+      outcome:
+        type: string
+        required: true
+        enum: ["pass", "fail", "escape", "unanswered", "not_graded"]
+      reason:
+        type: string
+        required: false
+      blocked:
+        type: boolean
+        required: true
+      provider:
+        type: string
+        required: true
+      model:
+        type: string
+        required: true
+      probabilities:
+        type: object
+        required: false
+      input_sha256:
+        type: string
+        required: false
+      input_bytes:
+        type: integer
+        required: false
+      input_tokens:
+        type: integer
+        required: false
+      output_tokens:
+        type: integer
+        required: false
+      unread_usage_attempts:
+        type: integer
+        required: false
+      attempts:
+        type: integer
+        required: true
+      latency_ms:
+        type: integer
+        required: true
+      error_class:
+        type: string
+        required: false
+      endpoint_origin:
+        type: string
+        required: false
+
   scheduler_ran:
     tier: 3
     fields:
@@ -825,7 +900,7 @@ Records when an agent bypassed a failing gate via `koto overrides record`.
 | `gate` | string | Yes | Gate identifier string. |
 | `rationale` | string | Yes | Human-readable reason for the override. |
 | `override_applied` | object | Yes | The value substituted as if the gate had produced it. Schema is gate-type-specific. |
-| `actual_output` | object | Yes | The gate's actual output at override time. Schema is gate-type-specific. |
+| `actual_output` | object | Yes | The gate's actual output at override time. Schema is gate-type-specific. For a `decider-check` gate it lists the criteria that were blocking, under `failed` and `unanswered`. |
 | `timestamp` | string | Yes | RFC 3339 UTC timestamp. Matches the outer envelope `timestamp`. |
 
 ---
@@ -1308,6 +1383,26 @@ Command, context-exists and context-matches gates produce findings. Other
 gate types, including `children-complete` and `request-leg`, log none, so a
 failure of one of them carries no `findings` and no `rule_counts`.
 
+**A `decider-check` gate** (docs/designs/DESIGN-koto-decider-checks.md) logs
+`output` as `{"failed": [<rule_id>...], "unanswered": [<rule_id>...], "error": ""}`,
+listing the veto criteria that blocked, and never logs `stdout` or `stderr`,
+since its output is the agent's own text. Its `outcome` separates a judgment
+from a fault:
+
+- `failed` when a veto criterion failed on a verdict. `findings` holds one per
+  failing criterion, with its `rule_id`, `rule_ref` and `message_source`
+  `decider`; unanswered criteria appear in `output.unanswered` only.
+- `error` when no criterion failed but a veto criterion got no verdict.
+  Unanswered is a checker fault, so no finding carries its `rule_id`: the one
+  finding is koto's, with the gate's name as `rule_id`, `message_source`
+  `koto`, and a message that begins `no verdict was read`.
+- `passed` otherwise, and always for shadow criteria: a shadow check's event
+  has outcome `passed`, empty lists and no findings, whatever the decider
+  said. Its verdicts are only in `decider_checked`.
+
+Each consultation's `decider_checked` event comes immediately before this
+event.
+
 A failed append of this event fails the command, as it always has.
 
 ---
@@ -1580,6 +1675,86 @@ outlives the session log; see `docs/workspace-layout.md`.
 
 ---
 
+#### `decider_checked`
+
+Records one consultation of one criterion of a `decider-check` gate: koto
+asked an opted-in decider whether an extracted slice of the agent's work
+meets a closed criterion (docs/designs/DESIGN-koto-decider-checks.md). It
+appears only for users who opted in, only on states whose template declares
+a decider check, and immediately before that gate's `gate_evaluated`. A
+verdict reused from earlier in the same visit, for an unchanged slice,
+appends none.
+
+```json
+{
+  "type": "decider_checked",
+  "payload": {
+    "state": "review",
+    "visit_seq": 2,
+    "gate": "comments",
+    "rule_id": "comment_reason",
+    "rule_ref": "https://example.org/rules/comment_reason",
+    "declaration_hash": "e0f8...0c2b",
+    "mode": "veto",
+    "threshold": 0.9,
+    "outcome": "fail",
+    "blocked": true,
+    "provider": "jev",
+    "model": "jev-1.13.0",
+    "probabilities": {"pass": 0.02, "fail": 0.95, "unclear": 0.03},
+    "input_sha256": "202c...db4d",
+    "input_bytes": 34,
+    "input_tokens": 100,
+    "output_tokens": 3,
+    "unread_usage_attempts": 0,
+    "attempts": 1,
+    "latency_ms": 250,
+    "endpoint_origin": "default"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `state` | string | Yes | The state evaluated. |
+| `visit_seq` | integer | Yes | The persisted `seq` of the event that opened the visit: the latest arrival from a different state, or rewind, into `state`. A self-transition doesn't open a visit, so it keeps the value. |
+| `gate` | string | Yes | The decider check's name. |
+| `rule_id` | string | Yes | The criterion's id, as the template declares it. Opaque to koto; once a rule registry exists it must be that registry's id, so adjudications naming the rule can join. |
+| `rule_ref` | string | Yes | The criterion's reference to its rule text. Opaque. |
+| `declaration_hash` | string | Yes | SHA-256 over the criterion's `rule_id`, question, pass, fail and escape descriptions, and its check's command (before substitution), byte budget and label. Mode, threshold and `rule_ref` are left out. |
+| `mode` | string | Yes | The effective mode: `veto` only when the template says `veto` and the user's effective decider mode is `auto`; otherwise `shadow`. |
+| `threshold` | number | Yes | The criterion's threshold, from 0.5 to 1.0. The frontmatter types it `any`, since the vocabulary has no number type. |
+| `outcome` | string | Yes | `pass`, `fail`, `escape`, `unanswered` or `not_graded`. Consumers MUST tolerate other values. |
+| `reason` | string | No | With `unanswered` only: `provider_error`, `unreadable_response`, `over_budget`, `extraction_failed`, `cap_spent` or `busy`. |
+| `blocked` | boolean | Yes | Whether this criterion blocked the state. Only a veto `fail` or `unanswered` does. |
+| `provider` | string | Yes | The provider name, such as `"jev"`. |
+| `model` | string | Yes | The model build the provider reported, or `"unknown"` when no answer named one. |
+| `probabilities` | object | No | `pass`, `fail` and `unclear`, each rounded to four places. Present when an answer was read. |
+| `input_sha256` | string | No | SHA-256 of the labelled slice, hashed as the routing decider hashes its inputs. Present whenever the extraction produced output. |
+| `input_bytes` | integer | No | Byte length of the redacted slice. Present with `input_sha256`. |
+| `input_tokens` | integer | No | Input tokens the provider reported, summed over every attempt that got a 2xx answer, including one koto couldn't use, since it was billed. Only the answer's usage counts are read. A non-2xx status or a transport failure adds nothing. |
+| `output_tokens` | integer | No | Output tokens, likewise. |
+| `unread_usage_attempts` | integer | No | Attempts that got a 2xx answer whose usage couldn't be read, the size of any remaining undercount. Written on every event; absent only on events from before it existed, which read as 0. |
+| `attempts` | integer | Yes | Provider attempts made: 0 when nothing was sent, 1, or 2 after one retry. |
+| `latency_ms` | integer | Yes | Wall time of the attempts, summed. |
+| `error_class` | string | No | How the last attempt failed, when it did: the routing decider's closed vocabulary (`timeout`, `connect`, `http_status`, `malformed`, `mismatched`). Consumers MUST tolerate values they don't recognize. |
+| `endpoint_origin` | string | No | Which configuration layer supplied the endpoint: `"default"`, `"user"` or `"env"`. A label, never a URL, host, query string or credential. |
+
+**Not graded and escape** are both "not checkable" and stay distinct: `not_graded` means
+the slice was empty, so nothing was asked and nothing sent; `escape` means the
+decider read the slice and answered that it can't be judged, or no value won
+at its threshold. **`unanswered`** is a checker fault, never a judgment about
+the agent's work.
+
+The event carries no slice content and no credentials: the slice appears only
+as `input_sha256` and `input_bytes`, and the API key, the response body and
+error text are never recorded. koto also appends each consultation to
+`~/.koto/_decider_ledger.jsonl` as a `checked` line with the same fields, and
+an override of a blocking decider check as one `check_overridden` line per
+blocking criterion; see `docs/workspace-layout.md`.
+
+---
+
 ### Tier 3: Internal
 
 Tier 3 events are intended for developer tooling and audit purposes. End-user
@@ -1679,6 +1854,7 @@ Each entry of `findings` is an object:
 | `check` | The check printed this finding. |
 | `output` | koto wrote the finding, and its message is a line taken from the check's output. |
 | `koto` | koto wrote the finding and its message, a sentence describing the outcome (such as `command exited with status 1`). |
+| `decider` | A decider's `fail` verdict on a decider-check criterion produced the finding. Its `rule_id` and `rule_ref` are the criterion's. |
 
 A check reports a finding by printing a line to standard output that starts
 with `::koto-finding::` followed by one JSON object; see
