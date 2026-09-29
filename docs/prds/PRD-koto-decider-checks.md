@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   Workflows tell the agent to follow rules about the prose it produces, such
   as "a code comment gives a reason" or "an acceptance criterion can be
@@ -29,7 +29,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-koto-decider-checks](docs/briefs/BRIEF-koto-decider-checks.md); carried in Absorbed Brief.
 
