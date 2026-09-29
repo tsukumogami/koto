@@ -11,8 +11,9 @@ problem: |
 goals: |
   An opted-in user's workflow won't leave a state while a decider judges the
   agent's artifact to break a declared criterion, the agent is told which
-  criterion failed (or that no verdict could be read), and a false fail has a
-  recorded way past. A pass never advances anything, users who haven't opted
+  criterion failed, and a false fail has a recorded way past. A missing
+  verdict never blocks: it is recorded with its reason and counted per
+  criterion. A pass never advances anything, users who haven't opted
   in see no change, and every consultation is recorded so a later feature can
   decide whether a pass deserves trust.
 motivating_context: |
@@ -98,11 +99,11 @@ approve.
 ## Goals
 
 - For opted-in users, a state doesn't advance while a declared criterion,
-  in veto mode, is judged failed on the artifact the agent produced, or while
-  no verdict could be read for it.
+  in veto mode, is judged failed on the artifact the agent produced. A
+  criterion that gets no verdict doesn't hold the state: it is recorded as
+  unchecked, with the reason, and never read as a pass.
 - The agent learns which criterion failed, through the same finding shape a
-  failed lint check already uses, and can tell a failed criterion apart from
-  a decider that gave no verdict.
+  failed lint check already uses.
 - A pass changes nothing about how the workflow moves.
 - A false fail has a way past through koto's existing override, and that
   override is visible later as a likely false fail.
@@ -131,8 +132,8 @@ approve.
   the check with a sentence saying why, through the override command I
   already use, so that a wrong verdict costs one command and leaves a record.
 - As an agent whose decider timed out or answered with something unreadable,
-  I want the finding to say that no verdict was read and why, so that I call
-  `koto next` again rather than rewrite text that may be fine.
+  I want the state to move on as if the check weren't there, so that a
+  provider outage doesn't cost me an override on every veto check.
 - As a project owner, I want to set `decider.mode = "shadow"` in the
   project's config and know that no criterion will block anyone working in
   the repository, so that I can collect records without risking a stuck run.
@@ -168,7 +169,7 @@ approve.
 - **Unanswered.** A consultation that produced no verdict, with one reason
   from a closed set: `provider_error`, `unreadable_response`, `over_budget`,
   `extraction_failed`, `cap_spent`, or `busy`. It is a fault in the check,
-  not a judgment about the agent's work.
+  not a judgment about the agent's work, and it never blocks.
 - **Not graded.** The slice was empty, so there was nothing to ask about and
   no request was sent. It differs from an escape, which is the decider's own
   well-formed answer that a slice it did read can't be judged; both are
@@ -255,29 +256,32 @@ approve.
   | `pass` | doesn't block, advances nothing | same | verdict `pass` |
   | `fail` | blocks; the check fails, with a finding naming the criterion | doesn't block | verdict `fail` |
   | `escape` | doesn't block | doesn't block | verdict `escape` |
-  | unanswered (any reason) | blocks; the check errs, with a finding naming the check | doesn't block | unanswered, with reason |
+  | unanswered (any reason) | doesn't block; listed in the check's output as unanswered | doesn't block | unanswered, with reason; not blocked |
   | empty slice | doesn't block | doesn't block | not graded |
 
-  The check's own outcome follows from its veto criteria: `failed` when any
-  criterion failed on a verdict; otherwise `error` when any was unanswered;
-  otherwise `passed`. In shadow mode the check's outcome is always `passed`
-  and its output lists nothing, whatever the decider said: a shadow verdict
-  lives only in the consultation record, so it never counts as a violation.
+  Only a `fail` in veto mode blocks. Fail-closed means a missing or
+  malformed answer is never read as a pass, not that it blocks. The check's
+  own outcome follows from its veto criteria: `failed` when any criterion
+  failed on a verdict, otherwise `passed`. In shadow mode the check's
+  outcome is always `passed` and its output lists nothing, whatever the
+  decider said: a shadow verdict lives only in the consultation record, so
+  it never counts as a violation. A check that can't grade anything at all
+  (it has no spec, or the session log can't be read) passes, says why in
+  its output, and records no consultation.
 
 - **R14. A fail finding.** A blocking `fail` puts a finding in the response's
   `failure` object at level `error`, with the criterion's `rule_id` and
   `rule_ref`, `message_source` `decider`, and a message naming the criterion
   and saying the decider judged the slice to fail it.
-- **R15. An unanswered finding.** Unanswered is a checker fault, not a
-  violation, so no finding ever carries an unanswered criterion's `rule_id`.
-  A blocking unanswered criterion is listed in the check's output under
-  `unanswered`. When the check errs (no criterion failed), the response
-  carries koto's own finding for the check: level `error`, `rule_id` the
-  check's name, `message_source` `koto`, and a message that begins `no
-  verdict was read` and names each unanswered criterion and its reason. When
-  a criterion also failed, the check fails with the fail findings only and
-  the unanswered criteria appear in the output alone. An unanswered
-  criterion is never read as a pass.
+- **R15. An unanswered criterion is listed, not a finding.** Unanswered is
+  a checker fault, not a violation, so no finding ever carries an unanswered
+  criterion's `rule_id` and koto adds no finding of its own for it. Every
+  unanswered veto criterion is listed in the check's output under
+  `unanswered`, on a passing check as on a failing one, and its
+  consultation record keeps the outcome unanswered with the reason and says
+  it didn't block. A reader of the log can therefore tell a pass that was
+  checked from one where nothing could be. An unanswered criterion is never
+  read as a pass.
 - **R16. One bounded retry.** A provider call that times out, can't connect,
   gets a 5xx status, or returns a malformed or mismatched response is retried
   once, immediately. Any other status (a 3xx, a 4xx including 429) is not
@@ -308,10 +312,14 @@ approve.
   routing consultation on an earlier state in the same call uses it too.
   Only `koto next` consults: `koto status`, `koto overrides record`, and
   template commands never run an extraction command or send a request.
-- **R21. Concurrent ticks don't double-consult.** Consultations take the
-  session's existing `decider.lock` without waiting. When another `koto next`
-  holds it, a criterion is unanswered with reason `busy` at once, sends
-  nothing, and uses no cap slot.
+- **R21. Concurrent ticks don't double-consult or skip a check.**
+  Consultations take the session's existing `decider.lock`. When another
+  `koto next` holds it, the evaluation waits, up to the longest the holder
+  can keep the lock (17 seconds at the default timeout, 60 at most), and
+  then consults for itself. Only if the wait runs out is a criterion
+  unanswered with reason `busy`, sending nothing and using no cap slot.
+  Since an unanswered criterion passes, the wait is what keeps a second,
+  concurrent `koto next` from passing a check the first is still grading.
 
 ### Overriding a false fail
 
@@ -323,9 +331,11 @@ approve.
 - **R23. An override is recorded against its criteria.** The override
   record's `actual_output` is the check's last output, which lists the
   `rule_id`s failing on a verdict and those unanswered under separate keys,
-  and the decider ledger gains one record per blocking criterion: a failing
-  one marked as a candidate false fail, an unanswered one marked as
-  overridden unanswered, whether its outcome was consulted or reused.
+  and the decider ledger gains one record per failing criterion, marked as a
+  candidate false fail, whether its outcome was consulted or reused. An
+  unanswered criterion didn't block, so the override didn't move past it
+  and records nothing for it. Ledgers from builds before this rule also
+  hold records marked overridden unanswered; the report still reads them.
 
 ### Records
 
@@ -357,8 +367,12 @@ approve.
   report` shows, per criterion and declaration hash, how many consultations
   passed, failed, escaped, went unanswered, and weren't graded, and how many
   overrides were recorded against the criterion, so a criterion that escapes
-  on everything reads as a no-op, not as silent approval. `--json` carries
-  the same counts.
+  or goes unanswered on everything reads as a no-op, not as silent approval.
+  Unanswered consultations are split by reason and grouped by cause: the
+  provider didn't answer (an error, a timeout or an unreadable answer),
+  koto didn't ask (a spent cap or a busy lock), or the input was bad (an
+  over-budget slice or a failed extraction). `--json` carries the same
+  counts.
 - **R27. Event changes are additive and documented.** Every new event, field
   and value is new or optional, `schema_version` stays 1, and the
   session-feed contract (`docs/reference/session-feed.md`) documents each
@@ -429,12 +443,11 @@ approve.
 - [ ] A slice holding a value the capture redactor knows reaches the stub
       redacted, and the byte budget is measured after redaction.
 - [ ] A slice of 2,561 bytes against the default budget sends no request and
-      is recorded unanswered with reason `over_budget`; in veto mode the
-      check errs with a `no verdict was read` finding named for the check,
-      and in shadow it doesn't block. A slice of exactly 2,560 bytes is consulted.
+      is recorded unanswered with reason `over_budget` and doesn't block in
+      either mode. A slice of exactly 2,560 bytes is consulted.
 - [ ] An extraction command that exits non-zero, or runs past its timeout,
       sends no request, is not retried, and is recorded unanswered with
-      reason `extraction_failed`; it blocks in veto mode only.
+      reason `extraction_failed`; it blocks in neither mode.
 - [ ] An empty or whitespace-only slice sends no request, blocks in neither
       mode, and is recorded as not graded.
 - [ ] With the user not opted in (mode `off`, or a mode with no key), a state
@@ -453,12 +466,15 @@ approve.
       recorded as `escape`.
 - [ ] In veto mode, a stub that times out, returns a 503, returns malformed
       JSON, or returns mismatched keys on both attempts receives exactly two
-      requests, the check's `gate_evaluated` outcome is `error`, its output
-      lists the criterion under `unanswered`, and the state blocks with one
-      finding at level `error` whose `rule_id` is the check's name,
-      `message_source` `koto`, and message beginning `no verdict was read`;
-      no finding carries the criterion's `rule_id`. A stub returning 401
-      receives one request.
+      requests, the check's `gate_evaluated` outcome is `passed`, its output
+      lists the criterion under `unanswered`, the state moves on with no
+      finding, and the consultation record keeps outcome `unanswered` with
+      the reason and `blocked: false`. A stub returning 401 receives one
+      request.
+- [ ] A check with no spec passes with `output.error` `missing_spec`; a
+      check whose session log can't be read passes with `output.error`
+      `log_unreadable` and every veto criterion under `unanswered`. Neither
+      asks anything or appends a consultation record, in either mode.
 - [ ] With one veto criterion failing and another unanswered, the check's
       outcome is `failed`, its only finding is the failing criterion's, and
       its output lists each criterion under its kind.
@@ -492,16 +508,17 @@ approve.
       leaving and re-entering the state, the same slice is consulted again.
 - [ ] With the routing decider having consulted on an earlier state in the
       same `koto next`, so that four veto criteria on the next state would
-      need five consultations in the call, the criterion past the cap
-      blocks with a finding naming `cap_spent`, and the next `koto next`
-      consults it.
-- [ ] With `decider.lock` held by another process, a veto criterion is
-      recorded unanswered with reason `busy` and blocks.
+      need five consultations in the call, the criterion past the cap is
+      recorded unanswered with `cap_spent`, doesn't block, and is listed
+      under `unanswered`, and the next `koto next` consults it.
+- [ ] With `decider.lock` held by another process past the wait, a veto
+      criterion is recorded unanswered with reason `busy` and doesn't block;
+      with the lock released during the wait, the criterion is consulted.
 - [ ] `koto overrides record --gate <check> --rationale <text>` moves past a
       check with one failing and one unanswered veto criterion; the override
       record's `actual_output` lists each under its kind, and the ledger gains
-      a candidate-false-fail record for the first and an overridden-unanswered
-      record for the second.
+      a candidate-false-fail record for the first and nothing for the
+      second.
 - [ ] Each consultation's session-log and ledger records carry every field
       R24 lists, and neither contains the slice text, the API key, or the
       stub's response body.
@@ -567,8 +584,14 @@ approve.
 - **The accuracy evidence is narrow.** Every threshold and mode choice rests
   on one model build, unbatched, on inputs under about 2.5 KB. A longer
   budget, up to the 8,192-byte maximum, is outside what was measured.
-- **A sustained provider outage blocks every veto criterion** until the agent
-  overrides it or the user lowers the mode.
+- **A provider outage lets work through unchecked.** While no verdict can be
+  read, every veto criterion passes as unanswered. The records and the
+  report's no-verdict tally show which criteria went unchecked and why, but
+  nothing holds the agent during the outage.
+- **An over-budget slice passes unchecked.** The agent controls the
+  artifact the slice comes from, so an agent that makes it longer than the
+  budget gets no verdict. The report tallies `over_budget` per criterion, so
+  a pattern shows.
 
 ## Decisions and Trade-offs
 
@@ -580,16 +603,23 @@ approve.
   per-criterion tally makes a criterion that escapes on everything visible as
   a no-op. Chosen because that tally is cheap: it aggregates ledger records
   the feature already writes.
-- **An unanswered consultation blocks in veto mode.** Alternative: let the
-  state move. Treating a garbled or absent answer as anything but a fail
-  would let a provider outage, or an input an agent made too long, switch the
-  check off. One immediate retry absorbs a transient error, and the finding
-  says to call `koto next` again rather than rewrite. The override remains
-  for a sustained outage.
-- **An over-budget slice is unanswered, not skipped.** The agent controls the
-  artifact the slice comes from, so letting size skip the check would be a
-  way around it. In veto mode it blocks, and the override, with its recorded
-  reason, covers a legitimately large change.
+- **An unanswered consultation never blocks.** The first version blocked on
+  it in veto mode, reading "fail closed" as "block". The maintainers ruled
+  on 2026-09-29 that fail-closed means only that a missing or malformed
+  answer is never read as a pass. Blocking on it cost every opted-in run one
+  override per veto check during a provider outage, and filled the
+  candidate false fails with overrides that said nothing about a
+  criterion's accuracy. So the state moves, the criterion is recorded as
+  unanswered with its reason and `blocked: false`, stays listed under the
+  check's `unanswered` output, and is tallied per criterion like an escape,
+  so a decider that never answers reads as a no-op rather than as silent
+  approval. One immediate retry still absorbs a transient error, and a
+  second concurrent `koto next` waits for the lock rather than passing a
+  check the first is grading (R21).
+- **An over-budget slice is unanswered, not skipped.** It is recorded as
+  unanswered with `over_budget`, not as not graded, so it counts as a
+  no-verdict in the report rather than disappearing. Like every
+  no-verdict it doesn't block.
 - **An empty slice isn't graded.** An empty slice means the artifact holds
   nothing the criterion applies to, such as a change that adds no comments.
 - **Veto needs effective mode `auto`.** Alternative: let `shadow` users be

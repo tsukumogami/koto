@@ -364,32 +364,31 @@ fn an_escape_never_blocks() {
 // unanswered
 // ---------------------------------------------------------------------------
 
-fn assert_unanswered_error(h: &Harness, out: &Value, reason: &str) {
-    assert_eq!(out["action"], "gate_blocked", "{}", out);
+/// A veto criterion `r` that got no verdict for `reason`: the gate passed
+/// and the workflow moved on, with no finding, while the log still says
+/// nothing was checked. The criterion stays under `output.unanswered`, and
+/// its `decider_checked` keeps outcome `unanswered` with the reason and
+/// `blocked: false`.
+fn assert_unanswered_passes(h: &Harness, out: &Value, reason: &str) {
+    assert_eq!(state_of(out), "done", "{}", out);
+    assert!(condition(out).is_none(), "{}", out);
     let g = gate_evals(h);
     let last = g.last().unwrap();
-    assert_eq!(last["outcome"], "error", "{}", last);
+    assert_eq!(last["outcome"], "passed", "{}", last);
     assert_eq!(last["output"]["unanswered"], json!(["r"]));
     assert_eq!(last["output"]["failed"], json!([]));
-    let f = findings(out);
-    assert_eq!(f.len(), 1, "{}", out);
-    assert_eq!(f[0]["rule_id"], "comments", "the finding names the check");
-    assert_eq!(f[0]["level"], "error");
-    assert_eq!(f[0]["message_source"], "koto");
-    let msg = f[0]["message"].as_str().unwrap();
-    assert!(msg.starts_with("no verdict was read"), "{}", msg);
-    assert!(msg.contains(reason), "{}", msg);
-    assert!(
-        !f.iter().any(|x| x["rule_id"] == "r"),
-        "no finding carries an unanswered criterion's rule_id"
-    );
+    assert_eq!(last["output"]["error"], "");
+    assert!(last.get("findings").is_none(), "{}", last);
     let c = checks(h);
-    assert_eq!(c.last().unwrap()["outcome"], "unanswered");
-    assert_eq!(c.last().unwrap()["reason"], reason);
+    let c = c.last().unwrap();
+    assert_eq!(c["outcome"], "unanswered");
+    assert_eq!(c["reason"], reason);
+    assert_eq!(c["mode"], "veto");
+    assert_eq!(c["blocked"], false);
 }
 
 #[test]
-fn provider_failures_are_retried_once_then_err() {
+fn provider_failures_are_retried_once_then_pass_unanswered() {
     let malformed = Reply::json(&json!({"model": "m", "answers": {"r": {"type": "choice"}}}));
     let mismatched = Reply::json(&json!({"model": "m", "answers": {"other": {}}}));
     for (reply, reason) in [
@@ -402,7 +401,7 @@ fn provider_failures_are_retried_once_then_err() {
         h.stub.push(reply);
         let out = run(&h, "auto");
         assert_eq!(h.stub.request_count(), 2, "{}", reason);
-        assert_unanswered_error(&h, &out, reason);
+        assert_unanswered_passes(&h, &out, reason);
         assert_eq!(checks(&h)[0]["attempts"], 2);
     }
 }
@@ -416,7 +415,7 @@ fn a_timeout_is_retried_once() {
     h.stub.push(slow);
     let out = run(&h, "auto");
     assert_eq!(h.stub.request_count(), 2);
-    assert_unanswered_error(&h, &out, "provider_error");
+    assert_unanswered_passes(&h, &out, "provider_error");
     assert_eq!(checks(&h)[0]["error_class"], "timeout");
 }
 
@@ -427,7 +426,7 @@ fn a_4xx_is_not_retried() {
         h.stub.push(Reply::status(status));
         let out = run(&h, "auto");
         assert_eq!(h.stub.request_count(), 1, "{}", status);
-        assert_unanswered_error(&h, &out, "provider_error");
+        assert_unanswered_passes(&h, &out, "provider_error");
     }
 }
 
@@ -473,6 +472,7 @@ fn a_fail_and_an_unanswered_criterion_fail_the_check_with_the_fail_finding_only(
     h.stub.push(fail("a"));
     h.stub.push(Reply::status(401));
     let out = run(&h, "auto");
+    assert_eq!(out["action"], "gate_blocked", "{}", out);
     let g = &gate_evals(&h)[0];
     assert_eq!(g["outcome"], "failed");
     assert_eq!(g["output"]["failed"], json!(["a"]));
@@ -481,9 +481,29 @@ fn a_fail_and_an_unanswered_criterion_fail_the_check_with_the_fail_finding_only(
     assert_eq!(f.len(), 1, "{}", out);
     assert_eq!(f[0]["rule_id"], "a");
     let c = checks(&h);
+    assert_eq!(c[0]["blocked"], true);
     assert_eq!(c[1]["rule_id"], "b");
     assert_eq!(c[1]["outcome"], "unanswered");
     assert_eq!(c[1]["reason"], "provider_error");
+    assert_eq!(c[1]["blocked"], false, "only the fail blocks");
+}
+
+#[test]
+fn a_passing_gate_keeps_an_unanswered_criterion_listed_beside_a_pass() {
+    let h = harness(&check_template(&criteria(&["a", "b"], "veto")), SLICE);
+    h.stub.push(pass("a"));
+    h.stub.push(Reply::status(401));
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+    let g = &gate_evals(&h)[0];
+    assert_eq!(g["outcome"], "passed");
+    assert_eq!(g["output"]["failed"], json!([]));
+    assert_eq!(g["output"]["unanswered"], json!(["b"]));
+    let c = checks(&h);
+    assert_eq!(c[0]["outcome"], "pass");
+    assert_eq!(c[1]["outcome"], "unanswered");
+    assert_eq!(c[1]["reason"], "provider_error");
+    assert_eq!(c[1]["blocked"], false);
 }
 
 #[test]
@@ -510,7 +530,7 @@ fn over_budget_empty_and_failed_extractions_send_nothing() {
     let h = harness(&check_template(&criterion("r", "veto")), &"x".repeat(2561));
     let out = run(&h, "auto");
     assert_eq!(h.stub.request_count(), 0);
-    assert_unanswered_error(&h, &out, "over_budget");
+    assert_unanswered_passes(&h, &out, "over_budget");
     assert_eq!(checks(&h)[0]["input_bytes"], 2561);
 
     let h = harness(
@@ -533,7 +553,7 @@ fn over_budget_empty_and_failed_extractions_send_nothing() {
     let h = harness(&tpl, SLICE);
     let out = run(&h, "auto");
     assert_eq!(h.stub.request_count(), 0);
-    assert_unanswered_error(&h, &out, "extraction_failed");
+    assert_unanswered_passes(&h, &out, "extraction_failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -686,13 +706,18 @@ fn a_self_transition_keeps_the_visit_and_an_arrival_opens_a_new_one() {
 
 #[test]
 fn an_unanswered_outcome_is_not_reused() {
-    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
-    h.stub.push(Reply::status(401));
+    // `review` waits for evidence, so the second call is the same visit.
+    let h = harness(&looping_template(&criterion("r", "veto")), SLICE);
     run(&h, "auto");
+    h.stub.push(Reply::status(401));
+    run_with(&h, "auto", r#"{"go": true}"#);
     h.stub.push(pass("r"));
-    let out = run(&h, "auto");
+    run(&h, "auto");
     assert_eq!(h.stub.request_count(), 2);
-    assert_eq!(state_of(&out), "done");
+    let c = checks(&h);
+    assert_eq!(c.len(), 2);
+    assert_eq!(c[1]["outcome"], "pass");
+    assert_eq!(c[1]["visit_seq"], c[0]["visit_seq"]);
 }
 
 /// `triage` asks the routing decider (auto on `go`) and routes to `review`,
@@ -749,6 +774,14 @@ fn checks_share_the_per_call_cap_with_the_routing_decider() {
     assert_eq!(c[3]["rule_id"], "d");
     assert_eq!(c[3]["outcome"], "unanswered");
     assert_eq!(c[3]["reason"], "cap_spent");
+    assert_eq!(c[3]["blocked"], false);
+    let g = gate_evals(&h);
+    assert_eq!(g[0]["output"]["unanswered"], json!(["d"]));
+    assert_eq!(
+        findings(&out).len(),
+        3,
+        "the fails block, the spent cap doesn't"
+    );
 
     // The next call consults d; a, b and c are reused.
     h.stub.push(fail("d"));
@@ -757,11 +790,10 @@ fn checks_share_the_per_call_cap_with_the_routing_decider() {
     assert_eq!(findings(&out).len(), 4, "{}", out);
 }
 
+/// Take the session's decider lock, as another `koto next` would.
 #[cfg(unix)]
-#[test]
-fn a_held_lock_makes_criteria_busy() {
+fn hold_lock(h: &Harness) -> std::fs::File {
     use std::os::unix::io::AsRawFd;
-    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
     std::fs::create_dir_all(h.session_dir()).unwrap();
     let f = std::fs::OpenOptions::new()
         .create(true)
@@ -774,10 +806,42 @@ fn a_held_lock_makes_criteria_busy() {
         unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
     );
+    f
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lock_held_past_the_wait_makes_criteria_busy() {
+    // A 50 ms timeout makes the wait 4 x 2 x 50 ms + 1 s = 1.4 s.
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    h.user_config("[decider]\ntimeout_ms = 50\n");
+    let f = hold_lock(&h);
+    let started = Instant::now();
     let out = run(&h, "auto");
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(1400), "{:?}", waited);
     assert_eq!(h.stub.request_count(), 0);
-    assert_unanswered_error(&h, &out, "busy");
+    assert_unanswered_passes(&h, &out, "busy");
     drop(f);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lock_released_during_the_wait_is_taken_and_the_check_asked() {
+    // A concurrent `koto next` can't pass a veto check the other one is
+    // still grading: this one waits for the lock and asks for itself.
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    let f = hold_lock(&h);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(f);
+    });
+    h.stub.push(fail("r"));
+    let out = run(&h, "auto");
+    release.join().unwrap();
+    assert_eq!(h.stub.request_count(), 1);
+    assert_eq!(out["action"], "gate_blocked", "{}", out);
+    assert_eq!(findings(&out)[0]["rule_id"], "r");
 }
 
 // ---------------------------------------------------------------------------
@@ -899,7 +963,7 @@ fn a_billed_answer_with_no_readable_usage_is_counted_as_unread() {
 }
 
 #[test]
-fn an_override_records_each_blocking_criterion_as_a_candidate_or_unanswered() {
+fn an_override_records_only_the_failed_criterion_as_a_candidate() {
     let h = harness(&check_template(&criteria(&["a", "b"], "veto")), SLICE);
     h.stub.push(fail("a"));
     h.stub.push(Reply::status(401));
@@ -928,11 +992,11 @@ fn an_override_records_each_blocking_criterion_as_a_candidate_or_unanswered() {
         .into_iter()
         .filter(|l| l["kind"] == "check_overridden")
         .collect();
-    assert_eq!(overridden.len(), 2, "{:?}", overridden);
+    // b got no verdict, which never blocked, so the override didn't move
+    // past it: no overridden_unanswered record.
+    assert_eq!(overridden.len(), 1, "{:?}", overridden);
     assert_eq!(overridden[0]["rule_id"], "a");
     assert_eq!(overridden[0]["override_kind"], "candidate_false_fail");
-    assert_eq!(overridden[1]["rule_id"], "b");
-    assert_eq!(overridden[1]["override_kind"], "overridden_unanswered");
     let c = checks(&h);
     assert_eq!(overridden[0]["visit_seq"], c[0]["visit_seq"]);
     assert_eq!(overridden[0]["declaration_hash"], c[0]["declaration_hash"]);
@@ -997,6 +1061,99 @@ fn the_report_tallies_each_criterion() {
         text
     );
     assert!(text.contains("1 candidate false fails"), "{}", text);
+}
+
+fn report_json(h: &Harness) -> Value {
+    let path = h.home().join(".koto").join("_decider_ledger.jsonl");
+    let out = h
+        .koto()
+        .args(["decider", "report", "--json", "--ledger"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+    json_out(&out)
+}
+
+#[cfg(unix)]
+#[test]
+fn the_report_counts_no_verdicts_per_criterion_by_cause() {
+    // `review` waits for evidence, so each call below is one more
+    // consultation of r in the same visit.
+    let h = harness(&looping_template(&criterion("r", "veto")), SLICE);
+    h.user_config("[decider]\ntimeout_ms = 50\n");
+    run(&h, "auto");
+    // The provider didn't answer.
+    h.stub.push(Reply::status(401));
+    run_with(&h, "auto", r#"{"go": true}"#);
+    // koto didn't ask: another `koto next` held the lock past the wait.
+    let f = hold_lock(&h);
+    run(&h, "auto");
+    drop(f);
+    // The input was bad: the slice is over budget.
+    write_slice(&h, &"x".repeat(2561));
+    run(&h, "auto");
+
+    let report = report_json(&h);
+    let r = &report["checks"][0];
+    assert_eq!(r["rule_id"], "r", "{}", report);
+    assert_eq!(r["unanswered"], 3);
+    assert_eq!(
+        r["unanswered_by_cause"],
+        json!({"provider": 1, "not_asked": 1, "input": 1})
+    );
+    assert_eq!(r["unanswered_by_reason"]["busy"], 1, "busy stays visible");
+    assert_eq!(r["overridden_unanswered"], 0);
+
+    let path = h.home().join(".koto").join("_decider_ledger.jsonl");
+    let table = h
+        .koto()
+        .args(["decider", "report", "--ledger"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&table.stdout);
+    assert!(
+        text.contains("no verdict: provider didn't answer 1, koto didn't ask 1, input bad 1"),
+        "{}",
+        text
+    );
+}
+
+#[test]
+fn a_ledger_with_an_overridden_unanswered_line_still_reads() {
+    // Ledgers written before a missing verdict stopped blocking hold
+    // `overridden_unanswered` lines; the report still counts them.
+    let h = harness(&check_template(&criterion("a", "veto")), SLICE);
+    h.stub.push(fail("a"));
+    run(&h, "auto");
+    let out = h
+        .koto()
+        .args([
+            "overrides",
+            "record",
+            WF,
+            "--gate",
+            "comments",
+            "--rationale",
+            "fine",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+    let path = h.home().join(".koto").join("_decider_ledger.jsonl");
+    let mut line = ledger(&h)
+        .into_iter()
+        .find(|l| l["kind"] == "check_overridden")
+        .unwrap();
+    line["override_kind"] = json!("overridden_unanswered");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(&format!("{}\n", line));
+    std::fs::write(&path, text).unwrap();
+
+    let a = &report_json(&h)["checks"][0];
+    assert_eq!(a["candidate_false_fail"], 1);
+    assert_eq!(a["overridden_unanswered"], 1);
 }
 
 // ---------------------------------------------------------------------------

@@ -808,9 +808,11 @@ gates:
 ```
 
 A check only ever vetoes. A criterion in `veto`, for a user whose effective
-decider mode is `auto`, blocks the state on a `fail` verdict or when no
-verdict could be read; a pass, an escape and an empty slice never block, and
-a pass never advances anything. In `shadow` nothing blocks and every verdict
+decider mode is `auto`, blocks the state on a `fail` verdict only. A
+missing or malformed verdict never blocks: the criterion is listed under the
+check's `output.unanswered` and recorded with its reason, and it is never
+read as a pass. A pass, an escape and an empty slice never block, and a pass
+never advances anything. In `shadow` nothing blocks and every verdict
 is recorded. For users who aren't opted in, the state behaves as if the check
 weren't declared. A blocking check stops the state even when it accepts
 evidence; the agent's way past a wrong verdict is `koto overrides record`.

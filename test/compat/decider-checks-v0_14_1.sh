@@ -10,7 +10,10 @@
 # Session: the new build drives fixtures-decider-checks/decider-checks.md
 # against the loopback stub (decider_stub.py answering "fail"), opted in at
 # `auto`. The veto criterion blocks review, the check is overridden, and the
-# session moves on to work, a state with no decider check. The log must hold
+# session moves on to work, a state with no decider check. A second session,
+# nv, points at an endpoint nothing listens on: the criterion gets no
+# verdict, which never blocks, so its gate passes with the criterion under
+# output.unanswered and the session moves on to work on its own. The log must hold
 # every event in EVENT_CHECKS, and the new build's `koto template
 # validate-feed` must accept it against docs/reference/session-feed.md. The
 # ledger must hold a `checked` and a `check_overridden` line, which the new
@@ -18,7 +21,7 @@
 #
 # v0.14.1 can't compile a template with a decider check, so it is handed the
 # session after it left the check: it must run `koto status` and `koto next`
-# on it, exit 0 and report the state the new build reports, and run
+# on each, exit 0 and report the state the new build reports, and run
 # `koto decider report` over the ledger, exit 0, and count the two new line
 # kinds as unknown rather than failing.
 #
@@ -27,6 +30,7 @@
 #
 # COMPAT_MUTATION breaks things on purpose, to show the checks bite:
 #   drop-event:N       delete the log lines matching EVENT_CHECKS[N]
+#   drop-nv-event:N    delete nv's log lines matching NV_EVENT_CHECKS[N]
 #   strip-field:K      delete payload field K from the events that carry it
 #   drop-ledger:KIND   delete the ledger's lines of kind KIND
 #   drop-transition    delete the last `transitioned` event
@@ -51,6 +55,13 @@ EVENT_CHECKS=(
   'the override of the check|.type? == "gate_override_recorded" and .payload.gate == "comments" and .payload.actual_output.failed == ["comment_reason"]'
 )
 
+# Events the no-verdict session must leave in its log: a pass that keeps
+# the criterion listed as unanswered, never read as compliance.
+NV_EVENT_CHECKS=(
+  'decider_checked for the unanswered criterion|.type? == "decider_checked" and .payload.rule_id == "comment_reason" and .payload.outcome == "unanswered" and .payload.reason == "provider_error" and .payload.mode == "veto" and .payload.blocked == false'
+  'gate_evaluated passing with the criterion unanswered|.type? == "gate_evaluated" and .payload.gate == "comments" and .payload.outcome == "passed" and .payload.output.failed == [] and .payload.output.unanswered == ["comment_reason"] and (.payload | has("findings") | not)'
+)
+
 # Required fields of the new event, as "field|jq filter selecting the events".
 STRIPPED_FIELDS=(
   'visit_seq|.type? == "decider_checked"'
@@ -72,6 +83,9 @@ mutations() {
   local i
   for i in "${!EVENT_CHECKS[@]}"; do
     echo "drop-event:$i"
+  done
+  for i in "${!NV_EVENT_CHECKS[@]}"; do
+    echo "drop-nv-event:$i"
   done
   for i in "${!STRIPPED_FIELDS[@]}"; do
     echo "strip-field:${STRIPPED_FIELDS[$i]%%|*}"
@@ -192,6 +206,23 @@ new_next "the override moves on to work" work
 NEW_STATE="$(new_koto status wf | jq -er '.current_state')" || fail "session: koto status failed"
 LOG_FILE="$(find "$HOME_DIR" "$WORK_DIR" -name 'koto-wf.state.jsonl' -type f | head -n 1)"
 [ -n "$LOG_FILE" ] || fail "session: no koto-wf.state.jsonl was written"
+
+# The no-verdict session: nothing listens on the discard port, so both
+# attempts fail to connect.
+nv_koto() {
+  (cd "$WORK_DIR" && env -u KOTO_SESSIONS_BASE HOME="$HOME_DIR" KOTO_DECIDER=auto \
+    KOTO_DECIDER_API_KEY="$KEY" KOTO_DECIDER_ENDPOINT="http://127.0.0.1:9/v1/systemone" \
+    "$KOTO_NEW_BIN" "$@")
+}
+nv_koto init nv --template "$WORK_DIR/decider-checks.md" >/dev/null 2>"$SCRATCH/init-nv.err" \
+  || fail "session: koto init nv failed: $(cat "$SCRATCH/init-nv.err")"
+out="$(nv_koto next nv --no-cleanup 2>&1)" || fail "session: nv's koto next exited non-zero: $out"
+got="$(printf '%s' "$out" | jq -er '.state')" || fail "session: nv's koto next printed no state: $out"
+[ "$got" = "work" ] || fail "session: a missing verdict should not block review, got: $out"
+pass "session: a missing verdict passes review -> $got"
+NV_STATE="$(nv_koto status nv | jq -er '.current_state')" || fail "session: koto status nv failed"
+NV_LOG="$(find "$HOME_DIR" "$WORK_DIR" -name 'koto-nv.state.jsonl' -type f | head -n 1)"
+[ -n "$NV_LOG" ] || fail "session: no koto-nv.state.jsonl was written"
 LEDGER="$HOME_DIR/.koto/_decider_ledger.jsonl"
 [ -f "$LEDGER" ] || fail "session: no ledger was written"
 
@@ -215,6 +246,11 @@ case "$MUTATION" in
     entry="${EVENT_CHECKS[${MUTATION#drop-event:}]}"
     echo "MUTATION: deleting log lines for '${entry%%|*}'"
     rewrite_lines "$LOG_FILE" "${entry#*|}" ""
+    ;;
+  drop-nv-event:*)
+    entry="${NV_EVENT_CHECKS[${MUTATION#drop-nv-event:}]}"
+    echo "MUTATION: deleting nv's log lines for '${entry%%|*}'"
+    rewrite_lines "$NV_LOG" "${entry#*|}" ""
     ;;
   strip-field:*)
     key="${MUTATION#strip-field:}"
@@ -246,9 +282,19 @@ for entry in "${EVENT_CHECKS[@]}"; do
   pass "events: $label ($n)"
 done
 
-out="$(KOTO_FEED_SPEC="$FEED_SPEC" koto_in "$KOTO_NEW_BIN" template validate-feed "$LOG_FILE" 2>&1)" \
-  || fail "contract: koto template validate-feed rejected the log: $out"
-pass "contract: the session-feed spec accepts the log"
+for entry in "${NV_EVENT_CHECKS[@]}"; do
+  label="${entry%%|*}"
+  filter="${entry#*|}"
+  n="$(jq -s "[.[] | select($filter)] | length" "$NV_LOG")" || fail "events: the filter for '$label' did not run"
+  [ "$n" -ge 1 ] || fail "events: nv's log holds no event for '$label'"
+  pass "events: $label ($n)"
+done
+
+for log in "$LOG_FILE" "$NV_LOG"; do
+  out="$(KOTO_FEED_SPEC="$FEED_SPEC" koto_in "$KOTO_NEW_BIN" template validate-feed "$log" 2>&1)" \
+    || fail "contract: koto template validate-feed rejected $(basename "$log"): $out"
+  pass "contract: the session-feed spec accepts $(basename "$log")"
+done
 
 for kind in "${LEDGER_KINDS[@]}"; do
   n="$(jq -s "[.[] | select(.kind? == \"$kind\")] | length" "$LEDGER")"
@@ -257,7 +303,7 @@ for kind in "${LEDGER_KINDS[@]}"; do
 done
 out="$(koto_in "$KOTO_NEW_BIN" decider report --json --ledger "$LEDGER" 2>&1)" \
   || fail "ledger: the new build's report failed: $out"
-printf '%s' "$out" | jq -e '.checks[0].rule_id == "comment_reason" and .checks[0].fail == 1 and .checks[0].candidate_false_fail == 1' >/dev/null \
+printf '%s' "$out" | jq -e '.checks[0].rule_id == "comment_reason" and .checks[0].fail == 1 and .checks[0].candidate_false_fail == 1 and .checks[0].unanswered == 1 and .checks[0].unanswered_by_cause.provider == 1' >/dev/null \
   || fail "ledger: the new build's report doesn't tally the check: $out"
 pass "ledger: the new build tallies the check"
 
@@ -281,6 +327,19 @@ printf '%s' "$out" | jq -e '.error == null' >/dev/null || fail "floor: koto next
 state="$(printf '%s' "$out" | jq -er '.state')" || fail "floor: koto next has no state: $out"
 [ "$state" = "$NEW_STATE" ] || fail "floor: koto next says '$state', the new build said '$NEW_STATE'"
 pass "v$FLOOR_VERSION koto next reads the log (state $state)"
+
+out="$(floor_koto status nv 2>&1)" || fail "floor: koto status nv exited non-zero: $out"
+reject_errors "koto status nv" "$out"
+state="$(printf '%s' "$out" | jq -er '.current_state')" || fail "floor: koto status nv has no current_state: $out"
+[ "$state" = "$NV_STATE" ] || fail "floor: koto status nv says '$state', the new build said '$NV_STATE'"
+pass "v$FLOOR_VERSION koto status reads the no-verdict log (state $state)"
+
+out="$(floor_koto next nv --no-cleanup 2>&1)" || fail "floor: koto next nv exited non-zero: $out"
+reject_errors "koto next nv" "$out"
+printf '%s' "$out" | jq -e '.error == null' >/dev/null || fail "floor: koto next nv returned an error: $out"
+state="$(printf '%s' "$out" | jq -er '.state')" || fail "floor: koto next nv has no state: $out"
+[ "$state" = "$NV_STATE" ] || fail "floor: koto next nv says '$state', the new build said '$NV_STATE'"
+pass "v$FLOOR_VERSION koto next reads the no-verdict log (state $state)"
 
 out="$(floor_koto decider report --json --ledger "$LEDGER" 2>&1)" || fail "floor: koto decider report exited non-zero: $out"
 unknown="$(printf '%s' "$out" | jq -er '.header.unknown_kind')" || fail "floor: the report has no unknown_kind: $out"

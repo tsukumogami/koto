@@ -41,7 +41,43 @@ pub enum UnansweredReason {
     Busy,
 }
 
+/// Who a missing verdict comes down to, for the report: the provider
+/// didn't answer, koto didn't ask, or the template's input was bad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum UnansweredCause {
+    /// A provider error or timeout after the retry, or an answer koto
+    /// couldn't read.
+    Provider,
+    /// The consultation cap was spent, or another `koto next` held the lock.
+    NotAsked,
+    /// The slice was over budget, or the extraction command failed.
+    Input,
+}
+
+impl UnansweredCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnansweredCause::Provider => "provider",
+            UnansweredCause::NotAsked => "not_asked",
+            UnansweredCause::Input => "input",
+        }
+    }
+}
+
 impl UnansweredReason {
+    /// The cause this reason is grouped under in the report.
+    pub fn cause(self) -> UnansweredCause {
+        match self {
+            UnansweredReason::ProviderError | UnansweredReason::UnreadableResponse => {
+                UnansweredCause::Provider
+            }
+            UnansweredReason::CapSpent | UnansweredReason::Busy => UnansweredCause::NotAsked,
+            UnansweredReason::OverBudget | UnansweredReason::ExtractionFailed => {
+                UnansweredCause::Input
+            }
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             UnansweredReason::ProviderError => "provider_error",
@@ -132,11 +168,13 @@ pub fn effective_check_mode(template: CheckMode, effective_global: GlobalMode) -
     }
 }
 
-/// Whether `outcome` blocks the state in `mode`: a fail or a missing verdict
-/// in veto. A pass, an escape and an empty slice never block, and nothing
-/// blocks in shadow.
+/// Whether `outcome` blocks the state in `mode`: only a fail in veto. A
+/// missing or malformed verdict is never read as a pass, but it doesn't
+/// block either: it is recorded with its reason and counted per criterion,
+/// like an escape. A pass, an escape and an empty slice never block, and
+/// nothing blocks in shadow.
 pub fn blocks(outcome: CheckOutcome, mode: CheckMode) -> bool {
-    mode == CheckMode::Veto && matches!(outcome, CheckOutcome::Fail | CheckOutcome::Unanswered(_))
+    mode == CheckMode::Veto && outcome == CheckOutcome::Fail
 }
 
 /// The one choice question a consultation asks: the criterion's question,
@@ -437,18 +475,20 @@ mod tests {
     }
 
     #[test]
-    fn blocking_needs_veto_and_a_fail_or_no_verdict() {
+    fn only_a_veto_fail_blocks() {
         let veto = CheckMode::Veto;
         let shadow = CheckMode::Shadow;
         assert!(blocks(CheckOutcome::Fail, veto));
-        assert!(blocks(
-            CheckOutcome::Unanswered(UnansweredReason::OverBudget),
-            veto
-        ));
         for o in [
             CheckOutcome::Pass,
             CheckOutcome::Escape,
             CheckOutcome::NotGraded,
+            CheckOutcome::Unanswered(UnansweredReason::ProviderError),
+            CheckOutcome::Unanswered(UnansweredReason::UnreadableResponse),
+            CheckOutcome::Unanswered(UnansweredReason::OverBudget),
+            CheckOutcome::Unanswered(UnansweredReason::ExtractionFailed),
+            CheckOutcome::Unanswered(UnansweredReason::CapSpent),
+            CheckOutcome::Unanswered(UnansweredReason::Busy),
         ] {
             assert!(!blocks(o, veto), "{:?}", o);
         }
@@ -460,6 +500,22 @@ mod tests {
             CheckOutcome::Unanswered(UnansweredReason::Busy),
         ] {
             assert!(!blocks(o, shadow), "{:?}", o);
+        }
+    }
+
+    #[test]
+    fn each_reason_has_one_cause() {
+        use UnansweredCause::*;
+        use UnansweredReason::*;
+        for (r, c) in [
+            (ProviderError, Provider),
+            (UnreadableResponse, Provider),
+            (CapSpent, NotAsked),
+            (Busy, NotAsked),
+            (OverBudget, Input),
+            (ExtractionFailed, Input),
+        ] {
+            assert_eq!(r.cause(), c, "{:?}", r);
         }
     }
 
@@ -513,7 +569,7 @@ mod tests {
             threshold: 0.9,
             outcome: RecordedOutcome::Unanswered,
             reason: Some(UnansweredReason::OverBudget),
-            blocked: true,
+            blocked: false,
             provider: "jev".into(),
             model: "unknown".into(),
             probabilities: BTreeMap::new(),

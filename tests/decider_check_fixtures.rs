@@ -117,7 +117,8 @@ fn outcome_rows(name: &str, rule_id: &str, path: &str, before: &str, after: &str
         (choice(rule_id, 0.02, 0.95, 0.03), "fail", true),
         (choice(rule_id, 0.95, 0.02, 0.03), "pass", false),
         (choice(rule_id, 0.1, 0.1, 0.8), "escape", false),
-        (Reply::status(401), "unanswered", true),
+        // A missing verdict never blocks.
+        (Reply::status(401), "unanswered", false),
     ];
     for (reply, outcome, blocks) in rows {
         let h = repo_harness(&veto, path, before, after);

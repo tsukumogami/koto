@@ -412,6 +412,12 @@ pub struct CheckTally {
     pub unanswered: u64,
     /// `unanswered` split by reason.
     pub unanswered_by_reason: BTreeMap<String, u64>,
+    /// `unanswered` grouped by cause: `provider` (an error, a timeout or an
+    /// unreadable answer), `not_asked` (a spent cap, or another `koto next`
+    /// holding the lock) and `input` (over budget, or a failed extraction).
+    /// A missing verdict never blocks, so this is where a decider that
+    /// never answers shows up.
+    pub unanswered_by_cause: BTreeMap<String, u64>,
     pub not_graded: u64,
     pub candidate_false_fail: u64,
     pub overridden_unanswered: u64,
@@ -470,6 +476,8 @@ pub fn tally_checks(read: &LedgerRead, opts: &ReportOptions) -> Vec<CheckTally> 
                         *t.unanswered_by_reason
                             .entry(reason.to_string())
                             .or_default() += 1;
+                        let cause = c.reason.map_or("unknown", |r| r.cause().as_str());
+                        *t.unanswered_by_cause.entry(cause.to_string()).or_default() += 1;
                     }
                 }
             }
@@ -1500,6 +1508,16 @@ pub fn render_table(report: &Report) -> String {
             },
             t.not_graded
         );
+        if t.unanswered > 0 {
+            let by = |cause: &str| t.unanswered_by_cause.get(cause).copied().unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "  no verdict: provider didn't answer {}, koto didn't ask {}, input bad {}",
+                by("provider"),
+                by("not_asked"),
+                by("input")
+            );
+        }
         let _ = writeln!(
             out,
             "  overrides: {} candidate false fails, {} overridden unanswered",

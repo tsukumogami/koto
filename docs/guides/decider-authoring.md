@@ -524,7 +524,7 @@ states:
   credentials, not a secret that happens to be in the text.
 - `max_bytes` (1 to 8,192, default 2,560) bounds the redacted slice. A slice
   over it is never truncated: nothing is sent and the criterion is
-  unanswered. The default is the range the accuracy evidence was measured on.
+  unanswered, which doesn't block. The default is the range the accuracy evidence was measured on.
 - `label` (default `artifact`) names the slice in the request.
 - Each criterion is keyed by its `rule_id`, an opaque id unique on the
   state, and needs a `rule_ref` pointing at the rule's text, the `question`,
@@ -549,7 +549,7 @@ can't `poll:`. The compile errors are the `E-DECIDER-CHECK-*` codes in
 | `pass`: pass is strictly the most likely and at least the threshold | doesn't block, advances nothing | the same |
 | `fail`: likewise for fail | blocks; a finding names the criterion | recorded only |
 | `escape`: anything else, a tie included | doesn't block | recorded only |
-| unanswered: no usable answer after one retry, over budget, the command failed, the per-call cap spent, or another `koto next` holding the lock | blocks; a finding named for the check says no verdict was read | recorded only |
+| unanswered: no usable answer after one retry, over budget, the command failed, the per-call cap spent, or another `koto next` holding the lock past the wait | doesn't block; listed under the check's `output.unanswered`, no finding | recorded only |
 | not graded: the slice is empty | doesn't block | recorded only |
 
 A criterion acts in veto only when the template says `veto` and the user's
@@ -558,11 +558,25 @@ effective decider mode is `auto`; under `shadow`, or when a project's
 shadow. Users who aren't opted in never run the command: the state behaves
 as if the check weren't declared.
 
+Only a `fail` blocks. A missing or malformed answer is never read as a pass,
+but it doesn't block either: the gate passes, the check's output keeps the
+criterion under `unanswered`, and its `decider_checked` records outcome
+`unanswered` with the reason and `blocked: false`. The next evaluation in
+the visit asks again. A check that can't grade anything at all passes and
+says why in `output.error`: `missing_spec` for a gate with no spec (only a
+compiled template read back from JSON can have one), `log_unreadable` when
+the session log can't be read, with every veto criterion listed as
+unanswered. When another `koto next` holds the session's decider lock, the
+evaluation waits for it, up to 17 seconds at the default timeout and never
+more than 60, so running two ticks at once doesn't get past a check.
+
 A blocking check stops the state even when it accepts evidence, so the
 agent's own evidence can't route around a veto on its own work. The way past
 a wrong verdict is `koto overrides record <session> --gate <check>
 --rationale <why>`, which holds for the rest of the visit and is recorded as a
-candidate false fail. Within one visit an unchanged slice reuses its verdict
+candidate false fail against each failed criterion. An unanswered criterion
+never blocked, so an override records nothing for it; ledgers from older
+builds also hold `overridden_unanswered` lines, which still read. Within one visit an unchanged slice reuses its verdict
 without asking again; a changed slice, or a new visit, is asked afresh.
 
 ### What's recorded for a check
@@ -571,10 +585,14 @@ Each consultation appends a `decider_checked` event just before the gate's
 `gate_evaluated`, and a `checked` line to `~/.koto/_decider_ledger.jsonl`:
 the criterion, its declaration hash, the effective mode, the probabilities,
 the outcome, the model, a hash and length of the slice, the token counts, and
-the attempts. An override of a blocking check adds one `check_overridden`
-line per blocking criterion. None of them holds the slice. `koto decider
-report` tallies them per criterion; a criterion that escapes on everything
-shows as a no-op there, not as silent approval. The field lists are in
+the attempts. An override of a failed check adds one `check_overridden`
+line per failed criterion. None of them holds the slice. `koto decider
+report` tallies them per criterion; a criterion that escapes or goes
+unanswered on everything shows as a no-op there, not as silent approval.
+Unanswered consultations are split by reason and grouped by cause:
+`provider` (an error, a timeout or an unreadable answer), `not_asked` (a
+spent cap or a busy lock) and `input` (over budget, or a failed
+extraction). The field lists are in
 `docs/reference/session-feed.md`.
 
 The declaration hash covers the `rule_id`, the question, the three
