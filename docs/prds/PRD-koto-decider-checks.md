@@ -157,16 +157,22 @@ approve.
 - **Criterion.** One closed question inside a decider check, identified by
   its `rule_id`.
 - **Slice.** The extraction command's standard output after redaction.
-- **Visit.** One entry into a state, as koto already counts visits for the
-  routing decider: it starts at the event that entered the state and ends
-  when the workflow leaves it.
+- **Visit.** The window koto already counts `visit_attempt` over: it opens
+  at an arrival in the state from a different state, or at a rewind into it,
+  and ends when the workflow leaves for another state. A self-transition
+  doesn't open a visit.
 - **Consultation.** One criterion's evaluation against one slice, whatever
   the number of provider attempts it took.
 - **Verdict.** `pass`, `fail`, or `escape`: a well-formed answer from the
   decider.
 - **Unanswered.** A consultation that produced no verdict, with one reason
   from a closed set: `provider_error`, `unreadable_response`, `over_budget`,
-  `extraction_failed`, `cap_spent`, or `busy`.
+  `extraction_failed`, `cap_spent`, or `busy`. It is a fault in the check,
+  not a judgment about the agent's work.
+- **Not graded.** The slice was empty, so there was nothing to ask about and
+  no request was sent. It differs from an escape, which is the decider's own
+  well-formed answer that a slice it did read can't be judged; both are
+  "not checkable" and are recorded and counted separately.
 - **Opted in.** The user's effective decider mode is `shadow` or `auto` and a
   usable key and endpoint are configured, exactly as koto decides it today
   (`docs/guides/decider-authoring.md`, "Opting in"). A user with a mode but no
@@ -247,19 +253,31 @@ approve.
   | Outcome | Veto mode | Shadow mode | Recorded as |
   |---------|-----------|-------------|-------------|
   | `pass` | doesn't block, advances nothing | same | verdict `pass` |
-  | `fail` | blocks, finding from the decider | doesn't block | verdict `fail` |
+  | `fail` | blocks; the check fails, with a finding naming the criterion | doesn't block | verdict `fail` |
   | `escape` | doesn't block | doesn't block | verdict `escape` |
-  | unanswered (any reason) | blocks, finding from koto | doesn't block | unanswered, with reason |
+  | unanswered (any reason) | blocks; the check errs, with a finding naming the check | doesn't block | unanswered, with reason |
   | empty slice | doesn't block | doesn't block | not graded |
+
+  The check's own outcome follows from its veto criteria: `failed` when any
+  criterion failed on a verdict; otherwise `error` when any was unanswered;
+  otherwise `passed`. In shadow mode the check's outcome is always `passed`
+  and its output lists nothing, whatever the decider said: a shadow verdict
+  lives only in the consultation record, so it never counts as a violation.
 
 - **R14. A fail finding.** A blocking `fail` puts a finding in the response's
   `failure` object at level `error`, with the criterion's `rule_id` and
   `rule_ref`, `message_source` `decider`, and a message naming the criterion
   and saying the decider judged the slice to fail it.
-- **R15. An unanswered finding.** A blocking unanswered consultation puts a
-  finding at level `error`, with the criterion's `rule_id` and `rule_ref`,
-  `message_source` `koto`, and a message that begins `no verdict was read`
-  and names the reason. It is never read as a pass.
+- **R15. An unanswered finding.** Unanswered is a checker fault, not a
+  violation, so no finding ever carries an unanswered criterion's `rule_id`.
+  A blocking unanswered criterion is listed in the check's output under
+  `unanswered`. When the check errs (no criterion failed), the response
+  carries koto's own finding for the check: level `error`, `rule_id` the
+  check's name, `message_source` `koto`, and a message that begins `no
+  verdict was read` and names each unanswered criterion and its reason. When
+  a criterion also failed, the check fails with the fail findings only and
+  the unanswered criteria appear in the output alone. An unanswered
+  criterion is never read as a pass.
 - **R16. One bounded retry.** A provider call that times out, can't connect,
   gets a 5xx status, or returns a malformed or mismatched response is retried
   once, immediately. Any other status (a 3xx, a 4xx including 429) is not
@@ -318,11 +336,17 @@ approve.
   threshold, the probabilities for pass, fail and escape when there was an
   answer, the verdict or the unanswered reason or not graded, whether it
   blocked, the provider, the model string, a SHA-256 of the slice and its
-  byte length, the total latency across attempts, the error class if any
-  (the routing decider's closed vocabulary), the number of attempts, and
-  where the endpoint came from (`default`, `user` or `env`, as the routing
-  decider records it). Neither record
-  holds the slice, the API key, or a response body.
+  byte length, the input and output token counts when the provider reports
+  them (summed over attempts), the total latency across attempts, the error
+  class if any (the routing decider's closed vocabulary), the number of
+  attempts, and where the endpoint came from as one of the labels `default`,
+  `user` or `env` (the routing decider's labels; never a URL). The visit is
+  given as the persisted sequence number of the event that opened it.
+  Neither record holds the slice, the API key, or a response body.
+- **R24a. Rule ids join adjudications.** A criterion's `rule_id` is opaque
+  to koto, but it is the key later adjudications join on (a review finding
+  or a CI failure naming the same rule), so once a rule registry exists a
+  criterion's `rule_id` must be that registry's id for the rule.
 - **R25. Declaration hash.** A criterion's declaration hash covers its
   `rule_id`, question, three descriptions, and its check's extraction
   command, byte budget and input label, and nothing else. Changing a mode,
@@ -403,9 +427,9 @@ approve.
 - [ ] A slice holding a value the capture redactor knows reaches the stub
       redacted, and the byte budget is measured after redaction.
 - [ ] A slice of 2,561 bytes against the default budget sends no request and
-      is recorded unanswered with reason `over_budget`; in veto mode it
-      blocks with a `no verdict was read` finding, and in shadow it doesn't
-      block. A slice of exactly 2,560 bytes is consulted.
+      is recorded unanswered with reason `over_budget`; in veto mode the
+      check errs with a `no verdict was read` finding named for the check,
+      and in shadow it doesn't block. A slice of exactly 2,560 bytes is consulted.
 - [ ] An extraction command that exits non-zero, or runs past its timeout,
       sends no request, is not retried, and is recorded unanswered with
       reason `extraction_failed`; it blocks in veto mode only.
@@ -427,9 +451,23 @@ approve.
       recorded as `escape`.
 - [ ] In veto mode, a stub that times out, returns a 503, returns malformed
       JSON, or returns mismatched keys on both attempts receives exactly two
-      requests, and the state blocks with a finding at level `error`,
-      `message_source` `koto`, and a message beginning `no verdict was read`;
-      a stub returning 401 receives one request.
+      requests, the check's `gate_evaluated` outcome is `error`, its output
+      lists the criterion under `unanswered`, and the state blocks with one
+      finding at level `error` whose `rule_id` is the check's name,
+      `message_source` `koto`, and message beginning `no verdict was read`;
+      no finding carries the criterion's `rule_id`. A stub returning 401
+      receives one request.
+- [ ] With one veto criterion failing and another unanswered, the check's
+      outcome is `failed`, its only finding is the failing criterion's, and
+      its output lists each criterion under its kind.
+- [ ] In shadow mode, a fail, an escape and an unanswered consultation each
+      leave the check's `gate_evaluated` outcome `passed` with empty
+      `failed` and `unanswered` lists and no findings.
+- [ ] A self-transition back into a state keeps the visit's `visit_seq` and
+      reuses its verdicts; an arrival from another state or a rewind opens a
+      new visit.
+- [ ] A stub answer reporting usage has its input and output token counts,
+      summed across attempts, in the consultation's records.
 - [ ] A stub that fails the first attempt and answers the second yields the
       second answer's verdict, recorded with two attempts, and the
       consultation counts once against the cap.

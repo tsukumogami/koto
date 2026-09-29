@@ -114,9 +114,15 @@ see a template without the checks.
 
 **Acceptance Criteria**:
 - [ ] Stub-driven tests cover every outcome row of the PRD's outcome table
-      in both modes, including the exact finding fields (`level`,
-      `rule_id`, `rule_ref`, `message_source` `decider` or `koto`, and the
-      `no verdict was read` prefix).
+      in both modes: a veto fail makes the check `failed` with a finding
+      carrying the criterion's `rule_id`, `rule_ref` and `message_source`
+      `decider`; an unanswered veto criterion makes it `error` with one
+      finding named for the check (`message_source` `koto`, `no verdict was
+      read` prefix) and never a finding with the criterion's `rule_id`;
+      shadow is always `passed` with empty lists.
+- [ ] `decider_checked` carries `visit_seq` from the arrival-or-rewind
+      boundary (a self-transition keeps it) and `input_tokens` and
+      `output_tokens` when the stub reports usage.
 - [ ] Retry: timeout, 503, malformed and mismatched answers get exactly two
       requests; 401 gets one; a first-attempt failure then answer records
       `attempts` 2 and counts once against the cap.
