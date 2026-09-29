@@ -860,28 +860,30 @@ pub fn is_is_set_matcher(value: &serde_json::Value) -> Option<bool> {
 /// Used by the compile-time E-SKIP-AMBIGUOUS check in `validate()` to determine
 /// which conditional transitions the skip_if values would activate. The runtime
 /// evaluator (`conditions_satisfied()` in `src/engine/advance.rs`) answers a
-/// different question — whether actual runtime evidence satisfies the skip_if
-/// predicate — so it does not call this function. What the two share is
-/// `is_is_set_matcher`: both use it to interpret `{is_set: bool}` values for
-/// the `vars.NAME` case, keeping the matching semantics aligned.
+/// different question — whether actual runtime state satisfies the skip_if
+/// predicate — so it does not call this function. The two agree on the
+/// `vars.NAME` matcher shapes: `is_is_set_matcher` for `{is_set: bool}` and a
+/// string for a value condition.
 ///
 /// # Matching rules
 ///
-/// - **`vars.NAME: {is_set: bool}`** — compile-time approximation: the
-///   condition is satisfied when `skip_conditions` provides a set/unset signal
-///   for the same variable key.  No variable store is available at compile
-///   time; we look at whether `skip_conditions` contains an `is_set`-shaped
-///   value (or any non-null value) for the key.
-/// - **direct value equality** — the `skip_conditions` map must contain the
-///   key with an equal JSON value.
+/// - **`vars.NAME: {is_set: bool}`** in `when` — compile-time approximation:
+///   the condition is satisfied when `skip_conditions` provides a set/unset
+///   signal for the same variable key. No variable store is available at
+///   compile time; we look at whether `skip_conditions` contains an
+///   `is_set`-shaped value (or any non-null value) for the key.
+/// - **direct value equality** — every other key, including a `vars.NAME`
+///   value condition (a string): the `skip_conditions` map must contain the
+///   key with an equal JSON value, so `skip_if: {vars.MODE: auto}` selects the
+///   `when: {vars.MODE: auto}` route.
 pub(crate) fn skip_if_matches_when(
     skip_conditions: &BTreeMap<String, serde_json::Value>,
     when: &BTreeMap<String, serde_json::Value>,
 ) -> bool {
-    let vars_prefix = format!("{}.", VARS_NAMESPACE);
+    let vars_prefix = VARS_PREFIX;
     when.iter().all(|(field, expected)| {
         // vars.NAME: {is_set: bool} path.
-        if field.starts_with(&vars_prefix) {
+        if field.starts_with(vars_prefix) {
             if let Some(expected_set) = is_is_set_matcher(expected) {
                 let is_set = skip_conditions
                     .get(field.as_str())
@@ -3083,9 +3085,11 @@ impl CompiledTemplate {
                 state_name, site, location, field
             ));
         }
-        if let Err(crate::engine::variables::VarError::Invalid { constraint, .. }) =
-            crate::engine::variables::check_value(var_name, decl, wanted)
-        {
+        if let Err(refusal) = crate::engine::variables::check_value(var_name, decl, wanted) {
+            let constraint = match refusal {
+                crate::engine::variables::VarError::Invalid { constraint, .. } => constraint,
+                other => other.to_string(),
+            };
             return Err(format!(
                 "E-VAR-ROUTE-VALUE: state {:?} {}: {} routes on {:?} = {:?}, which koto init \
                  would refuse ({}); the route could never fire\n  \
@@ -3132,7 +3136,7 @@ impl CompiledTemplate {
             // so the field is not required to be declared in accepts.
             let gates_prefix = format!("{}.", GATES_EVIDENCE_NAMESPACE);
             let evidence_prefix = format!("{}.", EVIDENCE_NAMESPACE);
-            let vars_prefix = format!("{}.", VARS_NAMESPACE);
+            let vars_prefix = VARS_PREFIX;
             let gate_fields: Vec<(&String, &serde_json::Value)> = when
                 .iter()
                 .filter(|(k, _)| k.starts_with(&gates_prefix))
@@ -3143,14 +3147,14 @@ impl CompiledTemplate {
                 .collect();
             let vars_fields: Vec<(&String, &serde_json::Value)> = when
                 .iter()
-                .filter(|(k, _)| k.starts_with(&vars_prefix))
+                .filter(|(k, _)| k.starts_with(vars_prefix))
                 .collect();
             let agent_fields: Vec<(&String, &serde_json::Value)> = when
                 .iter()
                 .filter(|(k, _)| {
                     !k.starts_with(&gates_prefix)
                         && !k.starts_with(&evidence_prefix)
-                        && !k.starts_with(&vars_prefix)
+                        && !k.starts_with(vars_prefix)
                 })
                 .collect();
 

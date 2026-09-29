@@ -2046,10 +2046,11 @@ fn resolve_value<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serd
 /// against the current engine state (merged evidence + variables).
 ///
 /// Matching rules:
-/// - **`vars.NAME: {is_set: bool}`** — resolves the named template variable at
-///   runtime against the `variables` map. Returns `true` when
-///   `variables.get(name).map(|v| !v.is_empty()).unwrap_or(false)` equals the
-///   expected bool.
+/// - **`vars.NAME`** — evaluated by `vars_condition_holds` against the
+///   `variables` map, the same helper transition resolution uses:
+///   `{is_set: bool}` compares "has a non-empty value" with the bool, and a
+///   string holds when the variable's value equals it exactly. A `vars.*` key
+///   never reads `merged_evidence`.
 /// - **all other keys** — dot-path lookup in `merged_evidence` using
 ///   `resolve_value`, compared with JSON equality. Gate keys like
 ///   `gates.ci.exit_code` require the nested gate structure in `merged_evidence`
