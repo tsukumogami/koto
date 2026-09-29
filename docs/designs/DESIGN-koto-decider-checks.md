@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 problem: |
   koto's decider answers routing questions about context that exists before
   the agent acts. It has no way to read what the agent produced, grade it
@@ -33,7 +33,7 @@ user_visible_surface: true
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
