@@ -13,7 +13,8 @@ goals: |
   mistyped variable or value, and each value-routed transition in the log
   names the variable and value that matched. Templates that don't route on
   a value compile and run exactly as before.
-upstream: docs/briefs/BRIEF-koto-value-routing.md
+absorbed:
+  - docs/briefs/BRIEF-koto-value-routing.md
 ---
 
 # PRD: koto value routing
@@ -21,6 +22,37 @@ upstream: docs/briefs/BRIEF-koto-value-routing.md
 ## Status
 
 Accepted
+
+The completeness, clarity and testability reviewers all passed it, the
+first two on a second round. The downstream DESIGN owns the approach.
+
+Absorbed [BRIEF-koto-value-routing](docs/briefs/BRIEF-koto-value-routing.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+The feature exists because a template can hold a variable's value but
+can't choose a path with it, so every branch on a value falls to directive
+prose that the agent must obey and that nothing checks or logs. This
+document's Problem Statement states that in full, including why a canary
+and a measurement effort need the split taken and recorded by koto.
+
+The outcome the brief asked for is an author who writes the branch as a
+transition, finds a mistyped name or value at compile time, and leaves a
+log that says which variable and value chose the path, with nothing
+changing for templates that don't route on a value. Those are this
+document's Goals, and the four people it imagined (a skill maintainer
+deleting a branch, an author catching a typo, a maintainer explaining why
+two runs diverged, an experiment owner splitting runs) are its User
+Stories.
+
+Its boundary held the feature to equality on template variables, the
+compile-time checks, the transition record, a stated rule for variables
+that change after init, documentation, and an inventory of deletable
+shirabe prose. It left out shirabe changes, richer expressions, decider
+routing, canary sampling and assignment, and conditional directive text.
+Those are this document's Requirements and Out of Scope. Its two open
+questions, whether the canary needs value routing and whether a routed
+variable must be immutable, are closed in Decisions and Trade-offs.
 
 ## Problem Statement
 
