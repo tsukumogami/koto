@@ -112,7 +112,9 @@ No gates are blocking. The state is waiting for you to submit evidence.
 koto next <name> --with-data '{"field_name": "value"}'
 ```
 
-Use `expects.fields` to know what keys to include. Match the keys exactly (they're already snake_case). Check `expects.options` if present — it shows which target state each field value routes to.
+Use `expects.fields` to know what keys to include. Match the keys exactly (they're already snake_case). Check `expects.options` if present — it shows which target state each field value routes to. A `vars.*` key in an option's `when` is a condition on a template variable that koto evaluates itself; it isn't a field you submit.
+
+A state that routes on a template variable's value (`vars.MODE: auto`) may advance as soon as it's entered, so a `koto next` can land you several states ahead with `advanced: true` and no evidence asked for. That's expected: follow the directive of the state you landed in.
 
 Example: if `expects.fields` contains `{"outcome": {"type": "enum", "required": true, "values": ["success", "failure"]}}`, submit:
 
