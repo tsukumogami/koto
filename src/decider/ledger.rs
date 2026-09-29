@@ -159,7 +159,8 @@ pub enum CheckOverrideKind {
     /// false fail for whoever judges the criterion's accuracy.
     CandidateFalseFail,
     /// The criterion was unanswered: the override moved past a checker
-    /// fault, not a judgment.
+    /// fault, not a judgment. Only builds from before a missing verdict
+    /// stopped blocking wrote it; it is kept so their ledgers still read.
     OverriddenUnanswered,
 }
 
