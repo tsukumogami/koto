@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 problem: |
   koto templates hold each variable's value for the whole session, but a
   transition's `when` clause can only ask whether `vars.NAME` is set. A
@@ -20,7 +20,7 @@ upstream: docs/briefs/BRIEF-koto-value-routing.md
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
