@@ -3,6 +3,7 @@
 pub mod assignments;
 pub mod compile;
 pub mod decider;
+pub mod decider_check;
 pub mod result_map;
 pub mod types;
 pub mod variables;

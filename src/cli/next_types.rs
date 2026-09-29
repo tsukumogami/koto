@@ -2250,6 +2250,7 @@ mod tests {
             leg: String::new(),
             expect: None,
             poll: None,
+            decider_check: None,
         }
     }
 
@@ -2268,6 +2269,7 @@ mod tests {
             leg: String::new(),
             expect: None,
             poll: None,
+            decider_check: None,
         }
     }
 
@@ -2574,6 +2576,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -2614,6 +2617,7 @@ mod tests {
             leg: String::new(),
             expect: None,
             poll: None,
+            decider_check: None,
         };
         let mut gate_defs = BTreeMap::new();
         gate_defs.insert("locked".to_string(), gate(false));
@@ -2661,6 +2665,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 

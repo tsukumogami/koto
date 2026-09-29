@@ -24,7 +24,8 @@ use crate::session::context::ContextStore;
 use crate::session::context_log::ContextReadRecord;
 use crate::template::types::{
     Gate, GATE_TYPE_CHILDREN_COMPLETE, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS,
-    GATE_TYPE_CONTEXT_MATCHES, GATE_TYPE_REQUEST_LEG, SUPPORTED_GATE_TYPES,
+    GATE_TYPE_CONTEXT_MATCHES, GATE_TYPE_DECIDER_CHECK, GATE_TYPE_REQUEST_LEG,
+    SUPPORTED_GATE_TYPES,
 };
 
 /// Outcome of a structured gate evaluation.
@@ -134,6 +135,12 @@ pub struct StructuredGateResult {
     /// `output`, never in it, so routing never sees it.
     #[serde(skip)]
     pub poll: Option<PollReport>,
+    /// For a decider check: one record per consultation this evaluation
+    /// made (none for a reused verdict). The advance loop appends them as
+    /// `decider_checked` events just before this evaluation's
+    /// `gate_evaluated`.
+    #[serde(skip)]
+    pub decider_checks: Vec<crate::decider::check::DeciderCheck>,
 }
 
 impl StructuredGateResult {
@@ -183,6 +190,7 @@ impl Default for StructuredGateResult {
             duration_ms: None,
             context_reads: Vec::new(),
             poll: None,
+            decider_checks: Vec::new(),
         }
     }
 }
@@ -222,7 +230,27 @@ pub fn evaluate_gates(
         session,
         children_evaluator,
         None,
+        None,
     )
+}
+
+/// Evaluates one `decider-check` gate by name: the CLI's check evaluator,
+/// which owns the provider, the lock and the ledger
+/// (DESIGN-koto-decider-checks.md, Decision 3).
+pub type DeciderCheckEvaluator<'a> = &'a dyn Fn(&str, &Gate) -> StructuredGateResult;
+
+/// A decider check evaluated with no evaluator: a pass that blocks nothing
+/// and records nothing. Only koto's own unrecorded evaluations reach this
+/// (the polling `default_action` loop deciding when to stop), and a check
+/// that can only veto is safe to leave out of those; the advance loop's
+/// recorded evaluation that follows consults it. The gate stays in the
+/// results so a caller counting gates sees it.
+fn decider_check_pass() -> StructuredGateResult {
+    StructuredGateResult {
+        outcome: GateOutcome::Passed,
+        output: crate::template::types::decider_check_default_output(),
+        ..Default::default()
+    }
 }
 
 /// [`evaluate_gates`], with the request store `request-leg` gates read.
@@ -232,6 +260,7 @@ pub fn evaluate_gates(
 /// session on the cloud backend, where request records do not replicate --
 /// and every `request-leg` gate then reports outcome `Error` with the reason
 /// in `error`, rather than passing or blocking silently.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_gates_with_request_store(
     gates: &BTreeMap<String, Gate>,
     working_dir: &Path,
@@ -240,11 +269,16 @@ pub fn evaluate_gates_with_request_store(
     session: Option<&str>,
     children_evaluator: Option<&dyn Fn(&Gate) -> StructuredGateResult>,
     request_root: Option<&Path>,
+    decider_checks: Option<DeciderCheckEvaluator<'_>>,
 ) -> BTreeMap<String, StructuredGateResult> {
     let mut results = BTreeMap::new();
     for (name, gate) in gates {
         let result = match gate.gate_type.as_str() {
             GATE_TYPE_COMMAND => evaluate_command_gate(name, gate, working_dir, env),
+            GATE_TYPE_DECIDER_CHECK => match decider_checks {
+                Some(eval) => eval(name, gate),
+                None => decider_check_pass(),
+            },
             GATE_TYPE_REQUEST_LEG => evaluate_request_leg_gate(gate, request_root),
             GATE_TYPE_CONTEXT_EXISTS => with_context_failure(
                 evaluate_context_exists_gate(gate, context_store, session),
@@ -810,6 +844,7 @@ fn command_gate_result(
             duration_ms,
             context_reads: Vec::new(),
             poll: None,
+            decider_checks: Vec::new(),
         };
     };
     let (outcome, evidence) = match kind {
@@ -844,6 +879,7 @@ fn command_gate_result(
         duration_ms,
         context_reads: Vec::new(),
         poll: None,
+        decider_checks: Vec::new(),
     }
 }
 
@@ -918,6 +954,7 @@ pub fn built_in_default(gate_type: &str) -> Option<serde_json::Value> {
         // Shared with `gate_type_builtin_default` rather than restated: a
         // resolved, valid record naming no child outcome.
         GATE_TYPE_REQUEST_LEG => Some(crate::template::types::request_leg_builtin_default()),
+        GATE_TYPE_DECIDER_CHECK => Some(crate::template::types::decider_check_default_output()),
         _ => None,
     }
 }
@@ -957,6 +994,7 @@ mod tests {
             leg: String::new(),
             expect: None,
             poll: None,
+            decider_check: None,
         }
     }
 
@@ -1468,6 +1506,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1506,6 +1545,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1542,6 +1582,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1577,6 +1618,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1620,6 +1662,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1658,6 +1701,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1693,6 +1737,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1724,6 +1769,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1936,6 +1982,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         gates.insert(
@@ -1954,6 +2001,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         gates.insert(
@@ -1972,6 +2020,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -2023,6 +2072,7 @@ mod tests {
                 leg: leg.to_string(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             }
         }
 

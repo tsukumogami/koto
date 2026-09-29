@@ -470,6 +470,80 @@ E-DECIDER-FLOOR: state "review" field "verdict" value "proceed": mode auto is no
 
 Fix: set the answer's mode to `shadow` or `never`. Nothing else in the template suppresses this error.
 
+#### decider-check diagnostic codes
+
+A `decider-check` gate (see `docs/guides/decider-authoring.md`, "Checking the agent's work") has these compile-time errors. Each fails compilation, both when a source template compiles and when a cached compiled template is loaded, and each message names the state, the check and, where there is one, the criterion. None is relaxed by `--allow-legacy-gates`.
+
+**E-DECIDER-CHECK-FIELD (error)**: a required part is missing or of the wrong type: an empty command, no criteria, a criterion without `rule_id`, `rule_ref`, `question`, `pass`, `fail` or `escape` (each non-empty; `rule_id` at most 128 bytes and `rule_ref` at most 512), an unknown key in a criterion, a gate key a decider check doesn't take, or `max_bytes`, `label` or `criteria` on a gate that isn't a decider check.
+
+```
+E-DECIDER-CHECK-FIELD: state "review" check "g" criterion "r1": question must be non-empty; the decider reads it as part of the question
+  remedy: write the question
+```
+
+**E-DECIDER-CHECK-THRESHOLD (error)**: a criterion's `threshold` isn't a number from 0.5 to 1.0 inclusive.
+
+```
+E-DECIDER-CHECK-THRESHOLD: state "review" check "g" criterion "r1": threshold 0.49 is outside [0.5, 1]
+  remedy: set a threshold from 0.5 to 1, or omit it for 0.9
+```
+
+**E-DECIDER-CHECK-MODE (error)**: a criterion's `mode` isn't `shadow` or `veto`.
+
+```
+E-DECIDER-CHECK-MODE: state "review" check "g" criterion "r1": unknown mode "auto"; a mode is one of shadow, veto
+  remedy: use shadow or veto, or omit mode for shadow
+```
+
+**E-DECIDER-CHECK-BUDGET (error)**: `max_bytes` isn't a whole number from 1 to 8,192.
+
+```
+E-DECIDER-CHECK-BUDGET: state "review" check "g": max_bytes 0 is outside 1 to 8192
+  remedy: set max_bytes from 1 to 8192, or omit it for 2560
+```
+
+**E-DECIDER-CHECK-LABEL (error)**: `label` isn't 1 to 64 bytes of letters, digits, `_` and `-`.
+
+```
+E-DECIDER-CHECK-LABEL: state "review" check "g": label "has space" must be 1 to 64 bytes of letters, digits, `_` and `-`
+  remedy: rename the label, or omit it for "artifact"
+```
+
+**E-DECIDER-CHECK-DUPLICATE (error)**: two criteria on one state, in the same check or different ones, share a `rule_id`.
+
+```
+E-DECIDER-CHECK-DUPLICATE: state "review" check "b" criterion "same": the rule_id is already declared on this state (check "a")
+  remedy: give each criterion on a state its own rule_id
+```
+
+**E-DECIDER-CHECK-LIMIT (error)**: a state declares more than four criteria across its decider checks. Four is the per-call consultation cap, so a state's criteria fit one `koto next`.
+
+```
+E-DECIDER-CHECK-LIMIT: state "review": declares 5 criteria across its decider checks; a state may declare at most 4
+  remedy: move some criteria to another state
+```
+
+**E-DECIDER-CHECK-OVERRIDABLE (error)**: a decider check is declared `overridable: false`. A check that can be wrong must always have a way past.
+
+```
+E-DECIDER-CHECK-OVERRIDABLE: state "review" check "g": a decider check can't be overridable: false; a check that can be wrong must always have a way past
+  remedy: remove overridable: false
+```
+
+**E-DECIDER-CHECK-POLL (error)**: a decider check declares `poll:`.
+
+```
+E-DECIDER-CHECK-POLL: state "review" check "g": poll is not allowed on a decider check; each evaluation asks the decider
+  remedy: remove poll
+```
+
+**E-DECIDER-CHECK-ROUTE (error)**: a `when` clause, a `skip_if` condition or a context assignment reads a decider check's output. A decider verdict never routes: the check can only block.
+
+```
+E-DECIDER-CHECK-ROUTE: state "review" check "comments": the when clause on the transition to "done" reads the check's output; a decider check never routes
+  remedy: route on something else; the check can only block
+```
+
 ---
 
 ### template validate

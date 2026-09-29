@@ -106,7 +106,9 @@ impl Decider for JevDecider {
             }
             return Err(DeciderError::http_status(status));
         }
-        decode_response(req, &bytes)
+        // A 2xx answer koto can't use was still billed: keep its usage (the
+        // token counts, nothing else) on the error.
+        decode_response(req, &bytes).map_err(|e| e.with_response_usage(usage_of_body(&bytes)))
     }
 }
 
@@ -307,6 +309,26 @@ pub fn decode_response(
     Ok(DecisionResponse {
         model: sanitize_model(root.get("model")),
         answers: out,
+        usage: decode_usage(root.get("usage")),
+    })
+}
+
+/// The `usage` of a response body koto couldn't otherwise use, when the
+/// body is a JSON object carrying one.
+fn usage_of_body(body: &[u8]) -> Option<super::types::Usage> {
+    let root: Value = serde_json::from_slice(body).ok()?;
+    decode_usage(root.get("usage"))
+}
+
+/// Jev's `usage`: `input_tokens` and `output_tokens` as whole numbers. Kept
+/// only when both are there; anything else in the object is ignored, and a
+/// missing or malformed `usage` is not an error, since the answer is still
+/// usable without it.
+fn decode_usage(raw: Option<&Value>) -> Option<super::types::Usage> {
+    let obj = raw?.as_object()?;
+    Some(super::types::Usage {
+        input_tokens: obj.get("input_tokens")?.as_u64()?,
+        output_tokens: obj.get("output_tokens")?.as_u64()?,
     })
 }
 
@@ -473,6 +495,31 @@ mod tests {
             other => panic!("{:?}", other),
         }
         assert_eq!(r.answers["ready"], Answer::Proposition { p_true: 0.7 });
+        assert_eq!(
+            r.usage,
+            Some(super::super::types::Usage {
+                input_tokens: 10,
+                output_tokens: 2
+            })
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_usage_is_not_an_error() {
+        for usage in [
+            Value::Null,
+            json!("lots"),
+            json!({"input_tokens": 10}),
+            json!({"input_tokens": -1, "output_tokens": 2}),
+        ] {
+            let mut v = ok_body();
+            v["usage"] = usage.clone();
+            let r = decode(&v).unwrap();
+            assert_eq!(r.usage, None, "{}", usage);
+        }
+        let mut v = ok_body();
+        v.as_object_mut().unwrap().remove("usage");
+        assert_eq!(decode(&v).unwrap().usage, None);
     }
 
     #[test]

@@ -209,6 +209,16 @@ pub struct DecisionResponse {
     pub model: String,
     /// Keyed by field name.
     pub answers: BTreeMap<String, Answer>,
+    /// Token counts the provider reported, when it reported them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+/// Token counts a provider reported for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 /// The answer to one question.
@@ -283,6 +293,12 @@ pub struct DeciderError {
     /// The HTTP status, set for [`ErrorClass::HttpStatus`] only.
     pub status: Option<u16>,
     pub detail: String,
+    /// Whether the provider answered with a 2xx status whose answer koto
+    /// then couldn't use. Such an answer was billed, so its usage counts.
+    pub responded: bool,
+    /// The token counts that answer reported, when they could be read.
+    /// Counts only: never any part of the answer.
+    pub usage: Option<Usage>,
 }
 
 impl DeciderError {
@@ -319,6 +335,14 @@ impl DeciderError {
         Self::new(ErrorClass::Mismatched, detail)
     }
 
+    /// Mark this error as coming from a 2xx answer koto couldn't use, with
+    /// the usage that answer reported, if any.
+    pub fn with_response_usage(mut self, usage: Option<Usage>) -> Self {
+        self.responded = true;
+        self.usage = usage;
+        self
+    }
+
     fn build(class: ErrorClass, status: Option<u16>, detail: String) -> Self {
         let status = if class == ErrorClass::HttpStatus {
             status
@@ -334,6 +358,8 @@ impl DeciderError {
             class,
             status,
             detail,
+            responded: false,
+            usage: None,
         }
     }
 }

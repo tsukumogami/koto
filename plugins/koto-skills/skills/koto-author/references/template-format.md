@@ -736,6 +736,47 @@ state whose `default_action` declares `polling:`. The command is yours: koto
 knows no forge and holds no credential, so a script over your forge's CLI
 (mapping "pending" to the pending code) is what makes this a CI wait.
 
+### `decider-check` — grading the agent's work against closed criteria
+
+A `decider-check` gate asks an opted-in user's decider whether a slice of what
+the agent produced meets a few closed criteria. Its command prints the slice;
+each criterion is one question with a pass, a fail and an escape:
+
+```yaml
+gates:
+  comment_reasons:
+    type: decider-check
+    command: "git diff --unified=2 --no-color {{BASE}} -- ':(exclude)*.md'"
+    timeout: 20           # optional, seconds, as for command gates
+    max_bytes: 2560       # optional, 1-8192, default 2560
+    label: change         # optional, default artifact
+    criteria:
+      comment_reason:     # the rule_id: opaque, unique on the state
+        rule_ref: "https://example.org/rules/comment-reason"
+        question: "Does every comment this change adds record why the code is shaped this way?"
+        pass: "Each added comment gives a reason the code can't show."
+        fail: "At least one added comment restates what the code does."
+        escape: "The change adds no comment, or it can't be judged."
+        threshold: 0.9    # optional, 0.5-1.0
+        mode: shadow      # optional: shadow (default) or veto
+```
+
+A check only ever vetoes. A criterion in `veto`, for a user whose effective
+decider mode is `auto`, blocks the state on a `fail` verdict or when no
+verdict could be read; a pass, an escape and an empty slice never block, and
+a pass never advances anything. In `shadow` nothing blocks and every verdict
+is recorded. For users who aren't opted in, the state behaves as if the check
+weren't declared. A blocking check stops the state even when it accepts
+evidence; the agent's way past a wrong verdict is `koto overrides record`.
+
+Compile-time rules (`E-DECIDER-CHECK-*`): a non-empty command; each criterion
+needs `rule_ref`, `question`, `pass`, `fail` and `escape`; at most four
+criteria across a state's decider checks, each `rule_id` once; a decider check
+can't be `overridable: false`, can't `poll:`, and no `when`, `skip_if` or
+context assignment may read its output. `max_bytes`, `label` and `criteria`
+belong to decider checks only. The full reference is
+`docs/guides/decider-authoring.md` ("Checking the agent's work").
+
 ### Findings: telling the agent why a check failed
 
 A failed `command`, `context-exists` or `context-matches` gate, and a failed `default_action`, carry a `failure` object on their blocking condition beside `output`. It holds `findings`, `findings_truncated`, and for command gates and actions the `captured` streams. None of it is routable: `when` clauses, `override_default` and recorded overrides see only the fields in the table above.

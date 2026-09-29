@@ -323,6 +323,12 @@ pub struct Gate {
     /// absent, so a template without it keeps its template hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll: Option<PollSpec>,
+    /// The extraction budget, label and criteria of a `decider-check` gate
+    /// (DESIGN-koto-decider-checks.md, Decision 1). Absent on every other
+    /// gate, and omitted from the compiled JSON when absent, so a template
+    /// without it keeps its template hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decider_check: Option<super::decider_check::DeciderCheckSpec>,
 }
 
 /// How koto re-evaluates a polling command gate.
@@ -340,6 +346,142 @@ pub struct PollSpec {
     pub hold_secs: u32,
     #[serde(default = "default_pending_exit_code")]
     pub pending_exit_code: i32,
+}
+
+/// Validate one `decider-check` gate on its own: the compile-time refusals a
+/// cached template must also get, then the spec's bounds and text.
+fn validate_decider_check_gate(
+    state_name: &str,
+    gate_name: &str,
+    gate: &Gate,
+) -> Result<(), String> {
+    let at = |code: &str| format!("{}: state {:?} check {:?}", code, state_name, gate_name);
+    if gate.command.trim().is_empty() {
+        return Err(format!(
+            "{}: command must not be empty; its output is the slice the criteria judge\n  \
+             remedy: set command to the extraction command",
+            at("E-DECIDER-CHECK-FIELD")
+        ));
+    }
+    if !gate.overridable {
+        return Err(format!(
+            "{}: a decider check can't be overridable: false; a check that can be wrong must \
+             always have a way past\n  \
+             remedy: remove overridable: false",
+            at("E-DECIDER-CHECK-OVERRIDABLE")
+        ));
+    }
+    if gate.poll.is_some() {
+        return Err(format!(
+            "{}: poll is not allowed on a decider check\n  remedy: remove poll",
+            at("E-DECIDER-CHECK-POLL")
+        ));
+    }
+    let Some(spec) = &gate.decider_check else {
+        return Err(format!(
+            "{}: a decider check needs at least one criterion\n  \
+             remedy: add a criterion under criteria",
+            at("E-DECIDER-CHECK-FIELD")
+        ));
+    };
+    super::decider_check::validate_spec(state_name, gate_name, spec)
+}
+
+/// The per-state decider-check rules: at most
+/// [`MAX_CRITERIA_PER_STATE`](super::decider_check::MAX_CRITERIA_PER_STATE)
+/// criteria across the state's checks, each `rule_id` once, and no `when`
+/// clause, `skip_if` condition or context assignment reading a decider
+/// check's output. A decider verdict must never route
+/// (DESIGN-koto-decider-checks.md, Decision 1).
+fn validate_state_decider_checks(state_name: &str, state: &TemplateState) -> Result<(), String> {
+    use super::decider_check::MAX_CRITERIA_PER_STATE;
+    let checks: Vec<(&String, &super::decider_check::DeciderCheckSpec)> = state
+        .gates
+        .iter()
+        .filter(|(_, g)| g.gate_type == GATE_TYPE_DECIDER_CHECK)
+        .filter_map(|(n, g)| g.decider_check.as_ref().map(|s| (n, s)))
+        .collect();
+    if checks.is_empty() {
+        return Ok(());
+    }
+    let total: usize = checks.iter().map(|(_, s)| s.criteria.len()).sum();
+    if total > MAX_CRITERIA_PER_STATE {
+        return Err(format!(
+            "E-DECIDER-CHECK-LIMIT: state {:?}: declares {} criteria across its decider checks; \
+             a state may declare at most {}\n  \
+             remedy: move some criteria to another state",
+            state_name, total, MAX_CRITERIA_PER_STATE
+        ));
+    }
+    let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+    for (gate_name, spec) in &checks {
+        for c in &spec.criteria {
+            if let Some(first) = seen.insert(c.rule_id.as_str(), gate_name.as_str()) {
+                return Err(format!(
+                    "E-DECIDER-CHECK-DUPLICATE: state {:?} check {:?} criterion {:?}: the \
+                     rule_id is already declared on this state (check {:?})\n  \
+                     remedy: give each criterion on a state its own rule_id",
+                    state_name, gate_name, c.rule_id, first
+                ));
+            }
+        }
+    }
+    let route_error = |gate: &str, place: String| {
+        format!(
+            "E-DECIDER-CHECK-ROUTE: state {:?} check {:?}: {} reads the check's output; a \
+             decider check never routes\n  \
+             remedy: route on something else; the check can only block",
+            state_name, gate, place
+        )
+    };
+    let decider_gate_of = |key: &str| -> Option<String> {
+        let rest = key
+            .strip_prefix(GATES_EVIDENCE_NAMESPACE)?
+            .strip_prefix('.')?;
+        let name = rest.split('.').next()?;
+        checks
+            .iter()
+            .any(|(n, _)| n.as_str() == name)
+            .then(|| name.to_string())
+    };
+    for transition in &state.transitions {
+        if let Some(when) = &transition.when {
+            for key in when.keys() {
+                if let Some(gate) = decider_gate_of(key) {
+                    return Err(route_error(
+                        &gate,
+                        format!(
+                            "the when clause on the transition to {:?}",
+                            transition.target
+                        ),
+                    ));
+                }
+            }
+        }
+        for (key, value) in &transition.context_assignments {
+            for reference in super::assignments::parse_refs(value) {
+                if let super::assignments::AssignmentRef::Gate { gate, .. } = reference {
+                    if checks.iter().any(|(n, _)| **n == gate) {
+                        return Err(route_error(
+                            &gate,
+                            format!(
+                                "context_assignments {:?} on the transition to {:?}",
+                                key, transition.target
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(skip) = &state.skip_if {
+        for key in skip.keys() {
+            if let Some(gate) = decider_gate_of(key) {
+                return Err(route_error(&gate, "skip_if".to_string()));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validate every polling gate on one state.
@@ -445,6 +587,10 @@ impl Gate {
             expect: _,
             // `poll` holds numbers only; it carries no references.
             poll: _,
+            // A decider check's criteria are the fixed text the decider
+            // reads as its question, never substituted: only its `command`
+            // is.
+            decider_check: _,
         } = self;
         let mut fields = vec![
             ("command", command.as_str()),
@@ -609,6 +755,9 @@ pub const GATE_TYPE_CONTEXT_MATCHES: &str = "context-matches";
 pub const GATE_TYPE_CHILDREN_COMPLETE: &str = "children-complete";
 /// Gate type: read one request leg's disposition and recorded result.
 pub const GATE_TYPE_REQUEST_LEG: &str = "request-leg";
+/// Gate type that grades an extracted slice against decider criteria
+/// (DESIGN-koto-decider-checks.md).
+pub const GATE_TYPE_DECIDER_CHECK: &str = "decider-check";
 
 /// Every gate type koto evaluates, in the order error messages list them.
 pub const SUPPORTED_GATE_TYPES: &[&str] = &[
@@ -617,6 +766,7 @@ pub const SUPPORTED_GATE_TYPES: &[&str] = &[
     GATE_TYPE_CONTEXT_MATCHES,
     GATE_TYPE_CHILDREN_COMPLETE,
     GATE_TYPE_REQUEST_LEG,
+    GATE_TYPE_DECIDER_CHECK,
 ];
 
 /// The object-typed output field of a `request-leg` gate. A `when` clause
@@ -804,6 +954,12 @@ pub fn gate_type_schema(gate_type: &str) -> Option<&'static [(&'static str, Gate
             ("payload", Object),
             ("error", Str),
         ]),
+        // Must stay in step with the output the check evaluator builds in
+        // `src/cli/check_evaluator.rs`. No `when` clause may read it; the
+        // schema exists for override values and the override record.
+        GATE_TYPE_DECIDER_CHECK => {
+            Some(&[("failed", Array), ("unanswered", Array), ("error", Str)])
+        }
         _ => None,
     }
 }
@@ -821,6 +977,7 @@ pub fn gate_type_builtin_default(gate_type: &str) -> Option<serde_json::Value> {
         GATE_TYPE_COMMAND => Some(serde_json::json!({"exit_code": 0, "error": ""})),
         GATE_TYPE_CONTEXT_EXISTS => Some(serde_json::json!({"exists": true, "error": ""})),
         GATE_TYPE_CONTEXT_MATCHES => Some(serde_json::json!({"matches": true, "error": ""})),
+        GATE_TYPE_DECIDER_CHECK => Some(decider_check_default_output()),
         GATE_TYPE_CHILDREN_COMPLETE => Some(serde_json::json!({
             "total": 0,
             "completed": 0,
@@ -842,6 +999,13 @@ pub fn gate_type_builtin_default(gate_type: &str) -> Option<serde_json::Value> {
         GATE_TYPE_REQUEST_LEG => Some(request_leg_builtin_default()),
         _ => None,
     }
+}
+
+/// The built-in default for a `decider-check` gate, and the output of a
+/// check that blocked nothing: no failing and no unanswered criteria. Shared
+/// by both default functions and the check evaluator.
+pub fn decider_check_default_output() -> serde_json::Value {
+    serde_json::json!({"failed": [], "unanswered": [], "error": ""})
 }
 
 /// The built-in default for a `request-leg` gate: a resolved, valid record
@@ -1261,6 +1425,9 @@ impl CompiledTemplate {
                     GATE_TYPE_REQUEST_LEG => {
                         validate_request_leg_gate(state_name, gate_name, gate)?;
                     }
+                    GATE_TYPE_DECIDER_CHECK => {
+                        validate_decider_check_gate(state_name, gate_name, gate)?;
+                    }
                     other => {
                         return Err(format!(
                             "state {:?} gate {:?}: unsupported gate type {:?}; supported types: {}. \
@@ -1272,6 +1439,17 @@ impl CompiledTemplate {
                             SUPPORTED_GATE_TYPES.join(", ")
                         ));
                     }
+                }
+            }
+            for (gate_name, gate) in &state.gates {
+                if gate.gate_type != GATE_TYPE_DECIDER_CHECK && gate.decider_check.is_some() {
+                    return Err(format!(
+                        "E-DECIDER-CHECK-FIELD: state {:?} gate {:?}: criteria are only allowed \
+                         on a decider-check gate, not on {:?}\n  \
+                         remedy: remove max_bytes, label and criteria, or make the gate type \
+                         decider-check",
+                        state_name, gate_name, gate.gate_type
+                    ));
                 }
             }
             // D2: validate override_default against gate type schema.
@@ -1454,6 +1632,10 @@ impl CompiledTemplate {
                     }
                 }
             }
+
+            // Decider checks (E-DECIDER-CHECK-*): the per-state limit,
+            // duplicate ids, and the rule that nothing routes on one.
+            validate_state_decider_checks(state_name, state)?;
 
             // Decider declarations (E-DECIDER-*), ahead of evidence routing
             // so the escape-routed case gets its own code.
@@ -1669,7 +1851,12 @@ impl CompiledTemplate {
                     .is_some_and(|w| w.keys().any(|k| k.starts_with(&gates_ns_prefix)))
             });
             if !has_gates_routing {
-                for gate_name in state.gates.keys() {
+                for (gate_name, gate) in &state.gates {
+                    // A decider check must not be routed on (E-DECIDER-CHECK-ROUTE),
+                    // so its missing `gates.*` routing is the intended shape.
+                    if gate.gate_type == GATE_TYPE_DECIDER_CHECK {
+                        continue;
+                    }
                     if strict {
                         return Err(format!(
                             "state {:?}: gate {:?} has no gates.* routing\n  \
@@ -3245,6 +3432,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3272,6 +3460,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3300,6 +3489,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -3393,6 +3583,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -3429,6 +3620,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -3938,6 +4130,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         t.validate(false).unwrap();
@@ -3995,6 +4188,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4036,6 +4230,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         t.validate(false).unwrap();
@@ -4061,6 +4256,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4093,6 +4289,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         t.validate(false).unwrap();
@@ -4127,6 +4324,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4273,6 +4471,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4303,6 +4502,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4353,6 +4553,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4387,6 +4588,7 @@ mod tests {
                     leg: String::new(),
                     expect: None,
                     poll: None,
+                    decider_check: None,
                 },
             );
             let err = t.validate(true).unwrap_err();
@@ -4432,6 +4634,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         state.transitions = vec![Transition {
@@ -4851,6 +5054,7 @@ command: "./check.sh"
             leg: String::new(),
             expect: None,
             poll: None,
+            decider_check: None,
         }
     }
 
@@ -4869,6 +5073,7 @@ command: "./check.sh"
             leg: String::new(),
             expect: None,
             poll: None,
+            decider_check: None,
         }
     }
 
@@ -4887,6 +5092,7 @@ command: "./check.sh"
             leg: String::new(),
             expect: None,
             poll: None,
+            decider_check: None,
         }
     }
 
@@ -5079,6 +5285,7 @@ command: "./check.sh"
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         t
@@ -5216,6 +5423,7 @@ command: "./check.sh"
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -5252,6 +5460,7 @@ command: "./check.sh"
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let mut when = BTreeMap::new();
@@ -5323,6 +5532,7 @@ command: "./check.sh"
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -5506,6 +5716,7 @@ command: "./check.sh"
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let mut when_a = BTreeMap::new();
@@ -5570,6 +5781,7 @@ command: "./check.sh"
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let mut accepts = BTreeMap::new();
@@ -5629,6 +5841,7 @@ command: "./check.sh"
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         // Dead-end transitions (would trigger D4 if D2 didn't block first).
@@ -5727,6 +5940,7 @@ command: "./check.sh"
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         t
@@ -6033,6 +6247,7 @@ command: "./check.sh"
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();
@@ -6221,6 +6436,7 @@ command: "./check.sh"
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();

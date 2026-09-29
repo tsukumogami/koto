@@ -339,6 +339,7 @@ mod tests {
                 .into_iter()
                 .map(|(k, a)| (k.to_string(), a))
                 .collect(),
+            usage: None,
         }
     }
 

@@ -965,6 +965,7 @@ mod tests {
                     ConsultResult::Answered(DecisionResponse {
                         model: "fake-1".to_string(),
                         answers,
+                        usage: None,
                     })
                 }
             };

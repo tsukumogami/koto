@@ -104,6 +104,7 @@ pub fn response(model: &str, answers: Vec<(&str, Answer)>) -> DecisionResponse {
             .into_iter()
             .map(|(k, a)| (k.to_string(), a))
             .collect(),
+        usage: None,
     }
 }
 
