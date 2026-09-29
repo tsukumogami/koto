@@ -694,6 +694,48 @@ Each gate type produces structured output that the engine injects into the evide
 
 `passed` is not a field name in any gate type. Don't use it in `when` conditions.
 
+### `poll:` — a command gate koto waits on
+
+A check that settles later than the tick that asks about it (CI on a pull
+request is the common case) can be a polling gate. Its command exits 0 when
+the check is done, a pending code (75, `EX_TEMPFAIL`, unless you set
+`pending_exit_code`) while it's still running, and anything else when it
+failed:
+
+```yaml
+gates:
+  ci:
+    type: command
+    command: "{{PLUGIN_ROOT}}/scripts/ci-status.sh"
+    timeout: 60            # one run; unchanged
+    poll:
+      interval_secs: 30    # wait between runs, at least 1
+      timeout_secs: 3600   # the whole wait, at least 1
+      hold_secs: 240       # optional, default 0: how long one koto next keeps re-running
+      pending_exit_code: 75  # optional, 1-255
+```
+
+Every tick runs the command once; while it says pending, koto re-runs it every
+`interval_secs` for at most `hold_secs` of that tick, and never starts a run
+past the deadline. The deadline is `timeout_secs` after the gate's first run
+since the latest entry into the state, so each entry (a self-transition
+included) starts a new wait. Set `hold_secs` to what the agent's harness lets
+one command run for; with 0 the tick returns after one run.
+
+What the agent sees: pending is a `temporal`, non-actionable blocking
+condition with `status: "pending"`, no `failure`, and a `poll` object whose
+`retry_after_secs` says when to tick again. Failed is the usual corrective
+command-gate failure. Still pending when the deadline passes is `timed_out`,
+with a finding saying so. The gate's routable output is unchanged
+(`gates.ci.exit_code` is 75 while pending), so route the done case on
+`exit_code: 0` and leave pending to block.
+
+Compile-time rules: `poll:` only on `command` gates; `interval_secs` and
+`timeout_secs` at least 1; `hold_secs` no more than `timeout_secs`; not in a
+state whose `default_action` declares `polling:`. The command is yours: koto
+knows no forge and holds no credential, so a script over your forge's CLI
+(mapping "pending" to the pending code) is what makes this a CI wait.
+
 ### Findings: telling the agent why a check failed
 
 A failed `command`, `context-exists` or `context-matches` gate, and a failed `default_action`, carry a `failure` object on their blocking condition beside `output`. It holds `findings`, `findings_truncated`, and for command gates and actions the `captured` streams. None of it is routable: `when` clauses, `override_default` and recorded overrides see only the fields in the table above.
@@ -1174,6 +1216,32 @@ Compile-time rules: keys must be usable context keys; values must be strings (nu
 Runtime rules: only the edge that fires writes. It writes on every kind of transition: evidence-resolved, gate-resolved auto-advance, and `skip_if`. An evidence field not submitted, or a gate path absent from that tick's output, resolves to `""` and the transition still happens. Evidence belongs to the state it was submitted to: when a submission moves the session into a state that auto-advances in the same tick, `${evidence.<field>}` on that state's outgoing edge resolves to `""` even though the field was in the submission, and it overwrites any value an earlier edge stored under the key. Put the assignment on the edge out of the state that takes the evidence. A gate path walks any nesting (`${gates.leg.payload.pr}`). Values are stored as resolved and never expanded again. A later write to the same key replaces the earlier one. The values are recorded on the `transitioned` event, and a failed store write is restored from the log on the next `koto context get`, `koto context exists`, or context gate.
 
 A command gate's output is only `exit_code` and `error`. To put what a script printed into context, have a `default_action` run `koto context add`.
+
+### `clear_on_entry` — keys cleared when a state is entered again
+
+A state whose gate asks whether a key exists passes the moment the key is
+there, including a key left over from the previous attempt. List the keys an
+attempt of the state produces, and koto removes them whenever the workflow
+enters the state again:
+
+```yaml
+states:
+  implementation:
+    clear_on_entry: [scrutiny_results.json, review_results.json, qa_results.json, summary.md]
+```
+
+Every entry clears except the session's first: a return from another state, a
+self-transition, `koto next --to`, and `koto rewind`. A gate override is not
+an entry. koto clears before the state's `default_action` and gates run, and a
+key written after the entry is kept, so an agent that writes a key and then
+ticks keeps its write. Each clearing is one `context_cleared` event in the log.
+
+Declare a key on the state whose re-entry makes it stale, typically the state
+a retry loop returns to, even when a later state's gate reads it; don't list a
+key the state reads as input from before it was entered. Compile-time rules:
+literal keys only (no `{{VAR}}`), each a usable context key, no duplicates, not
+on a terminal state, not an empty list, and not a key any transition writes
+through `context_assignments`.
 
 ### Self-loops
 

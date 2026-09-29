@@ -15,7 +15,9 @@
 # EVENT_CHECKS. v0.14.1 must then run `koto status`, `koto next` and
 # `koto context get` on the session, exit 0, report the state the new build
 # reports, return the fresh verdict, and report the cleared key absent in a
-# second session that stops right after its clearing.
+# second session that stops right after its clearing. The new build's
+# `koto template validate-feed` must accept the log against
+# docs/reference/session-feed.md.
 #
 # Templates that declare neither feature are covered by the failure-reporting
 # job, which compiles every other fixture under both builds and checks their
@@ -34,6 +36,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+FEED_SPEC="$REPO_ROOT/docs/reference/session-feed.md"
 FIXTURE="$SCRIPT_DIR/fixtures-ci-wait/ci-wait-stale-keys.md"
 FLOOR_VERSION="0.14.1"
 STALE="stale verdict from the last attempt"
@@ -245,6 +249,11 @@ done
 n="$(jq -s '[.[] | select(.type? == "context_cleared")] | length' "$LOG_FILE")"
 [ "$n" -eq 1 ] || fail "events: expected one context_cleared, found $n"
 pass "events: exactly one clearing for the one re-entry"
+
+# The published contract describes every event and field in the log.
+out="$(KOTO_FEED_SPEC="$FEED_SPEC" new_koto template validate-feed "$LOG_FILE" 2>&1)" \
+  || fail "contract: koto template validate-feed rejected the log: $out"
+pass "contract: the session-feed spec accepts the log"
 
 # --- v0.14.1 reads the log ---------------------------------------------------
 
