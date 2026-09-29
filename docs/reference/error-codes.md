@@ -401,7 +401,7 @@ Fix: route on a declared variable, or test the capture's presence instead.
 **E-VAR-ROUTE-OVERLAP (error)**: two conditional transitions out of one state share a `vars.*` key that one of them gives a value, and nothing else in the two clauses tells them apart, so one variable value could satisfy both. Two routes naming the same value overlap, and so do a value route and an `{is_set: true}` route on the same variable. A value route and an `{is_set: false}` route don't.
 
 ```
-E-VAR-ROUTE-OVERLAP: state "route": transitions to "fast" and "slow" can both match one value of "vars.MODE"
+E-VAR-ROUTE-OVERLAP: state "route": transitions to "fast" and "slow" can both match one value of variable "MODE"
   remedy: give the two routes different values, or add a key that tells them apart
 ```
 
@@ -584,7 +584,7 @@ E-DECIDER-CHECK-ROUTE: state "review" check "comments": the when clause on the t
   remedy: route on something else; the check can only block
 ```
 
-**E-DECIDER-CHECK-SPEC (error)**: a compiled template has a `decider-check` gate with no `decider_check` spec, so there is nothing to grade. The compiler never writes one (a source check with no criteria is `E-DECIDER-CHECK-FIELD`), but koto reads compiled JSON back from the cache and a session's directory without recompiling it. Every load refuses it: `koto init`, `koto next` on a session already in flight, `koto template validate` and every other command that reads the compiled template. The session never starts or resumes on it, and it is never read as a check that passed. A template that compiles today loads unchanged, with the same hash.
+**E-DECIDER-CHECK-SPEC (error)**: a compiled template has a `decider-check` gate with no `decider_check` spec, so there is nothing to grade. The compiler never writes one (a source check with no criteria is `E-DECIDER-CHECK-FIELD`), but koto reads compiled JSON back from the cache and a session's directory without recompiling it. Every load refuses it: `koto init`, `koto next` on a session already in flight, `koto template validate`, `koto overrides record` and every other command that acts on the compiled template. The session never starts or resumes on it, and it is never read as a check that passed. Readers that only display a session, such as the dashboard and the `/workflows` projection, read the template on a best-effort basis and treat it as unreadable, so they show less about that session rather than failing. A template that compiles today loads unchanged, with the same hash.
 
 ```
 E-DECIDER-CHECK-SPEC: state "review" check "comments": the compiled template has a decider check with no decider_check spec, so there is nothing to grade

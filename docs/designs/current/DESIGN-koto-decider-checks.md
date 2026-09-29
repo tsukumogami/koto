@@ -279,14 +279,16 @@ the measurement effort counts violations from `gate_evaluated`:
 
 Builds before this rule wrote `error`, with koto's `no verdict was read`
 finding named for the check, when no criterion failed but a veto criterion
-went unanswered. Readers keep accepting `error` on old logs; koto no longer
-writes it for a decider check.
+went unanswered. koto no longer writes it for a decider check; old logs that
+hold it still parse and validate, with no special handling.
 
 `output.error` is empty except when the check couldn't grade anything at
 all, and then the gate passes and says why. `missing_spec`: the gate has no
-decider-check spec, which a validated template can't produce but a compiled
-template read back from JSON isn't revalidated for; the lists are empty.
-`log_unreadable`: the session log couldn't be read, so there is no state or
+decider-check spec, which a validated template can't produce. A compiled
+template read back from JSON isn't revalidated, so loading one refuses such
+a gate with `E-DECIDER-CHECK-SPEC` before any session starts or resumes on
+it; `missing_spec` stays in the evaluator only as a defence in depth, and the
+lists are empty. `log_unreadable`: the session log couldn't be read, so there is no state or
 visit to record under and no verdict to reuse; nothing is asked or
 recorded, and every veto criterion is listed under `unanswered`. Neither
 case writes a `decider_checked`, so nothing is ever recorded under an empty
@@ -609,7 +611,7 @@ must be that registry's id for the rule. A consumer keys decider rates by
 | `decider_checked` | `state`, `visit_seq`, `gate`, `input_sha256`, `input_bytes` | string, integer, string, string, integer | hash and bytes when the extraction produced output | Where it ran and what it judged, by hash. |
 | `gate_evaluated` (decider check) | `outcome` | `passed`, `failed` (older logs also `error`) | always | `failed` is a violation; shadow is always `passed`. |
 | `gate_evaluated` (decider check) | `output.failed`, `output.unanswered` | arrays of `rule_id` | always | Veto criteria that failed on a verdict, and veto criteria that got no verdict, on a passed gate as on a failed one; empty in shadow. |
-| `gate_evaluated` (decider check) | `output.error` | `""`, `missing_spec`, `log_unreadable` | always | Why nothing could be graded; the gate passed. |
+| `gate_evaluated` (decider check) | `output.error` | `""`, `missing_spec`, `log_unreadable` | always | Why nothing could be graded; the gate passed. `missing_spec` is unreachable from a loaded template (`E-DECIDER-CHECK-SPEC`). |
 | `gate_evaluated` (decider check) | finding `message_source` value `decider` | string | on a fail finding | The finding's message came from a decider verdict. |
 | ledger `check_overridden` | `override_kind` | `candidate_false_fail` (older ledgers also `overridden_unanswered`) | always | What an override moved past. |
 

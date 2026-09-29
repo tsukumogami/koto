@@ -114,7 +114,9 @@ pub fn missing_decider_check_spec(
 /// with no spec ([`missing_decider_check_spec`]). Every place koto loads a
 /// compiled template goes through `Deserialize`, so this one check covers
 /// `koto init`, `koto next` on a session already in flight, and every other
-/// reader.
+/// command that acts on the template. Best-effort display readers (the
+/// dashboard, the `/workflows` projection) already treat a template that
+/// fails to parse as unreadable, and do the same here.
 fn deserialize_states<'de, D>(deserializer: D) -> Result<BTreeMap<String, TemplateState>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -3418,12 +3420,12 @@ impl CompiledTemplate {
                         if let Some(var_key) = shared_value_var {
                             return Err(format!(
                                 "E-VAR-ROUTE-OVERLAP: state {:?}: transitions to {:?} and {:?} can both match \
-                                 one value of {:?}\n  \
+                                 one value of variable {:?}\n  \
                                  remedy: give the two routes different values, or add a key that tells them apart",
                                 state_name,
                                 conditional[i].target,
                                 conditional[j].target,
-                                var_key
+                                var_key.strip_prefix(VARS_PREFIX).unwrap_or(var_key)
                             ));
                         }
                     }

@@ -1743,6 +1743,24 @@ fn routing_counts_every_billed_answer_with_its_provider_and_model() {
         // Written on every record, zero included.
         assert_eq!(c["unread_usage_attempts"], unread, "{}", label);
         assert_consulted_meets_the_contract(c);
+
+        // The ledger's `consulted` line carries the same accounting.
+        let ledger =
+            std::fs::read_to_string(h.home().join(".koto").join("_decider_ledger.jsonl")).unwrap();
+        let line: Value = ledger
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|l| l["kind"] == "consulted")
+            .unwrap_or_else(|| panic!("no consulted line: {}", ledger));
+        for key in [
+            "input_tokens",
+            "output_tokens",
+            "unread_usage_attempts",
+            "provider",
+            "model",
+        ] {
+            assert_eq!(line.get(key), c.get(key), "ledger {}: {}", key, line);
+        }
     }
 }
 

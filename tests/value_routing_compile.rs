@@ -348,4 +348,23 @@ fn both_vars_error_families_name_the_variable_the_same_way() {
         "E-VAR-ROUTE-VALUE: state \"route\": skip_if routes on variable \"MODE\" = \"atuo\", \
          which koto init would refuse (values:[auto,interactive]); the route could never fire"
     );
+
+    // The overlap refusal names the variable the same way, not its key.
+    let err = expect_err(
+        &template(
+            "      - target: fast
+        when:
+          vars.MODE: auto
+      - target: slow
+        when:
+          vars.MODE: auto",
+            "",
+        ),
+        "E-VAR-ROUTE-OVERLAP",
+    );
+    assert_eq!(
+        first_line_from(&err, "E-VAR-ROUTE-OVERLAP"),
+        "E-VAR-ROUTE-OVERLAP: state \"route\": transitions to \"fast\" and \"slow\" can both \
+         match one value of variable \"MODE\""
+    );
 }
