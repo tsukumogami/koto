@@ -451,7 +451,7 @@ jobs:
 
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, stability-tests, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, audit, tsuku-distributed-install, cloud-integration]
+    needs: [check-artifacts, unit-tests, stability-tests, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, poll-forge-neutral, audit, tsuku-distributed-install, cloud-integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -465,6 +465,8 @@ jobs:
              [ "${{ needs.decider-checks.result }}" = "failure" ] || \
              [ "${{ needs.decider-compat-v0-12-2.result }}" = "failure" ] || \
              [ "${{ needs.failure-reporting-compat-v0-14-1.result }}" = "failure" ] || \
+             [ "${{ needs.ci-wait-stale-keys-compat-v0-14-1.result }}" = "failure" ] || \
+             [ "${{ needs.poll-forge-neutral.result }}" = "failure" ] || \
              [ "${{ needs.audit.result }}" = "failure" ] || \
              [ "${{ needs.cloud-integration.result }}" = "failure" ] || \
              [ "${{ needs.tsuku-distributed-install.result }}" = "failure" ]; then

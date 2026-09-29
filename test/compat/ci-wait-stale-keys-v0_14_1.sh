@@ -19,6 +19,10 @@
 # `koto template validate-feed` must accept the log against
 # docs/reference/session-feed.md.
 #
+# The fixture lives in fixtures-ci-wait/, not fixtures/: the failure-reporting
+# job compiles every template in fixtures/ under v0.14.1 too, and v0.14.1
+# refuses the clear_on_entry and poll keys this fixture exists to use.
+#
 # Templates that declare neither feature are covered by the failure-reporting
 # job, which compiles every other fixture under both builds and checks their
 # logs hold no pending outcome.
