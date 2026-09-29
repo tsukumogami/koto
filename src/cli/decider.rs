@@ -46,7 +46,7 @@ pub struct ReportArgs {
     #[arg(long, value_name = "PATH")]
     pub ledger: Option<PathBuf>,
 
-    /// Report only questions on this state; with --fixtures, the state
+    /// Report only questions and decider checks on this state; with --fixtures, the state
     /// whose declaration the fixtures exercise
     #[arg(long, value_name = "STATE")]
     pub state: Option<String>,
