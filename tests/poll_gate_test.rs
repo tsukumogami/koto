@@ -417,3 +417,144 @@ fn a_non_overridable_polling_gate_refuses_an_override() {
     );
     assert!(!out.status.success());
 }
+
+#[test]
+fn a_hold_starts_no_run_past_hold_secs() {
+    // Always pending; a 2-second hold at a 1-second interval allows at most
+    // the first run and two more.
+    let poll = "          interval_secs: 1\n          timeout_secs: 600\n          hold_secs: 2\n";
+    let (_tmp, dir) = setup(&[75, 75, 75, 75, 75, 75], poll);
+    let started = std::time::Instant::now();
+    let resp = next(&dir, "wf", None);
+    let took = started.elapsed();
+    assert_eq!(ci_condition(&resp)["status"], "pending");
+    let n = runs(&dir);
+    assert!((2..=3).contains(&n), "runs: {n}");
+    assert!(took < std::time::Duration::from_secs(4), "held {took:?}");
+    let p = &ci_evals(&dir)[0]["payload"]["poll"];
+    assert_eq!(p["evaluations"], n as u64);
+}
+
+#[test]
+fn a_hold_starts_no_run_past_the_deadline() {
+    // A long hold but a 2-second window: no run may start at or past it.
+    let poll = "          interval_secs: 1\n          timeout_secs: 2\n          hold_secs: 2\n";
+    let (_tmp, dir) = setup(&[75, 75, 75, 75, 75, 75], poll);
+    let started = std::time::Instant::now();
+    next(&dir, "wf", None);
+    let took = started.elapsed();
+    assert!(runs(&dir) <= 2, "runs: {}", runs(&dir));
+    assert!(took < std::time::Duration::from_secs(3), "held {took:?}");
+}
+
+#[test]
+fn a_signal_ends_the_hold() {
+    let poll = "          interval_secs: 1\n          timeout_secs: 600\n          hold_secs: 60\n";
+    let (_tmp, dir) = setup(&[75; 100], poll);
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_koto"))
+        .args(["next", "wf", "--no-cleanup"])
+        .current_dir(&dir)
+        .env("KOTO_SESSIONS_BASE", sessions_base(&dir))
+        .env("HOME", &dir)
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("KOTO_WORKFLOWS_DIR")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let started = std::time::Instant::now();
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "koto next kept holding after SIGTERM"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_custom_pending_code_is_honoured() {
+    let poll =
+        "          interval_secs: 1\n          timeout_secs: 600\n          pending_exit_code: 8\n";
+    let (_tmp, dir) = setup(&[8, 75], poll);
+    let c = ci_condition(&next(&dir, "wf", None));
+    assert_eq!(c["status"], "pending");
+    // 75 is an ordinary failure once another code means pending.
+    let c = ci_condition(&next(&dir, "wf", None));
+    assert_eq!(c["status"], "failed");
+    assert_eq!(c["poll"]["status"], "failed");
+}
+
+#[test]
+fn each_polling_gate_keeps_its_own_interval() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    for (name, log) in [("fast.sh", "fast.log"), ("slow.sh", "slow.log")] {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\necho run >> {log}\nexit 75\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let src = dir.join("wf.md");
+    std::fs::write(
+        &src,
+        r#"---
+name: two-polls
+version: "1.0"
+initial_state: ci
+states:
+  ci:
+    gates:
+      fast:
+        type: command
+        command: ./fast.sh
+        poll:
+          interval_secs: 1
+          timeout_secs: 600
+          hold_secs: 3
+      slow:
+        type: command
+        command: ./slow.sh
+        poll:
+          interval_secs: 3
+          timeout_secs: 600
+          hold_secs: 3
+    transitions:
+      - target: done
+        when:
+          gates.fast.exit_code: 0
+          gates.slow.exit_code: 0
+  done:
+    terminal: true
+---
+
+## ci
+
+Wait.
+
+## done
+
+Done.
+"#,
+    )
+    .unwrap();
+    run_ok(&dir, &["init", "wf", "--template", src.to_str().unwrap()]);
+    next(&dir, "wf", None);
+    let count = |log: &str| {
+        std::fs::read_to_string(dir.join(log))
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
+    let (fast, slow) = (count("fast.log"), count("slow.log"));
+    assert!(fast >= 3, "the 1-second gate ran {fast} times");
+    assert_eq!(slow, 2, "the 3-second gate ran {slow} times, fast {fast}");
+}

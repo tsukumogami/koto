@@ -8,6 +8,12 @@
 //! and then classifies each polling gate's last run: done, pending, failed or
 //! timed out.
 //!
+//! It lives beside the advance loop rather than inside it because the loop
+//! only needs its outcome: the loop passes in the tick's log and the shutdown
+//! flag, and `settle` owns the waiting. Several polling gates in one state
+//! share one hold but keep their own schedules: each is re-run one interval
+//! after its last run started, and only the gates that are due run.
+//!
 //! The polling window opens at the first run of the gate since the latest
 //! entry into the state and is recorded on every logged evaluation as
 //! `poll.since`, so it spans ticks and a new entry opens a new one. A pending
@@ -117,33 +123,51 @@ pub fn settle<G, E>(
         );
     }
 
+    // Each gate keeps its own schedule: it is next due one interval after its
+    // last run started, and a wait lasts until the earliest due gate, so a
+    // slow-interval gate is never re-run at a faster gate's pace.
+    let mut next_due: BTreeMap<&str, SystemTime> = polling
+        .iter()
+        .map(|(name, spec)| {
+            (
+                name.as_str(),
+                first_run_start + Duration::from_secs(u64::from(spec.interval_secs)),
+            )
+        })
+        .collect();
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        let now = SystemTime::now();
-        let eligible: Vec<(&String, &PollSpec)> = polling
+        // A pending gate may run again only if that run would start within
+        // this tick's hold and before its window's deadline.
+        let schedulable: Vec<(&String, SystemTime)> = polling
             .iter()
             .filter(|(name, spec)| {
                 if !is_pending(&results[name.as_str()], spec) {
                     return false;
                 }
-                let next_run = now + Duration::from_secs(u64::from(spec.interval_secs));
+                let due = next_due[name.as_str()];
                 let hold_end = first_run_start + Duration::from_secs(u64::from(spec.hold_secs));
                 let deadline = windows[name.as_str()].since
                     + Duration::from_secs(u64::from(spec.timeout_secs));
-                next_run <= hold_end && next_run < deadline
+                due <= hold_end && due < deadline
             })
-            .copied()
+            .map(|(name, _)| (*name, next_due[name.as_str()]))
             .collect();
-        let Some(wait) = eligible.iter().map(|(_, spec)| spec.interval_secs).min() else {
+        let Some(earliest) = schedulable.iter().map(|(_, due)| *due).min() else {
             break;
         };
-        if !sleep_unless_shutdown(Duration::from_secs(u64::from(wait)), shutdown) {
+        let wait = earliest
+            .duration_since(SystemTime::now())
+            .unwrap_or_default();
+        if !sleep_unless_shutdown(wait, shutdown) {
             break;
         }
-        let subset: BTreeMap<String, Gate> = eligible
+        let started = SystemTime::now();
+        let subset: BTreeMap<String, Gate> = schedulable
             .iter()
+            .filter(|(_, due)| *due <= earliest)
             .map(|(name, _)| ((*name).clone(), gates[name.as_str()].clone()))
             .collect();
         match evaluate(&subset) {
@@ -151,6 +175,12 @@ pub fn settle<G, E>(
                 for (name, result) in rerun {
                     if let Some(w) = windows.get_mut(name.as_str()) {
                         w.runs += 1;
+                    }
+                    if let Some((key, spec)) = polling.iter().find(|(n, _)| **n == name) {
+                        next_due.insert(
+                            key.as_str(),
+                            started + Duration::from_secs(u64::from(spec.interval_secs)),
+                        );
                     }
                     results.insert(name, result);
                 }
@@ -216,5 +246,69 @@ fn sleep_unless_shutdown(total: Duration, shutdown: &AtomicBool) -> bool {
             return true;
         }
         std::thread::sleep((end - now).min(Duration::from_millis(100)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(pending: i32) -> PollSpec {
+        PollSpec {
+            interval_secs: 1,
+            timeout_secs: 60,
+            hold_secs: 0,
+            pending_exit_code: pending,
+        }
+    }
+
+    fn result(outcome: GateOutcome, output: serde_json::Value) -> StructuredGateResult {
+        StructuredGateResult {
+            outcome,
+            output,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_a_plain_exit_with_the_pending_code_is_pending() {
+        let s = spec(75);
+        let pending = result(
+            GateOutcome::Failed,
+            serde_json::json!({"exit_code": 75, "error": ""}),
+        );
+        assert!(is_pending(&pending, &s));
+        let other = result(
+            GateOutcome::Failed,
+            serde_json::json!({"exit_code": 1, "error": ""}),
+        );
+        assert!(!is_pending(&other, &s));
+        let passed = result(
+            GateOutcome::Passed,
+            serde_json::json!({"exit_code": 0, "error": ""}),
+        );
+        assert!(!is_pending(&passed, &s));
+    }
+
+    #[test]
+    fn a_killed_or_unstartable_run_is_never_pending() {
+        let s = spec(75);
+        // The shapes `command_gate_result` gives a per-run timeout and a
+        // spawn failure, even if an exit code happened to match.
+        let timed_out = result(
+            GateOutcome::TimedOut,
+            serde_json::json!({"exit_code": 75, "error": "timed_out", "failure_kind": "timed_out"}),
+        );
+        assert!(!is_pending(&timed_out, &s));
+        let spawn = result(
+            GateOutcome::Error,
+            serde_json::json!({"exit_code": -1, "error": "no shell", "failure_kind": "spawn_failed"}),
+        );
+        assert!(!is_pending(&spawn, &s));
+        let odd = result(
+            GateOutcome::Failed,
+            serde_json::json!({"exit_code": 75, "error": "", "failure_kind": "spawn_failed"}),
+        );
+        assert!(!is_pending(&odd, &s));
     }
 }
