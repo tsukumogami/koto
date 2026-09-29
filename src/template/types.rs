@@ -1035,9 +1035,9 @@ pub fn gate_type_builtin_default(gate_type: &str) -> Option<serde_json::Value> {
     }
 }
 
-/// The built-in default for a `decider-check` gate, and the output of a
-/// check that blocked nothing: no failing and no unanswered criteria. Shared
-/// by both default functions and the check evaluator.
+/// The built-in default for a `decider-check` gate: no failing and no
+/// unanswered criteria. Shared by both default functions and the gate
+/// evaluator's pass when no check evaluator is supplied.
 pub fn decider_check_default_output() -> serde_json::Value {
     serde_json::json!({"failed": [], "unanswered": [], "error": ""})
 }

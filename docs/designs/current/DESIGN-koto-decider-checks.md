@@ -12,9 +12,10 @@ decision: |
   redacts and bounds its output, and asks the opted-in decider one choice
   question per criterion (pass, fail, and the escape `unclear`). A veto
   criterion under effective mode `auto` fails the gate on a fail verdict, with
-  an `error` finding carrying the criterion's `rule_id` and `rule_ref`, and
-  makes the gate err when no verdict could be read, with a finding named for
-  the check; everything else, and every shadow criterion, passes. The gate's output never
+  an `error` finding carrying the criterion's `rule_id` and `rule_ref`;
+  everything else passes, including a criterion that got no verdict, which
+  the gate's output lists as unanswered and the log records with its reason,
+  and every shadow criterion. The gate's output never
   routes, it is always overridable, and opted-out users get a template view
   with the gates removed. Each consultation writes a `decider_checked` event
   and a ledger `checked` record, overrides add `check_overridden` records, and
@@ -243,38 +244,70 @@ handle is shared between the routing port and the check evaluator.
 #### Chosen: a new `decider_checked` event, ledger `checked` and `check_overridden` records, and a gate output that lists failing and unanswered criteria
 
 `gate_evaluated` for a decider check keeps its usual shape. Its `output` is
-`{"failed": [<rule_id>...], "unanswered": [<rule_id>...], "error": ""}`,
-listing the veto criteria that blocked, so an override's `actual_output`
-already names them by kind (R23) and `gate_override_recorded` needs no new
-field. It never carries `stdout` or `stderr`: the slice is the agent's text
-and isn't recorded (R24).
+`{"failed": [<rule_id>...], "unanswered": [<rule_id>...], "error": ""}`:
+`failed` lists the veto criteria that failed on a verdict, the only ones that
+block, and `unanswered` the veto criteria that got no verdict, so an
+override's `actual_output` already names them by kind (R23) and
+`gate_override_recorded` needs no new field. It never carries `stdout` or
+`stderr`: the slice is the agent's text and isn't recorded (R24).
 
-The event's `outcome` separates a judgment from a fault, because the
-measurement effort counts violations from `gate_evaluated`:
+**A missing verdict never blocks.** Fail-closed means only that a missing
+or malformed answer is never read as a pass. It doesn't mean such an answer
+blocks: an outage or a busy lock would then cost every opted-in run one
+override per veto check, and fill the candidate false fails with overrides
+that say nothing about a criterion's accuracy. So `blocks(outcome, mode)` is
+true only for `fail` in veto. A criterion that got no verdict, for any
+reason, passes; its `decider_checked` keeps outcome `unanswered` with the
+reason and `blocked: false`, the gate's `output.unanswered` keeps listing it
+on a passing gate, and `koto decider report` counts it per criterion, the
+way it counts escapes. A reader of the log can therefore tell a pass that
+was checked and met from one where nothing could be checked.
+
+The event's `outcome` separates a judgment from everything else, because
+the measurement effort counts violations from `gate_evaluated`:
 
 - **`failed`** when any veto criterion failed on a verdict. The findings are
   one per failing criterion, with its `rule_id`; attempt stamps and rule
   counts follow as for any failed gate. Unanswered criteria, if any, appear
-  in `output.unanswered` only, and each one's `decider_checked` still records
-  outcome `unanswered` with its reason.
-- **`error`** when no criterion failed but a veto criterion went unanswered.
-  Unanswered is a checker fault, so its `rule_id` never appears in a
-  finding: the one finding is koto's fallback for the check, with the check's
-  name as `rule_id` (the convention failure reporting already uses for a
-  koto-written finding), naming each unanswered criterion and its reason.
-- **`passed`** otherwise, and always in shadow mode: a shadow check's
-  `gate_evaluated` is written, with outcome `passed`, empty lists and no
-  findings, whatever the decider said. The verdict lives only in
-  `decider_checked`, so shadow criteria never count as violations.
+  in `output.unanswered` only.
+- **`passed`** otherwise, with `output.unanswered` listing every veto
+  criterion that got no verdict and no finding: a missing verdict is a
+  checker fault, not a violation, so no finding ever carries its `rule_id`.
+  In shadow mode a check's `gate_evaluated` is always `passed`, with empty
+  lists and no findings, whatever the decider said. The verdict lives only
+  in `decider_checked`, so shadow criteria never count as violations.
+
+Builds before this rule wrote `error`, with koto's `no verdict was read`
+finding named for the check, when no criterion failed but a veto criterion
+went unanswered. Readers keep accepting `error` on old logs; koto no longer
+writes it for a decider check.
+
+`output.error` is empty except when the check couldn't grade anything at
+all, and then the gate passes and says why. `missing_spec`: the gate has no
+decider-check spec, which a validated template can't produce but a compiled
+template read back from JSON isn't revalidated for; the lists are empty.
+`log_unreadable`: the session log couldn't be read, so there is no state or
+visit to record under and no verdict to reuse; nothing is asked or
+recorded, and every veto criterion is listed under `unanswered`. Neither
+case writes a `decider_checked`, so nothing is ever recorded under an empty
+state name.
+
+The engine blocks on a decider check only when its output lists a failed
+criterion: a criterion recorded as blocking, never the gate's outcome alone
+and never a shadow check. A decider check that passes, or that an older log
+recorded as `error`, doesn't count toward the state's failed gates.
 
 Each consultation that isn't a reuse appends one `decider_checked` event,
 one per criterion, holding the fields R24 lists. The ledger gains a
 `checked` record (the envelope plus the same fields) and, written by
-`koto overrides record` when the overridden gate is a decider check with
-blocking criteria, one `check_overridden` record per blocking criterion,
-with `override_kind` `candidate_false_fail` or `overridden_unanswered`.
+`koto overrides record` when the overridden gate is a decider check with a
+failed criterion, one `check_overridden` record per failed criterion, with
+`override_kind` `candidate_false_fail`. An unanswered criterion never
+blocked, so an override doesn't move past it and records nothing for it.
+Ledgers written before that rule also hold `overridden_unanswered` records,
+which the report still reads and counts.
 `koto overrides record` doesn't evaluate anything to write these: it reads
-the gate's latest `gate_evaluated` output for the two lists, and takes each
+the gate's latest `gate_evaluated` output for the failed list, and takes each
 criterion's `visit_seq` and `declaration_hash` from the latest
 `decider_checked` for that `rule_id` in the visit (a reused verdict appends
 none, but the consultation it reused is in the same visit). Older koto skips
@@ -315,10 +348,21 @@ both kinds as unknown (`report.rs` counts them under `unknown_kind`). A
   returns `Skipped` once it is spent, so the engine's own counter and the
   shared one agree. A criterion that finds it spent is unanswered with
   `cap_spent`.
-- **The lock.** The evaluator takes the session's `decider.lock` without
-  blocking for the whole gate evaluation and releases it before returning.
-  If another process holds it, every criterion of the gate is unanswered
-  with `busy`, sends nothing and uses no cap slot (R21).
+- **The lock.** The evaluator takes the session's `decider.lock` for the
+  whole gate evaluation and releases it before returning. If another process
+  holds it, the evaluator tries again every 50 ms for up to the longest a
+  holder can keep it: every consultation of the per-call cap with its
+  retry, at the provider timeout, plus a second (4 x 2 x 2 s + 1 s = 17 s at
+  the default timeout), capped at 60 s. Only if the wait runs out is every
+  criterion of the gate unanswered with `busy`, sending nothing and using no
+  cap slot (R21). The wait is what stops a second, concurrent `koto next`
+  from passing a veto check the first one is still grading, now that a
+  missing verdict passes: the second waits, then consults for itself. The
+  60 s cap only bites above a provider timeout of about 7.4 s; there a
+  holder still grading can outlast the wait, and the waiting tick's
+  criteria go `busy` and pass.
+  `busy` stays separate in the report's per-reason tally, so a pattern of
+  lock-busy passes on one criterion shows.
 - **The retry.** A `DeciderError` of class `timeout`, `connect`,
   `malformed` or `mismatched`, or `http_status` with a 5xx status, is retried
   once at once. Any other status is not. A consultation counts once however
@@ -342,9 +386,9 @@ both kinds as unknown (`report.rs` counts them under `unknown_kind`). A
   descriptors on `decider.lock` in one process would contend. They never
   coexist: the evaluator opens, locks and closes the file within one gate
   evaluation, and the routing port locks only inside `consult`, which runs
-  after the gate step. A concurrent `koto next` can see `busy` for up to
-  eight attempts' worth of time (about 16 s at the default timeout); the
-  finding tells it to call again.
+  after the gate step. A concurrent `koto next` waits on the lock for up to
+  eight attempts' worth of time plus a second (17 s at the default timeout)
+  before its criteria go `busy`.
 - **Cloud sessions.** Reuse reads the local log, which on the cloud backend
   can lag the remote one. The worst outcome is an extra consultation, never
   a wrong verdict. The loop's own transitions are appended before the gate
@@ -356,8 +400,14 @@ both kinds as unknown (`report.rs` counts them under `unknown_kind`). A
   state is a new attempt, and the PRD scopes reuse to one visit. Rejected.
 - **A separate cap for checks.** It would raise the worst-case cost of a
   `koto next`. Rejected with the PRD.
-- **Blocking on the lock.** A second `koto next` would wait on the first's
-  provider calls; failing fast with `busy` matches the routing decider.
+- **Failing fast on the lock.** The routing decider does, and this design
+  first did too. Once a missing verdict passes, a second `koto next` run
+  while the first holds the lock would pass a veto check the first is still
+  grading, so the agent could skip its own check by running two ticks at
+  once. Rejected for the bounded wait.
+- **Waiting without a bound.** A holder that hangs past its own timeouts
+  would hold the agent's turn indefinitely. The bound covers a holder that
+  behaves, and the per-criterion `busy` tally shows one that doesn't.
 
 ### Decision 7: How modes and the escape resolve
 
@@ -382,13 +432,13 @@ slice, and consults once per criterion (reusing a verdict for an unchanged
 slice within the visit), under the shared per-call cap and the session's
 decider lock, with one retry for transient provider errors. A veto
 criterion under effective mode `auto` fails the gate on a fail verdict, with
-a finding naming the criterion, and makes the gate err when no verdict could
-be read, with a finding naming the check. Everything else, and every shadow
-criterion, passes, and a pass changes nothing. Each consultation is recorded in the
-session log and the ledger, overrides of a blocking check are recorded as
-candidate false fails or overridden unanswered consultations, and `koto
-decider report` tallies it all per criterion. Opted-out users see a template
-without the checks.
+a finding naming the criterion. Everything else passes, and a pass changes
+nothing: a criterion that got no verdict is listed as unanswered and
+recorded with its reason, and every shadow criterion passes. Each
+consultation is recorded in the session log and the ledger, an override of
+a failed check is recorded as a candidate false fail per failed criterion,
+and `koto decider report` tallies it all per criterion, no-verdicts by
+cause. Opted-out users see a template without the checks.
 
 ## Solution Architecture
 
@@ -453,16 +503,19 @@ koto next ──► handle_next
   unlike `children-complete`, which errors); `StructuredGateResult.decider_checks`
   (skipped); `MessageSource::Decider` (`"decider"`) in `src/findings.rs`.
 - **`src/engine/advance.rs`**: append each `decider_checks` record as
-  `EventPayload::DeciderChecked` before `gate_evaluated`.
+  `EventPayload::DeciderChecked` before `gate_evaluated`, and block on a
+  decider check only when its output lists a failed criterion.
 - **`src/engine/types.rs`**: `EventPayload::DeciderChecked(DeciderCheck)`,
   type name `decider_checked`.
 - **`src/decider/ledger.rs`**: `LedgerRecord::Checked` and
   `LedgerRecord::CheckOverridden`; the reader accepts both kinds.
 - **`src/decider/report.rs`**: a `checks` section: per `(state, gate,
   rule_id, declaration_hash)`, counts of `pass`, `fail`, `escape`,
-  `unanswered` (and per reason), `not_graded`, `candidate_false_fail` and
-  `overridden_unanswered`; rendered as a table and under `checks` in
-  `--json`.
+  `unanswered` (per reason, and per cause: `provider` for a provider error
+  or an unreadable answer, `not_asked` for a spent cap or a busy lock,
+  `input` for an over-budget slice or a failed extraction), `not_graded`,
+  `candidate_false_fail` and `overridden_unanswered` (from older ledgers);
+  rendered as a table and under `checks` in `--json`.
 - **`src/cli/mod.rs`**: build the evaluator and the budget; the opted-out
   template view; `TickGates` carries the evaluator; `execute_with_polling`
   passes decider checks; `koto overrides record` writes `check_overridden`.
@@ -491,13 +544,12 @@ The outcome rules, in `src/decider/check.rs`:
 | `pass` | P(pass) strictly highest and ≥ threshold | no | none |
 | `fail` | P(fail) strictly highest and ≥ threshold | yes | `message_source: decider`: "criterion \<id\> failed: the decider judged the \<label\> to fail: \<fail description\>" |
 | `escape` | otherwise, ties included | no | none |
-| unanswered | provider error after retry, unreadable answer, over budget, extraction failed, cap spent, busy | yes | none of its own; when the check errs, koto's check-level finding (`rule_id` the check's name, `message_source: koto`): "no verdict was read for \<id\> (\<reason\>)[, ...]; call koto next again, or override the check with a reason if this persists" |
+| unanswered | provider error after retry, unreadable answer, over budget, extraction failed, cap spent, busy | no | none; listed under `output.unanswered` |
 | not graded | slice empty or whitespace | no | none |
 
-Both findings are level `error`, with `effect_landed` filled as for any
-gate; the fail finding carries the criterion's `rule_id` and `rule_ref`, the
-check-level one the check's name and no `rule_ref`. Shadow never blocks and
-adds no finding. **Not graded** and **escape** are both "not checkable" and
+The fail finding is level `error`, with `effect_landed` filled as for any
+gate, and carries the criterion's `rule_id` and `rule_ref`. Shadow never
+blocks and adds no finding. **Not graded** and **escape** are both "not checkable" and
 stay distinct: not graded means koto had nothing to ask (an empty slice, no
 request sent); escape means the decider read the slice and answered that it
 can't be judged.
@@ -516,7 +568,7 @@ can't be judged.
 | `threshold` | number | yes | The criterion's threshold. |
 | `outcome` | string | yes | `pass`, `fail`, `escape`, `unanswered` or `not_graded`. Consumers MUST tolerate other values. |
 | `reason` | string | no | With `unanswered`: `provider_error`, `unreadable_response`, `over_budget`, `extraction_failed`, `cap_spent` or `busy`. |
-| `blocked` | boolean | yes | Whether this criterion blocked the state. |
+| `blocked` | boolean | yes | Whether this criterion blocked the state: `true` only for `fail` in veto. `false` for every `unanswered` outcome; older builds wrote `true` for a veto `unanswered`. |
 | `provider` | string | yes | `jev`. |
 | `model` | string | yes | Model the provider reported, or `unknown`. |
 | `probabilities` | object | no | `pass`, `fail`, `unclear`, rounded to four places; present when an answer was read. |
@@ -533,7 +585,8 @@ can't be judged.
 The ledger `checked` record adds the envelope (`v`, `at`, `session`,
 `session_id`). The ledger `check_overridden` record holds the envelope,
 `state`, `visit_seq`, `gate`, `rule_id`, `declaration_hash` and `override_kind`
-(`candidate_false_fail` or `overridden_unanswered`).
+(`candidate_false_fail`; ledgers from older builds also hold
+`overridden_unanswered`).
 
 A criterion's `rule_id` is opaque to koto and declared by the template, but
 it is the join key for later adjudications (a review finding or a CI failure
@@ -554,10 +607,11 @@ must be that registry's id for the rule. A consumer keys decider rates by
 | `decider_checked` | `unread_usage_attempts` | integer | always | Billed attempts whose usage couldn't be read: the size of any undercount. |
 | `decider_checked` | `attempts`, `latency_ms`, `error_class` | integer, integer, string | `error_class` when the last attempt failed | The consultation's cost and failure class. |
 | `decider_checked` | `state`, `visit_seq`, `gate`, `input_sha256`, `input_bytes` | string, integer, string, string, integer | hash and bytes when the extraction produced output | Where it ran and what it judged, by hash. |
-| `gate_evaluated` (decider check) | `outcome` | `passed`, `failed`, `error` | always | `failed` is a violation; `error` is a checker fault; shadow is always `passed`. |
-| `gate_evaluated` (decider check) | `output.failed`, `output.unanswered` | arrays of `rule_id` | always | The blocking criteria by kind; empty in shadow. |
+| `gate_evaluated` (decider check) | `outcome` | `passed`, `failed` (older logs also `error`) | always | `failed` is a violation; shadow is always `passed`. |
+| `gate_evaluated` (decider check) | `output.failed`, `output.unanswered` | arrays of `rule_id` | always | Veto criteria that failed on a verdict, and veto criteria that got no verdict, on a passed gate as on a failed one; empty in shadow. |
+| `gate_evaluated` (decider check) | `output.error` | `""`, `missing_spec`, `log_unreadable` | always | Why nothing could be graded; the gate passed. |
 | `gate_evaluated` (decider check) | finding `message_source` value `decider` | string | on a fail finding | The finding's message came from a decider verdict. |
-| ledger `check_overridden` | `override_kind` | `candidate_false_fail`, `overridden_unanswered` | always | What an override moved past. |
+| ledger `check_overridden` | `override_kind` | `candidate_false_fail` (older ledgers also `overridden_unanswered`) | always | What an override moved past. |
 
 ### Data flow for one gate evaluation
 
@@ -568,15 +622,18 @@ must be that registry's id for the rule. A consumer keys decider rates by
 2. Empty or whitespace slice: every criterion `not_graded`. Over
    `max_bytes`: every criterion `unanswered / over_budget` (hash and length
    recorded, no request).
-3. Take `decider.lock` without waiting; on failure every criterion is
-   `unanswered / busy`.
-4. Read the local log; find the visit start; for each criterion in
+3. Take `decider.lock`, waiting up to the bound in Decision 6; if it runs
+   out every criterion is `unanswered / busy`.
+4. Read the local log; if it can't be read, or names no state, pass with
+   `output.error` `log_unreadable` and every veto criterion unanswered,
+   recording nothing. Find the visit start; for each criterion in
    declaration order, reuse a matching verdict or, if the budget has room,
    consult (at most two attempts); else `unanswered / cap_spent`.
 5. Append a ledger `checked` line per consultation; release the lock.
 6. Build the output lists, the findings for blocking criteria, and the
-   records. The gate's outcome is `failed` if any criterion failed on a
-   verdict, else `error` if any was unanswered, else `passed`.
+   records. The gate's outcome is `failed` if any veto criterion failed on
+   a verdict, else `passed`; either way `output.unanswered` lists the veto
+   criteria that got no verdict.
 
 ## Implementation Approach
 
@@ -645,8 +702,11 @@ same effect, since an escape never blocks; the per-criterion escape tally in
 `koto decider report` is how such a pattern shows up.
 
 **Evasion by the agent.** An agent controls the artifact the slice comes
-from. An over-budget slice is unanswered, not skipped, so size can't switch
-the check off. An empty slice is not graded; making a slice empty means
+from. An over-budget slice is unanswered, not skipped: it passes like any
+missing verdict, so an agent that makes the slice too long gets past the
+check, but the record says `over_budget` and the report tallies it per
+criterion, so size can't switch a check off silently. An empty slice is not
+graded; making a slice empty means
 removing the thing the criterion judges (Known Limitations in the PRD). The
 extraction command's string is fixed by the template, but a script it calls
 may sit in the tree the agent edits, and then the agent can shape or empty
@@ -659,11 +719,14 @@ a response body or error text; the slice appears only as its hash and
 length. `gate_evaluated` for a decider check never carries streams. The
 ledger keeps its mode 0600.
 
-**Denial of progress.** A provider outage blocks veto criteria, and so can a
-concurrent `koto next` holding the lock (`busy`) or a routing consultation
-that spent the cap earlier in the call (`cap_spent`). Each is the
-fail-closed choice; the next call retries, the override is the way past, and
-a project can lower the mode to `shadow`. Reuse is keyed on the slice, not
+**Denial of progress.** A provider outage, a spent cap or a busy lock
+doesn't block: each leaves its criteria unanswered and the gate passes, so
+no outage costs an override. The cost moves to coverage instead: a criterion
+that goes unanswered wasn't checked on that visit, which the gate's
+`output.unanswered`, the `decider_checked` reason and the report's
+per-criterion tally all show. The bounded lock wait (Decision 6) keeps a
+concurrent `koto next` from turning a busy lock into a way past a check.
+Reuse is keyed on the slice, not
 the model; a verdict read earlier in the same visit from another model build
 is reused, which is acceptable within one visit and visible in the records.
 
@@ -690,15 +753,18 @@ adds no new execution surface.
   wait for a release and raise its minimum koto.
 - One request per criterion costs more round trips than a batch, and a state
   with four criteria takes the whole per-call cap.
-- A provider outage blocks every veto criterion until an override or a mode
-  change.
+- During a provider outage no veto criterion is checked; the work passes
+  ungraded, visibly so in the records.
+- A second `koto next` that finds the lock held waits up to 17 s at the
+  default timeout (60 s at most) before its criteria go `busy`.
 - An agent can empty a slice by removing the thing it grades.
 
 ### Mitigations
 
 - Every criterion ships in shadow; nothing blocks until a maintainer sets
   `veto` and a user opts in at `auto`.
-- The unanswered finding tells the agent to call `koto next` again first;
-  verdicts already read are reused, so a retry only re-asks what failed.
+- A criterion that goes unanswered is asked again on the next evaluation
+  in the visit; verdicts already read are reused, so a retry only re-asks
+  what got no answer.
 - Batching is a measured change away if cost matters: the request shape
   already supports several questions.

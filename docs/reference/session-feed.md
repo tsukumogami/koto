@@ -926,7 +926,7 @@ Records when an agent bypassed a failing gate via `koto overrides record`.
 | `gate` | string | Yes | Gate identifier string. |
 | `rationale` | string | Yes | Human-readable reason for the override. |
 | `override_applied` | object | Yes | The value substituted as if the gate had produced it. Schema is gate-type-specific. |
-| `actual_output` | object | Yes | The gate's actual output at override time. Schema is gate-type-specific. For a `decider-check` gate it lists the criteria that were blocking, under `failed` and `unanswered`. |
+| `actual_output` | object | Yes | The gate's actual output at override time. Schema is gate-type-specific. For a `decider-check` gate it lists the criteria that failed, the only ones that block, under `failed`, and those that got no verdict under `unanswered`. |
 | `timestamp` | string | Yes | RFC 3339 UTC timestamp. Matches the outer envelope `timestamp`. |
 
 ---
@@ -1410,21 +1410,34 @@ gate types, including `children-complete` and `request-leg`, log none, so a
 failure of one of them carries no `findings` and no `rule_counts`.
 
 **A `decider-check` gate** (docs/designs/current/DESIGN-koto-decider-checks.md) logs
-`output` as `{"failed": [<rule_id>...], "unanswered": [<rule_id>...], "error": ""}`,
-listing the veto criteria that blocked, and never logs `stdout` or `stderr`,
-since its output is the agent's own text. Its `outcome` separates a judgment
-from a fault:
+`output` as `{"failed": [<rule_id>...], "unanswered": [<rule_id>...], "error": ""}`:
+`failed` lists the veto criteria that failed on a verdict, the only ones
+that block, and `unanswered` the veto criteria that got no verdict. It never
+logs `stdout` or `stderr`, since its output is the agent's own text. Its
+`outcome` is:
 
 - `failed` when a veto criterion failed on a verdict. `findings` holds one per
   failing criterion, with its `rule_id`, `rule_ref` and `message_source`
   `decider`; unanswered criteria appear in `output.unanswered` only.
-- `error` when no criterion failed but a veto criterion got no verdict.
-  Unanswered is a checker fault, so no finding carries its `rule_id`: the one
-  finding is koto's, with the gate's name as `rule_id`, `message_source`
-  `koto`, and a message that begins `no verdict was read`.
-- `passed` otherwise, and always for shadow criteria: a shadow check's event
-  has outcome `passed`, empty lists and no findings, whatever the decider
-  said. Its verdicts are only in `decider_checked`.
+- `passed` otherwise. A missing or malformed verdict never blocks, but it is
+  never read as a pass either: every veto criterion that got no verdict stays
+  listed in `output.unanswered` on the passing event, with no finding, and its
+  `decider_checked` keeps outcome `unanswered` with the reason and `blocked:
+  false`. A reader can therefore tell a pass that was checked and met from one
+  where nothing could be checked. A shadow check's event is always `passed`,
+  with empty lists and no findings, whatever the decider said; its verdicts
+  are only in `decider_checked`.
+
+`output.error` is `""` unless the check couldn't grade anything, and then the
+event is `passed` and no `decider_checked` precedes it: `missing_spec` when
+the gate has no decider-check spec (the lists are empty), or `log_unreadable`
+when the session log couldn't be read (every veto criterion is listed under
+`unanswered`). Consumers MUST tolerate other values.
+
+Logs from koto before this rule may hold a decider check's event with outcome
+`error` (no criterion failed, a veto criterion got no verdict) and koto's own
+finding, `rule_id` the gate's name, `message_source` `koto`, message beginning
+`no verdict was read`. koto no longer writes it; readers keep accepting it.
 
 Each consultation's `decider_checked` event comes immediately before this
 event.
@@ -1756,7 +1769,7 @@ appends none.
 | `threshold` | number | Yes | The criterion's threshold, from 0.5 to 1.0. The frontmatter types it `any`, since the vocabulary has no number type. |
 | `outcome` | string | Yes | `pass`, `fail`, `escape`, `unanswered` or `not_graded`. Consumers MUST tolerate other values. |
 | `reason` | string | No | With `unanswered` only: `provider_error`, `unreadable_response`, `over_budget`, `extraction_failed`, `cap_spent` or `busy`. |
-| `blocked` | boolean | Yes | Whether this criterion blocked the state. Only a veto `fail` or `unanswered` does. |
+| `blocked` | boolean | Yes | Whether this criterion blocked the state. Only a veto `fail` does; an `unanswered` outcome is always `false`. Logs from older koto may hold `true` on a veto `unanswered`. |
 | `provider` | string | Yes | The provider name, such as `"jev"`. |
 | `model` | string | Yes | The model build the provider reported, or `"unknown"` when no answer named one. |
 | `probabilities` | object | No | `pass`, `fail` and `unclear`, each rounded to four places. Present when an answer was read. |
@@ -1774,14 +1787,14 @@ appends none.
 the slice was empty, so nothing was asked and nothing sent; `escape` means the
 decider read the slice and answered that it can't be judged, or no value won
 at its threshold. **`unanswered`** is a checker fault, never a judgment about
-the agent's work.
+the agent's work, and it never blocks.
 
 The event carries no slice content and no credentials: the slice appears only
 as `input_sha256` and `input_bytes`, and the API key, the response body and
 error text are never recorded. koto also appends each consultation to
 `~/.koto/_decider_ledger.jsonl` as a `checked` line with the same fields, and
 an override of a blocking decider check as one `check_overridden` line per
-blocking criterion; see `docs/workspace-layout.md`.
+failed criterion; see `docs/workspace-layout.md`.
 
 ---
 

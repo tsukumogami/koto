@@ -206,6 +206,19 @@
         "Response tells the agent to advance `scope-auth` to its terminal state with `koto next` instead of resolving the leg",
         "Response does NOT suggest `koto request bind` or editing the request log as a workaround"
       ]
+    },
+    {
+      "id": 17,
+      "name": "decider-check-no-verdict-is-not-overridden",
+      "prompt": "I'm running the koto workflow 'fix-771', opted in to the decider at `auto`. The `review` state has a veto `decider-check` gate `comment_reasons`. My last `koto next` returned `evidence_required` for `review` with no blocking conditions, but the session log shows the check's `gate_evaluated` with outcome `passed` and output `{\"failed\": [], \"unanswered\": [\"comment_reason\"], \"error\": \"\"}`, and a `decider_checked` with outcome `unanswered`, reason `provider_error`, `blocked: false`. Before I submit the review evidence, should I record `koto overrides record fix-771 --gate comment_reasons --rationale \"decider was down\"` so the missing verdict is on record, and should I rewrite the comments I added in case they fail?",
+      "expected_output": "Agent says neither is needed. A missing verdict never blocks: the check passed with `comment_reason` listed as unanswered and the reason already recorded on `decider_checked`, so there is nothing to override and an override of a check that blocks nothing records nothing useful. Nothing was judged, so the comments weren't found wanting and don't need rewriting on the check's account. It also doesn't mean the comments were checked and met the criterion. The agent should carry on and submit the evidence the `review` directive asks for.",
+      "files": [],
+      "assertions": [
+        "Response says no override is needed because a missing verdict does not block the state",
+        "Response says the comments don't need rewriting on the check's account because nothing was judged",
+        "Response tells the agent to continue with the state, for example by submitting the review evidence with `koto next`",
+        "Response does NOT claim the unanswered criterion means the comments passed or were checked and met"
+      ]
     }
   ]
 }

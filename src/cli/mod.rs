@@ -4490,6 +4490,11 @@ fn handle_next(
             &command_env,
         )
         .with_ledger_root(dirs::home_dir().map(|h| h.join(".koto")))
+        // Every tick that consults waits for the lock; an evaluator built
+        // without this tries it once.
+        .with_lock_wait(crate::cli::check_evaluator::lock_wait_for(
+            decider_settings.timeout(),
+        ))
     });
 
     // The one gate evaluator this tick uses, wherever it evaluates gates.
