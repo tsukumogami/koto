@@ -1383,7 +1383,7 @@ Command, context-exists and context-matches gates produce findings. Other
 gate types, including `children-complete` and `request-leg`, log none, so a
 failure of one of them carries no `findings` and no `rule_counts`.
 
-**A `decider-check` gate** (docs/designs/DESIGN-koto-decider-checks.md) logs
+**A `decider-check` gate** (docs/designs/current/DESIGN-koto-decider-checks.md) logs
 `output` as `{"failed": [<rule_id>...], "unanswered": [<rule_id>...], "error": ""}`,
 listing the veto criteria that blocked, and never logs `stdout` or `stderr`,
 since its output is the agent's own text. Its `outcome` separates a judgment
@@ -1679,7 +1679,7 @@ outlives the session log; see `docs/workspace-layout.md`.
 
 Records one consultation of one criterion of a `decider-check` gate: koto
 asked an opted-in decider whether an extracted slice of the agent's work
-meets a closed criterion (docs/designs/DESIGN-koto-decider-checks.md). It
+meets a closed criterion (docs/designs/current/DESIGN-koto-decider-checks.md). It
 appears only for users who opted in, only on states whose template declares
 a decider check, and immediately before that gate's `gate_evaluated`. A
 verdict reused from earlier in the same visit, for an unchanged slice,

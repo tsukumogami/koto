@@ -490,7 +490,7 @@ Everything above is about a decider answering a routing question. A
 agent produced meets a few closed criteria, such as "every comment this
 change adds gives a reason". It can only object. A criterion in veto blocks
 the state and tells the agent which rule it broke; a pass never advances
-anything. The design is `docs/designs/DESIGN-koto-decider-checks.md`.
+anything. The design is `docs/designs/current/DESIGN-koto-decider-checks.md`.
 
 ### Declaring a check
 
