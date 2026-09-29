@@ -3559,6 +3559,7 @@ mod tests {
             input_bytes: Some(34),
             input_tokens: None,
             output_tokens: None,
+            unread_usage_attempts: 0,
             attempts: 0,
             latency_ms: 0,
             error_class: None,

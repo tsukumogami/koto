@@ -391,6 +391,105 @@ impl QuestionReport {
 pub struct LedgerReport {
     pub header: Header,
     pub questions: Vec<QuestionReport>,
+    pub checks: Vec<CheckTally>,
+}
+
+/// What the ledger holds for one decider-check criterion under one
+/// declaration (DESIGN-koto-decider-checks.md, Decision 5): how its
+/// consultations came out and how often an override moved past it. A
+/// criterion that escapes or goes unanswered on everything reads as a no-op
+/// here rather than as silent approval.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct CheckTally {
+    pub state: String,
+    pub gate: String,
+    pub rule_id: String,
+    pub declaration_hash: String,
+    pub consultations: u64,
+    pub pass: u64,
+    pub fail: u64,
+    pub escape: u64,
+    pub unanswered: u64,
+    /// `unanswered` split by reason.
+    pub unanswered_by_reason: BTreeMap<String, u64>,
+    pub not_graded: u64,
+    pub candidate_false_fail: u64,
+    pub overridden_unanswered: u64,
+}
+
+/// Tally every decider-check criterion in the ledger, keyed by state, gate,
+/// `rule_id` and declaration hash, in that order. `opts.state` limits it to
+/// one state, as it does the questions.
+pub fn tally_checks(read: &LedgerRead, opts: &ReportOptions) -> Vec<CheckTally> {
+    use crate::decider::check::RecordedOutcome;
+    use crate::decider::ledger::CheckOverrideKind;
+    type Key = (String, String, String, String);
+    fn slot<'m>(
+        tallies: &'m mut BTreeMap<Key, CheckTally>,
+        state: &str,
+        gate: &str,
+        rule_id: &str,
+        hash: &str,
+    ) -> &'m mut CheckTally {
+        let key = (
+            state.to_string(),
+            gate.to_string(),
+            rule_id.to_string(),
+            hash.to_string(),
+        );
+        tallies.entry(key).or_insert_with(|| CheckTally {
+            state: state.to_string(),
+            gate: gate.to_string(),
+            rule_id: rule_id.to_string(),
+            declaration_hash: hash.to_string(),
+            ..CheckTally::default()
+        })
+    }
+    let wanted = |state: &str| opts.state.as_deref().is_none_or(|s| s == state);
+    let mut tallies: BTreeMap<Key, CheckTally> = BTreeMap::new();
+    for r in &read.records {
+        match r {
+            LedgerRecord::Checked(c) if wanted(&c.check.state) => {
+                let c = &c.check;
+                let t = slot(
+                    &mut tallies,
+                    &c.state,
+                    &c.gate,
+                    &c.rule_id,
+                    &c.declaration_hash,
+                );
+                t.consultations += 1;
+                match c.outcome {
+                    RecordedOutcome::Pass => t.pass += 1,
+                    RecordedOutcome::Fail => t.fail += 1,
+                    RecordedOutcome::Escape => t.escape += 1,
+                    RecordedOutcome::NotGraded => t.not_graded += 1,
+                    RecordedOutcome::Unanswered => {
+                        t.unanswered += 1;
+                        let reason = c.reason.map_or("unknown", |r| r.as_str());
+                        *t.unanswered_by_reason
+                            .entry(reason.to_string())
+                            .or_default() += 1;
+                    }
+                }
+            }
+            LedgerRecord::CheckOverridden(o) if wanted(&o.state) => {
+                let t = slot(
+                    &mut tallies,
+                    &o.state,
+                    &o.gate,
+                    &o.rule_id,
+                    &o.declaration_hash,
+                );
+                match o.override_kind {
+                    CheckOverrideKind::CandidateFalseFail => t.candidate_false_fail += 1,
+                    CheckOverrideKind::OverriddenUnanswered => t.overridden_unanswered += 1,
+                }
+            }
+            _ => {}
+        }
+    }
+    tallies.into_values().collect()
 }
 
 impl LedgerReport {
@@ -646,7 +745,11 @@ pub fn analyze(read: &LedgerRead, opts: &ReportOptions) -> LedgerReport {
         .into_iter()
         .map(|((state, field, hash), q)| finish_question(state, field, hash, q))
         .collect();
-    LedgerReport { header, questions }
+    LedgerReport {
+        header,
+        questions,
+        checks: tally_checks(read, opts),
+    }
 }
 
 fn answered_key(a: &AnsweredRecord) -> Option<VisitKey> {
@@ -1305,6 +1408,8 @@ pub struct Report {
     pub ledger: String,
     pub header: Header,
     pub questions: Vec<QuestionReport>,
+    /// Per-criterion decider-check tallies; empty when the ledger has none.
+    pub checks: Vec<CheckTally>,
     pub fixtures: Option<FixtureReport>,
 }
 
@@ -1365,8 +1470,41 @@ pub fn render_table(report: &Report) -> String {
         "  {} consultations from a custom endpoint; {} excluded from eligibility",
         h.custom_endpoint_consultations, h.excluded_from_eligibility
     );
-    if report.questions.is_empty() {
+    if report.questions.is_empty() && report.checks.is_empty() {
         let _ = writeln!(out, "\nno consultations recorded");
+    }
+    for t in &report.checks {
+        let _ = writeln!(
+            out,
+            "\ncheck {}.{} criterion {}",
+            t.state, t.gate, t.rule_id
+        );
+        let _ = writeln!(out, "  declaration hash {}", t.declaration_hash);
+        let reasons: Vec<String> = t
+            .unanswered_by_reason
+            .iter()
+            .map(|(r, n)| format!("{} {}", r, n))
+            .collect();
+        let _ = writeln!(
+            out,
+            "  consultations {}: pass {}, fail {}, escape {}, unanswered {}{}, not graded {}",
+            t.consultations,
+            t.pass,
+            t.fail,
+            t.escape,
+            t.unanswered,
+            if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", reasons.join(", "))
+            },
+            t.not_graded
+        );
+        let _ = writeln!(
+            out,
+            "  overrides: {} candidate false fails, {} overridden unanswered",
+            t.candidate_false_fail, t.overridden_unanswered
+        );
     }
     for q in &report.questions {
         let _ = writeln!(out, "\nquestion {}.{}", q.state, q.field);

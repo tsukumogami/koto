@@ -122,8 +122,9 @@ see a template without the checks.
       read` prefix) and never a finding with the criterion's `rule_id`;
       shadow is always `passed` with empty lists.
 - [ ] `decider_checked` carries `visit_seq` from the arrival-or-rewind
-      boundary (a self-transition keeps it) and `input_tokens` and
-      `output_tokens` when the stub reports usage.
+      boundary (a self-transition keeps it), `input_tokens` and
+      `output_tokens` summed over every 2xx attempt, and
+      `unread_usage_attempts` for 2xx attempts with no readable usage.
 - [ ] Retry: timeout, 503, malformed and mismatched answers get exactly two
       requests; 401 gets one; a first-attempt failure then answer records
       `attempts` 2 and counts once against the cap.

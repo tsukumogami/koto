@@ -337,8 +337,9 @@ approve.
   answer, the verdict or the unanswered reason or not graded, whether it
   blocked, the provider, the model string, a SHA-256 of the slice and its
   byte length, the input and output token counts when the provider reports
-  them (summed over the attempts whose answer was read), the total latency
-  across attempts, the error
+  them (summed over every attempt that got a 2xx answer, since each was
+  billed), the number of such attempts whose usage couldn't be read, the
+  total latency across attempts, the error
   class if any (the routing decider's closed vocabulary), the number of
   attempts, and where the endpoint came from as one of the labels `default`,
   `user` or `env` (the routing decider's labels; never a URL). The visit is
@@ -468,8 +469,9 @@ approve.
       reuses its verdicts; an arrival from another state or a rewind opens a
       new visit.
 - [ ] A stub answer reporting usage has its input and output token counts in
-      the consultation's records; an attempt whose body koto couldn't read
-      adds none.
+      the consultation's records, including a 2xx answer koto couldn't use;
+      a 2xx answer with no readable usage raises `unread_usage_attempts`, and
+      a non-2xx status adds to neither.
 - [ ] A stub that fails the first attempt and answers the second yields the
       second answer's verdict, recorded with two attempts, and the
       consultation counts once against the cap.

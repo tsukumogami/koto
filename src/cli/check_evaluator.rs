@@ -27,7 +27,7 @@ use crate::decider::check::{
     recorded_probabilities, verdict, CheckOutcome, DeciderCheck, UnansweredReason,
 };
 use crate::decider::ledger::{append_or_warn, LedgerRecord};
-use crate::decider::types::{Decider, ErrorClass, GlobalMode, SettingOrigin};
+use crate::decider::types::{Decider, ErrorClass, GlobalMode, LabelledInput, SettingOrigin};
 use crate::engine::decider::MAX_CONSULTATIONS_PER_CALL;
 use crate::engine::persistence::{arrival_index, derive_state_from_log};
 use crate::engine::types::{Event, EventPayload};
@@ -119,6 +119,48 @@ pub fn without_checks(
     compiled
 }
 
+/// The ledger's `check_overridden` records for an override of the decider
+/// check `gate` in `state`: one per criterion the check's last output
+/// (`actual_output`) lists as blocking, `candidate_false_fail` for a failed
+/// one and `overridden_unanswered` for an unanswered one. Each takes its
+/// visit and declaration hash from the latest `decider_checked` for that
+/// criterion in the log; a reused verdict appended none, but the
+/// consultation it reused is there. A criterion with no such record gets
+/// none.
+pub fn override_records(
+    events: &[Event],
+    state: &str,
+    gate: &str,
+    actual_output: &serde_json::Value,
+    session: &str,
+    session_id: Option<&str>,
+) -> Vec<LedgerRecord> {
+    use crate::decider::ledger::CheckOverrideKind;
+    let mut out = Vec::new();
+    for (key, kind) in [
+        ("failed", CheckOverrideKind::CandidateFalseFail),
+        ("unanswered", CheckOverrideKind::OverriddenUnanswered),
+    ] {
+        let ids = actual_output[key].as_array().cloned().unwrap_or_default();
+        for rule_id in ids.iter().filter_map(|v| v.as_str()) {
+            let latest = events.iter().rev().find_map(|e| match &e.payload {
+                EventPayload::DeciderChecked(c)
+                    if c.state == state && c.gate == gate && c.rule_id == rule_id =>
+                {
+                    Some((c.visit_seq, c.declaration_hash.clone()))
+                }
+                _ => None,
+            });
+            if let Some((visit_seq, hash)) = latest {
+                out.push(LedgerRecord::check_overridden(
+                    session, session_id, state, visit_seq, gate, rule_id, &hash, kind,
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Held while one gate's criteria are consulted. Closing the file releases
 /// the `flock`.
 struct LockHold {
@@ -132,9 +174,23 @@ struct Consulted {
     model: String,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    unread_usage_attempts: u32,
     attempts: u32,
     latency_ms: u64,
     error_class: Option<ErrorClass>,
+}
+
+impl Consulted {
+    /// Add one billed answer's usage, or count it as unread.
+    fn add_usage(&mut self, usage: Option<crate::decider::types::Usage>) {
+        match usage {
+            Some(u) => {
+                self.input_tokens = Some(self.input_tokens.unwrap_or(0) + u.input_tokens);
+                self.output_tokens = Some(self.output_tokens.unwrap_or(0) + u.output_tokens);
+            }
+            None => self.unread_usage_attempts += 1,
+        }
+    }
 }
 
 impl Consulted {
@@ -146,6 +202,7 @@ impl Consulted {
             model: UNKNOWN_MODEL.to_string(),
             input_tokens: None,
             output_tokens: None,
+            unread_usage_attempts: 0,
             attempts: 0,
             latency_ms: 0,
             error_class: None,
@@ -261,7 +318,11 @@ impl<'a> CliCheckEvaluator<'a> {
             (Some(CheckOutcome::NotGraded), None)
         } else {
             let input = Some((
-                input_sha256(&build_check_request(&spec.criteria[0], &spec.label, slice).inputs),
+                // The labelled input every criterion's request carries.
+                input_sha256(&[LabelledInput {
+                    label: spec.label.clone(),
+                    content: slice.to_string(),
+                }]),
                 slice.len() as u64,
             ));
             if output.stdout_truncated || slice.len() > spec.max_bytes as usize {
@@ -339,6 +400,7 @@ impl<'a> CliCheckEvaluator<'a> {
                     input_bytes: input.as_ref().map(|(_, n)| *n),
                     input_tokens: c.input_tokens,
                     output_tokens: c.output_tokens,
+                    unread_usage_attempts: c.unread_usage_attempts,
                     attempts: c.attempts,
                     latency_ms: c.latency_ms,
                     error_class: c.error_class,
@@ -383,10 +445,7 @@ impl<'a> CliCheckEvaluator<'a> {
             match answer {
                 Ok(response) => {
                     c.model = response.model.clone();
-                    if let Some(u) = response.usage {
-                        c.input_tokens = Some(c.input_tokens.unwrap_or(0) + u.input_tokens);
-                        c.output_tokens = Some(c.output_tokens.unwrap_or(0) + u.output_tokens);
-                    }
+                    c.add_usage(response.usage);
                     let (outcome, probabilities) =
                         verdict(&response, &criterion.rule_id, criterion.threshold);
                     c.outcome = outcome;
@@ -400,6 +459,12 @@ impl<'a> CliCheckEvaluator<'a> {
                     c.error_class = Some(ErrorClass::Malformed);
                 }
                 Err(e) => {
+                    // A 2xx answer koto couldn't use was billed; a non-2xx
+                    // status or a transport failure generally isn't, and
+                    // carries no usage to read.
+                    if e.responded {
+                        c.add_usage(e.usage);
+                    }
                     c.error_class = Some(e.class);
                     c.outcome = CheckOutcome::Unanswered(reason_for_error(e.class));
                     c.probabilities.clear();

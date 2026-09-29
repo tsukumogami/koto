@@ -124,6 +124,7 @@ fn handle_report(args: ReportArgs) -> anyhow::Result<()> {
         ledger: ledger.display().to_string(),
         header: ledger_report.header,
         questions: ledger_report.questions,
+        checks: ledger_report.checks,
         fixtures,
     };
     if args.json {

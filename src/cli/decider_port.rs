@@ -122,15 +122,15 @@ impl<'a> CliDeciderPort<'a> {
         }
     }
 
-    /// Write `consulted` records to the ledger under `koto_root`
-    /// (`~/.koto`). `None` means there is no home directory: each record
-    /// then produces a warning instead of a line.
     /// Share the per-call consultation cap with decider checks.
     pub fn with_budget(mut self, budget: crate::cli::check_evaluator::ConsultBudget) -> Self {
         self.budget = Some(budget);
         self
     }
 
+    /// Write `consulted` records to the ledger under `koto_root`
+    /// (`~/.koto`). `None` means there is no home directory: each record
+    /// then produces a warning instead of a line.
     pub fn with_ledger_root(mut self, koto_root: Option<PathBuf>) -> Self {
         self.ledger_root = koto_root;
         self

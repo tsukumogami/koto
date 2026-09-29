@@ -290,6 +290,11 @@ pub struct DeciderCheck {
     pub input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    /// Attempts that got a 2xx answer whose usage couldn't be read, so a
+    /// remaining undercount of `input_tokens` and `output_tokens` is visible
+    /// rather than guessed. Absent on records written before it existed.
+    #[serde(default)]
+    pub unread_usage_attempts: u32,
     pub attempts: u32,
     pub latency_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -516,6 +521,7 @@ mod tests {
             input_bytes: Some(2561),
             input_tokens: Some(10),
             output_tokens: Some(2),
+            unread_usage_attempts: 0,
             attempts: 0,
             latency_ms: 0,
             error_class: None,

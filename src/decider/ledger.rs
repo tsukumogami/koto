@@ -434,6 +434,7 @@ mod tests {
             input_bytes: Some(120),
             input_tokens: Some(300),
             output_tokens: Some(3),
+            unread_usage_attempts: 0,
             attempts: 1,
             latency_ms: 250,
             error_class: None,

@@ -106,7 +106,9 @@ impl Decider for JevDecider {
             }
             return Err(DeciderError::http_status(status));
         }
-        decode_response(req, &bytes)
+        // A 2xx answer koto can't use was still billed: keep its usage (the
+        // token counts, nothing else) on the error.
+        decode_response(req, &bytes).map_err(|e| e.with_response_usage(usage_of_body(&bytes)))
     }
 }
 
@@ -309,6 +311,13 @@ pub fn decode_response(
         answers: out,
         usage: decode_usage(root.get("usage")),
     })
+}
+
+/// The `usage` of a response body koto couldn't otherwise use, when the
+/// body is a JSON object carrying one.
+fn usage_of_body(body: &[u8]) -> Option<super::types::Usage> {
+    let root: Value = serde_json::from_slice(body).ok()?;
+    decode_usage(root.get("usage"))
 }
 
 /// Jev's `usage`: `input_tokens` and `output_tokens` as whole numbers. Kept

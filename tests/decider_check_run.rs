@@ -845,3 +845,156 @@ fn a_slow_provider_is_bounded_by_the_timeout() {
         took
     );
 }
+
+// ---------------------------------------------------------------------------
+// spend, overrides and the report
+// ---------------------------------------------------------------------------
+
+fn ledger(h: &Harness) -> Vec<Value> {
+    let path = h.home().join(".koto").join("_decider_ledger.jsonl");
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_billed_answer_koto_cannot_use_still_counts_its_tokens() {
+    // A 2xx answer that can't be read as pass, fail or escape was billed.
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    let bad = Reply::json(&json!({
+        "model": "m", "answers": {"r": {"type": "choice"}},
+        "usage": {"input_tokens": 40, "output_tokens": 1}
+    }));
+    h.stub.push(bad);
+    h.stub.push(fail("r"));
+    run(&h, "auto");
+    let c = &checks(&h)[0];
+    assert_eq!(c["attempts"], 2);
+    assert_eq!(c["input_tokens"], 140);
+    assert_eq!(c["output_tokens"], 4);
+    assert_eq!(c["unread_usage_attempts"], 0);
+}
+
+#[test]
+fn a_billed_answer_with_no_readable_usage_is_counted_as_unread() {
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    h.stub.push(Reply::raw(200, "not json"));
+    h.stub.push(fail("r"));
+    run(&h, "auto");
+    let c = &checks(&h)[0];
+    assert_eq!(c["attempts"], 2);
+    assert_eq!(c["input_tokens"], 100);
+    assert_eq!(c["unread_usage_attempts"], 1);
+
+    // A non-2xx status is not billed and counts as neither.
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    h.stub.push(Reply::status(503));
+    h.stub.push(fail("r"));
+    run(&h, "auto");
+    let c = &checks(&h)[0];
+    assert_eq!(c["input_tokens"], 100);
+    assert_eq!(c["unread_usage_attempts"], 0);
+}
+
+#[test]
+fn an_override_records_each_blocking_criterion_as_a_candidate_or_unanswered() {
+    let h = harness(&check_template(&criteria(&["a", "b"], "veto")), SLICE);
+    h.stub.push(fail("a"));
+    h.stub.push(Reply::status(401));
+    run(&h, "auto");
+    let out = h
+        .koto()
+        .args([
+            "overrides",
+            "record",
+            WF,
+            "--gate",
+            "comments",
+            "--rationale",
+            "the comment gives the reason",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+
+    let ov = h.events_of("gate_override_recorded");
+    let actual = &ov[0]["payload"]["actual_output"];
+    assert_eq!(actual["failed"], json!(["a"]));
+    assert_eq!(actual["unanswered"], json!(["b"]));
+
+    let overridden: Vec<Value> = ledger(&h)
+        .into_iter()
+        .filter(|l| l["kind"] == "check_overridden")
+        .collect();
+    assert_eq!(overridden.len(), 2, "{:?}", overridden);
+    assert_eq!(overridden[0]["rule_id"], "a");
+    assert_eq!(overridden[0]["override_kind"], "candidate_false_fail");
+    assert_eq!(overridden[1]["rule_id"], "b");
+    assert_eq!(overridden[1]["override_kind"], "overridden_unanswered");
+    let c = checks(&h);
+    assert_eq!(overridden[0]["visit_seq"], c[0]["visit_seq"]);
+    assert_eq!(overridden[0]["declaration_hash"], c[0]["declaration_hash"]);
+
+    // The override holds for the visit: nothing is extracted or asked.
+    let before = extractions(&h);
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+    assert_eq!(extractions(&h), before);
+    assert_eq!(h.stub.request_count(), 2);
+}
+
+#[test]
+fn the_report_tallies_each_criterion() {
+    let h = harness(&check_template(&criteria(&["a", "b"], "veto")), SLICE);
+    h.stub.push(fail("a"));
+    h.stub.push(escape("b"));
+    run(&h, "auto");
+    let out = h
+        .koto()
+        .args([
+            "overrides",
+            "record",
+            WF,
+            "--gate",
+            "comments",
+            "--rationale",
+            "fine",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+    let path = h.home().join(".koto").join("_decider_ledger.jsonl");
+    let out = h
+        .koto()
+        .args(["decider", "report", "--json", "--ledger"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+    let report = json_out(&out);
+    let checks = report["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 2, "{}", report);
+    let a = checks.iter().find(|c| c["rule_id"] == "a").unwrap();
+    assert_eq!(a["fail"], 1);
+    assert_eq!(a["consultations"], 1);
+    assert_eq!(a["candidate_false_fail"], 1);
+    let b = checks.iter().find(|c| c["rule_id"] == "b").unwrap();
+    assert_eq!(b["escape"], 1);
+    assert_eq!(b["candidate_false_fail"], 0);
+
+    let table = h
+        .koto()
+        .args(["decider", "report", "--ledger"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&table.stdout);
+    assert!(
+        text.contains("check review.comments criterion a"),
+        "{}",
+        text
+    );
+    assert!(text.contains("1 candidate false fails"), "{}", text);
+}

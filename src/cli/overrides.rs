@@ -349,6 +349,26 @@ pub fn handle_overrides_record(
         );
     }
 
+    // 7. An override of a blocking decider check is recorded in the decider
+    //    ledger against each criterion it moved past: a candidate false fail
+    //    for a failed one, an overridden unanswered consultation for an
+    //    unanswered one (DESIGN-koto-decider-checks.md, Decision 5). A
+    //    ledger that can't be written warns and changes nothing else.
+    if gate_def.gate_type == crate::template::types::GATE_TYPE_DECIDER_CHECK {
+        let session_id = Some(header.session_id.as_str()).filter(|s| !s.is_empty());
+        let ledger_root = dirs::home_dir().map(|h| h.join(".koto"));
+        for record in crate::cli::check_evaluator::override_records(
+            &events,
+            &current_state,
+            &gate,
+            &actual_output,
+            &name,
+            session_id,
+        ) {
+            crate::decider::ledger::append_or_warn(ledger_root.as_deref(), &record);
+        }
+    }
+
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({

@@ -523,8 +523,9 @@ can't be judged.
 | `input_sha256` | string | no | SHA-256 of the labelled slice, as the routing decider hashes inputs; present whenever the extraction produced output. |
 | `input_bytes` | integer | no | Byte length of the redacted slice; present with `input_sha256`. |
 | `attempts` | integer | yes | Provider attempts made: 0, 1 or 2. |
-| `input_tokens` | integer | no | Input tokens the provider reported, summed over the attempts whose answer koto could read (a failed attempt's body is discarded unread, so it reports none). Jev reports them under `usage`; absent when no attempt reported usage. |
+| `input_tokens` | integer | no | Input tokens the provider reported, summed over every attempt that got a 2xx answer, including one koto couldn't use (it was billed). From Jev's `usage` block, which holds counts only; the rest of an unusable answer is never read. A non-2xx status or a transport failure adds nothing. Absent when no attempt reported usage. |
 | `output_tokens` | integer | no | Output tokens, likewise. Jev reports no cache fields; a provider that does can add them later as optional fields. |
+| `unread_usage_attempts` | integer | yes | Attempts that got a 2xx answer whose usage couldn't be read (a body that isn't JSON, or no usable `usage` block), so a remaining undercount is visible rather than guessed. Absent on records written before it existed; read as 0. |
 | `latency_ms` | integer | yes | Total wall time of the attempts. |
 | `error_class` | string | no | The last attempt's error class, when it failed. |
 | `endpoint_origin` | string | no | Which configuration layer supplied the endpoint: one of the labels `default`, `user` or `env`, as the routing decider records it. Never a URL, host, query string or credential. |
@@ -549,7 +550,8 @@ must be that registry's id for the rule. A consumer keys decider rates by
 | `decider_checked` | `rule_id`, `rule_ref`, `declaration_hash`, `mode` | strings | always | The criterion, its reference, its declaration, and its effective mode. |
 | `decider_checked` | `outcome`, `reason`, `blocked` | string, string, boolean | `reason` with `unanswered` | What the consultation produced and whether it blocked. |
 | `decider_checked` | `probabilities` | object of numbers | when an answer was read | P(pass), P(fail), P(unclear), four places. |
-| `decider_checked` | `input_tokens`, `output_tokens` | integers | when the provider reported usage | The consultation's spend. |
+| `decider_checked` | `input_tokens`, `output_tokens` | integers | when the provider reported usage | The consultation's spend, over every billed (2xx) attempt. |
+| `decider_checked` | `unread_usage_attempts` | integer | always | Billed attempts whose usage couldn't be read: the size of any undercount. |
 | `decider_checked` | `attempts`, `latency_ms`, `error_class` | integer, integer, string | `error_class` when the last attempt failed | The consultation's cost and failure class. |
 | `decider_checked` | `state`, `visit_seq`, `gate`, `input_sha256`, `input_bytes` | string, integer, string, string, integer | hash and bytes when the extraction produced output | Where it ran and what it judged, by hash. |
 | `gate_evaluated` (decider check) | `outcome` | `passed`, `failed`, `error` | always | `failed` is a violation; `error` is a checker fault; shadow is always `passed`. |
