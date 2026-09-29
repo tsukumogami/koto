@@ -263,7 +263,7 @@ pub fn bindings_from_events(events: &[Event]) -> HashMap<String, String> {
             EventPayload::VariableCaptured { key, value } => {
                 vars.insert(key.clone(), value.clone());
             }
-            EventPayload::VariablesRebound { variables } => {
+            EventPayload::VariablesRebound { variables, .. } => {
                 vars.extend(variables.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
             _ => {}
@@ -1111,6 +1111,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            previous: Default::default(),
         }
     }
 

@@ -786,6 +786,7 @@ fn init_child_core(
         condition_type: "auto".to_string(),
         skip_if_matched: None,
         context_assignments: None,
+        vars_matched: None,
     };
     let initial_events = vec![
         Event {
@@ -975,6 +976,7 @@ pub fn init_inline_into_session(
         condition_type: "auto".to_string(),
         skip_if_matched: None,
         context_assignments: None,
+        vars_matched: None,
     };
     let initial_events = vec![
         Event {

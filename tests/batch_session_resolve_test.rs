@@ -462,6 +462,7 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
             condition_type: "direct".to_string(),
             skip_if_matched: None,
             context_assignments: None,
+            vars_matched: None,
         },
         idempotency_hash: None,
     };

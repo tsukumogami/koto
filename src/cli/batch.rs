@@ -6645,6 +6645,7 @@ mod tests {
                 condition_type: "gate".to_string(),
                 skip_if_matched: None,
                 context_assignments: None,
+                vars_matched: None,
             },
             idempotency_hash: None,
         }];
@@ -6664,6 +6665,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
                 idempotency_hash: None,
             },
@@ -6688,6 +6690,7 @@ mod tests {
                     condition_type: "gate".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
                 idempotency_hash: None,
             },

@@ -806,9 +806,41 @@ pub fn is_present_matcher(value: &serde_json::Value) -> bool {
     value.as_str() == Some(PRESENT_MATCHER_VALUE)
 }
 
-/// Namespace prefix for template variable existence checks in `when` clauses.
-/// Keys like `vars.MY_VAR` reference declared template variables.
+/// Namespace for template variable conditions in `when` clauses and
+/// `skip_if` maps. Keys like `vars.MY_VAR` reference declared template
+/// variables.
 pub const VARS_NAMESPACE: &str = "vars";
+
+/// [`VARS_NAMESPACE`] with its separator: the prefix of every `vars.*` key.
+pub const VARS_PREFIX: &str = "vars.";
+
+/// Whether two `when` values for the same key can never both hold.
+///
+/// Plain JSON inequality everywhere except `vars.*`, where a value and
+/// `{is_set: true}` both hold for any non-empty value: two different strings
+/// are disjoint, a string and `{is_set: false}` are disjoint (an empty
+/// variable matches no string), and a string and `{is_set: true}` are not.
+pub(crate) fn values_disjoint(field: &str, a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    if field.starts_with(VARS_PREFIX) {
+        match (
+            vars_value_matcher(a),
+            vars_value_matcher(b),
+            is_is_set_matcher(a),
+            is_is_set_matcher(b),
+        ) {
+            (Some(_), None, _, Some(set)) | (None, Some(_), Some(set), _) => return !set,
+            _ => {}
+        }
+    }
+    a != b
+}
+
+/// Check if a `vars.*` condition value is a value matcher: a JSON string the
+/// variable's value must equal exactly. Returns the string, or `None` for
+/// any other shape (including `{is_set: bool}`).
+pub fn vars_value_matcher(value: &serde_json::Value) -> Option<&str> {
+    value.as_str()
+}
 
 /// Check if a `when` value is an `{is_set: bool}` matcher.
 ///
@@ -1563,6 +1595,19 @@ impl CompiledTemplate {
                          remedy: add a transition target, or remove skip_if",
                         state_name
                     ));
+                }
+
+                // A vars.* value condition in skip_if means what it means in
+                // a `when` clause, so it passes the same checks. An
+                // `{is_set: ...}` entry keeps its old, unchecked treatment
+                // here: templates that test an undeclared name that way have
+                // always compiled, and value routing doesn't change them.
+                for (field, value) in skip_conditions {
+                    if field.starts_with(VARS_PREFIX) && is_is_set_matcher(value).is_none() {
+                        self.validate_vars_condition(
+                            state_name, "skip_if", "skip_if", field, value, &captures,
+                        )?;
+                    }
                 }
 
                 // E-SKIP-AMBIGUOUS: when all transitions are conditional, simulate skip_if values
@@ -2963,6 +3008,94 @@ impl CompiledTemplate {
         Ok(())
     }
 
+    /// Validate one `vars.<name>` condition, in a `when` clause or a
+    /// `skip_if` map.
+    ///
+    /// `{is_set: bool}` keeps its rule (Issue #141): the name must be a
+    /// declared variable or a capture. A string is a value condition and
+    /// must name a declared variable (`E-VAR-ROUTE-UNDECLARED`), not a
+    /// capture (`E-VAR-ROUTE-CAPTURE`: a later state can overwrite one), and
+    /// be a value `koto init` could store for it (`E-VAR-ROUTE-VALUE`):
+    /// non-empty, inside the allowlist, and accepted by its `values:` or
+    /// `pattern:`. Any other value is `E-VAR-ROUTE-VALUE` too.
+    fn validate_vars_condition(
+        &self,
+        state_name: &str,
+        site: &str,
+        location: &str,
+        field: &str,
+        value: &serde_json::Value,
+        captures: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let var_name = match field.strip_prefix(VARS_PREFIX) {
+            Some(name) if !name.is_empty() && !name.contains('.') => name,
+            _ => {
+                return Err(format!(
+                    "state {:?}: {} key {:?} has invalid format; expected \"vars.<VARIABLE_NAME>\"",
+                    state_name, location, field
+                ));
+            }
+        };
+        if is_is_set_matcher(value).is_some() {
+            // The variable must be declared: either in the variables
+            // block, or as some state's capture name. A capture is only
+            // ever set once its state has run, so `vars.NAME is_set` is
+            // exactly the question "did the command that produces NAME
+            // already run" -- which is why the capture namespace belongs
+            // in this check.
+            if !self.variables.contains_key(var_name) && !captures.contains_key(var_name) {
+                return Err(format!(
+                    "state {:?} {}: {} references undeclared variable {:?}; \
+                     add it to the template's variables block",
+                    state_name, site, location, var_name
+                ));
+            }
+            return Ok(());
+        }
+        let Some(wanted) = vars_value_matcher(value) else {
+            return Err(format!(
+                "E-VAR-ROUTE-VALUE: state {:?} {}: {} value for {:?} must be a string or \
+                 {{\"is_set\": true|false}}, not {}\n  \
+                 remedy: quote the value (\"true\", \"3\"), or use {{\"is_set\": ...}}",
+                state_name, site, location, field, value
+            ));
+        };
+        let Some(decl) = self.variables.get(var_name) else {
+            if captures.contains_key(var_name) {
+                return Err(format!(
+                    "E-VAR-ROUTE-CAPTURE: state {:?} {}: {} routes on the value of {:?}, \
+                     a capture; a later state can overwrite a capture, so a route can't read its value\n  \
+                     remedy: declare the value as a variable, or test the capture with {{\"is_set\": true}}",
+                    state_name, site, location, var_name
+                ));
+            }
+            return Err(format!(
+                "E-VAR-ROUTE-UNDECLARED: state {:?} {}: {} routes on undeclared variable {:?}\n  \
+                 remedy: declare {:?} in the template's variables block, or correct the name",
+                state_name, site, location, var_name, var_name
+            ));
+        };
+        if wanted.is_empty() {
+            return Err(format!(
+                "E-VAR-ROUTE-VALUE: state {:?} {}: {} value for {:?} is empty; \
+                 an empty variable counts as not set and matches no value\n  \
+                 remedy: test emptiness with {{\"is_set\": false}}",
+                state_name, site, location, field
+            ));
+        }
+        if let Err(crate::engine::variables::VarError::Invalid { constraint, .. }) =
+            crate::engine::variables::check_value(var_name, decl, wanted)
+        {
+            return Err(format!(
+                "E-VAR-ROUTE-VALUE: state {:?} {}: {} routes on {:?} = {:?}, which koto init \
+                 would refuse ({}); the route could never fire\n  \
+                 remedy: use a value the variable accepts, or widen its constraint",
+                state_name, site, location, var_name, wanted, constraint
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate evidence routing rules for a single state.
     fn validate_evidence_routing(
         &self,
@@ -3051,38 +3184,18 @@ impl CompiledTemplate {
                 }
             }
 
-            // Issue #141: validate vars.<name> entries use the {is_set: bool} matcher.
-            // The vars.* namespace only supports existence checking, not equality.
+            // Issue #141 and value routing: every vars.<name> entry is either
+            // the {is_set: bool} matcher or a value the variable can hold.
+            let site = format!("transition to {:?}", transition.target);
             for (field, value) in &vars_fields {
-                let segments: Vec<&str> = field.splitn(3, '.').collect();
-                if segments.len() != 2 || segments[1].is_empty() {
-                    return Err(format!(
-                        "state {:?}: when clause key {:?} has invalid format; expected \"vars.<VARIABLE_NAME>\"",
-                        state_name, field.as_str()
-                    ));
-                }
-                let var_name = segments[1];
-                // The variable must be declared: either in the variables
-                // block, or as some state's capture name. A capture is only
-                // ever set once its state has run, so `vars.NAME is_set` is
-                // exactly the question "did the command that produces NAME
-                // already run" -- which is why the capture namespace belongs
-                // in this check.
-                if !self.variables.contains_key(var_name) && !captures.contains_key(var_name) {
-                    return Err(format!(
-                        "state {:?} transition to {:?}: when clause references undeclared variable {:?}; \
-                         add it to the template's variables block",
-                        state_name, transition.target, var_name
-                    ));
-                }
-                if is_is_set_matcher(value).is_none() {
-                    return Err(format!(
-                        "state {:?} transition to {:?}: when value for vars key {:?} must be \
-                         {{\"is_set\": true}} or {{\"is_set\": false}}; \
-                         the vars.* namespace only supports existence matching",
-                        state_name, transition.target, field
-                    ));
-                }
+                self.validate_vars_condition(
+                    state_name,
+                    &site,
+                    "when clause",
+                    field,
+                    value,
+                    captures,
+                )?;
             }
 
             // Rule 6 applied to gates.* fields: values must be JSON scalars.
@@ -3216,14 +3329,38 @@ impl CompiledTemplate {
 
                     let mut has_shared_field = false;
                     let mut has_disjoint_value = false;
+                    // A shared vars.* key where one side names a value: the
+                    // pair overlaps on a variable's value, so a refusal of it
+                    // carries E-VAR-ROUTE-OVERLAP.
+                    let mut shared_value_var: Option<&str> = None;
 
                     for (field, val_a) in when_a {
                         if let Some(val_b) = when_b.get(field) {
                             has_shared_field = true;
-                            if val_a != val_b {
+                            if field.starts_with(VARS_PREFIX)
+                                && (vars_value_matcher(val_a).is_some()
+                                    || vars_value_matcher(val_b).is_some())
+                            {
+                                shared_value_var = shared_value_var.or(Some(field.as_str()));
+                            }
+                            if values_disjoint(field, val_a, val_b) {
                                 has_disjoint_value = true;
                                 break;
                             }
+                        }
+                    }
+
+                    if has_shared_field && !has_disjoint_value {
+                        if let Some(var_key) = shared_value_var {
+                            return Err(format!(
+                                "E-VAR-ROUTE-OVERLAP: state {:?}: transitions to {:?} and {:?} can both match \
+                                 one value of {:?}\n  \
+                                 remedy: give the two routes different values, or add a key that tells them apart",
+                                state_name,
+                                conditional[i].target,
+                                conditional[j].target,
+                                var_key
+                            ));
                         }
                     }
 
@@ -7117,7 +7254,9 @@ command: "./check.sh"
     }
 
     #[test]
-    fn vars_equality_value_is_rejected() {
+    fn vars_value_condition_on_declared_variable_validates() {
+        // A string on a vars.* key is a value condition; FOO declares no
+        // constraint, so any allowlisted, non-empty value is accepted.
         let mut t = template_with_var("FOO");
         let state = t.states.get_mut("start").unwrap();
         let mut when = BTreeMap::new();
@@ -7127,12 +7266,40 @@ command: "./check.sh"
             when: Some(when),
             context_assignments: Default::default(),
         }];
+        assert!(t.validate(true).is_ok());
+    }
+
+    #[test]
+    fn vars_non_string_value_is_rejected() {
+        let mut t = template_with_var("FOO");
+        let state = t.states.get_mut("start").unwrap();
+        let mut when = BTreeMap::new();
+        when.insert("vars.FOO".to_string(), serde_json::json!(true));
+        state.transitions = vec![Transition {
+            target: "done".to_string(),
+            when: Some(when),
+            context_assignments: Default::default(),
+        }];
         let err = t.validate(true).unwrap_err();
-        assert!(
-            err.contains("only supports existence matching"),
-            "got: {}",
-            err
-        );
+        assert!(err.starts_with("E-VAR-ROUTE-VALUE:"), "got: {}", err);
+    }
+
+    #[test]
+    fn values_disjoint_knows_a_value_implies_set() {
+        let key = "vars.MODE";
+        let auto = serde_json::json!("auto");
+        let interactive = serde_json::json!("interactive");
+        let set = serde_json::json!({"is_set": true});
+        let unset = serde_json::json!({"is_set": false});
+        assert!(values_disjoint(key, &auto, &interactive));
+        assert!(!values_disjoint(key, &auto, &auto));
+        assert!(!values_disjoint(key, &auto, &set));
+        assert!(!values_disjoint(key, &set, &auto));
+        assert!(values_disjoint(key, &auto, &unset));
+        assert!(values_disjoint(key, &unset, &auto));
+        assert!(values_disjoint(key, &set, &unset));
+        // Outside vars.*, plain inequality.
+        assert!(values_disjoint("verdict", &auto, &set));
     }
 
     #[test]

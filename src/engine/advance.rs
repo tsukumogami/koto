@@ -20,8 +20,9 @@ use crate::findings::{
 use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::session::context_log::{append_best_effort, READER_GATE};
 use crate::template::types::{
-    is_is_set_matcher, is_present_matcher, ActionDecl, CompiledTemplate, TemplateState,
-    ACTION_CONDITION_NAME, EVIDENCE_NAMESPACE, GATES_EVIDENCE_NAMESPACE, VARS_NAMESPACE,
+    is_is_set_matcher, is_present_matcher, vars_value_matcher, ActionDecl, CompiledTemplate,
+    TemplateState, ACTION_CONDITION_NAME, EVIDENCE_NAMESPACE, GATES_EVIDENCE_NAMESPACE,
+    VARS_PREFIX,
 };
 
 /// Maximum number of transitions per invocation. Defense-in-depth against
@@ -1809,6 +1810,11 @@ where
                             condition_type: "skip_if".to_string(),
                             skip_if_matched: Some(skip_conditions.clone()),
                             context_assignments,
+                            vars_matched: vars_matched_for(
+                                template_state,
+                                edge,
+                                Some(skip_conditions),
+                            ),
                         };
                         append_event(&payload).map_err(AdvanceError::PersistenceError)?;
                         visited.insert(target.clone());
@@ -1851,6 +1857,7 @@ where
                     &mut state,
                     target,
                     context_assignments,
+                    vars_matched_for(template_state, edge, None),
                     &mut visited,
                     &mut advanced,
                     &mut transition_count,
@@ -1896,6 +1903,7 @@ where
                                 &mut state,
                                 target,
                                 context_assignments,
+                                vars_matched_for(template_state, Some(edge), None),
                                 &mut visited,
                                 &mut advanced,
                                 &mut transition_count,
@@ -1965,6 +1973,7 @@ fn take_transition<F>(
     state: &mut String,
     target: String,
     context_assignments: Option<BTreeMap<String, String>>,
+    vars_matched: Option<BTreeMap<String, String>>,
     visited: &mut HashSet<String>,
     advanced: &mut bool,
     transition_count: &mut usize,
@@ -1990,6 +1999,7 @@ where
         condition_type: "auto".to_string(),
         skip_if_matched: None,
         context_assignments,
+        vars_matched,
     };
     append_event(&payload).map_err(AdvanceError::PersistenceError)?;
 
@@ -2054,17 +2064,9 @@ fn conditions_satisfied(
     merged_evidence: &serde_json::Value,
     variables: &std::collections::HashMap<String, String>,
 ) -> bool {
-    let vars_prefix = format!("{}.", VARS_NAMESPACE);
     conditions.iter().all(|(key, expected)| {
-        if key.starts_with(&vars_prefix) {
-            if let Some(expected_set) = is_is_set_matcher(expected) {
-                let var_name = &key[vars_prefix.len()..];
-                let is_set = variables
-                    .get(var_name)
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false);
-                return is_set == expected_set;
-            }
+        if let Some(var_name) = key.strip_prefix(VARS_PREFIX) {
+            return vars_condition_holds(var_name, expected, variables);
         }
         resolve_value(merged_evidence, key) == Some(expected)
     })
@@ -2425,21 +2427,79 @@ fn condition_holds(
                 .as_object()
                 .is_some_and(|obj| obj.contains_key(inner));
     }
-    // Issue #141: `vars.<name>: {is_set: bool}` checks whether
-    // a template variable was provided at init time with a
-    // non-empty value.
-    let vars_prefix = format!("{}.", VARS_NAMESPACE);
-    if field.starts_with(&vars_prefix) {
-        if let Some(expected_set) = is_is_set_matcher(expected) {
-            let var_name = &field[vars_prefix.len()..];
-            let is_set = variables
-                .get(var_name)
-                .map(|v| !v.is_empty())
-                .unwrap_or(false);
-            return is_set == expected_set;
-        }
+    if let Some(var_name) = field.strip_prefix(VARS_PREFIX) {
+        return vars_condition_holds(var_name, expected, variables);
     }
     resolve_value(evidence, field) == Some(expected)
+}
+
+/// Whether a `vars.<name>` condition holds against the variable map.
+///
+/// The one definition both evaluators share: `condition_holds` (transition
+/// resolution) and [`conditions_satisfied`] (`skip_if`).
+///
+/// - `{is_set: bool}` (Issue #141) holds when "the variable has a non-empty
+///   value" equals the bool.
+/// - a string holds when the variable's value is exactly that string. An
+///   empty or missing variable matches no string.
+/// - anything else holds never. A `vars.*` key never reads submitted
+///   evidence, so a payload shaped like `{"vars": {...}}` can't satisfy it.
+fn vars_condition_holds(
+    var_name: &str,
+    expected: &serde_json::Value,
+    variables: &std::collections::HashMap<String, String>,
+) -> bool {
+    if let Some(expected_set) = is_is_set_matcher(expected) {
+        let is_set = variables
+            .get(var_name)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        return is_set == expected_set;
+    }
+    match vars_value_matcher(expected) {
+        Some(want) => variables
+            .get(var_name)
+            .is_some_and(|have| !have.is_empty() && have == want),
+        None => false,
+    }
+}
+
+/// The value conditions (`vars.NAME: <string>`) in `conditions`, as the
+/// `vars_matched` map a `transitioned` event records: each variable name
+/// mapped to the value the condition names. `is_set` conditions are left out.
+fn value_conditions(
+    conditions: Option<&BTreeMap<String, serde_json::Value>>,
+    into: &mut BTreeMap<String, String>,
+) {
+    for (field, expected) in conditions.into_iter().flatten() {
+        if let (Some(name), Some(value)) = (
+            field.strip_prefix(VARS_PREFIX),
+            vars_value_matcher(expected),
+        ) {
+            into.insert(name.to_string(), value.to_string());
+        }
+    }
+}
+
+/// The `vars_matched` record for the edge a transition took, plus the
+/// `skip_if` map when a `skip_if` fired it. `None` when neither holds a
+/// value condition, so the field stays off every other transition.
+fn vars_matched_for(
+    template_state: &TemplateState,
+    edge: Option<usize>,
+    skip_conditions: Option<&BTreeMap<String, serde_json::Value>>,
+) -> Option<BTreeMap<String, String>> {
+    let mut matched = BTreeMap::new();
+    let when = edge
+        .and_then(|index| template_state.transitions.get(index))
+        .and_then(|t| t.when.as_ref());
+    value_conditions(when, &mut matched);
+    value_conditions(skip_conditions, &mut matched);
+    if matched.is_empty() {
+        None
+    } else {
+        Some(matched)
+    }
 }
 
 /// Merge evidence from the current epoch's `evidence_submitted` events.
@@ -3133,6 +3193,7 @@ mod tests {
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
                 context_assignments: None,
+                vars_matched: None,
             },
             idempotency_hash: None,
         }];
@@ -5642,6 +5703,7 @@ mod tests {
                     condition_type: "auto".to_string(),
                     skip_if_matched: None,
                     context_assignments: None,
+                    vars_matched: None,
                 },
             ),
             make_event(
@@ -6310,6 +6372,7 @@ mod tests {
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
                 context_assignments: None,
+                vars_matched: None,
             },
         )];
 
@@ -6553,6 +6616,7 @@ mod tests {
                 condition_type: "auto".to_string(),
                 skip_if_matched: None,
                 context_assignments: None,
+                vars_matched: None,
             },
         )];
 
@@ -6808,6 +6872,225 @@ mod tests {
     // -----------------------------------------------------------------------
     // conditions_satisfied tests (skip_if runtime evaluator)
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Value routing: `vars.NAME: <string>` conditions
+    // (DESIGN-koto-value-routing.md)
+    // -----------------------------------------------------------------------
+
+    fn vars_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn mode_routes() -> TemplateState {
+        make_state(vec![
+            conditional("fast", vec![("vars.MODE", serde_json::json!("auto"))]),
+            conditional(
+                "slow",
+                vec![("vars.MODE", serde_json::json!("interactive"))],
+            ),
+        ])
+    }
+
+    #[test]
+    fn value_route_resolves_on_entry_without_evidence() {
+        let state = mode_routes();
+        let none = serde_json::json!({});
+        assert_eq!(
+            resolve_transition(&state, &none, false, false, &vars_of(&[("MODE", "auto")])),
+            TransitionResolution::Resolved("fast".to_string())
+        );
+        assert_eq!(
+            resolve_transition(
+                &state,
+                &none,
+                false,
+                false,
+                &vars_of(&[("MODE", "interactive")])
+            ),
+            TransitionResolution::Resolved("slow".to_string())
+        );
+    }
+
+    #[test]
+    fn value_match_is_exact() {
+        let routes = |value: &str| {
+            make_state(vec![conditional(
+                "hit",
+                vec![("vars.V", serde_json::json!(value))],
+            )])
+        };
+        let none = serde_json::json!({});
+        let hits = |value: &str, have: &str| {
+            resolve_transition(
+                &routes(value),
+                &none,
+                false,
+                false,
+                &vars_of(&[("V", have)]),
+            ) == TransitionResolution::Resolved("hit".to_string())
+        };
+        assert!(!hits("Auto", "auto"), "case-sensitive");
+        assert!(!hits("a", "ab"), "no prefix match");
+        assert!(!hits("a", " a"), "no trimming");
+        assert!(!hits("a", "a "), "no trimming");
+        for ch in [" ", ".", "_", "/", ":", "@", "+", "-", "7"] {
+            let value = format!("x{}y", ch);
+            assert!(hits(&value, &value), "{:?} matches itself", value);
+            assert!(!hits(&value, "xy"), "{:?} matches only itself", value);
+        }
+    }
+
+    #[test]
+    fn empty_variable_matches_no_value_but_is_set_false() {
+        let state = make_state(vec![
+            conditional("valued", vec![("vars.MODE", serde_json::json!("auto"))]),
+            conditional(
+                "unset",
+                vec![("vars.MODE", serde_json::json!({"is_set": false}))],
+            ),
+        ]);
+        let none = serde_json::json!({});
+        for vars in [vars_of(&[("MODE", "")]), HashMap::new()] {
+            assert_eq!(
+                resolve_transition(&state, &none, false, false, &vars),
+                TransitionResolution::Resolved("unset".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn value_condition_ands_with_evidence() {
+        let mut state = make_state(vec![conditional(
+            "go",
+            vec![
+                ("vars.MODE", serde_json::json!("auto")),
+                ("verdict", serde_json::json!("approve")),
+            ],
+        )]);
+        state.accepts = make_accepts(vec!["verdict"]);
+        let vars = vars_of(&[("MODE", "auto")]);
+        let approve = serde_json::json!({"verdict": "approve"});
+        let reject = serde_json::json!({"verdict": "reject"});
+        assert_eq!(
+            resolve_transition(&state, &approve, false, true, &vars),
+            TransitionResolution::Resolved("go".to_string())
+        );
+        assert_eq!(
+            resolve_transition(&state, &reject, false, true, &vars),
+            TransitionResolution::NeedsEvidence
+        );
+        assert_eq!(
+            resolve_transition(
+                &state,
+                &approve,
+                false,
+                true,
+                &vars_of(&[("MODE", "interactive")])
+            ),
+            TransitionResolution::NeedsEvidence
+        );
+    }
+
+    #[test]
+    fn unmatched_value_routes_ask_for_evidence_or_take_the_fallback() {
+        let none = serde_json::json!({});
+        let vars = vars_of(&[("MODE", "interactive")]);
+        let only_auto = make_state(vec![conditional(
+            "fast",
+            vec![("vars.MODE", serde_json::json!("auto"))],
+        )]);
+        assert_eq!(
+            resolve_transition(&only_auto, &none, false, false, &vars),
+            TransitionResolution::NeedsEvidence
+        );
+        let with_fallback = make_state(vec![
+            conditional("fast", vec![("vars.MODE", serde_json::json!("auto"))]),
+            unconditional("slow"),
+        ]);
+        // Entered by auto-advance: the directive still gets its turn.
+        assert_eq!(
+            resolve_transition(&with_fallback, &none, false, false, &vars),
+            TransitionResolution::NeedsEvidence
+        );
+        // Entered with fresh evidence: the fallback fires.
+        let submitted = serde_json::json!({"note": "x"});
+        assert_eq!(
+            resolve_transition(&with_fallback, &submitted, false, true, &vars),
+            TransitionResolution::Resolved("slow".to_string())
+        );
+    }
+
+    #[test]
+    fn a_vars_condition_never_reads_submitted_evidence() {
+        let state = mode_routes();
+        let forged = serde_json::json!({"vars": {"MODE": "auto"}});
+        assert_eq!(
+            resolve_transition(&state, &forged, false, true, &HashMap::new()),
+            TransitionResolution::NeedsEvidence
+        );
+        let mut conditions = BTreeMap::new();
+        conditions.insert("vars.MODE".to_string(), serde_json::json!("auto"));
+        assert!(!conditions_satisfied(&conditions, &forged, &HashMap::new()));
+    }
+
+    #[test]
+    fn skip_if_value_condition_matches_by_value() {
+        let mut conditions = BTreeMap::new();
+        conditions.insert("vars.MODE".to_string(), serde_json::json!("auto"));
+        let none = serde_json::json!({});
+        assert!(conditions_satisfied(
+            &conditions,
+            &none,
+            &vars_of(&[("MODE", "auto")])
+        ));
+        assert!(!conditions_satisfied(
+            &conditions,
+            &none,
+            &vars_of(&[("MODE", "interactive")])
+        ));
+        assert!(!conditions_satisfied(&conditions, &none, &HashMap::new()));
+    }
+
+    #[test]
+    fn vars_matched_records_value_conditions_only() {
+        let state = make_state(vec![
+            conditional(
+                "both",
+                vec![
+                    ("vars.MODE", serde_json::json!("auto")),
+                    ("vars.ARM", serde_json::json!("with-rule")),
+                    ("vars.OPT", serde_json::json!({"is_set": true})),
+                    ("verdict", serde_json::json!("approve")),
+                ],
+            ),
+            conditional(
+                "presence",
+                vec![("vars.OPT", serde_json::json!({"is_set": false}))],
+            ),
+            unconditional("fallback"),
+        ]);
+        let matched = vars_matched_for(&state, Some(0), None).unwrap();
+        assert_eq!(matched.len(), 2);
+        assert_eq!(matched["MODE"], "auto");
+        assert_eq!(matched["ARM"], "with-rule");
+        assert_eq!(vars_matched_for(&state, Some(1), None), None);
+        assert_eq!(vars_matched_for(&state, Some(2), None), None);
+        assert_eq!(vars_matched_for(&state, None, None), None);
+        // A skip_if value condition is recorded even when the edge has none.
+        let mut skip = BTreeMap::new();
+        skip.insert(
+            "vars.ISSUE_SOURCE".to_string(),
+            serde_json::json!("plan_outline"),
+        );
+        skip.insert("mode".to_string(), serde_json::json!("plan_backed"));
+        let from_skip = vars_matched_for(&state, Some(2), Some(&skip)).unwrap();
+        assert_eq!(from_skip.len(), 1);
+        assert_eq!(from_skip["ISSUE_SOURCE"], "plan_outline");
+    }
 
     #[test]
     fn skip_if_conditions_satisfied_vars_set() {
