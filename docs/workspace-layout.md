@@ -207,10 +207,11 @@ Each line is a JSON object tagged by `kind`:
   `consulted`, drops its probabilities (marked `trimmed`) to fit the
   line cap.
 - `check_overridden`: written by `koto overrides record` for each
-  criterion an override of a blocking decider check moved past. It
+  failed criterion an override of a blocking decider check moved past. It
   carries the state, `visit_seq`, the gate, `rule_id`,
-  `declaration_hash`, and `override_kind` (`candidate_false_fail` or
-  `overridden_unanswered`).
+  `declaration_hash`, and `override_kind` (`candidate_false_fail`; lines
+  from older builds may also say `overridden_unanswered`, for an
+  unanswered criterion, which no longer blocks).
 
 Every kind also carries `v` (always 1), `at` (RFC 3339 UTC), `session`
 (the session name), and `session_id` (the session header's UUID, or
