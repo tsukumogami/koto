@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   koto templates hold each variable's value for the whole session, but a
   transition's `when` clause can only ask whether `vars.NAME` is set. A
@@ -21,7 +21,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 The completeness, clarity and testability reviewers all passed it, the
 first two on a second round. The downstream DESIGN owns the approach.
