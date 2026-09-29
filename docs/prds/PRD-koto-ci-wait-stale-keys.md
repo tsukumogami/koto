@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: Done
 problem: |
   Two protocol steps that koto-backed workflows rely on are the agent's job,
   carried in directive prose: waiting on a check that settles later than the
@@ -26,7 +26,7 @@ absorbed:
 
 ## Status
 
-Accepted
+Done
 
 Absorbed [BRIEF-koto-ci-wait-stale-keys](docs/briefs/BRIEF-koto-ci-wait-stale-keys.md); carried in Absorbed Brief.
 
