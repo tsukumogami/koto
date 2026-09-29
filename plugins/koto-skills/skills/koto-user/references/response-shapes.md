@@ -118,8 +118,9 @@ are blocking.
   absent, there is only a fallback transition and all evidence values lead to the same
   next state.
 - A `when` key starting with `vars.` (for example `"vars.MODE": "auto"`) is a condition
-  on a template variable, not evidence you submit. koto reads it from the variables the
-  session was started with; don't put it in `--with-data`.
+  on a template variable, not evidence you submit. koto reads it from the session's
+  current variables (the values set at `koto init`, or re-applied by a later attach for a
+  `rebind: true` variable); don't put it in `--with-data`.
 - `details` is omitted once it's already been delivered since you last arrived at
   this phase, unless `--full` is passed.
 

@@ -753,7 +753,7 @@ Marks the birth of a session. Written once at `koto init` time.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `template_path` | string | Yes | Path to the compiled template JSON in koto's cache directory. |
-| `variables` | object | No | Variable bindings active at init time. String-to-string map holding every declared variable, with the value passed, its default, or the empty string. Absent when no variables were set. A declared variable without `rebind: true` keeps this value for the whole session. |
+| `variables` | object | No | Variable bindings active at init time. String-to-string map holding every declared variable, with the value passed, its default, or the empty string. Absent when the template declares no variables. A declared variable without `rebind: true` keeps this value for the whole session. |
 | `spawn_entry` | object | No | Present only for batch-spawned child sessions. Carries `template` (source path), `vars` (bindings), and `waits_on` (sorted dependency list). Absent for top-level sessions. |
 
 ---

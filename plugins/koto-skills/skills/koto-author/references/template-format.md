@@ -328,7 +328,7 @@ states:
           vars.MODE: interactive
 ```
 
-A state whose only transitions are value routes advances as soon as it's entered, without asking for evidence, and the agent never sees its directive. A value condition combines with the clause's other keys by AND, like any other key, so `{vars.MODE: auto, verdict: approve}` fires only when both hold.
+When one of a state's value routes matches, the state advances as soon as it's entered, without asking for evidence, and the agent never sees its directive. A value condition combines with the clause's other keys by AND, like any other key, so `{vars.MODE: auto, verdict: approve}` fires only when both hold.
 
 Matching rules:
 
@@ -1577,8 +1577,8 @@ states:
 A variable counts as "set" when its value is a non-empty string. Variables that are absent or have an empty string default are "not set".
 
 The compiler enforces:
-- `vars.*` keys must use `{is_set: true}` or `{is_set: false}` as the value. Equality matchers (e.g., `vars.FOO: "bar"`) are rejected.
-- The variable name after `vars.` must be declared in the template's `variables` block.
+- A `vars.*` key takes `{is_set: true}`, `{is_set: false}`, or a string value. A string is a value route, with its own checks: see [Routing on a variable's value](#routing-on-a-variables-value).
+- The variable name after `vars.` must be declared in the template's `variables` block (or, for `is_set`, be a capture).
 - `{is_set: true}` and `{is_set: false}` on the same field are disjoint (no mutual exclusivity conflict). Two identical `{is_set: true}` conditions on different transitions are flagged as conflicting.
 
 ### `deny_unknown_fields` narrowed to source templates

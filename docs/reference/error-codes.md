@@ -369,7 +369,7 @@ Fix: add the referenced gate name to the state's `gates` block, or correct the `
 
 #### value routing diagnostic codes
 
-A `vars.NAME: <value>` condition routes on a variable's value, in a `when` clause or a `skip_if` map. Four compile-time errors refuse a value route that could never fire or can't be told apart from another. Each fails compilation, and each message names the state, where the condition sits, the variable, and the value where one applies. An `{is_set: true|false}` condition is not a value route and keeps its own rules.
+A `vars.NAME: <value>` condition routes on a variable's value, in a `when` clause or a `skip_if` map. Four compile-time errors refuse a value route that could never fire or can't be told apart from another. Each fails compilation and names the state and the variable; the first three also name where the condition sits and the value, and the overlap error names the two transitions. An `{is_set: true|false}` condition is not a value route and keeps its own rules.
 
 **E-VAR-ROUTE-UNDECLARED (error)**: the condition names a variable the template's `variables:` block doesn't declare.
 
