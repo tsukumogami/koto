@@ -357,7 +357,10 @@ both kinds as unknown (`report.rs` counts them under `unknown_kind`). A
   criterion of the gate unanswered with `busy`, sending nothing and using no
   cap slot (R21). The wait is what stops a second, concurrent `koto next`
   from passing a veto check the first one is still grading, now that a
-  missing verdict passes: the second waits, then consults for itself.
+  missing verdict passes: the second waits, then consults for itself. The
+  60 s cap only bites above a provider timeout of about 7.4 s; there a
+  holder still grading can outlast the wait, and the waiting tick's
+  criteria go `busy` and pass.
   `busy` stays separate in the report's per-reason tally, so a pattern of
   lock-busy passes on one criterion shows.
 - **The retry.** A `DeciderError` of class `timeout`, `connect`,

@@ -55,8 +55,8 @@ pub const ESCAPE_VALUE: &str = "unclear";
 pub enum CheckMode {
     /// Consult and record, never block.
     Shadow,
-    /// Block on a fail, or on no verdict, when the user's effective mode is
-    /// `auto`.
+    /// Block on a fail when the user's effective mode is `auto`. A missing
+    /// verdict is recorded but never blocks.
     Veto,
 }
 

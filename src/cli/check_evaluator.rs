@@ -176,8 +176,9 @@ pub fn override_records(
 /// what keeps a second, concurrent `koto next` from passing a veto check
 /// the first one is still grading.
 pub fn lock_wait_for(provider_timeout: Duration) -> Duration {
-    let holder = provider_timeout * (MAX_CONSULTATIONS_PER_CALL as u32 * MAX_ATTEMPTS)
-        + Duration::from_secs(1);
+    let holder = provider_timeout
+        .saturating_mul(MAX_CONSULTATIONS_PER_CALL as u32 * MAX_ATTEMPTS)
+        .saturating_add(Duration::from_secs(1));
     holder.min(MAX_LOCK_WAIT)
 }
 
@@ -407,7 +408,12 @@ impl<'a> CliCheckEvaluator<'a> {
         };
         // Without the log there is no state or visit to record under, and
         // no verdict to reuse, so nothing is asked or recorded: every veto
-        // criterion is listed as unanswered and the check passes.
+        // criterion is listed as unanswered and the check passes. That
+        // holds whatever the slice decided (empty, over budget, a failed
+        // extraction), since none of it can be recorded either. A log that
+        // names no state is treated the same way. The lock wait above may
+        // have been spent for nothing here; an unreadable log is rare
+        // enough not to read it twice.
         let read = self.backend.read_events_local(self.session).ok();
         let Some((session_id, events, state)) = read.as_ref().and_then(|(header, events)| {
             let state = derive_state_from_log(events).filter(|s| !s.is_empty())?;
