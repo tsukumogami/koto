@@ -15,13 +15,14 @@ goals: |
   recorded way past. A pass never advances anything, users who haven't opted
   in see no change, and every consultation is recorded so a later feature can
   decide whether a pass deserves trust.
-upstream: docs/briefs/BRIEF-koto-decider-checks.md
 motivating_context: |
   shirabe's Jev accuracy spike found two prose criteria where Jev, asked in
   choice form, let no bad or adversarial text through on inputs under about
   2.5 KB: "a code comment gives a reason, not a restatement" and "an
   acceptance criterion can be answered yes or no". That earns a decider
   design for both, as a veto, while a pass still has to earn trust.
+absorbed:
+  - docs/briefs/BRIEF-koto-decider-checks.md
 ---
 
 # PRD: Grading the agent's work against closed criteria
@@ -29,6 +30,41 @@ motivating_context: |
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-koto-decider-checks](docs/briefs/BRIEF-koto-decider-checks.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+The feature was framed around prose rules a workflow tells the agent to
+follow in what it produces, a code comment that gives a reason rather than
+restating the code and an acceptance criterion that can be answered yes or
+no, which nothing checks while the workflow runs. A script can't tell a
+reason from a restatement, so the agent's own claim is the only check until
+a reviewer reads the pull request, and koto's opt-in decider can't help as
+built: it routes on context that exists before the agent acts, asks one
+question per field, and never objects. The framing also named a trust
+problem the tool must not hide: the accuracy evidence earns a fail, not a
+pass, and a garbled or absent answer must never count as approval.
+
+The outcome it set is for an opted-in user's workflow to refuse to leave a
+state while a decider judges the agent's artifact to break a named
+criterion, telling the agent which one through the finding shape failed
+checks already use, with a recorded override for a false fail, no change for
+anyone not opted in, and every verdict kept for the later work that decides
+whether a pass can be trusted.
+
+Five journeys framed it, carried as the User Stories below: a maintainer
+adding the two criteria in shadow, an agent stopped by a failed criterion,
+an agent overriding a false fail, an agent meeting a decider that gave no
+verdict, and a contributor who never opted in. The boundary it drew held in
+grading a bounded, command-extracted slice against template-fixed criteria,
+several choice-form criteria per state, a veto-only verdict with shadow as
+the default, the existing override, and a record of every consultation. It
+pushed out a pass advancing anything, criteria beyond the two, boolean and
+score questions, changes to the routing decider and its floor rule, a
+rule-id registry and check levels, a new override mechanism, shirabe changes,
+and batching the spike didn't measure; all of these are carried under Out of
+Scope.
 
 ## Problem Statement
 
