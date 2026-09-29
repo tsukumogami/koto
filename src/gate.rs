@@ -24,7 +24,8 @@ use crate::session::context::ContextStore;
 use crate::session::context_log::ContextReadRecord;
 use crate::template::types::{
     Gate, GATE_TYPE_CHILDREN_COMPLETE, GATE_TYPE_COMMAND, GATE_TYPE_CONTEXT_EXISTS,
-    GATE_TYPE_CONTEXT_MATCHES, GATE_TYPE_REQUEST_LEG, SUPPORTED_GATE_TYPES,
+    GATE_TYPE_CONTEXT_MATCHES, GATE_TYPE_DECIDER_CHECK, GATE_TYPE_REQUEST_LEG,
+    SUPPORTED_GATE_TYPES,
 };
 
 /// Outcome of a structured gate evaluation.
@@ -918,6 +919,7 @@ pub fn built_in_default(gate_type: &str) -> Option<serde_json::Value> {
         // Shared with `gate_type_builtin_default` rather than restated: a
         // resolved, valid record naming no child outcome.
         GATE_TYPE_REQUEST_LEG => Some(crate::template::types::request_leg_builtin_default()),
+        GATE_TYPE_DECIDER_CHECK => Some(crate::template::types::decider_check_default_output()),
         _ => None,
     }
 }
@@ -957,6 +959,7 @@ mod tests {
             leg: String::new(),
             expect: None,
             poll: None,
+            decider_check: None,
         }
     }
 
@@ -1468,6 +1471,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1506,6 +1510,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1542,6 +1547,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1577,6 +1583,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1620,6 +1627,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1658,6 +1666,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1693,6 +1702,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1724,6 +1734,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -1936,6 +1947,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         gates.insert(
@@ -1954,6 +1966,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         gates.insert(
@@ -1972,6 +1985,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -2023,6 +2037,7 @@ mod tests {
                 leg: leg.to_string(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             }
         }
 

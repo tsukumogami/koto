@@ -8830,6 +8830,7 @@ Done.
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let substituted =
@@ -8897,6 +8898,7 @@ Done.
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -8971,6 +8973,7 @@ Done.
             leg: "{{TOKEN}}-leg".to_string(),
             expect: None,
             poll: None,
+            decider_check: None,
         };
         for (field, raw) in authored.substitutable_fields() {
             assert!(
@@ -9135,6 +9138,7 @@ Done.
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -9215,6 +9219,7 @@ Done.
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let expected_command = {

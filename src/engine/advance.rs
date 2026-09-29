@@ -3258,6 +3258,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -3445,6 +3446,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -3547,6 +3549,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -3682,6 +3685,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -3818,6 +3822,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -3938,6 +3943,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -5169,6 +5175,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -5209,6 +5216,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -5343,6 +5351,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -5594,6 +5603,7 @@ mod tests {
             leg: String::new(),
             expect: None,
             poll: None,
+            decider_check: None,
         }
     }
 
@@ -6223,6 +6233,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -6356,6 +6367,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -6465,6 +6477,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -6600,6 +6613,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 
@@ -6694,6 +6708,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
 

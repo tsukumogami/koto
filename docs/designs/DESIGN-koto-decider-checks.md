@@ -116,9 +116,9 @@ states:
 
 A gate is the unit koto already blocks on, reports findings for, counts
 attempts for, and overrides. The gate's name is the `--gate` argument; its
-criteria are its findings. `Gate` gains three fields, `max_bytes`, `label`
-and `criteria`, all skipped when empty, so no existing template's compiled
-JSON changes. The escape value is fixed as `unclear` and the choice values
+criteria are its findings. The source keys `max_bytes`, `label` and
+`criteria` compile into one optional `Gate` field, `decider_check`, skipped
+when absent, so no existing template's compiled JSON changes. The escape value is fixed as `unclear` and the choice values
 as `pass` and `fail`, the words the spike asked with.
 
 #### Alternatives considered
@@ -246,7 +246,8 @@ measurement effort counts violations from `gate_evaluated`:
 - **`failed`** when any veto criterion failed on a verdict. The findings are
   one per failing criterion, with its `rule_id`; attempt stamps and rule
   counts follow as for any failed gate. Unanswered criteria, if any, appear
-  in `output.unanswered` only.
+  in `output.unanswered` only, and each one's `decider_checked` still records
+  outcome `unanswered` with its reason.
 - **`error`** when no criterion failed but a veto criterion went unanswered.
   Unanswered is a checker fault, so its `rule_id` never appears in a
   finding: the one finding is koto's fallback for the check, with the check's
@@ -405,14 +406,17 @@ koto next ──► handle_next
 ### Components
 
 - **`src/template/types.rs`**: `GATE_TYPE_DECIDER_CHECK = "decider-check"`,
-  added to `SUPPORTED_GATE_TYPES`; `Gate` gains `max_bytes: Option<u32>`,
-  `label: String` and `criteria: BTreeMap<String, CheckCriterion>` (each
-  skipped when empty or `None`); `CheckCriterion { rule_ref, question, pass,
-  fail, escape, threshold: Option<f64>, mode: Option<CheckMode> }` with
-  defaults resolved at compile time; `gate_type_schema("decider-check")` is
-  `failed: Array, unanswered: Array, error: Str`, and `built_in_default`
-  returns empty lists and an empty error. `validate_decider_checks` holds
-  every new compile rule. The strict-mode "gate has no `gates.*` routing"
+  added to `SUPPORTED_GATE_TYPES`; `Gate` gains one optional field,
+  `decider_check: Option<DeciderCheckSpec>`, skipped when `None`, so every
+  existing `Gate` literal changes by one line. `DeciderCheckSpec { max_bytes,
+  label, criteria: Vec<CheckCriterion> }` keeps criteria in declaration
+  order, and `CheckCriterion { rule_id, rule_ref, question, pass, fail,
+  escape, threshold, mode }` holds every default resolved at compile time
+  (both in `src/template/decider_check.rs`, with the declaration hash and the
+  per-check bounds); `gate_type_schema("decider-check")` is `failed: Array,
+  unanswered: Array, error: Str`, and `built_in_default` returns empty lists
+  and an empty error. `validate_state_decider_checks` holds the per-state
+  rules (limit, duplicates, routing). The strict-mode "gate has no `gates.*` routing"
   check skips decider checks, which must not route.
 - **`src/template/compile.rs`**: `SourceGate` gains `max_bytes`, `label` and
   `criteria` (kept raw so errors can name state, gate and criterion);

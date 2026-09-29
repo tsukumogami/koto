@@ -12,8 +12,8 @@ use super::types::{
     default_failure_policy, ActionDecl, CompiledTemplate, FailurePolicy, FieldSchema, Gate,
     MaterializeChildrenSpec, PollSpec, PollingConfig, TemplateState, Transition, VariableDecl,
     DEFAULT_PENDING_EXIT_CODE, GATE_TYPE_CHILDREN_COMPLETE, GATE_TYPE_COMMAND,
-    GATE_TYPE_CONTEXT_EXISTS, GATE_TYPE_CONTEXT_MATCHES, GATE_TYPE_REQUEST_LEG,
-    SUPPORTED_GATE_TYPES,
+    GATE_TYPE_CONTEXT_EXISTS, GATE_TYPE_CONTEXT_MATCHES, GATE_TYPE_DECIDER_CHECK,
+    GATE_TYPE_REQUEST_LEG, SUPPORTED_GATE_TYPES,
 };
 
 /// YAML front-matter structure of a template source file.
@@ -483,6 +483,17 @@ struct SourceGate {
     /// Re-evaluation settings; allowed on `command` gates only.
     #[serde(default)]
     poll: Option<SourcePollSpec>,
+    /// A `decider-check` gate's byte budget, kept raw so a malformed value
+    /// is refused with `E-DECIDER-CHECK-BUDGET` naming the state and check.
+    #[serde(default)]
+    max_bytes: Option<serde_yaml_ng::Value>,
+    /// A `decider-check` gate's input label, kept raw likewise.
+    #[serde(default)]
+    label: Option<serde_yaml_ng::Value>,
+    /// A `decider-check` gate's criteria: a map from `rule_id` to the
+    /// criterion, in declaration order.
+    #[serde(default)]
+    criteria: Option<serde_yaml_ng::Value>,
     /// Every key the fields above don't name. `SourceState` uses
     /// `deny_unknown_fields`, but serde's error for it surfaces only as the
     /// outer "failed to parse front-matter" context, which names neither the
@@ -522,6 +533,20 @@ const SOURCE_GATE_KEYS: &[&str] = &[
     "leg",
     "expect",
     "poll",
+    "max_bytes",
+    "label",
+    "criteria",
+];
+
+/// The keys a decider-check criterion may carry.
+const SOURCE_CRITERION_KEYS: &[&str] = &[
+    "rule_ref",
+    "question",
+    "pass",
+    "fail",
+    "escape",
+    "threshold",
+    "mode",
 ];
 
 /// Compile a YAML/Markdown template source file to a FormatVersion=1 CompiledTemplate.
@@ -945,6 +970,27 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
             gate_name
         ));
     }
+    if source.gate_type == GATE_TYPE_DECIDER_CHECK {
+        return compile_decider_check(state_name, gate_name, source, overridable);
+    }
+    for (key, present) in [
+        ("max_bytes", source.max_bytes.is_some()),
+        ("label", source.label.is_some()),
+        ("criteria", source.criteria.is_some()),
+    ] {
+        if present {
+            return Err(anyhow!(
+                "validation error: E-DECIDER-CHECK-FIELD: state {:?} gate {:?}: {} is only \
+                 allowed on a decider-check gate, not on {:?}\n  \
+                 remedy: remove {}, or make the gate type decider-check",
+                state_name,
+                gate_name,
+                key,
+                source.gate_type,
+                key
+            ));
+        }
+    }
     if source.poll.is_some() && source.gate_type != GATE_TYPE_COMMAND {
         return Err(anyhow!(
             "state {:?} gate {:?}: poll is only allowed on a command gate, not on {:?}",
@@ -981,6 +1027,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                     hold_secs: p.hold_secs,
                     pending_exit_code: p.pending_exit_code.unwrap_or(DEFAULT_PENDING_EXIT_CODE),
                 }),
+                decider_check: None,
             })
         }
         GATE_TYPE_CONTEXT_EXISTS => {
@@ -1005,6 +1052,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             })
         }
         GATE_TYPE_CONTEXT_MATCHES => {
@@ -1036,6 +1084,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             })
         }
         GATE_TYPE_CHILDREN_COMPLETE => {
@@ -1076,6 +1125,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             })
         }
         GATE_TYPE_REQUEST_LEG => {
@@ -1097,6 +1147,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 leg: source.leg.clone(),
                 expect,
                 poll: None,
+                decider_check: None,
             };
             super::types::validate_request_leg_gate(state_name, gate_name, &gate)
                 .map_err(|e| anyhow!(e))?;
@@ -1112,6 +1163,234 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
             SUPPORTED_GATE_TYPES.join(", ")
         )),
     }
+}
+
+/// Compile a `decider-check` gate (DESIGN-koto-decider-checks.md, Decision
+/// 1), resolving every default.
+///
+/// Only what the compiled types can't represent fails here: a key a gate or
+/// criterion doesn't take, a value of the wrong type, an unknown mode,
+/// `poll`, and `overridable: false`. Bounds and required text are checked on
+/// the compiled form by [`validate_spec`](super::decider_check::validate_spec)
+/// through `CompiledTemplate::validate`, so a cached template gets the same
+/// checks.
+fn compile_decider_check(
+    state_name: &str,
+    gate_name: &str,
+    source: &SourceGate,
+    overridable: bool,
+) -> anyhow::Result<Gate> {
+    use super::decider_check::{
+        CheckCriterion, CheckMode, DeciderCheckSpec, DEFAULT_CHECK_LABEL, DEFAULT_CHECK_MAX_BYTES,
+        DEFAULT_CHECK_THRESHOLD,
+    };
+    let err = |code: &str, detail: String, remedy: &str| {
+        anyhow!(
+            "validation error: {}: state {:?} check {:?}{}\n  remedy: {}",
+            code,
+            state_name,
+            gate_name,
+            detail,
+            remedy
+        )
+    };
+    if source.poll.is_some() {
+        return Err(err(
+            "E-DECIDER-CHECK-POLL",
+            ": poll is not allowed on a decider check; each evaluation asks the decider".into(),
+            "remove poll",
+        ));
+    }
+    if !overridable {
+        return Err(err(
+            "E-DECIDER-CHECK-OVERRIDABLE",
+            ": a decider check can't be overridable: false; a check that can be wrong must \
+             always have a way past"
+                .into(),
+            "remove overridable: false",
+        ));
+    }
+    if source.command.trim().is_empty() {
+        return Err(err(
+            "E-DECIDER-CHECK-FIELD",
+            ": command must not be empty; its output is the slice the criteria judge".into(),
+            "set command to the extraction command",
+        ));
+    }
+    for (key, present) in [
+        ("key", !source.key.is_empty()),
+        ("pattern", !source.pattern.is_empty()),
+        ("completion", source.completion.is_some()),
+        ("name_filter", source.name_filter.is_some()),
+        ("request", !source.request.is_empty()),
+        ("leg", !source.leg.is_empty()),
+        ("expect", source.expect.is_some()),
+    ] {
+        if present {
+            return Err(err(
+                "E-DECIDER-CHECK-FIELD",
+                format!(": {} is not a decider-check key", key),
+                "remove it",
+            ));
+        }
+    }
+    let max_bytes = match &source.max_bytes {
+        None => DEFAULT_CHECK_MAX_BYTES,
+        Some(v) => match v.as_u64() {
+            Some(n) if n <= u64::from(u32::MAX) => n as u32,
+            _ => {
+                return Err(err(
+                    "E-DECIDER-CHECK-BUDGET",
+                    format!(": max_bytes must be a whole number of bytes, found {:?}", v),
+                    "set max_bytes from 1 to 8192, or omit it",
+                ))
+            }
+        },
+    };
+    let label = match &source.label {
+        None => DEFAULT_CHECK_LABEL.to_string(),
+        Some(serde_yaml_ng::Value::String(l)) => l.clone(),
+        Some(v) => {
+            return Err(err(
+                "E-DECIDER-CHECK-LABEL",
+                format!(": label must be a string, found {:?}", v),
+                "set label to a short name such as comments",
+            ))
+        }
+    };
+    let mut criteria = Vec::new();
+    match &source.criteria {
+        None => {}
+        Some(serde_yaml_ng::Value::Mapping(map)) => {
+            for (key, value) in map {
+                let rule_id = match key {
+                    serde_yaml_ng::Value::String(k) => k.clone(),
+                    other => {
+                        return Err(err(
+                            "E-DECIDER-CHECK-FIELD",
+                            format!(": criterion key {:?} must be a string rule_id", other),
+                            "key each criterion by its rule_id",
+                        ))
+                    }
+                };
+                let at = format!(" criterion {:?}", rule_id);
+                let serde_yaml_ng::Value::Mapping(fields) = value else {
+                    return Err(err(
+                        "E-DECIDER-CHECK-FIELD",
+                        format!("{}: a criterion must be a map of its fields", at),
+                        "write rule_ref, question, pass, fail and escape under the criterion",
+                    ));
+                };
+                for k in fields.keys() {
+                    let known = k
+                        .as_str()
+                        .is_some_and(|k| SOURCE_CRITERION_KEYS.contains(&k));
+                    if !known {
+                        return Err(err(
+                            "E-DECIDER-CHECK-FIELD",
+                            format!(
+                                "{}: unknown key {:?}; a criterion accepts only: {}",
+                                at,
+                                k,
+                                SOURCE_CRITERION_KEYS.join(", ")
+                            ),
+                            "remove or correct the key",
+                        ));
+                    }
+                }
+                let text = |name: &str| -> anyhow::Result<String> {
+                    match fields.get(name) {
+                        None => Ok(String::new()),
+                        Some(serde_yaml_ng::Value::String(t)) => Ok(t.clone()),
+                        Some(v) => Err(err(
+                            "E-DECIDER-CHECK-FIELD",
+                            format!("{}: {} must be a string, found {:?}", at, name, v),
+                            "quote the text",
+                        )),
+                    }
+                };
+                let rule_ref = text("rule_ref")?;
+                let question = text("question")?;
+                let pass = text("pass")?;
+                let fail = text("fail")?;
+                let escape = text("escape")?;
+                let threshold = match fields.get("threshold") {
+                    None => DEFAULT_CHECK_THRESHOLD,
+                    Some(v) => v.as_f64().ok_or_else(|| {
+                        err(
+                            "E-DECIDER-CHECK-THRESHOLD",
+                            format!("{}: threshold must be a number, found {:?}", at, v),
+                            "set a threshold from 0.5 to 1.0, or omit it for 0.9",
+                        )
+                    })?,
+                };
+                let mode = match fields.get("mode") {
+                    None => CheckMode::DEFAULT,
+                    Some(serde_yaml_ng::Value::String(m)) => {
+                        CheckMode::parse(m).ok_or_else(|| {
+                            err(
+                                "E-DECIDER-CHECK-MODE",
+                                format!(
+                                    "{}: unknown mode {:?}; a mode is one of {}",
+                                    at,
+                                    m,
+                                    CheckMode::NAMES.join(", ")
+                                ),
+                                "use shadow or veto, or omit mode for shadow",
+                            )
+                        })?
+                    }
+                    Some(v) => {
+                        return Err(err(
+                            "E-DECIDER-CHECK-MODE",
+                            format!("{}: mode must be shadow or veto, found {:?}", at, v),
+                            "use shadow or veto, or omit mode for shadow",
+                        ))
+                    }
+                };
+                criteria.push(CheckCriterion {
+                    rule_id,
+                    rule_ref,
+                    question,
+                    pass,
+                    fail,
+                    escape,
+                    threshold,
+                    mode,
+                });
+            }
+        }
+        Some(v) => {
+            return Err(err(
+                "E-DECIDER-CHECK-FIELD",
+                format!(
+                    ": criteria must be a map from rule_id to criterion, found {:?}",
+                    v
+                ),
+                "key each criterion by its rule_id",
+            ))
+        }
+    }
+    Ok(Gate {
+        gate_type: source.gate_type.clone(),
+        command: source.command.clone(),
+        timeout: source.timeout,
+        key: String::new(),
+        pattern: String::new(),
+        override_default: source.override_default.clone(),
+        completion: None,
+        name_filter: None,
+        overridable,
+        request: String::new(),
+        leg: String::new(),
+        expect: None,
+        poll: None,
+        decider_check: Some(DeciderCheckSpec {
+            max_bytes,
+            label,
+            criteria,
+        }),
+    })
 }
 
 /// Convert a `request-leg` gate's raw `expect` value into its compiled form.

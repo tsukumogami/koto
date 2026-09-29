@@ -339,6 +339,7 @@ mod tests {
                 leg: String::new(),
                 expect: None,
                 poll: None,
+                decider_check: None,
             },
         );
         let output = to_mermaid(&t);
@@ -382,6 +383,7 @@ mod tests {
                             leg: String::new(),
                             expect: None,
                             poll: None,
+                            decider_check: None,
                         },
                     );
                     g

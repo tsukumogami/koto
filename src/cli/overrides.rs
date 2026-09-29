@@ -458,6 +458,7 @@ mod tests {
             leg: String::new(),
             expect: None,
             poll: None,
+            decider_check: None,
         }
     }
 
@@ -518,6 +519,7 @@ mod tests {
             leg: String::new(),
             expect: None,
             poll: None,
+            decider_check: None,
         };
         let result = resolve_override_applied(None, &gate);
         assert!(result.is_err());
