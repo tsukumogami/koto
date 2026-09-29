@@ -3,7 +3,10 @@
 //!
 //! [`CliCheckEvaluator`] evaluates one `decider-check` gate: it runs the
 //! extraction command, bounds the redacted slice, takes the session's
-//! `decider.lock` without waiting, reads the local log for the visit and
+//! `decider.lock`, waiting for another tick to release it for up to the
+//! per-call consultation cap times two attempts times the provider timeout,
+//! plus a second, and never more than 60 s ([`lock_wait_for`]), before its
+//! criteria go unanswered with `busy`, reads the local log for the visit and
 //! for verdicts it can reuse, consults the provider once per criterion (one
 //! retry for a transient failure) under the per-call cap it shares with the
 //! routing decider, appends a ledger `checked` line per consultation, and
