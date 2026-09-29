@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::action::{run_shell_command, CommandEnv};
 use crate::cli::decider_port::{input_sha256, DECIDER_LOCK_FILE};
@@ -34,7 +34,7 @@ use crate::engine::types::{Event, EventPayload};
 use crate::findings::{Finding, FindingLevel, GateFailure, MessageSource};
 use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::session::SessionBackend;
-use crate::template::decider_check::{declaration_hash, DeciderCheckSpec};
+use crate::template::decider_check::{declaration_hash, CheckMode, DeciderCheckSpec};
 use crate::template::types::{Gate, GATE_TYPE_DECIDER_CHECK};
 
 /// Model recorded when no answer named one.
@@ -120,9 +120,11 @@ pub fn without_checks(
 }
 
 /// The ledger's `check_overridden` records for an override of the decider
-/// check `gate` in `state`: one per criterion the check's last output
-/// (`actual_output`) lists as blocking, `candidate_false_fail` for a failed
-/// one and `overridden_unanswered` for an unanswered one. Each takes its
+/// check `gate` in `state`: one `candidate_false_fail` per criterion the
+/// check's last output (`actual_output`) lists as failed, the only kind of
+/// criterion that blocks. An unanswered criterion never blocked, so the
+/// override didn't move past it and it gets none; `overridden_unanswered`
+/// survives only in ledgers written before that rule. Each record takes its
 /// visit and declaration hash from the latest `decider_checked` for that
 /// criterion in the log; a reused verdict appended none, but the
 /// consultation it reused is there. A criterion with no such record gets
@@ -137,29 +139,61 @@ pub fn override_records(
 ) -> Vec<LedgerRecord> {
     use crate::decider::ledger::CheckOverrideKind;
     let mut out = Vec::new();
-    for (key, kind) in [
-        ("failed", CheckOverrideKind::CandidateFalseFail),
-        ("unanswered", CheckOverrideKind::OverriddenUnanswered),
-    ] {
-        let ids = actual_output[key].as_array().cloned().unwrap_or_default();
-        for rule_id in ids.iter().filter_map(|v| v.as_str()) {
-            let latest = events.iter().rev().find_map(|e| match &e.payload {
-                EventPayload::DeciderChecked(c)
-                    if c.state == state && c.gate == gate && c.rule_id == rule_id =>
-                {
-                    Some((c.visit_seq, c.declaration_hash.clone()))
-                }
-                _ => None,
-            });
-            if let Some((visit_seq, hash)) = latest {
-                out.push(LedgerRecord::check_overridden(
-                    session, session_id, state, visit_seq, gate, rule_id, &hash, kind,
-                ));
+    let ids = actual_output["failed"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for rule_id in ids.iter().filter_map(|v| v.as_str()) {
+        let latest = events.iter().rev().find_map(|e| match &e.payload {
+            EventPayload::DeciderChecked(c)
+                if c.state == state && c.gate == gate && c.rule_id == rule_id =>
+            {
+                Some((c.visit_seq, c.declaration_hash.clone()))
             }
+            _ => None,
+        });
+        if let Some((visit_seq, hash)) = latest {
+            out.push(LedgerRecord::check_overridden(
+                session,
+                session_id,
+                state,
+                visit_seq,
+                gate,
+                rule_id,
+                &hash,
+                CheckOverrideKind::CandidateFalseFail,
+            ));
         }
     }
     out
 }
+
+/// How long a tick waits for `decider.lock` before its criteria go
+/// unanswered with `busy`: the longest another tick can hold it (every
+/// consultation of the per-call cap, each with its retry, at the provider
+/// timeout, plus a second), capped at [`MAX_LOCK_WAIT`]. At the default
+/// 2-second timeout that is 17 seconds. Waiting rather than failing fast is
+/// what keeps a second, concurrent `koto next` from passing a veto check
+/// the first one is still grading.
+pub fn lock_wait_for(provider_timeout: Duration) -> Duration {
+    let holder = provider_timeout * (MAX_CONSULTATIONS_PER_CALL as u32 * MAX_ATTEMPTS)
+        + Duration::from_secs(1);
+    holder.min(MAX_LOCK_WAIT)
+}
+
+/// The longest a tick waits for `decider.lock`, whatever the timeout.
+pub const MAX_LOCK_WAIT: Duration = Duration::from_secs(60);
+
+/// How often a waiting tick tries the lock again.
+const LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// `output.error` on a check that passed because it had no spec to grade
+/// against.
+pub const MISSING_SPEC: &str = "missing_spec";
+
+/// `output.error` on a check that passed because the session log couldn't
+/// be read, so neither the state nor the visit is known.
+pub const LOG_UNREADABLE: &str = "log_unreadable";
 
 /// Held while one gate's criteria are consulted. Closing the file releases
 /// the `flock`.
@@ -216,6 +250,7 @@ struct Graded {
     rule_id: String,
     rule_ref: String,
     fail_description: String,
+    mode: CheckMode,
     outcome: CheckOutcome,
     blocked: bool,
     record: Option<DeciderCheck>,
@@ -232,6 +267,9 @@ pub struct CliCheckEvaluator<'a> {
     endpoint_origin: SettingOrigin,
     budget: ConsultBudget,
     ledger_root: Option<PathBuf>,
+    /// How long to wait for `decider.lock` ([`lock_wait_for`]); zero tries
+    /// once.
+    lock_wait: Duration,
     working_dir: &'a Path,
     env: &'a CommandEnv,
 }
@@ -256,6 +294,7 @@ impl<'a> CliCheckEvaluator<'a> {
             endpoint_origin,
             budget,
             ledger_root: None,
+            lock_wait: Duration::ZERO,
             working_dir,
             env,
         }
@@ -265,6 +304,27 @@ impl<'a> CliCheckEvaluator<'a> {
     pub fn with_ledger_root(mut self, koto_root: Option<PathBuf>) -> Self {
         self.ledger_root = koto_root;
         self
+    }
+
+    /// How long to wait for `decider.lock` before a criterion is `busy`.
+    pub fn with_lock_wait(mut self, wait: Duration) -> Self {
+        self.lock_wait = wait;
+        self
+    }
+
+    /// Take `decider.lock`, trying again until [`Self::lock_wait`] runs out.
+    fn lock_waiting(&self) -> Option<LockHold> {
+        let deadline = Instant::now() + self.lock_wait;
+        loop {
+            if let Some(hold) = self.try_lock() {
+                return Some(hold);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            std::thread::sleep(LOCK_POLL.min(deadline - now));
+        }
     }
 
     #[cfg(unix)]
@@ -300,8 +360,11 @@ impl<'a> CliCheckEvaluator<'a> {
     /// Evaluate the `decider-check` gate `name` (already substituted), whose
     /// criteria's declaration hashes are `hashes`, in declaration order.
     pub fn evaluate(&self, name: &str, gate: &Gate, hashes: &[String]) -> StructuredGateResult {
+        // A validated template always has a spec, but a compiled one read
+        // back from JSON isn't revalidated. With nothing to grade against,
+        // the check passes and says why; it never blocks.
         let Some(spec) = gate.decider_check.as_ref() else {
-            return pass_result(Vec::new(), None);
+            return pass_result(&[], MISSING_SPEC, Vec::new(), None);
         };
         let output = run_shell_command(&gate.command, self.working_dir, gate.timeout, self.env);
         self.env.record(&format!("gate '{}'", name), &output);
@@ -338,19 +401,31 @@ impl<'a> CliCheckEvaluator<'a> {
         // Every record needs the visit; an outcome decided above still gets
         // one. The lock is only needed to consult.
         let lock = if early.is_none() {
-            self.try_lock()
+            self.lock_waiting()
         } else {
             None
         };
+        // Without the log there is no state or visit to record under, and
+        // no verdict to reuse, so nothing is asked or recorded: every veto
+        // criterion is listed as unanswered and the check passes.
         let read = self.backend.read_events_local(self.session).ok();
-        let (session_id, events) = match &read {
-            Some((header, events)) => (
+        let Some((session_id, events, state)) = read.as_ref().and_then(|(header, events)| {
+            let state = derive_state_from_log(events).filter(|s| !s.is_empty())?;
+            Some((
                 Some(header.session_id.as_str()).filter(|s| !s.is_empty()),
                 events.as_slice(),
-            ),
-            None => (None, &[][..]),
+                state,
+            ))
+        }) else {
+            drop(lock);
+            let veto: Vec<&str> = spec
+                .criteria
+                .iter()
+                .filter(|c| effective_check_mode(c.mode, self.global) == CheckMode::Veto)
+                .map(|c| c.rule_id.as_str())
+                .collect();
+            return pass_result(&veto, LOG_UNREADABLE, Vec::new(), duration_ms);
         };
-        let state = derive_state_from_log(events).unwrap_or_default();
         let visit_index = arrival_index(events, &state);
         let visit_seq = visit_index.map(|i| events[i].seq).unwrap_or(0);
         let visit_events = visit_index.map(|i| &events[i + 1..]).unwrap_or(events);
@@ -411,6 +486,7 @@ impl<'a> CliCheckEvaluator<'a> {
                 rule_id: criterion.rule_id.clone(),
                 rule_ref: criterion.rule_ref.clone(),
                 fail_description: criterion.fail.clone(),
+                mode,
                 outcome,
                 blocked,
                 record,
@@ -423,7 +499,7 @@ impl<'a> CliCheckEvaluator<'a> {
             let line = LedgerRecord::checked(self.session, session_id, record.clone());
             append_or_warn(self.ledger_root.as_deref(), &line);
         }
-        result_for(name, spec, &graded, records, duration_ms)
+        result_for(spec, &graded, records, duration_ms)
     }
 
     /// Ask the provider about one criterion, retrying once on a transient
@@ -503,11 +579,28 @@ fn reusable(
     })
 }
 
-/// A passing result: nothing blocked.
-fn pass_result(records: Vec<DeciderCheck>, duration_ms: Option<u64>) -> StructuredGateResult {
+/// The check's output: the failed and unanswered veto criteria, and why no
+/// criterion could be graded at all (empty when they could).
+fn check_output(failed: &[&str], unanswered: &[&str], error: &str) -> serde_json::Value {
+    serde_json::json!({
+        "failed": failed,
+        "unanswered": unanswered,
+        "error": error,
+    })
+}
+
+/// A passing result: nothing blocked. `unanswered` names the veto criteria
+/// that got no verdict, so a pass that checked nothing never reads as one
+/// that was checked and met.
+fn pass_result(
+    unanswered: &[&str],
+    error: &str,
+    records: Vec<DeciderCheck>,
+    duration_ms: Option<u64>,
+) -> StructuredGateResult {
     StructuredGateResult {
         outcome: GateOutcome::Passed,
-        output: crate::template::types::decider_check_default_output(),
+        output: check_output(&[], unanswered, error),
         duration_ms,
         decider_checks: records,
         ..Default::default()
@@ -516,94 +609,50 @@ fn pass_result(records: Vec<DeciderCheck>, duration_ms: Option<u64>) -> Structur
 
 /// The gate's result from its criteria's outcomes (Decision 5): `failed`
 /// with one finding per failing veto criterion when any failed on a
-/// verdict; otherwise `error` with koto's one finding for the check when a
-/// veto criterion went unanswered; otherwise `passed`. Unanswered criteria
-/// are listed in the output and never named by a finding: a missing
-/// verdict is a checker fault, not a violation.
+/// verdict, otherwise `passed`. Either way the output lists the veto
+/// criteria that went unanswered. A missing verdict is a checker fault,
+/// not a violation: it never blocks and no finding names it.
 fn result_for(
-    name: &str,
     spec: &DeciderCheckSpec,
     graded: &[Graded],
     records: Vec<DeciderCheck>,
     duration_ms: Option<u64>,
 ) -> StructuredGateResult {
-    let failed: Vec<&Graded> = graded
+    let failed: Vec<&Graded> = graded.iter().filter(|g| g.blocked).collect();
+    let unanswered: Vec<&str> = graded
         .iter()
-        .filter(|g| g.blocked && g.outcome == CheckOutcome::Fail)
+        .filter(|g| g.mode == CheckMode::Veto && matches!(g.outcome, CheckOutcome::Unanswered(_)))
+        .map(|g| g.rule_id.as_str())
         .collect();
-    let unanswered: Vec<&Graded> = graded
-        .iter()
-        .filter(|g| g.blocked && matches!(g.outcome, CheckOutcome::Unanswered(_)))
-        .collect();
-    if failed.is_empty() && unanswered.is_empty() {
-        return pass_result(records, duration_ms);
+    if failed.is_empty() {
+        return pass_result(&unanswered, "", records, duration_ms);
     }
-    let output = serde_json::json!({
-        "failed": failed.iter().map(|g| g.rule_id.as_str()).collect::<Vec<_>>(),
-        "unanswered": unanswered.iter().map(|g| g.rule_id.as_str()).collect::<Vec<_>>(),
-        "error": "",
-    });
-    if !failed.is_empty() {
-        let findings = failed
-            .iter()
-            .map(|g| Finding {
-                rule_id: g.rule_id.clone(),
-                level: FindingLevel::Error,
-                message: format!(
-                    "criterion {} failed: the decider judged the {} to fail it: {}",
-                    g.rule_id, spec.label, g.fail_description
-                ),
-                path: None,
-                line: None,
-                column: None,
-                rule_ref: Some(g.rule_ref.clone()),
-                effect_landed: None,
-                message_source: MessageSource::Decider,
-            })
-            .collect();
-        return StructuredGateResult {
-            outcome: GateOutcome::Failed,
-            output,
-            failure: Some(GateFailure {
-                fallback: None,
-                captured: None,
-            }),
-            findings,
-            duration_ms,
-            decider_checks: records,
-            ..Default::default()
-        };
-    }
-    let reasons: Vec<String> = unanswered
+    let failed_ids: Vec<&str> = failed.iter().map(|g| g.rule_id.as_str()).collect();
+    let findings = failed
         .iter()
-        .map(|g| match g.outcome {
-            CheckOutcome::Unanswered(r) => format!("{} ({})", g.rule_id, r.as_str()),
-            _ => g.rule_id.clone(),
+        .map(|g| Finding {
+            rule_id: g.rule_id.clone(),
+            level: FindingLevel::Error,
+            message: format!(
+                "criterion {} failed: the decider judged the {} to fail it: {}",
+                g.rule_id, spec.label, g.fail_description
+            ),
+            path: None,
+            line: None,
+            column: None,
+            rule_ref: Some(g.rule_ref.clone()),
+            effect_landed: None,
+            message_source: MessageSource::Decider,
         })
         .collect();
-    let fallback = Finding {
-        rule_id: name.to_string(),
-        level: FindingLevel::Error,
-        message: format!(
-            "no verdict was read for {}; call koto next again, or override the check with a \
-             reason if this persists",
-            reasons.join(", ")
-        ),
-        path: None,
-        line: None,
-        column: None,
-        rule_ref: None,
-        effect_landed: None,
-        message_source: MessageSource::Koto,
-    };
     StructuredGateResult {
-        outcome: GateOutcome::Error,
-        output,
+        outcome: GateOutcome::Failed,
+        output: check_output(&failed_ids, &unanswered, ""),
         failure: Some(GateFailure {
-            fallback: Some(fallback),
+            fallback: None,
             captured: None,
         }),
-        findings: Vec::new(),
+        findings,
         duration_ms,
         decider_checks: records,
         ..Default::default()
@@ -625,5 +674,187 @@ mod tests {
         assert!(!a.try_take());
         assert!(!b.try_take());
         assert_eq!(a.used(), MAX_CONSULTATIONS_PER_CALL);
+    }
+
+    #[test]
+    fn the_lock_wait_covers_a_holder_and_is_capped() {
+        assert_eq!(
+            lock_wait_for(Duration::from_millis(2_000)),
+            Duration::from_secs(17)
+        );
+        assert_eq!(
+            lock_wait_for(Duration::from_millis(50)),
+            Duration::from_millis(1_400)
+        );
+        assert_eq!(lock_wait_for(Duration::from_secs(10)), MAX_LOCK_WAIT);
+    }
+
+    // -- the evaluator against a real local session ----------------------
+
+    use crate::decider::fake::ScriptedDecider;
+    use crate::decider::types::{DecisionRequest, DecisionResponse};
+    use crate::engine::types::StateFileHeader;
+    use crate::session::local::LocalBackend;
+    use crate::template::decider_check::CheckCriterion;
+    use std::sync::Arc;
+
+    struct Shared(Arc<ScriptedDecider>);
+
+    impl Decider for Shared {
+        fn provider(&self) -> &str {
+            self.0.provider()
+        }
+
+        fn decide(
+            &self,
+            req: &DecisionRequest,
+        ) -> Result<DecisionResponse, crate::decider::types::DeciderError> {
+            self.0.decide(req)
+        }
+    }
+
+    /// A decider check over a fixed slice, one criterion per `(id, mode)`.
+    fn check_gate(criteria: &[(&str, CheckMode)]) -> Gate {
+        let mut gate: Gate = serde_json::from_value(serde_json::json!({
+            "type": GATE_TYPE_DECIDER_CHECK,
+            "command": "printf 'let x = 1; // sets x'",
+        }))
+        .unwrap();
+        gate.decider_check = Some(DeciderCheckSpec {
+            max_bytes: 2560,
+            label: "comments".into(),
+            criteria: criteria
+                .iter()
+                .map(|(id, mode)| CheckCriterion {
+                    rule_id: id.to_string(),
+                    rule_ref: "ref".into(),
+                    question: "Does each comment give a reason?".into(),
+                    pass: "yes".into(),
+                    fail: "no".into(),
+                    escape: "can't tell".into(),
+                    threshold: 0.9,
+                    mode: *mode,
+                })
+                .collect(),
+        });
+        gate
+    }
+
+    /// A session `wf` in state `review`, or, with `log: false`, a session
+    /// directory with no log to read.
+    fn backend(tmp: &Path, log: bool) -> LocalBackend {
+        let backend = LocalBackend::with_base_dir(tmp.to_path_buf());
+        backend.create("wf").unwrap();
+        if log {
+            let header: StateFileHeader = serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "workflow": "wf",
+                "template_hash": "0".repeat(64),
+                "created_at": "2026-01-01T00:00:00Z",
+                "session_id": "s",
+            }))
+            .unwrap();
+            let events: Vec<Event> = [
+                r#"{"seq":1,"timestamp":"2026-01-01T00:00:00Z","type":"workflow_initialized","payload":{"template_path":"t.json","variables":{}}}"#,
+                r#"{"seq":2,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":null,"to":"review","condition_type":"auto"}}"#,
+            ]
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+            backend.init_state_file("wf", header, events).unwrap();
+        }
+        backend
+    }
+
+    fn evaluate(
+        backend: &LocalBackend,
+        dir: &Path,
+        gate: &Gate,
+        decider: &Arc<ScriptedDecider>,
+    ) -> StructuredGateResult {
+        let env = CommandEnv::inherit();
+        let evaluator = CliCheckEvaluator::new(
+            backend,
+            "wf",
+            Box::new(Shared(decider.clone())),
+            GlobalMode::Auto,
+            SettingOrigin::Default,
+            ConsultBudget::new(),
+            dir,
+            &env,
+        );
+        let hashes = declaration_hashes(&BTreeMap::from([("comments".to_string(), gate.clone())]));
+        evaluator.evaluate("comments", gate, &hashes["comments"])
+    }
+
+    #[test]
+    fn a_check_with_no_spec_passes_and_says_why() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = backend(tmp.path(), true);
+        let mut gate = check_gate(&[("r", CheckMode::Veto)]);
+        gate.decider_check = None;
+        let decider = Arc::new(ScriptedDecider::new());
+        let env = CommandEnv::inherit();
+        let evaluator = CliCheckEvaluator::new(
+            &backend,
+            "wf",
+            Box::new(Shared(decider.clone())),
+            GlobalMode::Auto,
+            SettingOrigin::Default,
+            ConsultBudget::new(),
+            tmp.path(),
+            &env,
+        );
+        let r = evaluator.evaluate("comments", &gate, &[]);
+        assert_eq!(r.outcome, GateOutcome::Passed);
+        assert_eq!(
+            r.output,
+            serde_json::json!({"failed": [], "unanswered": [], "error": "missing_spec"})
+        );
+        assert!(r.decider_checks.is_empty());
+        assert!(r.failure.is_none() && r.findings.is_empty());
+        assert_eq!(decider.calls(), 0);
+    }
+
+    #[test]
+    fn an_unreadable_log_passes_lists_veto_criteria_and_records_nothing() {
+        for (mode, listed) in [
+            (CheckMode::Veto, serde_json::json!(["a", "b"])),
+            (CheckMode::Shadow, serde_json::json!([])),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let backend = backend(tmp.path(), false);
+            let gate = check_gate(&[("a", mode), ("b", mode)]);
+            let decider = Arc::new(ScriptedDecider::new());
+            let r = evaluate(&backend, tmp.path(), &gate, &decider);
+            assert_eq!(r.outcome, GateOutcome::Passed, "{:?}", mode);
+            assert_eq!(
+                r.output,
+                serde_json::json!({"failed": [], "unanswered": listed, "error": "log_unreadable"}),
+                "{:?}",
+                mode
+            );
+            // Nothing is recorded, so nothing lands under an empty state.
+            assert!(r.decider_checks.is_empty(), "{:?}", mode);
+            assert!(r.failure.is_none() && r.findings.is_empty());
+            assert_eq!(decider.calls(), 0, "nothing is asked without a visit");
+        }
+    }
+
+    #[test]
+    fn a_readable_log_records_under_its_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = backend(tmp.path(), true);
+        let gate = check_gate(&[("r", CheckMode::Veto)]);
+        let decider = Arc::new(ScriptedDecider::new());
+        // No reply queued: the provider fails twice, so no verdict.
+        let r = evaluate(&backend, tmp.path(), &gate, &decider);
+        assert_eq!(r.outcome, GateOutcome::Passed);
+        assert_eq!(r.output["unanswered"], serde_json::json!(["r"]));
+        let c = &r.decider_checks[0];
+        assert_eq!(c.state, "review");
+        assert_eq!(c.visit_seq, 2);
+        assert!(!c.blocked);
+        assert_eq!(c.reason, Some(UnansweredReason::ProviderError));
     }
 }

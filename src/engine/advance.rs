@@ -1680,9 +1680,26 @@ where
             // when clauses referencing gates.* can route based on gate output.
             // (gate_evidence_map is already populated above)
 
-            let any_failed = gate_results
-                .values()
-                .any(|r| !matches!(r.outcome, GateOutcome::Passed));
+            // A decider check blocks only on a criterion recorded as
+            // blocking, a veto fail listed in its output, never on its
+            // outcome alone: a missing verdict and every shadow check pass
+            // (DESIGN-koto-decider-checks.md, Decision 5).
+            let is_decider_check = |name: &str| {
+                template_state
+                    .gates
+                    .get(name)
+                    .is_some_and(|g| g.gate_type == crate::template::types::GATE_TYPE_DECIDER_CHECK)
+            };
+            let blocks = |name: &str, r: &StructuredGateResult| {
+                if is_decider_check(name) {
+                    r.output["failed"]
+                        .as_array()
+                        .is_some_and(|failed| !failed.is_empty())
+                } else {
+                    !matches!(r.outcome, GateOutcome::Passed)
+                }
+            };
+            let any_failed = gate_results.iter().any(|(name, r)| blocks(name, r));
 
             // Determine whether this state uses structured gate routing: at least
             // one transition's when clause references a gates.* key. Used both to
@@ -1705,12 +1722,9 @@ where
                 // a veto on the agent's own work, so the agent's evidence must
                 // not route past it. It blocks whatever the state accepts,
                 // and `koto overrides record` is the way past.
-                let decider_check_blocks = gate_results.iter().any(|(name, r)| {
-                    r.outcome != GateOutcome::Passed
-                        && template_state.gates.get(name).is_some_and(|g| {
-                            g.gate_type == crate::template::types::GATE_TYPE_DECIDER_CHECK
-                        })
-                });
+                let decider_check_blocks = gate_results
+                    .iter()
+                    .any(|(name, r)| is_decider_check(name) && blocks(name, r));
                 if decider_check_blocks || (template_state.accepts.is_none() && !has_gates_routing)
                 {
                     return Ok(AdvanceResult {
@@ -3402,6 +3416,117 @@ mod tests {
         assert_eq!(result.final_state, "gated");
         assert!(!result.advanced);
         assert!(matches!(result.stop_reason, StopReason::GateBlocked(_)));
+    }
+
+    /// A decider check blocks only on a criterion recorded as blocking (a
+    /// failed one in its output), never on its outcome alone: an `error`
+    /// or `failed` outcome with nothing failed, as a log from an older
+    /// build or a shadow check could carry, moves on.
+    #[test]
+    fn a_decider_check_blocks_only_on_a_failed_criterion() {
+        use crate::template::types::{Gate, GATE_TYPE_DECIDER_CHECK};
+
+        let template_for = || {
+            let mut gate: Gate = serde_json::from_value(serde_json::json!({
+                "type": GATE_TYPE_DECIDER_CHECK,
+                "command": "cat slice.txt",
+            }))
+            .unwrap();
+            gate.decider_check = None;
+            let mut gates = BTreeMap::new();
+            gates.insert("comments".to_string(), gate);
+            make_template(vec![
+                (
+                    "review",
+                    TemplateState {
+                        directive: "Review.".to_string(),
+                        details: String::new(),
+                        transitions: vec![unconditional("done")],
+                        terminal: false,
+                        gates,
+                        accepts: None,
+                        integration: None,
+                        default_action: None,
+                        materialize_children: None,
+                        failure: false,
+                        skipped_marker: false,
+                        skip_if: None,
+                        result: None,
+                        clear_on_entry: Vec::new(),
+                    },
+                ),
+                (
+                    "done",
+                    TemplateState {
+                        directive: "Done.".to_string(),
+                        details: String::new(),
+                        transitions: vec![],
+                        terminal: true,
+                        gates: BTreeMap::new(),
+                        accepts: None,
+                        integration: None,
+                        default_action: None,
+                        materialize_children: None,
+                        failure: false,
+                        skipped_marker: false,
+                        skip_if: None,
+                        result: None,
+                        clear_on_entry: Vec::new(),
+                    },
+                ),
+            ])
+        };
+
+        for (outcome, failed, blocks) in [
+            (GateOutcome::Error, serde_json::json!([]), false),
+            (GateOutcome::Failed, serde_json::json!([]), false),
+            (GateOutcome::Passed, serde_json::json!([]), false),
+            (GateOutcome::Failed, serde_json::json!(["r"]), true),
+        ] {
+            let template = template_for();
+            let mut append = |_: &EventPayload| -> Result<(), String> { Ok(()) };
+            let shutdown = AtomicBool::new(false);
+            let gate_eval = |gates: &BTreeMap<String, crate::template::types::Gate>| {
+                let mut results = BTreeMap::new();
+                for name in gates.keys() {
+                    results.insert(
+                        name.clone(),
+                        StructuredGateResult {
+                            outcome: outcome.clone(),
+                            output: serde_json::json!({
+                                "failed": failed.clone(),
+                                "unanswered": ["u"],
+                                "error": "",
+                            }),
+                            ..Default::default()
+                        },
+                    );
+                }
+                Ok(results)
+            };
+            let result = advance_until_stop(
+                "review",
+                &template,
+                &BTreeMap::new(),
+                &[],
+                &mut append,
+                &gate_eval,
+                &unavailable_integration,
+                &noop_action,
+                &VariableOverlay::new(),
+                &shutdown,
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(result.stop_reason, StopReason::GateBlocked(_)),
+                blocks,
+                "{:?} {}",
+                outcome,
+                failed
+            );
+            let expected = if blocks { "review" } else { "done" };
+            assert_eq!(result.final_state, expected, "{:?} {}", outcome, failed);
+        }
     }
 
     #[test]
