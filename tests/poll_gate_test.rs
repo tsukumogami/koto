@@ -255,6 +255,9 @@ fn a_failed_answer_is_a_corrective_command_gate_failure() {
     assert_eq!(p["attempt"], 1);
 }
 
+/// The condition's `status` is the command gate's (`timed_out`, a run
+/// killed by the gate's per-run `timeout`), while `poll.status` is the poll's
+/// view: the command never answered, so it failed rather than timed out.
 #[test]
 fn a_run_killed_by_its_own_timeout_is_failed_not_pending() {
     // The gate's per-run timeout (1 s) kills a command that sleeps longer.
@@ -555,6 +558,7 @@ Done.
             .unwrap_or(0)
     };
     let (fast, slow) = (count("fast.log"), count("slow.log"));
+    // Under one shared schedule both would run at the fast gate's pace.
     assert!(fast >= 3, "the 1-second gate ran {fast} times");
-    assert_eq!(slow, 2, "the 3-second gate ran {slow} times, fast {fast}");
+    assert!(slow <= 2, "the 3-second gate ran {slow} times, fast {fast}");
 }

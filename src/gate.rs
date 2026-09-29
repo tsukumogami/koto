@@ -50,6 +50,12 @@ pub enum GateOutcome {
 }
 
 /// Where a polling gate stood after a tick's evaluations.
+///
+/// `TimedOut` is the poll's own deadline passing while the command still
+/// said pending. A single run killed by the gate's per-run `timeout` is a
+/// different thing: its outcome is `GateOutcome::TimedOut` as for any
+/// command gate, but the poll counts it as `Failed`, because the command
+/// never answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollStatus {
     Done,

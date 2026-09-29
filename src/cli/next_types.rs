@@ -1064,13 +1064,13 @@ pub struct BlockingCondition {
 }
 
 /// A polling gate's `poll` object on its blocking condition.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PollResponse {
     /// `pending`, `failed` or `timed_out` (a passing gate doesn't block).
     pub status: String,
     /// On a pending gate: how long to wait before ticking again, the gate's
     /// `interval_secs`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_secs: Option<u32>,
     /// Seconds since the polling window opened.
     pub elapsed_secs: u64,

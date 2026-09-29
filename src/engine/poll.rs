@@ -37,7 +37,7 @@ use crate::template::types::{Gate, PollSpec};
 ///
 /// `state` must be the state the workflow occupies, as for
 /// [`any_entry_index`].
-pub fn recorded_window(events: &[Event], state: &str, gate: &str) -> (Option<String>, u64) {
+pub(crate) fn recorded_window(events: &[Event], state: &str, gate: &str) -> (Option<String>, u64) {
     let start = any_entry_index(events, state).map_or(0, |i| i + 1);
     let mut since = None;
     let mut runs = 0;
@@ -64,7 +64,7 @@ pub fn recorded_window(events: &[Event], state: &str, gate: &str) -> (Option<Str
 /// non-zero exit with the pending code. A run killed by the gate's own
 /// timeout or one that couldn't start carries a `failure_kind` and is never
 /// pending.
-pub fn is_pending(result: &StructuredGateResult, spec: &PollSpec) -> bool {
+pub(crate) fn is_pending(result: &StructuredGateResult, spec: &PollSpec) -> bool {
     result.outcome == GateOutcome::Failed
         && result.output.get("failure_kind").is_none()
         && result.output.get("exit_code").and_then(|v| v.as_i64())
