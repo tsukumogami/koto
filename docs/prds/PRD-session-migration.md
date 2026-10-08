@@ -1,7 +1,7 @@
 ---
 schema: prd/v1
+absorbed: docs/briefs/BRIEF-session-migration.md
 status: Accepted
-upstream: docs/briefs/BRIEF-session-migration.md
 source_issue: 313
 problem: |
   koto's S3 remote stores a session but can't move one. Each session lives
@@ -24,6 +24,37 @@ goals: |
 ## Status
 
 Accepted
+
+Absorbed [BRIEF](docs/briefs/BRIEF-session-migration.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+**Why this exists.** koto's S3 remote stores a session but can't move one.
+Each session lives under a prefix derived from the workspace that created
+it, `rebind` is undone under the cloud backend, context keys never leave
+the first workspace's prefix, a host with no session directory can't take a
+pull, and the guide says a second machine resumes by running `koto next`.
+The maintainers' model (koto#313) is a migration: import into a fresh local
+session, mark the old object.
+
+**The outcome.** An operator continuing a session elsewhere brings it over
+with one command, state log and every context key intact, and keeps working
+there. Any command on the first host that reads it says where it went, so
+nothing there continues it by accident.
+
+**The journeys.** An operator moves a coordinator's session to a second
+host; an agent on the first host touches the migrated session and is
+refused; a maintainer re-runs the carrier harness after changing the cloud
+backend; a first-time user sets up cloud sync, including a self-hosted
+MinIO, from the guide.
+
+**The boundary.** In: the import verb, the migrated marker and its refusal,
+what an imported session needs to run (anchor, template, name), the
+terminal-cleanup interaction, the state log's safety during an import, a
+harness, and the guide and design corrections. Out: a session shared live
+between hosts, stopping an offline original, requests, wakes and legs,
+child sessions, listing and pruning, a context view, callers above koto,
+and any remote but koto's own bucket.
 
 ## Problem Statement
 
