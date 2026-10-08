@@ -9,7 +9,10 @@ use tempfile::Builder;
 use crate::template::compile::compile;
 
 /// Return the koto cache directory: `$XDG_CACHE_HOME/koto` or `~/.cache/koto`.
-fn cache_dir() -> PathBuf {
+///
+/// `koto session import` looks here for a session's compiled template by
+/// its hash, the file `koto template compile` writes.
+pub(crate) fn cache_dir() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
