@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-session-migration.md
 decision_provenance: inline-resolved
 problem: |
@@ -43,7 +43,7 @@ rationale: |
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
@@ -514,14 +514,15 @@ describe what the slice and the hardening ship.
    simplest form (the template from the local cache only, a plain
    `import_name_taken` refusal with no `--as` and no retry branch, cleanup
    on failure best effort); the marker check on `read_header` and
-   `read_events`; `SessionMigrated` in `next` and `status`; the fake
+   `read_events`; cleanup keeping the marker; `SessionMigrated` in `next`
+   and `status`; the fake
    endpoint and the carrier test's seven steps. Its pull request reports
    the harness result.
 2. **Import hardening.** The full refusal table with no-trace tests;
    `--as` and the retry branch; the template push at init and
    `--trust-template`; staging, rollback and `import_unmarked`;
    the marker check on every `ContextStore` method and its per-process
-   cache; cleanup keeping the marker; the request-count, timing and
+   cache; the request-count, timing and
    credential tests.
 3. **Header rewrites through the backend (koto#310).** `rewrite_header` on
    the trait, the three call sites, and a cloud test that rebinds and adopts
