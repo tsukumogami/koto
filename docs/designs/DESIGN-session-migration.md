@@ -58,7 +58,7 @@ every append and pulled whole on every `read_header` and `read_events`,
 overwriting the local file. Context keys go per key through
 `src/session/sync.rs`, with `ctx/manifest.json` and a `version.json` counter
 that guards context writes only. Under the cloud backend the local store is
-always `~/.koto/sessions`: `KOTO_SESSIONS_BASE` is honored only by the local
+always `$HOME/.koto/sessions`: `KOTO_SESSIONS_BASE` is honored only by the local
 backend.
 
 Six facts in the code shape the design:
@@ -70,7 +70,7 @@ Six facts in the code shape the design:
    host's `PATH`, `HOME` and `XDG_CONFIG_HOME`, and commands run with those
    values.
 2. **The template is a host path.** `WorkflowInitialized.template_path`
-   records `~/.cache/koto/<sha256>.json` as an absolute path for file
+   records `$HOME/.cache/koto/<sha256>.json` as an absolute path for file
    templates (a session-relative `<sha256>.json` for `--from-stdin` ones).
    `koto next` reads it and checks its SHA-256 against the header's
    `template_hash`; a missing file is a template error. The cache is not
