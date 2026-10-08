@@ -1068,6 +1068,9 @@ fn create_bucket(config: &CloudConfig) -> anyhow::Result<Box<Bucket>> {
         region,
         credentials,
     )?;
+    if config.path_style == Some(true) {
+        return Ok(bucket.with_path_style());
+    }
     Ok(bucket)
 }
 
@@ -1993,5 +1996,27 @@ mod tests {
         backend.get("wf", "notes.md").unwrap();
         let (_, again) = backend.local.read_events("wf").unwrap();
         assert_eq!(again.len(), events.len());
+    }
+
+    // -- session.cloud.path_style --
+
+    #[test]
+    fn create_bucket_addresses_the_bucket_path_style_when_asked() {
+        let mut config = CloudConfig {
+            endpoint: Some("http://127.0.0.1:9000".to_string()),
+            bucket: Some("sessions".to_string()),
+            region: Some("us-east-1".to_string()),
+            access_key: Some("k".to_string()),
+            secret_key: Some("s".to_string()),
+            path_style: Some(true),
+        };
+        let bucket = create_bucket(&config).unwrap();
+        assert!(bucket.is_path_style());
+        assert_eq!(bucket.url(), "http://127.0.0.1:9000/sessions");
+
+        config.path_style = None;
+        assert!(!create_bucket(&config).unwrap().is_path_style());
+        config.path_style = Some(false);
+        assert!(!create_bucket(&config).unwrap().is_path_style());
     }
 }
