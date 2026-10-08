@@ -1,7 +1,7 @@
 ---
 schema: prd/v1
 absorbed: docs/briefs/BRIEF-session-migration.md
-status: Accepted
+status: In Progress
 source_issue: 313
 problem: |
   koto's S3 remote stores a session but can't move one. Each session lives
@@ -23,7 +23,7 @@ goals: |
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF](docs/briefs/BRIEF-session-migration.md); carried in Absorbed Brief.
 
@@ -293,9 +293,10 @@ session stores.
   anchor, B's session store, a session id different from the source's, and
   B's `HOME` in its command-environment record; `koto next` from B advances
   it (R4).
-- [ ] With the template absent from B's cache, the import carries it from the
-  remote object and the target's next tick loads it; with no copy anywhere,
-  the import refuses with `import_template_unavailable` naming the hash (R5).
+- [ ] With the template compiled in B's cache, the import uses it and the
+  target's next tick loads it although A's cache path doesn't exist on B;
+  with no acceptable copy, the import refuses with
+  `import_template_unavailable` naming the hash (R5).
 - [ ] After the import, B's prefix holds the state file, every key, the
   manifest, a version record and the template, and importing from B into a
   third workspace C succeeds (R6).
