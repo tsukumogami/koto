@@ -429,6 +429,22 @@ events:
         type: string
         required: true
 
+  session_imported:
+    tier: 2
+    fields:
+      from_workspace:
+        type: string
+        required: true
+      from_session:
+        type: string
+        required: true
+      from_session_id:
+        type: string
+        required: true
+      machine_id:
+        type: string
+        required: true
+
   environment_adopted:
     tier: 2
     fields:
@@ -1622,6 +1638,35 @@ deliberate command, and this event is what keeps the move from being silent.
 Several of these can appear in one log: a checkout can move more than once, and
 each move is its own event. A rebind to the directory the session is already
 bound to writes nothing, so consecutive events always differ.
+
+---
+
+#### `session_imported`
+
+Written by `koto session import`, as the last event of the log it creates.
+Every event before it is the source session's, copied verbatim from the
+source's remote object; this one records where they came from.
+
+```json
+{
+  "type": "session_imported",
+  "payload": {
+    "from_workspace": "/srv/ws-a",
+    "from_session": "coord",
+    "from_session_id": "source-session-id",
+    "machine_id": "a1b2c3d4e5f6"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `from_workspace` | string | Yes | The absolute path the source workspace had on the host that created the session, as passed to `--from`. Its hash is the remote prefix the session was read from. |
+| `from_session` | string | Yes | The source session's name. |
+| `from_session_id` | string | Yes | The source header's `session_id`. The imported header carries a new one. |
+| `machine_id` | string | Yes | The importing machine's id, from koto's user config. |
+
+A log imported more than once carries one of these per import, oldest first.
 
 The event is appended before the header field is written, the same ordering
 `execution_anchor_adopted` uses and for the same reason.
