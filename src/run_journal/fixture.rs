@@ -8,11 +8,12 @@
 //!
 //! Two row kinds exist:
 //!
-//! - `path_under_tempdir`: the directory as the session header records it
-//!   (no symlink is resolved) lies under the process's temporary directory
-//!   (`TMPDIR`, as given or resolved), or its path matches `pattern`
-//!   (`/tmp`, `/var/folders`) either directly or below the row's
-//!   `alias_root`.
+//! - `path_under_tempdir`: the directory as the session header records it,
+//!   normalized lexically the way POSIX `normpath` does (`.`, `..` and
+//!   repeated slashes collapsed, no symlink resolved), lies under `TMPDIR`
+//!   (as given, normalized the same way, and only when absolute), or matches
+//!   `pattern` (`/tmp`, `/var/folders`) either directly or below the row's
+//!   `alias_root`. A relative directory is under no temporary directory.
 //!
 //!   macOS keeps the real `/tmp` and `/var/folders` under one top-level
 //!   directory and makes the familiar names symlinks into it, so a path
@@ -26,7 +27,7 @@
 //!   `pattern`. With `ancestor_pattern`, an earlier segment must also match
 //!   that.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -112,27 +113,35 @@ fn parse_rules(json: &str) -> Result<Vec<Rule>, String> {
 /// Whether a session whose template came from `template_source_dir` is a
 /// test fixture.
 pub(crate) fn is_fixture(template_source_dir: Option<&Path>) -> bool {
-    is_fixture_with_temp_dir(template_source_dir, &std::env::temp_dir())
+    let tmpdir = std::env::var_os("TMPDIR");
+    is_fixture_with_tmpdir(
+        template_source_dir,
+        tmpdir.as_deref().map(|t| t.to_string_lossy()).as_deref(),
+    )
 }
 
-/// [`is_fixture`] with the process's temporary directory given, so tests
-/// can name one without changing the environment.
-fn is_fixture_with_temp_dir(template_source_dir: Option<&Path>, temp_dir: &Path) -> bool {
+/// [`is_fixture`] with the `TMPDIR` value given, so tests can name one
+/// without changing the environment.
+fn is_fixture_with_tmpdir(template_source_dir: Option<&Path>, tmpdir: Option<&str>) -> bool {
     let Some(dir) = template_source_dir else {
         return false;
     };
-    rules().iter().any(|rule| matches(rule, dir, temp_dir))
+    rules().iter().any(|rule| matches(rule, dir, tmpdir))
 }
 
-fn matches(rule: &Rule, dir: &Path, temp_dir: &Path) -> bool {
+fn matches(rule: &Rule, dir: &Path, tmpdir: Option<&str>) -> bool {
     match rule {
         Rule::UnderTempdir {
             pattern,
             alias_prefix,
         } => {
-            // The path as the session header records it: resolving symlinks
-            // here would classify paths the header's own value doesn't name.
-            let text = dir.to_string_lossy();
+            // The path as the session header records it, normalized only
+            // lexically: resolving symlinks would classify paths the header's
+            // own value doesn't name. A relative path is under no temporary
+            // directory.
+            let Some(text) = normpath(&dir.to_string_lossy()) else {
+                return false;
+            };
             if pattern.is_match(&text) {
                 return true;
             }
@@ -141,9 +150,10 @@ fn matches(rule: &Rule, dir: &Path, temp_dir: &Path) -> bool {
                     return true;
                 }
             }
-            temp_roots(temp_dir)
-                .iter()
-                .any(|root| dir.starts_with(root))
+            // TMPDIR counts as given, and only when it is absolute.
+            tmpdir.and_then(normpath).is_some_and(|root| {
+                text == root || text.starts_with(&format!("{}/", root.trim_end_matches('/')))
+            })
         }
         Rule::Segment { pattern, ancestor } => {
             let segments: Vec<String> = dir
@@ -164,16 +174,30 @@ fn matches(rule: &Rule, dir: &Path, temp_dir: &Path) -> bool {
     }
 }
 
-/// The process's temporary directory, as given and with symlinks resolved,
-/// so a template directory recorded under either spelling of it matches.
-fn temp_roots(temp_dir: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![temp_dir.to_path_buf()];
-    if let Ok(resolved) = std::fs::canonicalize(temp_dir) {
-        if resolved != temp_dir {
-            roots.push(resolved);
+/// POSIX `normpath` on an absolute path: collapse `.`, `..` and repeated
+/// slashes without touching the filesystem. As POSIX allows, exactly two
+/// leading slashes are kept as two; one, or three or more, become one.
+/// `None` for a relative path.
+fn normpath(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let lead = if path.starts_with("//") && !path.starts_with("///") {
+        "//"
+    } else {
+        "/"
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
         }
     }
-    roots
+    Some(format!("{lead}{}", parts.join("/")))
 }
 
 #[cfg(test)]
@@ -193,10 +217,14 @@ mod tests {
         format!("/{MACOS_ALIAS_ROOT}{path}")
     }
 
-    /// Whether `p` is a fixture with `temp_dir` as the process's
-    /// temporary directory.
-    fn fixture_with_temp_dir(p: &str, temp_dir: &str) -> bool {
-        is_fixture_with_temp_dir(Some(Path::new(p)), Path::new(temp_dir))
+    /// Whether `p` is a fixture with `TMPDIR` set to `tmpdir`.
+    fn fixture_with_temp_dir(p: &str, tmpdir: &str) -> bool {
+        is_fixture_with_tmpdir(Some(Path::new(p)), Some(tmpdir))
+    }
+
+    /// Whether `p` is a fixture with `TMPDIR` unset.
+    fn fixture_without_tmpdir(p: &str) -> bool {
+        is_fixture_with_tmpdir(Some(Path::new(p)), None)
     }
 
     #[test]
@@ -270,9 +298,59 @@ mod tests {
             "/elsewhere"
         ));
 
-        // And the real one, whatever it is on this host.
-        let under_temp = std::env::temp_dir().join("no-such-dir-for-run-journal");
-        assert!(is_fixture(Some(&under_temp)));
+        // A relative TMPDIR names nothing.
+        assert!(!fixture_with_temp_dir(
+            "/home/me/scratch-temp/a",
+            "scratch-temp"
+        ));
+        // TMPDIR is matched as given, not resolved, and normalized lexically.
+        assert!(fixture_with_temp_dir(
+            "/home/me/scratch-temp/a",
+            "/home/me/./scratch-temp/"
+        ));
+    }
+
+    #[test]
+    fn paths_are_normalized_lexically_before_matching() {
+        assert!(fixture_without_tmpdir("/home/me/../../tmp/x"));
+        assert!(fixture_without_tmpdir("/tmp/./a//b"));
+        assert!(fixture_without_tmpdir("///tmp/x"), "three slashes are one");
+        assert!(!fixture_without_tmpdir("/tmp/../home/x"));
+        assert!(!fixture_without_tmpdir("//tmp/x"), "two slashes stay two");
+        assert!(!fixture_without_tmpdir("/../tmpx"));
+        assert!(fixture_without_tmpdir("/../tmp"));
+        assert!(fixture_without_tmpdir(&format!(
+            "{}/../../tmp/x",
+            alias("/var")
+        )));
+    }
+
+    #[test]
+    fn a_relative_path_is_under_no_temporary_directory() {
+        assert!(!fixture_without_tmpdir("tmp/x"));
+        assert!(!fixture_without_tmpdir("./tmp/x"));
+        assert!(!fixture_with_temp_dir("scratch/a", "scratch"));
+        // The segment rules still read a relative path's segments.
+        assert!(fixture_without_tmpdir("work/tmp.Ab12Cd/x"));
+    }
+
+    #[test]
+    fn normpath_matches_posix() {
+        for (input, want) in [
+            ("/", "/"),
+            ("//", "//"),
+            ("///", "/"),
+            ("/a/b/..", "/a"),
+            ("/a/./b/", "/a/b"),
+            ("/..", "/"),
+            ("/../a", "/a"),
+            ("//a//b", "//a/b"),
+            ("/a/../../b", "/b"),
+        ] {
+            assert_eq!(normpath(input).as_deref(), Some(want), "{input}");
+        }
+        assert_eq!(normpath("a/b"), None);
+        assert_eq!(normpath(""), None);
     }
 
     #[test]
