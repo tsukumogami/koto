@@ -45,6 +45,17 @@ rationale: |
 
 Planned
 
+**Note (2026-10-09), two departures in the implementation.** The import's
+move into place takes no lock: review found that the staging directory is
+private and complete before the move, and the rename never replaces an
+existing directory (`atomic_rename_dir`), so nothing can open the target
+before it exists and a lock would guard nothing. Step 10 of the import
+sequence below said "under the target's local lock". And
+`SessionBackend::rewrite_header` has a default (rewrite the local file, then
+confirm the push with `ensure_pushed`) instead of a `LocalBackend` override,
+so a future syncing backend pushes header rewrites without overriding it;
+`CloudBackend` overrides it to push the way it pushes events.
+
 ## Context and Problem Statement
 
 The requirements are in `docs/prds/PRD-session-migration.md`; this design
