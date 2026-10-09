@@ -152,19 +152,19 @@ Check that the directory is the one you meant.
 
 `koto session import` moves a cloud-backed session to another workspace, usually on another host, and leaves a `migrated.json` marker beside the old copy in the bucket. The cloud backend checks for it before reading a session, so the old copy refuses instead of forking. Nothing is read or written on the refused call.
 
-`koto next` uses the nested shape:
+`koto next`, `koto status` and the `koto context` commands refuse with this code. Each writes the error to **stdout**, not stderr, and exits 2. `koto next` uses the nested shape:
 
 ```json
 {"error":{"code":"session_migrated","message":"session_migrated: session 'review' was migrated to 'review' in /srv/ws-b; continue it there","details":[]}}
 ```
 
-`koto status` and the `koto context` commands use the flat shape, with the code leading the message:
+`koto status` and the `koto context` commands use the flat shape, with the code leading the message. This refusal is an exception to Shape 2's stderr rule: it goes to stdout like `koto next`'s.
 
 ```json
 {"error":"session_migrated: session 'review' was migrated to 'review' in /srv/ws-b; continue it there","command":"status"}
 ```
 
-All of them exit 2. The remedy is to continue the session where the message says, from that workspace's directory. Don't rebind, re-init or resolve this copy to get past the refusal; advancing both copies would fork the session. If this copy is no longer wanted, `koto session cleanup <name>` in this workspace removes the local copy and the source's objects in the bucket, but keeps the marker. When the import itself is what you're running, its own codes are in `command-reference.md`, "koto session import".
+The remedy is to continue the session where the message says, from that workspace's directory. Don't rebind, re-init or resolve this copy to get past the refusal; advancing both copies would fork the session. If this copy is no longer wanted, `koto session cleanup <name>` in this workspace removes the local copy and the source's objects in the bucket, but keeps the marker. When the import itself is what you're running, its own codes are in `command-reference.md`, "koto session import".
 
 ---
 

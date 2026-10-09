@@ -749,6 +749,8 @@ This is the only verb that changes an anchor, and a real move appends an `execut
 
 The target is canonicalized before it is recorded, so what lands on the header is the form the per-tick check compares against. A `--to` that names nothing, or names a file, is refused and the anchor is left alone. So is an unknown session name. These refusals go to stderr with exit 1, not to a JSON error envelope.
 
+Under the cloud backend the rewritten header is pushed to the bucket, like the event. A failed push doesn't fail the rebind: it succeeds locally, prints a warning to stderr, and the session's next successful push carries the new anchor.
+
 Which refusal you are repairing matters. On the same host, `execution_anchor_unresolvable` leaves rebinding as the only way out short of restoring the tree. `execution_anchor_mismatch` on a checkout that did *not* move means you are simply standing in the wrong place — change directory instead of rebinding, or you will point the session at the wrong tree.
 
 `rebind` is for a checkout that moved on one host. A session that has to continue on another machine, or in another workspace, is moved with `koto session import`, not rebound.
