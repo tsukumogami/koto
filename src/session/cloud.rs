@@ -898,10 +898,15 @@ impl SessionBackend for CloudBackend {
         self.local.read_header(id)
     }
 
-    /// Rewrite the local header, then push the state file. The push is
-    /// best-effort, as `append_event`'s is: a header rewrite follows an
-    /// event that was pushed the same way, and a caller that needs the
-    /// remote copy confirmed follows up with `ensure_pushed`.
+    /// Rewrite the local header, then push the state file through
+    /// `sync_push_state`, the same best-effort push `append_event` makes.
+    ///
+    /// The risk is accepted, not handled: when the push fails (offline, or
+    /// the bucket refuses it) the rewrite stays local and a warning goes to
+    /// stderr. The next successful push of this session carries it; until
+    /// then, a pull from another command can restore the old header. Rebind
+    /// and anchor adoption take that risk; a caller that can't follows up
+    /// with `ensure_pushed`, as the command-environment adoption does.
     fn rewrite_header(
         &self,
         id: &str,

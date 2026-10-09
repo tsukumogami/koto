@@ -3816,6 +3816,7 @@ fn resolve_action_working_dir(
 ///
 /// On failure, returns the message `koto next` reports as a persistence
 /// error.
+// Unix-only because its one caller, `handle_next`, is; elsewhere it'd be dead code.
 #[cfg(unix)]
 fn record_execution_anchor_adoption(
     backend: &dyn SessionBackend,
@@ -4213,11 +4214,7 @@ fn handle_next(
         ExecutionAnchorCheck::Satisfied { anchor } => anchor,
         ExecutionAnchorCheck::Adopt { anchor } => {
             // R14: a session written before anchoring existed adopts
-            // the directory it is ticked from. The event goes down
-            // first so a crash between the two writes repeats a
-            // visible adoption rather than leaving a silent one; the
-            // header field is what makes the next tick take the
-            // ordinary path.
+            // the directory it is ticked from.
             if let Err(message) = record_execution_anchor_adoption(backend, &name, &anchor) {
                 let ne = NextError {
                     code: NextErrorCode::PersistenceError,

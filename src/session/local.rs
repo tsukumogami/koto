@@ -219,15 +219,6 @@ impl SessionBackend for LocalBackend {
         persistence::read_header(&path)
     }
 
-    fn rewrite_header(
-        &self,
-        id: &str,
-        f: &dyn Fn(StateFileHeader) -> StateFileHeader,
-    ) -> anyhow::Result<()> {
-        let path = self.base_dir.join(id).join(state_file_name(id));
-        crate::engine::claim::rewrite_header_atomically(&path, f)
-    }
-
     fn init_state_file(
         &self,
         id: &str,

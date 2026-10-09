@@ -391,22 +391,32 @@ pub trait SessionBackend: Send + Sync {
     /// event log verbatim, and sync the result the way
     /// [`append_event`](Self::append_event) syncs an event.
     ///
-    /// Every header rewrite goes through here. A rewrite that wrote the
-    /// local file directly would be undone on a backend that pulls before
-    /// reading: the remote copy still carries the old header, and the next
-    /// read restores it (koto#310).
+    /// Every header rewrite in the CLI goes through here. A rewrite that
+    /// wrote the local file directly would be undone on a backend that pulls
+    /// before reading: the remote copy still carries the old header, and the
+    /// next read restores it (koto#310). The two rewrites in
+    /// `src/engine/claim.rs` (the assignment claim and the re-delegation
+    /// epoch bump) take a state-file path and no backend; nothing outside
+    /// tests reaches them today.
     ///
     /// The default rewrites the state file under
-    /// [`session_dir`](Self::session_dir) in place (temp file, then
-    /// rename), which is all a backend with no remote half needs. A backend
-    /// that syncs must override it to push the rewritten file.
+    /// [`session_dir`](Self::session_dir) in place (temp file, then rename)
+    /// and then calls [`ensure_pushed`](Self::ensure_pushed), printing a
+    /// warning to stderr if the push fails rather than failing the rewrite,
+    /// as `append_event`'s sync does. A backend with no remote half gets a
+    /// no-op push; one that syncs gets its rewrite pushed without having to
+    /// override this.
     fn rewrite_header(
         &self,
         id: &str,
         f: &dyn Fn(StateFileHeader) -> StateFileHeader,
     ) -> anyhow::Result<()> {
         let path = self.session_dir(id).join(state_file_name(id));
-        crate::engine::claim::rewrite_header_atomically(&path, f)
+        crate::engine::claim::rewrite_header_atomically(&path, f)?;
+        if let Err(e) = self.ensure_pushed(id) {
+            eprintln!("warning: cloud sync failed for state upload: {}", e);
+        }
+        Ok(())
     }
 
     /// Push any pending local state for `id` to durable remote storage
