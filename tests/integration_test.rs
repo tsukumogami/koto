@@ -2397,8 +2397,11 @@ All done.
     );
 
     // The state stops for evidence rather than advancing to a terminal state,
-    // so the session directory is still on disk to compare against.
-    let session_dir = std::fs::canonicalize(sessions_base(dir.path()).join("act-vars-wf")).unwrap();
+    // so the session directory is still on disk. koto renders it from
+    // KOTO_SESSIONS_BASE as given, so compare against that path rather than
+    // a resolved one (on macOS the temp dir resolves through a symlink).
+    let session_dir = sessions_base(dir.path()).join("act-vars-wf");
+    assert!(session_dir.is_dir());
     assert_eq!(
         written,
         format!(

@@ -565,7 +565,7 @@ fn nested_koto_under_the_repeated_notice_condition_completes_and_settles() {
         (cd "$base/abcdef1234567890" && mkdir -p $names)
         koto session list >/dev/null
         koto session list >/dev/null 2>"{second_err}"
-        echo "second-run-bytes=$(wc -c <"{second_err}")"
+        echo "second-run-bytes=$(wc -c <"{second_err}" | tr -d ' ')"
 "#,
         collisions = collisions,
         second_err = dir.path().join("second.err").display(),
