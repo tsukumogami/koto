@@ -8,7 +8,9 @@ checks PR CI does not run, are marked. Paths that carry behavior where no comman
 what they do have their own entry at the end, which makes the gate cannot-verify rather than
 letting the default pass them; this file is knowingly left to the default, since halting every
 map edit would make the map painful to maintain. This file is `@`-imported on every `/work-on`
-run, so it stays short; the reasons are in its commit history.
+run, so it stays short; the reasons are in its commit history. The gate itself reads the JSON
+form, `verification-map.json` beside this file, which carries the CI-mirroring commands only;
+change the two together.
 
 ## Verification map
 
