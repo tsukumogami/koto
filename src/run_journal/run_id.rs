@@ -9,9 +9,19 @@
 //! found by walking `parent_workflow` names up to the root, and is `None`
 //! when a link in that chain is gone: an omitted run id is better than a
 //! wrong one, so a child's run id is never a non-root ancestor's id.
+//!
+//! The walk, and the parent read a new child's lineage starts from, read
+//! headers from this host's store only (see [`local_header`]). They never
+//! go through `SessionBackend::read_header`, which on a cloud store pulls
+//! the remote copy and checks for a migration marker: a lineage lookup
+//! must not cost a round trip per ancestor, and an ancestor that is
+//! missing, unreadable or migrated ends the walk with no run id rather
+//! than an error.
 
+use crate::engine::persistence;
 use crate::engine::types::StateFileHeader;
-use crate::session::SessionBackend;
+use crate::session::validate::validate_session_id;
+use crate::session::{state_file_name, SessionBackend};
 
 use super::sidecar;
 
@@ -25,6 +35,16 @@ fn id(value: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// The header of session `name` as this host's store holds it, read
+/// straight from the state file under `backend.session_dir(name)`. `None`
+/// when the name isn't a valid session id or the file is missing or
+/// unreadable; nothing here reaches a remote store.
+fn local_header(backend: &dyn SessionBackend, name: &str) -> Option<StateFileHeader> {
+    validate_session_id(name).ok()?;
+    let path = backend.session_dir(name).join(state_file_name(name));
+    persistence::read_header(&path).ok()
 }
 
 /// The run id recorded in, or implied by, `header` alone: its
@@ -54,17 +74,15 @@ pub(crate) fn run_id(backend: &dyn SessionBackend, header: &StateFileHeader) -> 
     walk(backend, header.parent_workflow.as_deref())
 }
 
-/// Walk `parent_workflow` names from `start` to the root. An ancestor that
-/// recorded its root, or cached a run id in its sidecar, ends the walk
-/// early.
+/// Walk `parent_workflow` names from `start` to the root, reading each
+/// ancestor's header from the local store. An ancestor that recorded its
+/// root, or cached a run id in its sidecar, ends the walk early; one whose
+/// header can't be read locally ends it with no run id.
 fn walk(backend: &dyn SessionBackend, start: Option<&str>) -> Option<String> {
     let mut next = start.map(str::to_string);
     for _ in 0..MAX_WALK {
         let name = next?;
-        if !backend.exists(&name) {
-            return None;
-        }
-        let header = backend.read_header(&name).ok()?;
+        let header = local_header(backend, &name)?;
         if let Some(found) = from_header_alone(&header) {
             return found;
         }
@@ -81,13 +99,15 @@ fn walk(backend: &dyn SessionBackend, start: Option<&str>) -> Option<String> {
 ///
 /// The root is the parent's recorded root when it has one, the parent
 /// itself when it has no parent, and otherwise (a parent created by an
-/// older koto) the parent's cached run id or the walk above it. Either
-/// value is `None` when it can't be resolved; nothing here fails a spawn.
+/// older koto) the parent's cached run id or the walk above it. The
+/// parent's header, like every ancestor's, is read from the local store.
+/// Either value is `None` when it can't be resolved; nothing here fails a
+/// spawn.
 pub(crate) fn child_lineage(
     backend: &dyn SessionBackend,
     parent: &str,
 ) -> (Option<String>, Option<String>) {
-    let Ok(parent_header) = backend.read_header(parent) else {
+    let Some(parent_header) = local_header(backend, parent) else {
         return (None, None);
     };
     let parent_id = id(&parent_header.session_id);

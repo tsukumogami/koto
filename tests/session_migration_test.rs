@@ -1900,3 +1900,105 @@ fn an_import_journals_a_new_run_on_the_importing_host() {
     assert_eq!(started["koto.fixture"], true);
     assert!(started.get("koto.parent.session.id").is_none());
 }
+
+/// A new child's lineage is read from the local store only. Under a parent
+/// created by an older koto (no `root_session_id`, no cached run id), the
+/// walk up to the root reads the root's header from this host's copy: no
+/// request touches the root's remote prefix, neither the state pull nor
+/// the migration-marker listing a backend header read would make.
+#[test]
+fn a_childs_lineage_walk_reads_ancestors_locally_and_asks_the_remote_nothing() {
+    let s3 = FakeS3::start(BUCKET);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = Host::new(tmp.path(), "a", &cloud(&s3));
+    let template = a.ws.join(migration_carrier::TEMPLATE_FILE);
+    let template = template.to_str().unwrap();
+    let run = a.koto(&["init", "lroot", "--template", template]);
+    assert!(run.ok(), "init lroot: {}", run.describe());
+    let run = a.koto(&[
+        "init",
+        "lroot.mid",
+        "--template",
+        template,
+        "--parent",
+        "lroot",
+    ]);
+    assert!(run.ok(), "init lroot.mid: {}", run.describe());
+    let root_id = a.header("lroot")["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Make the middle session look like an older koto's, locally and in
+    // its remote copy, so a pull can't bring the lineage fields back.
+    let mut lines = a.state_lines("lroot.mid");
+    let mut header: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    let obj = header.as_object_mut().unwrap();
+    obj.remove("root_session_id");
+    obj.remove("parent_session_id");
+    lines[0] = serde_json::to_string(&header).unwrap();
+    let bytes = lines.join("\n") + "\n";
+    std::fs::write(a.state_path("lroot.mid"), &bytes).unwrap();
+    s3.put(
+        &format!(
+            "{}koto-lroot.mid.state.jsonl",
+            session_prefix(&a, "lroot.mid")
+        ),
+        bytes.as_bytes(),
+    );
+    let _ = std::fs::remove_file(a.session_dir("lroot.mid").join("run-journal.json"));
+
+    s3.clear_requests();
+    let run = a.koto(&[
+        "init",
+        "lroot.leaf",
+        "--template",
+        template,
+        "--parent",
+        "lroot.mid",
+    ]);
+    assert!(run.ok(), "init lroot.leaf: {}", run.describe());
+    assert_eq!(
+        a.header("lroot.leaf")["root_session_id"],
+        root_id.as_str(),
+        "the walk found the root"
+    );
+    let root_prefix = session_prefix(&a, "lroot");
+    let touched: Vec<String> = s3
+        .requests()
+        .iter()
+        .filter(|r| {
+            r.key.starts_with(&root_prefix)
+                || r.list_prefix
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with(&root_prefix))
+        })
+        .map(describe)
+        .collect();
+    assert_eq!(touched, Vec::<String>::new());
+
+    // With the root's local copy gone, the walk stops quietly: the spawn
+    // still succeeds, with no root recorded, and still asks the remote
+    // nothing about the root.
+    std::fs::remove_dir_all(a.session_dir("lroot")).unwrap();
+    s3.clear_requests();
+    let run = a.koto(&[
+        "init",
+        "lroot.leaf2",
+        "--template",
+        template,
+        "--parent",
+        "lroot.mid",
+    ]);
+    assert!(run.ok(), "init lroot.leaf2: {}", run.describe());
+    let leaf2 = a.header("lroot.leaf2");
+    assert!(leaf2.get("root_session_id").is_none(), "{leaf2}");
+    assert_eq!(
+        leaf2["parent_session_id"],
+        a.header("lroot.mid")["session_id"]
+    );
+    assert!(s3
+        .requests()
+        .iter()
+        .all(|r| !r.key.starts_with(&root_prefix)));
+}
