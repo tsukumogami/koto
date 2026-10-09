@@ -9322,4 +9322,52 @@ Done.
             expected_command
         );
     }
+
+    /// The first tick of a session with no anchor adopts one. On the cloud
+    /// backend the adopted header has to reach the remote copy, or the next
+    /// tick's pull drops it and the session adopts again (koto#310's
+    /// pattern on the adoption path).
+    #[cfg(unix)]
+    #[test]
+    fn a_cloud_first_tick_adoption_pushes_the_anchor_and_the_next_tick_keeps_it() {
+        use crate::engine::template_source_status::{check_execution_anchor, ExecutionAnchorCheck};
+        use crate::session::cloud::test_support::{
+            cloud_backend_at, header_of, seed_session, serve, state_key_suffix,
+        };
+
+        let sessions = tempfile::TempDir::new().unwrap();
+        let checkout = tempfile::TempDir::new().unwrap();
+        let anchor = std::fs::canonicalize(checkout.path()).unwrap();
+
+        let seeded = seed_session(sessions.path(), "wf", None);
+        let endpoint = serve(vec![(state_key_suffix("wf"), seeded)]);
+        let backend = Backend::Cloud(cloud_backend_at(sessions.path(), endpoint.url.clone()));
+
+        record_execution_anchor_adoption(&backend, "wf", &anchor).unwrap();
+
+        let pushed = endpoint
+            .last_put(&state_key_suffix("wf"))
+            .expect("adoption pushed the state file");
+        assert_eq!(
+            header_of(&pushed).execution_dir,
+            Some(anchor.clone()),
+            "the last state push carries the adopted anchor"
+        );
+
+        // The next tick's pulling read finds the anchor and takes the
+        // ordinary path instead of adopting again.
+        let (header, events) = backend.read_events("wf").unwrap();
+        assert_eq!(header.execution_dir, Some(anchor.clone()));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.payload, EventPayload::ExecutionAnchorAdopted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            check_execution_anchor(header.execution_dir.as_deref(), checkout.path()),
+            ExecutionAnchorCheck::Satisfied { anchor }
+        );
+    }
 }
