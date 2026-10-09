@@ -402,10 +402,11 @@ pub trait SessionBackend: Send + Sync {
     /// The default rewrites the state file under
     /// [`session_dir`](Self::session_dir) in place (temp file, then rename)
     /// and then calls [`ensure_pushed`](Self::ensure_pushed), printing a
-    /// warning to stderr if the push fails rather than failing the rewrite,
-    /// as `append_event`'s sync does. A backend with no remote half gets a
-    /// no-op push; one that syncs gets its rewrite pushed without having to
-    /// override this.
+    /// warning to stderr if the push fails rather than failing the rewrite.
+    /// A backend with no remote half gets a no-op push. A backend that syncs
+    /// gets its rewrite pushed through its strict push, which is enough to
+    /// keep the rewrite from being lost; it overrides this only to push the
+    /// way its other writes do, as `CloudBackend` does.
     fn rewrite_header(
         &self,
         id: &str,
@@ -414,7 +415,7 @@ pub trait SessionBackend: Send + Sync {
         let path = self.session_dir(id).join(state_file_name(id));
         crate::engine::claim::rewrite_header_atomically(&path, f)?;
         if let Err(e) = self.ensure_pushed(id) {
-            eprintln!("warning: cloud sync failed for state upload: {}", e);
+            eprintln!("warning: session sync failed for state upload: {}", e);
         }
         Ok(())
     }

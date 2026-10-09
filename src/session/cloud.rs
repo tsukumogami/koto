@@ -935,6 +935,12 @@ impl SessionBackend for CloudBackend {
     /// Rewrite the local header, then push the state file through
     /// `sync_push_state`, the same best-effort push `append_event` makes.
     ///
+    /// Overridden rather than left to the trait default, which pushes
+    /// through `ensure_pushed` (the strict probe built for "push parent
+    /// before child mutation" ordering) and turns its error into a warning.
+    /// Going through `sync_push_state` keeps a header rewrite on the same
+    /// push path, and the same warning, as the event write it follows.
+    ///
     /// The risk is accepted, not handled: when the push fails (offline, or
     /// the bucket refuses it) the rewrite stays local and a warning goes to
     /// stderr. The next successful push of this session carries it; until
