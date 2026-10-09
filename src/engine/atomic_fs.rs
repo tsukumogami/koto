@@ -212,7 +212,7 @@ pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
 
 /// Route `EEXIST` to [`AtomicCreateError::Collision`] and everything
 /// else to the I/O bucket.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn from_io(e: std::io::Error) -> AtomicCreateError {
     if e.kind() == std::io::ErrorKind::AlreadyExists {
         AtomicCreateError::Collision
