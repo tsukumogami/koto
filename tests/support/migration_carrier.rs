@@ -197,6 +197,7 @@ impl Host {
 
     pub fn cmd(&self) -> Command {
         let mut cmd = Command::cargo_bin("koto").unwrap();
+        cmd.env_remove("CLAUDE_CODE_SESSION_ID");
         cmd.current_dir(&self.ws)
             .env("HOME", &self.home)
             .env("XDG_CACHE_HOME", &self.cache)

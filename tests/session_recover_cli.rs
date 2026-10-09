@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 /// and its migration run against a controlled `~/.koto/sessions/`.
 fn koto_at_home(home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.env("HOME", home);
     cmd.env_remove("KOTO_SESSIONS_BASE");
     cmd

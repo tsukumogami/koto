@@ -809,9 +809,10 @@ fn validate_compiled_template(path: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
-/// The root the decider ledger is written under (`~/.koto`), or `None` when
-/// there is no home directory, in which case each ledger write warns.
-pub(super) fn ledger_root() -> Option<PathBuf> {
+/// The root the decider ledger and the run journal are written under
+/// (`~/.koto`), or `None` when there is no home directory, in which case
+/// each ledger write warns (the run journal warns once per process).
+pub(crate) fn ledger_root() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".koto"))
 }
 
@@ -896,7 +897,8 @@ fn handle_workflows_action(action: WorkflowsAction) -> Result<()> {
 /// Build the local backend, honoring `KOTO_SESSIONS_BASE` for testing.
 pub(crate) fn build_local_backend() -> Result<LocalBackend> {
     if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
-        Ok(LocalBackend::with_base_dir(PathBuf::from(base)))
+        // A redirected store is still the CLI's own: journal it.
+        Ok(LocalBackend::with_base_dir(PathBuf::from(base)).with_run_journal())
     } else {
         LocalBackend::new()
     }
@@ -3144,6 +3146,9 @@ fn finish_terminal_tick(
     // arrival (see the doc comment).
     let mut defer_for_parent = false;
     if arrival {
+        // The run journal's `terminal` record, once per arrival and before
+        // any cleanup below, so it survives the session's removal.
+        crate::run_journal::terminal(backend, name, header, final_state);
         // Re-read so the index classifier sees a mid-tick `WorkflowCancelled`.
         let post_events = backend
             .read_events(name)
@@ -7916,6 +7921,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         }
     }
@@ -8603,6 +8610,8 @@ Done.
                     deadline: None,
                     retry_count: None,
                     agent_config: None,
+                    root_session_id: None,
+                    parent_session_id: None,
                     respawn_generation: None,
                 },
                 vec![],

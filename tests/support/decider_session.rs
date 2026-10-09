@@ -223,6 +223,7 @@ impl Harness {
     /// A `koto` command with no decider env set at all.
     pub fn koto(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_koto"));
+        cmd.env_remove("CLAUDE_CODE_SESSION_ID");
         cmd.current_dir(&self.dir);
         cmd.env("HOME", self.home());
         cmd.env("KOTO_SESSIONS_BASE", self.dir.join("sessions"));

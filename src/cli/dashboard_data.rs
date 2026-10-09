@@ -583,6 +583,8 @@ fn make_empty_header() -> StateFileHeader {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        root_session_id: None,
+        parent_session_id: None,
     }
 }
 
@@ -988,6 +990,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
         }
     }
 
@@ -1731,6 +1735,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         append_header(&state_path, &header).unwrap();

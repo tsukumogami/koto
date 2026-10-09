@@ -4,7 +4,9 @@
 //!
 //! [`append_bounded_line`] is the append discipline the workspace-wide
 //! JSONL files share: the terminal index (`_terminal_index.jsonl`) and the
-//! decider ledger (`_decider_ledger.jsonl`).
+//! decider ledger (`_decider_ledger.jsonl`). The run journal
+//! (`_run_journal.jsonl`) uses [`append_bounded_line_no_follow`], the same
+//! discipline with symlinks refused.
 //!
 //! ## Atomicity
 //!
@@ -78,6 +80,59 @@ pub fn append_bounded_line(dir: &Path, path: &Path, line: &str, max: usize) -> R
     Ok(())
 }
 
+/// [`append_bounded_line`] for a file that must not be reached through a
+/// symlink.
+///
+/// The run journal (`_run_journal.jsonl`) uses it: on unix the file is
+/// opened with `O_NOFOLLOW`, so a symlink planted at `path` makes the open
+/// fail instead of appending to whatever the link points at. Everything
+/// else -- the bound, the single `O_APPEND` write, mode 0600 on create --
+/// is the same as [`append_bounded_line`].
+pub fn append_bounded_line_no_follow(
+    dir: &Path,
+    path: &Path,
+    line: &str,
+    max: usize,
+) -> Result<()> {
+    let len = line.len() + 1;
+    if len > max {
+        anyhow::bail!(
+            "line for {} exceeds the PIPE_BUF append bound ({} bytes > {})",
+            path.display(),
+            len,
+            max
+        );
+    }
+
+    if !dir.exists() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+
+    let mut buf = String::with_capacity(len);
+    buf.push_str(line);
+    buf.push('\n');
+
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    // O_APPEND: the kernel picks the offset per write. Never seek() or
+    // write_at() on this handle.
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to open {} for append", path.display()))?;
+    file.write_all(buf.as_bytes())
+        .with_context(|| format!("failed to append to {}", path.display()))?;
+    file.sync_data()
+        .with_context(|| format!("failed to fsync {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +183,33 @@ mod tests {
         let mode = std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
         assert_eq!(std::fs::read_to_string(&existing).unwrap(), "{}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_follow_refuses_a_symlink_and_leaves_its_target_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.txt");
+        std::fs::write(&target, "untouched\n").unwrap();
+        let link = tmp.path().join("journal.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = append_bounded_line_no_follow(tmp.path(), &link, "{}", 4096).unwrap_err();
+        assert!(err.to_string().contains("failed to open"), "{}", err);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched\n");
+
+        // A regular file is appended to and created 0600, as with the
+        // following variant.
+        let fresh = tmp.path().join("fresh.jsonl");
+        append_bounded_line_no_follow(tmp.path(), &fresh, "{}", 4096).unwrap();
+        append_bounded_line_no_follow(tmp.path(), &fresh, "{}", 4096).unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "{}\n{}\n");
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let err = append_bounded_line_no_follow(tmp.path(), &fresh, "123456789", 9).unwrap_err();
+        assert!(err.to_string().contains("10 bytes > 9"), "{}", err);
     }
 
     #[test]

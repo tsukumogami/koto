@@ -29,6 +29,13 @@ pub(crate) const INIT_TMP_SUFFIX: &str = ".tmp";
 /// `~/.koto/sessions/`.
 pub struct LocalBackend {
     base_dir: PathBuf,
+    /// Whether this store's sessions are recorded in the run journal. On
+    /// for the user's store ([`LocalBackend::new`]) and for the store the
+    /// koto CLI opens; off for a store built with
+    /// [`LocalBackend::with_base_dir`] unless it opts in with
+    /// [`LocalBackend::with_run_journal`], so tests and embedders that
+    /// keep sessions elsewhere don't write the user's journal.
+    run_journal: bool,
 }
 
 impl LocalBackend {
@@ -41,14 +48,27 @@ impl LocalBackend {
             .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
         let base_dir = home.join(".koto").join("sessions");
         migrate_if_needed(&base_dir);
-        Ok(Self { base_dir })
+        Ok(Self {
+            base_dir,
+            run_journal: true,
+        })
     }
 
     /// Create a backend with an explicit base directory.
     ///
     /// Intended for tests that need to control the storage location.
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+        Self {
+            base_dir,
+            run_journal: false,
+        }
+    }
+
+    /// Record this store's sessions in the run journal (see
+    /// `crate::run_journal`), as [`LocalBackend::new`] does.
+    pub fn with_run_journal(mut self) -> Self {
+        self.run_journal = true;
+        self
     }
 
     /// The directory sessions are stored under.
@@ -62,6 +82,10 @@ impl LocalBackend {
 }
 
 impl SessionBackend for LocalBackend {
+    fn run_journal_enabled(&self) -> bool {
+        self.run_journal
+    }
+
     fn create(&self, id: &str) -> anyhow::Result<PathBuf> {
         validate_session_id(id)?;
         let dir = self.base_dir.join(id);
@@ -201,6 +225,9 @@ impl SessionBackend for LocalBackend {
     ) -> anyhow::Result<()> {
         let path = self.base_dir.join(id).join(state_file_name(id));
         persistence::append_event(&path, payload, timestamp)?;
+        // Journal the committed payload (best-effort, after the commit, so a
+        // failed append above never writes a record). See `crate::run_journal`.
+        crate::run_journal::after_commit(self, id, payload);
         // Materialize the native Claude Code `/workflows` artifact off the one
         // commit funnel (opt-in, best-effort: never fails the commit). `self`
         // is both the SessionBackend (header chain) and the ContextStore
@@ -300,7 +327,12 @@ impl SessionBackend for LocalBackend {
         let (_file, tmp_path) = tmp.keep().map_err(|e| SessionError::Io(e.error))?;
 
         match atomic_create_rename(&tmp_path, &target) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // The session now exists: journal its creation and initial
+                // state (best-effort, never fails the init).
+                crate::run_journal::after_init(self, id, &header, &initial_events);
+                Ok(())
+            }
             Err(e) => {
                 // On every error path the tempfile is still at `tmp_path`
                 // (renameat2/link/rename leave the source untouched on
@@ -1002,6 +1034,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
@@ -1042,6 +1076,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
@@ -1653,6 +1689,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let events = vec![
@@ -1758,6 +1796,8 @@ mod tests {
                     deadline: None,
                     retry_count: None,
                     agent_config: None,
+                    root_session_id: None,
+                    parent_session_id: None,
                     respawn_generation: None,
                 };
                 let events = vec![Event {
@@ -2256,6 +2296,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
@@ -2400,6 +2442,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();

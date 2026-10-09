@@ -642,6 +642,7 @@ fn import_refuses_a_manifest_entry_with_no_content_object() {
 fn import_help_states_the_stopped_source_rule() {
     let output = assert_cmd::Command::cargo_bin("koto")
         .unwrap()
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["session", "import", "--help"])
         .output()
         .unwrap();
@@ -655,4 +656,78 @@ fn import_help_states_the_stopped_source_rule() {
     ] {
         assert!(help.contains(phrase), "help lacks {phrase:?}:\n{help}");
     }
+}
+
+/// Lines of a host's run journal, as JSON.
+fn run_journal(host: &Host) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(host.home.join(".koto").join("_run_journal.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// An import journals one `session_started` for a new run on the importing
+/// host: its new id as both session and run id, the source's id as
+/// `imported_from`, the importing command's driver, and the source's
+/// template identity. None of the source's records are copied.
+#[test]
+fn an_import_journals_a_new_run_on_the_importing_host() {
+    let s3 = FakeS3::start(BUCKET);
+    let root = tempfile::TempDir::new().unwrap();
+    let cloud = cloud(&s3);
+    let a = Host::new(root.path(), "a", &cloud);
+    let b = Host::new(root.path(), "b", &cloud);
+    let c = Host::new(root.path(), "c", &cloud);
+    let name = "journaled";
+    let mut carrier = Carrier::new(&a, &b, &c, name);
+    carrier.init_a();
+    let source_header = a.header(name);
+    let source_id = source_header["session_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        run_journal(&a).len(),
+        2,
+        "A's own session_started and state"
+    );
+
+    carrier.compile_on("import", &b);
+    let output = b
+        .cmd()
+        .env("CLAUDE_CODE_SESSION_ID", "driver-b")
+        .args(["session", "import", name, "--from", &a.ws_str()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "import: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let header = b.header(name);
+    let new_id = header["session_id"].as_str().unwrap();
+    assert_ne!(new_id, source_id);
+    assert!(header.get("root_session_id").is_none());
+    assert!(header.get("parent_session_id").is_none());
+
+    let journal = run_journal(&b);
+    assert_eq!(journal.len(), 1, "only the import's record: {journal:?}");
+    let started = &journal[0];
+    assert_eq!(started["kind"], "session_started");
+    assert_eq!(started["session"], name);
+    assert_eq!(started["koto.session.id"], new_id);
+    assert_eq!(started["koto.run.id"], new_id);
+    assert_eq!(started["imported_from"], source_id.as_str());
+    assert_eq!(started["koto.driver.session.id"], "driver-b");
+    assert_eq!(
+        started["koto.template.name"],
+        source_header["template_name"]
+    );
+    assert_eq!(
+        started["koto.template.hash"],
+        source_header["template_hash"]
+    );
+    // The template source directory is under this test's temporary root,
+    // so the importing host classifies the session as a fixture.
+    assert_eq!(started["koto.fixture"], true);
+    assert!(started.get("koto.parent.session.id").is_none());
 }

@@ -1,0 +1,27 @@
+[
+  {
+    "rule": "temporary_directory",
+    "kind": "path_under_tempdir",
+    "field": "template_source_dir",
+    "pattern": "^(/private)?/(tmp|var/folders)(/|$)"
+  },
+  {
+    "rule": "mktemp_directory",
+    "kind": "path_segment_regex",
+    "field": "template_source_dir",
+    "pattern": "^tmp\\.[A-Za-z0-9]{6,}$"
+  },
+  {
+    "rule": "ablation_directory",
+    "kind": "path_segment_regex",
+    "field": "template_source_dir",
+    "pattern": "^shirabe-ablation\\."
+  },
+  {
+    "rule": "tool_test_directory",
+    "kind": "path_segment_regex",
+    "field": "template_source_dir",
+    "pattern": "^tests?$",
+    "ancestor_pattern": "^(koto|niwa|shirabe)$"
+  }
+]

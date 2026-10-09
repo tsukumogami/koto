@@ -641,7 +641,17 @@ fn an_uncreatable_koto_dir_warns_and_changes_nothing_else() {
 
     let h = ready(&standard("shadow", "shadow"), vec![go()]);
     let home = h.home();
-    assert!(!home.join(".koto").exists());
+    // Creating the session wrote the run journal, the only thing in the
+    // koto home so far; take it away so the home has no koto dir again.
+    let koto_dir = home.join(".koto");
+    let entries: Vec<_> = std::fs::read_dir(&koto_dir)
+        .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        entries,
+        vec![std::ffi::OsString::from("_run_journal.jsonl")]
+    );
+    std::fs::remove_dir_all(&koto_dir).unwrap();
     std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
     let out = h.next_mode("shadow");
     std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();

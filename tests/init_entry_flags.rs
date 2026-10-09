@@ -17,6 +17,7 @@ use assert_fs::TempDir;
 
 fn koto_cmd(home: &Path, cwd: &Path) -> Command {
     let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(cwd);
     cmd.env("HOME", home);
     cmd.env("KOTO_SESSIONS_BASE", home.join("sessions"));

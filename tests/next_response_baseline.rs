@@ -280,6 +280,7 @@ fn koto_cmd(dir: &Path) -> Command {
     let sessions = dir.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions);
     cmd.env("HOME", dir);

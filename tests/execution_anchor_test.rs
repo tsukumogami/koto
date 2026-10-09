@@ -32,6 +32,7 @@ fn sessions_base(home: &Path) -> PathBuf {
 /// whose session storage is rooted at `home`.
 fn koto_cmd(home: &Path, cwd: &Path) -> Command {
     let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(cwd);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(home));
     cmd.env("HOME", home);

@@ -803,6 +803,10 @@ impl SessionBackend for CloudBackend {
         self.local.session_dir(id)
     }
 
+    fn run_journal_enabled(&self) -> bool {
+        self.local.run_journal_enabled()
+    }
+
     fn store_identity(&self) -> Option<crate::engine::types::SessionStoreIdentity> {
         let base = self.local.base_dir();
         Some(crate::engine::types::SessionStoreIdentity {
@@ -1587,6 +1591,10 @@ impl CloudBackend {
             let mut header = source.header.clone();
             header.workflow = name.to_string();
             header.session_id = session_id.clone();
+            // An import starts a new run: the source's lineage doesn't carry
+            // over, and its id is journaled as `imported_from` instead.
+            header.root_session_id = None;
+            header.parent_session_id = None;
             header.execution_dir = Some(anchor.to_path_buf());
             header.origin = self.store_identity().map(|store| SessionOrigin {
                 anchor: anchor.to_path_buf(),
@@ -1681,6 +1689,13 @@ impl CloudBackend {
                 ));
             }
             pushed.push(key);
+        }
+
+        // The session is built here and pushed: journal it as a new run.
+        // This sits before the marker because a marker failure leaves the
+        // imported session in place.
+        if let Ok(header) = self.local.read_header(name) {
+            crate::run_journal::imported(&self.local, name, &header, &source.header.session_id);
         }
 
         // 8. Mark the source last, so every failure before this point left
@@ -1839,6 +1854,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         append_header(&state_path, &header).unwrap();
@@ -1945,6 +1962,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let events = vec![Event {
@@ -2001,6 +2020,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let events = vec![Event {
@@ -2060,6 +2081,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let events = vec![Event {

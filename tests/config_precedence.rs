@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 /// discovered relative to that directory).
 fn koto_cmd(home_dir: &Path, cwd_dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(cwd_dir);
     cmd.env("HOME", home_dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(cwd_dir));
@@ -199,6 +200,7 @@ fn cli_flag_overrides_env_var_in_koto_next() {
     // when downstream consumer issues land).
     let output = Command::cargo_bin("koto")
         .unwrap()
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["next", "--help"])
         .output()
         .unwrap();
@@ -216,6 +218,7 @@ fn only_redelegation_cap_is_cli_overridable() {
     // flags at V1 (Decision 4: --redelegation-cap is the only one).
     let output = Command::cargo_bin("koto")
         .unwrap()
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["next", "--help"])
         .output()
         .unwrap();

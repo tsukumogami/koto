@@ -87,6 +87,8 @@ fn make_header(workflow: &str, role: Option<&str>) -> StateFileHeader {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        root_session_id: None,
+        parent_session_id: None,
     }
 }
 

@@ -54,6 +54,7 @@ impl Env {
 
     fn koto(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_koto"));
+        cmd.env_remove("CLAUDE_CODE_SESSION_ID");
         cmd.env_clear()
             .current_dir(self.path())
             .env("PATH", "/usr/bin:/bin")

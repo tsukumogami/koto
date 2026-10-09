@@ -38,6 +38,8 @@ fn full_header() -> StateFileHeader {
         deadline: Some("2026-05-24T01:00:00Z".to_string()),
         retry_count: Some(2),
         agent_config: Some(serde_json::json!({"timeout": "1h"})),
+        root_session_id: None,
+        parent_session_id: None,
         respawn_generation: None,
     }
 }
@@ -169,6 +171,8 @@ fn none_valued_request_store_fields_produce_no_keys_on_the_wire() {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        root_session_id: None,
+        parent_session_id: None,
         respawn_generation: None,
     };
     let json = serde_json::to_string(&header).expect("serialize");

@@ -434,6 +434,7 @@ fn a_compiled_check_with_no_spec_is_refused_on_load() {
     let path = dir.path().join("t.json");
     std::fs::write(&path, &text).unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_koto"))
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["template", "validate"])
         .arg(&path)
         .output()

@@ -1882,6 +1882,7 @@ fn validate_feed_accepts_a_log_with_decider_events() {
     let spec =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/reference/session-feed.md");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_koto"))
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["template", "validate-feed"])
         .arg(&log)
         .env("KOTO_FEED_SPEC", &spec)

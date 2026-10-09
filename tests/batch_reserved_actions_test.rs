@@ -29,6 +29,7 @@ fn sessions_base(dir: &Path) -> PathBuf {
 
 fn koto_cmd(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
     cmd.env("HOME", dir);
@@ -126,6 +127,7 @@ fn run_invocation(dir: &Path, invocation: &str) -> serde_json::Value {
         .env("PATH", path)
         .env("KOTO_SESSIONS_BASE", sessions_base(dir))
         .env("HOME", dir)
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

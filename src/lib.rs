@@ -11,7 +11,9 @@ pub mod export;
 pub mod findings;
 #[cfg(unix)]
 pub mod gate;
+pub(crate) mod host_env;
 pub mod redact;
+pub(crate) mod run_journal;
 pub mod session;
 pub mod template;
 pub mod workflows_surface;

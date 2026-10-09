@@ -313,6 +313,11 @@ pub fn handle_start(
     )
     .map_err(|msg| anyhow::anyhow!(msg))?;
 
+    // The session's run identity, fixed now from the parent's header (see
+    // `crate::run_journal`).
+    let (root_session_id, parent_session_id) =
+        crate::run_journal::child_lineage(backend, validated_parent.as_str());
+
     // -- Compose the header --
     let ts = now_iso8601();
     let template_name = template.map(|s| s.to_string());
@@ -342,6 +347,8 @@ pub fn handle_start(
         deadline: None,
         retry_count: None,
         agent_config: None,
+        root_session_id,
+        parent_session_id,
         respawn_generation: None,
     };
 

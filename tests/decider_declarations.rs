@@ -344,6 +344,7 @@ fn misspelled_key_is_named_by_koto_template_compile() {
     .unwrap();
     let out = assert_cmd::Command::cargo_bin("koto")
         .unwrap()
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .env("XDG_CACHE_HOME", dir.path().join("cache"))
         .env("HOME", dir.path())
         .args(["template", "compile", src.to_str().unwrap()])
@@ -1076,6 +1077,7 @@ fn koto_next_and_status_carry_the_descriptions() {
     let koto = |args: &[&str]| {
         let out = assert_cmd::Command::cargo_bin("koto")
             .unwrap()
+            .env_remove("CLAUDE_CODE_SESSION_ID")
             .current_dir(d)
             .env("HOME", d)
             .env("XDG_CACHE_HOME", d.join("cache"))

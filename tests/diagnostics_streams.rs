@@ -13,6 +13,7 @@ use std::path::Path;
 /// that override bypasses the migration path this test exercises.
 fn koto_at_home(home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.env("HOME", home);
     cmd.env_remove("KOTO_SESSIONS_BASE");
     cmd

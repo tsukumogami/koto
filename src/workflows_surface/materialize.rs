@@ -33,10 +33,11 @@ const PREVIEW_MAX: usize = 240;
 /// `SessionStart` hook hands koto the session's `/workflows` directory.
 pub const WORKFLOWS_DIR_ENV: &str = "KOTO_WORKFLOWS_DIR";
 
-/// Environment variable Claude Code sets to the viewing session's id in every
-/// subprocess. Under `workflows.native` (default on), koto self-discovers the
-/// session's `/workflows` directory from it -- no `SessionStart` hook required.
-const CLAUDE_SESSION_ID_ENV: &str = "CLAUDE_CODE_SESSION_ID";
+// `CLAUDE_SESSION_ID_ENV` is the variable Claude Code sets to the viewing
+// session's id in every subprocess. Under `workflows.native` (default on),
+// koto self-discovers the session's `/workflows` directory from it -- no
+// `SessionStart` hook required.
+use crate::host_env::{host_env, CLAUDE_SESSION_ID_ENV};
 
 /// Materialize `session_id`'s `/workflows` artifact after a state-commit.
 ///
@@ -250,40 +251,6 @@ fn preview(s: &str) -> String {
 ///
 /// `None` means no target resolved: write nothing, default path untouched
 /// (fully headless, or opted out).
-/// A variable the hosting Claude Code session hands koto.
-#[cfg(not(test))]
-fn host_env(name: &str) -> Option<String> {
-    std::env::var(name).ok()
-}
-
-/// In unit tests the host's variables are never read from the process
-/// environment: a test run inside a Claude Code session would otherwise
-/// discover that session's real `/workflows` directory, write into it, and
-/// publish a location whose logged write changes the events the test counts.
-/// A test that wants a host variable sets it with [`set_host_env_for_test`].
-#[cfg(test)]
-fn host_env(name: &str) -> Option<String> {
-    HOST_ENV.with(|m| m.borrow().get(name).cloned())
-}
-
-#[cfg(test)]
-thread_local! {
-    static HOST_ENV: std::cell::RefCell<std::collections::HashMap<String, String>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// Set (or with `None`, clear) a host variable for this thread's unit tests.
-#[cfg(test)]
-pub(crate) fn set_host_env_for_test(name: &str, value: Option<&str>) {
-    HOST_ENV.with(|m| {
-        let mut m = m.borrow_mut();
-        match value {
-            Some(v) => m.insert(name.to_string(), v.to_string()),
-            None => m.remove(name),
-        };
-    });
-}
-
 fn resolve_target_dir(
     backend: &dyn SessionBackend,
     store: &dyn ContextStore,
@@ -413,6 +380,7 @@ fn atomic_write(dir: &Path, target: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::engine::types::{Event, EventPayload, StateFileHeader};
+    use crate::host_env::set_host_env_for_test;
     use crate::session::local::LocalBackend;
     use tempfile::TempDir;
 
