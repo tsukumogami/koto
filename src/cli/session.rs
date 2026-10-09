@@ -527,9 +527,7 @@ pub fn handle_update(backend: &dyn SessionBackend, name: &str, intent: &str) -> 
 /// nothing and reports `rebound: false`. The event means the anchor
 /// moved; a no-op invocation did not move it.
 pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>) -> Result<()> {
-    use crate::engine::claim::rewrite_header_atomically;
     use crate::engine::types::{now_iso8601, EventPayload};
-    use crate::session::state_file_name;
     use anyhow::Context;
     use std::path::PathBuf;
 
@@ -592,17 +590,18 @@ pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>)
     };
     backend.append_event(name, &payload, &now_iso8601())?;
 
-    let state_path = backend.session_dir(name).join(state_file_name(name));
-    let recorded = target.clone();
-    rewrite_header_atomically(&state_path, |mut h| {
+    // Through the backend, which pushes the rewritten header: a local
+    // rewrite alone is undone by the next read's pull on the cloud
+    // backend (koto#310).
+    backend.rewrite_header(name, &|mut h| {
         // The origin record moves with an explicit, audited rebind, so
         // `koto init --attach-live` from the new checkout still finds
         // its own session. A session with no origin record gets none:
         // nothing backfills one.
         if let Some(origin) = h.origin.as_mut() {
-            origin.anchor = recorded.clone();
+            origin.anchor = target.clone();
         }
-        h.execution_dir = Some(recorded);
+        h.execution_dir = Some(target.clone());
         h
     })?;
 

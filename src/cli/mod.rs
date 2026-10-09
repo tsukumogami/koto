@@ -3772,6 +3772,37 @@ fn resolve_action_working_dir(
     Ok(resolved)
 }
 
+/// Record a first tick's adoption of `anchor` as `name`'s execution
+/// anchor: the `execution_anchor_adopted` event, then the header field
+/// that makes the next tick take the ordinary path.
+///
+/// The event goes down first so a crash between the two writes repeats a
+/// visible adoption rather than leaving a silent one. The header goes
+/// through the backend, which pushes it: a local rewrite alone is undone by
+/// the next read's pull on the cloud backend (koto#310).
+///
+/// On failure, returns the message `koto next` reports as a persistence
+/// error.
+#[cfg(unix)]
+fn record_execution_anchor_adoption(
+    backend: &dyn SessionBackend,
+    name: &str,
+    anchor: &Path,
+) -> std::result::Result<(), String> {
+    let payload = EventPayload::ExecutionAnchorAdopted {
+        anchor: anchor.to_path_buf(),
+    };
+    backend
+        .append_event(name, &payload, &now_iso8601())
+        .map_err(|e| format!("failed to record execution anchor adoption: {}", e))?;
+    backend
+        .rewrite_header(name, &|mut h| {
+            h.execution_dir = Some(anchor.to_path_buf());
+            h
+        })
+        .map_err(|e| format!("failed to record execution anchor: {}", e))
+}
+
 /// Handle the `koto next` command with full output contract support.
 ///
 /// Flow:
@@ -4143,29 +4174,10 @@ fn handle_next(
             // visible adoption rather than leaving a silent one; the
             // header field is what makes the next tick take the
             // ordinary path.
-            let payload = EventPayload::ExecutionAnchorAdopted {
-                anchor: anchor.clone(),
-            };
-            if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
+            if let Err(message) = record_execution_anchor_adoption(backend, &name, &anchor) {
                 let ne = NextError {
                     code: NextErrorCode::PersistenceError,
-                    message: format!("failed to record execution anchor adoption: {}", e),
-                    details: vec![],
-                };
-                let json = serde_json::json!({"error": ne});
-                exit_with_error_code(json, ne.code.exit_code());
-            }
-            let state_path = backend
-                .session_dir(&name)
-                .join(crate::session::state_file_name(&name));
-            let recorded = anchor.clone();
-            if let Err(e) = crate::engine::claim::rewrite_header_atomically(&state_path, |mut h| {
-                h.execution_dir = Some(recorded);
-                h
-            }) {
-                let ne = NextError {
-                    code: NextErrorCode::PersistenceError,
-                    message: format!("failed to record execution anchor: {}", e),
+                    message,
                     details: vec![],
                 };
                 let json = serde_json::json!({"error": ne});

@@ -587,10 +587,8 @@ pub(crate) fn adopt_command_environment(
         dropped: report.dropped_path_entries.clone(),
     };
     backend.append_event(name, &payload, &now_iso8601())?;
-    let state_path = dir.join(crate::session::state_file_name(name));
-    let written = record.clone();
-    crate::engine::claim::rewrite_header_atomically(&state_path, |mut h| {
-        h.command_environment = Some(written);
+    backend.rewrite_header(name, &|mut h| {
+        h.command_environment = Some(record.clone());
         h
     })?;
     backend
@@ -1805,14 +1803,12 @@ Done.
 
     fn seed_parent_with_environment(backend: &LocalBackend, parent: &str) {
         seed_parent_anchored(backend, parent, None);
-        let state = backend
-            .session_dir(parent)
-            .join(crate::session::state_file_name(parent));
-        crate::engine::claim::rewrite_header_atomically(&state, |mut h| {
-            h.command_environment = Some(parent_record());
-            h
-        })
-        .expect("seed parent record");
+        backend
+            .rewrite_header(parent, &|mut h| {
+                h.command_environment = Some(parent_record());
+                h
+            })
+            .expect("seed parent record");
     }
 
     #[test]
@@ -1908,16 +1904,14 @@ Done.
         let sessions = TempDir::new().expect("sessions dir");
         let backend = backend_in(sessions.path());
         seed_parent_with_environment(&backend, "wf");
-        let state = backend
-            .session_dir("wf")
-            .join(crate::session::state_file_name("wf"));
 
         // A claim write: read-modify-write of an unrelated field.
-        crate::engine::claim::rewrite_header_atomically(&state, |mut h| {
-            h.dispatch_epoch += 1;
-            h
-        })
-        .expect("claim-style rewrite");
+        backend
+            .rewrite_header("wf", &|mut h| {
+                h.dispatch_epoch += 1;
+                h
+            })
+            .expect("claim-style rewrite");
         assert_eq!(
             backend.read_header("wf").unwrap().command_environment,
             Some(parent_record())
