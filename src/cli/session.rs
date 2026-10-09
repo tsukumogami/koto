@@ -527,9 +527,7 @@ pub fn handle_update(backend: &dyn SessionBackend, name: &str, intent: &str) -> 
 /// nothing and reports `rebound: false`. The event means the anchor
 /// moved; a no-op invocation did not move it.
 pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>) -> Result<()> {
-    use crate::engine::claim::rewrite_header_atomically;
     use crate::engine::types::{now_iso8601, EventPayload};
-    use crate::session::state_file_name;
     use anyhow::Context;
     use std::path::PathBuf;
 
@@ -592,17 +590,18 @@ pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>)
     };
     backend.append_event(name, &payload, &now_iso8601())?;
 
-    let state_path = backend.session_dir(name).join(state_file_name(name));
-    let recorded = target.clone();
-    rewrite_header_atomically(&state_path, |mut h| {
+    // Through the backend, which pushes the rewritten header: a local
+    // rewrite alone is undone by the next read's pull on the cloud
+    // backend (koto#310).
+    backend.rewrite_header(name, &|mut h| {
         // The origin record moves with an explicit, audited rebind, so
         // `koto init --attach-live` from the new checkout still finds
         // its own session. A session with no origin record gets none:
         // nothing backfills one.
         if let Some(origin) = h.origin.as_mut() {
-            origin.anchor = recorded.clone();
+            origin.anchor = target.clone();
         }
-        h.execution_dir = Some(recorded);
+        h.execution_dir = Some(target.clone());
         h
     })?;
 
@@ -1038,5 +1037,60 @@ fn parent_remote_presence_label(cloud: &CloudBackend, name: &str) -> &'static st
         "fresh"
     } else {
         "local_only"
+    }
+}
+
+#[cfg(test)]
+mod rebind_tests {
+    use super::*;
+    use crate::engine::template_source_status::{check_execution_anchor, ExecutionAnchorCheck};
+    use crate::engine::types::EventPayload;
+    use crate::session::cloud::test_support::{
+        cloud_backend_at, header_of, seed_session, serve, state_key_suffix,
+    };
+
+    /// koto#310: on the cloud backend a rebind reported success and the
+    /// next command's pull restored the old anchor, because the header
+    /// rewrite never left the machine. The remote copy has to carry the
+    /// new anchor, and the read `koto next` makes from the new directory
+    /// has to find it there.
+    #[test]
+    fn a_cloud_rebind_pushes_the_new_anchor_and_next_from_there_proceeds() {
+        let sessions = tempfile::TempDir::new().unwrap();
+        let old = tempfile::TempDir::new().unwrap();
+        let new = tempfile::TempDir::new().unwrap();
+        let old_anchor = std::fs::canonicalize(old.path()).unwrap();
+        let new_anchor = std::fs::canonicalize(new.path()).unwrap();
+
+        // The session as `koto init` left it: the same bytes locally and
+        // remotely, anchored at the old directory.
+        let seeded = seed_session(sessions.path(), "wf", Some(old_anchor.clone()));
+        let endpoint = serve(vec![(state_key_suffix("wf"), seeded)]);
+        let backend = Backend::Cloud(cloud_backend_at(sessions.path(), endpoint.url.clone()));
+
+        handle_rebind(&backend, "wf", Some(new.path().to_str().unwrap())).unwrap();
+
+        let pushed = endpoint
+            .last_put(&state_key_suffix("wf"))
+            .expect("rebind pushed the state file");
+        assert_eq!(
+            header_of(&pushed).execution_dir,
+            Some(new_anchor.clone()),
+            "the last state push carries the new anchor"
+        );
+
+        // What `koto next` does first: a pulling read, then the anchor
+        // check against the directory it runs in.
+        let (header, events) = backend.read_events("wf").unwrap();
+        assert_eq!(header.execution_dir, Some(new_anchor.clone()));
+        assert!(events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::ExecutionAnchorRebound { from, to }
+                if from.as_deref() == Some(old_anchor.as_path()) && *to == new_anchor
+        )));
+        assert_eq!(
+            check_execution_anchor(header.execution_dir.as_deref(), new.path()),
+            ExecutionAnchorCheck::Satisfied { anchor: new_anchor }
+        );
     }
 }
