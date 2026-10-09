@@ -40,8 +40,8 @@ session-migration design also adds a check before the cloud backend reads a
 session's state or context: it looks for a `migrated.json` marker beside the
 session's remote objects, left there by `koto session import`, and refuses
 with `session_migrated` when it finds one, so a session that moved to another
-workspace isn't read or advanced in its old one. See
-`docs/designs/current/DESIGN-session-migration.md`.
+workspace isn't read or advanced in its old one. The session-migration
+design (`DESIGN-session-migration.md`) has the details.
 
 ## Context and problem statement
 

@@ -201,7 +201,7 @@ koto session resolve <name> --keep remote  # download the bucket's version
 |-----|-------------|---------|---------------|
 | `session.backend` | Storage backend | `local` | Yes |
 | `session.cloud.endpoint` | S3-compatible endpoint URL | (none) | Yes |
-| `session.cloud.bucket` | Bucket name | `koto-sessions` | Yes |
+| `session.cloud.bucket` | Bucket name | `koto-sessions` (used when the key is unset; `koto config get` shows it as unset) | Yes |
 | `session.cloud.region` | Region | (none) | Yes |
 | `session.cloud.path_style` | Address the bucket in the path (`true`) rather than as a subdomain; needed for an IP-address endpoint | `false` | Yes |
 | `session.cloud.access_key` | Access key ID | (none) | No (user/env only) |

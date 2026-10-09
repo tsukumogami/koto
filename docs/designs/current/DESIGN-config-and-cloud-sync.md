@@ -42,8 +42,9 @@ the next pull undid them; they now go through `SessionBackend::rewrite_header`,
 which under the cloud backend pushes the rewritten header (koto#310). A rebind
 whose push fails still succeeds locally, with a warning. A new key,
 `session.cloud.path_style`, addresses the bucket in the path rather than as a
-subdomain, which an endpoint given as an IP address needs. See
-`docs/designs/current/DESIGN-session-migration.md`; the setup guide,
+subdomain, which an endpoint given as an IP address needs. The
+session-migration design (`DESIGN-session-migration.md`) has the details; the
+setup guide,
 `docs/guides/cloud-sync-setup.md`, lists the commands that reach the bucket.
 
 ## Context and Problem Statement
