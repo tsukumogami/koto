@@ -497,6 +497,146 @@ fn import_refusals() {
     );
 }
 
+/// A source session `wf` in A (holding `notes.md`), B with the template
+/// compiled, and A's manifest as JSON for a test to tamper with.
+struct TamperedSource {
+    s3: FakeS3,
+    _root: tempfile::TempDir,
+    a: Host,
+    b: Host,
+    manifest: serde_json::Value,
+}
+
+impl TamperedSource {
+    fn new() -> Self {
+        let s3 = FakeS3::start(BUCKET);
+        let root = tempfile::TempDir::new().unwrap();
+        let cloud = cloud(&s3);
+        let a = Host::new(root.path(), "a", &cloud);
+        let b = Host::new(root.path(), "b", &cloud);
+        start_session(&a, "wf");
+        compile(&b);
+        let manifest = serde_json::from_slice(
+            &s3.object(&Self::source_key_of(&a, "ctx/manifest.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        TamperedSource {
+            s3,
+            _root: root,
+            a,
+            b,
+            manifest,
+        }
+    }
+
+    fn source_key_of(a: &Host, rest: &str) -> String {
+        format!("{}{}", session_prefix(a, "wf"), rest)
+    }
+
+    /// The bucket key of `rest` under the source session.
+    fn source_key(&self, rest: &str) -> String {
+        Self::source_key_of(&self.a, rest)
+    }
+
+    /// Write the (tampered) manifest back to the source's prefix.
+    fn put_manifest(&self) {
+        self.s3.put(
+            &self.source_key("ctx/manifest.json"),
+            &serde_json::to_vec(&self.manifest).unwrap(),
+        );
+    }
+
+    /// Import `wf` into B and assert it is refused as unreadable, naming
+    /// `key`, with nothing left behind: no local session in B and no
+    /// object under B's prefix.
+    fn assert_refused_naming(&self, key: &str) {
+        let run = self
+            .b
+            .koto(&["session", "import", "wf", "--from", &self.a.ws_str()]);
+        let msg = refused(&run, "import_source_unreadable", 1);
+        assert!(msg.contains(key), "the refusal doesn't name {key}: {msg}");
+        assert!(
+            !self.b.session_dir("wf").exists(),
+            "a local session was left in B"
+        );
+        assert_eq!(
+            self.s3.keys_under(&format!("{}/", self.b.prefix())),
+            Vec::<String>::new(),
+            "objects were left under B's prefix"
+        );
+    }
+}
+
+/// A manifest naming a key that isn't a valid context key is refused
+/// before anything is fetched or written. The object is placed both under
+/// the literal key and where `..` resolves to, so that without the name
+/// check the import would succeed and write outside `ctx/`.
+#[test]
+fn import_refuses_a_manifest_key_that_is_not_a_valid_context_key() {
+    let mut src = TamperedSource::new();
+    let bytes = b"escaped".to_vec();
+    src.manifest["keys"]["../escape"] = serde_json::json!({
+        "created_at": "2026-01-01T00:00:00Z",
+        "size": bytes.len(),
+        "hash": sha256_hex(&bytes),
+    });
+    src.put_manifest();
+    src.s3.put(&src.source_key("ctx/../escape"), &bytes);
+    src.s3.put(&src.source_key("escape"), &bytes);
+
+    src.assert_refused_naming("../escape");
+}
+
+/// A key whose bytes were changed after its manifest entry was written,
+/// keeping the size, fails the SHA-256 check.
+#[test]
+fn import_refuses_a_key_whose_bytes_do_not_match_the_manifest_hash() {
+    let src = TamperedSource::new();
+    let original = src.s3.object(&src.source_key("ctx/notes.md")).unwrap();
+    let mut altered = original.clone();
+    altered[0] ^= 0x20;
+    assert_eq!(altered.len(), original.len());
+    src.s3.put(&src.source_key("ctx/notes.md"), &altered);
+
+    src.assert_refused_naming("notes.md");
+}
+
+/// A key whose size differs from its manifest entry fails the size check.
+/// The entry's hash is set to the new bytes' hash, so only the size is
+/// wrong.
+#[test]
+fn import_refuses_a_key_whose_size_does_not_match_the_manifest() {
+    let mut src = TamperedSource::new();
+    let longer = b"notes, now longer than the manifest says".to_vec();
+    src.s3.put(&src.source_key("ctx/notes.md"), &longer);
+    src.manifest["keys"]["notes.md"]["hash"] = serde_json::json!(sha256_hex(&longer));
+    assert_ne!(
+        src.manifest["keys"]["notes.md"]["size"],
+        serde_json::json!(longer.len())
+    );
+    src.put_manifest();
+
+    src.assert_refused_naming("notes.md");
+}
+
+/// A manifest entry whose content object is missing is refused. The entry
+/// describes empty content, so a missing object read as empty would pass
+/// the size and hash checks: only the missing-object check stops it.
+#[test]
+fn import_refuses_a_manifest_entry_with_no_content_object() {
+    let mut src = TamperedSource::new();
+    src.manifest["keys"]["ghost.md"] = serde_json::json!({
+        "created_at": "2026-01-01T00:00:00Z",
+        "size": 0,
+        "hash": sha256_hex(b""),
+    });
+    src.put_manifest();
+    assert!(src.s3.object(&src.source_key("ctx/ghost.md")).is_none());
+
+    src.assert_refused_naming("ghost.md");
+}
+
 /// The help text states the stopped-source rule.
 #[test]
 fn import_help_states_the_stopped_source_rule() {
