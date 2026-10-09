@@ -1,7 +1,7 @@
 ---
 schema: prd/v1
 absorbed: docs/briefs/BRIEF-session-migration.md
-status: In Progress
+status: Done
 source_issue: 313
 problem: |
   koto's S3 remote stores a session but can't move one. Each session lives
@@ -23,7 +23,7 @@ goals: |
 
 ## Status
 
-In Progress
+Done
 
 Absorbed [BRIEF](docs/briefs/BRIEF-session-migration.md); carried in Absorbed Brief.
 
@@ -459,4 +459,4 @@ design picks how).
 
 ## Downstream Artifacts
 
-- `docs/designs/DESIGN-session-migration.md` (to be written)
+- `docs/designs/current/DESIGN-session-migration.md` (to be written)

@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 upstream: docs/prds/PRD-session-migration.md
 decision_provenance: inline-resolved
 problem: |
@@ -43,7 +43,7 @@ rationale: |
 
 ## Status
 
-Planned
+Current
 
 **Note (2026-10-09), two departures in the implementation.** The import's
 move into place takes no lock: review found that the staging directory is
