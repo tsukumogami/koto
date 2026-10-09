@@ -29,12 +29,14 @@ pub(crate) const INIT_TMP_SUFFIX: &str = ".tmp";
 /// `~/.koto/sessions/`.
 pub struct LocalBackend {
     base_dir: PathBuf,
-    /// Whether this store's sessions are recorded in the run journal. On
-    /// for the user's store ([`LocalBackend::new`]) and for the store the
-    /// koto CLI opens; off for a store built with
-    /// [`LocalBackend::with_base_dir`] unless it opts in with
-    /// [`LocalBackend::with_run_journal`], so tests and embedders that
-    /// keep sessions elsewhere don't write the user's journal.
+    /// Whether this store's sessions are recorded in the run journal.
+    /// Always on for every store the koto CLI builds: the user's store
+    /// ([`LocalBackend::new`]) and the `KOTO_SESSIONS_BASE` store, which
+    /// the CLI builds with [`LocalBackend::with_base_dir`] followed by
+    /// [`LocalBackend::with_run_journal`]. Off only for a bare
+    /// [`LocalBackend::with_base_dir`] store, the test constructor, so unit
+    /// tests that keep sessions in a scratch directory don't write the
+    /// user's journal.
     run_journal: bool,
 }
 
@@ -56,9 +58,12 @@ impl LocalBackend {
 
     /// Create a backend with an explicit base directory.
     ///
-    /// Intended for tests that need to control the storage location. Its
-    /// sessions are not recorded in the run journal unless it opts in with
-    /// [`LocalBackend::with_run_journal`].
+    /// A test constructor, for tests that need to control the storage
+    /// location. Its sessions are not recorded in the run journal unless it
+    /// opts in with [`LocalBackend::with_run_journal`]. The shipped CLI never
+    /// uses it without that opt-in: `build_local_backend` in `src/cli/mod.rs`
+    /// calls `with_run_journal()` on the `KOTO_SESSIONS_BASE` store, so every
+    /// store the CLI opens is journaled.
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
         Self {
             base_dir,

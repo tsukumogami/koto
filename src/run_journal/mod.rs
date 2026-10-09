@@ -8,10 +8,11 @@
 //! outlive the sessions they describe, including sessions koto removes at
 //! their terminal tick or on `koto session cleanup`.
 //!
-//! The user's session store and the store the koto CLI opens are journaled.
-//! A store a test or an embedder builds elsewhere with
-//! `LocalBackend::with_base_dir` is not, unless it opts in with
-//! `LocalBackend::with_run_journal`.
+//! Journaling is always on for every store the koto CLI builds: the user's
+//! session store and the `KOTO_SESSIONS_BASE` store. Only a bare
+//! `LocalBackend::with_base_dir` store, the test constructor, is not
+//! journaled unless it opts in with `LocalBackend::with_run_journal`, and
+//! the CLI always opts in.
 //!
 //! ## Records
 //!
