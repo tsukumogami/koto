@@ -121,8 +121,8 @@ Six facts in the code shape the design:
 
 ## Considered Options
 
-Every question below was resolved inline under `/scope`, as ordinary
-choices; none went to `/decision`.
+Every question below was settled inline while the feature was scoped, as an
+ordinary choice; none needed a separate decision record.
 
 ### Decision 1: The verb and how it names the source
 
@@ -344,8 +344,8 @@ prints one JSON object:
 
 `template` is `local-cache`, `bucket` (under `--trust-template`), or
 `unchanged` when a re-run finds the session already built;
-`marked` is false only alongside
-`import_unmarked`. Refusals print `{"error": {"code": ..., "message": ...}}`
+`marked` is always true on success, since a marker that couldn't be written
+exits `import_unmarked` instead. Refusals print `{"error": {"code": ..., "message": ...}}`
 and exit 2 for the caller-actionable codes (`import_requires_cloud`,
 `import_source_not_found`, `import_source_migrated`,
 `import_source_is_child`, `import_name_taken`,
@@ -362,8 +362,10 @@ and exit 2 for the caller-actionable codes (`import_requires_cloud`,
 2. Derive the source prefix from `--from` (Decision 1).
 3. Read the source's `migrated.json`: a marker naming another target refuses
    `import_source_migrated` with that target; a marker naming this import's
-   own target and session means an earlier run's marker PUT landed, so the
-   import is already complete and nothing is written; a failed read refuses
+   own target means an earlier run's marker PUT landed: when the local target
+   exists with the marker's session id the import is already complete and
+   nothing is written, and otherwise it refuses `import_source_migrated` with
+   a hint naming the conflict; a failed read refuses
    `import_source_unreadable`.
 4. GET the source's state file: 404 refuses `import_source_not_found`. Parse
    the header; a `schema_version` other than 1, or a `template_hash` that
@@ -411,6 +413,8 @@ and exit 2 for the caller-actionable codes (`import_requires_cloud`,
    pushed and the staging directory, and refuse `import_push_failed`.
 10. Rename the staging directory to `<sessions>/<target>/` with a rename that
     never replaces an existing directory, and rename its state file to match.
+    If the target appeared meanwhile, take back what step 9 pushed and refuse
+    `import_name_taken`.
 11. GET the source's `migrated.json` again; if another import marked it
     meanwhile, keep the target, exit `import_source_migrated` naming the
     other target, and leave the operator to remove one of the two. Otherwise
@@ -434,7 +438,9 @@ absent one records "not migrated"; a failed listing prints
 `warning: cloud sync: migration check failed: ...` and proceeds. It runs at
 the top of `read_header`, `read_events` and every `ContextStore` method on
 the cloud backend (`add`, `add_with_writer`, `get`, `ctx_exists`, `remove`,
-`list_keys`, `meta`). `read_events_local`, `exists`, `list`, `cleanup` and
+`list_keys`, `meta`). `ctx_exists` and `meta` have no error return, so for a
+migrated session they answer `false` and `None`; callers that must say why
+call `check_not_migrated` themselves. `read_events_local`, `exists`, `list`, `cleanup` and
 the `session resolve` paths don't call it.
 
 `SessionMigrated` is a typed error in `src/session/mod.rs`. Its message is
@@ -623,7 +629,8 @@ that name the endpoint print it with any URL userinfo removed.
 
 ### Negative
 
-- Every cloud command pays one more GET on its first read of a session.
+- Every cloud command pays one more request (a listing for the marker) on
+  its first read of a session.
 - An import needs the template compiled on the new host first, from a
   checkout whose template matches the session's hash, unless the operator
   passes `--trust-template`.
