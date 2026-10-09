@@ -94,6 +94,38 @@ impl From<std::io::Error> for SessionError {
     }
 }
 
+/// A cloud read refused because the session was imported elsewhere.
+///
+/// `koto session import` leaves a `migrated.json` object beside the source
+/// session's remote state file. The cloud backend checks for it before it
+/// reads the session's state, and returns this error when it is there, so
+/// the old copy refuses instead of forking the session.
+///
+/// The message begins with the error code, `session_migrated`, so every
+/// command's existing error path carries it; `koto next` and `koto status`
+/// downcast to this type to choose their exit code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMigrated {
+    /// The session that was read.
+    pub name: String,
+    /// The session it was imported as.
+    pub target: String,
+    /// The workspace path the import ran in.
+    pub workspace: String,
+}
+
+impl fmt::Display for SessionMigrated {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "session_migrated: session '{}' was migrated to '{}' in {}; continue it there",
+            self.name, self.target, self.workspace
+        )
+    }
+}
+
+impl std::error::Error for SessionMigrated {}
+
 /// RAII guard for an advisory `flock(LOCK_EX)` held on a session's
 /// state file.
 ///
@@ -722,6 +754,24 @@ impl ContextStore for Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_migrated_message_leads_with_its_code_and_names_the_target() {
+        let err = SessionMigrated {
+            name: "coord".to_string(),
+            target: "coord".to_string(),
+            workspace: "/srv/ws-b".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "session_migrated: session 'coord' was migrated to 'coord' in /srv/ws-b; \
+             continue it there"
+        );
+        // Through anyhow, as the backend returns it, the type survives for
+        // callers that pick an exit code by it.
+        let wrapped = anyhow::Error::new(err.clone());
+        assert_eq!(wrapped.downcast_ref::<SessionMigrated>(), Some(&err));
+    }
 
     #[test]
     fn local_backend_is_not_cloud() {

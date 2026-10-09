@@ -555,6 +555,36 @@ pub enum SessionCommand {
         to: Option<String>,
     },
 
+    /// Import a session from another workspace's copy in the bucket.
+    ///
+    /// Reads session <NAME> as the workspace at --from pushed it to the
+    /// configured bucket, and creates it here as a new local session
+    /// anchored in the current directory: the source's events plus a
+    /// `session_imported` event, every context key, and the compiled
+    /// template. It pushes the new session under this workspace's prefix,
+    /// then leaves a `migrated.json` marker beside the source, so the old
+    /// copy refuses with `session_migrated` from then on. Nothing else
+    /// under the source's prefix is written.
+    ///
+    /// Import only a stopped source: no process may still be advancing the
+    /// session, and its last write must have reached the remote. Stop the
+    /// agent on the source host first; if a push from it failed, run
+    /// `koto session resolve <name> --keep local` there before importing.
+    ///
+    /// The compiled template comes from this machine's own cache, by the
+    /// hash the session recorded, never from the bucket: run
+    /// `koto template compile` on the session's template here first.
+    /// Requires the cloud backend.
+    Import {
+        /// Session name, the same in the source workspace and here
+        name: String,
+
+        /// Absolute path of the source workspace, as it was on the host
+        /// that created the session
+        #[arg(long = "from", value_name = "WORKSPACE_PATH")]
+        from: String,
+    },
+
     /// List, and optionally restore, sessions the old-layout migration set
     /// aside because their name was already taken.
     ///
@@ -1524,6 +1554,9 @@ pub fn run(app: App) -> Result<()> {
                 }
                 SessionCommand::Rebind { name, to } => {
                     session::handle_rebind(&backend, &name, to.as_deref())
+                }
+                SessionCommand::Import { name, from } => {
+                    session::handle_import(&backend, &name, &from)
                 }
             }
         }
@@ -4075,8 +4108,19 @@ fn handle_next(
     let (mut header, events) = match backend.read_events(&name) {
         Ok(result) => result,
         Err(err) => {
+            // A session imported elsewhere is refused by the backend before
+            // it reads anything; that is the caller's to act on, not a
+            // persistence failure.
+            let code = if err
+                .downcast_ref::<crate::session::SessionMigrated>()
+                .is_some()
+            {
+                NextErrorCode::SessionMigrated
+            } else {
+                NextErrorCode::PersistenceError
+            };
             let ne = NextError {
-                code: NextErrorCode::PersistenceError,
+                code,
                 message: err.to_string(),
                 details: vec![],
             };
@@ -6941,7 +6985,16 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     let (header, events) = match backend.read_events(name) {
         Ok(result) => result,
         Err(err) => {
-            let code = exit_code_for_engine_error(&err);
+            // A session imported elsewhere exits 2, as `koto next` does for
+            // it: the caller continues it where the message says.
+            let code = if err
+                .downcast_ref::<crate::session::SessionMigrated>()
+                .is_some()
+            {
+                EXIT_CALLER_ERROR
+            } else {
+                exit_code_for_engine_error(&err)
+            };
             exit_with_error_code(
                 serde_json::json!({
                     "error": err.to_string(),

@@ -617,6 +617,70 @@ pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>)
     Ok(())
 }
 
+/// Import session `name` from the workspace at `from` into the current
+/// directory, under the cloud backend.
+///
+/// Prints one JSON object on success. A refusal or failure prints
+/// `{"error": {"code": ..., "message": ...}}` and exits 2 for the codes a
+/// caller acts on and 1 for the rest (see
+/// [`crate::session::cloud::ImportErrorCode::exit_code`]).
+/// The remote work, and the order that keeps the source untouched until
+/// the end, is in [`CloudBackend::import_session`].
+pub fn handle_import(backend: &Backend, name: &str, from: &str) -> Result<()> {
+    use crate::session::cloud::{ImportError, ImportErrorCode};
+    use anyhow::Context;
+
+    let refuse = |err: ImportError| -> ! {
+        super::exit_with_error_code(
+            serde_json::json!({
+                "error": {
+                    "code": err.code.as_str(),
+                    "message": err.message,
+                }
+            }),
+            err.code.exit_code(),
+        )
+    };
+
+    let cloud = match backend {
+        Backend::Cloud(c) => c,
+        Backend::Local(_) => refuse(ImportError::new(
+            ImportErrorCode::RequiresCloud,
+            "session import reads another workspace's copy in the bucket, which needs the \
+             cloud backend (session.backend = \"cloud\")",
+        )),
+    };
+
+    // `name` reaches remote keys and a local path join, so it goes through
+    // the newtype before either.
+    let name = ValidatedSessionId::new(name)?.into_inner();
+
+    let cwd = std::env::current_dir().context("the current directory could not be read")?;
+    let anchor = std::fs::canonicalize(&cwd)
+        .with_context(|| format!("cannot resolve the current directory {}", cwd.display()))?;
+
+    let outcome = match cloud.import_session(&name, std::path::Path::new(from), &anchor) {
+        Ok(outcome) => outcome,
+        Err(err) => refuse(err),
+    };
+
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "name": outcome.name,
+            "imported": true,
+            "from": {
+                "workspace": outcome.from_workspace,
+                "session": outcome.from_session,
+            },
+            "keys": outcome.keys,
+            "template": "local-cache",
+            "marked": true,
+        }))?
+    );
+    Ok(())
+}
+
 /// Print the absolute session directory path.
 pub fn handle_dir(backend: &dyn SessionBackend, name: &str) -> Result<()> {
     let dir = backend.session_dir(name);

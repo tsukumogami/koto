@@ -679,6 +679,27 @@ pub(crate) fn repo_id(working_dir: &Path) -> anyhow::Result<String> {
     Ok(hash[..16].to_string())
 }
 
+/// Derive the remote prefix of a workspace that may not exist on this
+/// machine.
+///
+/// `koto session import --from <path>` names the workspace a session was
+/// created in, usually a path on another host. When the path resolves here
+/// this is exactly [`repo_id`]; when it doesn't, the literal path is hashed
+/// the same way, which matches the creating host's `repo_id` whenever the
+/// caller passes the canonical path that host recorded. The path is only
+/// hashed, never opened beyond the canonicalization attempt.
+///
+/// A relative path is refused: it would be resolved against whatever
+/// directory the import happens to run from, not the source host's.
+pub(crate) fn prefix_for_workspace(path: &Path) -> anyhow::Result<String> {
+    if !path.is_absolute() {
+        anyhow::bail!("workspace path must be absolute, got '{}'", path.display());
+    }
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let hash = sha256_hex(resolved.to_string_lossy().as_bytes());
+    Ok(hash[..16].to_string())
+}
+
 /// Rename a session's state file inside `dir` from the `from` identity to
 /// the `to` identity.
 ///
@@ -1113,6 +1134,54 @@ mod tests {
     fn repo_id_fails_for_nonexistent_dir() {
         let result = repo_id(Path::new("/nonexistent/path/that/does/not/exist"));
         assert!(result.is_err());
+    }
+
+    // -- prefix_for_workspace: repo_id where the path resolves, the literal
+    // path's hash where it doesn't --
+
+    #[test]
+    fn prefix_for_workspace_equals_repo_id_for_an_existing_dir() {
+        let tmp = TempDir::new().unwrap();
+        let checkout = tmp.path().join("checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        assert_eq!(
+            prefix_for_workspace(&checkout).unwrap(),
+            repo_id(&checkout).unwrap()
+        );
+        // A spelling that canonicalizes to the same directory agrees too.
+        let dotted = tmp.path().join("checkout").join(".");
+        assert_eq!(
+            prefix_for_workspace(&dotted).unwrap(),
+            repo_id(&checkout).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefix_for_workspace_follows_a_symlink_like_repo_id() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            prefix_for_workspace(&link).unwrap(),
+            repo_id(&real).unwrap()
+        );
+    }
+
+    #[test]
+    fn prefix_for_workspace_hashes_the_literal_path_when_it_does_not_resolve() {
+        let path = Path::new("/srv/elsewhere/ws-a");
+        assert!(!path.exists());
+        let expected = &sha256_hex(b"/srv/elsewhere/ws-a")[..16];
+        assert_eq!(prefix_for_workspace(path).unwrap(), expected);
+    }
+
+    #[test]
+    fn prefix_for_workspace_refuses_a_relative_path() {
+        let err = prefix_for_workspace(Path::new("ws-a")).unwrap_err();
+        assert!(err.to_string().contains("must be absolute"), "{err}");
     }
 
     // -- scenario 5: exists checks for state file --

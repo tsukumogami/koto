@@ -393,6 +393,7 @@ fn next_error_code_round_trips_through_serde() {
         NextErrorCode::ExecutionAnchorUnresolvable,
         NextErrorCode::CaptureUnset,
         NextErrorCode::NestedInvocation,
+        NextErrorCode::SessionMigrated,
     ];
     for code in codes {
         let v = serde_json::to_value(&code).unwrap();
@@ -435,6 +436,15 @@ fn nested_invocation_is_coded_and_classed_as_a_caller_error() {
     assert_eq!(NextErrorCode::NestedInvocation.exit_code(), 2);
 }
 
+/// A session imported into another workspace refuses under its own code, in
+/// the caller-error class: the caller continues it where it now lives.
+#[test]
+fn session_migrated_is_coded_and_classed_as_a_caller_error() {
+    let code = serde_json::to_value(NextErrorCode::SessionMigrated).unwrap();
+    assert_eq!(code, "session_migrated");
+    assert_eq!(NextErrorCode::SessionMigrated.exit_code(), 2);
+}
+
 /// Every registered code lands in the envelope under `error.code` as a bare
 /// string, with no `command` key riding along -- the code identifies the
 /// condition, so there is nothing to string-match.
@@ -445,6 +455,7 @@ fn every_code_serializes_into_the_envelope_shape() {
         NextErrorCode::ExecutionAnchorUnresolvable,
         NextErrorCode::CaptureUnset,
         NextErrorCode::NestedInvocation,
+        NextErrorCode::SessionMigrated,
     ] {
         let err = NextError {
             code: code.clone(),
