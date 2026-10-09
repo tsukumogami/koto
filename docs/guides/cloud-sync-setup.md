@@ -87,6 +87,8 @@ So the prefix is the session's identity on its host. Running `koto next review` 
 
 `koto session rebind` is a different thing. It's for a checkout that moved on the same host: stand in the new location and rebind the session's execution anchor there. Don't use it to carry a session to another machine.
 
+Under the cloud backend, rebind pushes the rewritten header to the bucket along with its `execution_anchor_rebound` event. If that push fails, the rebind still succeeds locally and prints a warning to stderr; the session's next successful push carries the new anchor.
+
 ## 5. Moving a session to another host
 
 `koto session import` reads a session from another workspace's prefix in the bucket and creates it as a new local session in the directory you run it from. Both hosts need the cloud backend pointed at the same bucket.

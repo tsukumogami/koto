@@ -27,17 +27,21 @@ Current
 **Note (2026-10-09).** This design routed all state I/O through the backend, but
 one path stayed outside it: rewriting a state file's header in place.
 `koto session rebind`, a first `koto next` adopting an execution anchor, and
-starting a child rewrote the header with `rewrite_header_atomically` on the
-local file, so under the cloud backend the rewritten header didn't reach the
-bucket and the next pull could undo it. The session-migration design closes that bypass
-with a `SessionBackend::rewrite_header` method that the cloud backend
-implements by pushing the state file; koto#310 carries that change. The same
-design adds a check before the cloud backend reads a session's state or
-context: it looks for a
-`migrated.json` marker beside the session's remote objects, left there by
-`koto session import`, and refuses with `session_migrated` when it finds one,
-so a session that moved to another workspace isn't read or advanced in its old
-one. See `docs/designs/current/DESIGN-session-migration.md`.
+starting a child rewrote the header on the local file, so under the cloud
+backend the new header never reached the bucket and the next read's pull put
+the old one back (koto#310). Header rewrites now go through
+`SessionBackend::rewrite_header`, and no code under `src/cli/` writes a header
+outside the backend. The trait's default rewrites the local file and confirms
+the push with `ensure_pushed`; the cloud backend overrides it to push the
+rewritten state file the way `append_event` does, best effort. If that push
+fails, the rewrite (and so a rebind) still succeeds locally with a warning on
+stderr, and the session's next successful push carries it. The
+session-migration design also adds a check before the cloud backend reads a
+session's state or context: it looks for a `migrated.json` marker beside the
+session's remote objects, left there by `koto session import`, and refuses
+with `session_migrated` when it finds one, so a session that moved to another
+workspace isn't read or advanced in its old one. See
+`docs/designs/current/DESIGN-session-migration.md`.
 
 ## Context and problem statement
 

@@ -37,9 +37,10 @@ session from the source's remote objects, pushes it under the importing
 workspace's prefix, and leaves a `migrated.json` marker beside the source so the
 old copy refuses with `session_migrated`. The cloud backend checks for that
 marker before it reads a session's state or context. Header rewrites (rebind, a first tick
-adopting an anchor, starting a child) were written to the local file outside
-the backend, so they never reached the bucket; the session-migration design
-routes them through the backend, and koto#310 carries that change. A new key,
+adopting an anchor, starting a child) used to go to the local file only, so
+the next pull undid them; they now go through `SessionBackend::rewrite_header`,
+which under the cloud backend pushes the rewritten header (koto#310). A rebind
+whose push fails still succeeds locally, with a warning. A new key,
 `session.cloud.path_style`, addresses the bucket in the path rather than as a
 subdomain, which an endpoint given as an IP address needs. See
 `docs/designs/current/DESIGN-session-migration.md`; the setup guide,
