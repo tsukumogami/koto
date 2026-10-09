@@ -619,7 +619,9 @@ pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>)
 }
 
 /// Import session `name` from the workspace at `from` into the current
-/// directory, under the cloud backend.
+/// directory, under the cloud backend, as `as_name` when given.
+/// `trust_template` takes the compiled template from the bucket instead of
+/// this machine's cache.
 ///
 /// Prints one JSON object on success. A refusal or failure prints
 /// `{"error": {"code": ..., "message": ...}}` and exits 2 for the codes a
@@ -627,8 +629,14 @@ pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>)
 /// [`crate::session::cloud::ImportErrorCode::exit_code`]).
 /// The remote work, and the order that keeps the source untouched until
 /// the end, is in [`CloudBackend::import_session`].
-pub fn handle_import(backend: &Backend, name: &str, from: &str) -> Result<()> {
-    use crate::session::cloud::{ImportError, ImportErrorCode};
+pub fn handle_import(
+    backend: &Backend,
+    name: &str,
+    from: &str,
+    as_name: Option<&str>,
+    trust_template: bool,
+) -> Result<()> {
+    use crate::session::cloud::{ImportError, ImportErrorCode, ImportRequest};
     use anyhow::Context;
 
     let refuse = |err: ImportError| -> ! {
@@ -652,15 +660,26 @@ pub fn handle_import(backend: &Backend, name: &str, from: &str) -> Result<()> {
         )),
     };
 
-    // `name` reaches remote keys and a local path join, so it goes through
-    // the newtype before either.
+    // Both names reach remote keys and a local path join, so they go
+    // through the newtype before either.
     let name = ValidatedSessionId::new(name)?.into_inner();
+    let target = match as_name {
+        Some(n) => ValidatedSessionId::new(n)?.into_inner(),
+        None => name.clone(),
+    };
 
     let cwd = std::env::current_dir().context("the current directory could not be read")?;
     let anchor = std::fs::canonicalize(&cwd)
         .with_context(|| format!("cannot resolve the current directory {}", cwd.display()))?;
 
-    let outcome = match cloud.import_session(&name, std::path::Path::new(from), &anchor) {
+    let request = ImportRequest {
+        name: &name,
+        target: &target,
+        from: std::path::Path::new(from),
+        anchor: &anchor,
+        trust_template,
+    };
+    let outcome = match cloud.import_session(&request) {
         Ok(outcome) => outcome,
         Err(err) => refuse(err),
     };
@@ -675,7 +694,7 @@ pub fn handle_import(backend: &Backend, name: &str, from: &str) -> Result<()> {
                 "session": outcome.from_session,
             },
             "keys": outcome.keys,
-            "template": "local-cache",
+            "template": outcome.template.as_str(),
             "marked": true,
         }))?
     );

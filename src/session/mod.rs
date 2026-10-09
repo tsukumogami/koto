@@ -530,6 +530,16 @@ impl Backend {
             Backend::Cloud(b) => b.local_base_dir(),
         }
     }
+
+    /// Refuse with [`SessionMigrated`] when `id` was imported into another
+    /// workspace. Always `Ok` on the local backend, which has no remote
+    /// copy to import from and makes no request.
+    pub fn check_not_migrated(&self, id: &str) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(_) => Ok(()),
+            Backend::Cloud(b) => b.check_not_migrated(id),
+        }
+    }
 }
 
 impl SessionBackend for Backend {
