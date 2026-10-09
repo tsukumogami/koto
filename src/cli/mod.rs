@@ -579,8 +579,11 @@ pub enum SessionCommand {
     /// template holds every command the session runs. Requires the cloud
     /// backend.
     ///
-    /// Running the same import again after `import_unmarked` writes only
-    /// the marker.
+    /// The output's `template` field says where the compiled template came
+    /// from: `local-cache`, `bucket` (under --trust-template), or
+    /// `unchanged` when a re-run found the session already built and took
+    /// none. Running the same import again after `import_unmarked` writes
+    /// only the marker.
     Import {
         /// Session name in the source workspace
         name: String,

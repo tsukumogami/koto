@@ -1801,6 +1801,24 @@ fn a_marker_that_landed_despite_an_error_completes_the_rerun() {
     .unwrap();
     s3.put(&marker, &theirs);
     let run = import(&b, "wf", &a, &[]);
-    refused(&run, "import_source_migrated", 2);
+    let msg = refused(&run, "import_source_migrated", 2);
+    assert!(
+        msg.contains("own marker") && msg.contains("is a different one") && msg.contains("--as"),
+        "{msg}"
+    );
     assert_eq!(s3.object(&marker), Some(theirs));
+
+    // With the local copy gone, the refusal says it is missing; nothing is
+    // rebuilt over a marked source.
+    std::fs::remove_dir_all(b.session_dir("wf")).unwrap();
+    s3.put(&marker, &landed);
+    s3.clear_requests();
+    let run = import(&b, "wf", &a, &[]);
+    let msg = refused(&run, "import_source_migrated", 2);
+    assert!(
+        msg.contains("own marker") && msg.contains("missing here"),
+        "{msg}"
+    );
+    assert!(!b.session_dir("wf").exists());
+    assert_eq!(all_writes(&s3), Vec::<(String, String)>::new());
 }

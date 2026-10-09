@@ -1264,8 +1264,14 @@ pub enum ImportErrorCode {
     TemplateUnavailable,
     /// A source object couldn't be read, or failed validation.
     SourceUnreadable,
-    /// Writing the imported session here, or pushing it under this
-    /// workspace's prefix, failed. Whatever was written is removed.
+    /// Building the imported session here, pushing it under this
+    /// workspace's prefix or moving it into place failed, or something the
+    /// import needs on this side couldn't be read: this machine's id, the
+    /// listing that checks this workspace's prefix for the name, or the
+    /// manifest of a target an earlier run left here. A failure while
+    /// staging, pushing or moving removes the staging directory and takes
+    /// back what the run pushed; the others come before anything is
+    /// written, so there is nothing to take back.
     PushFailed,
     /// The imported session is in place and pushed, but the marker on the
     /// source couldn't be written.
@@ -1466,7 +1472,7 @@ struct ImportSource {
     /// The source's marker, when it names this workspace's prefix and the
     /// import's target: an earlier run of this import may have written it
     /// and then been told the PUT failed.
-    own_marker: Option<MarkerRead>,
+    own_marker: Option<Vec<u8>>,
 }
 
 impl ImportSource {
@@ -1497,36 +1503,6 @@ fn unreadable_source(
     )
 }
 
-/// The target a marker names, read leniently: a missing field reads as
-/// empty.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MarkerRead {
-    session: String,
-    session_id: String,
-    workspace: String,
-    prefix: String,
-}
-
-impl MarkerRead {
-    fn parse(bytes: &[u8]) -> Self {
-        let marker: serde_json::Value = serde_json::from_slice(bytes).unwrap_or_default();
-        let field = |name: &str| {
-            marker
-                .get("target")
-                .and_then(|t| t.get(name))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string()
-        };
-        MarkerRead {
-            session: field("session"),
-            session_id: field("session_id"),
-            workspace: field("workspace"),
-            prefix: field("prefix"),
-        }
-    }
-}
-
 /// The refusal for a source that already carries another import's marker.
 fn already_migrated(name: &str, workspace: &str, marker: &[u8]) -> ImportError {
     let migrated = migrated_from_marker(name, marker);
@@ -1541,7 +1517,10 @@ fn already_migrated(name: &str, workspace: &str, marker: &[u8]) -> ImportError {
 
 /// What already holds the import's target name.
 enum ExistingTarget {
-    /// Nothing: a fresh import.
+    /// Nothing, or only an earlier run of this same import that pushed the
+    /// target but never moved it into place here (it stopped between the
+    /// push and the rename). Either way the import runs in full, writing
+    /// over any such copy key for key.
     Free,
     /// An earlier run of this same import, complete on this machine
     /// (it stopped at `import_unmarked`). Only the marker is missing.
@@ -1549,13 +1528,6 @@ enum ExistingTarget {
         /// The `session_id` that run gave the target.
         session_id: String,
     },
-    /// An earlier run of this same import that pushed the target but never
-    /// moved it into place here (it stopped between the push and the
-    /// rename). The import runs again over it, writing the same keys. If
-    /// that run fails too, taking back what it pushed can take the earlier
-    /// copy's state file with it; the next run then finds the name free
-    /// and imports afresh over whatever is left.
-    RemoteOnly,
 }
 
 /// The `session_imported` event a log ends its imports with, and the
@@ -1614,6 +1586,11 @@ impl ImportedAs {
 
 /// The directory an import builds its target in, inside the session store.
 /// Removed when dropped, unless it was moved into place.
+///
+/// A process killed mid-import can leave one behind as
+/// `<sessions>/.import-<target>-<random>/`. Nothing reads it and no
+/// session is named like it (a session name starts with a letter), so it
+/// is safe to delete by hand.
 struct Staging {
     dir: PathBuf,
     moved: bool,
@@ -1639,20 +1616,6 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     builder.create(path)
 }
 
-/// Take an exclusive `flock` on `path` without waiting, the lock
-/// `SessionBackend::lock_state_file` takes on a state file.
-#[cfg(unix)]
-fn lock_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::io::AsRawFd;
-
-    let file = std::fs::File::open(path)?;
-    // SAFETY: the descriptor belongs to `file`, which outlives the call.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(file)
-}
-
 impl CloudBackend {
     /// Import session `req.name` from the workspace at `req.from` into this
     /// workspace as `req.target`, anchored at `req.anchor`.
@@ -1666,6 +1629,9 @@ impl CloudBackend {
     /// removes the staging directory and exactly the objects this run
     /// pushed. The import never writes any other object under the
     /// source's prefix.
+    ///
+    /// Rollback ends at the rename: once the target is in place, the
+    /// marker step never takes anything back, whatever it reports.
     ///
     /// A re-run of an import that stopped at `import_unmarked` writes only
     /// the marker; one whose target reached the bucket but not this
@@ -1689,15 +1655,23 @@ impl CloudBackend {
         // target here, the import is already complete; nothing is written.
         if let Some(marker) = &source.own_marker {
             return match self.local_import_of(req.target, &source) {
-                Some(session_id) if session_id == marker.session_id => Ok(outcome(
-                    self.local_key_count(req.target)?,
-                    TemplateOrigin::Unchanged,
-                )),
-                _ => Err(ImportError::new(
+                Some(session_id) if session_id == marker_target_field(marker, "session_id") => Ok(
+                    outcome(self.local_key_count(req.target)?, TemplateOrigin::Unchanged),
+                ),
+                found => Err(ImportError::new(
                     ImportErrorCode::SourceMigrated,
                     format!(
-                        "session '{}' in workspace {} was already migrated to '{}' in {}",
-                        source.name, source.workspace, marker.session, marker.workspace
+                        "session '{}' in workspace {} carries this import's own marker, naming \
+                         '{}' in this workspace, but {}; remove '{}' from this workspace's \
+                         prefix in the bucket, or import again under --as <new-name>",
+                        source.name,
+                        source.workspace,
+                        req.target,
+                        match found {
+                            None => "that session is missing here",
+                            Some(_) => "the session here is a different one",
+                        },
+                        req.target
                     ),
                 )),
             };
@@ -1711,7 +1685,7 @@ impl CloudBackend {
                     self.local_key_count(req.target)?,
                     TemplateOrigin::Unchanged,
                 ),
-                ExistingTarget::Free | ExistingTarget::RemoteOnly => {
+                ExistingTarget::Free => {
                     let template = self.import_template(req, &source)?;
                     let (manifest, manifest_bytes) = self.read_source_manifest(&source)?;
                     let machine_id = import_machine_id()?;
@@ -1788,11 +1762,12 @@ impl CloudBackend {
         let own_marker = match &marker {
             None => None,
             Some(bytes) => {
-                let read = MarkerRead::parse(bytes);
-                if read.prefix != self.prefix || read.session != req.target {
+                if marker_target_field(bytes, "prefix") != self.prefix
+                    || marker_target_field(bytes, "session") != req.target
+                {
                     return Err(already_migrated(name, &workspace, bytes));
                 }
-                Some(read)
+                Some(bytes.clone())
             }
         };
 
@@ -1892,7 +1867,7 @@ impl CloudBackend {
             Ok(false) => Ok(ExistingTarget::Free),
             Ok(true) => match self.fetch_object(&key) {
                 Ok(bytes) => match bytes.as_deref().and_then(ImportedAs::read) {
-                    Some(imported) if imported.is_of(source) => Ok(ExistingTarget::RemoteOnly),
+                    Some(imported) if imported.is_of(source) => Ok(ExistingTarget::Free),
                     _ => Err(taken("this workspace's prefix in the bucket")),
                 },
                 Err(e) => Err(could_not_check(&e)),
@@ -2176,6 +2151,11 @@ impl CloudBackend {
     }
 
     /// Delete objects an import pushed before it failed.
+    ///
+    /// On a re-run over a target an earlier run left only in the bucket,
+    /// the keys deleted can be ones that run pushed too, the state file
+    /// included: this run wrote over them. The next run then finds the name
+    /// free and imports afresh over whatever is left.
     fn take_back(&self, pushed: &[String]) {
         for key in pushed {
             if let Err(e) = self.bucket.delete_object(key) {
@@ -2187,10 +2167,9 @@ impl CloudBackend {
         }
     }
 
-    /// Rename the staging directory to `<sessions>/<target>/`, holding the
-    /// lock `lock_state_file(target)` takes on the staged state file, which
-    /// becomes the target's: a command that reaches the target's state file
-    /// the moment it appears finds it locked until the rename is done.
+    /// Rename the staging directory to `<sessions>/<target>/`. No lock is
+    /// taken: the staging directory is private and complete, and the rename
+    /// is atomic, so nothing can open the target before it exists whole.
     ///
     /// The rename never replaces anything, not even an empty directory: a
     /// target that appeared while the import ran refuses
@@ -2205,13 +2184,7 @@ impl CloudBackend {
         use crate::engine::atomic_fs::{atomic_rename_dir, AtomicCreateError};
 
         let target_dir = self.local.session_dir(target);
-        let moved = (|| -> Result<(), AtomicCreateError> {
-            #[cfg(unix)]
-            let _lock = lock_exclusive(&staging.dir.join(state_file_name(target)))
-                .map_err(AtomicCreateError::Io)?;
-            atomic_rename_dir(&staging.dir, &target_dir)
-        })();
-        match moved {
+        match atomic_rename_dir(&staging.dir, &target_dir) {
             Ok(()) => {
                 staging.moved = true;
                 Ok(())
@@ -2392,20 +2365,21 @@ fn is_migration_marker(session_prefix: &str, key: &str) -> bool {
 /// `unknown` rather than failing, because the refusal must hold whatever a
 /// marker's writer put in it.
 fn migrated_from_marker(id: &str, bytes: &[u8]) -> SessionMigrated {
-    let marker: serde_json::Value = serde_json::from_slice(bytes).unwrap_or_default();
-    let field = |name: &str| {
-        marker
-            .get("target")
-            .and_then(|t| t.get(name))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string()
-    };
     SessionMigrated {
         name: id.to_string(),
-        target: field("session"),
-        workspace: field("workspace"),
+        target: marker_target_field(bytes, "session"),
+        workspace: marker_target_field(bytes, "workspace"),
     }
+}
+
+/// The string field `name` of a marker's `target`, read leniently: a marker
+/// that doesn't parse, or a field that is missing or of another shape,
+/// reads as `unknown`.
+fn marker_target_field(bytes: &[u8], name: &str) -> String {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|m| m.get("target")?.get(name)?.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[cfg(test)]
