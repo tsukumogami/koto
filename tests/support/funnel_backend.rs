@@ -10,7 +10,9 @@
 //! mod funnel_backend;
 //! ```
 //!
-//! Every method delegates to the wrapped `LocalBackend`. A refused append
+//! Every method, the trait's defaulted ones included, delegates to the
+//! wrapped `LocalBackend`, so the wrapper behaves as that store does apart
+//! from the recording and the refusal. A refused append
 //! returns an error without calling it, as an append that failed before
 //! its commit would, so nothing is written to the log and no post-commit
 //! hook (the run journal among them) runs.
@@ -20,7 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use koto::engine::types::{Event, EventPayload, StateFileHeader};
+use koto::engine::types::{Event, EventPayload, SessionStoreIdentity, StateFileHeader};
 use koto::session::local::LocalBackend;
 use koto::session::{SessionBackend, SessionError, SessionInfo, SessionLock};
 
@@ -105,6 +107,26 @@ impl SessionBackend for FunnelBackend {
 
     fn read_events(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
         self.inner.read_events(id)
+    }
+
+    fn read_events_local(&self, id: &str) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
+        self.inner.read_events_local(id)
+    }
+
+    fn rewrite_header(
+        &self,
+        id: &str,
+        f: &dyn Fn(StateFileHeader) -> StateFileHeader,
+    ) -> anyhow::Result<()> {
+        self.inner.rewrite_header(id, f)
+    }
+
+    fn count_unreadable(&self) -> usize {
+        self.inner.count_unreadable()
+    }
+
+    fn store_identity(&self) -> Option<SessionStoreIdentity> {
+        self.inner.store_identity()
     }
 
     fn read_header(&self, id: &str) -> anyhow::Result<StateFileHeader> {

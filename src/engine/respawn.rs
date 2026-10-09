@@ -427,6 +427,11 @@ pub struct RespawnExecution<'a> {
 ///
 /// On `F1Outcome::NoOp`: no events emitted; return
 /// [`RespawnExecuted::NoOp`].
+///
+/// A failed append returns `Err` at once and leaves the events already
+/// committed in place: when the cancel's append fails, the
+/// `RequesterRespawn` evidence stays on the log, the requester is not
+/// cancelled, and the run journal has no `cancelled` record for it.
 pub fn execute_respawn(
     exec: &RespawnExecution<'_>,
     respawner: &dyn SubstrateRespawner,

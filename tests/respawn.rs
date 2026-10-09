@@ -928,10 +928,10 @@ fn a_respawn_fallback_cancel_journals_one_cancelled_record_after_the_event_commi
         );
         assert_eq!(records[0]["koto.session.id"], "requester", "{path:?}");
 
-        // The cancel event is committed on the log, and the journal was
-        // written after it: the record exists only once the log holds the
-        // event, and the journal file was last written no earlier than the
-        // log.
+        // The cancel event is committed on the log, and the journal file
+        // was last written no earlier than the log. Timestamps can tie, so
+        // this alone doesn't order the two writes: the test below adds the
+        // other half, that a cancel whose append fails writes no record.
         assert_eq!(
             event_types(&run.state_file).last().map(String::as_str),
             Some("workflow_cancelled"),
