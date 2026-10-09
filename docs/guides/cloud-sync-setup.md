@@ -95,7 +95,7 @@ Under the cloud backend, rebind pushes the rewritten header to the bucket along 
 
 ### Stop the source first
 
-Import a stopped session only. Before you import:
+Import a stopped session only: if the source keeps advancing after the import, the session forks into two copies that nothing reconciles. Before you import:
 
 1. Stop every process that advances the session on the source host: the agent, any loop ticking `koto next`, anything writing context.
 2. Make sure its last write reached the bucket. If any command on the source host printed a cloud sync warning, or you aren't sure, run this on the source host, from the source workspace:
@@ -126,7 +126,7 @@ On the new host, `cd` to the directory the session should run in and run:
 koto session import review --from /srv/ws-a
 ```
 
-`--from` is the absolute path of the source workspace as it was on the host that created the session, symlinks resolved. A relative path is refused. The current directory becomes the new session's execution anchor and its workspace, so run the session's later commands from there.
+`--from` is the absolute path of the source workspace as it was on the host that created the session, symlinks resolved. A relative path is refused. To find it, run `pwd -P` in the source workspace; `koto session list` there shows the session's name. The current directory becomes the new session's execution anchor and its workspace, so run the session's later commands from there.
 
 If a session called `review` already exists on this host or under this workspace's prefix, give the import a new name:
 
