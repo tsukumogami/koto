@@ -392,6 +392,12 @@ pub struct CloudConfig {
     pub region: Option<String>,
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
+    /// Address the bucket path-style (`<endpoint>/<bucket>/<key>`) rather
+    /// than as a virtual host (`<bucket>.<endpoint>/<key>`). An endpoint
+    /// whose host is an IP address needs it, as does a self-hosted store
+    /// that doesn't serve bucket subdomains. Unset means false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_style: Option<bool>,
 }
 
 fn default_backend() -> String {
@@ -408,6 +414,7 @@ pub fn get_value(config: &KotoConfig, key: &str) -> Option<String> {
         "session.cloud.region" => config.session.cloud.region.clone(),
         "session.cloud.access_key" => config.session.cloud.access_key.clone(),
         "session.cloud.secret_key" => config.session.cloud.secret_key.clone(),
+        "session.cloud.path_style" => config.session.cloud.path_style.map(|b| b.to_string()),
         "request_store.stale_claim_timeout_seconds" => {
             Some(config.request_store.stale_claim_timeout_seconds.to_string())
         }
@@ -497,6 +504,20 @@ pub fn set_value_in_toml(doc: &mut toml::Value, key: &str, value: &str) -> Resul
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
             let cloud_table = cloud.as_table_mut().ok_or("cloud is not a table")?;
             cloud_table.insert(field.to_string(), toml::Value::String(value.to_string()));
+        }
+        "session.cloud.path_style" => {
+            let parsed: bool = value
+                .parse()
+                .map_err(|_| format!("value for {} must be true or false", key))?;
+            let session = table
+                .entry("session")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            let session_table = session.as_table_mut().ok_or("session is not a table")?;
+            let cloud = session_table
+                .entry("cloud")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            let cloud_table = cloud.as_table_mut().ok_or("cloud is not a table")?;
+            cloud_table.insert("path_style".to_string(), toml::Value::Boolean(parsed));
         }
         "request_store.stale_claim_timeout_seconds"
         | "request_store.stale_dispatch_timeout_seconds"
@@ -605,7 +626,8 @@ pub fn unset_value_in_toml(doc: &mut toml::Value, key: &str) -> Result<bool, Str
         | "session.cloud.bucket"
         | "session.cloud.region"
         | "session.cloud.access_key"
-        | "session.cloud.secret_key" => {
+        | "session.cloud.secret_key"
+        | "session.cloud.path_style" => {
             let field = key.strip_prefix("session.cloud.").unwrap();
             if let Some(session) = table.get_mut("session") {
                 if let Some(st) = session.as_table_mut() {
@@ -681,6 +703,7 @@ pub const ALL_KEYS: &[&str] = &[
     "session.cloud.region",
     "session.cloud.access_key",
     "session.cloud.secret_key",
+    "session.cloud.path_style",
     "request_store.stale_claim_timeout_seconds",
     "request_store.stale_dispatch_timeout_seconds",
     "request_store.redelegation_cap",
@@ -1078,6 +1101,33 @@ mod tests {
     #[test]
     fn test_workflows_native_in_all_keys() {
         assert!(ALL_KEYS.contains(&"workflows.native"));
+    }
+
+    #[test]
+    fn test_path_style_set_get_unset_round_trips_as_a_bool() {
+        assert!(ALL_KEYS.contains(&"session.cloud.path_style"));
+
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        set_value_in_toml(&mut doc, "session.cloud.path_style", "true").unwrap();
+        assert_eq!(
+            doc["session"]["cloud"]["path_style"],
+            toml::Value::Boolean(true),
+            "stored as a TOML bool, not a string"
+        );
+        let config: KotoConfig = doc.clone().try_into().unwrap();
+        assert_eq!(config.session.cloud.path_style, Some(true));
+        assert_eq!(
+            get_value(&config, "session.cloud.path_style"),
+            Some("true".to_string())
+        );
+
+        let err = set_value_in_toml(&mut doc, "session.cloud.path_style", "yes").unwrap_err();
+        assert!(err.contains("must be true or false"), "{err}");
+
+        assert!(unset_value_in_toml(&mut doc, "session.cloud.path_style").unwrap());
+        let config: KotoConfig = doc.try_into().unwrap();
+        assert_eq!(config.session.cloud.path_style, None);
+        assert_eq!(get_value(&config, "session.cloud.path_style"), None);
     }
     // -----------------------------------------------------------------------
     // decider.* coverage

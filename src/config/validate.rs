@@ -12,6 +12,7 @@ const PROJECT_ALLOWLIST: &[&str] = &[
     "session.cloud.endpoint",
     "session.cloud.bucket",
     "session.cloud.region",
+    "session.cloud.path_style",
     "decider.mode",
 ];
 
@@ -253,6 +254,7 @@ mod tests {
         assert!(validate_project_key("session.cloud.endpoint").is_ok());
         assert!(validate_project_key("session.cloud.bucket").is_ok());
         assert!(validate_project_key("session.cloud.region").is_ok());
+        assert!(validate_project_key("session.cloud.path_style").is_ok());
         assert!(validate_project_key("decider.mode").is_ok());
     }
 
