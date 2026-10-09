@@ -45,16 +45,21 @@ rationale: |
 
 Current
 
-**Note (2026-10-09), two departures in the implementation.** The import's
+**Note (2026-10-09), departures in the implementation.** The import's
 move into place takes no lock: review found that the staging directory is
 private and complete before the move, and the rename never replaces an
 existing directory (`atomic_rename_dir`), so nothing can open the target
-before it exists and a lock would guard nothing. Step 10 of the import
-sequence below said "under the target's local lock". And
+before it exists and a lock would guard nothing. Decision 8 and step 10 of
+the import sequence first said the move ran under the target's local lock.
+And
 `SessionBackend::rewrite_header` has a default (rewrite the local file, then
 confirm the push with `ensure_pushed`) instead of a `LocalBackend` override,
 so a future syncing backend pushes header rewrites without overriding it;
-`CloudBackend` overrides it to push the way it pushes events.
+`CloudBackend` overrides it to push the way it pushes events. Three smaller
+changes followed review: the marker check lists instead of GETting, to avoid
+rust-s3's retry sleep on the expected 404; an import re-run that finds its
+own marker on the source reports `template: unchanged` instead of refusing;
+and the sections below now say so.
 
 ## Context and Problem Statement
 
@@ -146,9 +151,11 @@ The source lives under a prefix computed from a path on another host.
 
 - **Chosen: a sibling object, `<prefix>/<name>/migrated.json`.** It holds
   `{schema: 1, target: {session, session_id, workspace, prefix},
-  machine_id, migrated_at}`. Reads check it with one GET; a 404 means not
-  migrated, any other failure means "can't tell" and the command proceeds
-  with a warning (PRD's fail-open decision). The source host's own pushes
+  machine_id, migrated_at}`. Reads check for it with one listing request
+  keyed on its name; absent means not migrated, and a failed listing means
+  "can't tell" and the command proceeds with a warning (PRD's fail-open
+  decision). Only a listed marker is fetched, and a listed marker refuses
+  even when its body can't be read. The source host's own pushes
   only ever PUT the state file, context keys, manifest and version record,
   so nothing it does overwrites the marker.
 - **Alternative: object metadata on the state file.** A header such as
@@ -262,7 +269,9 @@ choose the commands a host runs. The import must not change that by default.
   defined for a source no process is advancing and whose last write reached
   the remote; the help text and the guide say so, and how to force a final
   push (`koto session resolve <name> --keep local` on the source host). The
-  import holds the new session's local lock while it moves it into place.
+  import builds the new session in a private staging directory and moves it
+  into place with a rename that never replaces, so no other process can open
+  it before it is complete.
   koto#239 stays open as its own work: it fixes concurrent writers on one
   host, which the import never adds.
 - **Alternative: take koto#239's lock in this feature.** Rejected: the lock
@@ -333,7 +342,8 @@ prints one JSON object:
  "keys": 5, "template": "local-cache", "marked": true}
 ```
 
-`template` is `local-cache` or `bucket` (under `--trust-template`);
+`template` is `local-cache`, `bucket` (under `--trust-template`), or
+`unchanged` when a re-run finds the session already built;
 `marked` is false only alongside
 `import_unmarked`. Refusals print `{"error": {"code": ..., "message": ...}}`
 and exit 2 for the caller-actionable codes (`import_requires_cloud`,
@@ -350,8 +360,11 @@ and exit 2 for the caller-actionable codes (`import_requires_cloud`,
 1. Refuse `import_requires_cloud` unless the backend is cloud. Validate both
    names as `ValidatedSessionId`.
 2. Derive the source prefix from `--from` (Decision 1).
-3. GET the source's `migrated.json`: 200 refuses `import_source_migrated`
-   naming its target; a non-404 failure refuses `import_source_unreadable`.
+3. Read the source's `migrated.json`: a marker naming another target refuses
+   `import_source_migrated` with that target; a marker naming this import's
+   own target and session means an earlier run's marker PUT landed, so the
+   import is already complete and nothing is written; a failed read refuses
+   `import_source_unreadable`.
 4. GET the source's state file: 404 refuses `import_source_not_found`. Parse
    the header; a `schema_version` other than 1, or a `template_hash` that
    isn't exactly 64 lowercase hex digits, refuses
@@ -396,8 +409,8 @@ and exit 2 for the caller-actionable codes (`import_requires_cloud`,
    `template.json`, each key, manifest, version record, using the strict
    (error-returning) push. On any failure, delete exactly the keys this run
    pushed and the staging directory, and refuse `import_push_failed`.
-10. Rename the staging directory to `<sessions>/<target>/` and rename its
-    state file to match, under the target's local lock.
+10. Rename the staging directory to `<sessions>/<target>/` with a rename that
+    never replaces an existing directory, and rename its state file to match.
 11. GET the source's `migrated.json` again; if another import marked it
     meanwhile, keep the target, exit `import_source_migrated` naming the
     other target, and leave the operator to remove one of the two. Otherwise
@@ -412,10 +425,12 @@ context key (R20).
 ### The marker check
 
 `CloudBackend` gains `check_not_migrated(id) -> anyhow::Result<()>` and a
-`migration_checked: Mutex<HashSet<String>>` field. The first call for an id
-in a process GETs `migrated.json`; later calls return the cached result.
-200 parses the marker and returns `SessionMigrated { name, target,
-workspace }`; a 404 records "not migrated"; any other error prints
+`migration_checks` cache field. The first call for an id in a process lists
+the session's prefix for `migrated.json` (a ListObjectsV2 request, since
+rust-s3 retries a GET's 404 after a one-second sleep); later calls return
+the cached result. A listed marker is fetched and returns `SessionMigrated
+{ name, target, workspace }`, and still refuses if the fetch fails; an
+absent one records "not migrated"; a failed listing prints
 `warning: cloud sync: migration check failed: ...` and proceeds. It runs at
 the top of `read_header`, `read_events` and every `ContextStore` method on
 the cloud backend (`add`, `add_with_writer`, `get`, `ctx_exists`, `remove`,
@@ -454,12 +469,13 @@ trait SessionBackend {
 }
 ```
 
-`LocalBackend` calls `rewrite_header_atomically`; `CloudBackend` calls the
-local one and then `sync_push_state`. The three CLI call sites move to it.
-Two more rewrites live in `src/engine/claim.rs` (the assignment-claim write
-and the re-delegation epoch bump); they take a state-file path rather than
-a backend. The koto#310 work moves them behind the backend where their
-callers hold one, and records any that stays in its pull request with the
+The trait's default runs `rewrite_header_atomically` and then confirms the
+push with `ensure_pushed`; `CloudBackend` overrides it to rewrite locally and
+then `sync_push_state`, the push its event appends use. The three CLI call
+sites move to it. Two more rewrites live in `src/engine/claim.rs` (the
+assignment-claim write and the re-delegation epoch bump); they take a
+state-file path rather than a backend, and only tests reach them, so they
+stay on the free function, as the koto#310 pull request records with the
 reason.
 
 ### Cleanup keeps the marker

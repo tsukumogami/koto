@@ -459,4 +459,4 @@ design picks how).
 
 ## Downstream Artifacts
 
-- `docs/designs/current/DESIGN-session-migration.md` (to be written)
+- `docs/designs/current/DESIGN-session-migration.md`: the technical design, built in #316, #317, #318 and #319
