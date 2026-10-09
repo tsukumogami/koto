@@ -391,6 +391,44 @@ pub trait SessionBackend: Send + Sync {
     /// Read just the header from the state file.
     fn read_header(&self, id: &str) -> anyhow::Result<StateFileHeader>;
 
+    /// # Stability: additive-only
+    ///
+    /// Not part of the Stage 1 frozen four; signature evolution is
+    /// permitted in minor releases.
+    ///
+    /// Replace the state file's header with `f` applied to it, keeping the
+    /// event log verbatim, and sync the result the way
+    /// [`append_event`](Self::append_event) syncs an event.
+    ///
+    /// Every header rewrite in the CLI goes through here. A rewrite that
+    /// wrote the local file directly would be undone on a backend that pulls
+    /// before reading: the remote copy still carries the old header, and the
+    /// next read restores it (koto#310). The two rewrites in
+    /// `src/engine/claim.rs` (the assignment claim and the re-delegation
+    /// epoch bump) take a state-file path and no backend; nothing outside
+    /// tests reaches them today.
+    ///
+    /// The default rewrites the state file under
+    /// [`session_dir`](Self::session_dir) in place (temp file, then rename)
+    /// and then calls [`ensure_pushed`](Self::ensure_pushed), printing a
+    /// warning to stderr if the push fails rather than failing the rewrite.
+    /// A backend with no remote half gets a no-op push. A backend that syncs
+    /// gets its rewrite pushed through its strict push, which is enough to
+    /// keep the rewrite from being lost; it overrides this only to push the
+    /// way its other writes do, as `CloudBackend` does.
+    fn rewrite_header(
+        &self,
+        id: &str,
+        f: &dyn Fn(StateFileHeader) -> StateFileHeader,
+    ) -> anyhow::Result<()> {
+        let path = self.session_dir(id).join(state_file_name(id));
+        crate::engine::claim::rewrite_header_atomically(&path, f)?;
+        if let Err(e) = self.ensure_pushed(id) {
+            eprintln!("warning: session sync failed for state upload: {}", e);
+        }
+        Ok(())
+    }
+
     /// Push any pending local state for `id` to durable remote storage
     /// and fail if the push cannot be confirmed.
     ///
@@ -539,6 +577,16 @@ impl Backend {
             Backend::Cloud(b) => b.local_base_dir(),
         }
     }
+
+    /// Refuse with [`SessionMigrated`] when `id` was imported into another
+    /// workspace. Always `Ok` on the local backend, which has no remote
+    /// copy to import from and makes no request.
+    pub fn check_not_migrated(&self, id: &str) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(_) => Ok(()),
+            Backend::Cloud(b) => b.check_not_migrated(id),
+        }
+    }
 }
 
 impl SessionBackend for Backend {
@@ -635,6 +683,17 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.read_header(id),
             Backend::Cloud(b) => b.read_header(id),
+        }
+    }
+
+    fn rewrite_header(
+        &self,
+        id: &str,
+        f: &dyn Fn(StateFileHeader) -> StateFileHeader,
+    ) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.rewrite_header(id, f),
+            Backend::Cloud(b) => b.rewrite_header(id, f),
         }
     }
 

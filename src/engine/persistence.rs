@@ -1097,7 +1097,7 @@ pub fn derive_last_gate_evaluated(events: &[Event], gate: &str) -> Option<serde_
 /// a crafted `template_path` can't point the fallback at any other file in
 /// the session directory, and every reader still verifies the bytes against
 /// the header's `template_hash`.
-fn resolve_template_path_in_session(template_path: &str, session_dir: &Path) -> String {
+pub(crate) fn resolve_template_path_in_session(template_path: &str, session_dir: &Path) -> String {
     if template_path.is_empty() {
         return template_path.to_string();
     }

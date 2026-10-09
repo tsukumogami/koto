@@ -87,6 +87,9 @@ Done.
 /// File name the template is written under in every workspace.
 pub const TEMPLATE_FILE: &str = "carrier.md";
 
+/// How long the carrier's import step may take, compile included.
+pub const IMPORT_STEP_LIMIT: Duration = Duration::from_secs(30);
+
 /// Where the cloud backend points, shared by every host.
 #[derive(Debug, Clone)]
 pub struct Cloud {
@@ -549,14 +552,23 @@ impl<'a> Carrier<'a> {
     /// A's template cache is removed first: on separate machines B could
     /// never read it, and on this one it would let B's first tick read the
     /// path A's log records instead of the copy in B's session directory.
+    ///
+    /// The step must finish within [`IMPORT_STEP_LIMIT`].
     pub fn import_b(&mut self) -> Run {
         self.timed("import-b", |c| {
             let step = "import-b";
+            let started = Instant::now();
             let _ = std::fs::remove_dir_all(c.a.cache.join("koto"));
             c.compile_on(step, c.b);
             let source_lines = c.a.state_lines(&c.name);
             let run = c.import(step, c.b, c.a);
             c.check_imported_log(step, c.b, c.a, &source_lines);
+            let took = started.elapsed();
+            ensure(
+                step,
+                took < IMPORT_STEP_LIMIT,
+                format!("the step took {:?}, over {:?}", took, IMPORT_STEP_LIMIT),
+            );
             run
         })
     }

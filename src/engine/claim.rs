@@ -429,6 +429,9 @@ pub fn write_header_assignment_claim_best_effort(
 ) {
     let coord_id_str = coord_id.as_str().to_string();
     let claimed_at = claimed_at.to_string();
+    // Local file only, with no backend to push it: nothing outside tests
+    // reaches this today. A production caller should pass its backend and
+    // use `SessionBackend::rewrite_header` instead (koto#310).
     let result = rewrite_header_atomically(state_file, move |mut h| {
         h.assignment_claim = Some(AssignmentClaim {
             coord_id: coord_id_str,
@@ -566,6 +569,9 @@ pub fn recover_orphaned_sidecar(inputs: &RecoveryInputs<'_>) -> Result<RecoveryA
     append_redelegated_audit(&coord_state_file, fields, &inputs.now)?;
 
     // Update header: clear claim (3c) or leave None (3b), bump epoch.
+    // Local file only, with no backend to push it: nothing outside tests
+    // reaches this today. A production caller should pass its backend and
+    // use `SessionBackend::rewrite_header` instead (koto#310).
     rewrite_header_atomically(inputs.state_file, move |mut h| {
         h.assignment_claim = None;
         h.dispatch_epoch = new_epoch;
