@@ -45,6 +45,59 @@ fn session_prefix(host: &Host, name: &str) -> String {
     format!("{}/{}/", host.prefix(), name)
 }
 
+/// A recorded request as `METHOD key`, or `LIST prefix` for a listing.
+fn describe(r: &fake_s3::Request) -> String {
+    match &r.list_prefix {
+        Some(prefix) => format!("LIST {}", prefix),
+        None => format!("{} {}", r.method, r.key),
+    }
+}
+
+/// The marker check costs `koto status` on a session that was never
+/// migrated exactly one request beyond what it made before the check
+/// existed, and no retry sleep. Before, status made two: the GET that pulls
+/// the state file, and the listing of this workspace's sessions it scans
+/// for superseded branches. The check lists for the marker, which answers
+/// 200 whether or not it is there, where a GET of a missing marker would be
+/// a 404 that rust-s3 retries after a second.
+#[test]
+fn the_marker_check_adds_one_request_and_no_retry_to_status() {
+    let s3 = FakeS3::start(BUCKET);
+    let root = tempfile::TempDir::new().unwrap();
+    let a = Host::new(root.path(), "a", &cloud(&s3));
+    let name = "plain";
+    let template = a.ws.join(migration_carrier::TEMPLATE_FILE);
+    let run = a.koto(&["init", name, "--template", template.to_str().unwrap()]);
+    assert!(run.ok(), "init: {}", run.describe());
+
+    s3.clear_requests();
+    let run = a.koto(&["status", name]);
+    assert!(run.ok(), "status: {}", run.describe());
+
+    let session = session_prefix(&a, name);
+    let requests = s3.requests();
+    let seen: Vec<String> = requests.iter().map(describe).collect();
+    assert_eq!(
+        seen,
+        vec![
+            // The marker check: the one added request.
+            format!("LIST {}migrated.json", session),
+            // What status made before the check existed: the state pull ...
+            format!("GET {}koto-{}.state.jsonl", session, name),
+            // ... and the session listing behind `superseded_branches`.
+            format!("LIST {}/", a.prefix()),
+        ],
+        "koto status made {:?}",
+        seen
+    );
+    let check = requests[1].at.duration_since(requests[0].at);
+    assert!(
+        check < std::time::Duration::from_millis(500),
+        "the marker check took {:?}; a retried 404 sleeps a full second",
+        check
+    );
+}
+
 /// The whole carrier, with the endpoint's record checked around the import.
 #[test]
 fn carrier_moves_a_session_from_a_to_b_to_c() {
@@ -74,11 +127,7 @@ fn carrier_moves_a_session_from_a_to_b_to_c() {
     s3.clear_requests();
     carrier.import_b();
     let step = "import-b";
-    let import_requests: Vec<String> = s3
-        .requests()
-        .iter()
-        .map(|r| format!("{} {}", r.method, r.key))
-        .collect();
+    let import_requests: Vec<String> = s3.requests().iter().map(describe).collect();
     println!(
         "import-b made {} requests:\n  {}",
         import_requests.len(),
@@ -306,14 +355,16 @@ fn cleanup_and_a_terminal_tick_leave_the_marker_in_place() {
         "cleanup must delete everything but the marker"
     );
 
-    // A terminal tick on a session whose marker can't be read: the check
-    // fails open with a warning, the tick reaches the terminal state, and
-    // its cleanup deletes the session's objects but not the marker.
+    // A terminal tick on a session whose marker check can't get an answer
+    // (the listing for the marker fails): the check fails open with a
+    // warning, the tick reaches the terminal state, and its cleanup, whose
+    // own listing of the session works, deletes the session's objects but
+    // not the marker.
     start_session(&a, "ticked");
     let ticked = session_prefix(&a, "ticked");
     let marker = format!("{}migrated.json", ticked);
     s3.put(&marker, br#"{"schema":1}"#);
-    s3.fail("GET", &marker, 500);
+    s3.fail("LIST", &marker, 500);
     for args in [
         vec!["next", "ticked"],
         vec!["next", "ticked", "--with-data", r#"{"choice":"go"}"#],

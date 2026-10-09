@@ -112,17 +112,23 @@ impl CloudBackend {
 
     /// Refuse when `id` was imported into another workspace.
     ///
-    /// GETs `<prefix>/<id>/migrated.json` the first time a process asks
-    /// about `id` and remembers the answer. A marker returns
-    /// [`SessionMigrated`] naming the session it was imported as and that
-    /// session's workspace. A 404 means not migrated. Any other failure
-    /// means the check can't tell: it warns and lets the read proceed,
-    /// so an unreachable bucket doesn't stop a host from working on its
-    /// local copy.
+    /// The first time a process asks about `id`, lists the bucket with
+    /// `<prefix>/<id>/migrated.json` as the prefix and remembers the
+    /// answer. The listing answers 200 whether or not the marker is there,
+    /// so the common case, a session that was never migrated, costs one
+    /// request and no retry (a GET of a missing object is a 404, which
+    /// rust-s3 retries after a one-second sleep). Only when the listing
+    /// shows the marker is its body fetched.
     ///
-    /// A marker that doesn't parse still refuses: its presence is the
-    /// signal, and a marker written by a newer koto must not fork the
-    /// session on an older one.
+    /// A marker returns [`SessionMigrated`] naming the session it was
+    /// imported as and that session's workspace. A listing that fails means
+    /// the check can't tell: it warns and lets the read proceed, so an
+    /// unreachable bucket doesn't stop a host from working on its local
+    /// copy.
+    ///
+    /// A marker whose body can't be read or parsed still refuses: its
+    /// presence is the signal, and a marker written by a newer koto must
+    /// not fork the session on an older one.
     pub fn check_not_migrated(&self, id: &str) -> anyhow::Result<()> {
         let mut checks = self
             .migration_checks
@@ -131,9 +137,15 @@ impl CloudBackend {
         let answer = match checks.get(id) {
             Some(answer) => answer.clone(),
             None => {
-                let answer = match self.get_object_if_present(&self.marker_key(id)) {
-                    Ok(None) => None,
-                    Ok(Some(bytes)) => Some(migrated_from_marker(id, &bytes)),
+                let key = self.marker_key(id);
+                let answer = match self.object_listed(&key) {
+                    Ok(false) => None,
+                    Ok(true) => match self.fetch_object(&key) {
+                        Ok(Some(bytes)) => Some(migrated_from_marker(id, &bytes)),
+                        // Removed between the listing and the GET.
+                        Ok(None) => None,
+                        Err(_) => Some(migrated_from_marker(id, b"")),
+                    },
                     Err(e) => {
                         eprintln!("warning: cloud sync: migration check failed: {:#}", e);
                         None
@@ -154,13 +166,32 @@ impl CloudBackend {
         format!("{}{}", self.session_prefix(id), MIGRATED_MARKER)
     }
 
-    /// GET an object, telling a missing object (`Ok(None)`) apart from a
-    /// request that failed (`Err`).
+    /// Whether an object exists, asked by listing with its key as the
+    /// prefix rather than by HEAD or GET.
     ///
-    /// rust-s3 is built with `fail-on-err`, so a 404 arrives as an `Err`
-    /// carrying the status rather than as an `Ok` response; only that
-    /// status counts as "absent".
-    fn get_object_if_present(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    /// rust-s3 is built with `fail-on-err`, so a missing object's 404
+    /// arrives as an `Err`, and the crate retries every `Err` once after a
+    /// one-second sleep. A listing answers 200 with zero or one matching
+    /// key either way, so asking about an object that is expected to be
+    /// absent costs one request and no sleep. `Err` means the listing
+    /// itself failed: the caller can't tell either way.
+    fn object_listed(&self, key: &str) -> anyhow::Result<bool> {
+        let results = self
+            .bucket
+            .list(key.to_string(), None)
+            .map_err(|e| anyhow::anyhow!("listing {} failed: {}", key, e))?;
+        Ok(results
+            .iter()
+            .any(|page| page.contents.iter().any(|obj| obj.key == key)))
+    }
+
+    /// GET an object expected to exist, telling a missing one (`Ok(None)`)
+    /// apart from a request that failed (`Err`). Only a 404 counts as
+    /// missing. Callers that expect the object may be absent probe with
+    /// [`CloudBackend::object_listed`] first, or use
+    /// [`CloudBackend::get_object_if_present`], so that no expected 404
+    /// pays rust-s3's retry sleep.
+    fn fetch_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
         match self.bucket.get_object(key) {
             Ok(response) => match response.status_code() {
                 200 => Ok(Some(response.bytes().to_vec())),
@@ -172,16 +203,13 @@ impl CloudBackend {
         }
     }
 
-    /// HEAD an object: whether it exists, with the same 404 rule as
-    /// [`CloudBackend::get_object_if_present`].
-    fn object_exists(&self, key: &str) -> anyhow::Result<bool> {
-        match self.bucket.head_object(key) {
-            Ok((_, 404)) => Ok(false),
-            Ok((_, status)) if (200..300).contains(&status) => Ok(true),
-            Ok((_, status)) => Err(anyhow::anyhow!("HEAD {} returned status {}", key, status)),
-            Err(e) if is_not_found(&e) => Ok(false),
-            Err(e) => Err(anyhow::anyhow!("HEAD {} failed: {}", key, e)),
+    /// Fetch an object that may well be absent: list for it, and GET it
+    /// only when the listing shows it.
+    fn get_object_if_present(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        if !self.object_listed(key)? {
+            return Ok(None);
         }
+        self.fetch_object(key)
     }
 
     /// The local directory sessions are stored under. Reached through
@@ -1417,7 +1445,7 @@ impl CloudBackend {
                 format!("a session named '{}' already exists on this machine", name),
             ));
         }
-        match self.object_exists(&self.state_key(name)) {
+        match self.object_listed(&self.state_key(name)) {
             Ok(false) => {}
             Ok(true) => {
                 return Err(ImportError::new(
@@ -1513,11 +1541,12 @@ impl CloudBackend {
                 )
             };
 
-            // Context keys, one fetched and written at a time.
+            // Context keys, one fetched and written at a time. The manifest
+            // says each exists, so each is one GET with no listing first.
             let ctx_dir = session_dir.join("ctx");
             for (key, meta) in &manifest.keys {
                 let bytes = self
-                    .get_object_if_present(&format!("{}ctx/{}", source_session, key))
+                    .fetch_object(&format!("{}ctx/{}", source_session, key))
                     .map_err(|e| unreadable(&format!("context key {:?}", key), &e))?
                     .ok_or_else(|| {
                         unreadable(
@@ -2544,9 +2573,47 @@ mod tests {
 
     // -- A cloud pull is a logged write with writer `sync` --
 
+    /// A ListObjectsV2 body naming `keys`, as rust-s3 parses it.
+    fn list_body(keys: &[String]) -> Vec<u8> {
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>\
+             <Name>test-bucket</Name><IsTruncated>false</IsTruncated>",
+        );
+        for key in keys {
+            xml.push_str(&format!(
+                "<Contents><Key>{}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified>\
+                 <Size>1</Size></Contents>",
+                key
+            ));
+        }
+        xml.push_str("</ListBucketResult>");
+        xml.into_bytes()
+    }
+
+    /// The `prefix` of a ListObjectsV2 request target, or `None` when the
+    /// target isn't a listing.
+    fn listing_prefix(target: &str) -> Option<String> {
+        let query = target.split_once('?')?.1;
+        let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
+        if !pairs.iter().any(|(k, v)| k == "list-type" && v == "2") {
+            return None;
+        }
+        Some(
+            pairs
+                .into_iter()
+                .find(|(k, _)| k == "prefix")
+                .map(|(_, v)| v)
+                .unwrap_or_default(),
+        )
+    }
+
     /// A minimal S3 stand-in: answers a GET for a path ending in one of
-    /// `objects`' names with its bytes, any other GET with 404, and every
-    /// other request (the state push) with an empty 200.
+    /// `objects`' names with its bytes, any other GET with 404, a listing
+    /// whose prefix ends in one of the names with that one key (any other
+    /// listing with none), and every other request (the state push) with
+    /// an empty 200.
     fn serve_objects(objects: Vec<(String, Vec<u8>)>) -> String {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
@@ -2576,8 +2643,17 @@ mod tests {
                 let _ = reader.read_exact(&mut body);
                 let mut parts = request_line.split_whitespace();
                 let method = parts.next().unwrap_or("");
-                let path = parts.next().unwrap_or("").split('?').next().unwrap_or("");
-                let (status, payload): (&str, Vec<u8>) = if method == "GET" {
+                let target = parts.next().unwrap_or("");
+                let path = target.split('?').next().unwrap_or("");
+                let listing = listing_prefix(target);
+                let (status, payload): (&str, Vec<u8>) = if let Some(prefix) = listing {
+                    let keys: Vec<String> = objects
+                        .iter()
+                        .filter(|(name, _)| prefix.ends_with(name.as_str()))
+                        .map(|_| prefix.clone())
+                        .collect();
+                    ("200 OK", list_body(&keys))
+                } else if method == "GET" {
                     match objects
                         .iter()
                         .find(|(name, _)| path.ends_with(name.as_str()))
@@ -2781,7 +2857,59 @@ mod tests {
         use std::sync::Arc;
 
         // Count connections: every request is one, since the stand-in
-        // closes each after answering.
+        // closes each after answering. A listing names the marker; any
+        // other request gets the marker's body.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let target = request_line.split_whitespace().nth(1).unwrap_or("");
+                let body = match listing_prefix(target) {
+                    Some(prefix) => list_body(&[prefix]),
+                    None => marker_bytes("wf", "/srv/ws-b"),
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(&body);
+            }
+        });
+        let tmp = TempDir::new().unwrap();
+        let backend = cloud_backend_at(tmp.path(), format!("http://{addr}"));
+
+        for _ in 0..3 {
+            let err = backend.check_not_migrated("wf").unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<SessionMigrated>().unwrap().workspace,
+                "/srv/ws-b"
+            );
+        }
+        // The listing and the marker's body, once.
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_missing_marker_costs_one_listing_and_no_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Answers every request with an empty listing, and counts them.
         let hits = Arc::new(AtomicUsize::new(0));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2798,7 +2926,7 @@ mod tests {
                         break;
                     }
                 }
-                let body = marker_bytes("wf", "/srv/ws-b");
+                let body = list_body(&[]);
                 let _ = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2810,9 +2938,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = cloud_backend_at(tmp.path(), format!("http://{addr}"));
 
-        for _ in 0..3 {
-            assert!(backend.check_not_migrated("wf").is_err());
-        }
+        let started = std::time::Instant::now();
+        backend.check_not_migrated("wf").unwrap();
+        // rust-s3 sleeps a full second before retrying a failed request.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "the check took {:?}",
+            started.elapsed()
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 

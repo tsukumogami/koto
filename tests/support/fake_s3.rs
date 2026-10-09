@@ -29,7 +29,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One request as the endpoint received it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +41,8 @@ pub struct Request {
     pub key: String,
     /// For a listing, its `prefix` parameter.
     pub list_prefix: Option<String>,
+    /// When the request had been read in full.
+    pub at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +146,8 @@ impl FakeS3 {
 
     /// Answer every `method` request for exactly `key` with `status` (and
     /// an S3 error body) from now on, leaving the stored object alone.
+    /// `method` `LIST` with a prefix as `key` fails the listings with
+    /// exactly that prefix.
     pub fn fail(&self, method: &str, key: &str, status: u16) {
         lock(&self.state).faults.push(Fault {
             method: method.to_string(),
@@ -286,15 +290,21 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
         } else {
             None
         },
+        at: Instant::now(),
     });
 
     if named_bucket != bucket {
         return Reply::error(404, "NoSuchBucket", "The specified bucket does not exist");
     }
+    let (fault_method, fault_key) = if is_list {
+        ("LIST".to_string(), param("prefix").unwrap_or_default())
+    } else {
+        (req.method.clone(), key.clone())
+    };
     if let Some(fault) = st
         .faults
         .iter()
-        .find(|f| f.method == req.method && f.key == key)
+        .find(|f| f.method == fault_method && f.key == fault_key)
     {
         return Reply::error(fault.status, "InternalError", "injected failure");
     }
