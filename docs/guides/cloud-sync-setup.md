@@ -27,7 +27,7 @@ koto config set session.cloud.bucket my-koto-sessions
 koto config set session.cloud.region auto
 ```
 
-To keep the settings to your own machine instead, add `--user`, which writes `~/.koto/config.toml`:
+To keep the settings to your own machine instead, add `--user`, which writes `$HOME/.koto/config.toml`:
 
 ```bash
 koto config set --user session.backend cloud
