@@ -1087,16 +1087,50 @@ pub fn derive_last_gate_evaluated(events: &[Event], gate: &str) -> Option<serde_
 /// through unchanged: callers detect and reject that case separately, and
 /// joining it against the session dir would silently produce the session
 /// directory itself.
-fn resolve_template_path_in_session(template_path: &str, session_dir: &Path) -> String {
+///
+/// One fallback: an absolute path that doesn't exist, whose file name is a
+/// content hash (exactly 64 lowercase hex digits plus `.json`), resolves to
+/// the file of that name in `session_dir` when one is there. That is how a
+/// session imported from another host (`koto session import`) runs: its log
+/// keeps the origin host's cache path byte for byte, and the import stores
+/// the compiled template beside the log under its hash. The name check means
+/// a crafted `template_path` can't point the fallback at any other file in
+/// the session directory, and every reader still verifies the bytes against
+/// the header's `template_hash`.
+pub(crate) fn resolve_template_path_in_session(template_path: &str, session_dir: &Path) -> String {
     if template_path.is_empty() {
         return template_path.to_string();
     }
     let path = Path::new(template_path);
     if path.is_absolute() {
+        if !path.exists() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                let local = session_dir.join(name);
+                if is_content_hash_file_name(name) && local.is_file() {
+                    return local.to_string_lossy().into_owned();
+                }
+            }
+        }
         template_path.to_string()
     } else {
         session_dir.join(path).to_string_lossy().into_owned()
     }
+}
+
+/// Whether `name` is `<64 lowercase hex digits>.json`, the file name the
+/// template cache gives a compiled template.
+fn is_content_hash_file_name(name: &str) -> bool {
+    name.strip_suffix(".json").is_some_and(is_template_hash)
+}
+
+/// Whether `hash` has the form of a `template_hash`: exactly 64 lowercase
+/// hex digits, the SHA-256 the template cache names files by. Anything that
+/// turns a recorded hash into a file name checks this first.
+pub(crate) fn is_template_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Derive full machine state from header and event log.
@@ -2290,6 +2324,92 @@ mod tests {
         ];
         let ms = derive_machine_state(&header, &events, Path::new("/sessions/test-wf")).unwrap();
         assert_eq!(ms.template_path, "");
+    }
+
+    // -- the session-directory fallback for a missing absolute template path --
+
+    const HASH_NAME: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.json";
+
+    #[test]
+    fn missing_absolute_hash_path_falls_back_to_the_session_dir_copy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join(HASH_NAME), b"{}").unwrap();
+        let recorded = format!("/elsewhere/.cache/koto/{}", HASH_NAME);
+
+        assert_eq!(
+            resolve_template_path_in_session(&recorded, &session_dir),
+            session_dir.join(HASH_NAME).to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn fallback_is_not_taken_for_a_name_that_is_not_a_content_hash() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        // Each of these exists in the session dir, so only the name rule
+        // stands between a crafted template_path and the file.
+        let names = [
+            "manifest.json",
+            "version.json",
+            // Uppercase hex is not what the cache writes.
+            "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef.json",
+            // 63 digits.
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde.json",
+            // Right stem, wrong extension.
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.md",
+        ];
+        for name in names {
+            std::fs::write(session_dir.join(name), b"{}").unwrap();
+            let recorded = format!("/elsewhere/{}", name);
+            assert_eq!(
+                resolve_template_path_in_session(&recorded, &session_dir),
+                recorded,
+                "{name} must not resolve into the session dir"
+            );
+        }
+    }
+
+    #[test]
+    fn an_existing_absolute_path_is_preferred_over_the_session_dir_copy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = tmp.path().join("cache");
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(cache.join(HASH_NAME), b"{}").unwrap();
+        std::fs::write(session_dir.join(HASH_NAME), b"{}").unwrap();
+        let recorded = cache.join(HASH_NAME).to_string_lossy().into_owned();
+
+        assert_eq!(
+            resolve_template_path_in_session(&recorded, &session_dir),
+            recorded
+        );
+    }
+
+    #[test]
+    fn a_template_hash_is_exactly_64_lowercase_hex_digits() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(is_template_hash(hash));
+        assert!(!is_template_hash(""));
+        assert!(!is_template_hash(&hash[1..]));
+        assert!(!is_template_hash(&format!("{}0", hash)));
+        assert!(!is_template_hash(&hash.to_uppercase()));
+        assert!(!is_template_hash(&format!("../{}", &hash[3..])));
+        assert!(!is_template_hash(&format!("{}g", &hash[1..])));
+    }
+
+    #[test]
+    fn missing_absolute_path_with_no_session_copy_passes_through() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let recorded = format!("/elsewhere/.cache/koto/{}", HASH_NAME);
+        assert_eq!(
+            resolve_template_path_in_session(&recorded, tmp.path()),
+            recorded,
+            "nothing to fall back to: the reader reports the recorded path"
+        );
     }
 
     #[test]

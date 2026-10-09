@@ -11,6 +11,9 @@
 
 #![cfg(feature = "cloud-integration-tests")]
 
+#[path = "support/migration_carrier.rs"]
+mod migration_carrier;
+
 use assert_cmd::Command;
 use assert_fs::TempDir;
 use predicates::prelude::*;
@@ -438,6 +441,65 @@ fn cloud_session_list_shows_synced_sessions() {
         .assert()
         .success();
     delete_s3_prefix(&endpoint, &bucket, &prefix);
+}
+
+/// Deletes every listed prefix when dropped, so a failing step still
+/// leaves the bucket clean.
+struct PrefixCleanup {
+    endpoint: String,
+    bucket: String,
+    prefixes: Vec<String>,
+}
+
+impl Drop for PrefixCleanup {
+    fn drop(&mut self) {
+        for prefix in &self.prefixes {
+            delete_s3_prefix(&self.endpoint, &self.bucket, prefix);
+        }
+    }
+}
+
+/// The session-migration carrier (`tests/session_migration_test.rs`)
+/// against the real bucket: init in A, keys, import into B, read the keys
+/// and advance in B, A refuses, import into C. A unique session name per
+/// run, and every prefix the three workspaces touched is deleted after.
+#[test]
+fn cloud_session_migration_carrier() {
+    use migration_carrier::{Carrier, Cloud, Host};
+
+    let (endpoint, bucket) = match s3_env() {
+        Some(v) => v,
+        None => {
+            eprintln!("S3 env not set, skipping");
+            return;
+        }
+    };
+    let root = TempDir::new().unwrap();
+    let cloud = Cloud {
+        endpoint: endpoint.clone(),
+        bucket: bucket.clone(),
+        region: "auto".to_string(),
+        path_style: false,
+        // The bucket secrets are already in the environment.
+        credentials: None,
+    };
+    let a = Host::new(root.path(), "a", &cloud);
+    let b = Host::new(root.path(), "b", &cloud);
+    let c = Host::new(root.path(), "c", &cloud);
+    let _cleanup = PrefixCleanup {
+        endpoint,
+        bucket,
+        prefixes: vec![a.prefix(), b.prefix(), c.prefix()],
+    };
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let name = format!("migration-{}-{}", std::process::id(), nanos);
+    let mut carrier = Carrier::new(&a, &b, &c, &name);
+    carrier.run_all();
+    println!("{}", carrier.report());
 }
 
 #[test]

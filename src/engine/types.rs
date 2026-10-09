@@ -1161,6 +1161,21 @@ pub enum EventPayload {
         from: Option<PathBuf>,
         to: PathBuf,
     },
+    /// Appended by `koto session import` after the source session's events,
+    /// which the import copies verbatim, so the log says where everything
+    /// before it came from: the workspace path and session name given to
+    /// the import, the source's `session_id`, and the importing machine's
+    /// id.
+    ///
+    /// State derivation ignores it. Additive: it does not move
+    /// `CURRENT_SCHEMA_VERSION`, and an older build lands it in
+    /// [`Unknown`](EventPayload::Unknown) and keeps reading the log.
+    SessionImported {
+        from_workspace: String,
+        from_session: String,
+        from_session_id: String,
+        machine_id: String,
+    },
     /// A state's `default_action` delivered its stdout under the name the
     /// state declared in `capture_stdout_as`
     /// (DESIGN-koto-runs-commands.md Decision 1).
@@ -1725,6 +1740,7 @@ impl EventPayload {
             EventPayload::ExecutionAnchorAdopted { .. } => "execution_anchor_adopted",
             EventPayload::EnvironmentAdopted { .. } => "environment_adopted",
             EventPayload::ExecutionAnchorRebound { .. } => "execution_anchor_rebound",
+            EventPayload::SessionImported { .. } => "session_imported",
             EventPayload::VariableCaptured { .. } => "variable_captured",
             EventPayload::VariablesRebound { .. } => "variables_rebound",
             EventPayload::RequestStoreResult { .. } => "request_store.result",
@@ -2056,6 +2072,16 @@ impl<'de> Deserialize<'de> for Event {
                 EventPayload::ExecutionAnchorRebound {
                     from: p.from,
                     to: p.to,
+                }
+            }
+            "session_imported" => {
+                let p: SessionImportedPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::SessionImported {
+                    from_workspace: p.from_workspace,
+                    from_session: p.from_session,
+                    from_session_id: p.from_session_id,
+                    machine_id: p.machine_id,
                 }
             }
             "variable_captured" => {
@@ -2398,6 +2424,14 @@ struct ExecutionAnchorReboundPayload {
     #[serde(default)]
     from: Option<PathBuf>,
     to: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct SessionImportedPayload {
+    from_workspace: String,
+    from_session: String,
+    from_session_id: String,
+    machine_id: String,
 }
 
 #[derive(Deserialize)]
@@ -4076,6 +4110,67 @@ mod tests {
         let serialized = serde_json::to_string(&event).unwrap();
         assert!(serialized.contains("execution_anchor_rebound"));
         assert!(serialized.contains("/old/checkout"));
+    }
+
+    #[test]
+    fn session_imported_roundtrips_byte_for_byte() {
+        use super::{Event, EventPayload};
+        let json = r#"{"seq":9,"timestamp":"2026-01-01T00:00:00Z","type":"session_imported","payload":{"from_workspace":"/srv/ws-a","from_session":"coord","from_session_id":"0b1c","machine_id":"a1b2c3d4"}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        match &event.payload {
+            EventPayload::SessionImported {
+                from_workspace,
+                from_session,
+                from_session_id,
+                machine_id,
+            } => {
+                assert_eq!(from_workspace, "/srv/ws-a");
+                assert_eq!(from_session, "coord");
+                assert_eq!(from_session_id, "0b1c");
+                assert_eq!(machine_id, "a1b2c3d4");
+            }
+            other => panic!("expected a session_imported payload, got {:?}", other),
+        }
+        assert_eq!(event.payload.type_name(), "session_imported");
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn session_imported_does_not_move_the_derived_state() {
+        use super::{Event, EventPayload};
+        let at = |seq, payload: EventPayload| Event {
+            seq,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        };
+        let events = vec![
+            at(
+                1,
+                EventPayload::Transitioned {
+                    from: None,
+                    to: "wait".to_string(),
+                    condition_type: "auto".to_string(),
+                    skip_if_matched: None,
+                    context_assignments: None,
+                    vars_matched: None,
+                },
+            ),
+            at(
+                2,
+                EventPayload::SessionImported {
+                    from_workspace: "/srv/ws-a".to_string(),
+                    from_session: "coord".to_string(),
+                    from_session_id: "0b1c".to_string(),
+                    machine_id: "a1b2c3d4".to_string(),
+                },
+            ),
+        ];
+        assert_eq!(
+            crate::engine::persistence::derive_state_from_log(&events).as_deref(),
+            Some("wait")
+        );
     }
 
     #[test]

@@ -119,7 +119,7 @@ changes, removal, or rename require a 6-week deprecation window.
 
 The remaining `SessionBackend` methods (`session_dir`, `exists`,
 `cleanup`, `append_header`, `append_event`, `read_header`,
-`ensure_pushed`, `relocate`, `lock_state_file`) carry an
+`rewrite_header`, `ensure_pushed`, `relocate`, `lock_state_file`) carry an
 **additive-only doc note**. Their signatures may evolve in minor
 releases; downstream consumers should not depend on their exact
 shape.

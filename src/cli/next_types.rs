@@ -952,6 +952,11 @@ pub enum NextErrorCode {
     /// started with -- a wrong answer rather than a missing one. Caller
     /// error: take the `koto next` call out of the template's command.
     NestedInvocation,
+    /// The session was imported into another workspace (`koto session
+    /// import`), and the cloud backend found the marker the import left
+    /// beside this copy. Caller error: continue the session where the
+    /// message says it now lives; ticking this copy would fork it.
+    SessionMigrated,
 }
 
 impl NextErrorCode {
@@ -973,6 +978,7 @@ impl NextErrorCode {
             // The template (or whoever wrote the command) has to change:
             // re-running the nested tick will refuse identically.
             NextErrorCode::NestedInvocation => 2,
+            NextErrorCode::SessionMigrated => 2,
             NextErrorCode::TemplateError => 3,
             NextErrorCode::PersistenceError => 3,
             NextErrorCode::ExecutionAnchorUnresolvable => 3,

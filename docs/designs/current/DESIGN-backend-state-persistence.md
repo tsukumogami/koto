@@ -1,6 +1,6 @@
 ---
+schema: design/v1
 status: Current
-upstream: docs/designs/current/DESIGN-config-and-cloud-sync.md
 problem: |
   State file I/O (append_event, read_events) happens directly in the CLI layer via
   persistence module functions, bypassing the SessionBackend trait entirely. CloudBackend
@@ -24,7 +24,30 @@ rationale: |
 
 Current
 
-## Context and problem statement
+**Note (2026-10-09).** This design routed all state I/O through the backend, but
+one path stayed outside it: rewriting a state file's header in place.
+`koto session rebind`, a first `koto next` adopting an execution anchor, and
+starting a child rewrote the header on the local file, so under the cloud
+backend the new header never reached the bucket and the next read's pull put
+the old one back (koto#310). Header rewrites now go through
+`SessionBackend::rewrite_header`, and no code under `src/cli/` writes a header
+outside the backend. The trait's default rewrites the local file and confirms
+the push with `ensure_pushed`; the cloud backend overrides it to push the
+rewritten state file the way `append_event` does, best effort. If that push
+fails, the rewrite (and so a rebind) still succeeds locally with a warning on
+stderr, and the session's next successful push carries it. The
+session-migration design also adds a check before the cloud backend reads a
+session's state or context: it looks for a `migrated.json` marker beside the
+session's remote objects, left there by `koto session import`, and refuses
+with `session_migrated` when it finds one, so a session that moved to another
+workspace isn't read or advanced in its old one. The session-migration
+design (`DESIGN-session-migration.md`) has the details.
+
+## Context and Problem Statement
+
+This design builds on the config-and-cloud-sync design
+(`docs/designs/current/DESIGN-config-and-cloud-sync.md`), which introduced the
+cloud backend.
 
 koto's `SessionBackend` trait manages session directories (create, cleanup, list) and
 `ContextStore` manages content (add, get, exists). But state file I/O — the JSONL
@@ -46,7 +69,7 @@ that point.
 These are spread across 6 handler functions: `handle_init`, `handle_next`,
 `handle_rewind`, `handle_cancel`, `handle_decisions_record`, `handle_decisions_list`.
 
-## Decision drivers
+## Decision Drivers
 
 - State mutations must be visible to CloudBackend for sync to work
 - Reads must go through the backend too (CloudBackend pulls before read)
@@ -55,7 +78,7 @@ These are spread across 6 handler functions: `handle_init`, `handle_next`,
 - LocalBackend must work identically to today
 - Removing persistence imports from CLI should catch missed call sites at compile time
 
-## Considered options
+## Considered Options
 
 ### Decision 1: How to extend SessionBackend with state I/O
 
@@ -114,7 +137,7 @@ clone. After refactor, it captures a backend reference and session ID string —
 methods are called directly. Post-write hook — doesn't solve reads (CloudBackend
 needs pull-before-read).
 
-## Decision outcome
+## Decision Outcome
 
 SessionBackend gains 4 state I/O methods. All 16 CLI call sites are refactored in
 one commit to call backend methods instead of persistence functions directly.
@@ -126,7 +149,7 @@ reads).
 The persistence module (`src/engine/persistence.rs`) keeps its format logic unchanged.
 It's called by LocalBackend, not by the CLI.
 
-## Solution architecture
+## Solution Architecture
 
 ### SessionBackend trait extension
 
@@ -250,7 +273,7 @@ impl SessionBackend for Backend {
 - `ContextStore` trait — unchanged
 - `state_file_name()` free function — still used by LocalBackend internally
 
-## Implementation approach
+## Implementation Approach
 
 ### Phase 1: Extend trait and implement for LocalBackend
 
@@ -274,7 +297,7 @@ Remove the now-unnecessary `sync_push_state()` call from `create()`.
 Run cloud integration tests against R2. Manually verify state files appear in the
 bucket after `koto init` and `koto next`.
 
-## Security considerations
+## Security Considerations
 
 No new security surface. State file permissions (0600) are still enforced by the
 persistence module. Cloud transport security is unchanged (HTTPS via rust-s3/rustls).

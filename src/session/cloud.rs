@@ -10,17 +10,30 @@
 //! cache on the remote manifest reduces redundant S3 GETs during rapid
 //! sequential calls.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::Context;
 use s3::creds::Credentials;
+use s3::error::S3Error;
 use s3::{Bucket, Region};
 
 use crate::config::CloudConfig;
 use crate::session::context::ContextStore;
 use crate::session::local::{repo_id, LocalBackend};
 use crate::session::sync::{self, ManifestCache};
-use crate::session::{state_file_name, SessionBackend, SessionError, SessionInfo, SessionLock};
+use crate::session::{
+    state_file_name, SessionBackend, SessionError, SessionInfo, SessionLock, SessionMigrated,
+};
+
+/// File name of the marker `koto session import` leaves beside a source
+/// session's remote objects. koto never deletes one.
+pub(crate) const MIGRATED_MARKER: &str = "migrated.json";
+
+/// File name of the compiled template a cloud session's init pushes beside
+/// its state file, for `koto session import --trust-template`.
+pub(crate) const TEMPLATE_OBJECT: &str = "template.json";
 
 /// Per-child outcome emitted by [`CloudBackend::reconcile_child`].
 ///
@@ -63,6 +76,11 @@ pub struct CloudBackend {
     bucket: Box<Bucket>,
     prefix: String,
     manifest_cache: ManifestCache,
+    /// Per-process answers of [`CloudBackend::check_not_migrated`], by
+    /// session id: `Some` when the session carries a migration marker.
+    /// A command reads a session's state many times; the marker costs one
+    /// request per session per process.
+    migration_checks: Mutex<HashMap<String, Option<SessionMigrated>>>,
 }
 
 impl CloudBackend {
@@ -75,12 +93,7 @@ impl CloudBackend {
         let local = LocalBackend::new()?;
         let prefix = repo_id(working_dir)?;
         let bucket = create_bucket(cloud_config)?;
-        Ok(Self {
-            local,
-            bucket,
-            prefix,
-            manifest_cache: ManifestCache::new(),
-        })
+        Ok(Self::with_parts(local, bucket, prefix))
     }
 
     /// Construct a `CloudBackend` with an explicit `LocalBackend` and bucket.
@@ -97,7 +110,113 @@ impl CloudBackend {
             bucket,
             prefix,
             manifest_cache: ManifestCache::new(),
+            migration_checks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Refuse when `id` was imported into another workspace.
+    ///
+    /// The first time a process asks about `id`, lists the bucket with
+    /// `<prefix>/<id>/migrated.json` as the prefix and remembers the
+    /// answer. The listing answers 200 whether or not the marker is there,
+    /// so the common case, a session that was never migrated, costs one
+    /// request and no retry (a GET of a missing object is a 404, which
+    /// rust-s3 retries after a one-second sleep). Only when the listing
+    /// shows the marker is its body fetched.
+    ///
+    /// A marker returns [`SessionMigrated`] naming the session it was
+    /// imported as and that session's workspace. A listing that fails means
+    /// the check can't tell: it warns and lets the read proceed, so an
+    /// unreachable bucket doesn't stop a host from working on its local
+    /// copy.
+    ///
+    /// A marker whose body can't be read or parsed still refuses: its
+    /// presence is the signal, and a marker written by a newer koto must
+    /// not fork the session on an older one.
+    pub fn check_not_migrated(&self, id: &str) -> anyhow::Result<()> {
+        let mut checks = self
+            .migration_checks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let answer = match checks.get(id) {
+            Some(answer) => answer.clone(),
+            None => {
+                let key = self.marker_key(id);
+                let answer = match self.object_listed(&key) {
+                    Ok(false) => None,
+                    Ok(true) => match self.fetch_object(&key) {
+                        Ok(Some(bytes)) => Some(migrated_from_marker(id, &bytes)),
+                        // Removed between the listing and the GET.
+                        Ok(None) => None,
+                        Err(_) => Some(migrated_from_marker(id, b"")),
+                    },
+                    Err(e) => {
+                        eprintln!(
+                            "warning: cloud sync: migration check failed: {}",
+                            without_url_userinfo(&format!("{:#}", e))
+                        );
+                        None
+                    }
+                };
+                checks.insert(id.to_string(), answer.clone());
+                answer
+            }
+        };
+        match answer {
+            Some(migrated) => Err(anyhow::Error::new(migrated)),
+            None => Ok(()),
+        }
+    }
+
+    /// S3 key of a session's migration marker under this backend's prefix.
+    fn marker_key(&self, id: &str) -> String {
+        format!("{}{}", self.session_prefix(id), MIGRATED_MARKER)
+    }
+
+    /// Whether an object exists, asked by listing with its key as the
+    /// prefix rather than by HEAD or GET.
+    ///
+    /// rust-s3 is built with `fail-on-err`, so a missing object's 404
+    /// arrives as an `Err`, and the crate retries every `Err` once after a
+    /// one-second sleep. A listing answers 200 with zero or one matching
+    /// key either way, so asking about an object that is expected to be
+    /// absent costs one request and no sleep. `Err` means the listing
+    /// itself failed: the caller can't tell either way.
+    fn object_listed(&self, key: &str) -> anyhow::Result<bool> {
+        let results = self
+            .bucket
+            .list(key.to_string(), None)
+            .map_err(|e| anyhow::anyhow!("listing {} failed: {}", key, e))?;
+        Ok(results
+            .iter()
+            .any(|page| page.contents.iter().any(|obj| obj.key == key)))
+    }
+
+    /// GET an object expected to exist, telling a missing one (`Ok(None)`)
+    /// apart from a request that failed (`Err`). Only a 404 counts as
+    /// missing. Callers that expect the object may be absent probe with
+    /// [`CloudBackend::object_listed`] first, or use
+    /// [`CloudBackend::get_object_if_present`], so that no expected 404
+    /// pays rust-s3's retry sleep.
+    fn fetch_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        match self.bucket.get_object(key) {
+            Ok(response) => match response.status_code() {
+                200 => Ok(Some(response.bytes().to_vec())),
+                404 => Ok(None),
+                status => Err(anyhow::anyhow!("GET {} returned status {}", key, status)),
+            },
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("GET {} failed: {}", key, e)),
+        }
+    }
+
+    /// Fetch an object that may well be absent: list for it, and GET it
+    /// only when the listing shows it.
+    fn get_object_if_present(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        if !self.object_listed(key)? {
+            return Ok(None);
+        }
+        self.fetch_object(key)
     }
 
     /// The local directory sessions are stored under. Reached through
@@ -145,6 +264,33 @@ impl CloudBackend {
         self.put_object(&key, &data)
     }
 
+    /// S3 key of a session's compiled template.
+    fn template_key(&self, id: &str) -> String {
+        format!("{}{}", self.session_prefix(id), TEMPLATE_OBJECT)
+    }
+
+    /// Upload the compiled template a session was initialized with, as
+    /// `template.json`, so `koto session import --trust-template` on
+    /// another host can take it. Non-fatal on failure, like every other
+    /// push: the import then needs the template compiled on its host.
+    ///
+    /// `template_path` is the one the `workflow_initialized` event records,
+    /// resolved against the session directory the way every state reader
+    /// resolves it.
+    fn push_template(&self, id: &str, template_path: &str) {
+        let session_dir = self.local.session_dir(id);
+        let path = crate::engine::persistence::resolve_template_path_in_session(
+            template_path,
+            &session_dir,
+        );
+        let result = std::fs::read(&path)
+            .with_context(|| format!("reading compiled template {}", path))
+            .and_then(|bytes| self.put_object(&self.template_key(id), &bytes));
+        if let Err(e) = result {
+            eprintln!("warning: cloud sync failed for template upload: {:#}", e);
+        }
+    }
+
     /// Download the state file from S3 to the local session directory.
     /// Non-fatal on failure: if S3 is unreachable, local state is used as-is.
     fn sync_pull_state(&self, id: &str) {
@@ -163,7 +309,12 @@ impl CloudBackend {
         }
     }
 
-    /// Delete all objects under a session's S3 prefix. Non-fatal on failure.
+    /// Delete all objects under a session's S3 prefix except its migration
+    /// marker. Non-fatal on failure.
+    ///
+    /// The marker stays because it is what makes every other host refuse
+    /// the session once it has been imported elsewhere: a cleanup or a
+    /// terminal tick on the old host must not be able to lift it.
     fn sync_delete_session(&self, id: &str) {
         let prefix = self.session_prefix(id);
         // List and delete objects under the prefix.
@@ -171,6 +322,9 @@ impl CloudBackend {
             Ok(results) => {
                 for list in &results {
                     for obj in &list.contents {
+                        if is_migration_marker(&prefix, &obj.key) {
+                            continue;
+                        }
                         if let Err(e) = self.bucket.delete_object(&obj.key) {
                             eprintln!("warning: cloud sync: failed to delete {}: {}", obj.key, e);
                         }
@@ -752,6 +906,9 @@ impl SessionBackend for CloudBackend {
         crate::engine::types::StateFileHeader,
         Vec<crate::engine::types::Event>,
     )> {
+        // Before the pull, so a migrated session's local file is left
+        // exactly as it was.
+        self.check_not_migrated(id)?;
         self.sync_pull_state(id);
         self.local.read_events(id)
     }
@@ -770,8 +927,34 @@ impl SessionBackend for CloudBackend {
     }
 
     fn read_header(&self, id: &str) -> anyhow::Result<crate::engine::types::StateFileHeader> {
+        self.check_not_migrated(id)?;
         self.sync_pull_state(id);
         self.local.read_header(id)
+    }
+
+    /// Rewrite the local header, then push the state file through
+    /// `sync_push_state`, the same best-effort push `append_event` makes.
+    ///
+    /// Overridden rather than left to the trait default, which pushes
+    /// through `ensure_pushed` (the strict probe built for "push parent
+    /// before child mutation" ordering) and turns its error into a warning.
+    /// Going through `sync_push_state` keeps a header rewrite on the same
+    /// push path, and the same warning, as the event write it follows.
+    ///
+    /// The risk is accepted, not handled: when the push fails (offline, or
+    /// the bucket refuses it) the rewrite stays local and a warning goes to
+    /// stderr. The next successful push of this session carries it; until
+    /// then, a pull from another command can restore the old header. Rebind
+    /// and anchor adoption take that risk; a caller that can't follows up
+    /// with `ensure_pushed`, as the command-environment adoption does.
+    fn rewrite_header(
+        &self,
+        id: &str,
+        f: &dyn Fn(crate::engine::types::StateFileHeader) -> crate::engine::types::StateFileHeader,
+    ) -> anyhow::Result<()> {
+        self.local.rewrite_header(id, f)?;
+        self.sync_push_state(id);
+        Ok(())
     }
 
     fn init_state_file(
@@ -793,8 +976,18 @@ impl SessionBackend for CloudBackend {
         // needs remote-visibility guarantees must reconcile locally-
         // committed state with a best-effort remote sync; this method
         // does not block on the upload.
+        let template_path =
+            initial_events.iter().find_map(|e| match &e.payload {
+                crate::engine::types::EventPayload::WorkflowInitialized {
+                    template_path, ..
+                } if !template_path.is_empty() => Some(template_path.clone()),
+                _ => None,
+            });
         self.local.init_state_file(id, header, initial_events)?;
         self.sync_push_state(id);
+        if let Some(template_path) = template_path {
+            self.push_template(id, &template_path);
+        }
         Ok(())
     }
 
@@ -817,6 +1010,12 @@ impl SessionBackend for CloudBackend {
                             Some(s) => s,
                             None => continue,
                         };
+                        // The marker stays where it is, as it does through
+                        // a cleanup: moving it would lift the refusal from
+                        // the name the other hosts know the session by.
+                        if is_migration_marker(&old_prefix, &obj.key) {
+                            continue;
+                        }
                         let new_key = format!("{}{}", self.session_prefix(to), suffix);
 
                         // Copy old -> new, then delete old.
@@ -895,6 +1094,7 @@ impl CloudBackend {
         content: &[u8],
         writer: Option<&str>,
     ) -> anyhow::Result<()> {
+        self.check_not_migrated(session)?;
         match writer {
             Some(w) => self.local.add_with_writer(session, key, content, w)?,
             None => self.local.add(session, key, content)?,
@@ -927,6 +1127,12 @@ impl CloudBackend {
     }
 }
 
+/// Every method asks [`CloudBackend::check_not_migrated`] first, so a
+/// session imported elsewhere neither reads nor writes its keys here: the
+/// methods that return a `Result` refuse with `SessionMigrated`, while
+/// `ctx_exists` answers false and `meta` none, having no room for a
+/// reason. The answer is cached per session, so a command that touches
+/// many keys pays for it once.
 impl ContextStore for CloudBackend {
     fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
         self.add_as(session, key, content, None)
@@ -944,7 +1150,12 @@ impl ContextStore for CloudBackend {
 
     /// The local metadata, or for a key only the remote store has, the
     /// remote manifest's.
+    ///
+    /// A migrated session has no metadata to give: `None`.
     fn meta(&self, session: &str, key: &str) -> Option<crate::session::context::KeyMeta> {
+        if self.check_not_migrated(session).is_err() {
+            return None;
+        }
         if let Some(meta) = self.local.meta(session, key) {
             return Some(meta);
         }
@@ -961,6 +1172,7 @@ impl ContextStore for CloudBackend {
     }
 
     fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+        self.check_not_migrated(session)?;
         // Pull from remote if a newer version exists. A pull that wrote the
         // local store is a write like any other, so it is logged -- before
         // the read the caller is about to log, which it produced.
@@ -988,7 +1200,12 @@ impl ContextStore for CloudBackend {
         self.local.get(session, key)
     }
 
+    /// A migrated session holds no key here: `false`. Callers that must
+    /// tell the operator why ask [`CloudBackend::check_not_migrated`].
     fn ctx_exists(&self, session: &str, key: &str) -> bool {
+        if self.check_not_migrated(session).is_err() {
+            return false;
+        }
         if self.local.ctx_exists(session, key) {
             return true;
         }
@@ -1004,6 +1221,7 @@ impl ContextStore for CloudBackend {
     }
 
     fn remove(&self, session: &str, key: &str) -> anyhow::Result<()> {
+        self.check_not_migrated(session)?;
         self.local.remove(session, key)?;
 
         // Check version before pushing deletion.
@@ -1030,6 +1248,7 @@ impl ContextStore for CloudBackend {
     }
 
     fn list_keys(&self, session: &str, prefix: Option<&str>) -> anyhow::Result<Vec<String>> {
+        self.check_not_migrated(session)?;
         let mut keys = self.local.list_keys(session, prefix)?;
         // Merge in remote-only keys.
         if let Some(remote_keys) = sync::remote_list_keys(
@@ -1050,6 +1269,1100 @@ impl ContextStore for CloudBackend {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Import: `koto session import <name> --from <workspace-path>`
+// ---------------------------------------------------------------------------
+
+/// Why `koto session import` stopped, as the code it prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportErrorCode {
+    /// The backend is local: there is no remote copy to read.
+    RequiresCloud,
+    /// The source workspace's prefix holds no state file for the session.
+    SourceNotFound,
+    /// The source already carries a migration marker.
+    SourceMigrated,
+    /// The source is a child session, which isn't imported on its own.
+    SourceIsChild,
+    /// The name is taken on this machine or under this workspace's prefix.
+    NameTaken,
+    /// This machine's template cache has no usable compiled template with
+    /// the session's hash.
+    TemplateUnavailable,
+    /// A source object couldn't be read, or failed validation.
+    SourceUnreadable,
+    /// Building the imported session here, pushing it under this
+    /// workspace's prefix or moving it into place failed, or something the
+    /// import needs on this side couldn't be read: this machine's id, the
+    /// listing that checks this workspace's prefix for the name, or the
+    /// manifest of a target an earlier run left here. A failure while
+    /// staging, pushing or moving removes the staging directory and takes
+    /// back what the run pushed; the others come before anything is
+    /// written, so there is nothing to take back.
+    PushFailed,
+    /// The imported session is in place and pushed, but the marker on the
+    /// source couldn't be written.
+    Unmarked,
+}
+
+impl ImportErrorCode {
+    /// The code as printed in the error object.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImportErrorCode::RequiresCloud => "import_requires_cloud",
+            ImportErrorCode::SourceNotFound => "import_source_not_found",
+            ImportErrorCode::SourceMigrated => "import_source_migrated",
+            ImportErrorCode::SourceIsChild => "import_source_is_child",
+            ImportErrorCode::NameTaken => "import_name_taken",
+            ImportErrorCode::TemplateUnavailable => "import_template_unavailable",
+            ImportErrorCode::SourceUnreadable => "import_source_unreadable",
+            ImportErrorCode::PushFailed => "import_push_failed",
+            ImportErrorCode::Unmarked => "import_unmarked",
+        }
+    }
+
+    /// 2 for a refusal the caller acts on (pick another name, compile the
+    /// template, import from the right workspace), 1 for a failure.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            ImportErrorCode::RequiresCloud
+            | ImportErrorCode::SourceNotFound
+            | ImportErrorCode::SourceMigrated
+            | ImportErrorCode::SourceIsChild
+            | ImportErrorCode::NameTaken
+            | ImportErrorCode::TemplateUnavailable => 2,
+            ImportErrorCode::SourceUnreadable
+            | ImportErrorCode::PushFailed
+            | ImportErrorCode::Unmarked => 1,
+        }
+    }
+}
+
+/// An import refusal or failure: a code and a message for the operator.
+#[derive(Debug)]
+pub struct ImportError {
+    pub code: ImportErrorCode,
+    pub message: String,
+}
+
+impl ImportError {
+    pub fn new(code: ImportErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: without_url_userinfo(&message.into()),
+        }
+    }
+}
+
+impl std::fmt::Display for ImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code.as_str(), self.message)
+    }
+}
+
+impl std::error::Error for ImportError {}
+
+/// Where an import took the session's compiled template from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateOrigin {
+    /// This machine's template cache, which `koto template compile` fills.
+    LocalCache,
+    /// The source's `template.json` in the bucket, under `--trust-template`.
+    Bucket,
+    /// None: a re-run that found the target already built took no
+    /// template, and the one in the target's directory is unchanged.
+    Unchanged,
+}
+
+impl TemplateOrigin {
+    /// The value of the import output's `template` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TemplateOrigin::LocalCache => "local-cache",
+            TemplateOrigin::Bucket => "bucket",
+            TemplateOrigin::Unchanged => "unchanged",
+        }
+    }
+}
+
+/// What `koto session import` was asked to do.
+#[derive(Debug, Clone, Copy)]
+pub struct ImportRequest<'a> {
+    /// The session's name in the source workspace.
+    pub name: &'a str,
+    /// The name it gets here: `--as`, else `name`.
+    pub target: &'a str,
+    /// The source workspace, as `--from` gave it.
+    pub from: &'a Path,
+    /// The canonical current directory, which anchors the new session.
+    pub anchor: &'a Path,
+    /// `--trust-template`: take the compiled template from the bucket.
+    pub trust_template: bool,
+}
+
+/// What a completed import did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportOutcome {
+    /// The new local session's name.
+    pub name: String,
+    /// The source workspace, as recorded in the `session_imported` event.
+    pub from_workspace: String,
+    /// The source session's name.
+    pub from_session: String,
+    /// How many context keys came across.
+    pub keys: usize,
+    /// Where the compiled template came from.
+    pub template: TemplateOrigin,
+}
+
+/// The source's state log, parsed for validation but kept as text so its
+/// events are carried byte for byte.
+struct SourceLog {
+    header: crate::engine::types::StateFileHeader,
+    /// Every event line, verbatim, without its line terminator.
+    event_lines: Vec<String>,
+    /// The last event's `seq`.
+    last_seq: u64,
+}
+
+/// Parse and check a source state file.
+///
+/// Refuses (with the reason) a log this build can't carry intact: not
+/// UTF-8, no header, a `schema_version` other than 1, an event line that
+/// doesn't parse, or a gap in the sequence numbers. Blank lines are
+/// dropped. The `template_hash` is checked by the caller, after it has
+/// refused a child session, whose hash may legitimately be empty.
+fn parse_source_log(bytes: &[u8]) -> Result<SourceLog, String> {
+    use crate::engine::types::{Event, StateFileHeader};
+
+    let text = std::str::from_utf8(bytes).map_err(|_| "the state file is not UTF-8".to_string())?;
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let header_line = lines.next().ok_or("the state file is empty")?;
+    let header: StateFileHeader = serde_json::from_str(header_line)
+        .map_err(|e| format!("the state file's header doesn't parse: {}", e))?;
+    if header.schema_version != 1 {
+        return Err(format!(
+            "the state file has schema_version {}; this koto imports version 1",
+            header.schema_version
+        ));
+    }
+    let mut event_lines = Vec::new();
+    let mut last_seq = 0;
+    for (i, line) in lines.enumerate() {
+        let event: Event = serde_json::from_str(line)
+            .map_err(|e| format!("event {} doesn't parse: {}", i + 1, e))?;
+        if event.seq != last_seq + 1 {
+            return Err(format!(
+                "event {} has seq {}, expected {}",
+                i + 1,
+                event.seq,
+                last_seq + 1
+            ));
+        }
+        last_seq = event.seq;
+        event_lines.push(line.to_string());
+    }
+    Ok(SourceLog {
+        header,
+        event_lines,
+        last_seq,
+    })
+}
+
+/// The marker an import writes beside the source session.
+#[derive(serde::Serialize)]
+struct MigrationMarker<'a> {
+    schema: u32,
+    target: MarkerTarget<'a>,
+    machine_id: &'a str,
+    migrated_at: String,
+}
+
+#[derive(serde::Serialize)]
+struct MarkerTarget<'a> {
+    session: &'a str,
+    session_id: &'a str,
+    workspace: String,
+    prefix: &'a str,
+}
+
+/// The source session an import reads: where its objects are and its
+/// parsed log.
+struct ImportSource {
+    /// The session's name in the source workspace.
+    name: String,
+    /// The source workspace, canonical when it resolves here.
+    workspace: String,
+    /// `<source prefix>/<name>/`, the source session's key prefix.
+    session: String,
+    log: SourceLog,
+    /// The source's marker, when it names this workspace's prefix and the
+    /// import's target: an earlier run of this import may have written it
+    /// and then been told the PUT failed.
+    own_marker: Option<Vec<u8>>,
+}
+
+impl ImportSource {
+    /// The bucket key of `rest` under the source session.
+    fn key(&self, rest: &str) -> String {
+        format!("{}{}", self.session, rest)
+    }
+
+    /// The refusal for a source object that couldn't be read or failed
+    /// validation.
+    fn unreadable(&self, what: &str, e: &dyn std::fmt::Display) -> ImportError {
+        unreadable_source(&self.name, &self.workspace, what, e)
+    }
+}
+
+fn unreadable_source(
+    name: &str,
+    workspace: &str,
+    what: &str,
+    e: &dyn std::fmt::Display,
+) -> ImportError {
+    ImportError::new(
+        ImportErrorCode::SourceUnreadable,
+        format!(
+            "could not read {} of session '{}' from workspace {}: {}",
+            what, name, workspace, e
+        ),
+    )
+}
+
+/// The refusal for a source that already carries another import's marker.
+fn already_migrated(name: &str, workspace: &str, marker: &[u8]) -> ImportError {
+    let migrated = migrated_from_marker(name, marker);
+    ImportError::new(
+        ImportErrorCode::SourceMigrated,
+        format!(
+            "session '{}' in workspace {} was already migrated to '{}' in {}",
+            name, workspace, migrated.target, migrated.workspace
+        ),
+    )
+}
+
+/// What already holds the import's target name.
+enum ExistingTarget {
+    /// Nothing, or only an earlier run of this same import that pushed the
+    /// target but never moved it into place here (it stopped between the
+    /// push and the rename). Either way the import runs in full, writing
+    /// over any such copy key for key.
+    Free,
+    /// An earlier run of this same import, complete on this machine
+    /// (it stopped at `import_unmarked`). Only the marker is missing.
+    Local {
+        /// The `session_id` that run gave the target.
+        session_id: String,
+    },
+}
+
+/// The `session_imported` event a log ends its imports with, and the
+/// header's `session_id`: enough to tell whether a log is an earlier run of
+/// a given import.
+struct ImportedAs {
+    session_id: String,
+    from_workspace: String,
+    from_session: String,
+    from_session_id: String,
+}
+
+impl ImportedAs {
+    /// Read from a state log's bytes; `None` when the log doesn't parse or
+    /// records no import.
+    fn read(bytes: &[u8]) -> Option<Self> {
+        use crate::engine::types::{Event, EventPayload, StateFileHeader};
+
+        let text = std::str::from_utf8(bytes).ok()?;
+        let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+        let header: StateFileHeader = serde_json::from_str(lines.next()?).ok()?;
+        let mut last = None;
+        for line in lines {
+            if let Ok(Event {
+                payload:
+                    EventPayload::SessionImported {
+                        from_workspace,
+                        from_session,
+                        from_session_id,
+                        ..
+                    },
+                ..
+            }) = serde_json::from_str::<Event>(line)
+            {
+                last = Some((from_workspace, from_session, from_session_id));
+            }
+        }
+        let (from_workspace, from_session, from_session_id) = last?;
+        Some(ImportedAs {
+            session_id: header.session_id,
+            from_workspace,
+            from_session,
+            from_session_id,
+        })
+    }
+
+    /// Whether this log's latest import is of `source`. Workspace, name and
+    /// session id must all agree: a log written before koto recorded
+    /// session ids has an empty one, which alone would match any other.
+    fn is_of(&self, source: &ImportSource) -> bool {
+        self.from_workspace == source.workspace
+            && self.from_session == source.name
+            && self.from_session_id == source.log.header.session_id
+    }
+}
+
+/// The directory an import builds its target in, inside the session store.
+/// Removed when dropped, unless it was moved into place.
+///
+/// A process killed mid-import can leave one behind as
+/// `<sessions>/.import-<target>-<random>/`. Nothing reads it and no
+/// session is named like it (a session name starts with a letter), so it
+/// is safe to delete by hand.
+struct Staging {
+    dir: PathBuf,
+    moved: bool,
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if !self.moved {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// Create the directory `path`, mode 0700, failing when anything is
+/// already there: not recursive, so the directory is the caller's alone.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+impl CloudBackend {
+    /// Import session `req.name` from the workspace at `req.from` into this
+    /// workspace as `req.target`, anchored at `req.anchor`.
+    ///
+    /// Reads and checks the source's remote objects; builds the target in
+    /// a staging directory inside the session store, with the source's
+    /// events plus a `session_imported` event, its context keys and
+    /// manifest verbatim, and the compiled template; pushes it under this
+    /// workspace's prefix; renames it into place; and only then writes
+    /// `migrated.json` beside the source. A failure before the rename
+    /// removes the staging directory and exactly the objects this run
+    /// pushed. The import never writes any other object under the
+    /// source's prefix.
+    ///
+    /// Rollback ends at the rename: once the target is in place, the
+    /// marker step never takes anything back, whatever it reports.
+    ///
+    /// A re-run of an import that stopped at `import_unmarked` writes only
+    /// the marker; one whose target reached the bucket but not this
+    /// machine builds and pushes it again.
+    ///
+    /// It is defined for a stopped source: no process advancing the
+    /// session, and its last write on the remote. Nothing here can tell a
+    /// source that is still moving.
+    pub fn import_session(&self, req: &ImportRequest<'_>) -> Result<ImportOutcome, ImportError> {
+        let source = self.read_import_source(req)?;
+        let outcome = |keys: usize, template: TemplateOrigin| ImportOutcome {
+            name: req.target.to_string(),
+            from_workspace: source.workspace.clone(),
+            from_session: source.name.clone(),
+            keys,
+            template,
+        };
+
+        // The source is marked for this very target: an earlier run's
+        // marker PUT landed though it reported a failure. With that run's
+        // target here, the import is already complete; nothing is written.
+        if let Some(marker) = &source.own_marker {
+            return match self.local_import_of(req.target, &source) {
+                Some(session_id) if session_id == marker_target_field(marker, "session_id") => Ok(
+                    outcome(self.local_key_count(req.target)?, TemplateOrigin::Unchanged),
+                ),
+                _ => {
+                    let local = self.local.session_dir(req.target);
+                    let (what, hint) = if local.exists() {
+                        (
+                            "the session here is a different one".to_string(),
+                            format!(
+                                "the conflict is the local session at {}: import again under \
+                                 --as <new-name>, or remove that session if it is not wanted",
+                                local.display()
+                            ),
+                        )
+                    } else {
+                        (
+                            "that session is missing here".to_string(),
+                            format!(
+                                "remove '{}' from this workspace's prefix in the bucket, or \
+                                 import again under --as <new-name>",
+                                req.target
+                            ),
+                        )
+                    };
+                    Err(ImportError::new(
+                        ImportErrorCode::SourceMigrated,
+                        format!(
+                            "session '{}' in workspace {} carries this import's own marker, \
+                             naming '{}' in this workspace, but {}; {}",
+                            source.name, source.workspace, req.target, what, hint
+                        ),
+                    ))
+                }
+            };
+        }
+
+        let (session_id, machine_id, keys, template_origin) =
+            match self.existing_target(req, &source)? {
+                ExistingTarget::Local { session_id } => (
+                    session_id,
+                    import_machine_id()?,
+                    self.local_key_count(req.target)?,
+                    TemplateOrigin::Unchanged,
+                ),
+                ExistingTarget::Free => {
+                    let template = self.import_template(req, &source)?;
+                    let (manifest, manifest_bytes) = self.read_source_manifest(&source)?;
+                    let machine_id = import_machine_id()?;
+                    let (mut staging, session_id) = self.stage_import(
+                        req,
+                        &source,
+                        &template,
+                        &manifest,
+                        manifest_bytes.as_deref(),
+                        &machine_id,
+                    )?;
+                    let pushed = self.push_staged(req.target, &staging.dir, &source, &manifest)?;
+                    self.move_into_place(req.target, &mut staging, &pushed)?;
+                    let origin = if req.trust_template {
+                        TemplateOrigin::Bucket
+                    } else {
+                        TemplateOrigin::LocalCache
+                    };
+                    (session_id, machine_id, manifest.keys.len(), origin)
+                }
+            };
+
+        self.mark_source(req, &source, &session_id, &machine_id)?;
+        Ok(outcome(keys, template_origin))
+    }
+
+    /// The `session_id` of the local session `target` when its log is an
+    /// import of `source`.
+    fn local_import_of(&self, target: &str, source: &ImportSource) -> Option<String> {
+        let bytes =
+            std::fs::read(self.local.session_dir(target).join(state_file_name(target))).ok()?;
+        let imported = ImportedAs::read(&bytes)?;
+        imported.is_of(source).then_some(imported.session_id)
+    }
+
+    /// How many keys the local session `target`'s manifest lists. A
+    /// manifest that can't be read fails the import rather than reporting
+    /// none.
+    fn local_key_count(&self, target: &str) -> Result<usize, ImportError> {
+        self.local
+            .read_manifest(target)
+            .map(|m| m.keys.len())
+            .map_err(|e| {
+                ImportError::new(
+                    ImportErrorCode::PushFailed,
+                    format!(
+                        "could not read the context manifest of the imported session '{}': {:#}",
+                        target, e
+                    ),
+                )
+            })
+    }
+
+    /// Read and check the source: refuse a marked one, then fetch its state
+    /// file and parse all of it before anything is written.
+    fn read_import_source(&self, req: &ImportRequest<'_>) -> Result<ImportSource, ImportError> {
+        use ImportErrorCode::*;
+
+        let name = req.name;
+        let source_prefix = crate::session::local::prefix_for_workspace(req.from)
+            .map_err(|e| ImportError::new(SourceNotFound, format!("--from: {}", e)))?;
+        let workspace = std::fs::canonicalize(req.from)
+            .unwrap_or_else(|_| req.from.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        let session = format!("{}/{}/", source_prefix, name);
+
+        // A source already marked was imported before. A marker naming this
+        // workspace's prefix and this import's target may be this import's
+        // own; that is settled once the source's log is read.
+        let marker = self
+            .get_object_if_present(&format!("{}{}", session, MIGRATED_MARKER))
+            .map_err(|e| unreadable_source(name, &workspace, "the migration marker", &e))?;
+        let own_marker = match &marker {
+            None => None,
+            Some(bytes) => {
+                if marker_target_field(bytes, "prefix") != self.prefix
+                    || marker_target_field(bytes, "session") != req.target
+                {
+                    return Err(already_migrated(name, &workspace, bytes));
+                }
+                Some(bytes.clone())
+            }
+        };
+
+        let state_bytes = self
+            .get_object_if_present(&format!("{}{}", session, state_file_name(name)))
+            .map_err(|e| unreadable_source(name, &workspace, "the state file", &e))?;
+        let state_bytes = match (state_bytes, &marker) {
+            (Some(bytes), _) => bytes,
+            (None, Some(bytes)) => return Err(already_migrated(name, &workspace, bytes)),
+            (None, None) => {
+                return Err(ImportError::new(
+                    SourceNotFound,
+                    format!(
+                        "workspace {} has no session '{}' in the bucket; pass the source \
+                         workspace's absolute path as it is on the host that created the session",
+                        workspace, name
+                    ),
+                ))
+            }
+        };
+        let log = parse_source_log(&state_bytes)
+            .map_err(|e| unreadable_source(name, &workspace, "the state file", &e))?;
+        if let Some(parent) = &log.header.parent_workflow {
+            return Err(ImportError::new(
+                SourceIsChild,
+                format!(
+                    "session '{}' is a child of '{}'; a child session is not imported on its own",
+                    name, parent
+                ),
+            ));
+        }
+        // The hash becomes a file name, so it must be one.
+        if !crate::engine::persistence::is_template_hash(&log.header.template_hash) {
+            return Err(unreadable_source(
+                name,
+                &workspace,
+                "the state file",
+                &"its header's template_hash is not 64 lowercase hex digits",
+            ));
+        }
+        Ok(ImportSource {
+            name: name.to_string(),
+            workspace,
+            session,
+            log,
+            own_marker,
+        })
+    }
+
+    /// Whether the target name is free, here and under this workspace's
+    /// prefix. A session holding it is an earlier run of this import when
+    /// the latest `session_imported` event in its log names this source;
+    /// anything else holding it refuses `import_name_taken`.
+    fn existing_target(
+        &self,
+        req: &ImportRequest<'_>,
+        source: &ImportSource,
+    ) -> Result<ExistingTarget, ImportError> {
+        use ImportErrorCode::*;
+
+        let target = req.target;
+        let taken = |place: &str| {
+            ImportError::new(
+                NameTaken,
+                format!(
+                    "{} already has a session named '{}', and it is not an import of session \
+                     '{}' from {}; pass --as <new-name> to import it under another name",
+                    place, target, source.name, source.workspace
+                ),
+            )
+        };
+
+        let dir = self.local.session_dir(target);
+        if dir.exists() {
+            return match std::fs::read(dir.join(state_file_name(target)))
+                .ok()
+                .and_then(|bytes| ImportedAs::read(&bytes))
+            {
+                Some(imported) if imported.is_of(source) => Ok(ExistingTarget::Local {
+                    session_id: imported.session_id,
+                }),
+                _ => Err(taken("this machine")),
+            };
+        }
+
+        let key = self.state_key(target);
+        let could_not_check = |e: &dyn std::fmt::Display| {
+            ImportError::new(
+                PushFailed,
+                format!(
+                    "could not check this workspace's prefix for a session named '{}': {}",
+                    target, e
+                ),
+            )
+        };
+        match self.object_listed(&key) {
+            Ok(false) => Ok(ExistingTarget::Free),
+            Ok(true) => match self.fetch_object(&key) {
+                Ok(bytes) => match bytes.as_deref().and_then(ImportedAs::read) {
+                    Some(imported) if imported.is_of(source) => Ok(ExistingTarget::Free),
+                    _ => Err(taken("this workspace's prefix in the bucket")),
+                },
+                Err(e) => Err(could_not_check(&e)),
+            },
+            Err(e) => Err(could_not_check(&e)),
+        }
+    }
+
+    /// The compiled template, checked against the header's `template_hash`
+    /// and parsed: from this machine's cache, or under `--trust-template`
+    /// from the source's `template.json`. Without the flag the bucket's
+    /// copy is never fetched.
+    fn import_template(
+        &self,
+        req: &ImportRequest<'_>,
+        source: &ImportSource,
+    ) -> Result<Vec<u8>, ImportError> {
+        use ImportErrorCode::*;
+
+        let hash = &source.log.header.template_hash;
+        let usable = |bytes: Vec<u8>| -> Result<Vec<u8>, String> {
+            let actual = crate::cache::sha256_hex(&bytes);
+            if &actual != hash {
+                return Err(format!("its contents hash to {}", actual));
+            }
+            serde_json::from_slice::<crate::template::types::CompiledTemplate>(&bytes)
+                .map_err(|e| format!("it doesn't parse as a compiled template: {}", e))?;
+            Ok(bytes)
+        };
+
+        if req.trust_template {
+            let key = source.key(TEMPLATE_OBJECT);
+            let bytes = self
+                .get_object_if_present(&key)
+                .map_err(|e| source.unreadable("the compiled template", &e))?;
+            return bytes
+                .ok_or_else(|| "the source has none in the bucket".to_string())
+                .and_then(usable)
+                .map_err(|why| {
+                    ImportError::new(
+                        TemplateUnavailable,
+                        format!(
+                            "the source's {} can't be used as the compiled template with hash \
+                             {}: {}; import without --trust-template after running \
+                             `koto template compile` here on the session's template",
+                            TEMPLATE_OBJECT, hash, why
+                        ),
+                    )
+                });
+        }
+
+        let template_file = crate::cache::cache_dir().join(format!("{}.json", hash));
+        std::fs::read(&template_file)
+            .map_err(|_| "it is not there".to_string())
+            .and_then(usable)
+            .map_err(|why| {
+                let source_file = source
+                    .log
+                    .header
+                    .template_source_file
+                    .as_deref()
+                    .map(|f| format!(" ({})", f))
+                    .unwrap_or_default();
+                ImportError::new(
+                    TemplateUnavailable,
+                    format!(
+                        "this machine has no usable compiled template with hash {} at {}: {}; \
+                         run `koto template compile` here on the session's template{} from a \
+                         checkout that matches it, then import again",
+                        hash,
+                        template_file.display(),
+                        why,
+                        source_file
+                    ),
+                )
+            })
+    }
+
+    /// The source's context manifest, with every key name checked before
+    /// any key is fetched, and its bytes when the source has one.
+    fn read_source_manifest(
+        &self,
+        source: &ImportSource,
+    ) -> Result<(crate::session::context::Manifest, Option<Vec<u8>>), ImportError> {
+        use crate::session::context::Manifest;
+        use crate::session::validate::validate_context_key;
+
+        let bytes = self
+            .get_object_if_present(&source.key("ctx/manifest.json"))
+            .map_err(|e| source.unreadable("the context manifest", &e))?;
+        let manifest: Manifest = match &bytes {
+            Some(bytes) => serde_json::from_slice(bytes)
+                .map_err(|e| source.unreadable("the context manifest", &e))?,
+            None => Manifest::default(),
+        };
+        for key in manifest.keys.keys() {
+            validate_context_key(key)
+                .map_err(|e| source.unreadable(&format!("context key {:?}", key), &e))?;
+        }
+        Ok((manifest, bytes))
+    }
+
+    /// Build the target in `<sessions>/.import-<target>-<random>/`, created
+    /// exclusively with mode 0700: the state log, the context keys (each
+    /// checked against the manifest), the manifest, the compiled template
+    /// and a fresh version record. Returns the staging directory, removed
+    /// when dropped, and the target's new `session_id`.
+    ///
+    /// A source with no manifest gets an empty one, so every imported
+    /// session has a `ctx/` manifest.
+    fn stage_import(
+        &self,
+        req: &ImportRequest<'_>,
+        source: &ImportSource,
+        template: &[u8],
+        manifest: &crate::session::context::Manifest,
+        manifest_bytes: Option<&[u8]>,
+        machine_id: &str,
+    ) -> Result<(Staging, String), ImportError> {
+        use crate::engine::types::{
+            generate_session_id, now_iso8601, Event, EventPayload, SessionOrigin,
+        };
+        use ImportErrorCode::*;
+
+        let target = req.target;
+        let write_failed = |what: &Path, e: &dyn std::fmt::Display| {
+            ImportError::new(
+                PushFailed,
+                format!("could not write {}: {}", what.display(), e),
+            )
+        };
+
+        let base = self.local.base_dir();
+        crate::session::local::ensure_koto_root(base)
+            .and_then(|()| std::fs::create_dir_all(base).map_err(anyhow::Error::from))
+            .map_err(|e| write_failed(base, &e))?;
+        let dir = base.join(format!(".import-{}-{}", target, generate_session_id()));
+        create_private_dir(&dir).map_err(|e| write_failed(&dir, &e))?;
+        let staging = Staging { dir, moved: false };
+        let dir = staging.dir.as_path();
+
+        // Context keys, one fetched and written at a time. The manifest says
+        // each exists, so each is one GET with no listing first.
+        let ctx_dir = dir.join("ctx");
+        std::fs::create_dir_all(&ctx_dir).map_err(|e| write_failed(&ctx_dir, &e))?;
+        for (key, meta) in &manifest.keys {
+            let what = format!("context key {:?}", key);
+            let bytes = self
+                .fetch_object(&source.key(&format!("ctx/{}", key)))
+                .map_err(|e| source.unreadable(&what, &e))?
+                .ok_or_else(|| {
+                    source.unreadable(&what, &"the manifest lists it but the object is missing")
+                })?;
+            if bytes.len() as u64 != meta.size || crate::cache::sha256_hex(&bytes) != meta.hash {
+                return Err(
+                    source.unreadable(&what, &"its size or SHA-256 doesn't match the manifest")
+                );
+            }
+            let path = ctx_dir.join(key);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| write_failed(parent, &e))?;
+            }
+            std::fs::write(&path, &bytes).map_err(|e| write_failed(&path, &e))?;
+        }
+        let empty;
+        let manifest_bytes = match manifest_bytes {
+            Some(bytes) => bytes,
+            None => {
+                empty =
+                    serde_json::to_vec_pretty(manifest).expect("Manifest serialize is infallible");
+                &empty
+            }
+        };
+        let path = ctx_dir.join("manifest.json");
+        std::fs::write(&path, manifest_bytes).map_err(|e| write_failed(&path, &e))?;
+
+        let hash = &source.log.header.template_hash;
+        let path = dir.join(format!("{}.json", hash));
+        std::fs::write(&path, template).map_err(|e| write_failed(&path, &e))?;
+
+        let path = dir.join("version.json");
+        crate::session::version::SessionVersion::new(machine_id.to_string())
+            .save(&path)
+            .map_err(|e| write_failed(&path, &e))?;
+
+        // The header is the source's, renamed, re-identified and
+        // re-anchored here, with a command environment taken on this host.
+        let session_id = generate_session_id();
+        let mut header = source.log.header.clone();
+        header.workflow = target.to_string();
+        header.session_id = session_id.clone();
+        header.execution_dir = Some(req.anchor.to_path_buf());
+        header.origin = self.store_identity().map(|store| SessionOrigin {
+            anchor: req.anchor.to_path_buf(),
+            store,
+        });
+        header.command_environment = Some(crate::engine::command_env::record_from_process(false).0);
+
+        let payload = EventPayload::SessionImported {
+            from_workspace: source.workspace.clone(),
+            from_session: source.name.clone(),
+            from_session_id: source.log.header.session_id.clone(),
+            machine_id: machine_id.to_string(),
+        };
+        let imported = Event {
+            seq: source.log.last_seq + 1,
+            timestamp: now_iso8601(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        };
+
+        let mut log =
+            serde_json::to_string(&header).expect("StateFileHeader serialize is infallible");
+        log.push('\n');
+        for line in &source.log.event_lines {
+            log.push_str(line);
+            log.push('\n');
+        }
+        log.push_str(&serde_json::to_string(&imported).expect("Event serialize is infallible"));
+        log.push('\n');
+        let path = dir.join(state_file_name(target));
+        std::fs::write(&path, log).map_err(|e| write_failed(&path, &e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| write_failed(&path, &e))?;
+        }
+
+        Ok((staging, session_id))
+    }
+
+    /// Push the staged target under this workspace's prefix with the strict
+    /// push: state file, template, each key, manifest, version record. On a
+    /// failure, delete exactly what this run pushed and refuse
+    /// `import_push_failed`. Returns the keys pushed.
+    fn push_staged(
+        &self,
+        target: &str,
+        staged: &Path,
+        source: &ImportSource,
+        manifest: &crate::session::context::Manifest,
+    ) -> Result<Vec<String>, ImportError> {
+        let prefix = self.session_prefix(target);
+        let hash = &source.log.header.template_hash;
+        let mut uploads = vec![
+            (self.state_key(target), staged.join(state_file_name(target))),
+            (
+                self.template_key(target),
+                staged.join(format!("{}.json", hash)),
+            ),
+        ];
+        for key in manifest.keys.keys() {
+            uploads.push((
+                format!("{}ctx/{}", prefix, key),
+                staged.join("ctx").join(key),
+            ));
+        }
+        uploads.push((
+            format!("{}ctx/manifest.json", prefix),
+            staged.join("ctx").join("manifest.json"),
+        ));
+        uploads.push((self.version_key(target), staged.join("version.json")));
+
+        let mut pushed = Vec::new();
+        for (key, path) in uploads {
+            let result = std::fs::read(&path)
+                .with_context(|| format!("reading {}", path.display()))
+                .and_then(|data| self.put_object(&key, &data));
+            if let Err(e) = result {
+                self.take_back(&pushed);
+                return Err(ImportError::new(
+                    ImportErrorCode::PushFailed,
+                    format!("could not push the imported session: {:#}", e),
+                ));
+            }
+            pushed.push(key);
+        }
+        Ok(pushed)
+    }
+
+    /// Delete objects an import pushed before it failed.
+    ///
+    /// On a re-run over a target an earlier run left only in the bucket,
+    /// the keys deleted can be ones that run pushed too, the state file
+    /// included: this run wrote over them. The next run then finds the name
+    /// free and imports afresh over whatever is left.
+    fn take_back(&self, pushed: &[String]) {
+        for key in pushed {
+            if let Err(e) = self.bucket.delete_object(key) {
+                eprintln!(
+                    "warning: cloud sync: failed to remove {} after a failed import: {}",
+                    key, e
+                );
+            }
+        }
+    }
+
+    /// Rename the staging directory to `<sessions>/<target>/`. No lock is
+    /// taken: the staging directory is private and complete, and the rename
+    /// is atomic, so nothing can open the target before it exists whole.
+    ///
+    /// The rename never replaces anything, not even an empty directory: a
+    /// target that appeared while the import ran refuses
+    /// `import_name_taken`. On any failure, take back what this run pushed;
+    /// the staging directory goes when `staging` drops.
+    fn move_into_place(
+        &self,
+        target: &str,
+        staging: &mut Staging,
+        pushed: &[String],
+    ) -> Result<(), ImportError> {
+        use crate::engine::atomic_fs::{atomic_rename_dir, AtomicCreateError};
+
+        let target_dir = self.local.session_dir(target);
+        match atomic_rename_dir(&staging.dir, &target_dir) {
+            Ok(()) => {
+                staging.moved = true;
+                Ok(())
+            }
+            Err(AtomicCreateError::Collision) => {
+                self.take_back(pushed);
+                Err(ImportError::new(
+                    ImportErrorCode::NameTaken,
+                    format!(
+                        "{} appeared while the import ran; what this import pushed was taken \
+                         back. Pass --as <new-name> to import under another name",
+                        target_dir.display()
+                    ),
+                ))
+            }
+            Err(AtomicCreateError::Io(e)) => {
+                self.take_back(pushed);
+                Err(ImportError::new(
+                    ImportErrorCode::PushFailed,
+                    format!(
+                        "could not move the imported session to {}: {}",
+                        target_dir.display(),
+                        e
+                    ),
+                ))
+            }
+        }
+    }
+
+    /// Mark the source as migrated to the target, last. The marker is read
+    /// again first: when another import marked the source while this one
+    /// ran, this one keeps its target and refuses `import_source_migrated`
+    /// naming the other, leaving the operator to remove one of the two. The
+    /// re-read narrows that window but doesn't close it; the stopped-source
+    /// rule is what rules out two imports at once.
+    ///
+    /// A marker that can't be read or written refuses `import_unmarked`,
+    /// keeping the target: running the same import again writes only the
+    /// marker.
+    fn mark_source(
+        &self,
+        req: &ImportRequest<'_>,
+        source: &ImportSource,
+        session_id: &str,
+        machine_id: &str,
+    ) -> Result<(), ImportError> {
+        use ImportErrorCode::*;
+
+        let unmarked = |e: &dyn std::fmt::Display| {
+            ImportError::new(
+                Unmarked,
+                format!(
+                    "session '{}' was imported and pushed as '{}', but the marker on the source \
+                     could not be written, so the source's host will not refuse it: {}; run the \
+                     same import again to write it",
+                    source.name, req.target, e
+                ),
+            )
+        };
+
+        let key = source.key(MIGRATED_MARKER);
+        match self.get_object_if_present(&key) {
+            Ok(None) => {}
+            Ok(Some(bytes)) => {
+                let other = migrated_from_marker(&source.name, &bytes);
+                return Err(ImportError::new(
+                    SourceMigrated,
+                    format!(
+                        "while this import ran, another import marked session '{}' in workspace \
+                         {} as migrated to '{}' in {}; this import's copy, '{}' in {}, is kept. \
+                         Continue one of the two and remove the other with \
+                         `koto session cleanup`",
+                        source.name,
+                        source.workspace,
+                        other.target,
+                        other.workspace,
+                        req.target,
+                        req.anchor.display()
+                    ),
+                ));
+            }
+            Err(e) => return Err(unmarked(&format!("{:#}", e))),
+        }
+
+        let marker = MigrationMarker {
+            schema: 1,
+            target: MarkerTarget {
+                session: req.target,
+                session_id,
+                workspace: req.anchor.to_string_lossy().into_owned(),
+                prefix: &self.prefix,
+            },
+            machine_id,
+            migrated_at: crate::engine::types::now_iso8601(),
+        };
+        let bytes = serde_json::to_vec(&marker).expect("marker serialize is infallible");
+        self.put_object(&key, &bytes)
+            .map_err(|e| unmarked(&format!("{:#}", e)))
+    }
+}
+
+/// This machine's id, for the `session_imported` event, the target's
+/// version record and the marker.
+fn import_machine_id() -> Result<String, ImportError> {
+    crate::session::version::get_or_create_machine_id().map_err(|e| {
+        ImportError::new(
+            ImportErrorCode::PushFailed,
+            format!("could not read this machine's id: {}", e),
+        )
+    })
+}
+
+/// `text` with the userinfo (`user:password@`) taken out of every URL in
+/// it, so an endpoint configured with credentials in its URL never prints
+/// them.
+pub(crate) fn without_url_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| {
+                matches!(c, '/' | '?' | '#' | '"' | '\'' | '<' | '>') || c.is_whitespace()
+            })
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        out.push_str(match authority.rfind('@') {
+            Some(at) => &authority[at + 1..],
+            None => authority,
+        });
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Construct an S3 `Bucket` from cloud configuration.
 fn create_bucket(config: &CloudConfig) -> anyhow::Result<Box<Bucket>> {
     let region = Region::Custom {
@@ -1068,11 +2381,304 @@ fn create_bucket(config: &CloudConfig) -> anyhow::Result<Box<Bucket>> {
         region,
         credentials,
     )?;
+    if config.path_style == Some(true) {
+        return Ok(bucket.with_path_style());
+    }
     Ok(bucket)
+}
+
+/// Whether an S3 error is a 404: the object (or bucket) isn't there.
+fn is_not_found(e: &S3Error) -> bool {
+    matches!(e, S3Error::HttpFailWithBody(404, _))
+}
+
+/// Whether `key` is the migration marker of the session whose objects live
+/// under `session_prefix` (`<prefix>/<id>/`). Exactly that key: a context
+/// key that happens to be named `migrated.json` lives under `ctx/` and is
+/// not one.
+fn is_migration_marker(session_prefix: &str, key: &str) -> bool {
+    key.strip_prefix(session_prefix) == Some(MIGRATED_MARKER)
+}
+
+/// Build the refusal a marker's bytes describe for session `id`.
+///
+/// Read leniently: a field that is missing or of another shape reads as
+/// `unknown` rather than failing, because the refusal must hold whatever a
+/// marker's writer put in it.
+fn migrated_from_marker(id: &str, bytes: &[u8]) -> SessionMigrated {
+    SessionMigrated {
+        name: id.to_string(),
+        target: marker_target_field(bytes, "session"),
+        workspace: marker_target_field(bytes, "workspace"),
+    }
+}
+
+/// The string field `name` of a marker's `target`, read leniently: a marker
+/// that doesn't parse, or a field that is missing or of another shape,
+/// reads as `unknown`.
+fn marker_target_field(bytes: &[u8], name: &str) -> String {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|m| m.get("target")?.get(name)?.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// An in-memory S3 stand-in and the fixtures that point a `CloudBackend` at
+/// it, shared by the tests here and by the CLI tests that run a command
+/// against a cloud-backed session.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    use s3::creds::Credentials;
+    use s3::{Bucket, Region};
+
+    use super::CloudBackend;
+    use crate::engine::types::StateFileHeader;
+    use crate::session::local::LocalBackend;
+    use crate::session::state_file_name;
+
+    /// The key prefix `cloud_backend_at` gives its backend.
+    pub(crate) const PREFIX: &str = "test-prefix";
+
+    /// One request the endpoint answered: method, path (query stripped) and
+    /// body.
+    #[derive(Debug, Clone)]
+    pub(crate) struct Request {
+        pub(crate) method: String,
+        pub(crate) path: String,
+        pub(crate) body: Vec<u8>,
+    }
+
+    /// A running endpoint: its URL and every request it has answered.
+    pub(crate) struct Endpoint {
+        pub(crate) url: String,
+        requests: Arc<Mutex<Vec<Request>>>,
+    }
+
+    impl Endpoint {
+        /// Every request answered so far, in arrival order.
+        pub(crate) fn requests(&self) -> Vec<Request> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        /// The body of the last PUT whose path ends with `suffix`.
+        pub(crate) fn last_put(&self, suffix: &str) -> Option<Vec<u8>> {
+            self.requests()
+                .into_iter()
+                .rev()
+                .find(|r| r.method == "PUT" && r.path.ends_with(suffix))
+                .map(|r| r.body)
+        }
+    }
+
+    /// A ListObjectsV2 body naming `keys`, as rust-s3 parses it.
+    pub(crate) fn list_body(keys: &[String]) -> Vec<u8> {
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>\
+             <Name>test-bucket</Name><IsTruncated>false</IsTruncated>",
+        );
+        for key in keys {
+            xml.push_str(&format!(
+                "<Contents><Key>{}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified>\
+                 <Size>1</Size></Contents>",
+                key
+            ));
+        }
+        xml.push_str("</ListBucketResult>");
+        xml.into_bytes()
+    }
+
+    /// The `prefix` of a ListObjectsV2 request target, or `None` when the
+    /// target isn't a listing.
+    pub(crate) fn listing_prefix(target: &str) -> Option<String> {
+        let query = target.split_once('?')?.1;
+        let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
+        if !pairs.iter().any(|(k, v)| k == "list-type" && v == "2") {
+            return None;
+        }
+        Some(
+            pairs
+                .into_iter()
+                .find(|(k, _)| k == "prefix")
+                .map(|(_, v)| v)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Serve `objects` from memory on a `127.0.0.1` port.
+    ///
+    /// A GET for a path ending in an object's name answers its bytes, and
+    /// any other GET answers 404. A listing whose prefix names an object
+    /// (it ends in a seeded name, or a stored path ends in it) answers that
+    /// one key, and any other listing answers none: that is how the
+    /// migration-marker check before every pull sees "no marker". A PUT
+    /// stores its body under its path, replacing whatever a GET of that
+    /// path answered before, so a pull after a push reads back what was
+    /// pushed. Every other request gets an empty 200. Each request is
+    /// recorded, its path stripped of the query.
+    ///
+    /// rust-s3 retries a 404 once after a second's sleep, so seed every
+    /// object a test GETs.
+    pub(crate) fn serve(objects: Vec<(String, Vec<u8>)>) -> Endpoint {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            let mut objects = objects;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut body);
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let target = parts.next().unwrap_or("");
+                let path = target.split('?').next().unwrap_or("").to_string();
+                let listing = listing_prefix(target);
+                let (status, payload): (&str, Vec<u8>) = match (method.as_str(), listing) {
+                    (_, Some(prefix)) => {
+                        let keys: Vec<String> = objects
+                            .iter()
+                            .filter(|(name, _)| {
+                                prefix.ends_with(name.as_str())
+                                    || name.ends_with(&format!("/{prefix}"))
+                            })
+                            .map(|_| prefix.clone())
+                            .collect();
+                        ("200 OK", list_body(&keys))
+                    }
+                    ("GET", None) => match objects
+                        .iter()
+                        .find(|(name, _)| path.ends_with(name.as_str()))
+                    {
+                        Some((_, bytes)) => ("200 OK", bytes.clone()),
+                        None => ("404 Not Found", Vec::new()),
+                    },
+                    ("PUT", None) => {
+                        objects.retain(|(name, _)| !path.ends_with(name.as_str()));
+                        objects.push((path.clone(), body.clone()));
+                        ("200 OK", Vec::new())
+                    }
+                    _ => ("200 OK", Vec::new()),
+                };
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(Request { method, path, body });
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = stream.write_all(&payload);
+            }
+        });
+        Endpoint {
+            url: format!("http://{addr}"),
+            requests,
+        }
+    }
+
+    /// A `CloudBackend` storing sessions under `base_dir` and syncing to
+    /// `endpoint` (path-style, under [`PREFIX`]).
+    pub(crate) fn cloud_backend_at(base_dir: &Path, endpoint: String) -> CloudBackend {
+        let region = Region::Custom {
+            region: "us-east-1".to_string(),
+            endpoint,
+        };
+        let credentials =
+            Credentials::new(Some("test-key"), Some("test-secret"), None, None, None).unwrap();
+        let bucket = Bucket::new("test-bucket", region, credentials)
+            .unwrap()
+            .with_path_style();
+        let local = LocalBackend::with_base_dir(base_dir.to_path_buf());
+        CloudBackend::with_parts(local, bucket, PREFIX.to_string())
+    }
+
+    /// The suffix of the remote key holding `id`'s state file.
+    pub(crate) fn state_key_suffix(id: &str) -> String {
+        format!("/{}/{}/{}", PREFIX, id, state_file_name(id))
+    }
+
+    /// Write a header-only state file for `id` under `base_dir`, anchored at
+    /// `execution_dir`, and return its bytes so a test can seed the remote
+    /// copy with them (the state `koto init` would have pushed).
+    pub(crate) fn seed_session(
+        base_dir: &Path,
+        id: &str,
+        execution_dir: Option<PathBuf>,
+    ) -> Vec<u8> {
+        let session_dir = base_dir.join(id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let state_path = session_dir.join(state_file_name(id));
+        let header = StateFileHeader {
+            command_environment: None,
+            schema_version: 1,
+            workflow: id.to_string(),
+            template_hash: "testhash".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: None,
+            template_source_dir: None,
+            template_source_file: None,
+            origin: None,
+            execution_dir,
+            session_id: String::new(),
+            intent: None,
+            template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
+        };
+        crate::engine::persistence::append_header(&state_path, &header).unwrap();
+        std::fs::read(&state_path).unwrap()
+    }
+
+    /// The header line of a state file's bytes.
+    pub(crate) fn header_of(state: &[u8]) -> StateFileHeader {
+        let text = std::str::from_utf8(state).expect("state file is UTF-8");
+        let first = text.lines().next().expect("state file has a header line");
+        serde_json::from_str(first).expect("header line parses")
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{
+        cloud_backend_at, header_of, list_body, listing_prefix, seed_session, serve,
+        state_key_suffix,
+    };
     use super::*;
     use crate::engine::persistence::append_header;
     use crate::engine::types::StateFileHeader;
@@ -1864,75 +3470,6 @@ mod tests {
 
     // -- A cloud pull is a logged write with writer `sync` --
 
-    /// A minimal S3 stand-in: answers a GET for a path ending in one of
-    /// `objects`' names with its bytes, any other GET with 404, and every
-    /// other request (the state push) with an empty 200.
-    fn serve_objects(objects: Vec<(String, Vec<u8>)>) -> String {
-        use std::io::{BufRead, BufReader, Read, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut request_line = String::new();
-                if reader.read_line(&mut request_line).is_err() {
-                    continue;
-                }
-                let mut content_length = 0usize;
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
-                    }
-                    let lower = line.to_ascii_lowercase();
-                    if let Some(v) = lower.strip_prefix("content-length:") {
-                        content_length = v.trim().parse().unwrap_or(0);
-                    }
-                }
-                let mut body = vec![0u8; content_length];
-                let _ = reader.read_exact(&mut body);
-                let mut parts = request_line.split_whitespace();
-                let method = parts.next().unwrap_or("");
-                let path = parts.next().unwrap_or("").split('?').next().unwrap_or("");
-                let (status, payload): (&str, Vec<u8>) = if method == "GET" {
-                    match objects
-                        .iter()
-                        .find(|(name, _)| path.ends_with(name.as_str()))
-                    {
-                        Some((_, bytes)) => ("200 OK", bytes.clone()),
-                        None => ("404 Not Found", Vec::new()),
-                    }
-                } else {
-                    ("200 OK", Vec::new())
-                };
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    payload.len()
-                );
-                let _ = stream.write_all(&payload);
-            }
-        });
-        format!("http://{addr}")
-    }
-
-    fn cloud_backend_at(base_dir: &Path, endpoint: String) -> CloudBackend {
-        let region = Region::Custom {
-            region: "us-east-1".to_string(),
-            endpoint,
-        };
-        let credentials =
-            Credentials::new(Some("test-key"), Some("test-secret"), None, None, None).unwrap();
-        let bucket = Bucket::new("test-bucket", region, credentials)
-            .unwrap()
-            .with_path_style();
-        let local = LocalBackend::with_base_dir(base_dir.to_path_buf());
-        CloudBackend::with_parts(local, bucket, "test-prefix".to_string())
-    }
-
     #[test]
     fn a_pull_records_writer_sync_in_the_store_and_the_log() {
         use crate::cache::sha256_hex;
@@ -1953,13 +3490,14 @@ mod tests {
         manifest
             .keys
             .insert("remote-only.md".to_string(), meta(b"elsewhere", "agent"));
-        let endpoint = serve_objects(vec![
+        let endpoint = serve(vec![
             (
                 "/ctx/manifest.json".to_string(),
                 serde_json::to_vec(&manifest).unwrap(),
             ),
             ("/ctx/notes.md".to_string(), content.clone()),
-        ]);
+        ])
+        .url;
 
         let tmp = TempDir::new().unwrap();
         write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
@@ -1993,5 +3531,440 @@ mod tests {
         backend.get("wf", "notes.md").unwrap();
         let (_, again) = backend.local.read_events("wf").unwrap();
         assert_eq!(again.len(), events.len());
+    }
+
+    // -- A header rewrite reaches the remote copy (koto#310) --
+
+    #[test]
+    fn rewrite_header_pushes_the_new_header_and_a_later_read_keeps_it() {
+        let tmp = TempDir::new().unwrap();
+        let seeded = seed_session(tmp.path(), "wf", None);
+        let endpoint = serve(vec![(state_key_suffix("wf"), seeded)]);
+        let backend = cloud_backend_at(tmp.path(), endpoint.url.clone());
+        let anchor = tmp.path().join("anchor");
+
+        backend
+            .rewrite_header("wf", &|mut h| {
+                h.execution_dir = Some(anchor.clone());
+                h
+            })
+            .unwrap();
+
+        let pushed = endpoint
+            .last_put(&state_key_suffix("wf"))
+            .expect("the rewrite pushed the state file");
+        assert_eq!(header_of(&pushed).execution_dir, Some(anchor.clone()));
+
+        // The next read pulls the remote copy over the local one; the
+        // rewrite has to survive that.
+        assert_eq!(
+            backend.read_header("wf").unwrap().execution_dir,
+            Some(anchor)
+        );
+        let last = endpoint.requests().pop().unwrap();
+        assert_eq!(
+            (
+                last.method.as_str(),
+                last.path.ends_with(&state_key_suffix("wf"))
+            ),
+            ("GET", true),
+            "the read pulled the state file"
+        );
+    }
+
+    // -- session.cloud.path_style --
+
+    #[test]
+    fn create_bucket_addresses_the_bucket_path_style_when_asked() {
+        let mut config = CloudConfig {
+            endpoint: Some("http://127.0.0.1:9000".to_string()),
+            bucket: Some("sessions".to_string()),
+            region: Some("us-east-1".to_string()),
+            access_key: Some("k".to_string()),
+            secret_key: Some("s".to_string()),
+            path_style: Some(true),
+        };
+        let bucket = create_bucket(&config).unwrap();
+        assert!(bucket.is_path_style());
+        assert_eq!(bucket.url(), "http://127.0.0.1:9000/sessions");
+
+        config.path_style = None;
+        assert!(!create_bucket(&config).unwrap().is_path_style());
+        config.path_style = Some(false);
+        assert!(!create_bucket(&config).unwrap().is_path_style());
+    }
+
+    // -- the migration marker on state reads --
+
+    fn marker_bytes(target: &str, workspace: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema": 1,
+            "target": {
+                "session": target,
+                "session_id": "id-b",
+                "workspace": workspace,
+                "prefix": "0123456789abcdef",
+            },
+            "machine_id": "m",
+            "migrated_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_marker_refuses_reads_and_leaves_the_local_file_alone() {
+        let endpoint = serve(vec![(
+            "/wf/migrated.json".to_string(),
+            marker_bytes("wf", "/srv/ws-b"),
+        )])
+        .url;
+        let tmp = TempDir::new().unwrap();
+        write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
+        let state = tmp.path().join("wf").join(state_file_name("wf"));
+        let before = fs::read(&state).unwrap();
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+
+        let err = backend.read_events("wf").unwrap_err();
+        let migrated = err
+            .downcast_ref::<SessionMigrated>()
+            .expect("a typed SessionMigrated");
+        assert_eq!(migrated.target, "wf");
+        assert_eq!(migrated.workspace, "/srv/ws-b");
+        assert!(err.to_string().starts_with("session_migrated:"), "{err}");
+
+        let err = backend.read_header("wf").unwrap_err();
+        assert!(err.downcast_ref::<SessionMigrated>().is_some(), "{err}");
+
+        assert_eq!(fs::read(&state).unwrap(), before);
+    }
+
+    #[test]
+    fn a_missing_marker_lets_reads_proceed() {
+        // The stand-in answers every GET it has no object for with 404.
+        let endpoint = serve(vec![]).url;
+        let tmp = TempDir::new().unwrap();
+        write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+        assert_eq!(backend.read_header("wf").unwrap().workflow, "wf");
+        backend.read_events("wf").unwrap();
+    }
+
+    #[test]
+    fn an_unreachable_bucket_warns_and_lets_reads_proceed() {
+        let tmp = TempDir::new().unwrap();
+        write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
+        let backend = test_cloud_backend(tmp.path());
+        backend.check_not_migrated("wf").unwrap();
+        assert_eq!(backend.read_header("wf").unwrap().workflow, "wf");
+    }
+
+    #[test]
+    fn a_marker_that_does_not_parse_still_refuses() {
+        let endpoint = serve(vec![(
+            "/wf/migrated.json".to_string(),
+            b"not json".to_vec(),
+        )])
+        .url;
+        let tmp = TempDir::new().unwrap();
+        write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+        let err = backend.check_not_migrated("wf").unwrap_err();
+        let migrated = err.downcast_ref::<SessionMigrated>().unwrap();
+        assert_eq!(migrated.target, "unknown");
+        assert_eq!(migrated.workspace, "unknown");
+    }
+
+    #[test]
+    fn the_marker_check_is_answered_once_per_session_per_process() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Count connections: every request is one, since the stand-in
+        // closes each after answering. A listing names the marker; any
+        // other request gets the marker's body.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let target = request_line.split_whitespace().nth(1).unwrap_or("");
+                let body = match listing_prefix(target) {
+                    Some(prefix) => list_body(&[prefix]),
+                    None => marker_bytes("wf", "/srv/ws-b"),
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(&body);
+            }
+        });
+        let tmp = TempDir::new().unwrap();
+        let backend = cloud_backend_at(tmp.path(), format!("http://{addr}"));
+
+        for _ in 0..3 {
+            let err = backend.check_not_migrated("wf").unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<SessionMigrated>().unwrap().workspace,
+                "/srv/ws-b"
+            );
+        }
+        // The listing and the marker's body, once.
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_missing_marker_costs_one_listing_and_no_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Answers every request with an empty listing, and counts them.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let body = list_body(&[]);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(&body);
+            }
+        });
+        let tmp = TempDir::new().unwrap();
+        let backend = cloud_backend_at(tmp.path(), format!("http://{addr}"));
+
+        let started = std::time::Instant::now();
+        backend.check_not_migrated("wf").unwrap();
+        // rust-s3 sleeps a full second before retrying a failed request.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "the check took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn only_the_sessions_own_marker_counts_as_one() {
+        assert!(is_migration_marker("p/wf/", "p/wf/migrated.json"));
+        assert!(!is_migration_marker("p/wf/", "p/wf/koto-wf.state.jsonl"));
+        // A context key named migrated.json is a context key: cleanup
+        // deletes it like any other.
+        assert!(!is_migration_marker("p/wf/", "p/wf/ctx/migrated.json"));
+        assert!(!is_migration_marker("p/wf/", "p/other/migrated.json"));
+    }
+
+    // -- the import's source checks --
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn source_log(header: serde_json::Value, events: &[serde_json::Value]) -> Vec<u8> {
+        let mut out = serde_json::to_string(&header).unwrap();
+        out.push('\n');
+        for e in events {
+            out.push_str(&serde_json::to_string(e).unwrap());
+            out.push('\n');
+        }
+        out.into_bytes()
+    }
+
+    fn header_json(hash: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "workflow": "wf",
+            "template_hash": hash,
+            "created_at": "2026-01-01T00:00:00Z",
+            "session_id": "id-a",
+        })
+    }
+
+    fn event_json(seq: u64) -> serde_json::Value {
+        serde_json::json!({
+            "seq": seq,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "intent_updated",
+            "payload": {"intent": "x"},
+        })
+    }
+
+    #[test]
+    fn parse_source_log_keeps_event_lines_verbatim() {
+        // Keys in an order serde wouldn't produce, to prove the line is
+        // carried rather than re-serialized.
+        let line = r#"{"payload":{"intent":"x"},"type":"intent_updated","timestamp":"2026-01-01T00:00:00Z","seq":1}"#;
+        let mut bytes = serde_json::to_vec(&header_json(HASH)).unwrap();
+        bytes.extend_from_slice(b"\n");
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.extend_from_slice(b"\n\n");
+        let log = parse_source_log(&bytes).unwrap();
+        assert_eq!(log.event_lines, vec![line.to_string()]);
+        assert_eq!(log.last_seq, 1);
+        assert_eq!(log.header.session_id, "id-a");
+    }
+
+    #[test]
+    fn parse_source_log_refuses_what_it_cannot_carry() {
+        let mut v2 = header_json(HASH);
+        v2["schema_version"] = serde_json::json!(2);
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", Vec::new()),
+            ("schema 2", source_log(v2, &[])),
+            (
+                "seq gap",
+                source_log(header_json(HASH), &[event_json(1), event_json(3)]),
+            ),
+            ("not utf-8", vec![0xff, 0xfe]),
+        ];
+        for (what, bytes) in cases {
+            assert!(parse_source_log(&bytes).is_err(), "{what} must be refused");
+        }
+        let mut garbage = source_log(header_json(HASH), &[event_json(1)]);
+        garbage.extend_from_slice(b"{not an event\n");
+        assert!(parse_source_log(&garbage).is_err());
+    }
+
+    /// A target directory that appears while the import runs, even an
+    /// empty one, is never renamed over: the move refuses
+    /// `import_name_taken`, takes back exactly what was pushed, and the
+    /// staging directory goes.
+    #[test]
+    fn a_target_that_appeared_meanwhile_is_not_renamed_over() {
+        let endpoint = serve(vec![]);
+        let tmp = TempDir::new().unwrap();
+        let backend = cloud_backend_at(tmp.path(), endpoint.url.clone());
+        let staged = tmp.path().join(".import-wf-test");
+        create_private_dir(&staged).unwrap();
+        fs::write(staged.join(state_file_name("wf")), b"{}\n").unwrap();
+        // Created by someone else between the push and the rename.
+        fs::create_dir(tmp.path().join("wf")).unwrap();
+
+        let pushed = vec![
+            "test-prefix/wf/koto-wf.state.jsonl".to_string(),
+            "test-prefix/wf/version.json".to_string(),
+        ];
+        let mut staging = Staging {
+            dir: staged.clone(),
+            moved: false,
+        };
+        let err = backend
+            .move_into_place("wf", &mut staging, &pushed)
+            .unwrap_err();
+        assert_eq!(err.code, ImportErrorCode::NameTaken, "{}", err);
+        assert!(err.message.contains("--as"), "{}", err);
+        drop(staging);
+
+        assert!(!staged.exists(), "the staging directory was left");
+        assert_eq!(
+            fs::read_dir(tmp.path().join("wf")).unwrap().count(),
+            0,
+            "the other directory was written into"
+        );
+        let seen: Vec<String> = endpoint
+            .requests()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                "DELETE /test-bucket/test-prefix/wf/koto-wf.state.jsonl".to_string(),
+                "DELETE /test-bucket/test-prefix/wf/version.json".to_string(),
+            ]
+        );
+    }
+
+    /// The staging directory is created mode 0700, inside the session
+    /// store, and creating it where anything already is fails.
+    #[cfg(unix)]
+    #[test]
+    fn the_staging_directory_is_private_and_exclusive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".import-wf-x");
+        create_private_dir(&dir).unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "mode {:o}", mode);
+
+        let err = create_private_dir(&dir).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // Not even an empty directory is reused, nor a file.
+        let file = tmp.path().join(".import-wf-y");
+        fs::write(&file, b"").unwrap();
+        assert_eq!(
+            create_private_dir(&file).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+    }
+
+    #[test]
+    fn userinfo_is_taken_out_of_every_url() {
+        assert_eq!(
+            without_url_userinfo(
+                "GET http://user:pass@127.0.0.1:9000/b/k failed; see https://key@host/x"
+            ),
+            "GET http://127.0.0.1:9000/b/k failed; see https://host/x"
+        );
+        assert_eq!(
+            without_url_userinfo("endpoint \"http://a:b@host\" refused"),
+            "endpoint \"http://host\" refused"
+        );
+        // An @ past the authority is the path's, not userinfo.
+        assert_eq!(
+            without_url_userinfo("http://host/p@q and no url here"),
+            "http://host/p@q and no url here"
+        );
+        let err = ImportError::new(
+            ImportErrorCode::SourceUnreadable,
+            "listing at http://AKIA:secret@10.0.0.1:9000/b failed",
+        );
+        assert_eq!(err.message, "listing at http://10.0.0.1:9000/b failed");
+    }
+
+    #[test]
+    fn import_codes_print_and_exit_as_documented() {
+        use ImportErrorCode::*;
+        for (code, text, exit) in [
+            (RequiresCloud, "import_requires_cloud", 2),
+            (SourceNotFound, "import_source_not_found", 2),
+            (SourceMigrated, "import_source_migrated", 2),
+            (SourceIsChild, "import_source_is_child", 2),
+            (NameTaken, "import_name_taken", 2),
+            (TemplateUnavailable, "import_template_unavailable", 2),
+            (SourceUnreadable, "import_source_unreadable", 1),
+            (PushFailed, "import_push_failed", 1),
+            (Unmarked, "import_unmarked", 1),
+        ] {
+            assert_eq!(code.as_str(), text);
+            assert_eq!(code.exit_code(), exit, "{text}");
+        }
     }
 }

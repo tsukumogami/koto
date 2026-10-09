@@ -371,6 +371,9 @@ fn merge_config(target: &mut KotoConfig, source: &LoadedConfig) {
     if source.config.session.cloud.secret_key.is_some() {
         target.session.cloud.secret_key = source.config.session.cloud.secret_key.clone();
     }
+    if source.config.session.cloud.path_style.is_some() {
+        target.session.cloud.path_style = source.config.session.cloud.path_style;
+    }
 
     for key in &source.request_store_keys {
         match key.as_str() {
@@ -1004,6 +1007,43 @@ mod tests {
         // The merge only overwrites if source backend is non-empty.
         assert_eq!(base.session.backend, "cloud");
         assert_eq!(base.session.cloud.bucket, Some("existing".to_string()));
+    }
+
+    #[test]
+    fn test_merge_path_style_overrides_only_when_set() {
+        let mut base = KotoConfig::default();
+        base.session.cloud.path_style = Some(true);
+
+        // A layer that doesn't set the key leaves the lower layer's value.
+        let unset = LoadedConfig {
+            config: KotoConfig::default(),
+            request_store_keys: vec![],
+            request_store_has_recursion: false,
+            workflows_native_present: false,
+        };
+        merge_config(&mut base, &unset);
+        assert_eq!(base.session.cloud.path_style, Some(true));
+
+        // A layer that sets it, even to false, wins.
+        let mut off = KotoConfig::default();
+        off.session.cloud.path_style = Some(false);
+        let overlay = LoadedConfig {
+            config: off,
+            request_store_keys: vec![],
+            request_store_has_recursion: false,
+            workflows_native_present: false,
+        };
+        merge_config(&mut base, &overlay);
+        assert_eq!(base.session.cloud.path_style, Some(false));
+    }
+
+    #[test]
+    fn test_path_style_parsed_from_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[session.cloud]\npath_style = true\n").unwrap();
+        let loaded = load_config_file(&path, "project config").unwrap();
+        assert_eq!(loaded.config.session.cloud.path_style, Some(true));
     }
 
     #[test]

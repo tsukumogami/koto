@@ -94,6 +94,38 @@ impl From<std::io::Error> for SessionError {
     }
 }
 
+/// A cloud read refused because the session was imported elsewhere.
+///
+/// `koto session import` leaves a `migrated.json` object beside the source
+/// session's remote state file. The cloud backend checks for it before it
+/// reads the session's state, and returns this error when it is there, so
+/// the old copy refuses instead of forking the session.
+///
+/// The message begins with the error code, `session_migrated`, so every
+/// command's existing error path carries it; `koto next` and `koto status`
+/// downcast to this type to choose their exit code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMigrated {
+    /// The session that was read.
+    pub name: String,
+    /// The session it was imported as.
+    pub target: String,
+    /// The workspace path the import ran in.
+    pub workspace: String,
+}
+
+impl fmt::Display for SessionMigrated {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "session_migrated: session '{}' was migrated to '{}' in {}; continue it there",
+            self.name, self.target, self.workspace
+        )
+    }
+}
+
+impl std::error::Error for SessionMigrated {}
+
 /// RAII guard for an advisory `flock(LOCK_EX)` held on a session's
 /// state file.
 ///
@@ -350,6 +382,44 @@ pub trait SessionBackend: Send + Sync {
     /// Read just the header from the state file.
     fn read_header(&self, id: &str) -> anyhow::Result<StateFileHeader>;
 
+    /// # Stability: additive-only
+    ///
+    /// Not part of the Stage 1 frozen four; signature evolution is
+    /// permitted in minor releases.
+    ///
+    /// Replace the state file's header with `f` applied to it, keeping the
+    /// event log verbatim, and sync the result the way
+    /// [`append_event`](Self::append_event) syncs an event.
+    ///
+    /// Every header rewrite in the CLI goes through here. A rewrite that
+    /// wrote the local file directly would be undone on a backend that pulls
+    /// before reading: the remote copy still carries the old header, and the
+    /// next read restores it (koto#310). The two rewrites in
+    /// `src/engine/claim.rs` (the assignment claim and the re-delegation
+    /// epoch bump) take a state-file path and no backend; nothing outside
+    /// tests reaches them today.
+    ///
+    /// The default rewrites the state file under
+    /// [`session_dir`](Self::session_dir) in place (temp file, then rename)
+    /// and then calls [`ensure_pushed`](Self::ensure_pushed), printing a
+    /// warning to stderr if the push fails rather than failing the rewrite.
+    /// A backend with no remote half gets a no-op push. A backend that syncs
+    /// gets its rewrite pushed through its strict push, which is enough to
+    /// keep the rewrite from being lost; it overrides this only to push the
+    /// way its other writes do, as `CloudBackend` does.
+    fn rewrite_header(
+        &self,
+        id: &str,
+        f: &dyn Fn(StateFileHeader) -> StateFileHeader,
+    ) -> anyhow::Result<()> {
+        let path = self.session_dir(id).join(state_file_name(id));
+        crate::engine::claim::rewrite_header_atomically(&path, f)?;
+        if let Err(e) = self.ensure_pushed(id) {
+            eprintln!("warning: session sync failed for state upload: {}", e);
+        }
+        Ok(())
+    }
+
     /// Push any pending local state for `id` to durable remote storage
     /// and fail if the push cannot be confirmed.
     ///
@@ -498,6 +568,16 @@ impl Backend {
             Backend::Cloud(b) => b.local_base_dir(),
         }
     }
+
+    /// Refuse with [`SessionMigrated`] when `id` was imported into another
+    /// workspace. Always `Ok` on the local backend, which has no remote
+    /// copy to import from and makes no request.
+    pub fn check_not_migrated(&self, id: &str) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(_) => Ok(()),
+            Backend::Cloud(b) => b.check_not_migrated(id),
+        }
+    }
 }
 
 impl SessionBackend for Backend {
@@ -587,6 +667,17 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.read_header(id),
             Backend::Cloud(b) => b.read_header(id),
+        }
+    }
+
+    fn rewrite_header(
+        &self,
+        id: &str,
+        f: &dyn Fn(StateFileHeader) -> StateFileHeader,
+    ) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.rewrite_header(id, f),
+            Backend::Cloud(b) => b.rewrite_header(id, f),
         }
     }
 
@@ -684,6 +775,24 @@ impl ContextStore for Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_migrated_message_leads_with_its_code_and_names_the_target() {
+        let err = SessionMigrated {
+            name: "coord".to_string(),
+            target: "coord".to_string(),
+            workspace: "/srv/ws-b".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "session_migrated: session 'coord' was migrated to 'coord' in /srv/ws-b; \
+             continue it there"
+        );
+        // Through anyhow, as the backend returns it, the type survives for
+        // callers that pick an exit code by it.
+        let wrapped = anyhow::Error::new(err.clone());
+        assert_eq!(wrapped.downcast_ref::<SessionMigrated>(), Some(&err));
+    }
 
     #[test]
     fn local_backend_is_not_cloud() {

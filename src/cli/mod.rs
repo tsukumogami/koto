@@ -555,6 +555,54 @@ pub enum SessionCommand {
         to: Option<String>,
     },
 
+    /// Import a session from another workspace's copy in the bucket.
+    ///
+    /// Reads session <NAME> as the workspace at --from pushed it to the
+    /// configured bucket, and creates it here, named --as when given, as a
+    /// new local session anchored in the current directory: the source's
+    /// events plus a `session_imported` event, every context key, and the
+    /// compiled template. It pushes the new session under this workspace's prefix,
+    /// then leaves a `migrated.json` marker beside the source, so the old
+    /// copy refuses with `session_migrated` from then on. Nothing else
+    /// under the source's prefix is written.
+    ///
+    /// Import only a stopped source: no process may still be advancing the
+    /// session, and its last write must have reached the remote. Stop the
+    /// agent on the source host first; if a push from it failed, run
+    /// `koto session resolve <name> --keep local` there before importing.
+    ///
+    /// The compiled template comes from this machine's own cache, by the
+    /// hash the session recorded: run `koto template compile` on the
+    /// session's template here first. --trust-template takes the copy the
+    /// source pushed to the bucket instead, after checking its hash; pass
+    /// it only when you trust everyone who can write the bucket, since the
+    /// template holds every command the session runs. Requires the cloud
+    /// backend.
+    ///
+    /// The output's `template` field says where the compiled template came
+    /// from: `local-cache`, `bucket` (under --trust-template), or
+    /// `unchanged` when a re-run found the session already built and took
+    /// none. Running the same import again after `import_unmarked` writes
+    /// only the marker.
+    Import {
+        /// Session name in the source workspace
+        name: String,
+
+        /// Absolute path of the source workspace, as it was on the host
+        /// that created the session
+        #[arg(long = "from", value_name = "WORKSPACE_PATH")]
+        from: String,
+
+        /// Name to give the session here, when its own name is taken
+        #[arg(long = "as", value_name = "NEW_NAME")]
+        as_name: Option<String>,
+
+        /// Take the compiled template from the bucket rather than this
+        /// machine's cache
+        #[arg(long)]
+        trust_template: bool,
+    },
+
     /// List, and optionally restore, sessions the old-layout migration set
     /// aside because their name was already taken.
     ///
@@ -1525,6 +1573,18 @@ pub fn run(app: App) -> Result<()> {
                 SessionCommand::Rebind { name, to } => {
                     session::handle_rebind(&backend, &name, to.as_deref())
                 }
+                SessionCommand::Import {
+                    name,
+                    from,
+                    as_name,
+                    trust_template,
+                } => session::handle_import(
+                    &backend,
+                    &name,
+                    &from,
+                    as_name.as_deref(),
+                    trust_template,
+                ),
             }
         }
         // `handle` never returns: it prints an envelope and exits, so
@@ -1534,6 +1594,28 @@ pub fn run(app: App) -> Result<()> {
         Command::Context { subcommand } => {
             let backend = build_backend()?;
             let store: &dyn ContextStore = &backend;
+            // A session imported into another workspace refuses here, before
+            // anything reads or writes it, exit 2 as `status` and `next`
+            // do: the caller continues it where the message says. `exists`
+            // needs this most, since the store's answer is a bool with no
+            // room for the reason. The check is cached per process, so the
+            // store's own check behind it costs nothing more.
+            let (session, command) = match &subcommand {
+                ContextCommand::Add { session, .. } => (session, "context add"),
+                ContextCommand::Get { session, .. } => (session, "context get"),
+                ContextCommand::Exists { session, .. } => (session, "context exists"),
+                ContextCommand::Remove { session, .. } => (session, "context remove"),
+                ContextCommand::List { session, .. } => (session, "context list"),
+            };
+            if let Err(e) = backend.check_not_migrated(session) {
+                exit_with_error_code(
+                    serde_json::json!({
+                        "error": e.to_string(),
+                        "command": command
+                    }),
+                    EXIT_CALLER_ERROR,
+                );
+            }
             match subcommand {
                 ContextCommand::Add {
                     session,
@@ -3772,6 +3854,38 @@ fn resolve_action_working_dir(
     Ok(resolved)
 }
 
+/// Record a first tick's adoption of `anchor` as `name`'s execution
+/// anchor: the `execution_anchor_adopted` event, then the header field
+/// that makes the next tick take the ordinary path.
+///
+/// The event goes down first so a crash between the two writes repeats a
+/// visible adoption rather than leaving a silent one. The header goes
+/// through the backend, which pushes it: a local rewrite alone is undone by
+/// the next read's pull on the cloud backend (koto#310).
+///
+/// On failure, returns the message `koto next` reports as a persistence
+/// error.
+// Unix-only because its one caller, `handle_next`, is; elsewhere it'd be dead code.
+#[cfg(unix)]
+fn record_execution_anchor_adoption(
+    backend: &dyn SessionBackend,
+    name: &str,
+    anchor: &Path,
+) -> std::result::Result<(), String> {
+    let payload = EventPayload::ExecutionAnchorAdopted {
+        anchor: anchor.to_path_buf(),
+    };
+    backend
+        .append_event(name, &payload, &now_iso8601())
+        .map_err(|e| format!("failed to record execution anchor adoption: {}", e))?;
+    backend
+        .rewrite_header(name, &|mut h| {
+            h.execution_dir = Some(anchor.to_path_buf());
+            h
+        })
+        .map_err(|e| format!("failed to record execution anchor: {}", e))
+}
+
 /// Handle the `koto next` command with full output contract support.
 ///
 /// Flow:
@@ -4044,8 +4158,19 @@ fn handle_next(
     let (mut header, events) = match backend.read_events(&name) {
         Ok(result) => result,
         Err(err) => {
+            // A session imported elsewhere is refused by the backend before
+            // it reads anything; that is the caller's to act on, not a
+            // persistence failure.
+            let code = if err
+                .downcast_ref::<crate::session::SessionMigrated>()
+                .is_some()
+            {
+                NextErrorCode::SessionMigrated
+            } else {
+                NextErrorCode::PersistenceError
+            };
             let ne = NextError {
-                code: NextErrorCode::PersistenceError,
+                code,
                 message: err.to_string(),
                 details: vec![],
             };
@@ -4138,34 +4263,11 @@ fn handle_next(
         ExecutionAnchorCheck::Satisfied { anchor } => anchor,
         ExecutionAnchorCheck::Adopt { anchor } => {
             // R14: a session written before anchoring existed adopts
-            // the directory it is ticked from. The event goes down
-            // first so a crash between the two writes repeats a
-            // visible adoption rather than leaving a silent one; the
-            // header field is what makes the next tick take the
-            // ordinary path.
-            let payload = EventPayload::ExecutionAnchorAdopted {
-                anchor: anchor.clone(),
-            };
-            if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
+            // the directory it is ticked from.
+            if let Err(message) = record_execution_anchor_adoption(backend, &name, &anchor) {
                 let ne = NextError {
                     code: NextErrorCode::PersistenceError,
-                    message: format!("failed to record execution anchor adoption: {}", e),
-                    details: vec![],
-                };
-                let json = serde_json::json!({"error": ne});
-                exit_with_error_code(json, ne.code.exit_code());
-            }
-            let state_path = backend
-                .session_dir(&name)
-                .join(crate::session::state_file_name(&name));
-            let recorded = anchor.clone();
-            if let Err(e) = crate::engine::claim::rewrite_header_atomically(&state_path, |mut h| {
-                h.execution_dir = Some(recorded);
-                h
-            }) {
-                let ne = NextError {
-                    code: NextErrorCode::PersistenceError,
-                    message: format!("failed to record execution anchor: {}", e),
+                    message,
                     details: vec![],
                 };
                 let json = serde_json::json!({"error": ne});
@@ -6929,7 +7031,16 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     let (header, events) = match backend.read_events(name) {
         Ok(result) => result,
         Err(err) => {
-            let code = exit_code_for_engine_error(&err);
+            // A session imported elsewhere exits 2, as `koto next` does for
+            // it: the caller continues it where the message says.
+            let code = if err
+                .downcast_ref::<crate::session::SessionMigrated>()
+                .is_some()
+            {
+                EXIT_CALLER_ERROR
+            } else {
+                exit_code_for_engine_error(&err)
+            };
             exit_with_error_code(
                 serde_json::json!({
                     "error": err.to_string(),
@@ -9308,6 +9419,54 @@ Done.
                 .unwrap()
                 .command,
             expected_command
+        );
+    }
+
+    /// The first tick of a session with no anchor adopts one. On the cloud
+    /// backend the adopted header has to reach the remote copy, or the next
+    /// tick's pull drops it and the session adopts again (koto#310's
+    /// pattern on the adoption path).
+    #[cfg(unix)]
+    #[test]
+    fn a_cloud_first_tick_adoption_pushes_the_anchor_and_the_next_tick_keeps_it() {
+        use crate::engine::template_source_status::{check_execution_anchor, ExecutionAnchorCheck};
+        use crate::session::cloud::test_support::{
+            cloud_backend_at, header_of, seed_session, serve, state_key_suffix,
+        };
+
+        let sessions = tempfile::TempDir::new().unwrap();
+        let checkout = tempfile::TempDir::new().unwrap();
+        let anchor = std::fs::canonicalize(checkout.path()).unwrap();
+
+        let seeded = seed_session(sessions.path(), "wf", None);
+        let endpoint = serve(vec![(state_key_suffix("wf"), seeded)]);
+        let backend = Backend::Cloud(cloud_backend_at(sessions.path(), endpoint.url.clone()));
+
+        record_execution_anchor_adoption(&backend, "wf", &anchor).unwrap();
+
+        let pushed = endpoint
+            .last_put(&state_key_suffix("wf"))
+            .expect("adoption pushed the state file");
+        assert_eq!(
+            header_of(&pushed).execution_dir,
+            Some(anchor.clone()),
+            "the last state push carries the adopted anchor"
+        );
+
+        // The next tick's pulling read finds the anchor and takes the
+        // ordinary path instead of adopting again.
+        let (header, events) = backend.read_events("wf").unwrap();
+        assert_eq!(header.execution_dir, Some(anchor.clone()));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.payload, EventPayload::ExecutionAnchorAdopted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            check_execution_anchor(header.execution_dir.as_deref(), checkout.path()),
+            ExecutionAnchorCheck::Satisfied { anchor }
         );
     }
 }

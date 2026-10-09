@@ -27,6 +27,26 @@ rationale: |
 
 Current
 
+**Note (2026-10-09).** Session migration changes what this design says about
+resuming a session elsewhere. The remote prefix, the hash of the canonical path
+of the directory koto runs in, is the session's identity on its host: a session
+belongs to the workspace that created it, and another host doesn't continue it
+by running `koto next`. Moving a session to another workspace or host is
+`koto session import <name> --from <workspace-path>`, which builds a new local
+session from the source's remote objects, pushes it under the importing
+workspace's prefix, and leaves a `migrated.json` marker beside the source so the
+old copy refuses with `session_migrated`. The cloud backend checks for that
+marker before it reads a session's state or context. Header rewrites (rebind, a first tick
+adopting an anchor, starting a child) used to go to the local file only, so
+the next pull undid them; they now go through `SessionBackend::rewrite_header`,
+which under the cloud backend pushes the rewritten header (koto#310). A rebind
+whose push fails still succeeds locally, with a warning. A new key,
+`session.cloud.path_style`, addresses the bucket in the path rather than as a
+subdomain, which an endpoint given as an IP address needs. The
+session-migration design (`DESIGN-session-migration.md`) has the details; the
+setup guide,
+`docs/guides/cloud-sync-setup.md`, lists the commands that reach the bucket.
+
 ## Context and Problem Statement
 koto's `LocalBackend` is the only storage backend. It's hardcoded in `build_backend()`
 with no way to select an alternative. Sessions live at `~/.koto/sessions/<repo-id>/<name>/`
