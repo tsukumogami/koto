@@ -1048,20 +1048,42 @@ fn session_started_carries_the_creating_driver_only_when_it_is_id_shaped() {
 }
 
 #[test]
-fn the_sentinel_driver_of_the_invoking_session_never_reaches_a_journal() {
-    // This suite's own harness clears the variable; a process spawned
-    // without clearing it is what this guards against.
+fn the_harness_keeps_an_inherited_driver_out_of_the_journal() {
+    // A suite run inside a Claude Code session inherits that session's
+    // driver. The harness must clear it on every spawn: start from a
+    // command that carries a sentinel, as an inherited variable would, and
+    // apply the harness environment over it.
     let env = Env::new();
     let t = env.template("simple.md", SIMPLE);
     let sentinel = "sentinel-driver-0b1d";
-    let mut cmd = env.cmd(None);
-    cmd.env_remove(DRIVER_ENV);
-    let out = Env::run(cmd, &["init", "quiet", "--template", t.to_str().unwrap()]);
-    assert!(out.ok);
-    assert!(!env.raw_journal().contains(sentinel));
+    let spawn = |driver: Option<&str>, name: &str| {
+        let mut cmd = Command::cargo_bin("koto").unwrap();
+        cmd.env(DRIVER_ENV, sentinel).current_dir(&env.work);
+        for (k, v) in env.envs(driver) {
+            match v {
+                Some(v) => cmd.env(k, v),
+                None => cmd.env_remove(k),
+            };
+        }
+        let out = Env::run(cmd, &["init", name, "--template", t.to_str().unwrap()]);
+        assert!(out.ok, "{}", out.stderr);
+    };
+
+    // The control: left in place, the sentinel is recorded, so this test
+    // can fail.
+    spawn(Some(sentinel), "control");
+    assert_eq!(
+        env.records("control")[0]["koto.driver.session.id"],
+        sentinel
+    );
+
+    // Cleared by the harness, it is not.
+    spawn(None, "quiet");
     assert!(env.records("quiet")[0]
         .get("koto.driver.session.id")
         .is_none());
+    let quiet: Vec<String> = env.records("quiet").iter().map(|r| r.to_string()).collect();
+    assert!(quiet.iter().all(|line| !line.contains(sentinel)));
 }
 
 // ----- Fixture rules through koto -----
