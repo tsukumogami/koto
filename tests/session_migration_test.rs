@@ -61,11 +61,14 @@ fn describe(r: &fake_s3::Request) -> String {
 
 /// The marker check costs `koto status` on a session that was never
 /// migrated exactly one request beyond what it made before the check
-/// existed, and no retry sleep. Before, status made two: the GET that pulls
-/// the state file, and the listing of this workspace's sessions it scans
-/// for superseded branches. The check lists for the marker, which answers
-/// 200 whether or not it is there, where a GET of a missing marker would be
-/// a 404 that rust-s3 retries after a second.
+/// existed, and no retry sleep. The baseline, `before_the_check`, is the
+/// list of requests `koto status` made before the marker check existed
+/// (measured with the check switched off): the GET that pulls the state
+/// file, and the listing of this workspace's sessions it scans for
+/// superseded branches. The test asserts the exact list: the marker
+/// listing, then the baseline, nothing else. The check lists for the
+/// marker, which answers 200 whether or not it is there, where a GET of a
+/// missing marker would be a 404 that rust-s3 retries after a second.
 #[test]
 fn the_marker_check_adds_one_request_and_no_retry_to_status() {
     let s3 = FakeS3::start(BUCKET);
@@ -83,19 +86,17 @@ fn the_marker_check_adds_one_request_and_no_retry_to_status() {
     let session = session_prefix(&a, name);
     let requests = s3.requests();
     let seen: Vec<String> = requests.iter().map(describe).collect();
-    assert_eq!(
-        seen,
-        vec![
-            // The marker check: the one added request.
-            format!("LIST {}migrated.json", session),
-            // What status made before the check existed: the state pull ...
-            format!("GET {}koto-{}.state.jsonl", session, name),
-            // ... and the session listing behind `superseded_branches`.
-            format!("LIST {}/", a.prefix()),
-        ],
-        "koto status made {:?}",
-        seen
-    );
+    let before_the_check = vec![
+        // The state pull ...
+        format!("GET {}koto-{}.state.jsonl", session, name),
+        // ... and the session listing behind `superseded_branches`.
+        format!("LIST {}/", a.prefix()),
+    ];
+    // The marker check: the one added request.
+    let mut expected = vec![format!("LIST {}migrated.json", session)];
+    expected.extend(before_the_check);
+    assert_eq!(seen, expected, "koto status made {:?}", seen);
+    assert_eq!(seen.len(), 3, "exactly one request over the baseline's two");
     let check = requests[1].at.duration_since(requests[0].at);
     assert!(
         check < std::time::Duration::from_millis(500),
@@ -960,10 +961,23 @@ fn an_unmarked_import_keeps_its_target_and_a_rerun_only_marks() {
     };
     let store_before = entries(&store);
 
+    // A local manifest that can't be read fails the re-run rather than
+    // reporting no keys, and writes nothing.
+    let manifest = b.session_dir("wf").join("ctx").join("manifest.json");
+    let manifest_bytes = std::fs::read(&manifest).unwrap();
+    std::fs::write(&manifest, b"not json").unwrap();
+    let run = import(&b, "wf", &a, &[]);
+    let msg = refused(&run, "import_push_failed", 1);
+    assert!(msg.contains("manifest"), "{msg}");
+    assert_eq!(all_writes(&s3), Vec::<(String, String)>::new());
+    std::fs::write(&manifest, &manifest_bytes).unwrap();
+
     let run = import(&b, "wf", &a, &[]);
     assert!(run.ok(), "re-run: {}", run.describe());
     assert_eq!(run.json["marked"], true);
     assert_eq!(run.json["keys"], 1);
+    // It took no template: the target's is the one the first run stored.
+    assert_eq!(run.json["template"], "unchanged");
     assert_eq!(
         all_writes(&s3),
         vec![("PUT".to_string(), marker.clone())],
@@ -1295,24 +1309,15 @@ fn the_marker_check_adds_one_request_to_next_and_none_on_the_local_backend() {
     let state = format!("{}koto-plain.state.jsonl", session);
     let get = format!("GET {}", state);
     let put = format!("PUT {}", state);
-    assert_eq!(
-        seen,
-        vec![
-            // The marker check: the one added request, answered once for
-            // the whole tick though the gate reads a context key.
-            format!("LIST {}migrated.json", session),
-            // What next made without the check: the pulls of the state
-            // file and the pushes of the events the tick appends.
-            get.clone(),
-            get.clone(),
-            put.clone(),
-            put.clone(),
-            put,
-            get,
-        ],
-        "koto next made {:?}",
-        seen
-    );
+    // The requests `koto next` made before the marker check existed
+    // (measured with the check switched off): the pulls of the state file
+    // and the pushes of the events the tick appends.
+    let before_the_check = vec![get.clone(), get.clone(), put.clone(), put.clone(), put, get];
+    // The marker check: the one added request, answered once for the
+    // whole tick though the gate reads a context key.
+    let mut expected = vec![format!("LIST {}migrated.json", session)];
+    expected.extend(before_the_check);
+    assert_eq!(seen, expected, "koto next made {:?}", seen);
 
     // The local backend, with the same cloud settings still in the config,
     // never reaches the endpoint.
@@ -1535,8 +1540,12 @@ fn credentials_never_reach_import_output_errors_or_the_marker() {
     assert!(run.ok(), "re-run: {}", run.describe());
     runs.push(run);
 
-    // A refusal, and a source listing that fails.
+    // Running it once more completes without writing; importing it again
+    // under another name is refused. Then a source listing that fails.
     let run = import(&b, "wf", &a, &[]);
+    assert!(run.ok(), "third run: {}", run.describe());
+    runs.push(run);
+    let run = import(&b, "wf", &a, &["--as", "again"]);
     refused(&run, "import_source_migrated", 2);
     runs.push(run);
     start_session(&a, "other");
@@ -1733,4 +1742,65 @@ fn init_pushes_the_compiled_template_it_records() {
         .init_state_file("bare", header_of("bare"), Vec::new())
         .unwrap();
     assert!(s3.object("pfx/bare/template.json").is_none());
+}
+
+/// A marker PUT that landed though the endpoint reported a failure: the
+/// re-run finds the source marked for its own target, finishes, and writes
+/// nothing. A marker naming another target still refuses.
+#[test]
+fn a_marker_that_landed_despite_an_error_completes_the_rerun() {
+    let s3 = FakeS3::start(BUCKET);
+    let root = tempfile::TempDir::new().unwrap();
+    let cloud = cloud(&s3);
+    let a = Host::new(root.path(), "a", &cloud);
+    let b = Host::new(root.path(), "b", &cloud);
+    let c = Host::new(root.path(), "c", &cloud);
+    start_session(&a, "wf");
+    compile(&b);
+    compile(&c);
+
+    let marker = format!("{}migrated.json", session_prefix(&a, "wf"));
+    s3.fail_after_storing(&marker, 500);
+    let run = import(&b, "wf", &a, &[]);
+    refused(&run, "import_unmarked", 1);
+    let landed = s3.object(&marker).expect("the marker landed");
+    s3.clear_faults();
+
+    s3.clear_requests();
+    let run = import(&b, "wf", &a, &[]);
+    assert!(run.ok(), "re-run: {}", run.describe());
+    assert_eq!(run.json["name"], "wf");
+    assert_eq!(run.json["marked"], true);
+    assert_eq!(run.json["keys"], 1);
+    assert_eq!(run.json["template"], "unchanged");
+    assert_eq!(all_writes(&s3), Vec::<(String, String)>::new());
+    assert_eq!(s3.object(&marker), Some(landed.clone()));
+
+    // The same marker is someone else's to C, and to B under another name.
+    let run = import(&c, "wf", &a, &[]);
+    let msg = refused(&run, "import_source_migrated", 2);
+    assert!(msg.contains(&b.ws_str()), "{msg}");
+    assert_no_trace(&s3, &c, "wf");
+    let run = import(&b, "wf", &a, &["--as", "again"]);
+    refused(&run, "import_source_migrated", 2);
+    assert_no_trace(&s3, &b, "again");
+
+    // And a target of that name here that isn't the marked session (its
+    // session id differs) doesn't count either.
+    let theirs = serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "target": {
+            "session": "wf",
+            "session_id": "00000000-0000-4000-8000-000000000000",
+            "workspace": b.ws_str(),
+            "prefix": b.prefix(),
+        },
+        "machine_id": "m",
+        "migrated_at": "2026-01-01T00:00:00Z",
+    }))
+    .unwrap();
+    s3.put(&marker, &theirs);
+    let run = import(&b, "wf", &a, &[]);
+    refused(&run, "import_source_migrated", 2);
+    assert_eq!(s3.object(&marker), Some(theirs));
 }

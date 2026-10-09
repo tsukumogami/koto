@@ -1336,6 +1336,9 @@ pub enum TemplateOrigin {
     LocalCache,
     /// The source's `template.json` in the bucket, under `--trust-template`.
     Bucket,
+    /// None: a re-run that found the target already built took no
+    /// template, and the one in the target's directory is unchanged.
+    Unchanged,
 }
 
 impl TemplateOrigin {
@@ -1344,6 +1347,7 @@ impl TemplateOrigin {
         match self {
             TemplateOrigin::LocalCache => "local-cache",
             TemplateOrigin::Bucket => "bucket",
+            TemplateOrigin::Unchanged => "unchanged",
         }
     }
 }
@@ -1459,6 +1463,10 @@ struct ImportSource {
     /// `<source prefix>/<name>/`, the source session's key prefix.
     session: String,
     log: SourceLog,
+    /// The source's marker, when it names this workspace's prefix and the
+    /// import's target: an earlier run of this import may have written it
+    /// and then been told the PUT failed.
+    own_marker: Option<MarkerRead>,
 }
 
 impl ImportSource {
@@ -1485,6 +1493,48 @@ fn unreadable_source(
         format!(
             "could not read {} of session '{}' from workspace {}: {}",
             what, name, workspace, e
+        ),
+    )
+}
+
+/// The target a marker names, read leniently: a missing field reads as
+/// empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MarkerRead {
+    session: String,
+    session_id: String,
+    workspace: String,
+    prefix: String,
+}
+
+impl MarkerRead {
+    fn parse(bytes: &[u8]) -> Self {
+        let marker: serde_json::Value = serde_json::from_slice(bytes).unwrap_or_default();
+        let field = |name: &str| {
+            marker
+                .get("target")
+                .and_then(|t| t.get(name))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        MarkerRead {
+            session: field("session"),
+            session_id: field("session_id"),
+            workspace: field("workspace"),
+            prefix: field("prefix"),
+        }
+    }
+}
+
+/// The refusal for a source that already carries another import's marker.
+fn already_migrated(name: &str, workspace: &str, marker: &[u8]) -> ImportError {
+    let migrated = migrated_from_marker(name, marker);
+    ImportError::new(
+        ImportErrorCode::SourceMigrated,
+        format!(
+            "session '{}' in workspace {} was already migrated to '{}' in {}",
+            name, workspace, migrated.target, migrated.workspace
         ),
     )
 }
@@ -1577,6 +1627,18 @@ impl Drop for Staging {
     }
 }
 
+/// Create the directory `path`, mode 0700, failing when anything is
+/// already there: not recursive, so the directory is the caller's alone.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 /// Take an exclusive `flock` on `path` without waiting, the lock
 /// `SessionBackend::lock_state_file` takes on a state file.
 #[cfg(unix)]
@@ -1614,48 +1676,93 @@ impl CloudBackend {
     /// source that is still moving.
     pub fn import_session(&self, req: &ImportRequest<'_>) -> Result<ImportOutcome, ImportError> {
         let source = self.read_import_source(req)?;
-        let template_origin = if req.trust_template {
-            TemplateOrigin::Bucket
-        } else {
-            TemplateOrigin::LocalCache
+        let outcome = |keys: usize, template: TemplateOrigin| ImportOutcome {
+            name: req.target.to_string(),
+            from_workspace: source.workspace.clone(),
+            from_session: source.name.clone(),
+            keys,
+            template,
         };
 
-        let (session_id, machine_id, keys) = match self.existing_target(req, &source)? {
-            ExistingTarget::Local { session_id } => {
-                let keys = self
-                    .local
-                    .read_manifest(req.target)
-                    .map(|m| m.keys.len())
-                    .unwrap_or(0);
-                (session_id, import_machine_id()?, keys)
-            }
-            ExistingTarget::Free | ExistingTarget::RemoteOnly => {
-                let template = self.import_template(req, &source)?;
-                let (manifest, manifest_bytes) = self.read_source_manifest(&source)?;
-                let machine_id = import_machine_id()?;
-                let (mut staging, session_id) = self.stage_import(
-                    req,
-                    &source,
-                    &template,
-                    &manifest,
-                    manifest_bytes.as_deref(),
-                    &machine_id,
-                )?;
-                let pushed = self.push_staged(req.target, &staging.dir, &source, &manifest)?;
-                self.move_into_place(req.target, &mut staging, &pushed)?;
-                (session_id, machine_id, manifest.keys.len())
-            }
-        };
+        // The source is marked for this very target: an earlier run's
+        // marker PUT landed though it reported a failure. With that run's
+        // target here, the import is already complete; nothing is written.
+        if let Some(marker) = &source.own_marker {
+            return match self.local_import_of(req.target, &source) {
+                Some(session_id) if session_id == marker.session_id => Ok(outcome(
+                    self.local_key_count(req.target)?,
+                    TemplateOrigin::Unchanged,
+                )),
+                _ => Err(ImportError::new(
+                    ImportErrorCode::SourceMigrated,
+                    format!(
+                        "session '{}' in workspace {} was already migrated to '{}' in {}",
+                        source.name, source.workspace, marker.session, marker.workspace
+                    ),
+                )),
+            };
+        }
+
+        let (session_id, machine_id, keys, template_origin) =
+            match self.existing_target(req, &source)? {
+                ExistingTarget::Local { session_id } => (
+                    session_id,
+                    import_machine_id()?,
+                    self.local_key_count(req.target)?,
+                    TemplateOrigin::Unchanged,
+                ),
+                ExistingTarget::Free | ExistingTarget::RemoteOnly => {
+                    let template = self.import_template(req, &source)?;
+                    let (manifest, manifest_bytes) = self.read_source_manifest(&source)?;
+                    let machine_id = import_machine_id()?;
+                    let (mut staging, session_id) = self.stage_import(
+                        req,
+                        &source,
+                        &template,
+                        &manifest,
+                        manifest_bytes.as_deref(),
+                        &machine_id,
+                    )?;
+                    let pushed = self.push_staged(req.target, &staging.dir, &source, &manifest)?;
+                    self.move_into_place(req.target, &mut staging, &pushed)?;
+                    let origin = if req.trust_template {
+                        TemplateOrigin::Bucket
+                    } else {
+                        TemplateOrigin::LocalCache
+                    };
+                    (session_id, machine_id, manifest.keys.len(), origin)
+                }
+            };
 
         self.mark_source(req, &source, &session_id, &machine_id)?;
+        Ok(outcome(keys, template_origin))
+    }
 
-        Ok(ImportOutcome {
-            name: req.target.to_string(),
-            from_workspace: source.workspace,
-            from_session: source.name,
-            keys,
-            template: template_origin,
-        })
+    /// The `session_id` of the local session `target` when its log is an
+    /// import of `source`.
+    fn local_import_of(&self, target: &str, source: &ImportSource) -> Option<String> {
+        let bytes =
+            std::fs::read(self.local.session_dir(target).join(state_file_name(target))).ok()?;
+        let imported = ImportedAs::read(&bytes)?;
+        imported.is_of(source).then_some(imported.session_id)
+    }
+
+    /// How many keys the local session `target`'s manifest lists. A
+    /// manifest that can't be read fails the import rather than reporting
+    /// none.
+    fn local_key_count(&self, target: &str) -> Result<usize, ImportError> {
+        self.local
+            .read_manifest(target)
+            .map(|m| m.keys.len())
+            .map_err(|e| {
+                ImportError::new(
+                    ImportErrorCode::PushFailed,
+                    format!(
+                        "could not read the context manifest of the imported session '{}': {:#}",
+                        target, e
+                    ),
+                )
+            })
     }
 
     /// Read and check the source: refuse a marked one, then fetch its state
@@ -1672,34 +1779,40 @@ impl CloudBackend {
             .into_owned();
         let session = format!("{}/{}/", source_prefix, name);
 
-        // A source already marked was imported before.
-        if let Some(marker) = self
+        // A source already marked was imported before. A marker naming this
+        // workspace's prefix and this import's target may be this import's
+        // own; that is settled once the source's log is read.
+        let marker = self
             .get_object_if_present(&format!("{}{}", session, MIGRATED_MARKER))
-            .map_err(|e| unreadable_source(name, &workspace, "the migration marker", &e))?
-        {
-            let migrated = migrated_from_marker(name, &marker);
-            return Err(ImportError::new(
-                SourceMigrated,
-                format!(
-                    "session '{}' in workspace {} was already migrated to '{}' in {}",
-                    name, workspace, migrated.target, migrated.workspace
-                ),
-            ));
-        }
+            .map_err(|e| unreadable_source(name, &workspace, "the migration marker", &e))?;
+        let own_marker = match &marker {
+            None => None,
+            Some(bytes) => {
+                let read = MarkerRead::parse(bytes);
+                if read.prefix != self.prefix || read.session != req.target {
+                    return Err(already_migrated(name, &workspace, bytes));
+                }
+                Some(read)
+            }
+        };
 
         let state_bytes = self
             .get_object_if_present(&format!("{}{}", session, state_file_name(name)))
-            .map_err(|e| unreadable_source(name, &workspace, "the state file", &e))?
-            .ok_or_else(|| {
-                ImportError::new(
+            .map_err(|e| unreadable_source(name, &workspace, "the state file", &e))?;
+        let state_bytes = match (state_bytes, &marker) {
+            (Some(bytes), _) => bytes,
+            (None, Some(bytes)) => return Err(already_migrated(name, &workspace, bytes)),
+            (None, None) => {
+                return Err(ImportError::new(
                     SourceNotFound,
                     format!(
                         "workspace {} has no session '{}' in the bucket; pass the source \
                          workspace's absolute path as it is on the host that created the session",
                         workspace, name
                     ),
-                )
-            })?;
+                ))
+            }
+        };
         let log = parse_source_log(&state_bytes)
             .map_err(|e| unreadable_source(name, &workspace, "the state file", &e))?;
         if let Some(parent) = &log.header.parent_workflow {
@@ -1725,6 +1838,7 @@ impl CloudBackend {
             workspace,
             session,
             log,
+            own_marker,
         })
     }
 
@@ -1916,15 +2030,7 @@ impl CloudBackend {
             .and_then(|()| std::fs::create_dir_all(base).map_err(anyhow::Error::from))
             .map_err(|e| write_failed(base, &e))?;
         let dir = base.join(format!(".import-{}-{}", target, generate_session_id()));
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        // Not recursive: an existing directory is an error, so the staging
-        // directory is this run's alone.
-        builder.create(&dir).map_err(|e| write_failed(&dir, &e))?;
+        create_private_dir(&dir).map_err(|e| write_failed(&dir, &e))?;
         let staging = Staging { dir, moved: false };
         let dir = staging.dir.as_path();
 
@@ -2084,33 +2190,44 @@ impl CloudBackend {
     /// Rename the staging directory to `<sessions>/<target>/`, holding the
     /// lock `lock_state_file(target)` takes on the staged state file, which
     /// becomes the target's: a command that reaches the target's state file
-    /// the moment it appears finds it locked until the rename is done. On a
-    /// failure, take back what was pushed; the staging directory goes when
-    /// `staging` drops.
+    /// the moment it appears finds it locked until the rename is done.
+    ///
+    /// The rename never replaces anything, not even an empty directory: a
+    /// target that appeared while the import ran refuses
+    /// `import_name_taken`. On any failure, take back what this run pushed;
+    /// the staging directory goes when `staging` drops.
     fn move_into_place(
         &self,
         target: &str,
         staging: &mut Staging,
         pushed: &[String],
     ) -> Result<(), ImportError> {
+        use crate::engine::atomic_fs::{atomic_rename_dir, AtomicCreateError};
+
         let target_dir = self.local.session_dir(target);
-        let moved = (|| -> std::io::Result<()> {
+        let moved = (|| -> Result<(), AtomicCreateError> {
             #[cfg(unix)]
-            let _lock = lock_exclusive(&staging.dir.join(state_file_name(target)))?;
-            if target_dir.exists() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "a session of that name appeared while the import ran",
-                ));
-            }
-            std::fs::rename(&staging.dir, &target_dir)
+            let _lock = lock_exclusive(&staging.dir.join(state_file_name(target)))
+                .map_err(AtomicCreateError::Io)?;
+            atomic_rename_dir(&staging.dir, &target_dir)
         })();
         match moved {
             Ok(()) => {
                 staging.moved = true;
                 Ok(())
             }
-            Err(e) => {
+            Err(AtomicCreateError::Collision) => {
+                self.take_back(pushed);
+                Err(ImportError::new(
+                    ImportErrorCode::NameTaken,
+                    format!(
+                        "{} appeared while the import ran; what this import pushed was taken \
+                         back. Pass --as <new-name> to import under another name",
+                        target_dir.display()
+                    ),
+                ))
+            }
+            Err(AtomicCreateError::Io(e)) => {
                 self.take_back(pushed);
                 Err(ImportError::new(
                     ImportErrorCode::PushFailed,
@@ -3537,6 +3654,109 @@ mod tests {
         let mut garbage = source_log(header_json(HASH), &[event_json(1)]);
         garbage.extend_from_slice(b"{not an event\n");
         assert!(parse_source_log(&garbage).is_err());
+    }
+
+    /// An endpoint that answers every request with an empty 2xx and
+    /// records each request line.
+    fn recording_endpoint() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let record = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                record.lock().unwrap().push(format!("{} {}", method, path));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A target directory that appears while the import runs, even an
+    /// empty one, is never renamed over: the move refuses
+    /// `import_name_taken`, takes back exactly what was pushed, and the
+    /// staging directory goes.
+    #[test]
+    fn a_target_that_appeared_meanwhile_is_not_renamed_over() {
+        let (endpoint, seen) = recording_endpoint();
+        let tmp = TempDir::new().unwrap();
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+        let staged = tmp.path().join(".import-wf-test");
+        create_private_dir(&staged).unwrap();
+        fs::write(staged.join(state_file_name("wf")), b"{}\n").unwrap();
+        // Created by someone else between the push and the rename.
+        fs::create_dir(tmp.path().join("wf")).unwrap();
+
+        let pushed = vec![
+            "test-prefix/wf/koto-wf.state.jsonl".to_string(),
+            "test-prefix/wf/version.json".to_string(),
+        ];
+        let mut staging = Staging {
+            dir: staged.clone(),
+            moved: false,
+        };
+        let err = backend
+            .move_into_place("wf", &mut staging, &pushed)
+            .unwrap_err();
+        assert_eq!(err.code, ImportErrorCode::NameTaken, "{}", err);
+        assert!(err.message.contains("--as"), "{}", err);
+        drop(staging);
+
+        assert!(!staged.exists(), "the staging directory was left");
+        assert_eq!(
+            fs::read_dir(tmp.path().join("wf")).unwrap().count(),
+            0,
+            "the other directory was written into"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "DELETE /test-bucket/test-prefix/wf/koto-wf.state.jsonl".to_string(),
+                "DELETE /test-bucket/test-prefix/wf/version.json".to_string(),
+            ]
+        );
+    }
+
+    /// The staging directory is created mode 0700, inside the session
+    /// store, and creating it where anything already is fails.
+    #[cfg(unix)]
+    #[test]
+    fn the_staging_directory_is_private_and_exclusive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".import-wf-x");
+        create_private_dir(&dir).unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "mode {:o}", mode);
+
+        let err = create_private_dir(&dir).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // Not even an empty directory is reused, nor a file.
+        let file = tmp.path().join(".import-wf-y");
+        fs::write(&file, b"").unwrap();
+        assert_eq!(
+            create_private_dir(&file).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
     }
 
     #[test]

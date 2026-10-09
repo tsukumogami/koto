@@ -52,6 +52,9 @@ struct Fault {
     method: String,
     key: String,
     status: u16,
+    /// Store a PUT's body before answering with the failure, as an
+    /// endpoint that wrote the object and lost the reply would.
+    store: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +167,18 @@ impl FakeS3 {
             method: method.to_string(),
             key: key.to_string(),
             status,
+            store: false,
+        });
+    }
+
+    /// Store every PUT to exactly `key` but answer it with `status`: the
+    /// write lands and the client is told it failed.
+    pub fn fail_after_storing(&self, key: &str, status: u16) {
+        lock(&self.state).faults.push(Fault {
+            method: "PUT".to_string(),
+            key: key.to_string(),
+            status,
+            store: true,
         });
     }
 
@@ -352,7 +367,11 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
         .faults
         .iter()
         .find(|f| f.method == fault_method && f.key == fault_key)
+        .cloned()
     {
+        if fault.store {
+            st.objects.insert(key.clone(), req.body.clone());
+        }
         return Reply::error(fault.status, "InternalError", "injected failure");
     }
 
