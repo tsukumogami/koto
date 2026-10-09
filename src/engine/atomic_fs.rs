@@ -135,6 +135,49 @@ pub fn atomic_create_rename(src: &Path, dst: &Path) -> Result<(), AtomicCreateEr
     std::fs::rename(src, dst).map_err(AtomicCreateError::Io)
 }
 
+/// Move the directory `src` to `dst`, failing with
+/// [`Collision`](AtomicCreateError::Collision) when anything is at `dst`,
+/// an empty directory included (a plain `rename` silently replaces one).
+/// Linux uses `renameat2(RENAME_NOREPLACE)`, as
+/// [`atomic_create_rename`] does.
+#[cfg(target_os = "linux")]
+pub fn atomic_rename_dir(src: &Path, dst: &Path) -> Result<(), AtomicCreateError> {
+    atomic_create_rename(src, dst)
+}
+
+/// macOS: `renamex_np(RENAME_EXCL)`. `link()`, the file fallback, can't
+/// link a directory.
+#[cfg(target_vendor = "apple")]
+pub fn atomic_rename_dir(src: &Path, dst: &Path) -> Result<(), AtomicCreateError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c = |p: &Path| {
+        CString::new(p.as_os_str().as_bytes()).map_err(|e| {
+            AtomicCreateError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("path contains NUL: {}", e),
+            ))
+        })
+    };
+    let (src_c, dst_c) = (c(src)?, c(dst)?);
+    // SAFETY: both are valid C strings; -1 sets errno.
+    let ret = unsafe { libc::renamex_np(src_c.as_ptr(), dst_c.as_ptr(), libc::RENAME_EXCL) };
+    if ret == 0 {
+        return Ok(());
+    }
+    Err(from_io(std::io::Error::last_os_error()))
+}
+
+/// Elsewhere: best-effort check-then-rename, with a non-atomic window.
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+pub fn atomic_rename_dir(src: &Path, dst: &Path) -> Result<(), AtomicCreateError> {
+    if dst.exists() {
+        return Err(AtomicCreateError::Collision);
+    }
+    std::fs::rename(src, dst).map_err(AtomicCreateError::Io)
+}
+
 /// Refuse to read or write through a symlink at `path`.
 ///
 /// A planted symlink would let a foothold redirect a write into a file the
@@ -182,6 +225,27 @@ fn from_io(e: std::io::Error) -> AtomicCreateError {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn a_directory_is_never_renamed_over_an_existing_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("f"), b"x").unwrap();
+        // An empty directory: what a plain rename would replace.
+        fs::create_dir(&dst).unwrap();
+        assert!(matches!(
+            atomic_rename_dir(&src, &dst),
+            Err(AtomicCreateError::Collision)
+        ));
+        assert!(src.join("f").exists());
+        assert_eq!(fs::read_dir(&dst).unwrap().count(), 0);
+
+        fs::remove_dir(&dst).unwrap();
+        atomic_rename_dir(&src, &dst).unwrap();
+        assert!(dst.join("f").exists() && !src.exists());
+    }
 
     #[test]
     fn creates_when_destination_is_absent() {

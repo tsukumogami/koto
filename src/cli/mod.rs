@@ -558,10 +558,10 @@ pub enum SessionCommand {
     /// Import a session from another workspace's copy in the bucket.
     ///
     /// Reads session <NAME> as the workspace at --from pushed it to the
-    /// configured bucket, and creates it here as a new local session
-    /// anchored in the current directory: the source's events plus a
-    /// `session_imported` event, every context key, and the compiled
-    /// template. It pushes the new session under this workspace's prefix,
+    /// configured bucket, and creates it here, named --as when given, as a
+    /// new local session anchored in the current directory: the source's
+    /// events plus a `session_imported` event, every context key, and the
+    /// compiled template. It pushes the new session under this workspace's prefix,
     /// then leaves a `migrated.json` marker beside the source, so the old
     /// copy refuses with `session_migrated` from then on. Nothing else
     /// under the source's prefix is written.
@@ -572,17 +572,35 @@ pub enum SessionCommand {
     /// `koto session resolve <name> --keep local` there before importing.
     ///
     /// The compiled template comes from this machine's own cache, by the
-    /// hash the session recorded, never from the bucket: run
-    /// `koto template compile` on the session's template here first.
-    /// Requires the cloud backend.
+    /// hash the session recorded: run `koto template compile` on the
+    /// session's template here first. --trust-template takes the copy the
+    /// source pushed to the bucket instead, after checking its hash; pass
+    /// it only when you trust everyone who can write the bucket, since the
+    /// template holds every command the session runs. Requires the cloud
+    /// backend.
+    ///
+    /// The output's `template` field says where the compiled template came
+    /// from: `local-cache`, `bucket` (under --trust-template), or
+    /// `unchanged` when a re-run found the session already built and took
+    /// none. Running the same import again after `import_unmarked` writes
+    /// only the marker.
     Import {
-        /// Session name, the same in the source workspace and here
+        /// Session name in the source workspace
         name: String,
 
         /// Absolute path of the source workspace, as it was on the host
         /// that created the session
         #[arg(long = "from", value_name = "WORKSPACE_PATH")]
         from: String,
+
+        /// Name to give the session here, when its own name is taken
+        #[arg(long = "as", value_name = "NEW_NAME")]
+        as_name: Option<String>,
+
+        /// Take the compiled template from the bucket rather than this
+        /// machine's cache
+        #[arg(long)]
+        trust_template: bool,
     },
 
     /// List, and optionally restore, sessions the old-layout migration set
@@ -1555,9 +1573,18 @@ pub fn run(app: App) -> Result<()> {
                 SessionCommand::Rebind { name, to } => {
                     session::handle_rebind(&backend, &name, to.as_deref())
                 }
-                SessionCommand::Import { name, from } => {
-                    session::handle_import(&backend, &name, &from)
-                }
+                SessionCommand::Import {
+                    name,
+                    from,
+                    as_name,
+                    trust_template,
+                } => session::handle_import(
+                    &backend,
+                    &name,
+                    &from,
+                    as_name.as_deref(),
+                    trust_template,
+                ),
             }
         }
         // `handle` never returns: it prints an envelope and exits, so
@@ -1567,6 +1594,28 @@ pub fn run(app: App) -> Result<()> {
         Command::Context { subcommand } => {
             let backend = build_backend()?;
             let store: &dyn ContextStore = &backend;
+            // A session imported into another workspace refuses here, before
+            // anything reads or writes it, exit 2 as `status` and `next`
+            // do: the caller continues it where the message says. `exists`
+            // needs this most, since the store's answer is a bool with no
+            // room for the reason. The check is cached per process, so the
+            // store's own check behind it costs nothing more.
+            let (session, command) = match &subcommand {
+                ContextCommand::Add { session, .. } => (session, "context add"),
+                ContextCommand::Get { session, .. } => (session, "context get"),
+                ContextCommand::Exists { session, .. } => (session, "context exists"),
+                ContextCommand::Remove { session, .. } => (session, "context remove"),
+                ContextCommand::List { session, .. } => (session, "context list"),
+            };
+            if let Err(e) = backend.check_not_migrated(session) {
+                exit_with_error_code(
+                    serde_json::json!({
+                        "error": e.to_string(),
+                        "command": command
+                    }),
+                    EXIT_CALLER_ERROR,
+                );
+            }
             match subcommand {
                 ContextCommand::Add {
                     session,
