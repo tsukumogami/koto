@@ -925,15 +925,20 @@ pub(crate) fn build_local_backend() -> Result<LocalBackend> {
     }
 }
 
-/// The koto home the run journal is written under for a command's terminal
-/// tick, by the rule `build_local_backend` applies: `None` (no journal) when
-/// `KOTO_SESSIONS_BASE` redirects the store, otherwise [`ledger_root`].
+/// The directory the run journal is written in for a command's terminal
+/// tick, by the rule `build_local_backend` applies: the redirected base
+/// itself when `KOTO_SESSIONS_BASE` redirects the store, otherwise
+/// [`ledger_root`].
 ///
-/// Unit tests never reach a journal through here; they build a store with
-/// `LocalBackend::with_base_dir_and_journal` on a temporary directory.
+/// Unit tests never reach a journal through here (`None` under `cfg(test)`,
+/// so no unit test can write the real home's journal); they build a store
+/// with `LocalBackend::with_base_dir` on a temporary directory.
 pub(crate) fn run_journal_root() -> Option<PathBuf> {
-    if cfg!(test) || std::env::var("KOTO_SESSIONS_BASE").is_ok() {
+    if cfg!(test) {
         return None;
+    }
+    if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
+        return Some(PathBuf::from(base));
     }
     ledger_root()
 }

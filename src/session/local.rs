@@ -29,12 +29,14 @@ pub(crate) const INIT_TMP_SUFFIX: &str = ".tmp";
 /// `~/.koto/sessions/`.
 pub struct LocalBackend {
     base_dir: PathBuf,
-    /// The koto home this store's run journal is written under (see
-    /// `crate::run_journal`), or `None` for a store that writes no journal.
-    /// The journal lives in the koto home of the store it describes:
-    /// [`LocalBackend::new`] sets it to `~/.koto`, the home its sessions
-    /// live in; a store on an explicit base directory
-    /// ([`LocalBackend::with_base_dir`]) has none.
+    /// The directory this store's run journal is written in (see
+    /// `crate::run_journal`). The journal lives with the store it
+    /// describes: [`LocalBackend::new`] sets it to `~/.koto`, the home its
+    /// sessions live in, and a store on an explicit base directory
+    /// ([`LocalBackend::with_base_dir`]) journals inside that base, so a
+    /// redirected store never writes the real home's journal. Session
+    /// listing skips plain files at the base level, so the journal file
+    /// there is never read as a session.
     journal_root: Option<PathBuf>,
 }
 
@@ -59,13 +61,13 @@ impl LocalBackend {
     ///
     /// Used by tests that need to control the storage location, and by
     /// `build_local_backend` in `src/cli/mod.rs` for the `KOTO_SESSIONS_BASE`
-    /// store. A store built here writes no run journal: the journal lives in
-    /// the koto home of the store it describes, and a store whose base was
-    /// redirected has none, so it never writes the real home's journal.
+    /// store. A store built here journals inside its own base directory
+    /// (`<base>/_run_journal.jsonl`), so it is journaled like any other store
+    /// and never writes the real home's journal.
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
         Self {
+            journal_root: Some(base_dir.clone()),
             base_dir,
-            journal_root: None,
         }
     }
 
@@ -79,8 +81,7 @@ impl LocalBackend {
         }
     }
 
-    /// The koto home this store's run journal is written under, or `None`
-    /// when it writes none.
+    /// The directory this store's run journal is written in.
     pub(crate) fn journal_root(&self) -> Option<&Path> {
         self.journal_root.as_deref()
     }

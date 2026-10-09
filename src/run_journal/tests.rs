@@ -140,7 +140,7 @@ fn init_writes_session_started_then_the_initial_state_and_a_sidecar() {
     assert_eq!(s["koto.template.hash"], "ab".repeat(32));
     assert_eq!(s["koto.fixture"], false);
     assert!(s.get("koto.parent.session.id").is_none());
-    assert!(s.get("imported_from").is_none());
+    assert!(s.get("koto.imported_from.session.id").is_none());
     let at = s["at"].as_str().unwrap();
     assert_eq!(at.len(), 24, "{at}");
     assert!(at.ends_with('Z') && at.as_bytes()[19] == b'.', "{at}");
@@ -417,9 +417,10 @@ fn an_older_child_walks_to_its_root_and_omits_the_run_id_when_the_root_is_gone()
 }
 
 #[test]
-fn a_store_on_an_explicit_base_writes_no_records_and_no_sidecar() {
+fn a_store_on_an_explicit_base_journals_inside_its_base() {
     let f = Fixture::new();
-    let other = LocalBackend::with_base_dir(f._tmp.path().join("elsewhere"));
+    let base = f._tmp.path().join("elsewhere");
+    let other = LocalBackend::with_base_dir(base.clone());
     other
         .init_state_file(
             "quiet",
@@ -434,10 +435,24 @@ fn a_store_on_an_explicit_base_writes_no_records_and_no_sidecar() {
             &crate::engine::types::now_iso8601(),
         )
         .unwrap();
+    // Not in the fixture's journal: the store journals inside its own base.
     assert!(f.journal().is_empty());
-    assert!(!other
+    let own: Vec<serde_json::Value> = std::fs::read_to_string(base.join(JOURNAL_FILE))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let kinds: Vec<&str> = own.iter().map(|r| r["kind"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        vec!["session_started", "state_entered", "state_entered"]
+    );
+    assert!(other
         .session_dir("quiet")
         .join(sidecar::SIDECAR_FILE)
         .exists());
+    // The journal file at the base level is never listed as a session.
+    let listed: Vec<String> = other.list().unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(listed, vec!["quiet".to_string()]);
     assert!(warnings_for_test().is_empty());
 }

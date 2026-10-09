@@ -3,7 +3,7 @@
 //! Every test runs the koto binary with `HOME` in a temporary directory and
 //! `KOTO_SESSIONS_BASE` unset, so the session store is the default one under
 //! that home and the journal it reads is that test's own (a store redirected
-//! by `KOTO_SESSIONS_BASE` writes no journal). Each test also sets or clears
+//! by `KOTO_SESSIONS_BASE` journals inside its own base). Each test also sets or clears
 //! `CLAUDE_CODE_SESSION_ID` on each spawned process explicitly, so the
 //! driver of the session running the suite never reaches a journal.
 //!
@@ -451,7 +451,7 @@ fn allowed_fields(kind: &str) -> &'static [&'static str] {
             "koto.template.name",
             "koto.template.hash",
             "koto.fixture",
-            "imported_from",
+            "koto.imported_from.session.id",
         ],
         "state_entered" => &["koto.state"],
         "terminal" => &["koto.terminal"],
@@ -1601,13 +1601,13 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// A store redirected with `KOTO_SESSIONS_BASE` writes no run journal. The
-/// journal lives in the koto home of the store it describes, so a run
-/// against a redirected store leaves `HOME` (here a stand-in for the
-/// developer's real home, apart from the store) with no journal file
-/// anywhere under it, and the store with no journal sidecars.
+/// A store redirected with `KOTO_SESSIONS_BASE` is journaled inside its own
+/// base: its records go to `<base>/_run_journal.jsonl`, and `HOME` (here a
+/// stand-in for the developer's real home, apart from the store) is left
+/// with no journal file anywhere under it. The journal file at the base
+/// level is never listed as a session.
 #[test]
-fn a_store_redirected_by_koto_sessions_base_writes_no_journal() {
+fn a_store_redirected_by_koto_sessions_base_journals_inside_its_base() {
     let env = Env::new();
     let base = env.tmp.path().join("redirected-sessions");
     let parent = env.template("parent.md", BATCH_PARENT);
@@ -1640,14 +1640,44 @@ fn a_store_redirected_by_koto_sessions_base_writes_no_journal() {
     run(&["next", "parent", "--with-data", &tasks.to_string()]);
     assert!(base.join("parent.A").is_dir(), "the child was spawned");
 
-    let journals: Vec<PathBuf> = files_under(&env.home)
+    // Nothing under HOME: the real home's journal is never written.
+    let under_home: Vec<PathBuf> = files_under(&env.home)
         .into_iter()
-        .chain(files_under(&base))
         .filter(|p| {
             p.file_name()
                 .is_some_and(|n| n == JOURNAL || n == "run-journal.json")
         })
         .collect();
-    assert_eq!(journals, Vec::<PathBuf>::new());
+    assert_eq!(under_home, Vec::<PathBuf>::new());
     assert!(!env.journal_path().exists());
+
+    // The store's own journal, inside the redirected base.
+    let journal = base.join(JOURNAL);
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&journal)
+        .unwrap_or_else(|e| panic!("{}: {e}", journal.display()))
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let started: Vec<&str> = records
+        .iter()
+        .filter(|r| r["kind"] == "session_started")
+        .map(|r| r["session"].as_str().unwrap())
+        .collect();
+    for name in ["seq", "kept", "parent", "parent.A"] {
+        assert!(started.contains(&name), "{name}: {started:?}");
+    }
+    assert!(records
+        .iter()
+        .any(|r| r["kind"] == "terminal" && r["session"] == "seq"));
+    assert!(records
+        .iter()
+        .any(|r| r["kind"] == "cancelled" && r["session"] == "kept"));
+
+    // The journal file at the base level is not read as a session.
+    let mut cmd = env.cmd(None);
+    cmd.env("KOTO_SESSIONS_BASE", &base);
+    let listed = Env::run(cmd, &["workflows"]);
+    assert!(listed.ok, "{}", listed.stderr);
+    assert!(!listed.stdout.contains(JOURNAL), "{}", listed.stdout);
+    assert!(!listed.stderr.contains(JOURNAL), "{}", listed.stderr);
 }

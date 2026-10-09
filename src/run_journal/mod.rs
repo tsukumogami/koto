@@ -10,13 +10,13 @@
 //!
 //! ## Where the journal lives
 //!
-//! The run journal lives in the koto home of the session store it
-//! describes. The user's store (`LocalBackend::new`, `~/.koto/sessions`,
-//! which the cloud store also keeps its local copies in) journals into
-//! `~/.koto`. A store built on an explicit base directory
-//! (`LocalBackend::with_base_dir`, which is what `KOTO_SESSIONS_BASE`
-//! builds) writes no journal, so a redirected store never writes the real
-//! home's journal. Tests that want both a scratch store and a journal use
+//! The run journal lives with the session store it describes. The user's
+//! store (`LocalBackend::new`, `~/.koto/sessions`, which the cloud store
+//! also keeps its local copies in) journals into `~/.koto`. A store built on
+//! an explicit base directory (`LocalBackend::with_base_dir`, which is what
+//! `KOTO_SESSIONS_BASE` builds) journals inside that base, so every store
+//! is journaled and a redirected store never writes the real home's
+//! journal. Tests that want the journal somewhere else use
 //! `LocalBackend::with_base_dir_and_journal`.
 //!
 //! The switch belongs to the store's constructor, not to the
@@ -34,7 +34,7 @@
 //! - `session_started`: `koto.parent.session.id` (children),
 //!   `koto.driver.session.id` (the Claude Code session that created it),
 //!   `koto.template.name`, `koto.template.hash`, `koto.fixture`, and
-//!   `imported_from` for `koto session import`.
+//!   `koto.imported_from.session.id` for `koto session import`.
 //! - `state_entered`: `koto.state`.
 //! - `terminal`: `koto.terminal`.
 //! - `cancelled`: nothing more.
@@ -58,7 +58,8 @@
 //! - [`terminal`], from the terminal tick, writes `terminal` once per
 //!   arrival.
 //! - [`imported`], from `koto session import`, writes the imported
-//!   session's `session_started`.
+//!   session's `session_started` and a `state_entered` for the state it is
+//!   in, once per imported session.
 //!
 //! ## Failure
 //!
@@ -319,7 +320,9 @@ fn session_started(
             "koto.fixture",
             fixture::is_fixture(header.template_source_dir.as_deref()),
         )
-        .id("imported_from", imported_from)
+        // The source session's id: the same `from_session_id` the import's
+        // `session_imported` event carries, under the same name.
+        .id("koto.imported_from.session.id", imported_from)
 }
 
 /// The session's run id: the sidecar's cached value, or derived from the
@@ -437,14 +440,24 @@ pub(crate) fn terminal(
     );
 }
 
-/// Journal a session `koto session import` has just built. The imported
-/// session is a new run: its own id is its run id, and the source's id is
-/// recorded as `imported_from`. None of the source's records are copied.
+/// Journal a session `koto session import` has just built: its
+/// `session_started`, then one `state_entered` for `current_state`, the
+/// state its carried log leaves it in, timed at the import as
+/// [`after_init`] times a new session's initial state. The imported session
+/// is a new run: its own id is its run id, and `imported_from` (the
+/// `from_session_id` of the import's `session_imported` event) is recorded
+/// as `koto.imported_from.session.id`. None of the source's records are
+/// copied.
+///
+/// The import calls this once, after the session is in place and before
+/// the source is marked, on the branch that built it; a retry that adopts
+/// an already-placed session, or an import that rolls back, writes nothing.
 pub(crate) fn imported(
     journal_root: Option<&Path>,
     backend: &dyn SessionBackend,
     session: &str,
     header: &StateFileHeader,
+    current_state: Option<&str>,
     imported_from: &str,
 ) {
     let Some(root) = journal_root else {
@@ -452,18 +465,29 @@ pub(crate) fn imported(
     };
     let run_id = Some(header.session_id.clone()).filter(|v| is_id(v));
     let driver = driver();
-    let record = session_started(
+    let mut records = vec![session_started(
         session,
         header,
         run_id.as_deref(),
         driver.as_deref(),
         Some(imported_from),
-    );
+    )];
+    if let Some(state) = current_state {
+        records.push(
+            Record::new(
+                "state_entered",
+                session,
+                &header.session_id,
+                run_id.as_deref(),
+            )
+            .name("koto.state", Some(state)),
+        );
+    }
     let _ = sidecar::write(
         &backend.session_dir(session),
         &sidecar::Sidecar { run_id, driver },
     );
-    write(root, &[record]);
+    write(root, &records);
 }
 
 #[cfg(test)]

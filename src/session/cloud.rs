@@ -1740,16 +1740,20 @@ impl CloudBackend {
                     )?;
                     let pushed = self.push_staged(req.target, &staging.dir, &source, &manifest)?;
                     self.move_into_place(req.target, &mut staging, &pushed)?;
-                    // The session is in place: journal it as a new run. This
-                    // comes before the marker, since a marker failure leaves
-                    // the imported session where it is, and a retry that
-                    // adopts it journals nothing further.
-                    if let Ok(header) = self.local.read_header(req.target) {
+                    // The session is in place: journal it as a new run, with
+                    // the state its carried log leaves it in. This comes
+                    // before the marker, since a marker failure leaves the
+                    // imported session where it is, and a retry that adopts
+                    // it takes the `Local` branch above and journals nothing
+                    // further. A rollback never reaches here.
+                    if let Ok((header, events)) = self.local.read_events(req.target) {
+                        let current = crate::engine::persistence::derive_state_from_log(&events);
                         crate::run_journal::imported(
                             self.local.journal_root(),
                             &self.local,
                             req.target,
                             &header,
+                            current.as_deref(),
                             &source.log.header.session_id,
                         );
                     }
@@ -2113,10 +2117,6 @@ impl CloudBackend {
         let mut header = source.log.header.clone();
         header.workflow = target.to_string();
         header.session_id = session_id.clone();
-        // An import starts a new run: the source's lineage doesn't carry
-        // over, and its id is journaled as `imported_from` instead.
-        header.root_session_id = None;
-        header.parent_session_id = None;
         header.execution_dir = Some(req.anchor.to_path_buf());
         header.origin = self.store_identity().map(|store| SessionOrigin {
             anchor: req.anchor.to_path_buf(),
