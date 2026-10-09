@@ -1,0 +1,33 @@
+{
+  "schema": "shirabe-verification-map/v1",
+  "commands": {
+    "cargo-test": {"run": ["cargo", "test", "--locked", "--", "--test-threads=1"], "timeout_secs": 3600},
+    "stability-tests": {"run": ["cargo", "test", "-p", "koto-stability-tests", "--", "--test-threads=1"], "timeout_secs": 3600},
+    "fmt": {"run": ["cargo", "fmt", "--check"]},
+    "clippy": {"run": ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"], "timeout_secs": 3600},
+    "decider-purity": {"run": ["bash", "scripts/check-decider-purity.sh"]},
+    "doc-names": {"run": ["cargo", "test", "--locked", "--test", "doc_names"], "timeout_secs": 3600},
+    "shipped-spec": {"run": ["cargo", "test", "--locked", "--lib", "shipped_spec"], "timeout_secs": 3600},
+    "evals-exist": {"run": ["bash", "scripts/check-evals-exist.sh"]},
+    "run-evals-test": {"run": ["bash", "scripts/run-evals_test.sh"]}
+  },
+  "entries": [
+    {
+      "paths": ["src/**", "tests/**", "test/functional/fixtures/**", "benches/**", "koto-stability-tests/**", "build.rs", "Cargo.toml", "Cargo.lock", "README.md", "CLAUDE.md"],
+      "commands": ["cargo-test", "stability-tests", "fmt", "clippy", "decider-purity"]
+    },
+    {
+      "paths": ["plugins/**", ".claude-plugin/**", "scripts/check-evals-exist.sh"],
+      "commands": ["doc-names", "evals-exist"]
+    },
+    {
+      "paths": ["docs/**"],
+      "commands": ["doc-names", "shipped-spec"]
+    },
+    {
+      "paths": ["scripts/run-evals.sh", "scripts/run-evals_test.sh", "scripts/classify-eval-session.py"],
+      "commands": ["run-evals-test"]
+    }
+  ],
+  "default": ["cargo-test", "stability-tests", "fmt", "clippy"]
+}
