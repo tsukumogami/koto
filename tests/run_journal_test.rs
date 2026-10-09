@@ -1138,12 +1138,13 @@ fn the_fixture_flag_follows_the_template_source_directory() {
     env.init("mktemp", &mk.join("simple.md"));
     assert_eq!(env.records("mktemp")[0]["koto.fixture"], true);
 
-    // A symlink from outside into a temporary directory: one, once the
-    // link is resolved.
+    // A symlink from outside into a temporary directory: not one. The rule
+    // reads the directory as the header records it, and an absolute
+    // template path is recorded as given, without resolving the link.
     let link = plain.join("linked");
     std::os::unix::fs::symlink(&env.work, &link).unwrap();
     env.init("linked", &link.join("simple.md"));
-    assert_eq!(env.records("linked")[0]["koto.fixture"], true);
+    assert_eq!(env.records("linked")[0]["koto.fixture"], false);
 
     // The same plain template with TMPDIR set to its directory: one, since
     // the process's temporary directory counts wherever it is.

@@ -8,15 +8,15 @@
 //!
 //! Two row kinds exist:
 //!
-//! - `path_under_tempdir`: the directory, with symlinks resolved (or as
-//!   recorded when it no longer resolves), lies under the process's
-//!   temporary directory (`TMPDIR`, as given or resolved), or its path
-//!   matches `pattern` (`/tmp`, `/var/folders`) either directly or below
-//!   the row's `alias_root`.
+//! - `path_under_tempdir`: the directory as the session header records it
+//!   (no symlink is resolved) lies under the process's temporary directory
+//!   (`TMPDIR`, as given or resolved), or its path matches `pattern`
+//!   (`/tmp`, `/var/folders`) either directly or below the row's
+//!   `alias_root`.
 //!
 //!   macOS keeps the real `/tmp` and `/var/folders` under one top-level
-//!   directory and makes the familiar names symlinks into it, so a resolved
-//!   path there starts with that directory. `alias_root` names it as a
+//!   directory and makes the familiar names symlinks into it, so a path
+//!   recorded after resolution starts with that directory. `alias_root` names it as a
 //!   single path segment, and the pattern is tried again on the path with
 //!   that one leading segment removed. The roots are matched by how they
 //!   are spelled, not by resolving `/tmp` at runtime, so Linux and macOS
@@ -130,8 +130,9 @@ fn matches(rule: &Rule, dir: &Path, temp_dir: &Path) -> bool {
             pattern,
             alias_prefix,
         } => {
-            let resolved = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-            let text = resolved.to_string_lossy();
+            // The path as the session header records it: resolving symlinks
+            // here would classify paths the header's own value doesn't name.
+            let text = dir.to_string_lossy();
             if pattern.is_match(&text) {
                 return true;
             }
@@ -142,7 +143,7 @@ fn matches(rule: &Rule, dir: &Path, temp_dir: &Path) -> bool {
             }
             temp_roots(temp_dir)
                 .iter()
-                .any(|root| resolved.starts_with(root))
+                .any(|root| dir.starts_with(root))
         }
         Rule::Segment { pattern, ancestor } => {
             let segments: Vec<String> = dir
@@ -164,7 +165,7 @@ fn matches(rule: &Rule, dir: &Path, temp_dir: &Path) -> bool {
 }
 
 /// The process's temporary directory, as given and with symlinks resolved,
-/// so a resolved template directory is compared against a resolved root.
+/// so a template directory recorded under either spelling of it matches.
 fn temp_roots(temp_dir: &Path) -> Vec<PathBuf> {
     let mut roots = vec![temp_dir.to_path_buf()];
     if let Ok(resolved) = std::fs::canonicalize(temp_dir) {
