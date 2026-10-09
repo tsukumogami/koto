@@ -56,7 +56,9 @@ impl LocalBackend {
 
     /// Create a backend with an explicit base directory.
     ///
-    /// Intended for tests that need to control the storage location.
+    /// Intended for tests that need to control the storage location. Its
+    /// sessions are not recorded in the run journal unless it opts in with
+    /// [`LocalBackend::with_run_journal`].
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
         Self {
             base_dir,

@@ -897,7 +897,8 @@ fn handle_workflows_action(action: WorkflowsAction) -> Result<()> {
 /// Build the local backend, honoring `KOTO_SESSIONS_BASE` for testing.
 pub(crate) fn build_local_backend() -> Result<LocalBackend> {
     if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
-        // A redirected store is still the CLI's own: journal it.
+        // A redirected store is still the CLI's own: journal it. The journal
+        // stays in the koto home (`ledger_root`), wherever the store is.
         Ok(LocalBackend::with_base_dir(PathBuf::from(base)).with_run_journal())
     } else {
         LocalBackend::new()

@@ -82,13 +82,15 @@ pub(crate) const MAX_LINE_BYTES: usize = 4096;
 /// The line format's version, the `v` every record carries.
 const FORMAT_VERSION: u64 = 1;
 
-const MAX_VALUE_CHARS: usize = 128;
+/// The longest id or name, in bytes. Both shapes are ASCII-only, so this
+/// is also the character limit.
+const MAX_VALUE_BYTES: usize = 128;
 
 /// Whether `value` has the id shape: 1 to 128 characters from
 /// `A-Z a-z 0-9 . _ : -`.
 pub(crate) fn is_id(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= MAX_VALUE_CHARS
+        && value.len() <= MAX_VALUE_BYTES
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
@@ -99,7 +101,7 @@ pub(crate) fn is_id(value: &str) -> bool {
 /// path can't pass as a template or state name.
 pub(crate) fn is_name(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= MAX_VALUE_CHARS
+        && value.len() <= MAX_VALUE_BYTES
         && !value.starts_with('/')
         && !value.starts_with('~')
         && value.bytes().all(|b| {
@@ -359,7 +361,9 @@ fn session_started(
 }
 
 /// The session's run id: the sidecar's cached value, or derived from the
-/// header (and the parent chain for an older child) and cached now.
+/// header (and the parent chain for an older child) and cached now. An
+/// unresolved run id is not cached, so a parent header that was briefly
+/// unreadable is tried again on the next record.
 fn cached_run_id(
     backend: &dyn SessionBackend,
     session_dir: &Path,
@@ -369,13 +373,15 @@ fn cached_run_id(
         return cached.run_id;
     }
     let run_id = run_id::run_id(backend, header);
-    let _ = sidecar::write(
-        session_dir,
-        &sidecar::Sidecar {
-            run_id: run_id.clone(),
-            driver: None,
-        },
-    );
+    if run_id.is_some() {
+        let _ = sidecar::write(
+            session_dir,
+            &sidecar::Sidecar {
+                run_id: run_id.clone(),
+                driver: None,
+            },
+        );
+    }
     run_id
 }
 

@@ -29,6 +29,10 @@ fn id(value: &str) -> Option<String> {
 
 /// The run id recorded in, or implied by, `header` alone: its
 /// `root_session_id`, or its own `session_id` when it has no parent.
+///
+/// The outer `None` means the header can't say (an older child: the walk
+/// has to answer); `Some(None)` means it says, and the answer is that the
+/// value isn't id-shaped, so the run id is left out.
 fn from_header_alone(header: &StateFileHeader) -> Option<Option<String>> {
     if let Some(root) = header.root_session_id.as_deref() {
         return Some(id(root));

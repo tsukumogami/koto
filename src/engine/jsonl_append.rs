@@ -199,8 +199,8 @@ mod tests {
         assert!(err.to_string().contains("failed to open"), "{}", err);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched\n");
 
-        // A regular file is appended to and created 0600, as with the
-        // following variant.
+        // A regular file is appended to and created 0600, as
+        // `append_bounded_line` does.
         let fresh = tmp.path().join("fresh.jsonl");
         append_bounded_line_no_follow(tmp.path(), &fresh, "{}", 4096).unwrap();
         append_bounded_line_no_follow(tmp.path(), &fresh, "{}", 4096).unwrap();
