@@ -55,11 +55,11 @@ And
 `SessionBackend::rewrite_header` has a default (rewrite the local file, then
 confirm the push with `ensure_pushed`) instead of a `LocalBackend` override,
 so a future syncing backend pushes header rewrites without overriding it;
-`CloudBackend` overrides it to push the way it pushes events. Three smaller
-changes followed review: the marker check lists instead of GETting, to avoid
-rust-s3's retry sleep on the expected 404; an import re-run that finds its
-own marker on the source reports `template: unchanged` instead of refusing;
-and the sections below now say so.
+`CloudBackend` overrides it to push the way it pushes events. Two smaller
+changes followed review, and the sections below say so: the marker check
+lists instead of GETting, to avoid rust-s3's retry sleep on the expected
+404, and an import re-run that finds its own marker on the source reports
+`template: unchanged` instead of refusing.
 
 ## Context and Problem Statement
 
@@ -229,8 +229,9 @@ choose the commands a host runs. The import must not change that by default.
 ### Decision 5: Making header rewrites persist (koto#310)
 
 - **Chosen: a backend method.** `SessionBackend::rewrite_header(id, f)`
-  runs `rewrite_header_atomically` on the local file; the cloud backend then
-  pushes the state file the way `append_event` does. `handle_rebind`, the
+  has a trait default that runs `rewrite_header_atomically` on the local
+  file and confirms the push with `ensure_pushed`; `CloudBackend` overrides
+  it to push the state file the way `append_event` does. `handle_rebind`, the
   anchor adoption in `handle_next` and the rewrite in `init_child.rs` call
   it instead of the free function, which stops being reachable from
   `src/cli/`.
