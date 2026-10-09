@@ -21,6 +21,9 @@ use tempfile::TempDir;
 
 const JOURNAL: &str = "_run_journal.jsonl";
 const DRIVER_ENV: &str = "CLAUDE_CODE_SESSION_ID";
+/// The top-level directory macOS keeps the real `/tmp` and `/var/folders`
+/// under, as one path segment.
+const MACOS_ALIAS_ROOT: &str = "private";
 
 // ----- Templates -----
 
@@ -1096,20 +1099,22 @@ fn the_fixture_flag_follows_the_template_source_directory() {
     env.init("in-temp", &temp_t);
     assert_eq!(env.records("in-temp")[0]["koto.fixture"], true);
 
-    // Outside every temporary directory: not one.
+    // Outside every temporary directory: not one. The roots are /tmp and
+    // /var/folders, plus their real locations on macOS, which keeps them
+    // below one top-level directory (MACOS_ALIAS_ROOT).
     let plain = non_temp_dir("plain");
     let resolved = std::fs::canonicalize(&plain).unwrap();
     let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-    if resolved.starts_with(&temp)
-        || [
-            "/tmp",
-            "/private/tmp",
-            "/var/folders",
-            "/private/var/folders",
-        ]
+    let roots: Vec<PathBuf> = ["tmp", "var/folders"]
         .iter()
-        .any(|root| resolved.starts_with(root))
-    {
+        .flat_map(|root| {
+            [
+                Path::new("/").join(root),
+                Path::new("/").join(MACOS_ALIAS_ROOT).join(root),
+            ]
+        })
+        .collect();
+    if resolved.starts_with(&temp) || roots.iter().any(|root| resolved.starts_with(root)) {
         eprintln!("skipped: the build's scratch directory is itself temporary");
         let _ = std::fs::remove_dir_all(&plain);
         return;
@@ -1139,6 +1144,17 @@ fn the_fixture_flag_follows_the_template_source_directory() {
     std::os::unix::fs::symlink(&env.work, &link).unwrap();
     env.init("linked", &link.join("simple.md"));
     assert_eq!(env.records("linked")[0]["koto.fixture"], true);
+
+    // The same plain template with TMPDIR set to its directory: one, since
+    // the process's temporary directory counts wherever it is.
+    let mut cmd = env.cmd(None);
+    cmd.env("TMPDIR", &plain);
+    let out = Env::run(
+        cmd,
+        &["init", "tmpdir", "--template", plain_t.to_str().unwrap()],
+    );
+    assert!(out.ok, "{}", out.stderr);
+    assert_eq!(env.records("tmpdir")[0]["koto.fixture"], true);
 
     let _ = std::fs::remove_dir_all(&plain);
 }

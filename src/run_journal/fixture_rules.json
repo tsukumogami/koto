@@ -3,7 +3,8 @@
     "rule": "temporary_directory",
     "kind": "path_under_tempdir",
     "field": "template_source_dir",
-    "pattern": "^(/private)?/(tmp|var/folders)(/|$)"
+    "pattern": "^/(tmp|var/folders)(/|$)",
+    "alias_root": "private"
   },
   {
     "rule": "mktemp_directory",
