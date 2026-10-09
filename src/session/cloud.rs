@@ -932,6 +932,31 @@ impl SessionBackend for CloudBackend {
         self.local.read_header(id)
     }
 
+    /// Rewrite the local header, then push the state file through
+    /// `sync_push_state`, the same best-effort push `append_event` makes.
+    ///
+    /// Overridden rather than left to the trait default, which pushes
+    /// through `ensure_pushed` (the strict probe built for "push parent
+    /// before child mutation" ordering) and turns its error into a warning.
+    /// Going through `sync_push_state` keeps a header rewrite on the same
+    /// push path, and the same warning, as the event write it follows.
+    ///
+    /// The risk is accepted, not handled: when the push fails (offline, or
+    /// the bucket refuses it) the rewrite stays local and a warning goes to
+    /// stderr. The next successful push of this session carries it; until
+    /// then, a pull from another command can restore the old header. Rebind
+    /// and anchor adoption take that risk; a caller that can't follows up
+    /// with `ensure_pushed`, as the command-environment adoption does.
+    fn rewrite_header(
+        &self,
+        id: &str,
+        f: &dyn Fn(crate::engine::types::StateFileHeader) -> crate::engine::types::StateFileHeader,
+    ) -> anyhow::Result<()> {
+        self.local.rewrite_header(id, f)?;
+        self.sync_push_state(id);
+        Ok(())
+    }
+
     fn init_state_file(
         &self,
         id: &str,
@@ -2398,8 +2423,262 @@ fn marker_target_field(bytes: &[u8], name: &str) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// An in-memory S3 stand-in and the fixtures that point a `CloudBackend` at
+/// it, shared by the tests here and by the CLI tests that run a command
+/// against a cloud-backed session.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    use s3::creds::Credentials;
+    use s3::{Bucket, Region};
+
+    use super::CloudBackend;
+    use crate::engine::types::StateFileHeader;
+    use crate::session::local::LocalBackend;
+    use crate::session::state_file_name;
+
+    /// The key prefix `cloud_backend_at` gives its backend.
+    pub(crate) const PREFIX: &str = "test-prefix";
+
+    /// One request the endpoint answered: method, path (query stripped) and
+    /// body.
+    #[derive(Debug, Clone)]
+    pub(crate) struct Request {
+        pub(crate) method: String,
+        pub(crate) path: String,
+        pub(crate) body: Vec<u8>,
+    }
+
+    /// A running endpoint: its URL and every request it has answered.
+    pub(crate) struct Endpoint {
+        pub(crate) url: String,
+        requests: Arc<Mutex<Vec<Request>>>,
+    }
+
+    impl Endpoint {
+        /// Every request answered so far, in arrival order.
+        pub(crate) fn requests(&self) -> Vec<Request> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        /// The body of the last PUT whose path ends with `suffix`.
+        pub(crate) fn last_put(&self, suffix: &str) -> Option<Vec<u8>> {
+            self.requests()
+                .into_iter()
+                .rev()
+                .find(|r| r.method == "PUT" && r.path.ends_with(suffix))
+                .map(|r| r.body)
+        }
+    }
+
+    /// A ListObjectsV2 body naming `keys`, as rust-s3 parses it.
+    pub(crate) fn list_body(keys: &[String]) -> Vec<u8> {
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>\
+             <Name>test-bucket</Name><IsTruncated>false</IsTruncated>",
+        );
+        for key in keys {
+            xml.push_str(&format!(
+                "<Contents><Key>{}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified>\
+                 <Size>1</Size></Contents>",
+                key
+            ));
+        }
+        xml.push_str("</ListBucketResult>");
+        xml.into_bytes()
+    }
+
+    /// The `prefix` of a ListObjectsV2 request target, or `None` when the
+    /// target isn't a listing.
+    pub(crate) fn listing_prefix(target: &str) -> Option<String> {
+        let query = target.split_once('?')?.1;
+        let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
+        if !pairs.iter().any(|(k, v)| k == "list-type" && v == "2") {
+            return None;
+        }
+        Some(
+            pairs
+                .into_iter()
+                .find(|(k, _)| k == "prefix")
+                .map(|(_, v)| v)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Serve `objects` from memory on a `127.0.0.1` port.
+    ///
+    /// A GET for a path ending in an object's name answers its bytes, and
+    /// any other GET answers 404. A listing whose prefix names an object
+    /// (it ends in a seeded name, or a stored path ends in it) answers that
+    /// one key, and any other listing answers none: that is how the
+    /// migration-marker check before every pull sees "no marker". A PUT
+    /// stores its body under its path, replacing whatever a GET of that
+    /// path answered before, so a pull after a push reads back what was
+    /// pushed. Every other request gets an empty 200. Each request is
+    /// recorded, its path stripped of the query.
+    ///
+    /// rust-s3 retries a 404 once after a second's sleep, so seed every
+    /// object a test GETs.
+    pub(crate) fn serve(objects: Vec<(String, Vec<u8>)>) -> Endpoint {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            let mut objects = objects;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut body);
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let target = parts.next().unwrap_or("");
+                let path = target.split('?').next().unwrap_or("").to_string();
+                let listing = listing_prefix(target);
+                let (status, payload): (&str, Vec<u8>) = match (method.as_str(), listing) {
+                    (_, Some(prefix)) => {
+                        let keys: Vec<String> = objects
+                            .iter()
+                            .filter(|(name, _)| {
+                                prefix.ends_with(name.as_str())
+                                    || name.ends_with(&format!("/{prefix}"))
+                            })
+                            .map(|_| prefix.clone())
+                            .collect();
+                        ("200 OK", list_body(&keys))
+                    }
+                    ("GET", None) => match objects
+                        .iter()
+                        .find(|(name, _)| path.ends_with(name.as_str()))
+                    {
+                        Some((_, bytes)) => ("200 OK", bytes.clone()),
+                        None => ("404 Not Found", Vec::new()),
+                    },
+                    ("PUT", None) => {
+                        objects.retain(|(name, _)| !path.ends_with(name.as_str()));
+                        objects.push((path.clone(), body.clone()));
+                        ("200 OK", Vec::new())
+                    }
+                    _ => ("200 OK", Vec::new()),
+                };
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(Request { method, path, body });
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = stream.write_all(&payload);
+            }
+        });
+        Endpoint {
+            url: format!("http://{addr}"),
+            requests,
+        }
+    }
+
+    /// A `CloudBackend` storing sessions under `base_dir` and syncing to
+    /// `endpoint` (path-style, under [`PREFIX`]).
+    pub(crate) fn cloud_backend_at(base_dir: &Path, endpoint: String) -> CloudBackend {
+        let region = Region::Custom {
+            region: "us-east-1".to_string(),
+            endpoint,
+        };
+        let credentials =
+            Credentials::new(Some("test-key"), Some("test-secret"), None, None, None).unwrap();
+        let bucket = Bucket::new("test-bucket", region, credentials)
+            .unwrap()
+            .with_path_style();
+        let local = LocalBackend::with_base_dir(base_dir.to_path_buf());
+        CloudBackend::with_parts(local, bucket, PREFIX.to_string())
+    }
+
+    /// The suffix of the remote key holding `id`'s state file.
+    pub(crate) fn state_key_suffix(id: &str) -> String {
+        format!("/{}/{}/{}", PREFIX, id, state_file_name(id))
+    }
+
+    /// Write a header-only state file for `id` under `base_dir`, anchored at
+    /// `execution_dir`, and return its bytes so a test can seed the remote
+    /// copy with them (the state `koto init` would have pushed).
+    pub(crate) fn seed_session(
+        base_dir: &Path,
+        id: &str,
+        execution_dir: Option<PathBuf>,
+    ) -> Vec<u8> {
+        let session_dir = base_dir.join(id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let state_path = session_dir.join(state_file_name(id));
+        let header = StateFileHeader {
+            command_environment: None,
+            schema_version: 1,
+            workflow: id.to_string(),
+            template_hash: "testhash".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            parent_workflow: None,
+            template_source_dir: None,
+            template_source_file: None,
+            origin: None,
+            execution_dir,
+            session_id: String::new(),
+            intent: None,
+            template_name: None,
+            needs_agent: None,
+            role: None,
+            inputs: None,
+            coordinator_of_record: None,
+            requested_by: None,
+            assignment_claim: None,
+            dispatch_epoch: 0,
+            priority: None,
+            deadline: None,
+            retry_count: None,
+            agent_config: None,
+            respawn_generation: None,
+        };
+        crate::engine::persistence::append_header(&state_path, &header).unwrap();
+        std::fs::read(&state_path).unwrap()
+    }
+
+    /// The header line of a state file's bytes.
+    pub(crate) fn header_of(state: &[u8]) -> StateFileHeader {
+        let text = std::str::from_utf8(state).expect("state file is UTF-8");
+        let first = text.lines().next().expect("state file has a header line");
+        serde_json::from_str(first).expect("header line parses")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{
+        cloud_backend_at, header_of, list_body, listing_prefix, seed_session, serve,
+        state_key_suffix,
+    };
     use super::*;
     use crate::engine::persistence::append_header;
     use crate::engine::types::StateFileHeader;
@@ -3191,122 +3470,6 @@ mod tests {
 
     // -- A cloud pull is a logged write with writer `sync` --
 
-    /// A ListObjectsV2 body naming `keys`, as rust-s3 parses it.
-    fn list_body(keys: &[String]) -> Vec<u8> {
-        let mut xml = String::from(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>\
-             <Name>test-bucket</Name><IsTruncated>false</IsTruncated>",
-        );
-        for key in keys {
-            xml.push_str(&format!(
-                "<Contents><Key>{}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified>\
-                 <Size>1</Size></Contents>",
-                key
-            ));
-        }
-        xml.push_str("</ListBucketResult>");
-        xml.into_bytes()
-    }
-
-    /// The `prefix` of a ListObjectsV2 request target, or `None` when the
-    /// target isn't a listing.
-    fn listing_prefix(target: &str) -> Option<String> {
-        let query = target.split_once('?')?.1;
-        let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .collect();
-        if !pairs.iter().any(|(k, v)| k == "list-type" && v == "2") {
-            return None;
-        }
-        Some(
-            pairs
-                .into_iter()
-                .find(|(k, _)| k == "prefix")
-                .map(|(_, v)| v)
-                .unwrap_or_default(),
-        )
-    }
-
-    /// A minimal S3 stand-in: answers a GET for a path ending in one of
-    /// `objects`' names with its bytes, any other GET with 404, a listing
-    /// whose prefix ends in one of the names with that one key (any other
-    /// listing with none), and every other request (the state push) with
-    /// an empty 200.
-    fn serve_objects(objects: Vec<(String, Vec<u8>)>) -> String {
-        use std::io::{BufRead, BufReader, Read, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut request_line = String::new();
-                if reader.read_line(&mut request_line).is_err() {
-                    continue;
-                }
-                let mut content_length = 0usize;
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
-                    }
-                    let lower = line.to_ascii_lowercase();
-                    if let Some(v) = lower.strip_prefix("content-length:") {
-                        content_length = v.trim().parse().unwrap_or(0);
-                    }
-                }
-                let mut body = vec![0u8; content_length];
-                let _ = reader.read_exact(&mut body);
-                let mut parts = request_line.split_whitespace();
-                let method = parts.next().unwrap_or("");
-                let target = parts.next().unwrap_or("");
-                let path = target.split('?').next().unwrap_or("");
-                let listing = listing_prefix(target);
-                let (status, payload): (&str, Vec<u8>) = if let Some(prefix) = listing {
-                    let keys: Vec<String> = objects
-                        .iter()
-                        .filter(|(name, _)| prefix.ends_with(name.as_str()))
-                        .map(|_| prefix.clone())
-                        .collect();
-                    ("200 OK", list_body(&keys))
-                } else if method == "GET" {
-                    match objects
-                        .iter()
-                        .find(|(name, _)| path.ends_with(name.as_str()))
-                    {
-                        Some((_, bytes)) => ("200 OK", bytes.clone()),
-                        None => ("404 Not Found", Vec::new()),
-                    }
-                } else {
-                    ("200 OK", Vec::new())
-                };
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    payload.len()
-                );
-                let _ = stream.write_all(&payload);
-            }
-        });
-        format!("http://{addr}")
-    }
-
-    fn cloud_backend_at(base_dir: &Path, endpoint: String) -> CloudBackend {
-        let region = Region::Custom {
-            region: "us-east-1".to_string(),
-            endpoint,
-        };
-        let credentials =
-            Credentials::new(Some("test-key"), Some("test-secret"), None, None, None).unwrap();
-        let bucket = Bucket::new("test-bucket", region, credentials)
-            .unwrap()
-            .with_path_style();
-        let local = LocalBackend::with_base_dir(base_dir.to_path_buf());
-        CloudBackend::with_parts(local, bucket, "test-prefix".to_string())
-    }
-
     #[test]
     fn a_pull_records_writer_sync_in_the_store_and_the_log() {
         use crate::cache::sha256_hex;
@@ -3327,13 +3490,14 @@ mod tests {
         manifest
             .keys
             .insert("remote-only.md".to_string(), meta(b"elsewhere", "agent"));
-        let endpoint = serve_objects(vec![
+        let endpoint = serve(vec![
             (
                 "/ctx/manifest.json".to_string(),
                 serde_json::to_vec(&manifest).unwrap(),
             ),
             ("/ctx/notes.md".to_string(), content.clone()),
-        ]);
+        ])
+        .url;
 
         let tmp = TempDir::new().unwrap();
         write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
@@ -3367,6 +3531,45 @@ mod tests {
         backend.get("wf", "notes.md").unwrap();
         let (_, again) = backend.local.read_events("wf").unwrap();
         assert_eq!(again.len(), events.len());
+    }
+
+    // -- A header rewrite reaches the remote copy (koto#310) --
+
+    #[test]
+    fn rewrite_header_pushes_the_new_header_and_a_later_read_keeps_it() {
+        let tmp = TempDir::new().unwrap();
+        let seeded = seed_session(tmp.path(), "wf", None);
+        let endpoint = serve(vec![(state_key_suffix("wf"), seeded)]);
+        let backend = cloud_backend_at(tmp.path(), endpoint.url.clone());
+        let anchor = tmp.path().join("anchor");
+
+        backend
+            .rewrite_header("wf", &|mut h| {
+                h.execution_dir = Some(anchor.clone());
+                h
+            })
+            .unwrap();
+
+        let pushed = endpoint
+            .last_put(&state_key_suffix("wf"))
+            .expect("the rewrite pushed the state file");
+        assert_eq!(header_of(&pushed).execution_dir, Some(anchor.clone()));
+
+        // The next read pulls the remote copy over the local one; the
+        // rewrite has to survive that.
+        assert_eq!(
+            backend.read_header("wf").unwrap().execution_dir,
+            Some(anchor)
+        );
+        let last = endpoint.requests().pop().unwrap();
+        assert_eq!(
+            (
+                last.method.as_str(),
+                last.path.ends_with(&state_key_suffix("wf"))
+            ),
+            ("GET", true),
+            "the read pulled the state file"
+        );
     }
 
     // -- session.cloud.path_style --
@@ -3410,10 +3613,11 @@ mod tests {
 
     #[test]
     fn a_marker_refuses_reads_and_leaves_the_local_file_alone() {
-        let endpoint = serve_objects(vec![(
+        let endpoint = serve(vec![(
             "/wf/migrated.json".to_string(),
             marker_bytes("wf", "/srv/ws-b"),
-        )]);
+        )])
+        .url;
         let tmp = TempDir::new().unwrap();
         write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
         let state = tmp.path().join("wf").join(state_file_name("wf"));
@@ -3437,7 +3641,7 @@ mod tests {
     #[test]
     fn a_missing_marker_lets_reads_proceed() {
         // The stand-in answers every GET it has no object for with 404.
-        let endpoint = serve_objects(vec![]);
+        let endpoint = serve(vec![]).url;
         let tmp = TempDir::new().unwrap();
         write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
         let backend = cloud_backend_at(tmp.path(), endpoint);
@@ -3456,10 +3660,11 @@ mod tests {
 
     #[test]
     fn a_marker_that_does_not_parse_still_refuses() {
-        let endpoint = serve_objects(vec![(
+        let endpoint = serve(vec![(
             "/wf/migrated.json".to_string(),
             b"not json".to_vec(),
-        )]);
+        )])
+        .url;
         let tmp = TempDir::new().unwrap();
         write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
         let backend = cloud_backend_at(tmp.path(), endpoint);
@@ -3646,49 +3851,15 @@ mod tests {
         assert!(parse_source_log(&garbage).is_err());
     }
 
-    /// An endpoint that answers every request with an empty 2xx and
-    /// records each request line.
-    fn recording_endpoint() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
-        use std::io::{BufRead, BufReader, Write};
-
-        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let record = std::sync::Arc::clone(&seen);
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut request_line = String::new();
-                let _ = reader.read_line(&mut request_line);
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
-                    }
-                }
-                let mut parts = request_line.split_whitespace();
-                let method = parts.next().unwrap_or("").to_string();
-                let path = parts.next().unwrap_or("").to_string();
-                record.lock().unwrap().push(format!("{} {}", method, path));
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                );
-            }
-        });
-        (format!("http://{addr}"), seen)
-    }
-
     /// A target directory that appears while the import runs, even an
     /// empty one, is never renamed over: the move refuses
     /// `import_name_taken`, takes back exactly what was pushed, and the
     /// staging directory goes.
     #[test]
     fn a_target_that_appeared_meanwhile_is_not_renamed_over() {
-        let (endpoint, seen) = recording_endpoint();
+        let endpoint = serve(vec![]);
         let tmp = TempDir::new().unwrap();
-        let backend = cloud_backend_at(tmp.path(), endpoint);
+        let backend = cloud_backend_at(tmp.path(), endpoint.url.clone());
         let staged = tmp.path().join(".import-wf-test");
         create_private_dir(&staged).unwrap();
         fs::write(staged.join(state_file_name("wf")), b"{}\n").unwrap();
@@ -3716,8 +3887,13 @@ mod tests {
             0,
             "the other directory was written into"
         );
+        let seen: Vec<String> = endpoint
+            .requests()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect();
         assert_eq!(
-            *seen.lock().unwrap(),
+            seen,
             vec![
                 "DELETE /test-bucket/test-prefix/wf/koto-wf.state.jsonl".to_string(),
                 "DELETE /test-bucket/test-prefix/wf/version.json".to_string(),
