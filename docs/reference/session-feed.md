@@ -1639,6 +1639,9 @@ Several of these can appear in one log: a checkout can move more than once, and
 each move is its own event. A rebind to the directory the session is already
 bound to writes nothing, so consecutive events always differ.
 
+The event is appended before the header field is written, the same ordering
+`execution_anchor_adopted` uses and for the same reason.
+
 ---
 
 #### `session_imported`
@@ -1661,15 +1664,12 @@ source's remote object; this one records where they came from.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `from_workspace` | string | Yes | The absolute path the source workspace had on the host that created the session, as passed to `--from`. Its hash is the remote prefix the session was read from. |
+| `from_workspace` | string | Yes | The source workspace's path as the import resolved it: the canonical form of `--from` when that path exists on the importing host, the literal absolute path otherwise. Its hash is the remote prefix the session was read from. |
 | `from_session` | string | Yes | The source session's name. |
 | `from_session_id` | string | Yes | The source header's `session_id`. The imported header carries a new one. |
 | `machine_id` | string | Yes | The importing machine's id, from koto's user config. |
 
 A log imported more than once carries one of these per import, oldest first.
-
-The event is appended before the header field is written, the same ordering
-`execution_anchor_adopted` uses and for the same reason.
 
 ---
 
