@@ -24,6 +24,21 @@ rationale: |
 
 Current
 
+**Note (2026-10-09).** This design routed all state I/O through the backend, but
+one path stayed outside it: rewriting a state file's header in place.
+`koto session rebind`, a first `koto next` adopting an execution anchor, and
+starting a child rewrote the header with `rewrite_header_atomically` on the
+local file, so under the cloud backend the rewritten header didn't reach the
+bucket and the next pull could undo it. The session-migration design closes that bypass
+with a `SessionBackend::rewrite_header` method that the cloud backend
+implements by pushing the state file; koto#310 carries that change. The same
+design adds a check before the cloud backend reads a session's state or
+context: it looks for a
+`migrated.json` marker beside the session's remote objects, left there by
+`koto session import`, and refuses with `session_migrated` when it finds one,
+so a session that moved to another workspace isn't read or advanced in its old
+one. See `docs/designs/current/DESIGN-session-migration.md`.
+
 ## Context and problem statement
 
 koto's `SessionBackend` trait manages session directories (create, cleanup, list) and
