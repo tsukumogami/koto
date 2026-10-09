@@ -913,9 +913,9 @@ fn handle_workflows_action(action: WorkflowsAction) -> Result<()> {
 
 /// Build the local backend, honoring `KOTO_SESSIONS_BASE` for testing.
 ///
-/// The run journal lives in the koto home of the store it describes. The
-/// default store under `~/.koto/sessions` journals into `~/.koto`; a store
-/// whose base `KOTO_SESSIONS_BASE` redirected writes no journal, so it never
+/// The run journal lives with the store it describes. The default store
+/// under `~/.koto/sessions` journals into `~/.koto`; a store whose base
+/// `KOTO_SESSIONS_BASE` redirected journals inside that base, so it never
 /// writes the real home's journal (see `crate::run_journal`).
 pub(crate) fn build_local_backend() -> Result<LocalBackend> {
     if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
@@ -923,24 +923,6 @@ pub(crate) fn build_local_backend() -> Result<LocalBackend> {
     } else {
         LocalBackend::new()
     }
-}
-
-/// The directory the run journal is written in for a command's terminal
-/// tick, by the rule `build_local_backend` applies: the redirected base
-/// itself when `KOTO_SESSIONS_BASE` redirects the store, otherwise
-/// [`ledger_root`].
-///
-/// Unit tests never reach a journal through here (`None` under `cfg(test)`,
-/// so no unit test can write the real home's journal); they build a store
-/// with `LocalBackend::with_base_dir` on a temporary directory.
-pub(crate) fn run_journal_root() -> Option<PathBuf> {
-    if cfg!(test) {
-        return None;
-    }
-    if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
-        return Some(PathBuf::from(base));
-    }
-    ledger_root()
 }
 
 /// Validate and resolve `--var KEY=VALUE` arguments against the template's
@@ -1460,6 +1442,7 @@ pub fn run(app: App) -> Result<()> {
             handle_next(
                 &backend,
                 context_store,
+                backend.journal_root(),
                 name,
                 with_data,
                 to,
@@ -3177,8 +3160,10 @@ fn append_terminal_index_for_session(
 /// `ChildCompleted` behind; a duplicate is harmless, because the converge
 /// keeps the latest event per task and prefers an on-disk child.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn finish_terminal_tick(
     backend: &dyn SessionBackend,
+    journal_root: Option<&Path>,
     name: &str,
     header: &crate::engine::types::StateFileHeader,
     compiled: &CompiledTemplate,
@@ -3218,13 +3203,7 @@ fn finish_terminal_tick(
     if arrival {
         // The run journal's `terminal` record, once per arrival and before
         // any cleanup below, so it survives the session's removal.
-        crate::run_journal::terminal(
-            run_journal_root().as_deref(),
-            backend,
-            name,
-            header,
-            final_state,
-        );
+        crate::run_journal::terminal(journal_root, backend, name, header, final_state);
         // Re-read so the index classifier sees a mid-tick `WorkflowCancelled`.
         let post_events = backend
             .read_events(name)
@@ -3946,6 +3925,9 @@ fn record_execution_anchor_adoption(
 fn handle_next(
     backend: &dyn SessionBackend,
     context_store: &dyn ContextStore,
+    // The run journal root of the store `backend` is, for the terminal
+    // tick's record (`Backend::journal_root`).
+    journal_root: Option<&Path>,
     name: String,
     with_data: Option<String>,
     to: Option<String>,
@@ -5099,6 +5081,7 @@ fn handle_next(
                 {
                     finish_terminal_tick(
                         backend,
+                        journal_root,
                         &name,
                         &header,
                         &compiled,
@@ -6685,6 +6668,7 @@ fn handle_next(
             {
                 finish_terminal_tick(
                     backend,
+                    journal_root,
                     &name,
                     &header,
                     &compiled,
@@ -6718,6 +6702,7 @@ fn handle_next(
 fn handle_next(
     _backend: &dyn SessionBackend,
     _context_store: &dyn ContextStore,
+    _journal_root: Option<&Path>,
     name: String,
     _with_data: Option<String>,
     _to: Option<String>,

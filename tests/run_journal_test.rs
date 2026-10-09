@@ -1460,8 +1460,11 @@ fn a_full_journal_file_system_costs_one_warning_and_nothing_else() {
             r#"{"go": "yes"}"#.into(),
         ],
     ];
+    // A step warns only when it has a record to write: the bare `next`
+    // waits on evidence in `start`, changes nothing, and journals nothing.
+    let records = [true, false, true];
     let mut outs = Vec::new();
-    for step in steps {
+    for (i, step) in steps.into_iter().enumerate() {
         // 64 blocks of 512 bytes: room for the session's own files, none
         // for an append to the 256 KiB journal.
         let mut sh = full.process(Path::new("sh"), None);
@@ -1472,7 +1475,7 @@ fn a_full_journal_file_system_costs_one_warning_and_nothing_else() {
         let output = sh.output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let warnings = stderr.lines().filter(|l| l.contains("run journal")).count();
-        assert_eq!(warnings, 1, "{stderr}");
+        assert_eq!(warnings, usize::from(records[i]), "step {i}: {stderr}");
         outs.push((
             output.status.success(),
             String::from_utf8_lossy(&output.stdout).to_string(),

@@ -569,6 +569,16 @@ impl Backend {
         }
     }
 
+    /// Where this backend's run journal is written: the journal root of the
+    /// local store it is, or, for the cloud backend, of the local store it
+    /// keeps its copies in. `None` writes no journal. See `crate::run_journal`.
+    pub(crate) fn journal_root(&self) -> Option<&std::path::Path> {
+        match self {
+            Backend::Local(b) => b.journal_root(),
+            Backend::Cloud(b) => b.journal_root(),
+        }
+    }
+
     /// Refuse with [`SessionMigrated`] when `id` was imported into another
     /// workspace. Always `Ok` on the local backend, which has no remote
     /// copy to import from and makes no request.

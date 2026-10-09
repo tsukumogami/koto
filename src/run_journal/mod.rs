@@ -22,8 +22,9 @@
 //! The switch belongs to the store's constructor, not to the
 //! `SessionBackend` trait: each writer below takes the journal's root as a
 //! parameter. The commit hooks and the import hook take it from the
-//! `LocalBackend` they run in; the terminal tick takes it from
-//! `crate::cli::run_journal_root`, which applies the same rule.
+//! `LocalBackend` they run in; the terminal tick takes it from the backend
+//! the command built (`Backend::journal_root`), which for the cloud backend
+//! is the local store it keeps its copies in.
 //!
 //! ## Records
 //!
@@ -418,8 +419,8 @@ pub(crate) fn after_commit(
 
 /// Journal an arrival at the terminal state `final_state`. The terminal
 /// tick calls this once per arrival, after the state's `state_entered`
-/// and before any cleanup, with the root `crate::cli::run_journal_root`
-/// resolves; `None` writes nothing.
+/// and before any cleanup, with the root of the command's backend
+/// (`Backend::journal_root`); `None` writes nothing.
 pub(crate) fn terminal(
     journal_root: Option<&Path>,
     backend: &dyn SessionBackend,

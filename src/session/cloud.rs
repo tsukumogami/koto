@@ -226,6 +226,12 @@ impl CloudBackend {
         self.local.base_dir()
     }
 
+    /// The run journal root of the local store this backend keeps its
+    /// copies in. Reached through `Backend::journal_root`.
+    pub(crate) fn journal_root(&self) -> Option<&Path> {
+        self.local.journal_root()
+    }
+
     /// S3 key for a session's state file.
     fn state_key(&self, id: &str) -> String {
         format!("{}/{}/{}", self.prefix, id, state_file_name(id))
