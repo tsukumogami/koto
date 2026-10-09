@@ -1468,6 +1468,10 @@ fn a_full_journal_file_system_costs_one_warning_and_nothing_else() {
         // 64 blocks of 512 bytes: room for the session's own files, none
         // for an append to the 256 KiB journal.
         let mut sh = full.process(Path::new("sh"), None);
+        // Under coverage, an instrumented koto writes its profile on exit,
+        // and the limit would cut that file short and break the report.
+        // The limit applies only to regular files, so send it to /dev/null.
+        sh.env("LLVM_PROFILE_FILE", "/dev/null");
         sh.arg("-c")
             .arg("trap '' XFSZ; ulimit -f 64; exec \"$0\" \"$@\"")
             .arg(&koto)
