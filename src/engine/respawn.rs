@@ -82,9 +82,8 @@ use anyhow::{Context, Result};
 use crate::engine::audit::requester_respawn_fields;
 use crate::engine::claim::format_rfc3339_millis;
 use crate::engine::errors::EngineError;
-use crate::engine::persistence::append_event;
 use crate::engine::types::{EventPayload, StateFileHeader, ValidatedSessionId};
-use crate::session::state_file_name;
+use crate::session::{state_file_name, SessionBackend};
 
 /// Fixed-form resume-context prompt handed to a freshly-spawned
 /// subagent under F1 cold-restart re-priming.
@@ -363,6 +362,49 @@ pub fn evaluate_f1_preconditions(inputs: &F1Inputs<'_>) -> F1Outcome {
     }
 }
 
+/// Inputs to [`execute_respawn`]. Grouped into a struct so the
+/// function signature stays clean and so future fields (e.g. a
+/// caller-supplied agent-membership target) compose naturally.
+///
+/// Every event the executor writes goes to the requester's log through
+/// `backend.append_event`, the store's one commit funnel, addressed by
+/// `requester_session_id` (the requester's session name). That is what
+/// lets the store's post-commit hooks see a respawn-fallback cancel the
+/// same way they see `koto cancel`: the run journal records it as
+/// `cancelled`. The executor never writes the requester's header; a
+/// change to it would go through `SessionBackend::rewrite_header`.
+#[derive(Clone)]
+pub struct RespawnExecution<'a> {
+    /// The session store holding the requester's log. Events are
+    /// appended through it, never to the state file directly.
+    pub backend: &'a dyn SessionBackend,
+    /// The requester's parsed header (source of role / template /
+    /// inputs / current respawn_generation).
+    pub header: &'a StateFileHeader,
+    /// Coordinator id orchestrating the respawn. Used for both
+    /// `prior_coordinator_of_record` and `new_coordinator_of_record`
+    /// on the audit event in the single-coordinator model.
+    pub coord_id: &'a str,
+    /// Requester's session name (validated). Used to address its log
+    /// in `backend`, render the resume-context prompt and address the
+    /// substrate primitive.
+    pub requester_session_id: &'a ValidatedSessionId,
+    /// `RequesterWoken.woken_at` from the coord's log, or `None`
+    /// when no wake has been emitted for this requester yet.
+    pub woken_at: Option<SystemTime>,
+    /// mtime of the requester's session log.
+    pub last_log_activity: SystemTime,
+    /// Wall-clock at evaluation time.
+    pub now: SystemTime,
+    /// Substrate transcript-retention window.
+    pub retention_floor: Duration,
+    /// Respawn-generation cap (`request_store.respawn_generation_cap`).
+    pub cap: u32,
+    /// Whether the requester's `template_name` is currently
+    /// compilable / present in the registry. Caller-determined.
+    pub template_exists: bool,
+}
+
 /// Execute the F1 respawn for one requester. Composes
 /// [`evaluate_f1_preconditions`] with the substrate primitive and
 /// the audit-event emission.
@@ -385,39 +427,6 @@ pub fn evaluate_f1_preconditions(inputs: &F1Inputs<'_>) -> F1Outcome {
 ///
 /// On `F1Outcome::NoOp`: no events emitted; return
 /// [`RespawnExecuted::NoOp`].
-/// Inputs to [`execute_respawn`]. Grouped into a struct so the
-/// function signature stays clean and so future fields (e.g. a
-/// caller-supplied agent-membership target) compose naturally.
-#[derive(Debug, Clone)]
-pub struct RespawnExecution<'a> {
-    /// Path to the requester's session log file.
-    pub requester_state_file: &'a Path,
-    /// The requester's parsed header (source of role / template /
-    /// inputs / current respawn_generation).
-    pub header: &'a StateFileHeader,
-    /// Coordinator id orchestrating the respawn. Used for both
-    /// `prior_coordinator_of_record` and `new_coordinator_of_record`
-    /// on the audit event in the single-coordinator model.
-    pub coord_id: &'a str,
-    /// Requester's session id (validated). Used to render the
-    /// resume-context prompt and address the substrate primitive.
-    pub requester_session_id: &'a ValidatedSessionId,
-    /// `RequesterWoken.woken_at` from the coord's log, or `None`
-    /// when no wake has been emitted for this requester yet.
-    pub woken_at: Option<SystemTime>,
-    /// mtime of the requester's session log.
-    pub last_log_activity: SystemTime,
-    /// Wall-clock at evaluation time.
-    pub now: SystemTime,
-    /// Substrate transcript-retention window.
-    pub retention_floor: Duration,
-    /// Respawn-generation cap (`request_store.respawn_generation_cap`).
-    pub cap: u32,
-    /// Whether the requester's `template_name` is currently
-    /// compilable / present in the registry. Caller-determined.
-    pub template_exists: bool,
-}
-
 pub fn execute_respawn(
     exec: &RespawnExecution<'_>,
     respawner: &dyn SubstrateRespawner,
@@ -458,19 +467,11 @@ pub fn execute_respawn(
                     e
                 );
                 emit_respawn_event(
-                    exec.requester_state_file,
-                    exec.requester_session_id,
+                    exec,
                     exec.header.respawn_generation.unwrap_or(0),
                     F3Cause::SubstrateRefused.reason(),
-                    exec.coord_id,
-                    exec.coord_id,
-                    exec.now,
                 )?;
-                emit_workflow_cancelled(
-                    exec.requester_state_file,
-                    F3Cause::SubstrateRefused.reason(),
-                    exec.now,
-                )?;
+                emit_workflow_cancelled(exec, F3Cause::SubstrateRefused.reason())?;
                 return Ok(RespawnExecuted::Abandoned {
                     cause: F3Cause::SubstrateRefused,
                 });
@@ -478,29 +479,17 @@ pub fn execute_respawn(
 
             // Successful respawn → emit RequesterRespawn with
             // reason: transcript_expired.
-            emit_respawn_event(
-                exec.requester_state_file,
-                exec.requester_session_id,
-                new_generation,
-                "transcript_expired",
-                exec.coord_id,
-                exec.coord_id,
-                exec.now,
-            )?;
+            emit_respawn_event(exec, new_generation, "transcript_expired")?;
             Ok(RespawnExecuted::Respawned { new_generation })
         }
 
         F1Outcome::F3Fallback { cause } => {
             emit_respawn_event(
-                exec.requester_state_file,
-                exec.requester_session_id,
+                exec,
                 exec.header.respawn_generation.unwrap_or(0),
                 cause.reason(),
-                exec.coord_id,
-                exec.coord_id,
-                exec.now,
             )?;
-            emit_workflow_cancelled(exec.requester_state_file, cause.reason(), exec.now)?;
+            emit_workflow_cancelled(exec, cause.reason())?;
             Ok(RespawnExecuted::Abandoned { cause })
         }
     }
@@ -521,23 +510,20 @@ pub enum RespawnExecuted {
 }
 
 /// Append a `RequesterRespawn` audit event to the requester's
-/// session log via the audit-helper.
+/// session log via the audit-helper. The coordinator is both the
+/// prior and the new coordinator of record (single-coordinator model).
 fn emit_respawn_event(
-    requester_state_file: &Path,
-    requester_session_id: &ValidatedSessionId,
+    exec: &RespawnExecution<'_>,
     respawn_generation: u32,
     reason: &str,
-    prior_coord: &str,
-    new_coord: &str,
-    now: SystemTime,
 ) -> Result<()> {
-    let respawned_at = format_rfc3339_millis(now);
+    let respawned_at = format_rfc3339_millis(exec.now);
     let fields = requester_respawn_fields(
-        requester_session_id,
+        exec.requester_session_id,
         respawn_generation,
         reason,
-        prior_coord,
-        new_coord,
+        exec.coord_id,
+        exec.coord_id,
         &respawned_at,
     );
     let payload = EventPayload::EvidenceSubmitted {
@@ -546,34 +532,56 @@ fn emit_respawn_event(
         submitter_cwd: None,
         source: None,
     };
-    append_event(requester_state_file, &payload, &respawned_at).with_context(|| {
-        format!(
-            "append RequesterRespawn to {}",
-            requester_state_file.display()
-        )
-    })?;
-    Ok(())
+    append_to_requester(exec, &payload, &respawned_at, "RequesterRespawn")
 }
 
 /// Append a `WorkflowCancelled` event so the requester transitions
-/// to terminal `abandoned` (F3 fallback).
-fn emit_workflow_cancelled(
-    requester_state_file: &Path,
-    reason: &str,
-    now: SystemTime,
-) -> Result<()> {
+/// to terminal `abandoned` (F3 fallback). Through the backend, so the
+/// run journal writes its `cancelled` record once the event commits,
+/// and writes nothing when the append fails.
+fn emit_workflow_cancelled(exec: &RespawnExecution<'_>, reason: &str) -> Result<()> {
     let payload = EventPayload::WorkflowCancelled {
         state: "request_store.respawn".to_string(),
         reason: reason.to_string(),
     };
-    let timestamp = format_rfc3339_millis(now);
-    append_event(requester_state_file, &payload, &timestamp).with_context(|| {
-        format!(
-            "append WorkflowCancelled to {}",
-            requester_state_file.display()
-        )
-    })?;
-    Ok(())
+    let timestamp = format_rfc3339_millis(exec.now);
+    append_to_requester(exec, &payload, &timestamp, "WorkflowCancelled")
+}
+
+/// Append one event to the requester's log through `exec.backend`.
+/// A failure carries the same `append <event> to <state file>` context
+/// it carried when the executor wrote the state file directly.
+fn append_to_requester(
+    exec: &RespawnExecution<'_>,
+    payload: &EventPayload,
+    timestamp: &str,
+    event: &str,
+) -> Result<()> {
+    let name = exec.requester_session_id.as_str();
+    exec.backend
+        .append_event(name, payload, timestamp)
+        .with_context(|| {
+            let state_file = exec.backend.session_dir(name).join(state_file_name(name));
+            format!("append {} to {}", event, state_file.display())
+        })
+}
+
+impl std::fmt::Debug for RespawnExecution<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The backend handle has no `Debug`; the session name and the
+        // inputs that decide the outcome are what a reader needs.
+        f.debug_struct("RespawnExecution")
+            .field("requester_session_id", &self.requester_session_id)
+            .field("header", &self.header)
+            .field("coord_id", &self.coord_id)
+            .field("woken_at", &self.woken_at)
+            .field("last_log_activity", &self.last_log_activity)
+            .field("now", &self.now)
+            .field("retention_floor", &self.retention_floor)
+            .field("cap", &self.cap)
+            .field("template_exists", &self.template_exists)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Compute the path to a session's state file from its

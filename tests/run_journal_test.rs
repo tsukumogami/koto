@@ -21,6 +21,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[path = "support/funnel_backend.rs"]
+mod funnel_backend;
+use funnel_backend::FunnelBackend;
+
 const JOURNAL: &str = "_run_journal.jsonl";
 const DRIVER_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 /// The top-level directory macOS keeps the real `/tmp` and `/var/folders`
@@ -1014,6 +1018,65 @@ fn rebind_writes_no_session_started() {
         elsewhere.to_str().unwrap(),
     ]);
     assert_eq!(env.raw_journal(), before);
+}
+
+/// Event types on `name`'s log, in order.
+fn event_types(env: &Env, name: &str) -> Vec<String> {
+    std::fs::read_to_string(env.state_path(name))
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|l| {
+            let event: Value = serde_json::from_str(l).unwrap();
+            event["type"].as_str().unwrap().to_string()
+        })
+        .collect()
+}
+
+/// `koto session update` appends only its `intent_updated` event: the
+/// header line is byte-identical before and after, and the journal, which
+/// has no record for an intent change, is unchanged.
+#[test]
+fn session_update_appends_only_its_event_and_leaves_the_header_untouched() {
+    let env = Env::new();
+    let t = env.template("simple.md", SIMPLE);
+    env.init("described", &t);
+    let header_before = std::fs::read_to_string(env.state_path("described"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let events_before = event_types(&env, "described");
+    let journal_before = env.raw_journal();
+
+    env.ok(&["session", "update", "described", "--intent", "a new intent"]);
+
+    let text = std::fs::read_to_string(env.state_path("described")).unwrap();
+    assert_eq!(text.lines().next().unwrap(), header_before);
+    let mut expected = events_before;
+    expected.push("intent_updated".to_string());
+    assert_eq!(event_types(&env, "described"), expected);
+    assert_eq!(env.raw_journal(), journal_before);
+}
+
+/// `handle_update` appends through `SessionBackend::append_event`, the
+/// store's commit funnel, not to the state file directly.
+#[test]
+fn session_update_appends_through_the_session_backend() {
+    let env = Env::new();
+    let t = env.template("simple.md", SIMPLE);
+    env.init("described", &t);
+    let backend = FunnelBackend::new(&env.sessions());
+    koto::cli::session::handle_update(&backend, "described", "a new intent").unwrap();
+    assert_eq!(
+        backend.appended(),
+        vec![("described".to_string(), "intent_updated".to_string())]
+    );
+    assert_eq!(
+        event_types(&env, "described").last().map(String::as_str),
+        Some("intent_updated")
+    );
 }
 
 // ----- The driver -----
