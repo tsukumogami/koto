@@ -350,6 +350,33 @@ pub trait SessionBackend: Send + Sync {
     /// Read just the header from the state file.
     fn read_header(&self, id: &str) -> anyhow::Result<StateFileHeader>;
 
+    /// # Stability: additive-only
+    ///
+    /// Not part of the Stage 1 frozen four; signature evolution is
+    /// permitted in minor releases.
+    ///
+    /// Replace the state file's header with `f` applied to it, keeping the
+    /// event log verbatim, and sync the result the way
+    /// [`append_event`](Self::append_event) syncs an event.
+    ///
+    /// Every header rewrite goes through here. A rewrite that wrote the
+    /// local file directly would be undone on a backend that pulls before
+    /// reading: the remote copy still carries the old header, and the next
+    /// read restores it (koto#310).
+    ///
+    /// The default rewrites the state file under
+    /// [`session_dir`](Self::session_dir) in place (temp file, then
+    /// rename), which is all a backend with no remote half needs. A backend
+    /// that syncs must override it to push the rewritten file.
+    fn rewrite_header(
+        &self,
+        id: &str,
+        f: &dyn Fn(StateFileHeader) -> StateFileHeader,
+    ) -> anyhow::Result<()> {
+        let path = self.session_dir(id).join(state_file_name(id));
+        crate::engine::claim::rewrite_header_atomically(&path, f)
+    }
+
     /// Push any pending local state for `id` to durable remote storage
     /// and fail if the push cannot be confirmed.
     ///
@@ -587,6 +614,17 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.read_header(id),
             Backend::Cloud(b) => b.read_header(id),
+        }
+    }
+
+    fn rewrite_header(
+        &self,
+        id: &str,
+        f: &dyn Fn(StateFileHeader) -> StateFileHeader,
+    ) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.rewrite_header(id, f),
+            Backend::Cloud(b) => b.rewrite_header(id, f),
         }
     }
 
