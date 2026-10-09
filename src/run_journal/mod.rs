@@ -8,11 +8,22 @@
 //! outlive the sessions they describe, including sessions koto removes at
 //! their terminal tick or on `koto session cleanup`.
 //!
-//! Journaling is always on for every store the koto CLI builds: the user's
-//! session store and the `KOTO_SESSIONS_BASE` store. Only a bare
-//! `LocalBackend::with_base_dir` store, the test constructor, is not
-//! journaled unless it opts in with `LocalBackend::with_run_journal`, and
-//! the CLI always opts in.
+//! ## Where the journal lives
+//!
+//! The run journal lives in the koto home of the session store it
+//! describes. The user's store (`LocalBackend::new`, `~/.koto/sessions`,
+//! which the cloud store also keeps its local copies in) journals into
+//! `~/.koto`. A store built on an explicit base directory
+//! (`LocalBackend::with_base_dir`, which is what `KOTO_SESSIONS_BASE`
+//! builds) writes no journal, so a redirected store never writes the real
+//! home's journal. Tests that want both a scratch store and a journal use
+//! `LocalBackend::with_base_dir_and_journal`.
+//!
+//! The switch belongs to the store's constructor, not to the
+//! `SessionBackend` trait: each writer below takes the journal's root as a
+//! parameter. The commit hooks and the import hook take it from the
+//! `LocalBackend` they run in; the terminal tick takes it from
+//! `crate::cli::run_journal_root`, which applies the same rule.
 //!
 //! ## Records
 //!
@@ -51,8 +62,8 @@
 //!
 //! ## Failure
 //!
-//! Writing is best-effort. When a record can't be written (no home, a
-//! read-only or full disk, a symlink at the journal's path, a record over
+//! Writing is best-effort. When a record can't be written (a koto home that
+//! can't be created, a read-only or full disk, a symlink at the journal's path, a record over
 //! [`MAX_LINE_BYTES`]) the process prints one warning line naming the run
 //! journal on stderr, the first time only, and carries on. Nothing about
 //! the command's output, exit code, session state or gate decisions
@@ -63,7 +74,7 @@ mod fixture;
 mod run_id;
 mod sidecar;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::Value;
 
@@ -170,20 +181,7 @@ impl Record {
     }
 }
 
-// ----- Where the journal goes -----
-
-/// Where records go: nowhere (unit tests that didn't ask for a journal), or
-/// the koto home, which is `None` when there is no home directory.
-enum Target {
-    #[cfg(test)]
-    Off,
-    Home(Option<PathBuf>),
-}
-
-#[cfg(not(test))]
-fn target() -> Target {
-    Target::Home(crate::cli::ledger_root())
-}
+// ----- Writing -----
 
 #[cfg(not(test))]
 fn max_line_bytes() -> usize {
@@ -200,27 +198,16 @@ fn warn_once(message: &str) {
     }
 }
 
-// Unit tests never write the invoking user's journal: each test thread
-// starts with the journal off, and a test that wants one points it at a
-// temporary koto home with `set_home_for_test`. The cap and the warn-once
-// flag are per thread too, so a test sees exactly the warnings its own
-// commands caused.
+// In unit tests the cap and the warn-once flag are per thread, so a test
+// sees exactly the warnings its own commands caused. Unit tests reach a
+// journal only through a store built with
+// `LocalBackend::with_base_dir_and_journal` on a temporary directory.
 #[cfg(test)]
 thread_local! {
-    static TEST_HOME: std::cell::RefCell<Option<Option<PathBuf>>> =
-        const { std::cell::RefCell::new(None) };
     static TEST_MAX_LINE: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_LINE_BYTES) };
     static TEST_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_WARNINGS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
-}
-
-#[cfg(test)]
-fn target() -> Target {
-    TEST_HOME.with(|h| match h.borrow().clone() {
-        None => Target::Off,
-        Some(home) => Target::Home(home),
-    })
 }
 
 #[cfg(test)]
@@ -238,12 +225,9 @@ fn warn_once(message: &str) {
     }
 }
 
-/// Point this thread's journal at `koto_home` (`Some(None)` simulates a
-/// missing home directory), or turn it off with `None`. Resets the cap and
-/// the warnings.
+/// Reset this thread's line cap and warnings.
 #[cfg(test)]
-pub(crate) fn set_home_for_test(koto_home: Option<Option<&Path>>) {
-    TEST_HOME.with(|h| *h.borrow_mut() = koto_home.map(|o| o.map(Path::to_path_buf)));
+pub(crate) fn reset_for_test() {
     TEST_MAX_LINE.with(|c| c.set(MAX_LINE_BYTES));
     TEST_WARNED.with(|w| w.set(false));
     TEST_WARNINGS.with(|w| w.borrow_mut().clear());
@@ -255,44 +239,21 @@ pub(crate) fn set_max_line_for_test(max: usize) {
     TEST_MAX_LINE.with(|c| c.set(max));
 }
 
-/// The warning lines this thread has printed since `set_home_for_test`.
+/// The warning lines this thread has printed since `reset_for_test`.
 #[cfg(test)]
 pub(crate) fn warnings_for_test() -> Vec<String> {
     TEST_WARNINGS.with(|w| w.borrow().clone())
 }
 
-/// Whether `backend`'s sessions are journaled: the store opted in (see
-/// `LocalBackend::with_run_journal`) and, in unit tests, the thread asked
-/// for a journal.
-fn enabled(backend: &dyn SessionBackend) -> bool {
-    if !backend.run_journal_enabled() {
-        return false;
-    }
-    match target() {
-        #[cfg(test)]
-        Target::Off => false,
-        Target::Home(_) => true,
-    }
-}
-
-/// Append `records` in order. A record that can't be written is skipped
-/// and the rest are still tried.
-fn write(records: &[Record]) {
-    let home = match target() {
-        #[cfg(test)]
-        Target::Off => return,
-        Target::Home(None) => {
-            warn_once("no home directory");
-            return;
-        }
-        Target::Home(Some(home)) => home,
-    };
-    let path = home.join(JOURNAL_FILE);
+/// Append `records` in order to the journal under `root`. A record that
+/// can't be written is skipped and the rest are still tried.
+fn write(root: &Path, records: &[Record]) {
+    let path = root.join(JOURNAL_FILE);
     let max = max_line_bytes();
     for record in records {
         let line = record.to_line();
         if let Err(e) =
-            crate::engine::jsonl_append::append_bounded_line_no_follow(&home, &path, &line, max)
+            crate::engine::jsonl_append::append_bounded_line_no_follow(root, &path, &line, max)
         {
             warn_once(&format!("{}: {}", path.display(), e.root_cause()));
         }
@@ -389,16 +350,18 @@ fn cached_run_id(
 /// Journal a session that `init_state_file` has just committed:
 /// `session_started`, then a `state_entered` for each state its initial
 /// events enter. Writes the session's sidecar with its run id and creation
-/// driver.
+/// driver. `journal_root` is the store's journal home; `None` writes
+/// nothing.
 pub(crate) fn after_init(
+    journal_root: Option<&Path>,
     backend: &dyn SessionBackend,
     session: &str,
     header: &StateFileHeader,
     initial_events: &[Event],
 ) {
-    if !enabled(backend) {
+    let Some(root) = journal_root else {
         return;
-    }
+    };
     let run_id = run_id::run_id(backend, header);
     let driver = driver();
     let mut records = vec![session_started(
@@ -417,16 +380,22 @@ pub(crate) fn after_init(
         &backend.session_dir(session),
         &sidecar::Sidecar { run_id, driver },
     );
-    write(&records);
+    write(root, &records);
 }
 
 /// Journal a payload `append_event` has just committed to `session`'s log.
 /// Payloads other than state entries and cancels write nothing and read
+/// nothing. `journal_root` is the store's journal home; `None` writes
 /// nothing.
-pub(crate) fn after_commit(backend: &dyn SessionBackend, session: &str, payload: &EventPayload) {
-    if !journals(payload) || !enabled(backend) {
+pub(crate) fn after_commit(
+    journal_root: Option<&Path>,
+    backend: &dyn SessionBackend,
+    session: &str,
+    payload: &EventPayload,
+) {
+    let Some(root) = journal_root.filter(|_| journals(payload)) else {
         return;
-    }
+    };
     let header = match backend.read_header(session) {
         Ok(h) => h,
         Err(e) => {
@@ -440,41 +409,47 @@ pub(crate) fn after_commit(backend: &dyn SessionBackend, session: &str, payload:
     };
     let run_id = cached_run_id(backend, &backend.session_dir(session), &header);
     if let Some(record) = record_for(payload, session, &header, run_id.as_deref()) {
-        write(&[record]);
+        write(root, &[record]);
     }
 }
 
 /// Journal an arrival at the terminal state `final_state`. The terminal
 /// tick calls this once per arrival, after the state's `state_entered`
-/// and before any cleanup.
+/// and before any cleanup, with the root `crate::cli::run_journal_root`
+/// resolves; `None` writes nothing.
 pub(crate) fn terminal(
+    journal_root: Option<&Path>,
     backend: &dyn SessionBackend,
     session: &str,
     header: &StateFileHeader,
     final_state: &str,
 ) {
-    if !enabled(backend) {
+    let Some(root) = journal_root else {
         return;
-    }
+    };
     let run_id = cached_run_id(backend, &backend.session_dir(session), header);
-    write(&[
-        Record::new("terminal", session, &header.session_id, run_id.as_deref())
-            .name("koto.terminal", Some(final_state)),
-    ]);
+    write(
+        root,
+        &[
+            Record::new("terminal", session, &header.session_id, run_id.as_deref())
+                .name("koto.terminal", Some(final_state)),
+        ],
+    );
 }
 
 /// Journal a session `koto session import` has just built. The imported
 /// session is a new run: its own id is its run id, and the source's id is
 /// recorded as `imported_from`. None of the source's records are copied.
 pub(crate) fn imported(
+    journal_root: Option<&Path>,
     backend: &dyn SessionBackend,
     session: &str,
     header: &StateFileHeader,
     imported_from: &str,
 ) {
-    if !enabled(backend) {
+    let Some(root) = journal_root else {
         return;
-    }
+    };
     let run_id = Some(header.session_id.clone()).filter(|v| is_id(v));
     let driver = driver();
     let record = session_started(
@@ -488,7 +463,7 @@ pub(crate) fn imported(
         &backend.session_dir(session),
         &sidecar::Sidecar { run_id, driver },
     );
-    write(&[record]);
+    write(root, &[record]);
 }
 
 #[cfg(test)]

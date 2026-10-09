@@ -1,7 +1,9 @@
 //! The run journal (`~/.koto/_run_journal.jsonl`) as koto commands write it.
 //!
-//! Every test runs the koto binary with `HOME` in a temporary directory, so
-//! the journal it reads is that test's own, and sets or clears
+//! Every test runs the koto binary with `HOME` in a temporary directory and
+//! `KOTO_SESSIONS_BASE` unset, so the session store is the default one under
+//! that home and the journal it reads is that test's own (a store redirected
+//! by `KOTO_SESSIONS_BASE` writes no journal). Each test also sets or clears
 //! `CLAUDE_CODE_SESSION_ID` on each spawned process explicitly, so the
 //! driver of the session running the suite never reaches a journal.
 //!
@@ -238,8 +240,9 @@ impl Out {
     }
 }
 
-/// One isolated koto home: `HOME`, the session store, the template cache
-/// and the working directory all live in one temporary directory.
+/// One isolated koto home: `HOME`, the session store (the default one,
+/// `$HOME/.koto/sessions`), the template cache and the working directory all
+/// live in one temporary directory.
 struct Env {
     tmp: TempDir,
     home: PathBuf,
@@ -254,7 +257,7 @@ impl Env {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
         let work = tmp.path().join("work");
-        for d in [&home, &work, &tmp.path().join("sessions")] {
+        for d in [&home, &work] {
             std::fs::create_dir_all(d).unwrap();
         }
         Env {
@@ -266,7 +269,7 @@ impl Env {
     }
 
     fn sessions(&self) -> PathBuf {
-        self.tmp.path().join("sessions")
+        self.koto_home().join("sessions")
     }
 
     fn koto_home(&self) -> PathBuf {
@@ -292,13 +295,13 @@ impl Env {
         let path = |p: PathBuf| Some(p.to_string_lossy().into_owned());
         let mut envs = vec![
             ("HOME".to_string(), path(self.home.clone())),
-            ("KOTO_SESSIONS_BASE".to_string(), path(self.sessions())),
             (
                 "XDG_CACHE_HOME".to_string(),
                 path(self.tmp.path().join("cache")),
             ),
         ];
         for unset in [
+            "KOTO_SESSIONS_BASE",
             "XDG_CONFIG_HOME",
             "KOTO_WORKFLOWS_DIR",
             "KOTO_DECIDER",
@@ -1316,7 +1319,7 @@ fn running_as_root() -> bool {
 }
 
 #[test]
-fn a_read_only_or_missing_home_costs_one_warning_per_command_and_nothing_else() {
+fn a_read_only_koto_home_costs_one_warning_per_command_and_nothing_else() {
     if running_as_root() {
         eprintln!("skipped: permissions don't bind this user");
         return;
@@ -1325,13 +1328,14 @@ fn a_read_only_or_missing_home_costs_one_warning_per_command_and_nothing_else() 
     let expected = sequence(&good);
     assert!(good.journal_path().exists());
 
-    // A read-only koto home.
+    // A read-only koto home, its session store already in place and still
+    // writable: only the journal can't be created.
     let ro = Env::new();
-    std::fs::create_dir_all(ro.koto_home()).unwrap();
+    std::fs::create_dir_all(ro.sessions()).unwrap();
     std::fs::set_permissions(ro.koto_home(), std::fs::Permissions::from_mode(0o500)).unwrap();
     let t = ro.template("simple.md", SIMPLE);
     let out = ro.koto(&["init", "seq", "--template", t.to_str().unwrap()]);
-    assert!(out.ok);
+    assert!(out.ok, "{}", out.stderr);
     assert_eq!(out.journal_warnings(), 1, "{}", out.stderr);
     let warning = out
         .stderr
@@ -1340,25 +1344,10 @@ fn a_read_only_or_missing_home_costs_one_warning_per_command_and_nothing_else() 
         .unwrap();
     assert!(warning.starts_with("warning: run journal write failed ("));
     ro.ok(&["session", "cleanup", "seq"]);
-    assert_eq!(sequence(&ro), expected);
-    assert!(!ro.journal_path().exists());
+    let got = sequence(&ro);
     std::fs::set_permissions(ro.koto_home(), std::fs::Permissions::from_mode(0o700)).unwrap();
-
-    // A home that doesn't exist and can't be created.
-    let missing = Env::new();
-    let locked = missing.tmp.path().join("locked");
-    std::fs::create_dir_all(&locked).unwrap();
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let mut gone = Env::new();
-    // Keep `gone`'s store and work dir; only HOME points nowhere.
-    gone.home = locked.join("home");
-    let t = gone.template("simple.md", SIMPLE);
-    let out = gone.koto(&["init", "seq", "--template", t.to_str().unwrap()]);
-    assert!(out.ok, "{}", out.stderr);
-    assert_eq!(out.journal_warnings(), 1, "{}", out.stderr);
-    gone.ok(&["session", "cleanup", "seq"]);
-    assert_eq!(sequence(&gone), expected);
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(got, expected);
+    assert!(!ro.journal_path().exists());
 }
 
 /// Whether an append past `ulimit -f` fails here. Linux enforces it; some
@@ -1590,4 +1579,75 @@ fn eight_concurrent_processes_append_whole_lines() {
         assert_eq!(states(&records), expected);
         assert_eq!(kinds(&records).last(), Some(&"terminal"));
     }
+}
+
+/// Every file under `dir`, recursively.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// A store redirected with `KOTO_SESSIONS_BASE` writes no run journal. The
+/// journal lives in the koto home of the store it describes, so a run
+/// against a redirected store leaves `HOME` (here a stand-in for the
+/// developer's real home, apart from the store) with no journal file
+/// anywhere under it, and the store with no journal sidecars.
+#[test]
+fn a_store_redirected_by_koto_sessions_base_writes_no_journal() {
+    let env = Env::new();
+    let base = env.tmp.path().join("redirected-sessions");
+    let parent = env.template("parent.md", BATCH_PARENT);
+    env.template("child.md", BATCH_CHILD);
+    let simple = env.template("simple.md", SIMPLE);
+    let run = |args: &[&str]| {
+        let mut cmd = env.cmd(Some("driver-redirected"));
+        cmd.env("KOTO_SESSIONS_BASE", &base);
+        let out = Env::run(cmd, args);
+        assert!(
+            out.ok,
+            "koto {:?} failed\nstdout: {}\nstderr: {}",
+            args, out.stdout, out.stderr
+        );
+        assert_eq!(out.journal_warnings(), 0, "{}", out.stderr);
+        out
+    };
+
+    run(&["init", "seq", "--template", simple.to_str().unwrap()]);
+    assert!(
+        base.join("seq").is_dir(),
+        "the session lives in the redirected store"
+    );
+    assert!(!env.session_dir("seq").exists());
+    run(&["next", "seq", "--with-data", r#"{"go": "yes"}"#]);
+    run(&["init", "kept", "--template", simple.to_str().unwrap()]);
+    run(&["cancel", "kept"]);
+    run(&["init", "parent", "--template", parent.to_str().unwrap()]);
+    let tasks = serde_json::json!({"tasks": [{"name": "A", "waits_on": [], "vars": {}}]});
+    run(&["next", "parent", "--with-data", &tasks.to_string()]);
+    assert!(base.join("parent.A").is_dir(), "the child was spawned");
+
+    let journals: Vec<PathBuf> = files_under(&env.home)
+        .into_iter()
+        .chain(files_under(&base))
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n == JOURNAL || n == "run-journal.json")
+        })
+        .collect();
+    assert_eq!(journals, Vec::<PathBuf>::new());
+    assert!(!env.journal_path().exists());
 }

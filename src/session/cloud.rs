@@ -837,10 +837,6 @@ impl SessionBackend for CloudBackend {
         self.local.session_dir(id)
     }
 
-    fn run_journal_enabled(&self) -> bool {
-        self.local.run_journal_enabled()
-    }
-
     fn store_identity(&self) -> Option<crate::engine::types::SessionStoreIdentity> {
         let base = self.local.base_dir();
         Some(crate::engine::types::SessionStoreIdentity {
@@ -1750,6 +1746,7 @@ impl CloudBackend {
                     // adopts it journals nothing further.
                     if let Ok(header) = self.local.read_header(req.target) {
                         crate::run_journal::imported(
+                            self.local.journal_root(),
                             &self.local,
                             req.target,
                             &header,

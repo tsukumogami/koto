@@ -1,11 +1,13 @@
-//! Unit tests for the run journal. Each test points its thread's journal at
-//! a temporary koto home; nothing here reads or writes the invoking user's.
+//! Unit tests for the run journal. Each test builds its store with
+//! `LocalBackend::with_base_dir_and_journal` on a temporary directory, so
+//! nothing here reads or writes the invoking user's journal.
 
 use super::*;
 use crate::engine::types::{Event, EventPayload, StateFileHeader};
 use crate::host_env::{set_host_env_for_test, CLAUDE_SESSION_ID_ENV};
 use crate::session::local::LocalBackend;
 use crate::session::SessionBackend;
+use std::path::PathBuf;
 use tempfile::TempDir;
 
 struct Fixture {
@@ -18,8 +20,9 @@ impl Fixture {
     fn new() -> Self {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("koto-home");
-        let backend = LocalBackend::with_base_dir(tmp.path().join("sessions")).with_run_journal();
-        set_home_for_test(Some(Some(&home)));
+        let backend =
+            LocalBackend::with_base_dir_and_journal(tmp.path().join("sessions"), home.clone());
+        reset_for_test();
         set_host_env_for_test(CLAUDE_SESSION_ID_ENV, None);
         Fixture {
             _tmp: tmp,
@@ -54,7 +57,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        set_home_for_test(None);
+        reset_for_test();
         set_host_env_for_test(CLAUDE_SESSION_ID_ENV, None);
     }
 }
@@ -326,26 +329,6 @@ fn values_outside_their_shape_are_left_out_and_the_record_is_kept() {
     assert_eq!(j[1]["koto.run.id"], "odd-id");
 }
 
-#[test]
-fn a_missing_home_warns_once_and_changes_nothing_else() {
-    let f = Fixture::new();
-    set_home_for_test(Some(None));
-    f.init("wf", header("wf", "wf-id", None), Some("a"));
-    f.backend
-        .append_event(
-            "wf",
-            &transitioned(Some("a"), "b"),
-            &crate::engine::types::now_iso8601(),
-        )
-        .unwrap();
-    assert_eq!(
-        warnings_for_test(),
-        vec!["warning: run journal write failed (no home directory)".to_string()]
-    );
-    let (_, events) = f.backend.read_events("wf").unwrap();
-    assert_eq!(events.len(), 3);
-}
-
 #[cfg(unix)]
 #[test]
 fn a_symlink_at_the_journal_path_is_refused_with_one_warning() {
@@ -434,7 +417,7 @@ fn an_older_child_walks_to_its_root_and_omits_the_run_id_when_the_root_is_gone()
 }
 
 #[test]
-fn a_store_that_did_not_opt_in_writes_no_records_and_no_sidecar() {
+fn a_store_on_an_explicit_base_writes_no_records_and_no_sidecar() {
     let f = Fixture::new();
     let other = LocalBackend::with_base_dir(f._tmp.path().join("elsewhere"));
     other

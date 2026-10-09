@@ -29,15 +29,13 @@ pub(crate) const INIT_TMP_SUFFIX: &str = ".tmp";
 /// `~/.koto/sessions/`.
 pub struct LocalBackend {
     base_dir: PathBuf,
-    /// Whether this store's sessions are recorded in the run journal.
-    /// Always on for every store the koto CLI builds: the user's store
-    /// ([`LocalBackend::new`]) and the `KOTO_SESSIONS_BASE` store, which
-    /// the CLI builds with [`LocalBackend::with_base_dir`] followed by
-    /// [`LocalBackend::with_run_journal`]. Off only for a bare
-    /// [`LocalBackend::with_base_dir`] store, the test constructor, so unit
-    /// tests that keep sessions in a scratch directory don't write the
-    /// user's journal.
-    run_journal: bool,
+    /// The koto home this store's run journal is written under (see
+    /// `crate::run_journal`), or `None` for a store that writes no journal.
+    /// The journal lives in the koto home of the store it describes:
+    /// [`LocalBackend::new`] sets it to `~/.koto`, the home its sessions
+    /// live in; a store on an explicit base directory
+    /// ([`LocalBackend::with_base_dir`]) has none.
+    journal_root: Option<PathBuf>,
 }
 
 impl LocalBackend {
@@ -48,34 +46,43 @@ impl LocalBackend {
     pub fn new() -> anyhow::Result<Self> {
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
-        let base_dir = home.join(".koto").join("sessions");
+        let koto_home = home.join(".koto");
+        let base_dir = koto_home.join("sessions");
         migrate_if_needed(&base_dir);
         Ok(Self {
             base_dir,
-            run_journal: true,
+            journal_root: Some(koto_home),
         })
     }
 
     /// Create a backend with an explicit base directory.
     ///
-    /// A test constructor, for tests that need to control the storage
-    /// location. Its sessions are not recorded in the run journal unless it
-    /// opts in with [`LocalBackend::with_run_journal`]. The shipped CLI never
-    /// uses it without that opt-in: `build_local_backend` in `src/cli/mod.rs`
-    /// calls `with_run_journal()` on the `KOTO_SESSIONS_BASE` store, so every
-    /// store the CLI opens is journaled.
+    /// Used by tests that need to control the storage location, and by
+    /// `build_local_backend` in `src/cli/mod.rs` for the `KOTO_SESSIONS_BASE`
+    /// store. A store built here writes no run journal: the journal lives in
+    /// the koto home of the store it describes, and a store whose base was
+    /// redirected has none, so it never writes the real home's journal.
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
         Self {
             base_dir,
-            run_journal: false,
+            journal_root: None,
         }
     }
 
-    /// Record this store's sessions in the run journal (see
-    /// `crate::run_journal`), as [`LocalBackend::new`] does.
-    pub fn with_run_journal(mut self) -> Self {
-        self.run_journal = true;
-        self
+    /// Create a backend with an explicit base directory whose run journal
+    /// is written under `journal_root`. For tests that need both a scratch
+    /// store and a journal to read back.
+    pub fn with_base_dir_and_journal(base_dir: PathBuf, journal_root: PathBuf) -> Self {
+        Self {
+            base_dir,
+            journal_root: Some(journal_root),
+        }
+    }
+
+    /// The koto home this store's run journal is written under, or `None`
+    /// when it writes none.
+    pub(crate) fn journal_root(&self) -> Option<&Path> {
+        self.journal_root.as_deref()
     }
 
     /// The directory sessions are stored under.
@@ -89,10 +96,6 @@ impl LocalBackend {
 }
 
 impl SessionBackend for LocalBackend {
-    fn run_journal_enabled(&self) -> bool {
-        self.run_journal
-    }
-
     fn create(&self, id: &str) -> anyhow::Result<PathBuf> {
         validate_session_id(id)?;
         let dir = self.base_dir.join(id);
@@ -234,7 +237,7 @@ impl SessionBackend for LocalBackend {
         persistence::append_event(&path, payload, timestamp)?;
         // Journal the committed payload (best-effort, after the commit, so a
         // failed append above never writes a record). See `crate::run_journal`.
-        crate::run_journal::after_commit(self, id, payload);
+        crate::run_journal::after_commit(self.journal_root(), self, id, payload);
         // Materialize the native Claude Code `/workflows` artifact off the one
         // commit funnel (opt-in, best-effort: never fails the commit). `self`
         // is both the SessionBackend (header chain) and the ContextStore
@@ -337,7 +340,13 @@ impl SessionBackend for LocalBackend {
             Ok(()) => {
                 // The session now exists: journal its creation and initial
                 // state (best-effort, never fails the init).
-                crate::run_journal::after_init(self, id, &header, &initial_events);
+                crate::run_journal::after_init(
+                    self.journal_root(),
+                    self,
+                    id,
+                    &header,
+                    &initial_events,
+                );
                 Ok(())
             }
             Err(e) => {

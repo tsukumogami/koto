@@ -827,10 +827,9 @@ fn validate_compiled_template(path: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
-/// The root the decider ledger and the run journal are written under
-/// (`~/.koto`), or `None` when there is no home directory, in which case
-/// each ledger write warns (the run journal warns once per process).
-pub(crate) fn ledger_root() -> Option<PathBuf> {
+/// The root the decider ledger is written under (`~/.koto`), or `None` when
+/// there is no home directory, in which case each ledger write warns.
+pub(super) fn ledger_root() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".koto"))
 }
 
@@ -913,14 +912,30 @@ fn handle_workflows_action(action: WorkflowsAction) -> Result<()> {
 }
 
 /// Build the local backend, honoring `KOTO_SESSIONS_BASE` for testing.
+///
+/// The run journal lives in the koto home of the store it describes. The
+/// default store under `~/.koto/sessions` journals into `~/.koto`; a store
+/// whose base `KOTO_SESSIONS_BASE` redirected writes no journal, so it never
+/// writes the real home's journal (see `crate::run_journal`).
 pub(crate) fn build_local_backend() -> Result<LocalBackend> {
     if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
-        // A redirected store is still the CLI's own: journal it. The journal
-        // stays in the koto home (`ledger_root`), wherever the store is.
-        Ok(LocalBackend::with_base_dir(PathBuf::from(base)).with_run_journal())
+        Ok(LocalBackend::with_base_dir(PathBuf::from(base)))
     } else {
         LocalBackend::new()
     }
+}
+
+/// The koto home the run journal is written under for a command's terminal
+/// tick, by the rule `build_local_backend` applies: `None` (no journal) when
+/// `KOTO_SESSIONS_BASE` redirects the store, otherwise [`ledger_root`].
+///
+/// Unit tests never reach a journal through here; they build a store with
+/// `LocalBackend::with_base_dir_and_journal` on a temporary directory.
+pub(crate) fn run_journal_root() -> Option<PathBuf> {
+    if cfg!(test) || std::env::var("KOTO_SESSIONS_BASE").is_ok() {
+        return None;
+    }
+    ledger_root()
 }
 
 /// Validate and resolve `--var KEY=VALUE` arguments against the template's
@@ -3198,7 +3213,13 @@ fn finish_terminal_tick(
     if arrival {
         // The run journal's `terminal` record, once per arrival and before
         // any cleanup below, so it survives the session's removal.
-        crate::run_journal::terminal(backend, name, header, final_state);
+        crate::run_journal::terminal(
+            run_journal_root().as_deref(),
+            backend,
+            name,
+            header,
+            final_state,
+        );
         // Re-read so the index classifier sees a mid-tick `WorkflowCancelled`.
         let post_events = backend
             .read_events(name)

@@ -289,15 +289,6 @@ pub trait SessionBackend: Send + Sync {
         None
     }
 
-    /// # Stability: additive-only
-    ///
-    /// Whether sessions in this store are recorded in the run journal
-    /// (`crate::run_journal`). The default is `false`: only a store that
-    /// opts in writes journal records.
-    fn run_journal_enabled(&self) -> bool {
-        false
-    }
-
     /// # Stability: additive-only (Issue 19 / Decision 5)
     ///
     /// Not part of the Stage 1 frozen four; signature evolution is
@@ -636,13 +627,6 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.store_identity(),
             Backend::Cloud(b) => b.store_identity(),
-        }
-    }
-
-    fn run_journal_enabled(&self) -> bool {
-        match self {
-            Backend::Local(b) => b.run_journal_enabled(),
-            Backend::Cloud(b) => b.run_journal_enabled(),
         }
     }
 
