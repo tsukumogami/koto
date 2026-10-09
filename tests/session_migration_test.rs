@@ -763,7 +763,7 @@ fn other_marker(target: &str, workspace: &str) -> Vec<u8> {
         "schema": 1,
         "target": {
             "session": target,
-            "session_id": "00000000-0000-4000-8000-000000000000",
+            "session_id": "fixture-session-id",
             "workspace": workspace,
             "prefix": "0123456789abcdef",
         },
@@ -1506,7 +1506,7 @@ fn import_requests_grow_by_one_get_and_one_put_per_key() {
 /// endpoint configured with credentials in its URL never prints them.
 #[test]
 fn credentials_never_reach_import_output_errors_or_the_marker() {
-    const ACCESS: &str = "AKIASENTINELACCESS042";
+    const ACCESS: &str = "SENTINELACCESSKEY042";
     const SECRET: &str = "sentinel+Secret/Value042";
     const URL_USER: &str = "sentinel-url-user";
     const URL_PASSWORD: &str = "sentinel-url-password";
@@ -1791,7 +1791,7 @@ fn a_marker_that_landed_despite_an_error_completes_the_rerun() {
         "schema": 1,
         "target": {
             "session": "wf",
-            "session_id": "00000000-0000-4000-8000-000000000000",
+            "session_id": "fixture-session-id",
             "workspace": b.ws_str(),
             "prefix": b.prefix(),
         },
