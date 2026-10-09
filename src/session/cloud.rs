@@ -1103,9 +1103,11 @@ impl CloudBackend {
 }
 
 /// Every method asks [`CloudBackend::check_not_migrated`] first, so a
-/// session imported elsewhere neither reads nor writes its keys here. The
-/// answer is cached per session, so a command that touches many keys pays
-/// for it once.
+/// session imported elsewhere neither reads nor writes its keys here: the
+/// methods that return a `Result` refuse with `SessionMigrated`, while
+/// `ctx_exists` answers false and `meta` none, having no room for a
+/// reason. The answer is cached per session, so a command that touches
+/// many keys pays for it once.
 impl ContextStore for CloudBackend {
     fn add(&self, session: &str, key: &str, content: &[u8]) -> anyhow::Result<()> {
         self.add_as(session, key, content, None)
@@ -1658,22 +1660,36 @@ impl CloudBackend {
                 Some(session_id) if session_id == marker_target_field(marker, "session_id") => Ok(
                     outcome(self.local_key_count(req.target)?, TemplateOrigin::Unchanged),
                 ),
-                found => Err(ImportError::new(
-                    ImportErrorCode::SourceMigrated,
-                    format!(
-                        "session '{}' in workspace {} carries this import's own marker, naming \
-                         '{}' in this workspace, but {}; remove '{}' from this workspace's \
-                         prefix in the bucket, or import again under --as <new-name>",
-                        source.name,
-                        source.workspace,
-                        req.target,
-                        match found {
-                            None => "that session is missing here",
-                            Some(_) => "the session here is a different one",
-                        },
-                        req.target
-                    ),
-                )),
+                _ => {
+                    let local = self.local.session_dir(req.target);
+                    let (what, hint) = if local.exists() {
+                        (
+                            "the session here is a different one".to_string(),
+                            format!(
+                                "the conflict is the local session at {}: import again under \
+                                 --as <new-name>, or remove that session if it is not wanted",
+                                local.display()
+                            ),
+                        )
+                    } else {
+                        (
+                            "that session is missing here".to_string(),
+                            format!(
+                                "remove '{}' from this workspace's prefix in the bucket, or \
+                                 import again under --as <new-name>",
+                                req.target
+                            ),
+                        )
+                    };
+                    Err(ImportError::new(
+                        ImportErrorCode::SourceMigrated,
+                        format!(
+                            "session '{}' in workspace {} carries this import's own marker, \
+                             naming '{}' in this workspace, but {}; {}",
+                            source.name, source.workspace, req.target, what, hint
+                        ),
+                    ))
+                }
             };
         }
 

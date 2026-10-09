@@ -1803,7 +1803,11 @@ fn a_marker_that_landed_despite_an_error_completes_the_rerun() {
     let run = import(&b, "wf", &a, &[]);
     let msg = refused(&run, "import_source_migrated", 2);
     assert!(
-        msg.contains("own marker") && msg.contains("is a different one") && msg.contains("--as"),
+        msg.contains("own marker")
+            && msg.contains("is a different one")
+            && msg.contains(&b.session_dir("wf").to_string_lossy().into_owned())
+            && msg.contains("--as")
+            && !msg.contains("bucket"),
         "{msg}"
     );
     assert_eq!(s3.object(&marker), Some(theirs));
@@ -1816,7 +1820,7 @@ fn a_marker_that_landed_despite_an_error_completes_the_rerun() {
     let run = import(&b, "wf", &a, &[]);
     let msg = refused(&run, "import_source_migrated", 2);
     assert!(
-        msg.contains("own marker") && msg.contains("missing here"),
+        msg.contains("own marker") && msg.contains("missing here") && msg.contains("bucket"),
         "{msg}"
     );
     assert!(!b.session_dir("wf").exists());
