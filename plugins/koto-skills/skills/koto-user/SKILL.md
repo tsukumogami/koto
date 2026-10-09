@@ -241,9 +241,12 @@ Standing in a subdirectory of the anchor is fine. Ticking from a *different* tre
 | Error code | Exit | What happened | What you do |
 |---|---|---|---|
 | `execution_anchor_mismatch` | 2 | The tick ran from a directory that is neither the anchor nor beneath it. The message names the bound directory. | `cd` to the directory the message names and re-run. |
-| `execution_anchor_unresolvable` | 3 | The recorded anchor names nothing on this machine — the checkout was deleted, or the session moved machines. | Put the checkout back where the message names, or rebind the session to where the tree is now. |
+| `execution_anchor_unresolvable` | 3 | The recorded anchor names nothing on this machine — the checkout was deleted or moved, or the session's files reached a host other than the one it runs on. | On the same host, put the checkout back where the message names, or rebind the session to where the tree is now. A session that belongs on another host moves with `koto session import`, not `rebind`. |
+| `session_migrated` | 2 | Under the cloud backend, the session was imported into another workspace with `koto session import`; this copy refuses so it can't fork. The message names the session and workspace it went to. | Stop working on this copy and continue the session where the message says. |
 
 When the checkout genuinely moved, `koto session rebind <session> [--to <dir>]` moves the anchor to match; `--to` defaults to the directory you run it from. It's the only verb that changes an anchor, and it records the move as an `execution_anchor_rebound` event.
+
+`rebind` is for a checkout that moved on one host. When the session itself has to move to another machine, or to another workspace, that's `koto session import <name> --from <workspace-path>` under the cloud backend, run on the new host from the directory the session should run in. It needs the source stopped first; see [command-reference.md](references/command-reference.md#koto-session-import-cloud-backend-only).
 
 Reach for it deliberately. A `execution_anchor_mismatch` usually means you're standing in the wrong place, not that the checkout moved, and rebinding then points the session at the wrong tree. Route on the error code rather than the message text.
 
@@ -613,7 +616,9 @@ Read these on demand, not upfront. The sections above cover the common path. Con
 
 **"execution_anchor_mismatch"** — you're ticking from a different tree than the one the session is bound to. The message names the bound directory; `cd` there (or into a subdirectory of it) and re-run. Nothing ran on the refused tick. See [Where a session's commands run](#where-a-sessions-commands-run).
 
-**"execution_anchor_unresolvable"** — the directory the session is bound to doesn't exist on this machine. Restore the checkout at the path the message names, or, if it moved, run `koto session rebind <session> --to <dir>` to point the session at where the tree is now.
+**"execution_anchor_unresolvable"** — the directory the session is bound to doesn't exist on this machine. Restore the checkout at the path the message names, or, if the checkout moved on this host, run `koto session rebind <session> --to <dir>` to point the session at where the tree is now. If the session moved machines, don't rebind it: import it on the new host with `koto session import <name> --from <workspace-path>`.
+
+**"session_migrated"** — the session was imported into another workspace, and this copy refuses `koto next`, `koto status` and the `koto context` commands (exit 2). The message names where it went: `session_migrated: session 'review' was migrated to 'review' in /srv/ws-b; continue it there`. Continue it there. Don't try to get around the refusal on this copy; advancing both would fork the session. See [error-handling.md](references/error-handling.md#session_migrated).
 
 **"capture_unset"** — a state read a `{{NAME}}` that a `capture_stdout_as` was supposed to deliver, and this run never entered the state that produces it. It covers the state's instructions, its `default_action`'s `command` and `working_dir`, and every field of its gates — a gate's `command`, `key`, `pattern` and `name_filter` alike; the message names which of them, along with the gate where one is involved, the value and the producing state. Nothing ran on either the action path or the gate path — the check happens before the command is spawned, the context key is read or the regex is compiled. One case reads differently: a gate on a state whose own *polling* action delivers the name is refused because that value cannot exist while the command is still running, and the message says so rather than naming a state you are standing in. This is a template routing problem, not something you can fix by re-ticking — report it to whoever authored the workflow.
 

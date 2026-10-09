@@ -23,6 +23,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session cleanup` | Runner — primary |
 | `koto session recover` | Operator — one-time migration recovery |
 | `koto session rebind` | Runner — after a checkout moves |
+| `koto session import` | Runner — cloud backend only, after a session moves to another host or workspace |
 | `koto session resolve` | Runner — cloud backend only |
 | `koto status` | Runner — primary |
 | `koto request create/bind/get/wait/list` | Runner — coordinator |
@@ -748,7 +749,60 @@ This is the only verb that changes an anchor, and a real move appends an `execut
 
 The target is canonicalized before it is recorded, so what lands on the header is the form the per-tick check compares against. A `--to` that names nothing, or names a file, is refused and the anchor is left alone. So is an unknown session name. These refusals go to stderr with exit 1, not to a JSON error envelope.
 
-Which refusal you are repairing matters. `execution_anchor_unresolvable` leaves rebinding as the only way out short of restoring the tree. `execution_anchor_mismatch` on a checkout that did *not* move means you are simply standing in the wrong place — change directory instead of rebinding, or you will point the session at the wrong tree.
+Which refusal you are repairing matters. On the same host, `execution_anchor_unresolvable` leaves rebinding as the only way out short of restoring the tree. `execution_anchor_mismatch` on a checkout that did *not* move means you are simply standing in the wrong place — change directory instead of rebinding, or you will point the session at the wrong tree.
+
+`rebind` is for a checkout that moved on one host. A session that has to continue on another machine, or in another workspace, is moved with `koto session import`, not rebound.
+
+---
+
+## koto session import (cloud backend only)
+
+```
+koto session import <name> --from <workspace-path> [--as <new-name>] [--trust-template]
+```
+
+Creates a new local session from the copy another workspace pushed to the bucket, anchored in the directory you run it from. Under the cloud backend a session's remote objects live under a prefix hashed from the canonical path of the workspace that created it, so this is how a session moves to another host or workspace. Run it on the new host, from the directory the session should run in.
+
+| Flag | Required | Meaning |
+|---|---|---|
+| `<name>` | Yes | The session's name in the source workspace. |
+| `--from <workspace-path>` | Yes | Absolute path of the source workspace as it was on the host that created the session, symlinks resolved. A relative path is refused. |
+| `--as <new-name>` | No | Name to give the session here when its own name is taken. |
+| `--trust-template` | No | Take the compiled template the source pushed to the bucket (after checking its hash) instead of this machine's cache. Only when everyone who can write the bucket is trusted: the template holds every command the session runs. |
+
+**The source must be stopped.** No process may still be advancing the session, and its last write must have reached the bucket. Stop the agent on the source host first; if a push from it failed, or you aren't sure, run `koto session resolve <name> --keep local` there, which uploads the whole local session. koto can't detect a source that is still moving.
+
+**The template comes from this machine's cache** by the hash the session recorded, so run `koto template compile` on the session's template here first, from a checkout that matches it. `--trust-template` is the alternative.
+
+**Success output (exit 0):**
+
+```json
+{"name":"review","imported":true,"from":{"workspace":"/srv/ws-a","session":"review"},"keys":4,"template":"local-cache","marked":true}
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | The new session's name here (`--as` when given). |
+| `from.workspace`, `from.session` | The source workspace and session name. |
+| `keys` | How many context keys came across. |
+| `template` | Where the compiled template came from: `local-cache`, `bucket` (under `--trust-template`), or `unchanged` when a re-run found the session already built here and took none. |
+| `marked` | Always `true` on success: the source carries a `migrated.json` marker. |
+
+The new session holds the source's events plus a `session_imported` event, every context key and the compiled template, and is pushed under this workspace's prefix before the marker is written. From then on the old copy refuses with `session_migrated` (see `error-handling.md#session_migrated`). The import writes nothing else under the source's prefix and deletes nothing; the source's objects stay in the bucket until a `koto session cleanup` in the source workspace, which keeps `migrated.json`. A child session is refused on its own, and importing a parent doesn't bring its children.
+
+**Errors** print `{"error":{"code":"...","message":"..."}}` and exit 2 for a refusal you act on, 1 for a failure:
+
+| `error.code` | Exit | Meaning | What to do |
+|---|---|---|---|
+| `import_requires_cloud` | 2 | The backend here is local. | Configure `session.backend = "cloud"` with the source's bucket. |
+| `import_source_not_found` | 2 | No state file for that name under the source workspace's prefix, or `--from` isn't absolute. | Check the name, and pass the canonical absolute path the source host used; check both hosts use the same bucket. |
+| `import_source_migrated` | 2 | The source was already imported somewhere. | Continue it where the message says, or import from that workspace. |
+| `import_source_is_child` | 2 | The named session is a child. | Import the root of its tree. |
+| `import_name_taken` | 2 | A different session holds the name here or under this workspace's prefix. | Re-run with `--as <new-name>`. |
+| `import_template_unavailable` | 2 | No usable compiled template with the session's hash (in the cache, or under `--trust-template` in the bucket). | Run `koto template compile` on the session's template here, then import again without `--trust-template`. |
+| `import_source_unreadable` | 1 | A source object couldn't be fetched or failed validation. | Retry if the bucket was unreachable; otherwise report the message. |
+| `import_push_failed` | 1 | Building, pushing or moving the session into place failed; what this run pushed was taken back. | Fix what the message names and run the same import again. |
+| `import_unmarked` | 1 | Imported and pushed, but the source's marker couldn't be written, so the old copy won't refuse yet. | Run the same import again; it writes only the marker. Keep the source stopped meanwhile. |
 
 ---
 
@@ -926,7 +980,9 @@ koto config list                 # Print merged config as TOML
 koto config list --json          # Print merged config as JSON
 ```
 
-Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `workflows.native`, `decider.mode`, `decider.api_key`, `decider.endpoint`, `decider.timeout_ms`.
+Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `session.cloud.path_style`, `workflows.native`, `decider.mode`, `decider.api_key`, `decider.endpoint`, `decider.timeout_ms`.
+
+`session.cloud.path_style` takes `true` or `false` (unset means `false`). `true` puts the bucket in the URL path instead of a subdomain, which an endpoint given as an IP address needs.
 
 The `[decider]` keys opt the user in to consulting a decider on declared template fields. It's off by default, and it's the user's choice, not the agent's: don't set these keys unless the user asks you to.
 

@@ -84,6 +84,7 @@ All `koto next` error codes, their exit codes, and what to do:
 | `persistence_error` | 3 | No | State file I/O failure or corruption | Report to user; this is an infrastructure problem |
 | `execution_anchor_unresolvable` | 3 | No | The session's recorded execution anchor names nothing on this machine — the checkout was deleted, or the session moved machines | Restore the checkout at the path the message names, or escalate |
 | `capture_unset` | 3 | No | A state reads a `capture_stdout_as` name that no state delivered on this run — in its instruction text, in its `default_action`'s `command` or `working_dir`, or in any field of one of its gates. The message names which, the gate where one is involved, the value, and the state that produces it. Nothing is spawned, read or compiled on either path | A template routing problem: the run never entered the producing state. Report it; re-ticking won't help |
+| `session_migrated` | 2 | No | Under the cloud backend, the session was imported into another workspace with `koto session import`, and this copy carries the marker the import left. The message names the session and workspace it went to | Continue the session where the message says; don't advance this copy. See [session_migrated](#session_migrated) |
 | `nested_invocation` | 2 | No | The tick was started from inside a command koto is running. The message names the session whose tick is in flight | Don't tick koto from a template's command. Take the `koto next` call out and let the enclosing tick advance the session |
 | `needs_agent_not_dispatched` | 66 | No | `koto next` was called against a `--needs-agent` child that the coordinator has not yet claimed/dispatched | Stop ticking the child directly; route through the coordinator's `koto next` on the parent root instead |
 | `recursion_cap_exceeded` | 64 | No | `koto session start --needs-agent` would push the workflow tree past one of the three recursion caps (`depth`, `fanout`, or `total_unassigned`) | Surface the cap dimension and threshold to the user; restructure the dispatch fanout (collapse a level, batch siblings, or split into separate trees) before retrying |
@@ -144,6 +145,26 @@ A session with no recorded anchor — written before anchoring existed, or creat
 `koto session start` — is not refused. Its first tick adopts the directory it's ticked
 from and prefixes the `directive` with a one-time notice naming the directory it bound.
 Check that the directory is the one you meant.
+
+---
+
+## session_migrated
+
+`koto session import` moves a cloud-backed session to another workspace, usually on another host, and leaves a `migrated.json` marker beside the old copy in the bucket. The cloud backend checks for it before reading a session, so the old copy refuses instead of forking. Nothing is read or written on the refused call.
+
+`koto next` uses the nested shape:
+
+```json
+{"error":{"code":"session_migrated","message":"session_migrated: session 'review' was migrated to 'review' in /srv/ws-b; continue it there","details":[]}}
+```
+
+`koto status` and the `koto context` commands use the flat shape, with the code leading the message:
+
+```json
+{"error":"session_migrated: session 'review' was migrated to 'review' in /srv/ws-b; continue it there","command":"status"}
+```
+
+All of them exit 2. The remedy is to continue the session where the message says, from that workspace's directory. Don't rebind, re-init or resolve this copy to get past the refusal; advancing both copies would fork the session. If this copy is no longer wanted, `koto session cleanup <name>` in this workspace removes the local copy and the source's objects in the bucket, but keeps the marker. When the import itself is what you're running, its own codes are in `command-reference.md`, "koto session import".
 
 ---
 
