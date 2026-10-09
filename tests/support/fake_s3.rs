@@ -13,7 +13,9 @@
 //! (`?list-type=2&prefix=..&delimiter=..`) answered in the XML rust-s3
 //! parses. Every request is recorded as (method, key) in arrival order, so a
 //! test can assert exactly what a command wrote where. [`FakeS3::fail`]
-//! makes every matching request answer with a given status instead.
+//! makes every matching request answer with a given status instead, and
+//! [`FakeS3::put_after`] stores an object as soon as a given request has
+//! been handled, the way another writer racing the command would.
 //!
 //! Authentication is ignored. A missing object or bucket answers 404 with an
 //! S3 XML error body, as a real endpoint does. Each connection is read and
@@ -52,11 +54,20 @@ struct Fault {
     status: u16,
 }
 
+#[derive(Debug, Clone)]
+struct Trigger {
+    method: String,
+    key: String,
+    put_key: String,
+    bytes: Vec<u8>,
+}
+
 #[derive(Debug, Default)]
 struct State {
     objects: BTreeMap<String, Vec<u8>>,
     requests: Vec<Request>,
     faults: Vec<Fault>,
+    triggers: Vec<Trigger>,
     shutdown: bool,
 }
 
@@ -153,6 +164,22 @@ impl FakeS3 {
             method: method.to_string(),
             key: key.to_string(),
             status,
+        });
+    }
+
+    /// Stop failing requests: undo every [`FakeS3::fail`].
+    pub fn clear_faults(&self) {
+        lock(&self.state).faults.clear();
+    }
+
+    /// Once, when the next `method` request for exactly `key` has been
+    /// handled and before it is answered, store `bytes` under `put_key`.
+    pub fn put_after(&self, method: &str, key: &str, put_key: &str, bytes: &[u8]) {
+        lock(&self.state).triggers.push(Trigger {
+            method: method.to_string(),
+            key: key.to_string(),
+            put_key: put_key.to_string(),
+            bytes: bytes.to_vec(),
         });
     }
 }
@@ -264,7 +291,27 @@ fn serve(stream: TcpStream, bucket: &str, state: &Mutex<State>) {
         return;
     };
     let reply = answer(&req, bucket, state);
+    // Before the reply goes out, so the client's next request already
+    // sees what the trigger stored.
+    fire_triggers(&req, bucket, state);
     write_reply(stream, &req.method, &reply);
+}
+
+/// Run, and forget, the triggers `req` matches.
+fn fire_triggers(req: &Incoming, bucket: &str, state: &Mutex<State>) {
+    let rest = req.path.strip_prefix('/').unwrap_or(&req.path);
+    let key = match rest.split_once('/') {
+        Some((b, k)) if b == bucket => k,
+        _ => return,
+    };
+    let mut st = lock(state);
+    let (fired, kept): (Vec<Trigger>, Vec<Trigger>) = std::mem::take(&mut st.triggers)
+        .into_iter()
+        .partition(|t| t.method == req.method && t.key == key);
+    st.triggers = kept;
+    for t in fired {
+        st.objects.insert(t.put_key, t.bytes);
+    }
 }
 
 fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {

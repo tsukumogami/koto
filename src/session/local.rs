@@ -932,7 +932,7 @@ fn atomic_create_rename(src: &Path, dst: &Path) -> Result<(), SessionError> {
 /// Walks up from `base_dir` to find a component named `.koto` and sets
 /// restrictive permissions on it. Creates all intermediate directories
 /// if needed.
-fn ensure_koto_root(base_dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn ensure_koto_root(base_dir: &Path) -> anyhow::Result<()> {
     // Find the .koto directory in the path ancestry.
     let mut koto_dir = None;
     let mut current = base_dir.to_path_buf();
