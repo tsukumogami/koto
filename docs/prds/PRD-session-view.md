@@ -13,7 +13,8 @@ goals: |
   every key with size and legible content), a compact account in the workflow
   view, and a scriptable one-shot form — with absences, unreadable keys and
   migrations stated plainly, and no raw byte dumps anywhere.
-upstream: docs/briefs/BRIEF-session-view.md
+absorbed:
+  - docs/briefs/BRIEF-session-view.md
 ---
 
 # PRD: A human-readable view of a session
@@ -21,6 +22,23 @@ upstream: docs/briefs/BRIEF-session-view.md
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-session-view](docs/briefs/BRIEF-session-view.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+The feature was framed before these requirements existed: a person responsible
+for a koto session — an operator checking a long-running run, a teammate
+taking one over, a maintainer debugging a stuck one — has no way to read what
+the session holds, because context keys carry the working state and the
+shipped surfaces show only names, single-key raw bytes, or state and
+directive. The framed outcome: that person reads the session like a status
+page, in a surface koto already ships, at the depth that fits the surface —
+full per-key content in the dashboard, a compact account in the workflow view
+— with large and binary values legible, absences stated, and a migrated
+session explained by naming its successor. The framing fixed the boundary this
+PRD's requirements and Out of Scope operationalize: existing surfaces only, no
+new verb or third surface, hygiene work excluded, the view strictly read-only.
 
 ## Problem Statement
 
