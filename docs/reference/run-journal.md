@@ -8,10 +8,12 @@ reads back its records, so a session's lines outlive the session itself,
 including sessions koto removes at their terminal tick or on
 `koto session cleanup`.
 
-It's a derived, host-local record, like the decider ledger and the terminal
-index. It isn't session state: cloud sync and `koto session import` don't
-carry it, and nothing koto does resumes from it. Deleting it changes
-nothing koto does.
+It sits beside the decider ledger and the terminal index and, like them,
+stays on the host that wrote it. It's derived, written from what sessions
+commit, and it isn't session state: cloud sync and `koto session import`
+don't carry it, and nothing koto does resumes from it. Deleting it changes
+nothing koto does, but its lines can't be rebuilt once the sessions they
+describe are gone.
 
 ## Location
 
@@ -40,7 +42,7 @@ and koto rebuilds it from the session header when it's missing.
 ## Line format
 
 Each line is one JSON object of at most 4096 bytes, newline included.
-Every record carries these fields:
+Records start with these fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -48,7 +50,7 @@ Every record carries these fields:
 | `v` | integer | The line format's version, currently `1`. |
 | `at` | string | When the record was written: UTC, RFC 3339, millisecond precision, `Z` suffix, such as `2026-10-10T03:09:22.599Z`. |
 | `session` | string | The session's name, such as `issue_42` or `parent.task-a`. |
-| `koto.session.id` | string | The session's `session_id` from its header. |
+| `koto.session.id` | string | The session's `session_id` from its header. Left out for a session whose header has no `session_id` (one created by a koto that predates the field); such a session's records also have no `koto.run.id`. |
 | `koto.run.id` | string | The run the session belongs to (see [Run ids](#run-ids)). Left out when it can't be resolved. |
 
 A field with no value is left out, never written as `null` or an empty
@@ -72,7 +74,7 @@ written.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `koto.parent.session.id` | string | The parent session's id. Children only. |
+| `koto.parent.session.id` | string | The parent session's id. Children only, and left out for a child created by a koto that didn't record it. |
 | `koto.driver.session.id` | string | The Claude Code session that created this one (see [Drivers](#drivers)). |
 | `koto.template.name` | string | The template's `name`. |
 | `koto.template.hash` | string | The compiled template's hash, the header's `template_hash`. Two sessions from one template name compiled before and after an edit share the name and differ in hash. |
@@ -237,8 +239,9 @@ way can't be rebuilt once the sessions they describe are gone.
   know. koto may add kinds and fields without changing `v`.
 - `v` changes only when an existing field changes meaning or shape.
   Skip records with a `v` you don't support.
-- Treat every field other than `kind`, `v`, `at`, `session` and
-  `koto.session.id` as optional.
+- Treat every field other than `kind`, `v`, `at` and `session` as
+  optional.
 - Join a session's records on `koto.session.id`, not `session`: a name can
   be reused by a later session (`--replace-terminal`, or a name freed by
-  cleanup), and its id can't.
+  cleanup), and its id can't. A record without `koto.session.id` comes
+  from a session too old to have one; fall back to `session` for it.

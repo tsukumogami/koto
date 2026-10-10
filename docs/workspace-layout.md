@@ -253,11 +253,11 @@ koto: one JSON line when a session starts, enters a state, reaches a
 terminal or is cancelled, or is driven by a different Claude Code session
 than the last one recorded. It sits beside the decider ledger and the
 terminal index and, like them, stays on this host: cloud sync never
-carries it. It's derived, not session state: `koto session import`
-doesn't carry it, nothing resumes from it, and koto never reads its
-records back, so deleting it changes nothing koto does. Its lines do
-outlive the sessions they describe, though, and can't be rebuilt once
-those sessions are gone.
+carries it. It's derived, written from what sessions commit, and isn't
+session state: `koto session import` doesn't carry it, nothing resumes
+from it, and koto never reads its records back, so deleting it changes
+nothing koto does. Unlike the terminal index it can't be rebuilt, though:
+its lines outlive the sessions they describe.
 
 The journal lives with the store it describes: `~/.koto/_run_journal.jsonl`
 for the default store (and the cloud store, which keeps its local copies
