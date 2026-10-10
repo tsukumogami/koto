@@ -58,6 +58,7 @@ impl Env {
     /// any of them.
     fn koto(&self, extra: &[(&str, &str)]) -> Command {
         let mut cmd = Command::cargo_bin("koto").unwrap();
+        cmd.env_remove("CLAUDE_CODE_SESSION_ID");
         cmd.env_clear();
         cmd.current_dir(&self.cwd);
         cmd.env("PATH", SYSTEM_PATH);

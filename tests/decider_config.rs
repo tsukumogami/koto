@@ -38,6 +38,7 @@ fn dirs() -> Dirs {
 /// what's under test.
 fn koto(d: &Dirs) -> Command {
     let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(&d.cwd);
     cmd.env("HOME", &d.home);
     cmd.env("KOTO_SESSIONS_BASE", d.cwd.join("sessions"));

@@ -31,6 +31,7 @@ fn s3_env() -> Option<(String, String)> {
 
 fn koto_cmd(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("HOME", dir.to_str().unwrap());
     cmd

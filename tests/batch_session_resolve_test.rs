@@ -404,6 +404,8 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
         deadline: None,
         retry_count: None,
         agent_config: None,
+        root_session_id: None,
+        parent_session_id: None,
         respawn_generation: None,
     };
     seed_backend
@@ -439,6 +441,8 @@ fn seed_parent_with_failed_child(base_dir: &Path, parent: &str, child_task: &str
         deadline: None,
         retry_count: None,
         agent_config: None,
+        root_session_id: None,
+        parent_session_id: None,
         respawn_generation: None,
     };
     let init_event = Event {

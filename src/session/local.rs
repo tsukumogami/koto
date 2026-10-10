@@ -29,6 +29,15 @@ pub(crate) const INIT_TMP_SUFFIX: &str = ".tmp";
 /// `~/.koto/sessions/`.
 pub struct LocalBackend {
     base_dir: PathBuf,
+    /// The directory this store's run journal is written in (see
+    /// `crate::run_journal`). The journal lives with the store it
+    /// describes: [`LocalBackend::new`] sets it to `~/.koto`, the home its
+    /// sessions live in, and a store on an explicit base directory
+    /// ([`LocalBackend::with_base_dir`]) journals inside that base, so a
+    /// redirected store never writes the real home's journal. Session
+    /// listing skips plain files at the base level, so the journal file
+    /// there is never read as a session.
+    journal_root: Option<PathBuf>,
 }
 
 impl LocalBackend {
@@ -39,16 +48,42 @@ impl LocalBackend {
     pub fn new() -> anyhow::Result<Self> {
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
-        let base_dir = home.join(".koto").join("sessions");
+        let koto_home = home.join(".koto");
+        let base_dir = koto_home.join("sessions");
         migrate_if_needed(&base_dir);
-        Ok(Self { base_dir })
+        Ok(Self {
+            base_dir,
+            journal_root: Some(koto_home),
+        })
     }
 
     /// Create a backend with an explicit base directory.
     ///
-    /// Intended for tests that need to control the storage location.
+    /// Used by tests that need to control the storage location, and by
+    /// `build_local_backend` in `src/cli/mod.rs` for the `KOTO_SESSIONS_BASE`
+    /// store. A store built here journals inside its own base directory
+    /// (`<base>/_run_journal.jsonl`), so it is journaled like any other store
+    /// and never writes the real home's journal.
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+        Self {
+            journal_root: Some(base_dir.clone()),
+            base_dir,
+        }
+    }
+
+    /// Create a backend with an explicit base directory whose run journal
+    /// is written under `journal_root`. For tests that need both a scratch
+    /// store and a journal to read back.
+    pub fn with_base_dir_and_journal(base_dir: PathBuf, journal_root: PathBuf) -> Self {
+        Self {
+            base_dir,
+            journal_root: Some(journal_root),
+        }
+    }
+
+    /// The directory this store's run journal is written in.
+    pub(crate) fn journal_root(&self) -> Option<&Path> {
+        self.journal_root.as_deref()
     }
 
     /// The directory sessions are stored under.
@@ -201,6 +236,9 @@ impl SessionBackend for LocalBackend {
     ) -> anyhow::Result<()> {
         let path = self.base_dir.join(id).join(state_file_name(id));
         persistence::append_event(&path, payload, timestamp)?;
+        // Journal the committed payload (best-effort, after the commit, so a
+        // failed append above never writes a record). See `crate::run_journal`.
+        crate::run_journal::after_commit(self.journal_root(), self, id, payload);
         // Materialize the native Claude Code `/workflows` artifact off the one
         // commit funnel (opt-in, best-effort: never fails the commit). `self`
         // is both the SessionBackend (header chain) and the ContextStore
@@ -300,7 +338,18 @@ impl SessionBackend for LocalBackend {
         let (_file, tmp_path) = tmp.keep().map_err(|e| SessionError::Io(e.error))?;
 
         match atomic_create_rename(&tmp_path, &target) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // The session now exists: journal its creation and initial
+                // state (best-effort, never fails the init).
+                crate::run_journal::after_init(
+                    self.journal_root(),
+                    self,
+                    id,
+                    &header,
+                    &initial_events,
+                );
+                Ok(())
+            }
             Err(e) => {
                 // On every error path the tempfile is still at `tmp_path`
                 // (renameat2/link/rename leave the source untouched on
@@ -1002,6 +1051,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
@@ -1042,6 +1093,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
@@ -1653,6 +1706,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let events = vec![
@@ -1758,6 +1813,8 @@ mod tests {
                     deadline: None,
                     retry_count: None,
                     agent_config: None,
+                    root_session_id: None,
+                    parent_session_id: None,
                     respawn_generation: None,
                 };
                 let events = vec![Event {
@@ -2256,6 +2313,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
@@ -2400,6 +2459,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();

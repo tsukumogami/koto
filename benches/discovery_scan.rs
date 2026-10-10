@@ -279,6 +279,8 @@ fn base_header(id: &str) -> StateFileHeader {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        root_session_id: None,
+        parent_session_id: None,
         respawn_generation: None,
     }
 }

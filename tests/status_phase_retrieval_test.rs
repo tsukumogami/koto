@@ -27,6 +27,7 @@ use koto::session::SessionBackend;
 
 fn koto_cmd(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
     cmd.env("HOME", dir);
@@ -737,6 +738,7 @@ fn status_attempts_no_lock_syscall_on_a_non_batch_session() {
         .arg(&koto_bin)
         .args(["status", "wf"])
         .current_dir(root)
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .env("KOTO_SESSIONS_BASE", sessions_base(root))
         .env("HOME", root)
         .stdout(Stdio::piped())
@@ -772,6 +774,7 @@ fn status_returns_promptly_while_koto_next_is_mid_tick_on_a_slow_gate() {
     init_workflow(root, "wf", SLOW_GATE_TEMPLATE);
 
     let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("koto"))
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["next", "wf"])
         .current_dir(root)
         .env("KOTO_SESSIONS_BASE", sessions_base(root))

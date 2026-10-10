@@ -226,6 +226,12 @@ impl CloudBackend {
         self.local.base_dir()
     }
 
+    /// The run journal root of the local store this backend keeps its
+    /// copies in. Reached through `Backend::journal_root`.
+    pub(crate) fn journal_root(&self) -> Option<&Path> {
+        self.local.journal_root()
+    }
+
     /// S3 key for a session's state file.
     fn state_key(&self, id: &str) -> String {
         format!("{}/{}/{}", self.prefix, id, state_file_name(id))
@@ -1740,6 +1746,23 @@ impl CloudBackend {
                     )?;
                     let pushed = self.push_staged(req.target, &staging.dir, &source, &manifest)?;
                     self.move_into_place(req.target, &mut staging, &pushed)?;
+                    // The session is in place: journal it as a new run, with
+                    // the state its carried log leaves it in. This comes
+                    // before the marker, since a marker failure leaves the
+                    // imported session where it is, and a retry that adopts
+                    // it takes the `Local` branch above and journals nothing
+                    // further. A rollback never reaches here.
+                    if let Ok((header, events)) = self.local.read_events(req.target) {
+                        let current = crate::engine::persistence::derive_state_from_log(&events);
+                        crate::run_journal::imported(
+                            self.local.journal_root(),
+                            &self.local,
+                            req.target,
+                            &header,
+                            current.as_deref(),
+                            &source.log.header.session_id,
+                        );
+                    }
                     let origin = if req.trust_template {
                         TemplateOrigin::Bucket
                     } else {
@@ -2659,6 +2682,8 @@ pub(crate) mod test_support {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         crate::engine::persistence::append_header(&state_path, &header).unwrap();
@@ -2736,6 +2761,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         append_header(&state_path, &header).unwrap();
@@ -2842,6 +2869,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let events = vec![Event {
@@ -2898,6 +2927,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let events = vec![Event {
@@ -2957,6 +2988,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let events = vec![Event {

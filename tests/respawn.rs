@@ -20,7 +20,12 @@ use koto::engine::respawn::{
     RespawnExecution, RespawnRequest, SubstrateRespawner, RESUME_CONTEXT_PROMPT,
 };
 use koto::engine::types::{EventPayload, StateFileHeader, ValidatedSessionId};
+use koto::session::local::LocalBackend;
 use koto::session::state_file_name;
+
+#[path = "support/funnel_backend.rs"]
+mod funnel_backend;
+use funnel_backend::FunnelBackend;
 
 // ----- Mock substrate respawner ------------------------------------------
 
@@ -87,7 +92,15 @@ fn make_header(workflow: &str, role: Option<&str>) -> StateFileHeader {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        root_session_id: None,
+        parent_session_id: None,
     }
+}
+
+/// The session store the requester's log lives in: `dir` itself, as
+/// [`write_requester_state`] lays it out.
+fn store(dir: &std::path::Path) -> LocalBackend {
+    LocalBackend::with_base_dir(dir.to_path_buf())
 }
 
 fn write_requester_state(
@@ -140,7 +153,7 @@ fn all_three_preconditions_positive_fires_f1() {
     let respawner = RecordingRespawner::default();
     let outcome = execute_respawn(
         &RespawnExecution {
-            requester_state_file: &state_file,
+            backend: &store(tmp.path()),
             header: &header,
             coord_id: "coord",
             requester_session_id: &sid,
@@ -185,7 +198,7 @@ fn all_three_preconditions_positive_fires_f1() {
 fn precondition_1_guard_woken_younger_than_floor() {
     let tmp = tempfile::tempdir().unwrap();
     let header = make_header("requester", Some("scrutineer"));
-    let state_file = write_requester_state(tmp.path(), "requester", &header);
+    write_requester_state(tmp.path(), "requester", &header);
     let sid = ValidatedSessionId::new("requester").unwrap();
     let now = SystemTime::now();
     // 1 day ago — well under the 30-day floor.
@@ -194,7 +207,7 @@ fn precondition_1_guard_woken_younger_than_floor() {
     let respawner = RecordingRespawner::default();
     let outcome = execute_respawn(
         &RespawnExecution {
-            requester_state_file: &state_file,
+            backend: &store(tmp.path()),
             header: &header,
             coord_id: "coord",
             requester_session_id: &sid,
@@ -223,7 +236,7 @@ fn precondition_1_guard_woken_younger_than_floor() {
 fn precondition_2_guard_requester_resumed_and_active() {
     let tmp = tempfile::tempdir().unwrap();
     let header = make_header("requester", Some("scrutineer"));
-    let state_file = write_requester_state(tmp.path(), "requester", &header);
+    write_requester_state(tmp.path(), "requester", &header);
     let sid = ValidatedSessionId::new("requester").unwrap();
     let now = SystemTime::now();
     let woken_at = now - Duration::from_secs(60 * 60 * 24 * 60); // 60 days ago
@@ -232,7 +245,7 @@ fn precondition_2_guard_requester_resumed_and_active() {
     let respawner = RecordingRespawner::default();
     let outcome = execute_respawn(
         &RespawnExecution {
-            requester_state_file: &state_file,
+            backend: &store(tmp.path()),
             header: &header,
             coord_id: "coord",
             requester_session_id: &sid,
@@ -261,7 +274,7 @@ fn precondition_2_guard_requester_resumed_and_active() {
 fn precondition_3_resumed_then_idle_past_floor_fires() {
     let tmp = tempfile::tempdir().unwrap();
     let header = make_header("requester", Some("scrutineer"));
-    let state_file = write_requester_state(tmp.path(), "requester", &header);
+    write_requester_state(tmp.path(), "requester", &header);
     let sid = ValidatedSessionId::new("requester").unwrap();
     let now = SystemTime::now();
     // woken_at 90 days ago; requester resumed 60 days ago, then idle for 60 days > floor.
@@ -270,7 +283,7 @@ fn precondition_3_resumed_then_idle_past_floor_fires() {
     let respawner = RecordingRespawner::default();
     let outcome = execute_respawn(
         &RespawnExecution {
-            requester_state_file: &state_file,
+            backend: &store(tmp.path()),
             header: &header,
             coord_id: "coord",
             requester_session_id: &sid,
@@ -303,7 +316,7 @@ fn cap_exceeded_yields_f3_abandoned() {
     let respawner = RecordingRespawner::default();
     let outcome = execute_respawn(
         &RespawnExecution {
-            requester_state_file: &state_file,
+            backend: &store(tmp.path()),
             header: &header,
             coord_id: "coord",
             requester_session_id: &sid,
@@ -355,7 +368,7 @@ fn f3_missing_role_yields_abandoned() {
     let respawner = RecordingRespawner::default();
     let outcome = execute_respawn(
         &RespawnExecution {
-            requester_state_file: &state_file,
+            backend: &store(tmp.path()),
             header: &header,
             coord_id: "coord",
             requester_session_id: &sid,
@@ -398,7 +411,7 @@ fn f3_template_missing_yields_abandoned() {
     let respawner = RecordingRespawner::default();
     let outcome = execute_respawn(
         &RespawnExecution {
-            requester_state_file: &state_file,
+            backend: &store(tmp.path()),
             header: &header,
             coord_id: "coord",
             requester_session_id: &sid,
@@ -442,7 +455,7 @@ fn f3_substrate_refused_yields_abandoned() {
     respawner.fail_next();
     let outcome = execute_respawn(
         &RespawnExecution {
-            requester_state_file: &state_file,
+            backend: &store(tmp.path()),
             header: &header,
             coord_id: "coord",
             requester_session_id: &sid,
@@ -488,11 +501,11 @@ fn respawn_generation_increments_across_cycles() {
     // gen=0 → F1 fires → gen=1
     {
         let header = make_header("requester-0", Some("scrutineer"));
-        let state_file = write_requester_state(tmp.path(), "requester-0", &header);
+        write_requester_state(tmp.path(), "requester-0", &header);
         let sid = ValidatedSessionId::new("requester-0").unwrap();
         let outcome = execute_respawn(
             &RespawnExecution {
-                requester_state_file: &state_file,
+                backend: &store(tmp.path()),
                 header: &header,
                 coord_id: "coord",
                 requester_session_id: &sid,
@@ -513,11 +526,11 @@ fn respawn_generation_increments_across_cycles() {
     {
         let mut header = make_header("requester-1", Some("scrutineer"));
         header.respawn_generation = Some(1);
-        let state_file = write_requester_state(tmp.path(), "requester-1", &header);
+        write_requester_state(tmp.path(), "requester-1", &header);
         let sid = ValidatedSessionId::new("requester-1").unwrap();
         let outcome = execute_respawn(
             &RespawnExecution {
-                requester_state_file: &state_file,
+                backend: &store(tmp.path()),
                 header: &header,
                 coord_id: "coord",
                 requester_session_id: &sid,
@@ -538,11 +551,11 @@ fn respawn_generation_increments_across_cycles() {
     {
         let mut header = make_header("requester-2", Some("scrutineer"));
         header.respawn_generation = Some(2);
-        let state_file = write_requester_state(tmp.path(), "requester-2", &header);
+        write_requester_state(tmp.path(), "requester-2", &header);
         let sid = ValidatedSessionId::new("requester-2").unwrap();
         let outcome = execute_respawn(
             &RespawnExecution {
-                requester_state_file: &state_file,
+                backend: &store(tmp.path()),
                 header: &header,
                 coord_id: "coord",
                 requester_session_id: &sid,
@@ -615,7 +628,7 @@ fn respawn_request_carries_saved_identity() {
     let mut header = make_header("requester", Some("custom-role"));
     header.template_name = Some("custom-template".into());
     header.inputs = Some(serde_json::json!({"draft_path": "docs/draft.md"}));
-    let state_file = write_requester_state(tmp.path(), "requester", &header);
+    write_requester_state(tmp.path(), "requester", &header);
     let sid = ValidatedSessionId::new("requester").unwrap();
     let now = SystemTime::now();
     let woken_at = now - Duration::from_secs(60 * 60 * 24 * 60);
@@ -623,7 +636,7 @@ fn respawn_request_carries_saved_identity() {
     let respawner = RecordingRespawner::default();
     let _ = execute_respawn(
         &RespawnExecution {
-            requester_state_file: &state_file,
+            backend: &store(tmp.path()),
             header: &header,
             coord_id: "coord",
             requester_session_id: &sid,
@@ -661,7 +674,7 @@ fn requester_respawn_uses_audit_helper_kind_constant() {
     let respawner = RecordingRespawner::default();
     let _ = execute_respawn(
         &RespawnExecution {
-            requester_state_file: &state_file,
+            backend: &store(tmp.path()),
             header: &header,
             coord_id: "coord",
             requester_session_id: &sid,
@@ -696,7 +709,7 @@ fn no_op_outcomes_emit_no_events() {
     let respawner = RecordingRespawner::default();
     let _ = execute_respawn(
         &RespawnExecution {
-            requester_state_file: &state_file,
+            backend: &store(tmp.path()),
             header: &header,
             coord_id: "coord",
             requester_session_id: &sid,
@@ -743,7 +756,7 @@ fn f3_paths_emit_workflow_cancelled() {
     let respawner = RecordingRespawner::default();
     let _ = execute_respawn(
         &RespawnExecution {
-            requester_state_file: &state_file,
+            backend: &store(tmp.path()),
             header: &header,
             coord_id: "coord",
             requester_session_id: &sid,
@@ -759,4 +772,224 @@ fn f3_paths_emit_workflow_cancelled() {
     .unwrap();
     let cancel_reason = find_workflow_cancelled(&state_file).unwrap();
     assert!(cancel_reason.starts_with("respawn_failed: "));
+}
+
+// ----- Writes go through the session backend's commit funnel ---------------
+//
+// The executor appends to the requester's log through
+// `SessionBackend::append_event`, so the store's post-commit hooks see a
+// respawn-fallback cancel exactly as they see `koto cancel`: the run
+// journal (`<base>/_run_journal.jsonl` for a store on an explicit base)
+// records it as `cancelled`. The header is never written.
+
+/// The respawn paths, one per outcome that writes events.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RespawnPath {
+    Respawned,
+    MissingRole,
+    CapExceeded,
+    TemplateNotFound,
+    SubstrateRefused,
+}
+
+const FALLBACKS: [RespawnPath; 4] = [
+    RespawnPath::MissingRole,
+    RespawnPath::CapExceeded,
+    RespawnPath::TemplateNotFound,
+    RespawnPath::SubstrateRefused,
+];
+
+/// One respawn run against a fresh store in its own temporary directory.
+struct Run {
+    tmp: tempfile::TempDir,
+    state_file: PathBuf,
+    header_line_before: String,
+    result: anyhow::Result<RespawnExecuted>,
+    appended: Vec<(String, String)>,
+}
+
+fn header_line(state_file: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(state_file).unwrap();
+    text.lines().next().unwrap().to_string()
+}
+
+/// Event types on the requester's log, in order.
+fn event_types(state_file: &std::path::Path) -> Vec<String> {
+    let (_, events) = read_events(state_file).unwrap();
+    events
+        .iter()
+        .map(|e| e.payload.type_name().to_string())
+        .collect()
+}
+
+/// Journal records for `session` in the store at `base`.
+fn journal_records(base: &std::path::Path, session: &str) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(base.join("_run_journal.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|r| r["session"] == session)
+        .collect()
+}
+
+fn run_path(path: RespawnPath, refuse: Option<&'static str>) -> Run {
+    let tmp = tempfile::tempdir().unwrap();
+    let role = (path != RespawnPath::MissingRole).then_some("scrutineer");
+    let mut header = make_header("requester", role);
+    if path == RespawnPath::CapExceeded {
+        header.respawn_generation = Some(2);
+    }
+    let state_file = write_requester_state(tmp.path(), "requester", &header);
+    let header_line_before = header_line(&state_file);
+    let backend = match refuse {
+        Some(event_type) => FunnelBackend::refusing(tmp.path(), event_type),
+        None => FunnelBackend::new(tmp.path()),
+    };
+    let respawner = RecordingRespawner::default();
+    if path == RespawnPath::SubstrateRefused {
+        respawner.fail_next();
+    }
+    let sid = ValidatedSessionId::new("requester").unwrap();
+    let now = SystemTime::now();
+    let woken_at = now - Duration::from_secs(60 * 60 * 24 * 60);
+    let result = execute_respawn(
+        &RespawnExecution {
+            backend: &backend,
+            header: &header,
+            coord_id: "coord",
+            requester_session_id: &sid,
+            woken_at: Some(woken_at),
+            last_log_activity: woken_at - Duration::from_secs(60),
+            now,
+            retention_floor: floor(),
+            cap: 2,
+            template_exists: path != RespawnPath::TemplateNotFound,
+        },
+        &respawner,
+    );
+    let appended = backend.appended();
+    Run {
+        tmp,
+        state_file,
+        header_line_before,
+        result,
+        appended,
+    }
+}
+
+#[test]
+fn every_respawn_write_goes_through_the_backend_and_leaves_the_header_untouched() {
+    for path in [RespawnPath::Respawned]
+        .into_iter()
+        .chain(FALLBACKS.iter().copied())
+    {
+        let run = run_path(path, None);
+        run.result.as_ref().unwrap();
+        let expected: Vec<&str> = if path == RespawnPath::Respawned {
+            vec!["evidence_submitted"]
+        } else {
+            vec!["evidence_submitted", "workflow_cancelled"]
+        };
+        // The same events in the same order as before the switch.
+        assert_eq!(event_types(&run.state_file), expected, "{path:?}");
+        // Each one appended through the backend, to the requester's log.
+        let through_backend: Vec<(String, String)> = expected
+            .iter()
+            .map(|t| ("requester".to_string(), t.to_string()))
+            .collect();
+        assert_eq!(run.appended, through_backend, "{path:?}");
+        // The header line is byte-identical.
+        assert_eq!(
+            header_line(&run.state_file),
+            run.header_line_before,
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn a_respawn_fallback_cancel_journals_one_cancelled_record_after_the_event_commits() {
+    for path in FALLBACKS {
+        let run = run_path(path, None);
+        assert!(
+            matches!(run.result, Ok(RespawnExecuted::Abandoned { .. })),
+            "{path:?}: {:?}",
+            run.result
+        );
+        let records = journal_records(run.tmp.path(), "requester");
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|r| r["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["cancelled"],
+            "{path:?}: one record, no terminal"
+        );
+        assert_eq!(records[0]["koto.session.id"], "requester", "{path:?}");
+
+        // The cancel event is committed on the log, and the journal file
+        // was last written no earlier than the log. Timestamps can tie, so
+        // this alone doesn't order the two writes: the test below adds the
+        // other half, that a cancel whose append fails writes no record.
+        assert_eq!(
+            event_types(&run.state_file).last().map(String::as_str),
+            Some("workflow_cancelled"),
+            "{path:?}"
+        );
+        let log_written = std::fs::metadata(&run.state_file)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let journal_written = std::fs::metadata(run.tmp.path().join("_run_journal.jsonl"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(journal_written >= log_written, "{path:?}");
+    }
+
+    // A successful respawn cancels nothing and journals nothing.
+    let run = run_path(RespawnPath::Respawned, None);
+    assert_eq!(
+        run.result.unwrap(),
+        RespawnExecuted::Respawned { new_generation: 1 }
+    );
+    assert!(journal_records(run.tmp.path(), "requester").is_empty());
+}
+
+#[test]
+fn a_failed_cancel_append_writes_no_cancelled_record_and_fails_as_before() {
+    for path in FALLBACKS {
+        let run = run_path(path, Some("workflow_cancelled"));
+        // The error the executor returned when it wrote the state file
+        // directly: the append's own error under
+        // `append WorkflowCancelled to <state file>`.
+        let err = run.result.expect_err("the cancel append was refused");
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "append WorkflowCancelled to {}: {}",
+                run.state_file.display(),
+                funnel_backend::INJECTED_FAILURE
+            ),
+            "{path:?}"
+        );
+        // The session is left as a failed cancel left it: the respawn
+        // evidence committed, no cancel, the header untouched.
+        assert_eq!(
+            event_types(&run.state_file),
+            vec!["evidence_submitted"],
+            "{path:?}"
+        );
+        assert_eq!(
+            header_line(&run.state_file),
+            run.header_line_before,
+            "{path:?}"
+        );
+        // And no `cancelled` record.
+        assert!(
+            journal_records(run.tmp.path(), "requester").is_empty(),
+            "{path:?}"
+        );
+    }
 }

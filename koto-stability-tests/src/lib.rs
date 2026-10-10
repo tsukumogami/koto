@@ -92,6 +92,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
         };
         assert_eq!(h.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(h.template_source_dir.is_none());
@@ -236,6 +238,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
         };
         assert!(h.template_source_dir.is_some());
     }
@@ -304,6 +308,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
         };
         let initial_events = vec![Event {
             seq: 1,

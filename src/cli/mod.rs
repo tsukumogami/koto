@@ -912,6 +912,11 @@ fn handle_workflows_action(action: WorkflowsAction) -> Result<()> {
 }
 
 /// Build the local backend, honoring `KOTO_SESSIONS_BASE` for testing.
+///
+/// The run journal lives with the store it describes. The default store
+/// under `~/.koto/sessions` journals into `~/.koto`; a store whose base
+/// `KOTO_SESSIONS_BASE` redirected journals inside that base, so it never
+/// writes the real home's journal (see `crate::run_journal`).
 pub(crate) fn build_local_backend() -> Result<LocalBackend> {
     if let Ok(base) = std::env::var("KOTO_SESSIONS_BASE") {
         Ok(LocalBackend::with_base_dir(PathBuf::from(base)))
@@ -1437,6 +1442,7 @@ pub fn run(app: App) -> Result<()> {
             handle_next(
                 &backend,
                 context_store,
+                backend.journal_root(),
                 name,
                 with_data,
                 to,
@@ -3154,8 +3160,10 @@ fn append_terminal_index_for_session(
 /// `ChildCompleted` behind; a duplicate is harmless, because the converge
 /// keeps the latest event per task and prefers an on-disk child.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn finish_terminal_tick(
     backend: &dyn SessionBackend,
+    journal_root: Option<&Path>,
     name: &str,
     header: &crate::engine::types::StateFileHeader,
     compiled: &CompiledTemplate,
@@ -3193,6 +3201,9 @@ fn finish_terminal_tick(
     // arrival (see the doc comment).
     let mut defer_for_parent = false;
     if arrival {
+        // The run journal's `terminal` record, once per arrival and before
+        // any cleanup below, so it survives the session's removal.
+        crate::run_journal::terminal(journal_root, backend, name, header, final_state);
         // Re-read so the index classifier sees a mid-tick `WorkflowCancelled`.
         let post_events = backend
             .read_events(name)
@@ -3914,6 +3925,9 @@ fn record_execution_anchor_adoption(
 fn handle_next(
     backend: &dyn SessionBackend,
     context_store: &dyn ContextStore,
+    // The run journal root of the store `backend` is, for the terminal
+    // tick's record (`Backend::journal_root`).
+    journal_root: Option<&Path>,
     name: String,
     with_data: Option<String>,
     to: Option<String>,
@@ -5067,6 +5081,7 @@ fn handle_next(
                 {
                     finish_terminal_tick(
                         backend,
+                        journal_root,
                         &name,
                         &header,
                         &compiled,
@@ -6653,6 +6668,7 @@ fn handle_next(
             {
                 finish_terminal_tick(
                     backend,
+                    journal_root,
                     &name,
                     &header,
                     &compiled,
@@ -6686,6 +6702,7 @@ fn handle_next(
 fn handle_next(
     _backend: &dyn SessionBackend,
     _context_store: &dyn ContextStore,
+    _journal_root: Option<&Path>,
     name: String,
     _with_data: Option<String>,
     _to: Option<String>,
@@ -7974,6 +7991,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         }
     }
@@ -8661,6 +8680,8 @@ Done.
                     deadline: None,
                     retry_count: None,
                     agent_config: None,
+                    root_session_id: None,
+                    parent_session_id: None,
                     respawn_generation: None,
                 },
                 vec![],

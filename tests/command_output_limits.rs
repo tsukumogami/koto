@@ -34,6 +34,7 @@ fn sessions_base(dir: &Path) -> PathBuf {
 
 fn koto_cmd(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
     cmd.env("HOME", dir);
@@ -564,7 +565,7 @@ fn nested_koto_under_the_repeated_notice_condition_completes_and_settles() {
         (cd "$base/abcdef1234567890" && mkdir -p $names)
         koto session list >/dev/null
         koto session list >/dev/null 2>"{second_err}"
-        echo "second-run-bytes=$(wc -c <"{second_err}")"
+        echo "second-run-bytes=$(wc -c <"{second_err}" | tr -d ' ')"
 "#,
         collisions = collisions,
         second_err = dir.path().join("second.err").display(),

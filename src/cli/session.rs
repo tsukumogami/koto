@@ -313,6 +313,11 @@ pub fn handle_start(
     )
     .map_err(|msg| anyhow::anyhow!(msg))?;
 
+    // The session's run identity, fixed now from the parent's header (see
+    // `crate::run_journal`).
+    let (root_session_id, parent_session_id) =
+        crate::run_journal::child_lineage(backend, validated_parent.as_str());
+
     // -- Compose the header --
     let ts = now_iso8601();
     let template_name = template.map(|s| s.to_string());
@@ -342,6 +347,8 @@ pub fn handle_start(
         deadline: None,
         retry_count: None,
         agent_config: None,
+        root_session_id,
+        parent_session_id,
         respawn_generation: None,
     };
 
@@ -484,12 +491,13 @@ mod tests {
 }
 
 /// Append an `IntentUpdated` event to the named session's log.
+///
+/// The event goes through `backend.append_event`, the store's commit
+/// funnel, like every other event. Only the event is appended: the
+/// session header is never written here, and a change to it would go
+/// through `SessionBackend::rewrite_header`.
 pub fn handle_update(backend: &dyn SessionBackend, name: &str, intent: &str) -> anyhow::Result<()> {
-    use crate::engine::{
-        persistence,
-        types::{now_iso8601, EventPayload},
-    };
-    use crate::session::state_file_name;
+    use crate::engine::types::{now_iso8601, EventPayload};
 
     if intent.len() > 1024 {
         anyhow::bail!(
@@ -498,16 +506,14 @@ pub fn handle_update(backend: &dyn SessionBackend, name: &str, intent: &str) -> 
         );
     }
 
-    let dir = backend.session_dir(name);
     if !backend.exists(name) {
         anyhow::bail!("session '{}' does not exist", name);
     }
 
-    let state_path = dir.join(state_file_name(name));
     let payload = EventPayload::IntentUpdated {
         intent: intent.to_string(),
     };
-    persistence::append_event(&state_path, &payload, &now_iso8601())?;
+    backend.append_event(name, &payload, &now_iso8601())?;
     Ok(())
 }
 

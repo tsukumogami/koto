@@ -27,6 +27,7 @@ const WAKE_BOUND: Duration = Duration::from_secs(1);
 
 fn koto_cmd(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("koto").unwrap();
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("HOME", dir);
     cmd.env("KOTO_SESSIONS_BASE", dir.join("sessions"));
@@ -102,6 +103,7 @@ fn cursor_now(dir: &Path, session: &str) -> String {
 /// no ring between reading the cursor and the watch starting is missed.
 fn spawn_watch(dir: &Path, session: &str, since: &str) -> Child {
     StdCommand::new(assert_cmd::cargo::cargo_bin("koto"))
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .current_dir(dir)
         .env("HOME", dir)
         .env("KOTO_SESSIONS_BASE", dir.join("sessions"))

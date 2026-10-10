@@ -894,6 +894,8 @@ fn a_failed_push_takes_back_exactly_what_it_pushed() {
     let msg = refused(&run, "import_push_failed", 1);
     assert!(msg.contains("ctx/manifest.json"), "{msg}");
     assert_no_trace(&s3, &b, "wf");
+    // A rolled-back import journals nothing.
+    assert_eq!(run_journal(&b), Vec::<serde_json::Value>::new());
 
     let writes = all_writes(&s3);
     let of = |method: &str| -> std::collections::BTreeSet<String> {
@@ -938,6 +940,13 @@ fn an_unmarked_import_keeps_its_target_and_a_rerun_only_marks() {
     let msg = refused(&run, "import_unmarked", 1);
     assert!(msg.contains("run the same import again"), "{msg}");
     assert!(b.state_path("wf").exists(), "the target must be kept");
+    // The kept target was journaled once, before the marker failed.
+    let journaled = run_journal(&b);
+    assert_eq!(
+        journal_kinds(&journaled),
+        vec!["session_started", "state_entered"],
+        "{journaled:?}"
+    );
     assert_eq!(staging_dirs(&b), Vec::<String>::new());
     let target = holdings(&s3, &b, "wf");
     assert_eq!(
@@ -985,6 +994,9 @@ fn an_unmarked_import_keeps_its_target_and_a_rerun_only_marks() {
     );
     assert_eq!(holdings(&s3, &b, "wf"), target);
     assert_eq!(entries(&store), store_before);
+    // Neither re-run, the refused one nor the one that adopted the placed
+    // target, journaled it again.
+    assert_eq!(run_journal(&b), journaled);
 
     let written: serde_json::Value = serde_json::from_slice(&s3.object(&marker).unwrap()).unwrap();
     assert_eq!(
@@ -1825,4 +1837,227 @@ fn a_marker_that_landed_despite_an_error_completes_the_rerun() {
     );
     assert!(!b.session_dir("wf").exists());
     assert_eq!(all_writes(&s3), Vec::<(String, String)>::new());
+}
+
+/// Lines of a host's run journal, as JSON.
+fn run_journal(host: &Host) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(host.home.join(".koto").join("_run_journal.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn journal_kinds(records: &[serde_json::Value]) -> Vec<&str> {
+    records
+        .iter()
+        .map(|r| r["kind"].as_str().unwrap())
+        .collect()
+}
+
+/// An import journals a new run on the importing host: one
+/// `session_started` with its new id as both session and run id, the
+/// source's id as `koto.imported_from.session.id`, the importing command's
+/// driver and the source's template identity, then one `state_entered` for
+/// the state the carried log leaves the session in. None of the source's
+/// records are copied. The fixture flag comes from the carried header's
+/// template source directory, a path that doesn't exist on the importing
+/// host.
+#[test]
+fn an_import_journals_a_new_run_on_the_importing_host() {
+    let s3 = FakeS3::start(BUCKET);
+    let root = tempfile::TempDir::new().unwrap();
+    let cloud = cloud(&s3);
+    let a = Host::new(root.path(), "a", &cloud);
+    let b = Host::new(root.path(), "b", &cloud);
+    let c = Host::new(root.path(), "c", &cloud);
+    let name = "journaled";
+    let mut carrier = Carrier::new(&a, &b, &c, name);
+    carrier.init_a();
+    carrier.keys_a();
+    let run = a.koto(&["next", name]);
+    assert!(run.ok(), "next: {}", run.describe());
+    assert_eq!(run.json["state"], "wait", "{}", run.describe());
+
+    // Record a template source directory under a mktemp-shaped segment,
+    // outside any temporary root and absent on the importing host, in A's
+    // copy and in the bucket's, which is the one the import reads.
+    let source_dir = "/home/builder/work/tmp.Qx7Lm2Rv/templates";
+    assert!(!std::path::Path::new(source_dir).exists());
+    let mut lines = a.state_lines(name);
+    let mut header: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    header["template_source_dir"] = serde_json::Value::from(source_dir);
+    lines[0] = serde_json::to_string(&header).unwrap();
+    let bytes = lines.join("\n") + "\n";
+    std::fs::write(a.state_path(name), &bytes).unwrap();
+    s3.put(
+        &format!("{}koto-{}.state.jsonl", session_prefix(&a, name), name),
+        bytes.as_bytes(),
+    );
+
+    let source_header = a.header(name);
+    let source_id = source_header["session_id"].as_str().unwrap().to_string();
+    let a_journal = run_journal(&a);
+
+    carrier.compile_on("import", &b);
+    let output = b
+        .cmd()
+        .env("CLAUDE_CODE_SESSION_ID", "driver-b")
+        .args(["session", "import", name, "--from", &a.ws_str()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "import: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let header = b.header(name);
+    let new_id = header["session_id"].as_str().unwrap();
+    assert_ne!(new_id, source_id);
+    assert_eq!(header["template_source_dir"], source_dir);
+    assert!(header.get("root_session_id").is_none());
+    assert!(header.get("parent_session_id").is_none());
+    let lines = b.state_lines(name);
+    let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(last["type"], "session_imported");
+
+    let journal = run_journal(&b);
+    assert_eq!(
+        journal_kinds(&journal),
+        vec!["session_started", "state_entered"],
+        "only the import's records: {journal:?}"
+    );
+    let started = &journal[0];
+    assert_eq!(started["session"], name);
+    assert_eq!(started["koto.session.id"], new_id);
+    assert_eq!(started["koto.run.id"], new_id);
+    assert_eq!(
+        started["koto.imported_from.session.id"], last["payload"]["from_session_id"],
+        "the same id the session_imported event carries"
+    );
+    assert_eq!(started["koto.imported_from.session.id"], source_id.as_str());
+    assert!(started.get("imported_from").is_none());
+    assert_eq!(started["koto.driver.session.id"], "driver-b");
+    assert_eq!(
+        started["koto.template.name"],
+        source_header["template_name"]
+    );
+    assert_eq!(
+        started["koto.template.hash"],
+        source_header["template_hash"]
+    );
+    assert_eq!(started["koto.fixture"], true);
+    assert!(started.get("koto.parent.session.id").is_none());
+
+    let entered = &journal[1];
+    assert_eq!(entered["session"], name);
+    assert_eq!(entered["koto.session.id"], new_id);
+    assert_eq!(entered["koto.run.id"], new_id);
+    assert_eq!(entered["koto.state"], "wait");
+
+    // The import wrote nothing to the source host's journal.
+    assert_eq!(run_journal(&a), a_journal);
+}
+
+/// A new child's lineage is read from the local store only. Under a parent
+/// created by an older koto (no `root_session_id`, no cached run id), the
+/// walk up to the root reads the root's header from this host's copy: no
+/// request touches the root's remote prefix, neither the state pull nor
+/// the migration-marker listing a backend header read would make.
+#[test]
+fn a_childs_lineage_walk_reads_ancestors_locally_and_asks_the_remote_nothing() {
+    let s3 = FakeS3::start(BUCKET);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = Host::new(tmp.path(), "a", &cloud(&s3));
+    let template = a.ws.join(migration_carrier::TEMPLATE_FILE);
+    let template = template.to_str().unwrap();
+    let run = a.koto(&["init", "lroot", "--template", template]);
+    assert!(run.ok(), "init lroot: {}", run.describe());
+    let run = a.koto(&[
+        "init",
+        "lroot.mid",
+        "--template",
+        template,
+        "--parent",
+        "lroot",
+    ]);
+    assert!(run.ok(), "init lroot.mid: {}", run.describe());
+    let root_id = a.header("lroot")["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Make the middle session look like an older koto's, locally and in
+    // its remote copy, so a pull can't bring the lineage fields back.
+    let mut lines = a.state_lines("lroot.mid");
+    let mut header: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    let obj = header.as_object_mut().unwrap();
+    obj.remove("root_session_id");
+    obj.remove("parent_session_id");
+    lines[0] = serde_json::to_string(&header).unwrap();
+    let bytes = lines.join("\n") + "\n";
+    std::fs::write(a.state_path("lroot.mid"), &bytes).unwrap();
+    s3.put(
+        &format!(
+            "{}koto-lroot.mid.state.jsonl",
+            session_prefix(&a, "lroot.mid")
+        ),
+        bytes.as_bytes(),
+    );
+    let _ = std::fs::remove_file(a.session_dir("lroot.mid").join("run-journal.json"));
+
+    s3.clear_requests();
+    let run = a.koto(&[
+        "init",
+        "lroot.leaf",
+        "--template",
+        template,
+        "--parent",
+        "lroot.mid",
+    ]);
+    assert!(run.ok(), "init lroot.leaf: {}", run.describe());
+    assert_eq!(
+        a.header("lroot.leaf")["root_session_id"],
+        root_id.as_str(),
+        "the walk found the root"
+    );
+    let root_prefix = session_prefix(&a, "lroot");
+    let touched: Vec<String> = s3
+        .requests()
+        .iter()
+        .filter(|r| {
+            r.key.starts_with(&root_prefix)
+                || r.list_prefix
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with(&root_prefix))
+        })
+        .map(describe)
+        .collect();
+    assert_eq!(touched, Vec::<String>::new());
+
+    // With the root's local copy gone, the walk stops quietly: the spawn
+    // still succeeds, with no root recorded, and still asks the remote
+    // nothing about the root.
+    std::fs::remove_dir_all(a.session_dir("lroot")).unwrap();
+    s3.clear_requests();
+    let run = a.koto(&[
+        "init",
+        "lroot.leaf2",
+        "--template",
+        template,
+        "--parent",
+        "lroot.mid",
+    ]);
+    assert!(run.ok(), "init lroot.leaf2: {}", run.describe());
+    let leaf2 = a.header("lroot.leaf2");
+    assert!(leaf2.get("root_session_id").is_none(), "{leaf2}");
+    assert_eq!(
+        leaf2["parent_session_id"],
+        a.header("lroot.mid")["session_id"]
+    );
+    assert!(s3
+        .requests()
+        .iter()
+        .all(|r| !r.key.starts_with(&root_prefix)));
 }

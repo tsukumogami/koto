@@ -49,6 +49,8 @@ fn init_parent_backend(dir: &std::path::Path, parent: &str) -> LocalBackend {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        root_session_id: None,
+        parent_session_id: None,
         respawn_generation: None,
     };
     let init_payload = EventPayload::WorkflowInitialized {

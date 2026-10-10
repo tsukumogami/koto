@@ -362,6 +362,23 @@ pub struct StateFileHeader {
     #[serde(default)]
     pub session_id: String,
 
+    /// `session_id` of the root of this session's parent chain, recorded
+    /// when a child is created so its run stays identifiable after the
+    /// root is removed. `None` on a root session (its run is its own
+    /// `session_id`), on a session created before the field existed, and on
+    /// a child whose root could not be resolved at creation.
+    ///
+    /// Additive field: omitted when None, defaults to None on old state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_session_id: Option<String>,
+
+    /// `session_id` of the parent session, recorded when a child is
+    /// created. `None` on a root session and on older state files.
+    ///
+    /// Additive field: omitted when None, defaults to None on old state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+
     /// Human-readable description of the workflow's goal, set at init time.
     ///
     /// Additive field: omitted when None, defaults to None on old state files.
@@ -2671,6 +2688,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
@@ -2705,6 +2724,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
@@ -2751,6 +2772,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
@@ -2790,6 +2813,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
@@ -2827,6 +2852,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();
@@ -3734,6 +3761,8 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let json = serde_json::to_string(&header).unwrap();

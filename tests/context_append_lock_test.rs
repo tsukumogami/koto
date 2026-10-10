@@ -32,6 +32,7 @@ fn sessions_base(dir: &Path) -> PathBuf {
 
 fn koto(dir: &Path) -> StdCommand {
     let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_koto"));
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
     cmd.env("HOME", dir);

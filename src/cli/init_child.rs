@@ -734,6 +734,14 @@ fn init_child_core(
                 .with_path(cached.source_path.clone())
         })?;
 
+    // The child's run identity, fixed now from the parent's header so it
+    // stays right after the parent or root is removed (see
+    // `crate::run_journal`).
+    let (root_session_id, parent_session_id) = match parent_name {
+        Some(parent) => crate::run_journal::child_lineage(backend, parent),
+        None => (None, None),
+    };
+
     let mut header = StateFileHeader {
         command_environment: Some(command_environment),
         schema_version: 1,
@@ -770,6 +778,8 @@ fn init_child_core(
         deadline: None,
         retry_count: None,
         agent_config: None,
+        root_session_id,
+        parent_session_id,
         respawn_generation: None,
     };
 
@@ -960,6 +970,8 @@ pub fn init_inline_into_session(
         deadline: None,
         retry_count: None,
         agent_config: None,
+        root_session_id: None,
+        parent_session_id: None,
         respawn_generation: None,
     };
 
@@ -1204,6 +1216,8 @@ Done.
             deadline: None,
             retry_count: None,
             agent_config: None,
+            root_session_id: None,
+            parent_session_id: None,
             respawn_generation: None,
         };
         let events = vec![Event {

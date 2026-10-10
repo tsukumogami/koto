@@ -23,6 +23,7 @@ of authority for this document).
 ├── sessions/                                  # AUTHORITATIVE state
 │   ├── <session-id>/
 │   │   ├── koto-<session-id>.state.jsonl      # header + event log
+│   │   ├── run-journal.json                   # derived (run journal cache: run id, creating driver)
 │   │   └── claim.lock                         # derived (request-store sidecar)
 │   └── .migration-conflicts/                  # AUTHORITATIVE state (see below)
 │       └── <repo-id>/<session-id>/
@@ -36,6 +37,7 @@ of authority for this document).
 ├── wakes/                                     # derived (per-session wake signal)
 │   └── <session-id>                           # one opaque line per wake
 ├── _decider_ledger.jsonl                      # AUTHORITATIVE state (decider consultations and answers)
+├── _run_journal.jsonl                         # host-local record for external readers (see below)
 ├── _terminal_index.jsonl                      # derived (request-store skip-list)
 └── _terminal_index.compact.lock               # derived (request-store compaction lease)
 ```
@@ -243,6 +245,19 @@ over it is skipped with a warning.
 - **Failure:** a ledger that can't be written (read-only, or a
   `~/.koto` that can't be created) costs one warning on stderr per
   record. The `koto next` response and exit code don't change.
+
+## Run journal: `~/.koto/_run_journal.jsonl`
+
+An append-only record of session identity and progress for tooling
+outside koto: one JSON line when a session starts, enters a state,
+reaches a terminal or is cancelled. koto never reads its records back, so
+deleting it changes nothing koto does, but its lines outlive the
+sessions they describe and can't be rebuilt once those sessions are
+gone. A store redirected with `KOTO_SESSIONS_BASE` keeps its journal
+inside that base instead. Each session's `run-journal.json` caches its
+run id and creating driver for later records; it goes with the session
+directory and is rebuilt from the header when missing. `src/run_journal/`
+documents the record format. Nothing in koto prunes the journal yet.
 
 ## Derived files introduced by the request-store
 

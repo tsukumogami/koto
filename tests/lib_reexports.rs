@@ -58,6 +58,8 @@ fn state_file_header_resolves_and_constructs() {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        root_session_id: None,
+        parent_session_id: None,
     };
     assert_eq!(h.schema_version, CURRENT_SCHEMA_VERSION);
 }
@@ -218,6 +220,8 @@ fn path_buf_used_for_template_source_dir_field() {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        root_session_id: None,
+        parent_session_id: None,
     };
     assert!(h.template_source_dir.is_some());
 }
