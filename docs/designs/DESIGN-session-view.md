@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Proposed
+status: Accepted
 problem: |
   No shipped surface shows a person what a session holds. The dashboard has
   no ContextStore access and reads state files by path, bypassing migration
@@ -29,7 +29,7 @@ upstream: docs/prds/PRD-session-view.md
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context and Problem Statement
 
