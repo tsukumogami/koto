@@ -31,6 +31,23 @@ upstream: docs/prds/PRD-session-view.md
 
 Planned
 
+**Correction (2026-10-10), the log read is local-only.** The merge review of
+the snapshot layer (#332) confirmed that reading the log through
+`SessionBackend::read_events` is itself a write on the cloud backend: it pulls
+the remote state object and rewrites the local state file before reading,
+which this view's read-only contract forbids. Two sentences below are
+corrected accordingly, with the maintainers' approval. The snapshot paragraph
+originally read "it reads the header and events once (`read_events`)"; it now
+reads "it reads the header and events once from the local copy
+(`read_events_local` — the cloud `read_events` pulls and rewrites the local
+log, a write this view never makes)". The read-only guarantees paragraph
+originally read "No events: the snapshot reads the log with `read_events`,
+which does not append"; it now reads "No events and no state pull: the
+snapshot reads the log with `read_events_local`, which neither appends nor
+pulls". The semantics this fixes in place: on a cloud-backed session the view
+shows the local copy's facts, exactly as it shows local key content, with the
+per-key locality and staleness markers saying where the remote differs.
+
 ## Context and Problem Statement
 
 A session's working state is spread across stores the shipped surfaces never
@@ -277,7 +294,9 @@ pub fn read_key_preview(backend: &Backend, name: &str, key: &str, bound: usize)
 
 `snapshot` calls `Backend::check_not_migrated` first: a `SessionMigrated`
 answer fills `migrated` and returns early with facts only. Otherwise it reads
-the header and events once (`read_events`), derives state
+the header and events once from the local copy (`read_events_local` — the
+cloud `read_events` pulls and rewrites the local log, a write this view never
+makes), derives state
 (`derive_machine_state`), and interpolates the directive through a
 directive-rendering helper extracted from `handle_status`. The split is
 deliberate and the trade is acknowledged: `handle_status` keeps its own
@@ -454,7 +473,7 @@ Output size is bounded as the PRD requires: the one-shot JSON is at most keys ti
 
 Manifest numbers are untrusted too. `size` is a `u64` and can be anything. The size formatter handles the full range with floating-point or saturating division and never indexes a unit table past the last entry; `0 B` and `u64::MAX` are both fixture cases. The remote manifest is fetched whole by `fetch_remote_manifest`, which has no body limit today; the view does not widen that, since it uses the cached fetch the backend already performs and adds no request (N2), but a bucket writer can hand any koto command a huge manifest and the view inherits that existing exposure, tracked as a follow-up rather than widened or fixed here. There is no loader thread: the TUI reads one bounded preview for the focused key per tick, cached per mtime generation, so rapid scrolling cannot queue unbounded reads, and a read that hangs (a network filesystem) stalls the tick exactly as `read_detail`'s synchronous state-file reads already can — an inherited exposure the design documents rather than papers over.
 
-**Read-only guarantees and what enforces each.** No pulls: the preview path calls a new accessor on the local store that composes the path through the store's own `content_path` after `validate_context_key` and reads the file; it never calls `ContextStore::get`, whose cloud implementation downloads, writes the local file and appends a `context_added` event. The enforcement is structural, since the accessor lives on the local half of the backend and has no handle to the bucket, and a test runs the cloud fixture with a mock S3 that fails the test on any GET of a `ctx/` object and on any PUT or DELETE at all. No events: the snapshot reads the log with `read_events`, which does not append, and a test asserts the event count and the file bytes are identical before and after a render and a `--detail` run (AC11). No marker writes: the only marker access is `check_not_migrated`, which lists and at most fetches `migrated.json` and caches the answer in memory; the view never calls the import, the cleanup or the retry paths that write or delete markers (`is_migration_marker` guards that code in `cloud.rs`). The session snapshot function takes `&Backend` and uses only read methods, and the dashboard receives no write-capable handle other than the one it already had. One honest caveat: `check_not_migrated` and the manifest fetch are network reads, and the manifest cache is mutated in memory; those are existing read-path effects that R10 allows and N2 bounds at two requests.
+**Read-only guarantees and what enforces each.** No pulls: the preview path calls a new accessor on the local store that composes the path through the store's own `content_path` after `validate_context_key` and reads the file; it never calls `ContextStore::get`, whose cloud implementation downloads, writes the local file and appends a `context_added` event. The enforcement is structural, since the accessor lives on the local half of the backend and has no handle to the bucket, and a test runs the cloud fixture with a mock S3 that fails the test on any GET of a `ctx/` object and on any PUT or DELETE at all. No events and no state pull: the snapshot reads the log with `read_events_local`, which neither appends nor pulls, and tests assert the event count and the file bytes are identical before and after a render and a `--detail` run, and that a cloud snapshot makes no GET of the state object (AC11). No marker writes: the only marker access is `check_not_migrated`, which lists and at most fetches `migrated.json` and caches the answer in memory; the view never calls the import, the cleanup or the retry paths that write or delete markers (`is_migration_marker` guards that code in `cloud.rs`). The session snapshot function takes `&Backend` and uses only read methods, and the dashboard receives no write-capable handle other than the one it already had. One honest caveat: `check_not_migrated` and the manifest fetch are network reads, and the manifest cache is mutated in memory; those are existing read-path effects that R10 allows and N2 bounds at two requests.
 
 The migration check runs first, so a migrated session never has its keys read. Its answer is cached per process; the Consequences section already notes the staleness. That is a correctness trade, not a security one, because a stale "not migrated" shows the old session's local keys read-only, which is what the local user already has on disk.
 
