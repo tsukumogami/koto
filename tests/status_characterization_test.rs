@@ -1,13 +1,15 @@
 //! Characterization of `koto status` output ahead of the directive-helper
 //! refactor (the status-refactor group of PLAN-session-view).
 //!
-//! These tests pin the full status JSON and exit code for four session
-//! shapes — mid-run, terminal, template-hash mismatch, migrated — with
-//! volatile values (the per-run template path, result timestamps)
-//! normalized deterministically. They are committed against the
-//! unrefactored `handle_status` and must pass unchanged once it renders
-//! its directive through `session_view::render_directive`: an output
-//! byte that moves fails one of the exact comparisons here.
+//! The mid-run shape — the one the refactor touches — is pinned as a
+//! full exact JSON compare, with the per-run template path the single
+//! normalized value; the tampered-template shape pins the mismatch
+//! object and the rendered directive; the terminal, migrated and
+//! never-advanced shapes pin their key fields, exit codes and exact
+//! error objects. Committed against the unrefactored `handle_status`,
+//! these must pass unchanged once it renders its directive through
+//! `session_view::render_directive`: a byte that moves on the rendering
+//! path fails an exact comparison here.
 
 #![cfg(unix)]
 
@@ -271,6 +273,38 @@ fn a_migrated_session_exits_two_with_the_exact_error_object() {
         json,
         serde_json::json!({
             "error": "session_migrated: session 'wf' was migrated to 'wf-elsewhere' in /srv/other; continue it there",
+            "command": "status",
+        })
+    );
+}
+
+#[test]
+fn a_never_advanced_session_exits_three_as_corrupt() {
+    // The exit the snapshot layer deliberately diverges from: a session
+    // whose log holds only workflow_initialized derives no state, and
+    // `koto status` answers with its infrastructure exit. Pinned here so
+    // the divergence the view documents cannot drift silently.
+    let tmp = TempDir::new().unwrap();
+    init_workflow(tmp.path(), "wf", TEMPLATE, &[]);
+    let state_path = sessions_base(tmp.path())
+        .join("wf")
+        .join("koto-wf.state.jsonl");
+    let text = std::fs::read_to_string(&state_path).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    // Keep the header and the workflow_initialized event only.
+    lines.truncate(2);
+    std::fs::write(&state_path, format!("{}\n", lines.join("\n"))).unwrap();
+
+    let output = koto_cmd(tmp.path())
+        .args(["status", "wf"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "infrastructure exit");
+    let json = parse_last_json(&output.stdout);
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "error": "corrupt state file: cannot derive current state",
             "command": "status",
         })
     );

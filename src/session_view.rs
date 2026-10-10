@@ -293,10 +293,10 @@ pub enum KeyPreview {
 
 /// Interpolate a state's directive (or details) text exactly the way
 /// `koto status` does: runtime `SESSION_DIR` / `SESSION_NAME` first, then
-/// the log's variables. [`snapshot`] calls it today; `handle_status`
-/// switches onto it in a follow-up change whose characterization tests
-/// pin its JSON byte-for-byte, so this is written to match its
-/// substitution order exactly.
+/// the log's variables. [`snapshot`] and `handle_status` both call it —
+/// one rendering, two readers — and
+/// `tests/status_characterization_test.rs` pins the output across the
+/// seam.
 pub fn render_directive(
     raw: &str,
     session_dir: &Path,
