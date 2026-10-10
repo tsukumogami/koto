@@ -484,3 +484,169 @@ fn a_record_after_a_partial_last_line_starts_on_its_own_line() {
     assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
     assert!(warnings_for_test().is_empty());
 }
+
+// ----- Driver changes -----
+
+fn evidence(state: &str) -> EventPayload {
+    EventPayload::EvidenceSubmitted {
+        state: state.into(),
+        fields: serde_json::from_str(r#"{"x":"y"}"#).unwrap(),
+        submitter_cwd: None,
+        source: None,
+    }
+}
+
+/// Append `payload` to `session` as a process driven by `driver` would.
+fn commit_as(f: &Fixture, driver: Option<&str>, session: &str, payload: &EventPayload) {
+    set_host_env_for_test(CLAUDE_SESSION_ID_ENV, driver);
+    let ts = crate::engine::types::now_iso8601();
+    f.backend.append_event(session, payload, &ts).unwrap();
+}
+
+fn cached_driver(f: &Fixture, session: &str) -> Option<String> {
+    sidecar::read(&f.backend.session_dir(session)).and_then(|s| s.driver)
+}
+
+#[test]
+fn each_change_of_driver_writes_driver_seen_before_the_payloads_record() {
+    let f = Fixture::new();
+    set_host_env_for_test(CLAUDE_SESSION_ID_ENV, Some("driver-a"));
+    f.init("wf", header("wf", "wf-id", None), Some("a"));
+    commit_as(&f, Some("driver-b"), "wf", &transitioned(Some("a"), "b"));
+    commit_as(&f, Some("driver-b"), "wf", &transitioned(Some("b"), "c"));
+    commit_as(&f, Some("driver-a"), "wf", &transitioned(Some("c"), "d"));
+
+    let j = f.journal();
+    assert_eq!(
+        kinds(&j),
+        vec![
+            "session_started",
+            "state_entered",
+            "driver_seen",
+            "state_entered",
+            "state_entered",
+            "driver_seen",
+            "state_entered",
+        ]
+    );
+    assert_eq!(j[2]["koto.driver.session.id"], "driver-b");
+    assert_eq!(j[3]["koto.state"], "b");
+    assert_eq!(j[5]["koto.driver.session.id"], "driver-a");
+    assert_eq!(j[6]["koto.state"], "d");
+    for r in &j[2..] {
+        assert_eq!(r["koto.session.id"], "wf-id");
+        assert_eq!(r["koto.run.id"], "wf-id");
+    }
+    assert_eq!(cached_driver(&f, "wf").as_deref(), Some("driver-a"));
+    // The run id stays cached next to the driver.
+    assert_eq!(
+        sidecar::read(&f.backend.session_dir("wf")).unwrap().run_id,
+        Some("wf-id".into())
+    );
+    assert!(warnings_for_test().is_empty());
+}
+
+#[test]
+fn a_payload_that_writes_no_record_still_records_a_new_driver() {
+    let f = Fixture::new();
+    set_host_env_for_test(CLAUDE_SESSION_ID_ENV, Some("driver-a"));
+    f.init("wf", header("wf", "wf-id", None), Some("a"));
+    commit_as(&f, Some("driver-b"), "wf", &evidence("a"));
+    commit_as(&f, Some("driver-b"), "wf", &evidence("a"));
+    let j = f.journal();
+    assert_eq!(
+        kinds(&j),
+        vec!["session_started", "state_entered", "driver_seen"]
+    );
+    assert_eq!(j[2]["koto.driver.session.id"], "driver-b");
+    assert!(j[2].get("koto.state").is_none());
+    assert_eq!(cached_driver(&f, "wf").as_deref(), Some("driver-b"));
+}
+
+#[test]
+fn no_driver_or_a_malformed_one_is_never_a_change() {
+    let f = Fixture::new();
+    set_host_env_for_test(CLAUDE_SESSION_ID_ENV, Some("driver-a"));
+    f.init("wf", header("wf", "wf-id", None), Some("a"));
+    let before = std::fs::read(f.backend.session_dir("wf").join(sidecar::SIDECAR_FILE)).unwrap();
+    let long = "d".repeat(200);
+    for driver in [None, Some("a\nb"), Some(long.as_str()), Some("")] {
+        commit_as(&f, driver, "wf", &evidence("a"));
+        commit_as(&f, driver, "wf", &transitioned(Some("a"), "a"));
+    }
+    let j = f.journal();
+    assert!(
+        kinds(&j).iter().all(|k| k != "driver_seen"),
+        "{:?}",
+        kinds(&j)
+    );
+    let after = std::fs::read(f.backend.session_dir("wf").join(sidecar::SIDECAR_FILE)).unwrap();
+    assert_eq!(before, after, "the cache is left as it was");
+}
+
+#[test]
+fn a_session_created_without_a_driver_records_its_first_one() {
+    let f = Fixture::new();
+    f.init("wf", header("wf", "wf-id", None), Some("a"));
+    assert_eq!(cached_driver(&f, "wf"), None);
+    commit_as(&f, None, "wf", &evidence("a"));
+    commit_as(&f, Some("driver-a"), "wf", &transitioned(Some("a"), "b"));
+    commit_as(&f, Some("driver-a"), "wf", &transitioned(Some("b"), "c"));
+    let j = f.journal();
+    assert_eq!(
+        kinds(&j),
+        vec![
+            "session_started",
+            "state_entered",
+            "driver_seen",
+            "state_entered",
+            "state_entered",
+        ]
+    );
+    assert!(j[0].get("koto.driver.session.id").is_none());
+    assert_eq!(j[2]["koto.driver.session.id"], "driver-a");
+    assert_eq!(cached_driver(&f, "wf").as_deref(), Some("driver-a"));
+}
+
+/// A session with no sidecar at all (an older koto made it, or the cache
+/// was lost) gets `driver_seen` for the first driver it meets, and the
+/// sidecar written for it never caches an unresolved run id.
+#[test]
+fn a_lost_sidecar_records_the_driver_again_and_keeps_an_unresolved_run_id_uncached() {
+    let f = Fixture::new();
+    // An older child whose parent is gone: its run id can't be resolved.
+    f.init(
+        "gone.kid",
+        header("gone.kid", "kid-id", Some("gone")),
+        Some("a"),
+    );
+    std::fs::remove_file(
+        f.backend
+            .session_dir("gone.kid")
+            .join(sidecar::SIDECAR_FILE),
+    )
+    .unwrap();
+    commit_as(&f, Some("driver-a"), "gone.kid", &evidence("a"));
+    let j = f.journal();
+    let last = j.last().unwrap();
+    assert_eq!(last["kind"], "driver_seen");
+    assert!(last.get("koto.run.id").is_none(), "{last}");
+    assert_eq!(cached_driver(&f, "gone.kid").as_deref(), Some("driver-a"));
+
+    // The parent appears (a root, as an older koto left it): the next
+    // record resolves the run id instead of trusting the empty cache.
+    f.init("gone", header("gone", "gone-id", None), None);
+    commit_as(
+        &f,
+        Some("driver-a"),
+        "gone.kid",
+        &transitioned(Some("a"), "b"),
+    );
+    let j = f.journal();
+    let last = j.last().unwrap();
+    assert_eq!(last["kind"], "state_entered");
+    assert_eq!(last["koto.run.id"], "gone-id");
+    let cached = sidecar::read(&f.backend.session_dir("gone.kid")).unwrap();
+    assert_eq!(cached.run_id.as_deref(), Some("gone-id"));
+    assert_eq!(cached.driver.as_deref(), Some("driver-a"));
+}

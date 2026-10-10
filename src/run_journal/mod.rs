@@ -39,6 +39,8 @@
 //! - `state_entered`: `koto.state`.
 //! - `terminal`: `koto.terminal`.
 //! - `cancelled`: nothing more.
+//! - `driver_seen`: `koto.driver.session.id`, the Claude Code session now
+//!   driving the session, when it differs from the last one recorded.
 //!
 //! A field with no value is left out, never written as null or empty. Ids
 //! must match `^[A-Za-z0-9._:-]{1,128}$` and names (template and state
@@ -55,7 +57,12 @@
 //! - [`after_commit`], from `LocalBackend::append_event` next to the
 //!   `/workflows` hook, writes `state_entered` for each `transitioned`,
 //!   `directed_transition` and `rewound` event and `cancelled` for
-//!   `workflow_cancelled`.
+//!   `workflow_cancelled`. Before those, on any committed payload, it
+//!   writes `driver_seen` when the process's driver (`CLAUDE_CODE_SESSION_ID`,
+//!   when id-shaped) differs from the one the session's sidecar caches, or
+//!   the sidecar caches none, and then caches the new driver. No driver is
+//!   never a change. Two commands racing under one new driver can each
+//!   write a `driver_seen`; readers take the distinct values.
 //! - [`terminal`], from the terminal tick, writes `terminal` once per
 //!   arrival.
 //! - [`imported`], from `koto session import`, writes the imported
@@ -83,7 +90,7 @@
 //! The journal is the one file koto writes for external readers. Each
 //! session also gets a sidecar, `run-journal.json` in its session
 //! directory, which koto does read back: it caches the session's run id
-//! and creating driver (see `sidecar`). Neither is session state. Cloud
+//! and the driver last recorded for it (see `sidecar`). Neither is session state. Cloud
 //! sync and `koto session import` carry neither: they move the state log,
 //! version, template and context files only.
 
@@ -343,16 +350,18 @@ fn session_started(
 }
 
 /// The session's run id: the sidecar's cached value, or derived from the
-/// header (and the parent chain for an older child) and cached now. An
-/// unresolved run id is not cached, so a parent header that was briefly
-/// unreadable is tried again on the next record.
+/// header (and the parent chain for an older child) and cached now, next
+/// to the driver the sidecar already holds. An unresolved run id is not
+/// trusted from the cache, so a parent header that was briefly unreadable
+/// is tried again on the next record.
 fn cached_run_id(
     backend: &dyn SessionBackend,
     session_dir: &Path,
     header: &StateFileHeader,
 ) -> Option<String> {
-    if let Some(cached) = sidecar::read(session_dir) {
-        return cached.run_id;
+    let cached = sidecar::read(session_dir);
+    if let Some(run_id) = cached.as_ref().and_then(|c| c.run_id.clone()) {
+        return Some(run_id);
     }
     let run_id = run_id::run_id(backend, header);
     if run_id.is_some() {
@@ -360,11 +369,21 @@ fn cached_run_id(
             session_dir,
             &sidecar::Sidecar {
                 run_id: run_id.clone(),
-                driver: None,
+                driver: cached.and_then(|c| c.driver),
             },
         );
     }
     run_id
+}
+
+/// The driver of this process when it differs from the one the session's
+/// sidecar caches, or when the sidecar caches none: a change of driving
+/// session that [`after_commit`] records. `None` when this process has no
+/// driver, since no driver is never a change.
+fn changed_driver(session_dir: &Path) -> Option<String> {
+    let current = driver()?;
+    let cached = sidecar::read(session_dir).and_then(|s| s.driver);
+    (cached.as_deref() != Some(current.as_str())).then_some(current)
 }
 
 /// Journal a session that `init_state_file` has just committed:
@@ -404,18 +423,29 @@ pub(crate) fn after_init(
 }
 
 /// Journal a payload `append_event` has just committed to `session`'s log.
-/// Payloads other than state entries and cancels write nothing and read
-/// nothing. `journal_root` is the store's journal home; `None` writes
-/// nothing.
+///
+/// When this process runs under a driver other than the one the session's
+/// sidecar caches (or the sidecar caches none), a `driver_seen` record comes
+/// first, whatever the payload, and the sidecar is then rewritten with the
+/// new driver. Two commands racing under the same new driver can each
+/// write one; readers take the distinct values, so the duplicate is
+/// harmless. Otherwise payloads other than state entries and cancels write
+/// nothing and read nothing beyond the sidecar. `journal_root` is the
+/// store's journal home; `None` writes nothing.
 pub(crate) fn after_commit(
     journal_root: Option<&Path>,
     backend: &dyn SessionBackend,
     session: &str,
     payload: &EventPayload,
 ) {
-    let Some(root) = journal_root.filter(|_| journals(payload)) else {
+    let Some(root) = journal_root else {
         return;
     };
+    let session_dir = backend.session_dir(session);
+    let new_driver = changed_driver(&session_dir);
+    if new_driver.is_none() && !journals(payload) {
+        return;
+    }
     let header = match backend.read_header(session) {
         Ok(h) => h,
         Err(e) => {
@@ -427,9 +457,29 @@ pub(crate) fn after_commit(
             return;
         }
     };
-    let run_id = cached_run_id(backend, &backend.session_dir(session), &header);
-    if let Some(record) = record_for(payload, session, &header, run_id.as_deref()) {
-        write(root, &[record]);
+    let run_id = cached_run_id(backend, &session_dir, &header);
+    let mut records = Vec::new();
+    if let Some(d) = new_driver.as_deref() {
+        records.push(
+            Record::new(
+                "driver_seen",
+                session,
+                &header.session_id,
+                run_id.as_deref(),
+            )
+            .id("koto.driver.session.id", Some(d)),
+        );
+    }
+    records.extend(record_for(payload, session, &header, run_id.as_deref()));
+    write(root, &records);
+    if new_driver.is_some() {
+        let _ = sidecar::write(
+            &session_dir,
+            &sidecar::Sidecar {
+                run_id,
+                driver: new_driver,
+            },
+        );
     }
 }
 
