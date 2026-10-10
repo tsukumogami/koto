@@ -17,7 +17,7 @@ use crate::engine::types::{Event, EventPayload, StateFileHeader};
 use crate::session::SessionBackend;
 use crate::template::types::CompiledTemplate;
 
-use super::contract::RenderStatus;
+use super::contract::{HoldingKey, Holdings, RenderStatus, HOLDINGS_KEY_CAP};
 
 const LABEL_SEP: &str = " \u{b7} "; // " · "
 
@@ -156,6 +156,83 @@ pub struct EnrichedProjection {
     pub base: Projection,
     /// The session's phases in structural order.
     pub phases: Vec<PhaseEntry>,
+    /// The holdings summary, folded from the same log read (contract v3).
+    pub holdings: Holdings,
+}
+
+/// Fold the holdings summary from the log: last writer wins per key, with
+/// `context_removed` and `context_cleared` taking keys back out. Counts and
+/// the byte total cover every live key; the listed names are the first
+/// [`HOLDINGS_KEY_CAP`] that pass the key grammar, because a pulled log can
+/// carry names no local write ever validated, and those are counted but
+/// never listed. Local state only: no store read, no remote request —
+/// `materialize_after_commit` runs this on every event append.
+fn fold_holdings(header: &StateFileHeader, events: &[Event]) -> Holdings {
+    use crate::session::context_log::loggable_key;
+    use std::collections::BTreeMap;
+
+    let mut live: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut event_anchor: Option<&std::path::Path> = None;
+    for e in events {
+        match &e.payload {
+            EventPayload::ContextAdded { key, size, .. } => {
+                live.insert(key.as_str(), *size);
+            }
+            EventPayload::ContextRemoved { key, .. } => {
+                live.remove(key.as_str());
+            }
+            EventPayload::ContextCleared { keys, .. } => {
+                for k in keys {
+                    live.remove(k.as_str());
+                }
+            }
+            EventPayload::ExecutionAnchorAdopted { anchor } => {
+                event_anchor = Some(anchor.as_path());
+            }
+            EventPayload::ExecutionAnchorRebound { to, .. } => {
+                event_anchor = Some(to.as_path());
+            }
+            _ => {}
+        }
+    }
+
+    let total_bytes = live.values().fold(0u64, |acc, s| acc.saturating_add(*s));
+    let valid: Vec<(&str, u64)> = live
+        .iter()
+        .filter(|(k, _)| loggable_key(k))
+        .map(|(k, s)| (*k, *s))
+        .collect();
+    let keys_truncated = valid.len() > HOLDINGS_KEY_CAP;
+    let keys = valid
+        .into_iter()
+        .take(HOLDINGS_KEY_CAP)
+        .map(|(k, s)| HoldingKey {
+            key: k.to_string(),
+            size: s,
+        })
+        .collect();
+
+    let cap_fact = |p: &std::path::Path| {
+        crate::session_view::sanitize_capped(&p.to_string_lossy(), crate::session_view::FACT_CAP)
+            .into_string()
+    };
+    let anchor = event_anchor
+        .map(cap_fact)
+        .or_else(|| header.execution_dir.as_deref().map(cap_fact))
+        .or_else(|| header.origin.as_ref().map(|o| cap_fact(&o.anchor)));
+    let store = header
+        .origin
+        .as_ref()
+        .map(|o| crate::session_view::sanitize_capped(&o.store.kind, 64).into_string());
+
+    Holdings {
+        key_count: live.len(),
+        total_bytes,
+        keys,
+        keys_truncated,
+        anchor,
+        store,
+    }
 }
 
 /// Derive the enriched projection for `session_id`, reading the log once.
@@ -199,7 +276,12 @@ pub fn derive_enriched_projection(
         None => Vec::new(),
     };
 
-    Some(EnrichedProjection { base, phases })
+    let holdings = fold_holdings(&header, &events);
+    Some(EnrichedProjection {
+        base,
+        phases,
+        holdings,
+    })
 }
 
 /// Build the ordered phase entries with per-phase status, directive, and
@@ -387,6 +469,130 @@ mod tests {
         h.intent = intent.map(str::to_string);
         h.template_name = template_name.map(str::to_string);
         h
+    }
+
+    fn event(seq: u64, payload: EventPayload) -> Event {
+        Event {
+            seq,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        }
+    }
+
+    fn added(seq: u64, key: &str, size: u64) -> Event {
+        event(
+            seq,
+            EventPayload::ContextAdded {
+                key: key.to_string(),
+                hash: "h".to_string(),
+                size,
+                writer: None,
+            },
+        )
+    }
+
+    #[test]
+    fn holdings_fold_is_last_writer_wins() {
+        let h = header(None, None);
+        let events = vec![
+            added(1, "a.md", 10),
+            added(2, "b.md", 20),
+            added(3, "a.md", 30), // re-add replaces
+            event(
+                4,
+                EventPayload::ContextRemoved {
+                    key: "b.md".to_string(),
+                    writer: None,
+                },
+            ),
+            added(5, "c.md", 5),
+            event(
+                6,
+                EventPayload::ContextCleared {
+                    state: "s".to_string(),
+                    keys: vec!["c.md".to_string()],
+                    entry_seq: 5,
+                },
+            ),
+        ];
+        let holdings = fold_holdings(&h, &events);
+        assert_eq!(holdings.key_count, 1);
+        assert_eq!(holdings.total_bytes, 30);
+        assert_eq!(holdings.keys.len(), 1);
+        assert_eq!(holdings.keys[0].key, "a.md");
+        assert_eq!(holdings.keys[0].size, 30);
+        assert!(!holdings.keys_truncated);
+        assert!(holdings.anchor.is_none(), "no anchor recorded anywhere");
+        assert!(holdings.store.is_none());
+    }
+
+    #[test]
+    fn holdings_counts_invalid_names_but_never_lists_them() {
+        let h = header(None, None);
+        let events = vec![added(1, "ok.md", 7), added(2, "../../etc/hosts", 9)];
+        let holdings = fold_holdings(&h, &events);
+        assert_eq!(holdings.key_count, 2);
+        assert_eq!(holdings.total_bytes, 16);
+        assert_eq!(holdings.keys.len(), 1);
+        assert_eq!(holdings.keys[0].key, "ok.md");
+    }
+
+    #[test]
+    fn holdings_saturate_and_truncate_at_the_cap() {
+        let h = header(None, None);
+        let mut events = vec![added(1, "big.bin", u64::MAX), added(2, "more.bin", 1)];
+        for i in 0..super::HOLDINGS_KEY_CAP {
+            events.push(added(3 + i as u64, &format!("k{i:03}.md"), 1));
+        }
+        let holdings = fold_holdings(&h, &events);
+        assert_eq!(holdings.total_bytes, u64::MAX, "saturating, no overflow");
+        assert_eq!(holdings.keys.len(), super::HOLDINGS_KEY_CAP);
+        assert!(holdings.keys_truncated);
+    }
+
+    #[test]
+    fn holdings_empty_session_is_zeroes() {
+        let h = header(None, None);
+        let holdings = fold_holdings(&h, &[]);
+        assert_eq!(holdings.key_count, 0);
+        assert_eq!(holdings.total_bytes, 0);
+        assert!(holdings.keys.is_empty());
+        assert!(!holdings.keys_truncated);
+    }
+
+    #[test]
+    fn holdings_anchor_prefers_the_last_anchor_event() {
+        let mut h = header(None, None);
+        h.execution_dir = Some(std::path::PathBuf::from("/srv/original"));
+        let events = vec![
+            event(
+                1,
+                EventPayload::ExecutionAnchorAdopted {
+                    anchor: std::path::PathBuf::from("/srv/adopted"),
+                },
+            ),
+            event(
+                2,
+                EventPayload::ExecutionAnchorRebound {
+                    from: Some(std::path::PathBuf::from("/srv/adopted")),
+                    to: std::path::PathBuf::from("/srv/rebound"),
+                },
+            ),
+        ];
+        let holdings = fold_holdings(&h, &events);
+        assert_eq!(holdings.anchor.as_deref(), Some("/srv/rebound"));
+        let none = fold_holdings(&h, &[]);
+        assert_eq!(none.anchor.as_deref(), Some("/srv/original"));
+    }
+
+    #[test]
+    fn holdings_sanitizes_a_hostile_anchor() {
+        let mut h = header(None, None);
+        h.execution_dir = Some(std::path::PathBuf::from("/srv/\u{1B}[2J/evil"));
+        let holdings = fold_holdings(&h, &[]);
+        assert_eq!(holdings.anchor.as_deref(), Some("/srv/\\u{1B}[2J/evil"));
     }
 
     #[test]

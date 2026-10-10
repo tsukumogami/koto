@@ -2203,6 +2203,27 @@ Sessions whose state file header fails to parse are excluded from the feed (they
 not valid sessions) but are reported as a trailing `note:` on stderr, so they are
 surfaced rather than silently dropped.
 
+## Native `/workflows` File
+
+On every event append, a session with a published `/workflows` location (the
+`workflows/publish-location` context key) writes a `koto-<uuid>.json` file into
+that directory for Claude Code's workflow view. Like the dashboard feed, the
+file is derived at write time from the data already in this contract — the
+event log and header — plus the compiled template for phase titles; nothing
+new is recorded in the log, and the render makes no remote request on a
+cloud-backed session.
+
+From contract version 3 the file carries a `holdings` summary folded from the
+`context_added` / `context_removed` / `context_cleared` events: the live key
+count, the summed byte total, up to 50 key names with their sizes, and the
+session's execution anchor and store kind. **Key names and sizes are written
+to this file; key content and hashes never are.** The file lands in a
+directory outside the session store (wherever the hosting session published),
+so a key name is the most a reader of that directory learns about what the
+session holds. Names that fail the context-key grammar are counted but not
+listed, and anchor and store strings are sanitized and length-capped before
+they are written.
+
 ## Lifecycle Metadata Surface
 
 Session-level liveness — whether a session is active, idle, blocked, stalled, failed,

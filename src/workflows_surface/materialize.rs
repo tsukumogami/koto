@@ -131,7 +131,8 @@ fn try_materialize(
         proj.status,
         start_time,
     )
-    .with_detail(phases, progress);
+    .with_detail(phases, progress)
+    .with_holdings(enriched.holdings.clone());
     let bytes = file.to_json_bytes()?;
     atomic_write(&dir, &target, &bytes)
 }
@@ -656,6 +657,91 @@ mod tests {
             .find(|n| n["type"] == "workflow_agent" && n["phaseTitle"] == "Review")
             .expect("review step");
         assert_eq!(review["state"], "progress");
+    }
+
+    /// The enriched file carries the holdings summary -- key names and sizes
+    /// folded from the event log alone -- and never the keys' hashes or any
+    /// content byte. No context file exists on disk here, so a fold that
+    /// reached for the store instead of the log would have nothing to read.
+    #[test]
+    fn holdings_in_file_carry_names_and_sizes_never_hashes_or_content() {
+        let base = TempDir::new().unwrap();
+        let wf = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+        write_template(&backend, "solo", MULTI_PHASE_TEMPLATE);
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
+
+        let add = |key: &str, hash: &str, size: u64| {
+            let payload = EventPayload::ContextAdded {
+                key: key.to_string(),
+                hash: hash.to_string(),
+                size,
+                writer: Some("agent".to_string()),
+            };
+            backend
+                .append_event("solo", &payload, "2026-01-01T00:02:00Z")
+                .expect("append context_added");
+        };
+        add("notes.md", "aaaa1111deadbeef", 64);
+        add("research/long.md", "bbbb2222deadbeef", 1_000);
+        // A removed key must not linger in the summary.
+        add("scratch.md", "cccc3333deadbeef", 9);
+        backend
+            .append_event(
+                "solo",
+                &EventPayload::ContextRemoved {
+                    key: "scratch.md".to_string(),
+                    writer: Some("agent".to_string()),
+                },
+                "2026-01-01T00:03:00Z",
+            )
+            .expect("append context_removed");
+
+        let path = wf.path().join(workflow_filename("solo-uuid"));
+        let bytes = std::fs::read(&path).expect("file written");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let holdings = &v["koto"]["holdings"];
+        // Three live keys: the two added above plus koto's own
+        // `workflows/publish-location`, a real context key `publish_location`
+        // wrote -- the summary reports what the session holds, koto's
+        // plumbing included. Its size tracks the temp path, so the byte
+        // total is checked relative to it.
+        assert_eq!(holdings["keyCount"], 3);
+        assert_eq!(holdings["keysTruncated"], false);
+        let keys = holdings["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 3);
+        let publish_size = keys
+            .iter()
+            .find(|k| k["key"] == "workflows/publish-location")
+            .expect("publish-location key listed")["size"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            holdings["totalBytes"].as_u64().unwrap(),
+            1_064 + publish_size
+        );
+        for k in keys {
+            let obj = k.as_object().unwrap();
+            assert_eq!(
+                obj.keys().collect::<Vec<_>>(),
+                vec!["key", "size"],
+                "a holdings key row carries the name and size and nothing else"
+            );
+        }
+        assert!(keys
+            .iter()
+            .any(|k| k["key"] == "notes.md" && k["size"] == 64));
+        assert!(keys
+            .iter()
+            .any(|k| k["key"] == "research/long.md" && k["size"] == 1_000));
+        assert!(!keys.iter().any(|k| k["key"] == "scratch.md"));
+
+        // Content safety: the hashes logged for the keys never reach the file.
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("deadbeef"), "no key hash in the file");
     }
 
     fn read_file(dir: &Path, uuid: &str) -> Option<serde_json::Value> {
