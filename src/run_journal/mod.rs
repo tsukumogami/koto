@@ -70,6 +70,20 @@
 //! journal on stderr, the first time only, and carries on. Nothing about
 //! the command's output, exit code, session state or gate decisions
 //! changes.
+//!
+//! A write cut short (a crash, a full disk) can leave a partial last line.
+//! The next record starts on a line of its own, so only the partial line is
+//! lost; two writers racing past a partial line can leave an empty line
+//! instead. Readers skip empty lines and lines that don't parse as JSON.
+//!
+//! ## Files
+//!
+//! The journal is the one file koto writes for external readers. Each
+//! session also gets a sidecar, `run-journal.json` in its session
+//! directory, which koto does read back: it caches the session's run id
+//! and creating driver (see `sidecar`). Neither is session state. Cloud
+//! sync and `koto session import` carry neither: they move the state log,
+//! version, template and context files only.
 
 mod driver;
 mod fixture;
@@ -253,13 +267,36 @@ fn write(root: &Path, records: &[Record]) {
     let path = root.join(JOURNAL_FILE);
     let max = max_line_bytes();
     for record in records {
-        let line = record.to_line();
+        let mut line = record.to_line();
+        // After a partial last line, start this record on a line of its own.
+        if ends_mid_line(&path) {
+            line.insert(0, '\n');
+        }
         if let Err(e) =
             crate::engine::jsonl_append::append_bounded_line_no_follow(root, &path, &line, max)
         {
             warn_once(&format!("{}: {}", path.display(), e.root_cause()));
         }
     }
+}
+
+/// Whether the journal at `path` is non-empty and its last byte isn't a
+/// newline, as a write cut short leaves it. Any failure to tell reads as
+/// no: the append that follows reports its own error.
+fn ends_mid_line(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let Ok(mut file) = options.open(path) else {
+        return false;
+    };
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::End(-1)).is_ok() && file.read_exact(&mut last).is_ok() && last[0] != b'\n'
 }
 
 // ----- The hooks -----

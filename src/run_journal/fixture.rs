@@ -150,9 +150,13 @@ fn matches(rule: &Rule, dir: &Path, tmpdir: Option<&str>) -> bool {
                     return true;
                 }
             }
-            // TMPDIR counts as given, and only when it is absolute.
+            // TMPDIR counts as given, and only when it is absolute. A TMPDIR
+            // of `/` names no temporary directory: it would make every
+            // absolute path a fixture. Any other value counts as given, so a
+            // TMPDIR of the home directory makes everything under home one.
             tmpdir.and_then(normpath).is_some_and(|root| {
-                text == root || text.starts_with(&format!("{}/", root.trim_end_matches('/')))
+                let trimmed = root.trim_end_matches('/');
+                !trimmed.is_empty() && (text == root || text.starts_with(&format!("{}/", trimmed)))
             })
         }
         Rule::Segment { pattern, ancestor } => {
@@ -297,6 +301,14 @@ mod tests {
             "/home/me/scratch-temp/a",
             "/elsewhere"
         ));
+        // A TMPDIR of the root names no temporary directory.
+        for root in ["/", "//", "///"] {
+            assert!(!fixture_with_temp_dir("/home/me/project", root), "{root}");
+        }
+        assert!(
+            fixture_with_temp_dir("/tmp/x", "/"),
+            "the fixed roots still count"
+        );
 
         // A relative TMPDIR names nothing.
         assert!(!fixture_with_temp_dir(

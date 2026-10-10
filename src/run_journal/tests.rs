@@ -456,3 +456,31 @@ fn a_store_on_an_explicit_base_journals_inside_its_base() {
     assert_eq!(listed, vec!["quiet".to_string()]);
     assert!(warnings_for_test().is_empty());
 }
+
+/// A partial last line, as a crash or a full disk leaves it, costs only
+/// that line: the next record starts on a line of its own and parses.
+#[test]
+fn a_record_after_a_partial_last_line_starts_on_its_own_line() {
+    let f = Fixture::new();
+    std::fs::create_dir_all(&f.home).unwrap();
+    let path = f.home.join(JOURNAL_FILE);
+    std::fs::write(&path, "{\"kind\":\"session_sta").unwrap();
+    write(
+        &f.home,
+        &[Record::new("cancelled", "torn", "id-torn", Some("id-torn"))],
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text:?}");
+    assert_eq!(lines[0], "{\"kind\":\"session_sta");
+    let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(record["kind"], "cancelled");
+    assert!(text.ends_with('\n'));
+    // A journal that ends cleanly gets no extra newline.
+    write(
+        &f.home,
+        &[Record::new("cancelled", "torn", "id-torn", Some("id-torn"))],
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+    assert!(warnings_for_test().is_empty());
+}
