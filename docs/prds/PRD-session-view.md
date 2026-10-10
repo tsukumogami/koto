@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   A person responsible for a koto session — an operator checking a
   long-running run, a teammate taking one over, a maintainer debugging a stuck
@@ -21,7 +21,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-session-view](docs/briefs/BRIEF-session-view.md); carried in Absorbed Brief.
 
