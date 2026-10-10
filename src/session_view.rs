@@ -156,8 +156,8 @@ pub fn sanitize_capped(input: &str, cap: usize) -> Sanitized {
 // ---------------------------------------------------------------------------
 
 /// Render a byte count in binary units with one decimal: `0 B`, `512 B`,
-/// `4.0 KiB`, `1.2 MiB`. Total over `u64::MAX` is impossible by type; the
-/// unit walk never indexes past its table.
+/// `4.0 KiB`, `1.2 MiB`. Covers every `u64` value; the unit walk stops
+/// at EiB and never indexes past its table.
 pub fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     if bytes < 1024 {
@@ -293,10 +293,10 @@ pub enum KeyPreview {
 
 /// Interpolate a state's directive (or details) text exactly the way
 /// `koto status` does: runtime `SESSION_DIR` / `SESSION_NAME` first, then
-/// the log's variables. [`snapshot`] calls it today; `handle_status`
-/// switches onto it in a follow-up change whose characterization tests
-/// pin its JSON byte-for-byte, so this is written to match its
-/// substitution order exactly.
+/// the log's variables. [`snapshot`] and `handle_status` both call it —
+/// one rendering, two readers — and
+/// `tests/status_characterization_test.rs` pins the output across the
+/// seam.
 pub fn render_directive(
     raw: &str,
     session_dir: &Path,
@@ -448,7 +448,9 @@ pub fn snapshot(backend: &Backend, name: &str) -> Result<SessionViewSnapshot, Sn
     // reading, which is a write this provably-read-only view must never
     // make (it can replace a newer local log with an older remote copy).
     // The view shows the local copy's state, exactly as it shows local
-    // key content.
+    // key content; on a cloud-backed session the facts can trail the
+    // remote, and the per-key locality and stale markers say where the
+    // remote differs.
     let (header, events) = match backend.read_events_local(name) {
         Ok(ok) => ok,
         // The local read makes no migration check (the one above already
@@ -460,7 +462,7 @@ pub fn snapshot(backend: &Backend, name: &str) -> Result<SessionViewSnapshot, Sn
 
     // A session that never advanced derives no current state; that is
     // absence to show, not corruption (an unparseable log already failed
-    // at `read_events`). This deliberately diverges from `koto status`,
+    // at the local read above). This deliberately diverges from `koto status`,
     // which exits 3 ("corrupt state file") on the same shape: a status
     // query on a never-run session has nothing to answer, while a view of
     // one has its facts and keys to show. The follow-up that moves
@@ -574,6 +576,8 @@ pub fn read_key_preview(backend: &Backend, name: &str, key: &str, bound: usize) 
                 Err(e)
                     if !read.complete
                         && e.error_len().is_none()
+                        // 3 is the longest partial UTF-8 sequence a cut
+                        // can leave: a 4-byte character missing its tail.
                         && e.valid_up_to() >= sample.len().saturating_sub(3) =>
                 {
                     // Split tail at the cut: keep the whole characters.
