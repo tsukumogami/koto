@@ -3,10 +3,12 @@
 //!
 //! koto appends one JSON object per line to `<koto home>/_run_journal.jsonl`
 //! (the same `~/.koto` the decider ledger uses) as sessions are created,
-//! enter states, reach a terminal and are cancelled. The journal is
-//! append-only: koto never rewrites, deletes or reads back its records, so its lines
-//! outlive the sessions they describe, including sessions koto removes at
-//! their terminal tick or on `koto session cleanup`.
+//! enter states, reach a terminal, are cancelled and change driver. The
+//! journal is append-only: koto never rewrites, deletes or reads back its
+//! records, so its lines outlive the sessions they describe, including
+//! sessions koto removes at their terminal tick or on
+//! `koto session cleanup`. `docs/reference/run-journal.md` documents the
+//! format for readers.
 //!
 //! ## Where the journal lives
 //!
@@ -72,9 +74,10 @@
 //! ## Failure
 //!
 //! Writing is best-effort. When a record can't be written (a koto home that
-//! can't be created, a read-only or full disk, a symlink at the journal's path, a record over
-//! [`MAX_LINE_BYTES`]) the process prints one warning line naming the run
-//! journal on stderr, the first time only, and carries on. Nothing about
+//! can't be created, a read-only or full disk, a symlink at the journal's
+//! path, a record over [`MAX_LINE_BYTES`]) the process prints one warning
+//! line naming the run journal on stderr, the first time only, and carries
+//! on. Nothing about
 //! the command's output, exit code, session state or gate decisions
 //! changes.
 //!
@@ -90,9 +93,9 @@
 //! The journal is the one file koto writes for external readers. Each
 //! session also gets a sidecar, `run-journal.json` in its session
 //! directory, which koto does read back: it caches the session's run id
-//! and the driver last recorded for it (see `sidecar`). Neither is session state. Cloud
-//! sync and `koto session import` carry neither: they move the state log,
-//! version, template and context files only.
+//! and the driver last recorded for it (see `sidecar`). Neither is session
+//! state. Cloud sync and `koto session import` carry neither: they move the
+//! state log, version, template and context files only.
 
 mod driver;
 mod fixture;
@@ -351,9 +354,10 @@ fn session_started(
 
 /// The session's run id: the sidecar's cached value, or derived from the
 /// header (and the parent chain for an older child) and cached now, next
-/// to the driver the sidecar already holds. An unresolved run id is not
-/// trusted from the cache, so a parent header that was briefly unreadable
-/// is tried again on the next record.
+/// to the driver the sidecar already holds. A sidecar with no run id (one
+/// written for a driver before the run id resolved) is derived again, so a
+/// parent header that was briefly unreadable is tried again on the next
+/// record.
 fn cached_run_id(
     backend: &dyn SessionBackend,
     session_dir: &Path,
@@ -429,9 +433,10 @@ pub(crate) fn after_init(
 /// first, whatever the payload, and the sidecar is then rewritten with the
 /// new driver. Two commands racing under the same new driver can each
 /// write one; readers take the distinct values, so the duplicate is
-/// harmless. Otherwise payloads other than state entries and cancels write
-/// nothing and read nothing beyond the sidecar. `journal_root` is the
-/// store's journal home; `None` writes nothing.
+/// harmless. Without a driver change, payloads other than state entries
+/// and cancels write nothing and read nothing beyond the sidecar; a driver
+/// change or a journaled payload also reads the session's header.
+/// `journal_root` is the store's journal home; `None` writes nothing.
 pub(crate) fn after_commit(
     journal_root: Option<&Path>,
     backend: &dyn SessionBackend,
@@ -472,6 +477,10 @@ pub(crate) fn after_commit(
     }
     records.extend(record_for(payload, session, &header, run_id.as_deref()));
     write(root, &records);
+    // The cache moves only after the journal write, so a crash between the
+    // two repeats the `driver_seen` on the next command rather than losing
+    // it. A write that failed (and warned) is not retried: the cache moves
+    // either way, as every journal write is best-effort.
     if new_driver.is_some() {
         let _ = sidecar::write(
             &session_dir,

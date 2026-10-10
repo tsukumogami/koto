@@ -19,6 +19,12 @@ header:
     session_id:
       type: string
       required: false
+    root_session_id:
+      type: string
+      required: false
+    parent_session_id:
+      type: string
+      required: false
     parent_workflow:
       type: string
       required: false
@@ -649,6 +655,8 @@ version signal.
 | `template_hash` | string | Yes | SHA-256 hex digest of the compiled template JSON at init time. |
 | `created_at` | string | Yes | RFC 3339 UTC timestamp of session creation. |
 | `session_id` | string | No | UUID v4 generated at `koto init` time. Absent (empty string) in files written before this field existed. |
+| `root_session_id` | string | No | `session_id` of the root of the session's parent chain, recorded when a child is created (by a batch spawn or `koto session start --parent`), so the child's run stays identifiable after the root is removed. A root's run is its own `session_id`. Absent on root sessions, on files written before the field existed, and on a child whose root couldn't be resolved when it was created. Never rewritten. The [run journal](run-journal.md#run-ids) records it as a child's run id. |
+| `parent_session_id` | string | No | `session_id` of the parent session, recorded when a child is created. Absent on root sessions and on files written before the field existed. Never rewritten. |
 | `parent_workflow` | string | No | Name of the parent workflow for batch-spawned children. Absent for top-level sessions. |
 | `template_source_dir` | string | No | Absolute path to the directory containing the source template at init time. Absent for stdin/inline templates and older files. |
 | `template_source_file` | string | No | File name (no directory) of the source template `koto init` compiled the session from, such as `work-on.md`. Together with `template_hash` it is the session's template identity, which `koto request attach` compares against the template a request leg names. Absent for `--from-stdin` sessions and older files; a leg attach refuses such a session rather than guessing. |
