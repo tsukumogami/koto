@@ -1,10 +1,12 @@
 //! The per-session run journal sidecar, `<session dir>/run-journal.json`.
 //!
-//! It caches the session's run id and the driver recorded when it was
-//! created, so journal records need no walk up the parent chain after the
-//! first. It is local to the host, lives in the session directory, and goes
-//! when the session is removed. Every failure here is non-fatal: without
-//! the cache the run id is derived again from the header.
+//! It caches the session's run id, so journal records need no walk up the
+//! parent chain after the first, and the driver last recorded for the
+//! session: the creating driver at first, then each new one a `driver_seen`
+//! record names. It is local to the host, lives in the session directory,
+//! and goes when the session is removed. Every failure here is non-fatal:
+//! without the cache the run id is derived again from the header, and a
+//! driver is recorded again as seen.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};

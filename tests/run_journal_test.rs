@@ -460,6 +460,7 @@ fn allowed_fields(kind: &str) -> &'static [&'static str] {
         "state_entered" => &["koto.state"],
         "terminal" => &["koto.terminal"],
         "cancelled" => &[],
+        "driver_seen" => &["koto.driver.session.id"],
         other => panic!("unknown record kind {other}"),
     }
 }
@@ -1155,6 +1156,475 @@ fn the_harness_keeps_an_inherited_driver_out_of_the_journal() {
     assert!(quiet.iter().all(|line| !line.contains(sentinel)));
 }
 
+// ----- Driver changes -----
+
+/// `start` takes a note without moving, or `go` to chain through `one` and
+/// `two` to `loop`; `loop` takes `again` to stay, to go back to `one`, or
+/// to finish.
+const DRIVEN: &str = r#"---
+name: journal-driven
+version: "1.0"
+initial_state: start
+states:
+  start:
+    accepts:
+      note:
+        type: string
+        required: false
+      go:
+        type: enum
+        required: false
+        values: ["yes"]
+    transitions:
+      - target: one
+        when:
+          go: "yes"
+  one:
+    transitions:
+      - target: two
+  two:
+    transitions:
+      - target: loop
+  loop:
+    accepts:
+      again:
+        type: enum
+        required: true
+        values: ["yes", "back", "no"]
+    transitions:
+      - target: loop
+        when:
+          again: "yes"
+      - target: one
+        when:
+          again: "back"
+      - target: done
+        when:
+          again: "no"
+  done:
+    terminal: true
+---
+
+## start
+
+Start.
+
+## one
+
+One.
+
+## two
+
+Two.
+
+## loop
+
+Loop.
+
+## done
+
+Done.
+"#;
+
+/// `(kind, the driver or the state it names)` for each of `session`'s
+/// records after `session_started`.
+fn driven_sequence(env: &Env, session: &str) -> Vec<(String, String)> {
+    env.records(session)
+        .iter()
+        .skip(1)
+        .map(|r| {
+            let kind = r["kind"].as_str().unwrap().to_string();
+            let what = match kind.as_str() {
+                "driver_seen" => r["koto.driver.session.id"].as_str().unwrap().to_string(),
+                "state_entered" => r["koto.state"].as_str().unwrap().to_string(),
+                _ => String::new(),
+            };
+            (kind, what)
+        })
+        .collect()
+}
+
+fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+    expected
+        .iter()
+        .map(|(k, w)| (k.to_string(), w.to_string()))
+        .collect()
+}
+
+fn ok_as(env: &Env, driver: Option<&str>, args: &[&str]) -> Out {
+    let out = env.koto_as(driver, args);
+    assert!(
+        out.ok,
+        "koto {:?} failed\nstdout: {}\nstderr: {}",
+        args, out.stdout, out.stderr
+    );
+    assert_eq!(out.journal_warnings(), 0, "{}", out.stderr);
+    out
+}
+
+#[test]
+fn driver_a_then_b_b_a_writes_driver_seen_b_then_a_before_each_commands_states() {
+    let env = Env::new();
+    let t = env.template("driven.md", DRIVEN);
+    let path = t.to_str().unwrap();
+    ok_as(&env, Some("driver-a"), &["init", "s", "--template", path]);
+    ok_as(
+        &env,
+        Some("driver-b"),
+        &["next", "s", "--with-data", r#"{"go": "yes"}"#],
+    );
+    ok_as(
+        &env,
+        Some("driver-b"),
+        &["next", "s", "--with-data", r#"{"again": "yes"}"#],
+    );
+    ok_as(
+        &env,
+        Some("driver-a"),
+        &["next", "s", "--with-data", r#"{"again": "back"}"#],
+    );
+
+    let started = &env.records("s")[0];
+    assert_eq!(started["kind"], "session_started");
+    assert_eq!(started["koto.driver.session.id"], "driver-a");
+    assert_eq!(
+        driven_sequence(&env, "s"),
+        pairs(&[
+            ("state_entered", "start"),
+            ("driver_seen", "driver-b"),
+            ("state_entered", "one"),
+            ("state_entered", "two"),
+            ("state_entered", "loop"),
+            ("state_entered", "loop"),
+            ("driver_seen", "driver-a"),
+            ("state_entered", "one"),
+            ("state_entered", "two"),
+            ("state_entered", "loop"),
+        ])
+    );
+    let id = env.session_id("s");
+    for r in env.records("s") {
+        assert_eq!(r["koto.session.id"], id.as_str());
+        assert_eq!(r["koto.run.id"], id.as_str());
+    }
+}
+
+#[test]
+fn an_unset_or_malformed_driver_writes_no_driver_seen() {
+    let env = Env::new();
+    let t = env.template("driven.md", DRIVEN);
+    let path = t.to_str().unwrap();
+    let long = "d".repeat(200);
+    let bad: [Option<&str>; 3] = [None, Some("driver\nb"), Some(&long)];
+    ok_as(
+        &env,
+        Some("driver-a"),
+        &["init", "made-by-a", "--template", path],
+    );
+    ok_as(&env, None, &["init", "made-by-none", "--template", path]);
+    for session in ["made-by-a", "made-by-none"] {
+        for driver in bad {
+            ok_as(
+                &env,
+                driver,
+                &["next", session, "--with-data", r#"{"note": "n"}"#],
+            );
+        }
+        ok_as(
+            &env,
+            bad[1],
+            &["next", session, "--with-data", r#"{"go": "yes"}"#],
+        );
+        ok_as(
+            &env,
+            bad[2],
+            &["next", session, "--with-data", r#"{"again": "yes"}"#],
+        );
+        let kinds_seen: Vec<String> = env
+            .records(session)
+            .iter()
+            .map(|r| r["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !kinds_seen.iter().any(|k| k == "driver_seen"),
+            "{session}: {kinds_seen:?}"
+        );
+        assert!(states(&env.records(session)).contains(&"loop"));
+    }
+    assert!(!env.raw_journal().contains("driver\\nb"));
+    assert!(!env.raw_journal().contains(&long));
+}
+
+#[test]
+fn a_session_created_without_a_driver_records_the_first_one_it_meets() {
+    let env = Env::new();
+    let t = env.template("driven.md", DRIVEN);
+    ok_as(
+        &env,
+        None,
+        &["init", "s", "--template", t.to_str().unwrap()],
+    );
+    ok_as(
+        &env,
+        Some("driver-a"),
+        &["next", "s", "--with-data", r#"{"go": "yes"}"#],
+    );
+    ok_as(
+        &env,
+        Some("driver-a"),
+        &["next", "s", "--with-data", r#"{"again": "yes"}"#],
+    );
+    assert!(env.records("s")[0].get("koto.driver.session.id").is_none());
+    assert_eq!(
+        driven_sequence(&env, "s"),
+        pairs(&[
+            ("state_entered", "start"),
+            ("driver_seen", "driver-a"),
+            ("state_entered", "one"),
+            ("state_entered", "two"),
+            ("state_entered", "loop"),
+            ("state_entered", "loop"),
+        ])
+    );
+}
+
+#[test]
+fn a_command_that_enters_no_state_still_records_a_new_driver() {
+    let env = Env::new();
+    let t = env.template("driven.md", DRIVEN);
+    ok_as(
+        &env,
+        Some("driver-a"),
+        &["init", "s", "--template", t.to_str().unwrap()],
+    );
+    // Evidence alone: committed, and no state entered.
+    ok_as(
+        &env,
+        Some("driver-b"),
+        &["next", "s", "--with-data", r#"{"note": "n"}"#],
+    );
+    assert_eq!(
+        driven_sequence(&env, "s"),
+        pairs(&[("state_entered", "start"), ("driver_seen", "driver-b")])
+    );
+    // A context write under a third driver is a committed payload too.
+    let file = env.work.join("note.txt");
+    std::fs::write(&file, "a note").unwrap();
+    ok_as(
+        &env,
+        Some("driver-c"),
+        &[
+            "context",
+            "add",
+            "s",
+            "note",
+            "--from-file",
+            file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        driven_sequence(&env, "s"),
+        pairs(&[
+            ("state_entered", "start"),
+            ("driver_seen", "driver-b"),
+            ("driver_seen", "driver-c"),
+        ])
+    );
+}
+
+/// A gate command doesn't receive `CLAUDE_CODE_SESSION_ID`, so a koto
+/// command it runs has no driver and records none, even against a session
+/// another driver created.
+#[test]
+fn a_koto_command_run_from_a_gate_writes_no_driver_seen() {
+    let env = Env::new();
+    let driven = env.template("driven.md", DRIVEN);
+    let note = env.work.join("note.txt");
+    std::fs::write(&note, "a note").unwrap();
+    let gated = format!(
+        r#"---
+name: journal-gated
+version: "1.0"
+initial_state: check
+states:
+  check:
+    gates:
+      nested:
+        type: command
+        command: "'{koto}' context add inner from-gate --from-file '{note}'"
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## check
+
+Check.
+
+## done
+
+Done.
+"#,
+        koto = env!("CARGO_BIN_EXE_koto"),
+        note = note.display(),
+    );
+    let gated = env.template("gated.md", &gated);
+    ok_as(
+        &env,
+        Some("driver-a"),
+        &["init", "inner", "--template", driven.to_str().unwrap()],
+    );
+    ok_as(
+        &env,
+        Some("driver-b"),
+        &["init", "outer", "--template", gated.to_str().unwrap()],
+    );
+    ok_as(&env, Some("driver-b"), &["next", "outer"]);
+
+    // The gate ran its koto command: the inner session logged the write.
+    assert!(
+        event_types(&env, "inner").contains(&"context_added".to_string()),
+        "{:?}",
+        event_types(&env, "inner")
+    );
+    for session in ["inner", "outer"] {
+        assert!(
+            env.records(session)
+                .iter()
+                .all(|r| r["kind"] != "driver_seen"),
+            "{session}: {:?}",
+            env.records(session)
+        );
+    }
+
+    // The control: the same write run directly under driver B is recorded.
+    ok_as(
+        &env,
+        Some("driver-b"),
+        &[
+            "context",
+            "add",
+            "inner",
+            "direct",
+            "--from-file",
+            note.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        driven_sequence(&env, "inner"),
+        pairs(&[("state_entered", "start"), ("driver_seen", "driver-b")])
+    );
+}
+
+/// A batch child with a step before its terminal, so a command can advance
+/// the child without finishing it.
+const STEPPED_CHILD: &str = r#"---
+name: journal-stepped-child
+version: "1.0"
+initial_state: work
+states:
+  work:
+    accepts:
+      marker:
+        type: enum
+        required: true
+        values: [next]
+    transitions:
+      - target: check
+        when:
+          marker: next
+  check:
+    accepts:
+      marker:
+        type: enum
+        required: true
+        values: [done]
+    transitions:
+      - target: done
+        when:
+          marker: done
+  done:
+    terminal: true
+---
+
+## work
+
+Do the work.
+
+## check
+
+Check it.
+
+## done
+
+Done.
+"#;
+
+#[test]
+fn a_command_advancing_only_a_batch_child_records_the_driver_for_the_child_alone() {
+    let env = Env::new();
+    let parent = env.template("parent.md", BATCH_PARENT);
+    env.template("child.md", STEPPED_CHILD);
+    ok_as(
+        &env,
+        Some("driver-a"),
+        &["init", "parent", "--template", parent.to_str().unwrap()],
+    );
+    let tasks = serde_json::json!({"tasks": [{"name": "a", "waits_on": [], "vars": {}}]});
+    ok_as(
+        &env,
+        Some("driver-a"),
+        &["next", "parent", "--with-data", &tasks.to_string()],
+    );
+    let child = env.records("parent.a");
+    assert_eq!(child[0]["kind"], "session_started");
+    assert_eq!(child[0]["koto.driver.session.id"], "driver-a");
+    let parent_events = event_types(&env, "parent");
+    let parent_records = env.records("parent");
+
+    ok_as(
+        &env,
+        Some("driver-b"),
+        &["next", "parent.a", "--with-data", r#"{"marker": "next"}"#],
+    );
+    assert_eq!(
+        driven_sequence(&env, "parent.a"),
+        pairs(&[
+            ("state_entered", "work"),
+            ("driver_seen", "driver-b"),
+            ("state_entered", "check"),
+        ])
+    );
+    // Only the child's log was appended to, and only the child records B.
+    assert_eq!(event_types(&env, "parent"), parent_events);
+    assert_eq!(env.records("parent"), parent_records);
+
+    // Finishing the child appends `child_completed` to the parent's log
+    // under B: a commit like any other, so the parent records B then.
+    ok_as(
+        &env,
+        Some("driver-b"),
+        &[
+            "next",
+            "parent.a",
+            "--no-cleanup",
+            "--with-data",
+            r#"{"marker": "done"}"#,
+        ],
+    );
+    assert_eq!(
+        event_types(&env, "parent").last().map(String::as_str),
+        Some("child_completed")
+    );
+    let seen: Vec<String> = driven_sequence(&env, "parent")
+        .into_iter()
+        .filter(|(k, _)| k == "driver_seen")
+        .map(|(_, d)| d)
+        .collect();
+    assert_eq!(seen, vec!["driver-b".to_string()]);
+}
+
 // ----- Fixture rules through koto -----
 
 #[test]
@@ -1622,8 +2092,15 @@ fn eight_concurrent_processes_append_whole_lines() {
         body.push_str(&format!("## s{i}\n\nStep {i}.\n\n"));
     }
     let t = env.template("long.md", &body);
+    // Each session is created under the driver that advances it, so no
+    // driver change adds a record to the count.
     for w in 0..8 {
-        env.init(&format!("w{w}"), &t);
+        let driver = format!("driver-{w}");
+        let out = env.koto_as(
+            Some(&driver),
+            &["init", &format!("w{w}"), "--template", t.to_str().unwrap()],
+        );
+        assert!(out.ok, "{}", out.stderr);
     }
     let handles: Vec<_> = (0..8)
         .map(|w| {

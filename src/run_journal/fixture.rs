@@ -17,12 +17,12 @@
 //!
 //!   macOS keeps the real `/tmp` and `/var/folders` under one top-level
 //!   directory and makes the familiar names symlinks into it, so a path
-//!   recorded after resolution starts with that directory. `alias_root` names it as a
-//!   single path segment, and the pattern is tried again on the path with
-//!   that one leading segment removed. The roots are matched by how they
-//!   are spelled, not by resolving `/tmp` at runtime, so Linux and macOS
-//!   classify the same set of paths: resolving would drop the alias forms
-//!   on Linux, where `/tmp` is no symlink.
+//!   recorded after resolution starts with that directory. `alias_root`
+//!   names it as a single path segment, and the pattern is tried again on
+//!   the path with that one leading segment removed. The roots are matched
+//!   by how they are spelled, not by resolving `/tmp` at runtime, so Linux
+//!   and macOS classify the same set of paths: resolving would drop the
+//!   alias forms on Linux, where `/tmp` is no symlink.
 //! - `path_segment_regex`: some segment of the recorded path matches
 //!   `pattern`. With `ancestor_pattern`, an earlier segment must also match
 //!   that.

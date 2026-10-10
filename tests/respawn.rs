@@ -833,6 +833,12 @@ fn journal_records(base: &std::path::Path, session: &str) -> Vec<serde_json::Val
 }
 
 fn run_path(path: RespawnPath, refuse: Option<&'static str>) -> Run {
+    // The run journal reads the driving session from this process's
+    // environment on every commit, and an in-process run has no child
+    // process to clear it on. Clear it here, so a suite run inside a Claude
+    // Code session records no driver and journals only what each test
+    // expects.
+    std::env::remove_var("CLAUDE_CODE_SESSION_ID");
     let tmp = tempfile::tempdir().unwrap();
     let role = (path != RespawnPath::MissingRole).then_some("scrutineer");
     let mut header = make_header("requester", role);

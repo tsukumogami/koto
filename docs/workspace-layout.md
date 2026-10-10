@@ -23,7 +23,7 @@ of authority for this document).
 ├── sessions/                                  # AUTHORITATIVE state
 │   ├── <session-id>/
 │   │   ├── koto-<session-id>.state.jsonl      # header + event log
-│   │   ├── run-journal.json                   # derived (run journal cache: run id, creating driver)
+│   │   ├── run-journal.json                   # derived (run journal cache: run id, last driver)
 │   │   └── claim.lock                         # derived (request-store sidecar)
 │   └── .migration-conflicts/                  # AUTHORITATIVE state (see below)
 │       └── <repo-id>/<session-id>/
@@ -248,16 +248,28 @@ over it is skipped with a warning.
 
 ## Run journal: `~/.koto/_run_journal.jsonl`
 
-An append-only record of session identity and progress for tooling
-outside koto: one JSON line when a session starts, enters a state,
-reaches a terminal or is cancelled. koto never reads its records back, so
-deleting it changes nothing koto does, but its lines outlive the
-sessions they describe and can't be rebuilt once those sessions are
-gone. A store redirected with `KOTO_SESSIONS_BASE` keeps its journal
-inside that base instead. Each session's `run-journal.json` caches its
-run id and creating driver for later records; it goes with the session
-directory and is rebuilt from the header when missing. `src/run_journal/`
-documents the record format. Nothing in koto prunes the journal yet.
+A host-local record of session identity and progress for tooling outside
+koto: one JSON line when a session starts, enters a state, reaches a
+terminal or is cancelled, or is driven by a different Claude Code session
+than the last one recorded. It sits beside the decider ledger and the
+terminal index and, like them, stays on this host: cloud sync never
+carries it. It's derived, written from what sessions commit, and isn't
+session state: `koto session import` doesn't carry it, nothing resumes
+from it, and koto never reads its records back, so deleting it changes
+nothing koto does. Unlike the terminal index it can't be rebuilt, though:
+its lines outlive the sessions they describe.
+
+The journal lives with the store it describes: `~/.koto/_run_journal.jsonl`
+for the default store (and the cloud store, which keeps its local copies
+there), and `<base>/_run_journal.jsonl` for a store redirected with
+`KOTO_SESSIONS_BASE=<base>`, never the real home's file. Each session's
+`run-journal.json` caches its run id and the driver it last recorded; it's
+derived too, goes with the session directory, and is rebuilt from the
+header when missing.
+
+No session-lifecycle command deletes or rewrites the journal, and koto
+doesn't prune it yet. `docs/reference/run-journal.md` documents the
+record format, the reader rules and how to remove it by hand.
 
 ## Derived files introduced by the request-store
 
@@ -482,4 +494,6 @@ them permanently destroys the history it holds.
   of authority for the `~/.koto/requests/` layout.
 - `docs/reference/error-codes.md` — the `koto request` code set,
   including the bounds and their config keys.
+- `docs/reference/run-journal.md` — the run journal's format and
+  reader rules.
 - `koto workspace prune --help` — the operator-driven cleanup verb.
