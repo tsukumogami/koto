@@ -250,7 +250,7 @@ over it is skipped with a warning.
 
 An append-only record of session identity and progress for tooling
 outside koto: one JSON line when a session starts, enters a state,
-reaches a terminal or is cancelled. koto never reads it back, so
+reaches a terminal or is cancelled. koto never reads its records back, so
 deleting it changes nothing koto does, but its lines outlive the
 sessions they describe and can't be rebuilt once those sessions are
 gone. A store redirected with `KOTO_SESSIONS_BASE` keeps its journal

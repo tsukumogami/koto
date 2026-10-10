@@ -6,7 +6,8 @@
 //! JSONL files share: the terminal index (`_terminal_index.jsonl`) and the
 //! decider ledger (`_decider_ledger.jsonl`). The run journal
 //! (`_run_journal.jsonl`) uses [`append_bounded_line_no_follow`], the same
-//! discipline with symlinks refused.
+//! discipline with symlinks refused, under a lock that lets it recover from
+//! a partial last line.
 //!
 //! ## Atomicity
 //!
@@ -81,13 +82,17 @@ pub fn append_bounded_line(dir: &Path, path: &Path, line: &str, max: usize) -> R
 }
 
 /// [`append_bounded_line`] for a file that must not be reached through a
-/// symlink.
+/// symlink and may hold a partial last line.
 ///
-/// The run journal (`_run_journal.jsonl`) uses it: on unix the file is
+/// The run journal (`_run_journal.jsonl`) uses it. On unix the file is
 /// opened with `O_NOFOLLOW`, so a symlink planted at `path` makes the open
-/// fail instead of appending to whatever the link points at. Everything
-/// else -- the bound, the single `O_APPEND` write, mode 0600 on create --
-/// is the same as [`append_bounded_line`].
+/// fail instead of appending to whatever the link points at. The append
+/// holds an exclusive advisory lock (`flock`), and under it a file that
+/// doesn't end in a newline (a write cut short by a crash or a full disk)
+/// gets one before the line, so the line starts on its own and only the
+/// partial line is lost. The lock is what makes that check safe: without
+/// it, a line another writer is still appending would look partial. The
+/// bound and mode 0600 on create are the same as [`append_bounded_line`].
 pub fn append_bounded_line_no_follow(
     dir: &Path,
     path: &Path,
@@ -109,12 +114,8 @@ pub fn append_bounded_line_no_follow(
             .with_context(|| format!("failed to create {}", dir.display()))?;
     }
 
-    let mut buf = String::with_capacity(len);
-    buf.push_str(line);
-    buf.push('\n');
-
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    options.read(true).create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -126,6 +127,26 @@ pub fn append_bounded_line_no_follow(
     let mut file = options
         .open(path)
         .with_context(|| format!("failed to open {} for append", path.display()))?;
+
+    let mut buf = String::with_capacity(len + 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: flock on a descriptor borrowed for the call; it neither
+        // closes nor retains it. The lock is released when `file` closes.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to lock {}", path.display()));
+        }
+        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut last = [0u8; 1];
+        if size > 0 && file.read_at(&mut last, size - 1).is_ok() && last[0] != b'\n' {
+            buf.push('\n');
+        }
+    }
+    buf.push_str(line);
+    buf.push('\n');
     file.write_all(buf.as_bytes())
         .with_context(|| format!("failed to append to {}", path.display()))?;
     file.sync_data()

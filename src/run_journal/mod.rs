@@ -4,7 +4,7 @@
 //! koto appends one JSON object per line to `<koto home>/_run_journal.jsonl`
 //! (the same `~/.koto` the decider ledger uses) as sessions are created,
 //! enter states, reach a terminal and are cancelled. The journal is
-//! append-only: koto never rewrites, reads back or deletes it, so its lines
+//! append-only: koto never rewrites, deletes or reads back its records, so its lines
 //! outlive the sessions they describe, including sessions koto removes at
 //! their terminal tick or on `koto session cleanup`.
 //!
@@ -71,10 +71,12 @@
 //! the command's output, exit code, session state or gate decisions
 //! changes.
 //!
-//! A write cut short (a crash, a full disk) can leave a partial last line.
-//! The next record starts on a line of its own, so only the partial line is
-//! lost; two writers racing past a partial line can leave an empty line
-//! instead. Readers skip empty lines and lines that don't parse as JSON.
+//! Writers take an advisory lock on the journal for each record, so a
+//! record is never interleaved with another. A write cut short (a crash, a
+//! full disk) can still leave a partial last line: the next writer sees,
+//! under the lock, that the file doesn't end in a newline and starts its
+//! record on a line of its own, so only the partial line is lost. Readers
+//! skip lines that don't parse as JSON.
 //!
 //! ## Files
 //!
@@ -267,36 +269,13 @@ fn write(root: &Path, records: &[Record]) {
     let path = root.join(JOURNAL_FILE);
     let max = max_line_bytes();
     for record in records {
-        let mut line = record.to_line();
-        // After a partial last line, start this record on a line of its own.
-        if ends_mid_line(&path) {
-            line.insert(0, '\n');
-        }
+        let line = record.to_line();
         if let Err(e) =
             crate::engine::jsonl_append::append_bounded_line_no_follow(root, &path, &line, max)
         {
             warn_once(&format!("{}: {}", path.display(), e.root_cause()));
         }
     }
-}
-
-/// Whether the journal at `path` is non-empty and its last byte isn't a
-/// newline, as a write cut short leaves it. Any failure to tell reads as
-/// no: the append that follows reports its own error.
-fn ends_mid_line(path: &Path) -> bool {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let Ok(mut file) = options.open(path) else {
-        return false;
-    };
-    let mut last = [0u8; 1];
-    file.seek(SeekFrom::End(-1)).is_ok() && file.read_exact(&mut last).is_ok() && last[0] != b'\n'
 }
 
 // ----- The hooks -----
