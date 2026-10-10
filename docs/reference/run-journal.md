@@ -50,7 +50,7 @@ Records start with these fields:
 | `v` | integer | The line format's version, currently `1`. |
 | `at` | string | When the record was written: UTC, RFC 3339, millisecond precision, `Z` suffix, such as `2026-10-10T03:09:22.599Z`. |
 | `session` | string | The session's name, such as `issue_42` or `parent.task-a`. |
-| `koto.session.id` | string | The session's `session_id` from its header. Left out for a session whose header has no `session_id` (one created by a koto that predates the field); such a session's records also have no `koto.run.id`. |
+| `koto.session.id` | string | The session's `session_id` from its header. Left out for a session whose header has no `session_id` (one created by a koto that predates the field). Such a session's records carry a `koto.run.id` only when it is a child whose root has a `session_id`. |
 | `koto.run.id` | string | The run the session belongs to (see [Run ids](#run-ids)). Left out when it can't be resolved. |
 
 A field with no value is left out, never written as `null` or an empty
@@ -162,8 +162,12 @@ as a newline) counts as no driver.
 - A command that appends to a child's log (a child finishing appends
   `child_completed` to its parent's log) records the driver for each
   session it appended to, and only those.
-- Gate commands and default actions don't receive `CLAUDE_CODE_SESSION_ID`,
-  so a koto command run from one records no driver.
+- By default, gate commands and default actions don't receive
+  `CLAUDE_CODE_SESSION_ID`, so a koto command run from one records no
+  driver. Two exceptions pass it through, and then such a command records
+  the outer session's driver like any other: a session created with
+  `koto init --legacy-environment`, which hands commands the whole
+  environment, and a template that lists the variable under `pass_env:`.
 - The same driver can be recorded twice in a row: two commands racing under
   one new driver can each write a `driver_seen`, and so can a session whose
   sidecar was lost. A `driver_seen` whose write failed (see
