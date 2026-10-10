@@ -17,7 +17,9 @@ use koto::session::cloud::CloudBackend;
 use koto::session::context::ContextStore;
 use koto::session::local::LocalBackend;
 use koto::session::{Backend, SessionBackend};
-use koto::session_view::{read_key_preview, snapshot, KeyPreview, Locality, EXCERPT_BOUND};
+use koto::session_view::{
+    read_key_preview, snapshot, KeyPreview, Locality, EXCERPT_BOUND, METADATA_CEILING,
+};
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
 
@@ -417,6 +419,78 @@ fn a_remote_only_key_shows_metadata_and_a_not_local_state() {
             && !r.key.ends_with("manifest.json")),
         "the preview never pulled remote content"
     );
+}
+
+#[test]
+fn a_multibyte_character_straddling_the_bound_is_cut_whole() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let local = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+    local
+        .init_state_file("wf", header_of("wf"), vec![initialized()])
+        .unwrap();
+    // 4095 ASCII bytes, then a 2-byte character straddling byte 4096.
+    let mut content = "a".repeat(EXCERPT_BOUND - 1);
+    content.push('é');
+    local.add("wf", "straddle.md", content.as_bytes()).unwrap();
+    let backend = Backend::Local(local);
+
+    match read_key_preview(&backend, "wf", "straddle.md", EXCERPT_BOUND) {
+        KeyPreview::Text { excerpt, truncated } => {
+            assert!(truncated);
+            assert_eq!(
+                excerpt.as_str().len(),
+                EXCERPT_BOUND - 1,
+                "the split character is dropped whole, not emptied"
+            );
+            assert!(excerpt.as_str().bytes().all(|b| b == b'a'));
+        }
+        other => panic!("a straddling cut is still text, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_complete_file_ending_in_a_partial_sequence_is_binary() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let local = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+    local
+        .init_state_file("wf", header_of("wf"), vec![initialized()])
+        .unwrap();
+    // The file genuinely ends mid-character: not text, whatever its size.
+    local.add("wf", "torn.bin", &[b'a', b'b', 0xC3]).unwrap();
+    let backend = Backend::Local(local);
+
+    assert!(matches!(
+        read_key_preview(&backend, "wf", "torn.bin", EXCERPT_BOUND),
+        KeyPreview::Binary { .. }
+    ));
+}
+
+#[test]
+fn the_metadata_ceiling_stops_the_listing_and_counts_the_rest() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let local = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+    local
+        .init_state_file("wf", header_of("wf"), vec![initialized()])
+        .unwrap();
+    local.add("wf", "seed.md", b"x").unwrap();
+
+    // A manifest no honest session produces: one entry over the ceiling.
+    let mut keys = serde_json::Map::new();
+    for i in 0..(METADATA_CEILING + 1) {
+        keys.insert(
+            format!("k{i:06}"),
+            serde_json::json!({"created_at": "2026-01-01T00:00:00Z", "size": 1, "hash": "a".repeat(64)}),
+        );
+    }
+    std::fs::write(
+        tmp.path().join("wf/ctx/manifest.json"),
+        serde_json::to_vec(&serde_json::json!({ "keys": keys })).unwrap(),
+    )
+    .unwrap();
+
+    let snap = snapshot(&Backend::Local(local), "wf").unwrap();
+    assert_eq!(snap.keys.len(), METADATA_CEILING);
+    assert_eq!(snap.unlisted_keys, 1);
 }
 
 #[test]

@@ -34,7 +34,9 @@ pub const EXCERPT_BOUND: usize = 4096;
 pub const METADATA_CEILING: usize = 100_000;
 
 /// Most keys the one-shot `--detail` mode reads content previews for;
-/// keys past it render metadata only.
+/// keys past it render metadata only. Unused in this module by design:
+/// it is declared beside its siblings so every surface constant lives in
+/// one place, and the `--detail` change consumes it.
 pub const DETAIL_PREVIEW_CEILING: usize = 1000;
 
 /// Display cap, in characters, for a migration banner value.
@@ -48,6 +50,12 @@ pub const FACT_CAP: usize = 1024;
 
 /// Marker appended where a cap or an excerpt bound cut text.
 pub const CUT_MARKER: &str = "…[cut]";
+
+/// Display cap, in characters, for a recorded writer value.
+pub const WRITER_CAP: usize = 64;
+
+/// Display cap, in characters, for an unreadable-key reason.
+pub const REASON_CAP: usize = 512;
 
 // ---------------------------------------------------------------------------
 // Sanitizer
@@ -161,10 +169,6 @@ pub fn format_size(bytes: u64) -> String {
         value /= 1024.0;
         unit += 1;
     }
-    if value >= 1024.0 {
-        // u64 cannot exceed 16 EiB, but stay total anyway.
-        value = 1024.0;
-    }
     format!("{:.1} {}", value, UNITS[unit])
 }
 
@@ -246,6 +250,8 @@ pub struct SessionFacts {
     /// template is unavailable.
     pub directive: Option<Sanitized>,
     pub execution_dir: Option<Sanitized>,
+    /// The origin anchor: the directory the session was created in.
+    pub anchor: Option<Sanitized>,
     /// The store origin: kind (`local` or `cloud`) and base path.
     pub store: Option<(Sanitized, Sanitized)>,
 }
@@ -287,8 +293,10 @@ pub enum KeyPreview {
 
 /// Interpolate a state's directive (or details) text exactly the way
 /// `koto status` does: runtime `SESSION_DIR` / `SESSION_NAME` first, then
-/// the log's variables. `handle_status` and [`snapshot`] share this one
-/// implementation.
+/// the log's variables. [`snapshot`] calls it today; `handle_status`
+/// switches onto it in a follow-up change whose characterization tests
+/// pin its JSON byte-for-byte, so this is written to match its
+/// substitution order exactly.
 pub fn render_directive(
     raw: &str,
     session_dir: &Path,
@@ -312,7 +320,9 @@ pub fn render_directive(
 /// Keep a recorded timestamp only when it has the RFC 3339 shape koto
 /// writes (`YYYY-MM-DDTHH:MM:SS`, optional fraction, `Z` or an offset).
 /// Anything else came from a writer koto did not control and is dropped
-/// rather than echoed.
+/// rather than echoed. The check is structural, not calendrical — month
+/// 99 passes — because its job is keeping control characters and prose
+/// out of a timestamp field, not validating dates.
 fn parse_timestamp(raw: &str) -> Option<String> {
     let b = raw.as_bytes();
     if b.len() < 20 || b.len() > 64 {
@@ -380,6 +390,7 @@ fn facts_from_header(
         current_state: None,
         directive: None,
         execution_dir: None,
+        anchor: None,
         store: None,
     };
     if let Some(h) = header {
@@ -393,6 +404,7 @@ fn facts_from_header(
             .execution_dir
             .as_deref()
             .map(|p| fact(&p.to_string_lossy()));
+        facts.anchor = h.origin.as_ref().map(|o| fact(&o.anchor.to_string_lossy()));
         facts.store = h
             .origin
             .as_ref()
@@ -435,8 +447,13 @@ pub fn snapshot(backend: &Backend, name: &str) -> Result<SessionViewSnapshot, Sn
         Ok(ok) => ok,
         Err(err) => {
             if let Some(m) = err.downcast_ref::<SessionMigrated>() {
-                // A marker that appeared between the check and the read.
-                let facts = facts_from_header(name, None);
+                // A marker that appeared between the check and the read:
+                // the same answer as the up-front check, local facts best
+                // effort.
+                let facts = match backend.read_events_local(name) {
+                    Ok((header, _)) => facts_from_header(name, Some(&header)),
+                    Err(_) => facts_from_header(name, None),
+                };
                 return Ok(SessionViewSnapshot {
                     facts,
                     migrated: Some(MigratedTo {
@@ -455,7 +472,12 @@ pub fn snapshot(backend: &Backend, name: &str) -> Result<SessionViewSnapshot, Sn
 
     // A session that never advanced derives no current state; that is
     // absence to show, not corruption (an unparseable log already failed
-    // at `read_events`).
+    // at `read_events`). This deliberately diverges from `koto status`,
+    // which exits 3 ("corrupt state file") on the same shape: a status
+    // query on a never-run session has nothing to answer, while a view of
+    // one has its facts and keys to show. The follow-up that moves
+    // `handle_status` onto the directive helper must preserve its exit
+    // behavior here.
     let session_dir = backend.session_dir(name);
     if let Some(machine) = derive_machine_state(&header, &events, &session_dir) {
         facts.current_state = Some(fact(&machine.current_state));
@@ -506,7 +528,7 @@ pub fn snapshot(backend: &Backend, name: &str) -> Result<SessionViewSnapshot, Sn
             display: sanitize_capped(raw_key, KEY_DISPLAY_CAP),
             raw: valid.then(|| raw_key.to_string()),
             size: meta.map(|m| m.size),
-            writer: meta.and_then(|m| m.writer.as_deref().map(|w| sanitize_capped(w, 64))),
+            writer: meta.and_then(|m| m.writer.as_deref().map(|w| sanitize_capped(w, WRITER_CAP))),
             created_at: meta.and_then(|m| parse_timestamp(&m.created_at)),
             locality: if local_meta.is_some() {
                 Locality::Local
@@ -529,22 +551,6 @@ pub fn snapshot(backend: &Backend, name: &str) -> Result<SessionViewSnapshot, Sn
 // Key preview
 // ---------------------------------------------------------------------------
 
-/// Longest cut of `bytes` at most `max` that does not split a UTF-8
-/// character. Byte-driven and total: on non-UTF-8 input it backs off at
-/// most three bytes and cuts there.
-fn char_boundary_cut(bytes: &[u8], max: usize) -> usize {
-    if bytes.len() <= max {
-        return bytes.len();
-    }
-    let mut cut = max;
-    let mut backed = 0;
-    while cut > 0 && backed < 3 && bytes[cut] & 0b1100_0000 == 0b1000_0000 {
-        cut -= 1;
-        backed += 1;
-    }
-    cut
-}
-
 /// Classify and bound one key's content for display.
 ///
 /// Reads only the local store, through the backend's bounded prefix
@@ -562,29 +568,39 @@ pub fn read_key_preview(backend: &Backend, name: &str, key: &str, bound: usize) 
 
     match backend.read_context_prefix(name, key, bound) {
         Ok(Some(read)) => {
-            let bytes: &[u8] = &read.bytes;
-            let sample = &bytes[..bytes.len().min(bound)];
-            let is_binary = sample.contains(&0)
-                || match std::str::from_utf8(sample) {
-                    Ok(_) => false,
-                    Err(e) => {
-                        // A clean cut can split a character at the sample's
-                        // end; only an error before the tail means binary.
-                        let tail_start = sample.len().saturating_sub(3);
-                        e.valid_up_to() < tail_start || e.error_len().is_some()
-                    }
-                };
-            if is_binary {
+            let sample: &[u8] = &read.bytes;
+            if sample.contains(&0) {
                 return KeyPreview::Binary {
                     size: recorded_size,
                     hash: recorded_hash,
                 };
             }
-            let cut = char_boundary_cut(sample, bound);
-            let text = std::str::from_utf8(&sample[..cut]).unwrap_or_default();
+            // Classify on the bytes actually read. The accessor's cut can
+            // split a trailing multi-byte character, so an INCOMPLETE read
+            // whose only defect is a partial sequence at the tail is text,
+            // excerpted up to the last whole character. A COMPLETE file
+            // that is not valid UTF-8 — a partial tail included — is
+            // binary: the content itself is not text.
+            let text = match std::str::from_utf8(sample) {
+                Ok(s) => s,
+                Err(e)
+                    if !read.complete
+                        && e.error_len().is_none()
+                        && e.valid_up_to() >= sample.len().saturating_sub(3) =>
+                {
+                    // Split tail at the cut: keep the whole characters.
+                    std::str::from_utf8(&sample[..e.valid_up_to()]).unwrap_or_default()
+                }
+                Err(_) => {
+                    return KeyPreview::Binary {
+                        size: recorded_size,
+                        hash: recorded_hash,
+                    };
+                }
+            };
             KeyPreview::Text {
                 excerpt: sanitize(text),
-                truncated: !read.complete || cut < bytes.len(),
+                truncated: !read.complete || text.len() < sample.len(),
             }
         }
         Ok(None) => match meta {
@@ -604,7 +620,7 @@ pub fn read_key_preview(backend: &Backend, name: &str, key: &str, bound: usize) 
             },
         },
         Err(err) => KeyPreview::Unreadable {
-            reason: sanitize_capped(&err.to_string(), 512),
+            reason: sanitize_capped(&err.to_string(), REASON_CAP),
         },
     }
 }
@@ -664,15 +680,6 @@ mod tests {
         assert!(parse_timestamp("yesterday\u{1B}[2J").is_none());
         assert!(parse_timestamp("2026-01-01 00:00:00").is_none());
         assert!(parse_timestamp("").is_none());
-    }
-
-    #[test]
-    fn char_boundary_cut_never_splits_a_character() {
-        let s = "aé€"; // 1 + 2 + 3 bytes
-        let b = s.as_bytes();
-        assert_eq!(char_boundary_cut(b, 6), 6);
-        assert_eq!(char_boundary_cut(b, 5), 3); // inside €
-        assert_eq!(char_boundary_cut(b, 2), 1); // inside é
     }
 
     #[test]
