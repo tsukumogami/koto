@@ -22,7 +22,6 @@ use crate::cli::dashboard_data::{
 use crate::cli::dashboard_render::render_frame;
 use crate::cli::dashboard_state::DashboardAppState;
 use crate::cli::DashboardArgs;
-use crate::session::SessionBackend;
 
 /// RAII guard that restores the terminal on any exit path, including `?` propagation.
 struct TerminalGuard;
@@ -188,7 +187,12 @@ fn format_once_line(
 }
 
 /// Entry point called from the CLI dispatch in `src/cli/mod.rs`.
-pub fn run(args: DashboardArgs, backend: &dyn SessionBackend) -> Result<()> {
+///
+/// Takes the concrete [`Backend`]: the Session tab and the `--detail`
+/// mode reach the context store and the migration check through it
+/// (`crate::session_view`), which no trait object carries. The data
+/// refresh below still consumes it as a `&dyn SessionBackend`.
+pub fn run(args: DashboardArgs, backend: &crate::session::Backend) -> Result<()> {
     // --once: print tab-separated lines and exit without a TUI.
     if args.once {
         let mut tree = SessionTree::new();

@@ -201,12 +201,11 @@ fn a_tampered_template_reports_the_mismatch_without_failing() {
     let actual = mismatch["actual"].as_str().unwrap();
     assert_eq!(actual.len(), 64);
     assert_ne!(actual, recorded);
-    assert_eq!(
+    assert!(
         json["directive"]
             .as_str()
             .unwrap()
             .contains("Tampered inputs"),
-        true,
         "the directive renders from the bytes on disk, reported as mismatched"
     );
 }

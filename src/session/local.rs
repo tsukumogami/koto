@@ -535,7 +535,7 @@ impl LocalBackend {
             .ok_or_else(|| anyhow::anyhow!("content path for key '{}' has no parent", key))?
             .canonicalize()
             .with_context(|| format!("failed to resolve content path for key '{}'", key))?;
-        if parent != ctx_root && !parent.starts_with(&ctx_root) {
+        if !parent.starts_with(&ctx_root) {
             anyhow::bail!(
                 "content path for key '{}' escapes the session's ctx directory",
                 key
