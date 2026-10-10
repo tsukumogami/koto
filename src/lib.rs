@@ -15,6 +15,7 @@ pub(crate) mod host_env;
 pub mod redact;
 pub(crate) mod run_journal;
 pub mod session;
+pub mod session_view;
 pub mod template;
 pub mod workflows_surface;
 

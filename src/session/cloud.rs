@@ -114,6 +114,35 @@ impl CloudBackend {
         }
     }
 
+    /// Delegate to the local store's bounded prefix read; never a remote
+    /// request. See [`crate::session::Backend::read_context_prefix`].
+    pub(crate) fn read_context_prefix(
+        &self,
+        session: &str,
+        key: &str,
+        bound: usize,
+    ) -> anyhow::Result<Option<crate::session::PrefixRead>> {
+        self.local.read_context_prefix(session, key, bound)
+    }
+
+    /// The local manifest plus the remote one, from the same cached fetch
+    /// `list_keys` and `meta` use. A failed fetch is `None`, never an
+    /// error: the metadata view degrades to local-only exactly as the
+    /// store's own reads do.
+    pub(crate) fn manifest_pair(
+        &self,
+        session: &str,
+    ) -> (
+        crate::session::context::Manifest,
+        Option<crate::session::context::Manifest>,
+    ) {
+        let local = self.local.read_manifest(session).unwrap_or_default();
+        let manifest_key = format!("{}/{}/ctx/manifest.json", self.prefix, session);
+        let remote =
+            sync::fetch_remote_manifest(&self.bucket, &manifest_key, session, &self.manifest_cache);
+        (local, remote)
+    }
+
     /// Refuse when `id` was imported into another workspace.
     ///
     /// The first time a process asks about `id`, lists the bucket with
