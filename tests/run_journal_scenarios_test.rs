@@ -174,15 +174,20 @@ fn plain_dir() -> Option<PathBuf> {
     std::fs::create_dir_all(&dir).unwrap();
     let resolved = std::fs::canonicalize(&dir).unwrap();
     let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-    let temporary = resolved.starts_with(&temp)
-        || [
-            "/tmp",
-            "/var/folders",
-            "/private/tmp",
-            "/private/var/folders",
-        ]
+    // The fixed temporary roots, and where they resolve to (on macOS, the
+    // same two under its top-level alias directory).
+    let roots: Vec<PathBuf> = ["/tmp", "/var/folders"]
         .iter()
-        .any(|root| resolved.starts_with(root) || dir.starts_with(root));
+        .flat_map(|root| {
+            let root = PathBuf::from(root);
+            let resolved_root = std::fs::canonicalize(&root).ok();
+            std::iter::once(root).chain(resolved_root)
+        })
+        .collect();
+    let temporary = resolved.starts_with(&temp)
+        || roots
+            .iter()
+            .any(|root| resolved.starts_with(root) || dir.starts_with(root));
     if temporary {
         let _ = std::fs::remove_dir_all(&dir);
         return None;

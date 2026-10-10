@@ -186,7 +186,7 @@ A session is a fixture when any rule matches:
 
 | Rule | Matches |
 |------|---------|
-| Temporary directory | The directory is, or is under, `/tmp`, `/var/folders`, `/private/tmp`, `/private/var/folders`, or `TMPDIR` when `TMPDIR` is absolute. |
+| Temporary directory | The directory is, or is under, `/tmp` or `/var/folders`, the same two under macOS's `/private` directory, or `TMPDIR` when `TMPDIR` is absolute (and not `/`). |
 | mktemp directory | A path segment matches `^tmp\.[A-Za-z0-9]{6,}$`. |
 | Ablation directory | A path segment starts with `shirabe-ablation.`. |
 | Tool test directory | A `test` or `tests` segment follows an earlier `koto`, `niwa` or `shirabe` segment. |
