@@ -157,7 +157,11 @@ impl Env {
 }
 
 /// A directory outside every temporary directory, or `None` when the
-/// build's scratch space is itself under one (the scenario can't run).
+/// build's scratch space is itself under one (the scenario can't run). It
+/// sits under the build's own scratch space, so a checkout whose path
+/// already holds a fixture-shaped segment (`tmp.XXXXXX`, or a `test`
+/// directory below a `koto`, `niwa` or `shirabe` one) would make the
+/// "plain" cases fixtures too; koto's own checkouts have neither.
 fn plain_dir() -> Option<PathBuf> {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "run-journal-scenarios-{}-{}",

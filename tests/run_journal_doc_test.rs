@@ -239,9 +239,11 @@ fn the_reference_carries_no_cost_figure() {
     assert!(found.is_empty(), "{REFERENCE} mentions cost: {found:?}");
 }
 
-/// The checks above fire on what they are meant to catch.
+/// The patterns the checks above use match the kind of text they are meant
+/// to catch, and a kind koto doesn't write is not among the source's
+/// literals. (The checks themselves run against the real reference.)
 #[test]
-fn the_checks_catch_what_they_look_for() {
+fn the_check_patterns_match_what_they_look_for() {
     let bad = "see `service.name` and https://example.com for $5 of cost";
     let dotted = Regex::new(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$").unwrap();
     assert!(spans(bad).iter().any(|s| dotted.is_match(s)));

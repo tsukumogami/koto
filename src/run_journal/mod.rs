@@ -31,8 +31,9 @@
 //! ## Records
 //!
 //! Every line carries `kind`, `v` (`1`), `at` (UTC, RFC 3339, milliseconds,
-//! `Z`), `session` (the session name), `koto.session.id` and, when known,
-//! `koto.run.id`. The kinds and their own fields:
+//! `Z`) and `session` (the session name), then `koto.session.id` and
+//! `koto.run.id` when known (a session from before session ids has
+//! neither). The kinds and their own fields:
 //!
 //! - `session_started`: `koto.parent.session.id` (children),
 //!   `koto.driver.session.id` (the Claude Code session that created it),
@@ -77,9 +78,8 @@
 //! can't be created, a read-only or full disk, a symlink at the journal's
 //! path, a record over [`MAX_LINE_BYTES`]) the process prints one warning
 //! line naming the run journal on stderr, the first time only, and carries
-//! on. Nothing about
-//! the command's output, exit code, session state or gate decisions
-//! changes.
+//! on. Nothing about the command's output, exit code, session state or
+//! gate decisions changes.
 //!
 //! Writers take an advisory lock on the journal for each record, so a
 //! record is never interleaved with another. A write cut short (a crash, a
