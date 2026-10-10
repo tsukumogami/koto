@@ -334,15 +334,26 @@ fn cloud_snapshot_cost(s3: &FakeS3, base: &std::path::Path, prefix: &str, n: usi
     // A fresh backend: no manifest cache, no migration-check cache.
     let reader = cloud_backend(s3, base, prefix);
     s3.clear_requests();
+    let before = dir_bytes(&base.join("wf"));
     let snap = snapshot(&Backend::Cloud(reader), "wf").unwrap();
     assert_eq!(snap.keys.len(), n);
     assert!(snap.keys.iter().all(|k| k.locality == Locality::Local));
+    assert_eq!(
+        before,
+        dir_bytes(&base.join("wf")),
+        "a cloud snapshot leaves the local session directory byte-identical"
+    );
 
     let requests = s3.requests();
     for r in &requests {
         assert_ne!(r.method, "PUT", "a snapshot never writes: {}", r.key);
         assert_ne!(r.method, "DELETE", "a snapshot never deletes: {}", r.key);
         if r.method == "GET" && r.list_prefix.is_none() {
+            assert!(
+                !r.key.ends_with(".state.jsonl"),
+                "a snapshot never pulls the state object: {}",
+                r.key
+            );
             assert!(
                 !r.key.contains("/ctx/") || r.key.ends_with("/ctx/manifest.json"),
                 "a snapshot never fetches key content: {}",
@@ -445,6 +456,25 @@ fn a_multibyte_character_straddling_the_bound_is_cut_whole() {
             assert!(excerpt.as_str().bytes().all(|b| b == b'a'));
         }
         other => panic!("a straddling cut is still text, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_value_of_exactly_the_bound_is_complete_and_not_truncated() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let local = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+    local
+        .init_state_file("wf", header_of("wf"), vec![initialized()])
+        .unwrap();
+    local
+        .add("wf", "exact.md", "a".repeat(EXCERPT_BOUND).as_bytes())
+        .unwrap();
+    match read_key_preview(&Backend::Local(local), "wf", "exact.md", EXCERPT_BOUND) {
+        KeyPreview::Text { excerpt, truncated } => {
+            assert_eq!(excerpt.as_str().len(), EXCERPT_BOUND);
+            assert!(!truncated, "exactly the bound is the whole file");
+        }
+        other => panic!("exact-bound content is text, got {other:?}"),
     }
 }
 

@@ -443,29 +443,17 @@ pub fn snapshot(backend: &Backend, name: &str) -> Result<SessionViewSnapshot, Sn
         return Err(SnapshotError::Infrastructure(err.to_string()));
     }
 
-    let (header, events) = match backend.read_events(name) {
+    // The LOCAL read, deliberately: `read_events` on the cloud backend
+    // pulls the remote state object and rewrites the local log before
+    // reading, which is a write this provably-read-only view must never
+    // make (it can replace a newer local log with an older remote copy).
+    // The view shows the local copy's state, exactly as it shows local
+    // key content.
+    let (header, events) = match backend.read_events_local(name) {
         Ok(ok) => ok,
-        Err(err) => {
-            if let Some(m) = err.downcast_ref::<SessionMigrated>() {
-                // A marker that appeared between the check and the read:
-                // the same answer as the up-front check, local facts best
-                // effort.
-                let facts = match backend.read_events_local(name) {
-                    Ok((header, _)) => facts_from_header(name, Some(&header)),
-                    Err(_) => facts_from_header(name, None),
-                };
-                return Ok(SessionViewSnapshot {
-                    facts,
-                    migrated: Some(MigratedTo {
-                        target: sanitize_capped(&m.target, BANNER_VALUE_CAP),
-                        workspace: sanitize_capped(&m.workspace, BANNER_VALUE_CAP),
-                    }),
-                    keys: Vec::new(),
-                    unlisted_keys: 0,
-                });
-            }
-            return Err(SnapshotError::Corrupt(err.to_string()));
-        }
+        // The local read makes no migration check (the one above already
+        // ran), so every error here is a record that cannot be read.
+        Err(err) => return Err(SnapshotError::Corrupt(err.to_string())),
     };
 
     let mut facts = facts_from_header(name, Some(&header));
