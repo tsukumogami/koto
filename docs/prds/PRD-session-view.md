@@ -123,9 +123,10 @@ migration reads like a broken session.
 - **R7. One-shot detail.** The dashboard's non-interactive invocation gains a
   single-session detail mode behind a new flag, emitting R1-R5 as JSON (the
   form koto's other CLI output already uses), with errors and exit codes
-  following koto's existing JSON error contract — a missing session and a
-  migrated session each produce the documented error object and a non-zero
-  exit. The existing multi-session feed's output is
+  following koto's existing JSON error contract — a missing session produces
+  the documented error object and a non-zero exit, while a migrated session is
+  a successful answer (exit 0) whose object names the successor session and
+  workspace in place of content. The existing multi-session feed's output is
   byte-compatible for existing invocations: same columns, same positions, no
   new columns.
 - **R8. Workflow view summary.** The workflow view's per-session file carries
