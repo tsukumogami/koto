@@ -518,20 +518,36 @@ const FACT_INDENT: &str = "  ";
 
 /// `Label: value` laid out in rows of at most `width` columns. A value too
 /// long for one row continues on indented rows, so its tail stays readable.
+/// A row breaks right after the last `/` or space that fits; only a run with
+/// neither within the width is cut at the column limit.
 fn wrap_fact(label: &str, value: &str, width: usize) -> Vec<String> {
-    let indent_cost: usize = FACT_INDENT.chars().map(cell_cost).sum();
+    let chars: Vec<char> = value.chars().collect();
     let mut rows: Vec<String> = Vec::new();
-    let mut row = format!("{label}: ");
-    let mut used: usize = row.chars().map(cell_cost).sum();
-    for c in value.chars() {
-        if used + cell_cost(c) > width && used > indent_cost {
-            rows.push(std::mem::replace(&mut row, FACT_INDENT.to_string()));
-            used = indent_cost;
+    let mut prefix = format!("{label}: ");
+    let mut pos = 0;
+    loop {
+        let mut used: usize = prefix.chars().map(cell_cost).sum();
+        // The longest run from `pos` that fits, always at least one char.
+        let mut end = pos;
+        while end < chars.len() && (used + cell_cost(chars[end]) <= width || end == pos) {
+            used += cell_cost(chars[end]);
+            end += 1;
         }
-        row.push(c);
-        used += cell_cost(c);
+        if end < chars.len() {
+            if let Some(i) = chars[pos..end].iter().rposition(|c| *c == '/' || *c == ' ') {
+                end = pos + i + 1;
+            }
+        }
+        rows.push(format!(
+            "{prefix}{}",
+            chars[pos..end].iter().collect::<String>()
+        ));
+        pos = end;
+        if pos >= chars.len() {
+            break;
+        }
+        prefix = FACT_INDENT.to_string();
     }
-    rows.push(row);
     if rows.len() > FACT_ROWS {
         rows.truncate(FACT_ROWS);
         let last = rows.pop().unwrap_or_default();
@@ -2056,6 +2072,46 @@ mod tests {
         }
         assert_eq!(joined, format!("Store origin: local {base}"), "{rows:#?}");
         assert!(!joined.contains(CUT_MARKER));
+    }
+
+    #[test]
+    fn wrap_fact_breaks_a_path_after_a_slash_not_mid_segment() {
+        let value = "local /Users/danielgazineu/koto-session-view-demo/sessions";
+        let rows = wrap_fact("Store origin", value, 70);
+        assert_eq!(
+            rows,
+            vec![
+                "Store origin: local /Users/danielgazineu/koto-session-view-demo/".to_string(),
+                "  sessions".to_string(),
+            ]
+        );
+        // Every row but the last ends at a boundary.
+        for row in &rows[..rows.len() - 1] {
+            assert!(row.ends_with('/') || row.ends_with(' '), "{row:?}");
+        }
+    }
+
+    #[test]
+    fn wrap_fact_breaks_after_a_space_in_prose() {
+        let rows = wrap_fact("Intent", "alpha beta gamma delta", 20);
+        assert_eq!(rows, vec!["Intent: alpha beta ", "  gamma delta"]);
+    }
+
+    #[test]
+    fn wrap_fact_hard_breaks_an_unbreakable_token_and_keeps_the_cap() {
+        let token = "x".repeat(40);
+        let rows = wrap_fact("Anchor", &token, 20);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(
+            rows.concat().replace("Anchor: ", "").replace("  ", ""),
+            token
+        );
+        assert!(rows.iter().all(|r| r.chars().count() <= 20), "{rows:?}");
+
+        let long = "y".repeat(500);
+        let rows = wrap_fact("Anchor", &long, 20);
+        assert_eq!(rows.len(), FACT_ROWS);
+        assert!(rows.last().unwrap().ends_with(CUT_MARKER), "{rows:?}");
     }
 
     #[test]
