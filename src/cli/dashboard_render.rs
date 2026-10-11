@@ -14,12 +14,18 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
-    TableState, Tabs,
+    TableState, Tabs, Wrap,
 };
 use ratatui::Frame;
 
 use crate::cli::dashboard_data::{DetailData, Liveness, SessionTree};
-use crate::cli::dashboard_state::{DashboardAppState, DashboardTab, Membership, TaskCounts};
+use crate::cli::dashboard_state::{
+    DashboardAppState, DashboardTab, Membership, SessionTabState, TaskCounts,
+};
+use crate::session_view::{
+    format_size, KeyPreview, Locality, MigratedTo, Sanitized, SessionFacts, SessionViewSnapshot,
+    CUT_MARKER,
+};
 
 /// Maximum number of evidence entries rendered in the detail pane.
 const EVIDENCE_DISPLAY_CAP: usize = 3;
@@ -85,6 +91,7 @@ pub fn render_frame(f: &mut Frame<'_>, state: &DashboardAppState) {
         state.focused_id.as_deref(),
         &state.tree,
         &state.active_tab,
+        &state.session_tab,
         chunks[1],
     );
 }
@@ -215,6 +222,7 @@ fn render_detail(
     session_name: Option<&str>,
     tree: &SessionTree,
     active_tab: &DashboardTab,
+    session_tab: &SessionTabState,
     area: ratatui::layout::Rect,
 ) {
     let title = match session_name {
@@ -230,11 +238,12 @@ fn render_detail(
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner_area);
 
     // Tabs widget.
-    let tab_titles = vec!["Summary", "History", "Remaining"];
+    let tab_titles = vec!["Summary", "History", "Remaining", "Session"];
     let selected = match active_tab {
         DashboardTab::Summary => 0,
         DashboardTab::History => 1,
         DashboardTab::Remaining => 2,
+        DashboardTab::Session => 3,
     };
     let tabs = Tabs::new(tab_titles)
         .select(selected)
@@ -251,6 +260,7 @@ fn render_detail(
         DashboardTab::Summary => render_summary_tab(f, detail, session_name, tree, chunks[1]),
         DashboardTab::History => render_history_tab(f, detail, chunks[1]),
         DashboardTab::Remaining => render_remaining_tab(f, detail, chunks[1]),
+        DashboardTab::Session => render_session_tab(f, session_tab, session_name, chunks[1]),
     }
 }
 
@@ -366,6 +376,357 @@ fn render_remaining_tab(
             .collect(),
     };
     f.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// Prefix on every line of untrusted content, so a value cannot pass for a
+/// fact, the banner, or a table row.
+const GUTTER: &str = "\u{2502} ";
+
+/// Printed after a field name when the session does not record the field.
+const ABSENT: &str = "\u{2014}";
+
+/// Directive lines shown in the facts block before the cut marker.
+const DIRECTIVE_LINES: usize = 4;
+
+/// Columns a character may take. Non-ASCII counts double so wrapped text
+/// never overflows a width it was fitted to, whatever the terminal draws.
+fn cell_cost(c: char) -> usize {
+    if c.is_ascii() {
+        1
+    } else {
+        2
+    }
+}
+
+/// Cut `line` to `width` columns, ending in the cut marker when it was cut.
+fn clip(line: &str, width: usize) -> String {
+    let cost: usize = line.chars().map(cell_cost).sum();
+    if cost <= width {
+        return line.to_string();
+    }
+    let budget = width.saturating_sub(CUT_MARKER.chars().map(cell_cost).sum());
+    let mut used = 0;
+    let mut out = String::new();
+    for c in line.chars() {
+        used += cell_cost(c);
+        if used > budget {
+            break;
+        }
+        out.push(c);
+    }
+    out.push_str(CUT_MARKER);
+    out
+}
+
+/// Lay `text` out behind the gutter in rows of at most `width` columns,
+/// stopping once there are more than `limit` rows.
+fn gutter_rows(text: &str, width: usize, limit: usize) -> Vec<String> {
+    let budget = width
+        .saturating_sub(GUTTER.chars().map(cell_cost).sum())
+        .max(1);
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let line = line.replace('\t', "    ");
+        let mut row = String::new();
+        let mut used = 0;
+        for c in line.chars() {
+            if used + cell_cost(c) > budget {
+                rows.push(format!("{GUTTER}{row}"));
+                row.clear();
+                used = 0;
+            }
+            row.push(c);
+            used += cell_cost(c);
+        }
+        rows.push(format!("{GUTTER}{row}"));
+        if rows.len() > limit {
+            break;
+        }
+    }
+    rows
+}
+
+/// At most `height` gutter rows of `text`. A cut, from the row limit or
+/// from `cut` (the source was already truncated), ends in a marker row.
+fn gutter_block(text: &str, cut: bool, width: usize, height: usize) -> Vec<String> {
+    if height == 0 {
+        return Vec::new();
+    }
+    let mut rows = gutter_rows(text, width, height);
+    let over = rows.len() > height;
+    if over || cut {
+        rows.truncate(height);
+        if rows.len() == height {
+            rows.pop();
+        }
+        rows.push(format!("{GUTTER}{CUT_MARKER}"));
+    }
+    rows
+}
+
+fn hash_text(hash: &Option<Sanitized>) -> String {
+    hash.as_ref()
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| "invalid-hash".to_string())
+}
+
+/// The text a preview shows, and whether the source was cut.
+fn preview_text(preview: &KeyPreview) -> (String, bool) {
+    match preview {
+        KeyPreview::Text { excerpt, truncated } => (excerpt.to_string(), *truncated),
+        KeyPreview::Binary { size, hash } => (
+            format!(
+                "type: binary\nsize: {}\nhash: {}",
+                format_size(*size),
+                hash_text(hash)
+            ),
+            false,
+        ),
+        KeyPreview::NotLocal { size, hash } => (
+            format!(
+                "not local: the content is in the remote store and is not fetched\nsize: {}\nhash: {}",
+                format_size(*size),
+                hash_text(hash)
+            ),
+            false,
+        ),
+        KeyPreview::Unreadable { reason } => (format!("unreadable: {reason}"), false),
+        KeyPreview::InvalidName => ("invalid key name: not read".to_string(), false),
+    }
+}
+
+/// One `Label: value` row per fact, `Label: —` for each the session does
+/// not record. A directive follows behind the gutter.
+fn fact_rows(facts: &SessionFacts, width: usize) -> Vec<String> {
+    let one = |label: &str, value: Option<&Sanitized>| {
+        let value = value.map(|v| v.as_str()).unwrap_or(ABSENT);
+        clip(&format!("{label}: {value}"), width)
+    };
+    let mut rows = vec![one("State", facts.current_state.as_ref())];
+    match &facts.directive {
+        Some(d) => {
+            rows.push("Directive:".to_string());
+            rows.extend(gutter_block(d.as_str(), false, width, DIRECTIVE_LINES));
+        }
+        None => rows.push(one("Directive", None)),
+    }
+    rows.push(one("Anchor", facts.anchor.as_ref()));
+    rows.push(one("Execution dir", facts.execution_dir.as_ref()));
+    let store = facts
+        .store
+        .as_ref()
+        .map(|(kind, base)| format!("{kind} {base}"));
+    rows.push(clip(
+        &format!("Store origin: {}", store.as_deref().unwrap_or(ABSENT)),
+        width,
+    ));
+    rows.push(one("Intent", facts.intent.as_ref()));
+    rows.push(one("Template", facts.template_name.as_ref()));
+    rows.push(one("Session id", facts.session_id.as_ref()));
+    rows.push(clip(
+        &format!("Created: {}", facts.created_at.as_deref().unwrap_or(ABSENT)),
+        width,
+    ));
+    rows
+}
+
+/// A banner value in double quotes, with `"` and `\` escaped so the value
+/// cannot close the quote and forge the fixed wording around it.
+fn quote_banner_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+fn migration_banner(m: &MigratedTo) -> String {
+    format!(
+        "migrated to session {} in workspace {}",
+        quote_banner_value(m.target.as_str()),
+        quote_banner_value(m.workspace.as_str())
+    )
+}
+
+/// Render the Session tab: the facts, then either the migration banner or
+/// the key table with the focused key's preview.
+fn render_session_tab(
+    f: &mut Frame<'_>,
+    tab: &SessionTabState,
+    session_name: Option<&str>,
+    area: ratatui::layout::Rect,
+) {
+    let loaded = session_name.is_some() && tab.loaded_session() == session_name;
+    if !loaded {
+        let msg = if session_name.is_some() {
+            "Loading session"
+        } else {
+            "No data"
+        };
+        f.render_widget(Paragraph::new(msg), area);
+        return;
+    }
+    match &tab.snapshot {
+        Some(Ok(snap)) => render_snapshot(f, tab, snap, area),
+        Some(Err(reason)) => {
+            let msg = format!("Session view unavailable: {reason}");
+            f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: false }), area);
+        }
+        None => f.render_widget(Paragraph::new("Loading session"), area),
+    }
+}
+
+fn render_snapshot(
+    f: &mut Frame<'_>,
+    tab: &SessionTabState,
+    snap: &SessionViewSnapshot,
+    area: ratatui::layout::Rect,
+) {
+    let facts = fact_rows(&snap.facts, area.width as usize);
+    let facts_height = (facts.len() as u16).min(area.height);
+    let facts_widget = Paragraph::new(Text::from(
+        facts.into_iter().map(Line::from).collect::<Vec<_>>(),
+    ));
+
+    if let Some(m) = &snap.migrated {
+        let chunks =
+            Layout::vertical([Constraint::Length(facts_height), Constraint::Min(0)]).split(area);
+        f.render_widget(facts_widget, chunks[0]);
+        let banner = Paragraph::new(Line::styled(
+            migration_banner(m),
+            Style::default().fg(Color::Yellow),
+        ))
+        .wrap(Wrap { trim: false });
+        f.render_widget(banner, chunks[1]);
+        return;
+    }
+
+    let chunks = Layout::vertical([
+        Constraint::Length(facts_height),
+        Constraint::Fill(3),
+        Constraint::Fill(2),
+    ])
+    .split(area);
+    f.render_widget(facts_widget, chunks[0]);
+    render_key_table(f, tab, snap, chunks[1]);
+    render_key_preview(f, tab, snap, chunks[2]);
+}
+
+/// The key table. Rows are built only for the window that ends at or after
+/// the cursor, so the cost follows the rows drawn, not the manifest's size.
+fn render_key_table(
+    f: &mut Frame<'_>,
+    tab: &SessionTabState,
+    snap: &SessionViewSnapshot,
+    area: ratatui::layout::Rect,
+) {
+    let title = if snap.unlisted_keys > 0 {
+        format!(
+            " keys ({}, {} not listed) ",
+            snap.keys.len(),
+            snap.unlisted_keys
+        )
+    } else {
+        format!(" keys ({}) ", snap.keys.len())
+    };
+    let block = Block::default().borders(Borders::TOP).title(title);
+    if snap.keys.is_empty() {
+        f.render_widget(Paragraph::new("No context keys").block(block), area);
+        return;
+    }
+
+    // The top border and the header take two rows.
+    let visible = (area.height as usize).saturating_sub(2).max(1);
+    let start = (tab.cursor + 1).saturating_sub(visible);
+    let end = snap.keys.len().min(start + visible);
+    let rows: Vec<Row> = snap.keys[start..end]
+        .iter()
+        .map(|k| {
+            tab.rows_built.set(tab.rows_built.get() + 1);
+            let state = match (k.raw.is_some(), k.locality, k.stale) {
+                (false, _, _) => "invalid-name",
+                (_, Locality::RemoteOnly, _) => "remote-only",
+                (_, Locality::Local, true) => "local, stale",
+                (_, Locality::Local, false) => "local",
+            };
+            Row::new(vec![
+                Cell::from(k.display.to_string()),
+                Cell::from(
+                    k.size
+                        .map(format_size)
+                        .unwrap_or_else(|| ABSENT.to_string()),
+                ),
+                Cell::from(
+                    k.writer
+                        .as_ref()
+                        .map(|w| w.to_string())
+                        .unwrap_or_else(|| ABSENT.to_string()),
+                ),
+                Cell::from(state),
+            ])
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(10),
+            Constraint::Length(10),
+            Constraint::Length(12),
+            Constraint::Length(12),
+        ],
+    )
+    .header(
+        Row::new(vec!["Key", "Size", "Writer", "State"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(block)
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    let mut table_state = TableState::default();
+    table_state.select(Some(tab.cursor - start));
+    f.render_stateful_widget(table, area, &mut table_state);
+}
+
+/// The focused key's preview, every row behind the gutter.
+fn render_key_preview(
+    f: &mut Frame<'_>,
+    tab: &SessionTabState,
+    snap: &SessionViewSnapshot,
+    area: ratatui::layout::Rect,
+) {
+    let Some(entry) = snap.keys.get(tab.cursor) else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .title(format!(" preview: {} ", entry.display));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let (text, cut) = if entry.raw.is_none() {
+        preview_text(&KeyPreview::InvalidName)
+    } else {
+        match tab.focused_preview() {
+            Some(preview) => preview_text(preview),
+            None => ("loading".to_string(), false),
+        }
+    };
+    let rows = gutter_block(&text, cut, inner.width as usize, inner.height as usize);
+    // Rows are fitted to the width already; the wrapped widget is the one
+    // the design names, and it must not need to reflow them.
+    let widget = Paragraph::new(Text::from(
+        rows.into_iter().map(Line::from).collect::<Vec<_>>(),
+    ))
+    .wrap(Wrap { trim: false });
+    f.render_widget(widget, inner);
 }
 
 /// Format a `Duration` as a compact human-readable string.
@@ -995,13 +1356,13 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_three_times_returns_to_summary() {
+    fn tab_cycles_four_times_returns_to_summary() {
         use crate::cli::dashboard_state::DashboardTab;
         use crossterm::event::KeyModifiers;
 
         let mut state = empty_state();
         assert_eq!(state.active_tab, DashboardTab::Summary);
-        for _ in 0..3 {
+        for _ in 0..4 {
             state.handle_key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Tab,
                 KeyModifiers::NONE,
@@ -1434,5 +1795,445 @@ mod tests {
             plain_rows[0].task_counts, member_rows[0].task_counts,
             "membership must not change how children are counted"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Session tab
+    // -----------------------------------------------------------------------
+
+    use crate::cli::dashboard_state::SessionLoad;
+    use crate::session_view::{
+        sanitize, sanitize_capped, KeyEntry, KeyPreview, Locality, MigratedTo, SessionFacts,
+        SessionViewSnapshot, BANNER_VALUE_CAP, CUT_MARKER,
+    };
+    use std::time::SystemTime;
+
+    const WIDTH: u16 = 100;
+    const HEIGHT: u16 = 30;
+    /// The detail pane's inner left edge at `WIDTH`: 40% list, then a border.
+    const PANE_X: u16 = 41;
+
+    fn facts() -> SessionFacts {
+        SessionFacts {
+            name: "wf".to_string(),
+            session_id: Some(sanitize("id-1")),
+            created_at: Some("2026-01-01T00:00:00Z".to_string()),
+            intent: Some(sanitize("ship it")),
+            template_name: Some(sanitize("work-on")),
+            current_state: Some(sanitize("implement")),
+            directive: Some(sanitize("Do the thing")),
+            execution_dir: Some(sanitize("/work")),
+            anchor: Some(sanitize("/anchor")),
+            store: Some((sanitize("local"), sanitize("/store"))),
+        }
+    }
+
+    fn entry(name: &str, size: u64) -> KeyEntry {
+        KeyEntry {
+            display: sanitize_capped(name, 256),
+            raw: Some(name.to_string()),
+            size: Some(size),
+            writer: None,
+            created_at: None,
+            locality: Locality::Local,
+            stale: false,
+        }
+    }
+
+    fn snapshot(keys: Vec<KeyEntry>) -> SessionViewSnapshot {
+        SessionViewSnapshot {
+            facts: facts(),
+            migrated: None,
+            keys,
+            unlisted_keys: 0,
+        }
+    }
+
+    fn text(s: &str, truncated: bool) -> KeyPreview {
+        KeyPreview::Text {
+            excerpt: sanitize(s),
+            truncated,
+        }
+    }
+
+    /// A tab loaded the way the tick loop loads it: through `tick`.
+    fn loaded(snap: SessionViewSnapshot, cursor: usize, preview: KeyPreview) -> SessionTabState {
+        let mut tab = SessionTabState::default();
+        let mtime = SystemTime::UNIX_EPOCH;
+        tab.tick("wf", mtime, |_| Ok(snap.clone()), |_, _| preview.clone());
+        tab.move_cursor(cursor as isize);
+        let again = preview.clone();
+        tab.tick("wf", mtime, |_| unreachable!(), |_, _| again);
+        tab
+    }
+
+    fn draw(tab: SessionTabState) -> (RatatuiBuffer, SessionTabState) {
+        let mut state = empty_state();
+        state.active_tab = DashboardTab::Session;
+        state.focused_id = Some("wf".to_string());
+        state.session_tab = tab;
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        terminal.draw(|f| render_frame(f, &state)).unwrap();
+        (terminal.backend().buffer().clone(), state.session_tab)
+    }
+
+    /// The pane's rows, left border and right border stripped.
+    fn pane_rows(buffer: &RatatuiBuffer) -> Vec<String> {
+        (1..HEIGHT - 1)
+            .map(|y| region_to_string(buffer, y..y + 1, PANE_X..WIDTH - 1))
+            .collect()
+    }
+
+    /// The preview rows with gutters removed and wrapping undone.
+    fn unwrapped_preview(buffer: &RatatuiBuffer) -> String {
+        pane_rows(buffer)
+            .iter()
+            .filter_map(|r| r.strip_prefix("\u{2502} "))
+            .map(|r| r.trim_end())
+            .collect()
+    }
+
+    fn pane_text(buffer: &RatatuiBuffer) -> String {
+        pane_rows(buffer).join("\n")
+    }
+
+    #[test]
+    fn session_tab_shows_facts_keys_with_size_and_marks_absent_fields() {
+        let mut snap = snapshot(vec![entry("notes.md", 11), entry("big.md", 4096)]);
+        snap.facts.intent = None;
+        snap.facts.anchor = None;
+        snap.facts.store = None;
+        let (buffer, _) = draw(loaded(snap, 0, text("hello", false)));
+        let pane = pane_text(&buffer);
+
+        assert!(pane.contains("State: implement"), "{pane}");
+        assert!(pane.contains("Directive:"), "{pane}");
+        // Every absent field prints its name and the dash, never a blank.
+        for field in ["Intent", "Anchor", "Store origin"] {
+            assert!(
+                pane.contains(&format!("{field}: \u{2014}")),
+                "{field}: {pane}"
+            );
+        }
+        assert!(pane.contains("Template: work-on"), "{pane}");
+        assert!(pane.contains("Session"), "tab title: {pane}");
+        // Every key is listed with its size.
+        assert!(pane.contains("notes.md"), "{pane}");
+        assert!(pane.contains("11 B"), "{pane}");
+        assert!(pane.contains("big.md"), "{pane}");
+        assert!(pane.contains("4.0 KiB"), "{pane}");
+    }
+
+    #[test]
+    fn session_tab_shows_store_origin_when_recorded() {
+        let (buffer, _) = draw(loaded(snapshot(vec![]), 0, text("", false)));
+        let pane = pane_text(&buffer);
+        assert!(pane.contains("Store origin: local /store"), "{pane}");
+        assert!(pane.contains("No context keys"), "{pane}");
+    }
+
+    #[test]
+    fn session_tab_cuts_a_long_excerpt_with_a_marker_and_guttered_rows() {
+        let excerpt = "a line of excerpt text that is fairly long\n".repeat(100);
+        let (buffer, _) = draw(loaded(
+            snapshot(vec![entry("long.md", 9000)]),
+            0,
+            text(&excerpt, true),
+        ));
+        let rows = pane_rows(&buffer);
+        let start = rows
+            .iter()
+            .position(|r| r.contains("preview: long.md"))
+            .expect("preview title");
+        let content = &rows[start + 1..];
+        assert!(content.len() > 3);
+        for row in content {
+            assert!(
+                row.starts_with("\u{2502} "),
+                "every preview row carries the gutter: {row:?}"
+            );
+        }
+        assert!(
+            content.last().unwrap().contains(CUT_MARKER),
+            "the cut is marked: {:?}",
+            content.last()
+        );
+    }
+
+    #[test]
+    fn session_tab_marks_a_cut_even_when_the_excerpt_fits_the_viewport() {
+        let (buffer, _) = draw(loaded(
+            snapshot(vec![entry("k", 5000)]),
+            0,
+            text("short body", true),
+        ));
+        let pane = pane_text(&buffer);
+        assert!(pane.contains("\u{2502} short body"), "{pane}");
+        assert!(pane.contains(&format!("\u{2502} {CUT_MARKER}")), "{pane}");
+    }
+
+    #[test]
+    fn session_tab_binary_key_shows_type_size_and_hash_but_no_bytes() {
+        let hash = "ab".repeat(32);
+        let preview = KeyPreview::Binary {
+            size: 4096,
+            hash: Some(sanitize(&hash)),
+        };
+        let (buffer, _) = draw(loaded(snapshot(vec![entry("blob.bin", 4096)]), 0, preview));
+        let pane = pane_text(&buffer);
+        assert!(pane.contains("\u{2502} type: binary"), "{pane}");
+        assert!(pane.contains("size: 4.0 KiB"), "{pane}");
+        assert!(
+            unwrapped_preview(&buffer).contains(&format!("hash: {hash}")),
+            "{pane}"
+        );
+    }
+
+    #[test]
+    fn session_tab_unreadable_key_shows_its_marker_while_other_keys_render() {
+        let preview = KeyPreview::Unreadable {
+            reason: sanitize("permission denied"),
+        };
+        let snap = snapshot(vec![entry("a-bad.md", 3), entry("b-good.md", 4)]);
+        let (buffer, _) = draw(loaded(snap, 0, preview));
+        let pane = pane_text(&buffer);
+        assert!(
+            pane.contains("\u{2502} unreadable: permission denied"),
+            "{pane}"
+        );
+        assert!(pane.contains("a-bad.md"), "{pane}");
+        assert!(pane.contains("b-good.md"), "{pane}");
+    }
+
+    #[test]
+    fn session_tab_remote_only_key_shows_not_local_with_recorded_size_and_hash() {
+        let mut remote = entry("remote.md", 2048);
+        remote.locality = Locality::RemoteOnly;
+        let hash = "cd".repeat(32);
+        let preview = KeyPreview::NotLocal {
+            size: 2048,
+            hash: Some(sanitize(&hash)),
+        };
+        let (buffer, _) = draw(loaded(snapshot(vec![remote]), 0, preview));
+        let pane = pane_text(&buffer);
+        assert!(pane.contains("remote-only"), "{pane}");
+        assert!(pane.contains("\u{2502} not local"), "{pane}");
+        assert!(pane.contains("size: 2.0 KiB"), "{pane}");
+        assert!(
+            unwrapped_preview(&buffer).contains(&format!("hash: {hash}")),
+            "{pane}"
+        );
+    }
+
+    #[test]
+    fn session_tab_invalid_name_says_so_and_stale_is_flagged() {
+        let mut bad = entry("a-bad", 1);
+        bad.raw = None;
+        let mut stale = entry("b-stale", 1);
+        stale.stale = true;
+        let (buffer, tab) = draw(loaded(snapshot(vec![bad, stale]), 0, text("x", false)));
+        let pane = pane_text(&buffer);
+        assert!(pane.contains("invalid-name"), "{pane}");
+        assert!(
+            pane.contains("\u{2502} invalid key name: not read"),
+            "{pane}"
+        );
+        assert!(pane.contains("local, stale"), "{pane}");
+        assert_eq!(tab.preview_reads, 0, "an invalid name is never read");
+    }
+
+    fn migrated_snapshot(target: &str, workspace: &str) -> SessionViewSnapshot {
+        let mut snap = snapshot(vec![entry("should-not-show.md", 1)]);
+        snap.migrated = Some(MigratedTo {
+            target: sanitize_capped(target, BANNER_VALUE_CAP),
+            workspace: sanitize_capped(workspace, BANNER_VALUE_CAP),
+        });
+        snap
+    }
+
+    #[test]
+    fn migration_banner_quotes_and_escapes_values_inside_fixed_wording() {
+        let snap = migrated_snapshot("x\" in workspace \"trusted", "a\\b");
+        let banner = migration_banner(snap.migrated.as_ref().unwrap());
+        assert_eq!(
+            banner,
+            "migrated to session \"x\\\" in workspace \\\"trusted\" in workspace \"a\\\\b\""
+        );
+    }
+
+    #[test]
+    fn migration_banner_caps_each_value_and_hides_the_key_table() {
+        let long = "t".repeat(BANNER_VALUE_CAP * 3);
+        let snap = migrated_snapshot(&long, "ws");
+        let m = snap.migrated.clone().unwrap();
+        assert!(m.target.as_str().ends_with(CUT_MARKER));
+        assert_eq!(
+            m.target.as_str().chars().count(),
+            BANNER_VALUE_CAP + CUT_MARKER.chars().count()
+        );
+
+        let (buffer, tab) = draw(loaded(snap, 0, text("x", false)));
+        let pane = pane_text(&buffer);
+        assert!(pane.contains("migrated to session"), "{pane}");
+        assert!(pane.contains("in workspace"), "{pane}");
+        assert!(!pane.contains("should-not-show.md"), "{pane}");
+        assert!(!pane.contains("keys ("), "{pane}");
+        assert_eq!(tab.rows_built.get(), 0);
+    }
+
+    #[test]
+    fn hostile_values_leave_no_control_characters_in_any_cell() {
+        let hostile = "a\u{1b}[2J\u{1b}]0;owned\u{7}\u{9b}31m\u{202e}evil\u{7f}\u{200b}z";
+        // Long enough to force the wrapped widget to reflow.
+        let excerpt = format!("{hostile} {}\n{hostile}", "w".repeat(200));
+        let mut key = entry("k", 1);
+        key.display = sanitize_capped(hostile, 256);
+        key.writer = Some(sanitize_capped(hostile, 64));
+        let mut snap = snapshot(vec![key]);
+        snap.facts.intent = Some(sanitize_capped(hostile, 1024));
+        snap.facts.directive = Some(sanitize(hostile));
+        let (buffer, _) = draw(loaded(snap, 0, text(&excerpt, false)));
+
+        let mut seen_escape = false;
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let symbol = buffer.cell((x, y)).unwrap().symbol().to_string();
+                for c in symbol.chars() {
+                    assert!(!c.is_control(), "control char {c:?} at ({x},{y})");
+                    assert!(
+                        !matches!(c, '\u{202A}'..='\u{202E}' | '\u{200B}'..='\u{200F}'),
+                        "invisible formatting char {c:?} at ({x},{y})"
+                    );
+                }
+            }
+        }
+        let pane = pane_text(&buffer);
+        seen_escape |= pane.contains("\\u{1B}[2J");
+        assert!(seen_escape, "the escape stays visible as text: {pane}");
+    }
+
+    #[test]
+    fn key_table_builds_rows_only_for_the_visible_window() {
+        let names: Vec<String> = (0..5000).map(|i| format!("key-{i:05}")).collect();
+        let keys: Vec<KeyEntry> = names.iter().map(|n| entry(n, 1)).collect();
+
+        let (buffer, tab) = draw(loaded(snapshot(keys.clone()), 0, text("x", false)));
+        let built = tab.rows_built.get();
+        assert!(built > 0 && built < 30, "built {built} rows for 5000 keys");
+        assert!(pane_text(&buffer).contains("key-00000"));
+
+        // Deep in the list the window follows the cursor, still bounded.
+        let (buffer, tab) = draw(loaded(snapshot(keys), 3000, text("x", false)));
+        let built = tab.rows_built.get();
+        assert!(built > 0 && built < 30, "built {built} rows at depth");
+        let pane = pane_text(&buffer);
+        assert!(pane.contains("key-03000"), "{pane}");
+        assert!(!pane.contains("key-00000"), "{pane}");
+    }
+
+    #[test]
+    fn other_tabs_render_the_same_with_or_without_session_data() {
+        let detail = || DetailData {
+            session_id: "wf".to_string(),
+            gate_name: Some("g".to_string()),
+            command: None,
+            result: Some("PASS".to_string()),
+            elapsed: Duration::from_secs(0),
+            evidence: vec![],
+            current_state: Some("implement".to_string()),
+            directive: Some("Do it".to_string()),
+            intent: None,
+            template_name: None,
+            history: vec![],
+            remaining: vec!["done".to_string()],
+        };
+        for tab in [
+            DashboardTab::Summary,
+            DashboardTab::History,
+            DashboardTab::Remaining,
+        ] {
+            let render = |session_tab: SessionTabState| {
+                let mut state = empty_state();
+                state.active_tab = tab.clone();
+                state.focused_id = Some("wf".to_string());
+                state.detail_cache = Some(detail());
+                state.session_tab = session_tab;
+                let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+                terminal.draw(|f| render_frame(f, &state)).unwrap();
+                terminal.backend().buffer().clone()
+            };
+            let with = render(loaded(
+                snapshot(vec![entry("k", 1)]),
+                0,
+                text("body", false),
+            ));
+            let without = render(SessionTabState::default());
+            assert_eq!(with, without, "{tab:?} must not depend on the Session tab");
+        }
+    }
+
+    #[test]
+    fn session_tab_without_a_loaded_snapshot_says_so() {
+        let (buffer, _) = draw(SessionTabState::default());
+        assert!(pane_text(&buffer).contains("Loading session"));
+    }
+
+    #[test]
+    fn session_tab_reads_a_real_store_one_preview_per_tick() {
+        use crate::session::context::ContextStore;
+        use crate::session::local::LocalBackend;
+        use crate::session::{Backend, SessionBackend};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let local = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        let header = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "workflow": "wf",
+            "template_hash": "h",
+            "created_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        let init = serde_json::from_value(serde_json::json!({
+            "seq": 1,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "workflow_initialized",
+            "payload": {"template_path": "", "variables": {}},
+        }))
+        .unwrap();
+        local.init_state_file("wf", header, vec![init]).unwrap();
+        local.add("wf", "a.md", b"alpha body").unwrap();
+        local.add("wf", "b.md", b"beta body").unwrap();
+        let backend = Backend::Local(local);
+
+        let mut tab = SessionTabState::default();
+        let mtime = SystemTime::UNIX_EPOCH;
+        let tick = |tab: &mut SessionTabState| {
+            tab.tick(
+                "wf",
+                mtime,
+                |n| crate::session_view::snapshot(&backend, n),
+                |n, k| {
+                    crate::session_view::read_key_preview(
+                        &backend,
+                        n,
+                        k,
+                        crate::session_view::EXCERPT_BOUND,
+                    )
+                },
+            )
+        };
+        tick(&mut tab);
+        assert_eq!(tab.preview_reads, 1);
+        for _ in 0..4 {
+            tick(&mut tab);
+        }
+        assert_eq!(tab.preview_reads, 1, "cached per (session, key, mtime)");
+        assert_eq!(tab.plan("wf", mtime), SessionLoad::Idle);
+
+        let (buffer, _) = draw(tab);
+        let pane = pane_text(&buffer);
+        assert!(pane.contains("\u{2502} alpha body"), "{pane}");
+        assert!(pane.contains("b.md"), "{pane}");
+        assert!(pane.contains("Anchor: \u{2014}"), "{pane}");
     }
 }

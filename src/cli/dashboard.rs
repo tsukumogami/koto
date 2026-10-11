@@ -20,7 +20,7 @@ use crate::cli::dashboard_data::{
     self, classify_liveness, compute_elapsed_since, CachedSession, Liveness, SessionTree,
 };
 use crate::cli::dashboard_render::render_frame;
-use crate::cli::dashboard_state::DashboardAppState;
+use crate::cli::dashboard_state::{DashboardAppState, DashboardTab};
 use crate::cli::DashboardArgs;
 
 /// RAII guard that restores the terminal on any exit path, including `?` propagation.
@@ -259,6 +259,30 @@ pub fn run(args: DashboardArgs, backend: &crate::session::Backend) -> Result<()>
                         state.detail_cache_mtime = current_mtime;
                         state.detail_cache_session = Some(id.clone());
                     }
+                }
+            }
+        }
+
+        // The Session tab loads on every tick but reads only when its plan
+        // says the cached view is stale: the snapshot on entry or a
+        // state-file mtime change, then one bounded preview for the focused
+        // key.
+        if state.active_tab == DashboardTab::Session {
+            if let Some(id) = state.focused_id.clone() {
+                if let Some(mtime) = state.tree.sessions.get(&id).map(|s| s.mtime) {
+                    state.session_tab.tick(
+                        &id,
+                        mtime,
+                        |name| crate::session_view::snapshot(backend, name),
+                        |name, key| {
+                            crate::session_view::read_key_preview(
+                                backend,
+                                name,
+                                key,
+                                crate::session_view::EXCERPT_BOUND,
+                            )
+                        },
+                    );
                 }
             }
         }
