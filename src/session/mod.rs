@@ -126,6 +126,16 @@ impl fmt::Display for SessionMigrated {
 
 impl std::error::Error for SessionMigrated {}
 
+/// A bounded prefix read of one context key's local content, from
+/// [`Backend::read_context_prefix`].
+#[derive(Debug, Clone)]
+pub struct PrefixRead {
+    /// At most the requested bound of leading bytes.
+    pub bytes: Vec<u8>,
+    /// Whether `bytes` is the whole file.
+    pub complete: bool,
+}
+
 /// RAII guard for an advisory `flock(LOCK_EX)` held on a session's
 /// state file.
 ///
@@ -586,6 +596,36 @@ impl Backend {
         match self {
             Backend::Local(_) => Ok(()),
             Backend::Cloud(b) => b.check_not_migrated(id),
+        }
+    }
+
+    /// Read at most `bound` leading bytes of a key's LOCAL content, for
+    /// bounded display (`crate::session_view`). Never a pull and never a
+    /// remote request on either variant: a key with no local content is
+    /// `Ok(None)`, whatever the remote holds. Refuses anything but a
+    /// regular file, checked before the open (an `open` on a FIFO blocks
+    /// before any handle check could run), and a path whose resolved
+    /// parent leaves the session's `ctx/` directory.
+    pub fn read_context_prefix(
+        &self,
+        session: &str,
+        key: &str,
+        bound: usize,
+    ) -> anyhow::Result<Option<PrefixRead>> {
+        match self {
+            Backend::Local(b) => b.read_context_prefix(session, key, bound),
+            Backend::Cloud(b) => b.read_context_prefix(session, key, bound),
+        }
+    }
+
+    /// The local context manifest and, on the cloud backend, the remote
+    /// one from the cached fetch its metadata paths already make (`None`
+    /// on the local backend or when the fetch fails). One request at
+    /// most, shared with the backend's own 5-second manifest cache.
+    pub fn manifest_pair(&self, session: &str) -> (context::Manifest, Option<context::Manifest>) {
+        match self {
+            Backend::Local(b) => (b.read_manifest(session).unwrap_or_default(), None),
+            Backend::Cloud(b) => b.manifest_pair(session),
         }
     }
 }

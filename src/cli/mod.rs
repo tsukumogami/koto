@@ -403,6 +403,17 @@ pub struct DashboardArgs {
     /// (--once) Include the receded set (done + abandoned); default excludes it
     #[arg(long)]
     pub all: bool,
+
+    /// Print one JSON object describing the named session -- facts, every
+    /// context key with metadata, and bounded content previews -- and exit.
+    /// Requires the positional session name; exclusive with the feed and
+    /// TUI flags.
+    #[arg(
+        long,
+        requires = "name",
+        conflicts_with_all = ["once", "status", "needs_you", "all", "interval"]
+    )]
+    pub detail: bool,
 }
 
 #[derive(Subcommand)]
@@ -7149,13 +7160,6 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     // anywhere in this function.
     if let Some(state) = current_template_state {
         if !state.terminal {
-            let mut runtime_vars = std::collections::HashMap::new();
-            runtime_vars.insert(
-                "SESSION_DIR".to_string(),
-                backend.session_dir(name).to_string_lossy().to_string(),
-            );
-            runtime_vars.insert("SESSION_NAME".to_string(), name.to_string());
-
             // Re-validates values as defense in depth, mirroring
             // `handle_next`'s construction of the same type -- this is
             // the "same two-layer pipeline" `koto next` substitutes
@@ -7173,14 +7177,23 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
                     );
                 }
             };
-            let substitute = |raw: &str| -> String {
-                let d = crate::cli::vars::substitute_vars(raw, &runtime_vars);
-                variables.substitute(&d)
-            };
-
-            response["directive"] = serde_json::json!(substitute(&state.directive));
+            // One directive rendering, shared with the session view;
+            // tests/status_characterization_test.rs pins the output
+            // byte-for-byte across this seam.
+            let session_dir = backend.session_dir(name);
+            response["directive"] = serde_json::json!(crate::session_view::render_directive(
+                &state.directive,
+                &session_dir,
+                name,
+                &variables,
+            ));
             if !state.details.is_empty() {
-                response["details"] = serde_json::json!(substitute(&state.details));
+                response["details"] = serde_json::json!(crate::session_view::render_directive(
+                    &state.details,
+                    &session_dir,
+                    name,
+                    &variables,
+                ));
             }
             if let Some(expects) = crate::cli::next_types::derive_expects(state) {
                 response["expects"] = serde_json::to_value(&expects)?;

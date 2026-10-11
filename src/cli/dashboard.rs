@@ -20,9 +20,8 @@ use crate::cli::dashboard_data::{
     self, classify_liveness, compute_elapsed_since, CachedSession, Liveness, SessionTree,
 };
 use crate::cli::dashboard_render::render_frame;
-use crate::cli::dashboard_state::DashboardAppState;
+use crate::cli::dashboard_state::{DashboardAppState, DashboardTab};
 use crate::cli::DashboardArgs;
-use crate::session::SessionBackend;
 
 /// RAII guard that restores the terminal on any exit path, including `?` propagation.
 struct TerminalGuard;
@@ -187,8 +186,184 @@ fn format_once_line(
     )
 }
 
+/// `--detail`: print one JSON object describing the named session and exit.
+///
+/// Errors follow the `handle_status` convention — `{error, command}` on
+/// stdout, exit 2 for a missing session, exit 3 for a corrupt record or an
+/// infrastructure failure. A migrated session is a successful exit-0 answer
+/// carrying `migrated {target, workspace}` and no `keys` member. Otherwise
+/// the object holds the session facts (absent facts are omitted, not
+/// nulled), every listed key in the snapshot's lexicographic order with its
+/// metadata, and an eagerly read bounded `content` preview for at most
+/// [`DETAIL_PREVIEW_CEILING`](crate::session_view::DETAIL_PREVIEW_CEILING)
+/// keys; past the ceiling a key carries `contentOmitted: "key-limit"` and
+/// the top-level `contentOmittedCount` counts them. Every string has been
+/// through the snapshot layer's sanitizer, and serde_json's own escaping
+/// runs after it, so the stream carries no raw control bytes.
+fn run_detail(name: &str, backend: &crate::session::Backend) -> ! {
+    use crate::cli::{exit_with_error_code, EXIT_CALLER_ERROR, EXIT_INFRASTRUCTURE};
+    use crate::session_view::{
+        self, KeyPreview, Locality, SnapshotError, DETAIL_PREVIEW_CEILING, EXCERPT_BOUND,
+    };
+
+    let snap = match session_view::snapshot(backend, name) {
+        Ok(s) => s,
+        Err(SnapshotError::NotFound) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": format!(
+                        "session '{}' not found",
+                        session_view::sanitize_capped(name, session_view::KEY_DISPLAY_CAP)
+                    ),
+                    "command": "dashboard",
+                }),
+                EXIT_CALLER_ERROR,
+            );
+        }
+        Err(e @ (SnapshotError::Corrupt(_) | SnapshotError::Infrastructure(_))) => {
+            exit_with_error_code(
+                serde_json::json!({
+                    "error": e.reason().as_str(),
+                    "command": "dashboard",
+                }),
+                EXIT_INFRASTRUCTURE,
+            );
+        }
+    };
+
+    // The shape is assembled by hand, so nothing at compile time holds it:
+    // `tests/dashboard_detail_test.rs` and the schema in
+    // `docs/reference/session-feed.md` are the contract. A field change
+    // updates both in the same commit.
+    let mut out = serde_json::Map::new();
+    let facts = &snap.facts;
+    out.insert("name".into(), facts.name.clone().into());
+    let mut put = |k: &str, v: Option<String>| {
+        if let Some(v) = v {
+            out.insert(k.into(), v.into());
+        }
+    };
+    put(
+        "session_id",
+        facts.session_id.clone().map(|s| s.into_string()),
+    );
+    put("created_at", facts.created_at.clone());
+    put("intent", facts.intent.clone().map(|s| s.into_string()));
+    put(
+        "template_name",
+        facts.template_name.clone().map(|s| s.into_string()),
+    );
+    put(
+        "current_state",
+        facts.current_state.clone().map(|s| s.into_string()),
+    );
+    put(
+        "directive",
+        facts.directive.clone().map(|s| s.into_string()),
+    );
+    put(
+        "execution_dir",
+        facts.execution_dir.clone().map(|s| s.into_string()),
+    );
+    put("anchor", facts.anchor.clone().map(|s| s.into_string()));
+    if let Some((kind, base)) = &facts.store {
+        out.insert(
+            "store".into(),
+            serde_json::json!({"kind": kind.as_str(), "base": base.as_str()}),
+        );
+    }
+
+    if let Some(m) = &snap.migrated {
+        // A migrated session is an answer, not an error: the successor is
+        // named and no key list follows (the local copy's keys describe a
+        // session that lives elsewhere now).
+        out.insert(
+            "migrated".into(),
+            serde_json::json!({"target": m.target.as_str(), "workspace": m.workspace.as_str()}),
+        );
+        println!("{}", serde_json::Value::Object(out));
+        std::process::exit(0);
+    }
+
+    let mut keys = Vec::with_capacity(snap.keys.len());
+    let mut omitted: u64 = 0;
+    for (i, entry) in snap.keys.iter().enumerate() {
+        let mut k = serde_json::Map::new();
+        k.insert("key".into(), entry.display.as_str().into());
+        if let Some(size) = entry.size {
+            k.insert("size".into(), size.into());
+        }
+        if let Some(w) = &entry.writer {
+            k.insert("writer".into(), w.as_str().into());
+        }
+        if let Some(c) = &entry.created_at {
+            k.insert("created_at".into(), c.as_str().into());
+        }
+        k.insert(
+            "locality".into(),
+            match entry.locality {
+                Locality::Local => "local",
+                Locality::RemoteOnly => "remote-only",
+            }
+            .into(),
+        );
+        k.insert("stale".into(), entry.stale.into());
+
+        if i >= DETAIL_PREVIEW_CEILING {
+            omitted += 1;
+            k.insert("contentOmitted".into(), "key-limit".into());
+        } else {
+            let preview = match &entry.raw {
+                Some(raw) => session_view::read_key_preview(backend, name, raw, EXCERPT_BOUND),
+                None => KeyPreview::InvalidName,
+            };
+            let content = match preview {
+                KeyPreview::Text { excerpt, truncated } => serde_json::json!({
+                    "type": "text", "excerpt": excerpt.as_str(), "truncated": truncated,
+                }),
+                KeyPreview::Binary { size, hash } => serde_json::json!({
+                    "type": "binary", "size": size,
+                    "hash": hash.map_or_else(|| "invalid-hash".to_string(), |h| h.into_string()),
+                }),
+                KeyPreview::NotLocal { size, hash } => serde_json::json!({
+                    "type": "not-local", "size": size,
+                    "hash": hash.map_or_else(|| "invalid-hash".to_string(), |h| h.into_string()),
+                }),
+                KeyPreview::Unreadable { reason } => serde_json::json!({
+                    "type": "unreadable", "reason": reason.as_str(),
+                }),
+                KeyPreview::InvalidName => serde_json::json!({"type": "invalid-name"}),
+            };
+            k.insert("content".into(), content);
+        }
+        keys.push(serde_json::Value::Object(k));
+    }
+    out.insert("keys".into(), keys.into());
+    out.insert("contentOmittedCount".into(), omitted.into());
+    out.insert("unlistedKeys".into(), (snap.unlisted_keys as u64).into());
+
+    println!("{}", serde_json::Value::Object(out));
+    std::process::exit(0);
+}
+
 /// Entry point called from the CLI dispatch in `src/cli/mod.rs`.
-pub fn run(args: DashboardArgs, backend: &dyn SessionBackend) -> Result<()> {
+///
+/// Takes the concrete [`Backend`]: the Session tab and the `--detail`
+/// mode reach the context store and the migration check through it
+/// (`crate::session_view`), which no trait object carries. The data
+/// refresh below still consumes it as a `&dyn SessionBackend`.
+pub fn run(args: DashboardArgs, backend: &crate::session::Backend) -> Result<()> {
+    // --detail: one JSON object for one session, checked before --once and
+    // the TUI so it can never fall into either. clap's `requires` guarantees
+    // the positional name is present.
+    if args.detail {
+        let name = args
+            .name
+            .as_deref()
+            .expect("clap `requires` guarantees the positional name");
+        run_detail(name, backend);
+    }
+
     // --once: print tab-separated lines and exit without a TUI.
     if args.once {
         let mut tree = SessionTree::new();
@@ -255,6 +430,30 @@ pub fn run(args: DashboardArgs, backend: &dyn SessionBackend) -> Result<()> {
                         state.detail_cache_mtime = current_mtime;
                         state.detail_cache_session = Some(id.clone());
                     }
+                }
+            }
+        }
+
+        // The Session tab loads on every tick but reads only when its plan
+        // says the cached view is stale: the snapshot on entry or a
+        // state-file mtime change, then one bounded preview for the focused
+        // key.
+        if state.active_tab == DashboardTab::Session {
+            if let Some(id) = state.focused_id.clone() {
+                if let Some(mtime) = state.tree.sessions.get(&id).map(|s| s.mtime) {
+                    state.session_tab.tick(
+                        &id,
+                        mtime,
+                        |name| crate::session_view::snapshot(backend, name),
+                        |name, key| {
+                            crate::session_view::read_key_preview(
+                                backend,
+                                name,
+                                key,
+                                crate::session_view::EXCERPT_BOUND,
+                            )
+                        },
+                    );
                 }
             }
         }
@@ -516,6 +715,7 @@ mod tests {
             status: status.map(|s| s.to_string()),
             needs_you,
             all,
+            detail: false,
         }
     }
 

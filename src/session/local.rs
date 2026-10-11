@@ -490,6 +490,88 @@ impl LocalBackend {
         }
     }
 
+    /// Read at most `bound` leading bytes of a key's content, for bounded
+    /// display. See [`crate::session::Backend::read_context_prefix`] for
+    /// the contract; this is the one implementation, and the cloud
+    /// backend delegates to its local store so no variant ever reaches
+    /// the bucket from here.
+    pub(crate) fn read_context_prefix(
+        &self,
+        session: &str,
+        key: &str,
+        bound: usize,
+    ) -> anyhow::Result<Option<crate::session::PrefixRead>> {
+        validate_context_key(key)?;
+        let path = self.content_path(session, key);
+
+        // lstat before any open: an `open` on a FIFO blocks until a writer
+        // appears, so the regular-file check must precede it, and a
+        // symlink at the leaf is rejected rather than followed.
+        let lmeta = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to stat content for key '{}': {}",
+                    key,
+                    e
+                ))
+            }
+        };
+        if !lmeta.is_file() {
+            anyhow::bail!("content for key '{}' is not a regular file", key);
+        }
+
+        // O_NOFOLLOW guards only the final component: a symlinked
+        // intermediate directory (planted by something other than koto)
+        // would still be followed, so the resolved parent must stay under
+        // the session's resolved ctx/ root.
+        let ctx_root = self
+            .ctx_dir(session)
+            .canonicalize()
+            .with_context(|| format!("failed to resolve ctx dir for session '{}'", session))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("content path for key '{}' has no parent", key))?
+            .canonicalize()
+            .with_context(|| format!("failed to resolve content path for key '{}'", key))?;
+        if !parent.starts_with(&ctx_root) {
+            anyhow::bail!(
+                "content path for key '{}' escapes the session's ctx directory",
+                key
+            );
+        }
+
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&path)
+        };
+        #[cfg(not(unix))]
+        let file = fs::OpenOptions::new().read(true).open(&path);
+        let file = file.with_context(|| format!("failed to open content for key '{}'", key))?;
+
+        // fstat the handle to close the check-to-open race.
+        let fmeta = file
+            .metadata()
+            .with_context(|| format!("failed to stat open content for key '{}'", key))?;
+        if !fmeta.is_file() {
+            anyhow::bail!("content for key '{}' is not a regular file", key);
+        }
+
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        file.take(bound as u64 + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("failed to read content for key '{}'", key))?;
+        let complete = bytes.len() <= bound;
+        bytes.truncate(bound);
+        Ok(Some(crate::session::PrefixRead { bytes, complete }))
+    }
+
     /// Write the manifest atomically using temp-file-then-rename.
     fn write_manifest(&self, session: &str, manifest: &Manifest) -> anyhow::Result<()> {
         let path = self.manifest_path(session);
