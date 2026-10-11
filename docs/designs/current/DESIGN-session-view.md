@@ -12,7 +12,7 @@ decision: |
   One data layer, three presentations: a library-callable session snapshot
   (facts, directive, per-key metadata) extracted from handle_status, plus a
   bounded, pull-free, sanitizing content reader; a new Session tab in the
-  dashboard TUI with an off-tick loader; a --detail JSON mode on the existing
+  dashboard TUI with a lazy loader on the existing tick; a --detail JSON mode on the existing
   dashboard invocation; and a holdings object in the workflow file's koto
   block at contract v3, derived from the log pass it already makes.
 rationale: |
@@ -56,6 +56,18 @@ originally read "under the hosting Claude Code session's directory in" followed
 by that path; it now reads "under the hosting Claude Code session's project
 directory, inside the user's Claude Code configuration directory". The
 meaning is unchanged.
+
+**Correction (2026-10-11), the loader runs on the tick.** Three passages
+called the Session tab's loader "off-tick", contradicting this design's own
+dashboard architecture ("There is no worker thread in v1. The Session tab
+loads lazily on the existing tick"), which is what shipped. With the
+maintainers' approval they now agree with it: the summary's "a new Session tab
+in the dashboard TUI with an off-tick loader" now reads "with a lazy loader on
+the existing tick"; Decision 2's "a lazy loader that runs off the render tick"
+now reads "a lazy loader that runs on the existing tick, guarded by the
+state-file mtime"; and the cross-validation's "Decision 2's off-tick loader"
+now reads "Decision 2's lazy, mtime-guarded loader on the existing tick". Moving
+the snapshot off the UI loop is tracked in koto#337.
 
 ## Context and Problem Statement
 
@@ -156,7 +168,8 @@ The technical problems that creates:
 
 - **Chosen: a new Session tab.** A fourth `DashboardTab`
   (`src/cli/dashboard_state.rs:19`) with its own scroll state and a lazy
-  loader that runs off the render tick; Summary, History, Remaining and
+  loader that runs on the existing tick, guarded by the state-file mtime;
+  Summary, History, Remaining and
   `read_detail` stay untouched. The key list gets a full-height scrollable
   surface, and anchor, origin, keys and the migration answer — none of which
   are in `read_detail`'s inputs — load through the new snapshot path.
@@ -217,7 +230,7 @@ The technical problems that creates:
 ### Cross-validation
 
 The four decisions compose with three reconciliations. The TUI uses Decision
-2's off-tick loader as the mechanism and Decision 1's bounded prefix read as
+2's lazy, mtime-guarded loader on the existing tick as the mechanism and Decision 1's bounded prefix read as
 the primitive; the one-shot mode reads eagerly and synchronously, since a
 single bounded pass is its whole life. The workflow file derives holdings from
 the log while the dashboard reads the manifest; the divergence is accepted for
