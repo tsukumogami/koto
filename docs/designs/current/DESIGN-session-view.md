@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 problem: |
   No shipped surface shows a person what a session holds. The dashboard has
   no ContextStore access and reads state files by path, bypassing migration
@@ -29,7 +29,7 @@ upstream: docs/prds/PRD-session-view.md
 
 ## Status
 
-Planned
+Current
 
 **Correction (2026-10-10), the log read is local-only.** The merge review of
 the snapshot layer (#332) confirmed that reading the log through
