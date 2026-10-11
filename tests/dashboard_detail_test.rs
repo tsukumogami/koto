@@ -416,16 +416,28 @@ fn detail_leaves_the_feed_and_the_verb_list_untouched() {
         .lines()
         .find(|l| l.starts_with("wf\t"))
         .expect("fixture session in the feed");
-    let cols: Vec<&str> = row.split('\t').collect();
+    // The whole row against a golden, byte for byte, with the two clock
+    // columns (elapsed, idle) normalized: they tick with wall time, so they
+    // are checked for their compact-duration shape and then replaced. Every
+    // other byte of the row, tabs included, must match exactly.
+    let mut cols: Vec<String> = row.split('\t').map(str::to_string).collect();
     assert_eq!(cols.len(), 8, "the eight-column contract");
-    // The time-independent columns, exactly (elapsed/idle tick with the
-    // clock; the golden covers what cannot move).
-    assert_eq!(cols[0], "wf");
-    assert_eq!(cols[1], "", "never advanced: empty current state");
-    assert_eq!(cols[3], "unknown");
-    assert_eq!(cols[4], "");
-    assert_eq!(cols[5], "");
-    assert_eq!(cols[7], "pending");
+    for i in [2, 6] {
+        assert!(
+            !cols[i].is_empty()
+                && cols[i]
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || "dhms".contains(c)),
+            "column {i} must be a compact duration, got {:?}",
+            cols[i]
+        );
+        cols[i] = "<clock>".to_string();
+    }
+    assert_eq!(
+        cols.join("\t"),
+        "wf\t\t<clock>\tunknown\t\t\t<clock>\tpending",
+        "the feed row for the fixture, golden apart from the clock"
+    );
 
     let help = koto_cmd(dir.path()).arg("--help").output().unwrap();
     let help_text = String::from_utf8(help.stdout).unwrap();
@@ -468,14 +480,22 @@ fn detail_leaves_the_feed_and_the_verb_list_untouched() {
 /// validated key through the store's own `content_path`.
 #[test]
 fn dashboard_sources_compose_no_path_from_manifest_strings() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for file in [
-        "src/cli/dashboard.rs",
-        "src/cli/dashboard_data.rs",
-        "src/cli/dashboard_render.rs",
-        "src/cli/dashboard_state.rs",
-    ] {
-        let source = std::fs::read_to_string(root.join(file)).unwrap();
+    let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli");
+    // Every `dashboard*.rs`, found by listing rather than named, so a new
+    // dashboard module is scanned the day it lands.
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&cli)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_string_lossy();
+            name.starts_with("dashboard") && name.ends_with(".rs")
+        })
+        .collect();
+    files.sort();
+    assert!(files.len() >= 4, "the dashboard modules were found");
+    for file in &files {
+        let file = file.display();
+        let source = std::fs::read_to_string(file.to_string()).unwrap();
         for forbidden in [
             "content_path",
             "ctx_dir",
