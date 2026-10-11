@@ -763,7 +763,7 @@ pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
             .map(|s| s.directive.clone())
     });
 
-    // Intent: from derive_intent or header fallback.
+    // Intent: the shared rule (last intent_updated event, header fallback).
     let intent = crate::engine::types::effective_intent(&header, &events);
 
     // Template name from header.

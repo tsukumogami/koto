@@ -388,6 +388,9 @@ fn valid_hash(raw: &str) -> Option<Sanitized> {
     }
 }
 
+/// The session facts: identity, template, anchors and store from the header;
+/// intent from `events` through [`crate::engine::types::effective_intent`],
+/// since koto records it as events and leaves the header field empty.
 fn facts_from_header(
     name: &str,
     header: Option<&crate::engine::types::StateFileHeader>,
