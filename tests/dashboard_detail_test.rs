@@ -646,3 +646,34 @@ fn detail_symlink_and_fifo_keys_are_unreadable_not_followed() {
     let notes = keys.iter().find(|k| k["key"] == "notes.md").unwrap();
     assert_eq!(notes["content"]["type"], "text");
 }
+
+/// Intent set the way people set it -- `koto init --intent`, then
+/// `koto session update --intent` -- reaches the `--detail` facts, and the
+/// latest update wins. koto records both as `intent_updated` events and
+/// leaves the header field empty, so a header-only read shows nothing.
+#[test]
+fn detail_shows_the_intent_from_init_and_the_latest_update() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let template = dir.path().join("t.md");
+    std::fs::write(
+        &template,
+        "---\nname: demo\nversion: \"1.0\"\ninitial_state: gather\nstates:\n  gather:\n    \
+         accepts:\n      route:\n        type: enum\n        required: true\n        values: [go]\n    \
+         transitions:\n      - target: done\n        when:\n          route: go\n  done:\n    \
+         terminal: true\n---\n\n## gather\n\nCollect inputs.\n\n## done\n\nDone.\n",
+    )
+    .unwrap();
+
+    koto_cmd(dir.path())
+        .args(["init", "demo", "--template", template.to_str().unwrap()])
+        .args(["--intent", "first intent"])
+        .assert()
+        .success();
+    assert_eq!(detail_json(dir.path(), "demo")["intent"], "first intent");
+
+    koto_cmd(dir.path())
+        .args(["session", "update", "--intent", "second intent", "demo"])
+        .assert()
+        .success();
+    assert_eq!(detail_json(dir.path(), "demo")["intent"], "second intent");
+}

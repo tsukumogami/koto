@@ -2181,6 +2181,51 @@ mod tests {
         assert!(pane_text(&buffer).contains("Loading session"));
     }
 
+    /// Intent is recorded as `intent_updated` events with the header field
+    /// left empty; the tab shows the latest one, not `—`.
+    #[test]
+    fn session_tab_shows_the_intent_koto_records_as_events() {
+        use crate::engine::types::EventPayload;
+        use crate::session::local::LocalBackend;
+        use crate::session::{Backend, SessionBackend};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let local = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+        let header = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "workflow": "wf",
+            "template_hash": "h",
+            "created_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        let init = serde_json::from_value(serde_json::json!({
+            "seq": 1,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "workflow_initialized",
+            "payload": {"template_path": "", "variables": {}},
+        }))
+        .unwrap();
+        local.init_state_file("wf", header, vec![init]).unwrap();
+        for text in ["first intent", "second intent"] {
+            local
+                .append_event(
+                    "wf",
+                    &EventPayload::IntentUpdated {
+                        intent: text.to_string(),
+                    },
+                    "2026-01-01T00:00:01Z",
+                )
+                .unwrap();
+        }
+        let backend = Backend::Local(local);
+
+        let snap = crate::session_view::snapshot(&backend, "wf").unwrap();
+        let (buffer, _) = draw(loaded(snap, 0, text("", false)));
+        let pane = pane_text(&buffer);
+        assert!(pane.contains("Intent: second intent"), "{pane}");
+        assert!(!pane.contains("Intent: \u{2014}"), "{pane}");
+    }
+
     #[test]
     fn session_tab_reads_a_real_store_one_preview_per_tick() {
         use crate::session::context::ContextStore;

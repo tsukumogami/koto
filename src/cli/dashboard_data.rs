@@ -13,7 +13,6 @@ use crate::engine::persistence::{
     derive_last_gate_evaluated, derive_machine_state, derive_state_from_log, is_terminal_state,
     latest_epoch_gate_failed, read_events, read_header,
 };
-use crate::engine::types::derive_intent;
 use crate::engine::types::is_leap;
 use crate::engine::types::StateFileHeader;
 use crate::session::{state_file_name, SessionBackend};
@@ -458,7 +457,7 @@ pub fn read_session(path: &Path) -> CachedSession {
             .map(|cs| latest_epoch_gate_failed(&events, cs))
             .unwrap_or(false);
 
-    let intent = derive_intent(&events).or_else(|| header.intent.clone());
+    let intent = crate::engine::types::effective_intent(&header, &events);
 
     // Capture the tail event's timestamp (already parsed for current_state) so
     // liveness can measure idle from last activity with no extra IO. For a
@@ -764,8 +763,8 @@ pub fn read_detail(path: &Path, session_id: &str) -> Option<DetailData> {
             .map(|s| s.directive.clone())
     });
 
-    // Intent: from derive_intent or header fallback.
-    let intent = crate::engine::types::derive_intent(&events).or_else(|| header.intent.clone());
+    // Intent: the shared rule (last intent_updated event, header fallback).
+    let intent = crate::engine::types::effective_intent(&header, &events);
 
     // Template name from header.
     let template_name = header.template_name.clone();

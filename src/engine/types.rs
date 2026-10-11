@@ -1787,6 +1787,16 @@ pub fn derive_intent(events: &[Event]) -> Option<String> {
     })
 }
 
+/// The session's intent as every surface shows it: the last `IntentUpdated`
+/// event, falling back to the header's `intent` field. `koto init --intent`
+/// and `koto session update --intent` record intent only as events and leave
+/// the header field empty, so a reader of the header alone never sees it.
+/// The dashboard, the session view and the `/workflows` label all read intent
+/// through this one rule so they cannot drift apart.
+pub fn effective_intent(header: &StateFileHeader, events: &[Event]) -> Option<String> {
+    derive_intent(events).or_else(|| header.intent.clone())
+}
+
 /// A single event appended to the JSONL state log.
 ///
 /// The `type` field serializes as a string matching the payload variant
@@ -4082,6 +4092,43 @@ mod tests {
     }
 
     // ===== Issue 2 (new): intent_updated event and derive_intent =====
+
+    #[test]
+    fn effective_intent_prefers_the_last_event_and_falls_back_to_the_header() {
+        let mut header: StateFileHeader = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "workflow": "wf",
+            "template_hash": "h",
+            "created_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        let intent = |seq: u64, text: &str| Event {
+            seq,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "intent_updated".to_string(),
+            payload: EventPayload::IntentUpdated {
+                intent: text.to_string(),
+            },
+            idempotency_hash: None,
+        };
+        // How koto records it: events only, header field empty.
+        assert_eq!(effective_intent(&header, &[]), None);
+        let events = vec![intent(2, "first"), intent(3, "second")];
+        assert_eq!(
+            effective_intent(&header, &events).as_deref(),
+            Some("second")
+        );
+        // A header value is the fallback, never an override of an event.
+        header.intent = Some("from header".to_string());
+        assert_eq!(
+            effective_intent(&header, &[]).as_deref(),
+            Some("from header")
+        );
+        assert_eq!(
+            effective_intent(&header, &events).as_deref(),
+            Some("second")
+        );
+    }
 
     #[test]
     fn derive_intent_returns_none_when_no_intent_events() {
