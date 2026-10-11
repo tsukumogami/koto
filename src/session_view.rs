@@ -34,9 +34,9 @@ pub const EXCERPT_BOUND: usize = 4096;
 pub const METADATA_CEILING: usize = 100_000;
 
 /// Most keys the one-shot `--detail` mode reads content previews for;
-/// keys past it render metadata only. Unused in this module by design:
-/// it is declared beside its siblings so every surface constant lives in
-/// one place, and the `--detail` change consumes it.
+/// keys past it render metadata only. Declared beside its siblings so
+/// every surface constant lives in one place; `dashboard::run_detail`
+/// consumes it.
 pub const DETAIL_PREVIEW_CEILING: usize = 1000;
 
 /// Display cap, in characters, for a migration banner value.

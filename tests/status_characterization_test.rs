@@ -181,6 +181,168 @@ fn terminal_status_carries_result_and_no_directive() {
     assert_eq!(json["result"]["status"], "success");
 }
 
+/// The terminal shape, pinned as the whole object rather than a subset:
+/// exactly these six members and nothing else, so a field that starts
+/// leaking onto (or off) the terminal answer fails an exact comparison.
+#[test]
+fn terminal_status_json_is_pinned_exactly() {
+    let tmp = TempDir::new().unwrap();
+    init_workflow(tmp.path(), "wf", TEMPLATE, &[]);
+    koto_cmd(tmp.path())
+        .args([
+            "next",
+            "wf",
+            "--no-cleanup",
+            "--with-data",
+            r#"{"route":"go"}"#,
+        ])
+        .assert()
+        .success();
+
+    let (ok, json) = status_raw(tmp.path(), "wf");
+    assert!(ok);
+    let hash = json["template_hash"].as_str().unwrap().to_string();
+    assert_eq!(hash.len(), 64);
+    let expected = serde_json::json!({
+        "name": "wf",
+        "current_state": "done",
+        "template_path": "<template_path>",
+        "template_hash": hash,
+        "is_terminal": true,
+        "result": {
+            "status": "success",
+            "summary": "completed at done",
+        },
+    });
+    assert_eq!(normalized(json, tmp.path()), expected);
+}
+
+/// A state that declares no `<!-- details -->` block answers with the
+/// directive and `expects` but no `details` member -- the details-absent
+/// half of the optional-fields contract, which the standard fixture
+/// (whose state always carries details) never exercises.
+#[test]
+fn a_state_without_details_omits_the_details_member() {
+    const NO_DETAILS_TEMPLATE: &str = r#"---
+name: characterization-fixture
+version: "1.0"
+initial_state: gather
+states:
+  gather:
+    accepts:
+      route:
+        type: enum
+        required: true
+        values: [go]
+    transitions:
+      - target: done
+        when:
+          route: go
+  done:
+    terminal: true
+---
+
+## gather
+
+Collect inputs.
+
+## done
+
+Done.
+"#;
+    let tmp = TempDir::new().unwrap();
+    init_workflow(tmp.path(), "wf", NO_DETAILS_TEMPLATE, &[]);
+
+    let (ok, json) = status_raw(tmp.path(), "wf");
+    assert!(ok);
+    assert_eq!(json["directive"], "Collect inputs.");
+    assert!(
+        json.get("details").is_none(),
+        "a phase that declares no details carries no details member"
+    );
+    assert!(json.get("expects").is_some());
+}
+
+/// A current state the compiled template does not name: the session's log
+/// says `ghost`, the template has no such state. `koto status` answers
+/// rather than failing -- not terminal, no directive block, no result --
+/// and the whole object is pinned so the shape cannot drift silently.
+#[test]
+fn a_current_state_missing_from_the_template_answers_minimally() {
+    let tmp = TempDir::new().unwrap();
+    init_workflow(tmp.path(), "wf", TEMPLATE, &[]);
+
+    let state_path = sessions_base(tmp.path())
+        .join("wf")
+        .join("koto-wf.state.jsonl");
+    koto::engine::persistence::append_event(
+        &state_path,
+        &koto::engine::types::EventPayload::Transitioned {
+            from: Some("gather".to_string()),
+            to: "ghost".to_string(),
+            condition_type: "evidence".to_string(),
+            skip_if_matched: None,
+            context_assignments: None,
+            vars_matched: None,
+        },
+        "2026-01-01T00:00:02Z",
+    )
+    .unwrap();
+
+    let (ok, json) = status_raw(tmp.path(), "wf");
+    assert!(ok, "an unknown current state is an answer, not a failure");
+    let hash = json["template_hash"].as_str().unwrap().to_string();
+    let expected = serde_json::json!({
+        "name": "wf",
+        "current_state": "ghost",
+        "template_path": "<template_path>",
+        "template_hash": hash,
+        "is_terminal": false,
+    });
+    assert_eq!(normalized(json, tmp.path()), expected);
+}
+
+/// A recorded variable value that fails re-validation: `koto status`
+/// exits 3 with the exact error object, the defense-in-depth path in the
+/// directive block (`Variables::from_events`) that no fixture reached
+/// before.
+#[test]
+fn a_variable_failing_revalidation_exits_three() {
+    let tmp = TempDir::new().unwrap();
+    init_workflow(tmp.path(), "wf", TEMPLATE, &["TOPIC=clean"]);
+
+    // Corrupt the recorded value in place: the CLI refused `;` at init,
+    // so rewrite the workflow_initialized line as a hostile writer would.
+    let state_path = sessions_base(tmp.path())
+        .join("wf")
+        .join("koto-wf.state.jsonl");
+    let rewritten: Vec<String> = std::fs::read_to_string(&state_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            if v["type"] == "workflow_initialized" {
+                v["payload"]["variables"]["TOPIC"] = serde_json::json!("bad;value");
+            }
+            serde_json::to_string(&v).unwrap()
+        })
+        .collect();
+    std::fs::write(&state_path, rewritten.join("\n") + "\n").unwrap();
+
+    let output = koto_cmd(tmp.path())
+        .args(["status", "wf"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let json = parse_last_json(&output.stdout);
+    assert_eq!(json["command"], "status");
+    let err = json["error"].as_str().unwrap();
+    assert!(
+        err.starts_with("variable re-validation failed:"),
+        "exact failure wording, got: {err}"
+    );
+}
+
 #[test]
 fn a_tampered_template_reports_the_mismatch_without_failing() {
     let tmp = TempDir::new().unwrap();
