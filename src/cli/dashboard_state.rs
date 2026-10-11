@@ -331,14 +331,20 @@ impl DashboardAppState {
 
             // List-view navigation updates focused_id.
             (ViewMode::List, KeyCode::Char('j') | KeyCode::Down, _) => {
-                self.move_cursor_down();
+                // Nothing is focused at launch: the first press focuses the
+                // row under the cursor (row 1) instead of moving past it.
+                if self.focused_id.is_some() {
+                    self.move_cursor_down();
+                }
                 let rows = self.visible_rows();
                 if let Some(row) = rows.get(self.cursor_idx) {
                     self.focused_id = Some(row.session_id.clone());
                 }
             }
             (ViewMode::List, KeyCode::Char('k') | KeyCode::Up, _) => {
-                self.move_cursor_up();
+                if self.focused_id.is_some() {
+                    self.move_cursor_up();
+                }
                 let rows = self.visible_rows();
                 if let Some(row) = rows.get(self.cursor_idx) {
                     self.focused_id = Some(row.session_id.clone());
@@ -365,7 +371,7 @@ impl DashboardAppState {
                 if let Some(row) = rows.get(self.cursor_idx) {
                     self.focused_id = Some(row.session_id.clone());
                     self.view_mode = ViewMode::Detail;
-                    self.detail_cache = None;
+                    self.invalidate_detail();
                 }
             }
 
@@ -404,7 +410,7 @@ impl DashboardAppState {
             (ViewMode::Detail, KeyCode::Esc, _) => {
                 self.view_mode = ViewMode::List;
                 self.focused_id = None;
-                self.detail_cache = None;
+                self.invalidate_detail();
             }
 
             // On the Session tab the detail view's cursor walks the key
@@ -435,7 +441,7 @@ impl DashboardAppState {
                 let rows = self.visible_rows();
                 if let Some(row) = rows.get(self.cursor_idx) {
                     self.focused_id = Some(row.session_id.clone());
-                    self.detail_cache = None;
+                    self.invalidate_detail();
                 }
             }
             (ViewMode::Detail, KeyCode::Char('k') | KeyCode::Up, _) => {
@@ -444,7 +450,7 @@ impl DashboardAppState {
                 let rows = self.visible_rows();
                 if let Some(row) = rows.get(self.cursor_idx) {
                     self.focused_id = Some(row.session_id.clone());
-                    self.detail_cache = None;
+                    self.invalidate_detail();
                 }
             }
 
@@ -458,6 +464,37 @@ impl DashboardAppState {
             }
 
             _ => {}
+        }
+    }
+
+    /// Drop the cached detail and the markers the refresh guard compares
+    /// against. Clearing only `detail_cache` leaves the guard believing the
+    /// cache is still current for the session, so it is never reloaded.
+    fn invalidate_detail(&mut self) {
+        self.detail_cache = None;
+        self.detail_cache_mtime = None;
+        self.detail_cache_session = None;
+    }
+
+    /// Reload the focused session's detail when the cache is for another
+    /// session or an older mtime. `read` is given the state-file path and ID.
+    pub fn refresh_detail(
+        &mut self,
+        read: impl FnOnce(&std::path::Path, &str) -> Option<DetailData>,
+    ) {
+        let Some(id) = self.focused_id.clone() else {
+            return;
+        };
+        let Some(session) = self.tree.sessions.get(&id) else {
+            return;
+        };
+        let (mtime, path) = (Some(session.mtime), session.state_path.clone());
+        if self.detail_cache_session.as_deref() != Some(id.as_str())
+            || mtime != self.detail_cache_mtime
+        {
+            self.detail_cache = read(&path, &id);
+            self.detail_cache_mtime = mtime;
+            self.detail_cache_session = Some(id);
         }
     }
 
@@ -949,6 +986,9 @@ mod tests {
             .insert("b".to_string(), make_session("b", None, None, false));
         state.tree.roots = vec!["a".to_string(), "b".to_string()];
         assert_eq!(state.cursor_idx, 0);
+        // The first press focuses row 1; the second moves to row 2.
+        state.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(state.cursor_idx, 0);
         state.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert_eq!(state.cursor_idx, 1);
     }
@@ -966,6 +1006,7 @@ mod tests {
             .insert("b".to_string(), make_session("b", None, None, false));
         state.tree.roots = vec!["a".to_string(), "b".to_string()];
         state.cursor_idx = 1;
+        state.focused_id = Some("b".to_string());
         state.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
         assert_eq!(state.cursor_idx, 0);
     }
@@ -999,6 +1040,8 @@ mod tests {
             .insert("b".to_string(), make_session("b", None, None, false));
         state.tree.roots = vec!["a".to_string(), "b".to_string()];
         state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.cursor_idx, 0);
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(state.cursor_idx, 1);
     }
 
@@ -1015,8 +1058,103 @@ mod tests {
             .insert("b".to_string(), make_session("b", None, None, false));
         state.tree.roots = vec!["a".to_string(), "b".to_string()];
         state.cursor_idx = 1;
+        state.focused_id = Some("b".to_string());
         state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(state.cursor_idx, 0);
+    }
+
+    fn two_root_state() -> DashboardAppState {
+        let mut state = DashboardAppState::new(500);
+        for n in ["a", "b"] {
+            state
+                .tree
+                .sessions
+                .insert(n.to_string(), make_session(n, None, Some("work"), false));
+        }
+        state.tree.roots = vec!["a".to_string(), "b".to_string()];
+        state
+    }
+
+    fn press(state: &mut DashboardAppState, code: KeyCode) {
+        state.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn detail_for(id: &str) -> DetailData {
+        DetailData {
+            session_id: id.to_string(),
+            gate_name: None,
+            command: None,
+            result: None,
+            elapsed: Duration::ZERO,
+            evidence: Vec::new(),
+            current_state: Some("work".to_string()),
+            directive: None,
+            intent: None,
+            template_name: None,
+            history: Vec::new(),
+            remaining: Vec::new(),
+        }
+    }
+
+    /// The tick loop's detail refresh, with a reader that always succeeds.
+    fn tick_detail(state: &mut DashboardAppState) {
+        state.refresh_detail(|_, id| Some(detail_for(id)));
+    }
+
+    #[test]
+    fn first_j_or_down_focuses_row_one_not_row_two() {
+        for code in [KeyCode::Char('j'), KeyCode::Down] {
+            let mut state = two_root_state();
+            let first = state.visible_rows()[0].session_id.clone();
+            let second = state.visible_rows()[1].session_id.clone();
+            assert!(state.focused_id.is_none());
+            press(&mut state, code);
+            assert_eq!(state.cursor_idx, 0, "{code:?}");
+            assert_eq!(state.focused_id.as_deref(), Some(first.as_str()));
+            press(&mut state, code);
+            assert_eq!(state.focused_id.as_deref(), Some(second.as_str()));
+        }
+    }
+
+    #[test]
+    fn j_then_enter_loads_the_detail_without_extra_tabs() {
+        let mut state = two_root_state();
+        press(&mut state, KeyCode::Char('j'));
+        // The loop loads the focused session's detail while still in the list.
+        tick_detail(&mut state);
+        assert!(state.detail_cache.is_some());
+
+        press(&mut state, KeyCode::Enter);
+        tick_detail(&mut state);
+        let id = state.focused_id.clone().unwrap();
+        let detail = state.detail_cache.as_ref().expect("detail after Enter");
+        assert_eq!(detail.session_id, id);
+    }
+
+    #[test]
+    fn j_k_enter_reloads_the_detail_for_the_same_session() {
+        let mut state = two_root_state();
+        press(&mut state, KeyCode::Char('j'));
+        tick_detail(&mut state);
+        press(&mut state, KeyCode::Char('j'));
+        tick_detail(&mut state);
+        press(&mut state, KeyCode::Char('k'));
+        tick_detail(&mut state);
+        press(&mut state, KeyCode::Enter);
+        tick_detail(&mut state);
+        assert!(state.detail_cache.is_some());
+        press(&mut state, KeyCode::Tab);
+        tick_detail(&mut state);
+        assert!(state.detail_cache.is_some());
+    }
+
+    #[test]
+    fn refresh_detail_keeps_the_cache_while_session_and_mtime_match() {
+        let mut state = two_root_state();
+        press(&mut state, KeyCode::Char('j'));
+        tick_detail(&mut state);
+        state.refresh_detail(|_, _| panic!("unchanged session must not be re-read"));
+        assert!(state.detail_cache.is_some());
     }
 
     // -----------------------------------------------------------------------

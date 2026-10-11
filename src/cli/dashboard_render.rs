@@ -464,21 +464,34 @@ fn gutter_block(text: &str, cut: bool, width: usize, height: usize) -> Vec<Strin
     rows
 }
 
-fn hash_text(hash: &Option<Sanitized>) -> String {
-    hash.as_ref()
-        .map(|h| h.to_string())
-        .unwrap_or_else(|| "invalid-hash".to_string())
+/// The hash as one unbroken token. When the full hash does not fit in
+/// `budget` columns it is shortened to its first 16 and last 8 characters
+/// around `…`, so it is never split across rows. `koto dashboard <name>
+/// --detail` prints the full hash.
+fn hash_text(hash: &Option<Sanitized>, budget: usize) -> String {
+    let Some(h) = hash.as_ref() else {
+        return "invalid-hash".to_string();
+    };
+    let full = h.to_string();
+    let cost: usize = full.chars().map(cell_cost).sum();
+    let chars: Vec<char> = full.chars().collect();
+    if cost <= budget || chars.len() <= 16 + 8 + 1 {
+        return full;
+    }
+    let head: String = chars[..16].iter().collect();
+    let tail: String = chars[chars.len() - 8..].iter().collect();
+    format!("{head}\u{2026}{tail}")
 }
 
 /// The text a preview shows, and whether the source was cut.
-fn preview_text(preview: &KeyPreview) -> (String, bool) {
+fn preview_text(preview: &KeyPreview, hash_budget: usize) -> (String, bool) {
     match preview {
         KeyPreview::Text { excerpt, truncated } => (excerpt.to_string(), *truncated),
         KeyPreview::Binary { size, hash } => (
             format!(
                 "type: binary\nsize: {}\nhash: {}",
                 format_size(*size),
-                hash_text(hash)
+                hash_text(hash, hash_budget)
             ),
             false,
         ),
@@ -486,7 +499,7 @@ fn preview_text(preview: &KeyPreview) -> (String, bool) {
             format!(
                 "not local: the content is in the remote store and is not fetched\nsize: {}\nhash: {}",
                 format_size(*size),
-                hash_text(hash)
+                hash_text(hash, hash_budget)
             ),
             false,
         ),
@@ -495,36 +508,69 @@ fn preview_text(preview: &KeyPreview) -> (String, bool) {
     }
 }
 
-/// One `Label: value` row per fact, `Label: —` for each the session does
+/// Rows one fact may take before it ends in the cut marker. Values are
+/// already capped by the data layer; this keeps one fact from crowding the
+/// key table off a short pane.
+const FACT_ROWS: usize = 6;
+
+/// Indent of a fact's continuation rows.
+const FACT_INDENT: &str = "  ";
+
+/// `Label: value` laid out in rows of at most `width` columns. A value too
+/// long for one row continues on indented rows, so its tail stays readable.
+fn wrap_fact(label: &str, value: &str, width: usize) -> Vec<String> {
+    let indent_cost: usize = FACT_INDENT.chars().map(cell_cost).sum();
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = format!("{label}: ");
+    let mut used: usize = row.chars().map(cell_cost).sum();
+    for c in value.chars() {
+        if used + cell_cost(c) > width && used > indent_cost {
+            rows.push(std::mem::replace(&mut row, FACT_INDENT.to_string()));
+            used = indent_cost;
+        }
+        row.push(c);
+        used += cell_cost(c);
+    }
+    rows.push(row);
+    if rows.len() > FACT_ROWS {
+        rows.truncate(FACT_ROWS);
+        let last = rows.pop().unwrap_or_default();
+        rows.push(clip(&format!("{last}{CUT_MARKER}"), width));
+    }
+    rows
+}
+
+/// One `Label: value` entry per fact, `Label: -` for each the session does
 /// not record. A directive follows behind the gutter.
 fn fact_rows(facts: &SessionFacts, width: usize) -> Vec<String> {
     let one = |label: &str, value: Option<&Sanitized>| {
-        let value = value.map(|v| v.as_str()).unwrap_or(ABSENT);
-        clip(&format!("{label}: {value}"), width)
+        wrap_fact(label, value.map(|v| v.as_str()).unwrap_or(ABSENT), width)
     };
-    let mut rows = vec![one("State", facts.current_state.as_ref())];
+    let mut rows = one("State", facts.current_state.as_ref());
     match &facts.directive {
         Some(d) => {
             rows.push("Directive:".to_string());
             rows.extend(gutter_block(d.as_str(), false, width, DIRECTIVE_LINES));
         }
-        None => rows.push(one("Directive", None)),
+        None => rows.extend(one("Directive", None)),
     }
-    rows.push(one("Anchor", facts.anchor.as_ref()));
-    rows.push(one("Execution dir", facts.execution_dir.as_ref()));
+    rows.extend(one("Anchor", facts.anchor.as_ref()));
+    rows.extend(one("Execution dir", facts.execution_dir.as_ref()));
     let store = facts
         .store
         .as_ref()
         .map(|(kind, base)| format!("{kind} {base}"));
-    rows.push(clip(
-        &format!("Store origin: {}", store.as_deref().unwrap_or(ABSENT)),
+    rows.extend(wrap_fact(
+        "Store origin",
+        store.as_deref().unwrap_or(ABSENT),
         width,
     ));
-    rows.push(one("Intent", facts.intent.as_ref()));
-    rows.push(one("Template", facts.template_name.as_ref()));
-    rows.push(one("Session id", facts.session_id.as_ref()));
-    rows.push(clip(
-        &format!("Created: {}", facts.created_at.as_deref().unwrap_or(ABSENT)),
+    rows.extend(one("Intent", facts.intent.as_ref()));
+    rows.extend(one("Template", facts.template_name.as_ref()));
+    rows.extend(one("Session id", facts.session_id.as_ref()));
+    rows.extend(wrap_fact(
+        "Created",
+        facts.created_at.as_deref().unwrap_or(ABSENT),
         width,
     ));
     rows
@@ -711,11 +757,14 @@ fn render_key_preview(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Columns left for a hash after the gutter and the `hash: ` label.
+    let hash_budget =
+        (inner.width as usize).saturating_sub(GUTTER.chars().count() + "hash: ".len());
     let (text, cut) = if entry.raw.is_none() {
-        preview_text(&KeyPreview::InvalidName)
+        preview_text(&KeyPreview::InvalidName, 0)
     } else {
         match tab.focused_preview() {
-            Some(preview) => preview_text(preview),
+            Some(preview) => preview_text(preview, hash_budget),
             None => ("loading".to_string(), false),
         }
     };
@@ -1884,15 +1933,6 @@ mod tests {
             .collect()
     }
 
-    /// The preview rows with gutters removed and wrapping undone.
-    fn unwrapped_preview(buffer: &RatatuiBuffer) -> String {
-        pane_rows(buffer)
-            .iter()
-            .filter_map(|r| r.strip_prefix("\u{2502} "))
-            .map(|r| r.trim_end())
-            .collect()
-    }
-
     fn pane_text(buffer: &RatatuiBuffer) -> String {
         pane_rows(buffer).join("\n")
     }
@@ -1984,8 +2024,62 @@ mod tests {
         assert!(pane.contains("\u{2502} type: binary"), "{pane}");
         assert!(pane.contains("size: 4.0 KiB"), "{pane}");
         assert!(
-            unwrapped_preview(&buffer).contains(&format!("hash: {hash}")),
-            "{pane}"
+            pane.contains(&format!("hash: {}\u{2026}{}", &hash[..16], &hash[56..])),
+            "a pane too narrow for the full hash shows it shortened: {pane}"
+        );
+    }
+
+    #[test]
+    fn session_tab_wraps_a_long_store_path_instead_of_cutting_it() {
+        let tail = "sessions-end-marker";
+        let base = format!("/Users/someone/{}/{tail}", "deep-directory/".repeat(8));
+        let mut snap = snapshot(vec![]);
+        snap.facts.store = Some((sanitize("local"), sanitize(&base)));
+        let (buffer, _) = draw(loaded(snap, 0, text("", false)));
+        let rows = pane_rows(&buffer);
+        let start = rows
+            .iter()
+            .position(|r| r.starts_with("Store origin: local /Users/someone/"))
+            .expect("store row");
+        // Rejoin the continuation rows (indented) and compare to the value.
+        let mut joined = rows[start].trim_end().to_string();
+        for row in &rows[start + 1..] {
+            match row.strip_prefix("  ") {
+                Some(rest) if !rest.starts_with(' ') && !rest.trim().is_empty() => {
+                    joined.push_str(rest.trim_end());
+                }
+                _ => break,
+            }
+            if joined.ends_with(tail) {
+                break;
+            }
+        }
+        assert_eq!(joined, format!("Store origin: local {base}"), "{rows:#?}");
+        assert!(!joined.contains(CUT_MARKER));
+    }
+
+    #[test]
+    fn session_tab_binary_hash_is_never_split_across_rows() {
+        let hash = "f4".repeat(32);
+        let preview = KeyPreview::Binary {
+            size: 4096,
+            hash: Some(sanitize(&hash)),
+        };
+        let (buffer, _) = draw(loaded(snapshot(vec![entry("blob.bin", 4096)]), 0, preview));
+        let rows = pane_rows(&buffer);
+        let hash_rows: Vec<&String> = rows.iter().filter(|r| r.contains("hash: ")).collect();
+        assert_eq!(hash_rows.len(), 1, "{rows:#?}");
+        let row = hash_rows[0];
+        // Either the whole hash sits on its row, or a shortened form does:
+        // first 16 characters, an ellipsis, last 8.
+        let whole = row.contains(&hash);
+        let short = row.contains(&format!("{}\u{2026}{}", &hash[..16], &hash[56..]));
+        assert!(whole || short, "{row:?}");
+        // No row after the hash row continues it.
+        let after = rows.iter().skip_while(|r| !r.contains("hash: ")).nth(1);
+        assert!(
+            after.map(|r| !r.contains("f4f4")).unwrap_or(true),
+            "{rows:#?}"
         );
     }
 
@@ -2020,8 +2114,8 @@ mod tests {
         assert!(pane.contains("\u{2502} not local"), "{pane}");
         assert!(pane.contains("size: 2.0 KiB"), "{pane}");
         assert!(
-            unwrapped_preview(&buffer).contains(&format!("hash: {hash}")),
-            "{pane}"
+            pane.contains(&format!("hash: {}\u{2026}{}", &hash[..16], &hash[56..])),
+            "a pane too narrow for the full hash shows it shortened: {pane}"
         );
     }
 
