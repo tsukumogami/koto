@@ -21,8 +21,10 @@ Session. It needs a terminal at least 80 columns wide to show both panes.
 
 The Session tab shows what a session holds: its facts and the context keys it
 has stored. It reads the local copy of the session and never changes it. It
-writes no context and no events, fetches no remote content, and touches no
-migration marker.
+writes no context and no events, fetches no key content from remote storage,
+and touches no migration marker. On a cloud-backed session it does make two
+small remote reads: the migration check, and the remote manifest that tells it
+which keys exist only in the cloud (see "How it loads" for what that costs).
 
 The top block lists the session's state, directive, anchor (the directory it
 was created in), execution directory, store origin, intent, template, session
@@ -88,4 +90,10 @@ the context store directly, outside koto, doesn't show until the session's
 next event.
 
 Because the reads are synchronous, a session on a hung network filesystem
-stalls the dashboard the same way the History tab would.
+stalls the dashboard the same way the History tab would. The same holds for a
+cloud-backed session whose bucket is unreachable: the snapshot's manifest read
+runs on the dashboard's own loop, so the whole dashboard can stop responding
+for up to the storage client's request timeout each time the snapshot loads,
+and a failed read is not cached, so it is retried on the next load. Moving the
+snapshot off the UI loop and caching a failed manifest read is tracked in
+[koto#337](https://github.com/tsukumogami/koto/issues/337).
