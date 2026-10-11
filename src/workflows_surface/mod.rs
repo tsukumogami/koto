@@ -19,7 +19,7 @@ pub mod project;
 
 pub use contract::{
     workflow_filename, HoldingKey, Holdings, Phase, ProgressNode, RenderStatus, WorkflowFile,
-    CONTRACT_VERSION, HOLDINGS_KEY_CAP,
+    CONTRACT_VERSION, HOLDINGS_KEY_CAP, HOLDINGS_STORE_CAP,
 };
 pub use discover::{publish_location, resolve_publish_location, PUBLISH_LOCATION_KEY};
 pub use materialize::{materialize_after_commit, WORKFLOWS_DIR_ENV};

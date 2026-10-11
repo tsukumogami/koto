@@ -20,7 +20,7 @@ use crate::cli::dashboard_data::{
     self, classify_liveness, compute_elapsed_since, CachedSession, Liveness, SessionTree,
 };
 use crate::cli::dashboard_render::render_frame;
-use crate::cli::dashboard_state::DashboardAppState;
+use crate::cli::dashboard_state::{DashboardAppState, DashboardTab};
 use crate::cli::DashboardArgs;
 
 /// RAII guard that restores the terminal on any exit path, including `?` propagation.
@@ -211,7 +211,10 @@ fn run_detail(name: &str, backend: &crate::session::Backend) -> ! {
         Err(SnapshotError::NotFound) => {
             exit_with_error_code(
                 serde_json::json!({
-                    "error": format!("session '{}' not found", name),
+                    "error": format!(
+                        "session '{}' not found",
+                        session_view::sanitize_capped(name, session_view::KEY_DISPLAY_CAP)
+                    ),
                     "command": "dashboard",
                 }),
                 EXIT_CALLER_ERROR,
@@ -220,7 +223,7 @@ fn run_detail(name: &str, backend: &crate::session::Backend) -> ! {
         Err(e @ (SnapshotError::Corrupt(_) | SnapshotError::Infrastructure(_))) => {
             exit_with_error_code(
                 serde_json::json!({
-                    "error": e.to_string(),
+                    "error": e.reason().as_str(),
                     "command": "dashboard",
                 }),
                 EXIT_INFRASTRUCTURE,
@@ -228,6 +231,10 @@ fn run_detail(name: &str, backend: &crate::session::Backend) -> ! {
         }
     };
 
+    // The shape is assembled by hand, so nothing at compile time holds it:
+    // `tests/dashboard_detail_test.rs` and the schema in
+    // `docs/reference/session-feed.md` are the contract. A field change
+    // updates both in the same commit.
     let mut out = serde_json::Map::new();
     let facts = &snap.facts;
     out.insert("name".into(), facts.name.clone().into());
@@ -423,6 +430,30 @@ pub fn run(args: DashboardArgs, backend: &crate::session::Backend) -> Result<()>
                         state.detail_cache_mtime = current_mtime;
                         state.detail_cache_session = Some(id.clone());
                     }
+                }
+            }
+        }
+
+        // The Session tab loads on every tick but reads only when its plan
+        // says the cached view is stale: the snapshot on entry or a
+        // state-file mtime change, then one bounded preview for the focused
+        // key.
+        if state.active_tab == DashboardTab::Session {
+            if let Some(id) = state.focused_id.clone() {
+                if let Some(mtime) = state.tree.sessions.get(&id).map(|s| s.mtime) {
+                    state.session_tab.tick(
+                        &id,
+                        mtime,
+                        |name| crate::session_view::snapshot(backend, name),
+                        |name, key| {
+                            crate::session_view::read_key_preview(
+                                backend,
+                                name,
+                                key,
+                                crate::session_view::EXCERPT_BOUND,
+                            )
+                        },
+                    );
                 }
             }
         }

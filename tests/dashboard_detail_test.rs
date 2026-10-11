@@ -278,7 +278,31 @@ fn detail_remote_only_key_renders_not_local() {
         &serde_json::to_vec(&remote_manifest).unwrap(),
     );
 
+    s3.clear_requests();
     let run = host.koto(&["dashboard", "wf", "--detail"]);
+    // The render's remote traffic is metadata only: the one manifest read
+    // that tells a remote-only key apart, and the migration-marker listing.
+    // No write, no pull of the state object, no key content.
+    for r in s3.requests() {
+        assert!(
+            r.method != "PUT" && r.method != "DELETE",
+            "--detail never writes: {} {}",
+            r.method,
+            r.key
+        );
+        if r.method == "GET" && r.list_prefix.is_none() {
+            assert!(
+                !r.key.ends_with(".state.jsonl"),
+                "--detail never pulls the state object: {}",
+                r.key
+            );
+            assert!(
+                !r.key.contains("/ctx/") || r.key.ends_with("/ctx/manifest.json"),
+                "--detail never fetches key content: {}",
+                r.key
+            );
+        }
+    }
     assert_eq!(run.code, Some(0), "{}", run.describe());
     let keys = run.json["keys"].as_array().unwrap();
     let remote = keys
@@ -350,6 +374,13 @@ fn detail_unreadable_key_marks_itself_and_spares_the_rest() {
     local.add("wf", "locked.md", b"cannot be read").unwrap();
     let content = dir.path().join("sessions/wf/ctx/locked.md");
     std::fs::set_permissions(&content, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&content).is_ok() {
+        // Running as root: permission bits don't stop the read, so this
+        // fixture can't make the key unreadable. The symlink and FIFO test
+        // covers the unreadable marker without relying on them.
+        std::fs::set_permissions(&content, std::fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
 
     let v = detail_json(dir.path(), "wf");
     let keys = v["keys"].as_array().unwrap();
@@ -514,4 +545,104 @@ fn dashboard_sources_compose_no_path_from_manifest_strings() {
             );
         }
     }
+}
+
+/// The error object's text is sanitized, not raw `anyhow` output: an I/O
+/// error that quotes a store path carrying ESC and U+202E reaches stdout
+/// with both as visible escapes. serde_json alone escapes ESC but passes
+/// U+202E through raw, so the absent bidi override is what pins the fix.
+#[test]
+fn detail_error_text_is_sanitized() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let base = dir.path().join("evil\u{1B}[2J\u{202E}base");
+    // A directory where the state log should be: the open fails and the
+    // error message quotes the hostile path.
+    std::fs::create_dir_all(base.join("wf").join("koto-wf.state.jsonl")).unwrap();
+
+    let output = koto_cmd(dir.path())
+        .env("KOTO_SESSIONS_BASE", &base)
+        .args(["dashboard", "wf", "--detail"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains('\u{1B}'), "no raw ESC: {stdout}");
+    assert!(
+        !stdout.contains('\u{202E}'),
+        "no raw bidi override: {stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let error = v["error"].as_str().unwrap();
+    assert!(
+        error.contains("\\u{1B}") && error.contains("\\u{202E}"),
+        "visible escape forms: {error}"
+    );
+}
+
+/// The flag's clap contract: it needs the positional name, and it refuses
+/// every feed and TUI flag rather than silently picking one mode.
+#[test]
+fn detail_requires_a_name_and_refuses_the_feed_and_tui_flags() {
+    let dir = tempfile::TempDir::new().unwrap();
+    local_fixture(dir.path());
+
+    let no_name = koto_cmd(dir.path())
+        .args(["dashboard", "--detail"])
+        .output()
+        .unwrap();
+    assert_eq!(no_name.status.code(), Some(2));
+    assert!(no_name.stdout.is_empty());
+
+    for flag in [
+        &["--once"][..],
+        &["--status", "active"],
+        &["--needs-you"],
+        &["--all"],
+        &["--interval", "100"],
+    ] {
+        let mut args = vec!["dashboard", "wf", "--detail"];
+        args.extend_from_slice(flag);
+        let out = koto_cmd(dir.path()).args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{flag:?} must be refused");
+        assert!(out.stdout.is_empty(), "{flag:?}: nothing on stdout");
+    }
+}
+
+/// A key whose content file was swapped for a symlink or a FIFO renders
+/// the unreadable marker -- never followed, never blocked on -- while the
+/// other keys still render.
+#[test]
+fn detail_symlink_and_fifo_keys_are_unreadable_not_followed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let local = local_fixture(dir.path());
+    local.add("wf", "linked.md", b"placeholder").unwrap();
+    local.add("wf", "piped.md", b"placeholder").unwrap();
+    let ctx = dir.path().join("sessions/wf/ctx");
+
+    let secret = dir.path().join("outside-secret.txt");
+    std::fs::write(&secret, b"SECRET-OUTSIDE-THE-STORE").unwrap();
+    std::fs::remove_file(ctx.join("linked.md")).unwrap();
+    std::os::unix::fs::symlink(&secret, ctx.join("linked.md")).unwrap();
+
+    std::fs::remove_file(ctx.join("piped.md")).unwrap();
+    let fifo = std::ffi::CString::new(ctx.join("piped.md").to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+
+    let output = koto_cmd(dir.path())
+        .args(["dashboard", "wf", "--detail"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "a FIFO must not block the read");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("SECRET-OUTSIDE-THE-STORE"),
+        "a symlinked key is never followed"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let keys = v["keys"].as_array().unwrap();
+    for name in ["linked.md", "piped.md"] {
+        let k = keys.iter().find(|k| k["key"] == name).unwrap();
+        assert_eq!(k["content"]["type"], "unreadable", "{name}");
+    }
+    let notes = keys.iter().find(|k| k["key"] == "notes.md").unwrap();
+    assert_eq!(notes["content"]["type"], "text");
 }

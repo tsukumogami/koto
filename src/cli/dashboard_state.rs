@@ -4,10 +4,13 @@
 //! Provides cursor movement, keyboard dispatch, and depth-first tree
 //! flattening via `visible_rows()`.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::session_view::{KeyPreview, Sanitized, SessionViewSnapshot, SnapshotError};
 
 use crate::cli::dashboard_data::liveness::{attention_key, idle_for, is_receded};
 use crate::cli::dashboard_data::{
@@ -20,6 +23,7 @@ pub enum DashboardTab {
     Summary,
     History,
     Remaining,
+    Session,
 }
 
 /// Which pane the user is currently viewing.
@@ -152,6 +156,128 @@ pub struct DashboardAppState {
     /// included in `visible_rows`. Toggled with `a`. Default `false`, matching
     /// the `--once` default and the TUI's attention-first view.
     pub show_receded: bool,
+
+    /// Loaded data and key cursor for the Session tab.
+    pub session_tab: SessionTabState,
+}
+
+/// What the Session tab should load on this tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLoad {
+    /// The snapshot is missing or built for another session or mtime.
+    Snapshot,
+    /// The snapshot is current; the focused key's preview is not.
+    Preview(String),
+    /// Everything on screen is current.
+    Idle,
+}
+
+/// The preview read for one (session, key, mtime), kept so the same key is
+/// not read again until the state file changes.
+#[derive(Debug)]
+pub struct CachedPreview {
+    session: String,
+    key: String,
+    mtime: SystemTime,
+    pub preview: KeyPreview,
+}
+
+/// Session-tab data: the snapshot, the key cursor, and the focused key's
+/// preview. Loads are driven by [`SessionTabState::tick`], never by a thread.
+#[derive(Default)]
+pub struct SessionTabState {
+    session: Option<String>,
+    mtime: Option<SystemTime>,
+    /// The snapshot, or why there is none.
+    pub snapshot: Option<Result<SessionViewSnapshot, Sanitized>>,
+    /// Index into the snapshot's keys.
+    pub cursor: usize,
+    preview: Option<CachedPreview>,
+    /// Bounded preview reads issued so far.
+    pub preview_reads: usize,
+    /// Key-table rows built by the renderer so far.
+    pub rows_built: Cell<usize>,
+}
+
+impl SessionTabState {
+    /// The session the loaded snapshot belongs to.
+    pub fn loaded_session(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+
+    fn key_count(&self) -> usize {
+        match &self.snapshot {
+            Some(Ok(snap)) => snap.keys.len(),
+            _ => 0,
+        }
+    }
+
+    /// The readable name of the key under the cursor, when it has one.
+    fn focused_key(&self) -> Option<&str> {
+        match &self.snapshot {
+            Some(Ok(snap)) => snap.keys.get(self.cursor)?.raw.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The cached preview, only when it is for the key under the cursor.
+    pub fn focused_preview(&self) -> Option<&KeyPreview> {
+        let cached = self.preview.as_ref()?;
+        let current = self.session.as_deref()?;
+        (cached.session == current
+            && Some(cached.mtime) == self.mtime
+            && Some(cached.key.as_str()) == self.focused_key())
+        .then_some(&cached.preview)
+    }
+
+    /// Decide what to load for `session` at `mtime`. Pure: the loop calls
+    /// it, and tests assert on it.
+    pub fn plan(&self, session: &str, mtime: SystemTime) -> SessionLoad {
+        if self.session.as_deref() != Some(session) || self.mtime != Some(mtime) {
+            return SessionLoad::Snapshot;
+        }
+        match self.focused_key() {
+            Some(key) if self.focused_preview().is_none() => SessionLoad::Preview(key.to_string()),
+            _ => SessionLoad::Idle,
+        }
+    }
+
+    /// Run one tick of loading: the snapshot when `plan` asks for it, then
+    /// at most one bounded preview read for the focused key.
+    pub fn tick(
+        &mut self,
+        session: &str,
+        mtime: SystemTime,
+        snapshot: impl FnOnce(&str) -> Result<SessionViewSnapshot, SnapshotError>,
+        preview: impl FnOnce(&str, &str) -> KeyPreview,
+    ) {
+        if self.plan(session, mtime) == SessionLoad::Snapshot {
+            if self.session.as_deref() != Some(session) {
+                self.cursor = 0;
+            }
+            self.snapshot = Some(snapshot(session).map_err(|e| e.reason()));
+            self.session = Some(session.to_string());
+            self.mtime = Some(mtime);
+            self.preview = None;
+            self.cursor = self.cursor.min(self.key_count().saturating_sub(1));
+        }
+        if let SessionLoad::Preview(key) = self.plan(session, mtime) {
+            let read = preview(session, &key);
+            self.preview_reads += 1;
+            self.preview = Some(CachedPreview {
+                session: session.to_string(),
+                key,
+                mtime,
+                preview: read,
+            });
+        }
+    }
+
+    /// Move the key cursor by `delta`, staying inside the listing.
+    pub fn move_cursor(&mut self, delta: isize) {
+        let max = self.key_count().saturating_sub(1);
+        self.cursor = self.cursor.saturating_add_signed(delta).min(max);
+    }
 }
 
 impl DashboardAppState {
@@ -175,6 +301,7 @@ impl DashboardAppState {
             detail_cache_session: None,
             active_tab: DashboardTab::Summary,
             show_receded: false,
+            session_tab: SessionTabState::default(),
         }
     }
 
@@ -280,6 +407,27 @@ impl DashboardAppState {
                 self.detail_cache = None;
             }
 
+            // On the Session tab the detail view's cursor walks the key
+            // table instead of the session list.
+            (ViewMode::Detail, KeyCode::Char('j') | KeyCode::Down, _)
+                if self.active_tab == DashboardTab::Session =>
+            {
+                self.session_tab.move_cursor(1);
+            }
+            (ViewMode::Detail, KeyCode::Char('k') | KeyCode::Up, _)
+                if self.active_tab == DashboardTab::Session =>
+            {
+                self.session_tab.move_cursor(-1);
+            }
+            (ViewMode::Detail, KeyCode::PageDown, _)
+                if self.active_tab == DashboardTab::Session =>
+            {
+                self.session_tab.move_cursor(10);
+            }
+            (ViewMode::Detail, KeyCode::PageUp, _) if self.active_tab == DashboardTab::Session => {
+                self.session_tab.move_cursor(-10);
+            }
+
             // Detail-view cursor movement (navigates sessions while in detail mode).
             (ViewMode::Detail, KeyCode::Char('j') | KeyCode::Down, _) => {
                 self.move_cursor_down();
@@ -304,7 +452,8 @@ impl DashboardAppState {
                 self.active_tab = match self.active_tab {
                     DashboardTab::Summary => DashboardTab::History,
                     DashboardTab::History => DashboardTab::Remaining,
-                    DashboardTab::Remaining => DashboardTab::Summary,
+                    DashboardTab::Remaining => DashboardTab::Session,
+                    DashboardTab::Session => DashboardTab::Summary,
                 };
             }
 
@@ -1070,9 +1219,180 @@ mod tests {
         state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(state.active_tab, DashboardTab::Remaining);
 
-        // Press Tab again: Remaining -> Summary (wrap)
+        // Press Tab again: Remaining -> Session
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.active_tab, DashboardTab::Session);
+
+        // Press Tab again: Session -> Summary (wrap)
         state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(state.active_tab, DashboardTab::Summary);
+    }
+
+    // -----------------------------------------------------------------------
+    // Session tab loading and key cursor
+    // -----------------------------------------------------------------------
+
+    use crate::session_view::{
+        sanitize, KeyEntry, Locality, SessionFacts, SessionViewSnapshot, SnapshotError,
+    };
+    use std::cell::RefCell;
+
+    fn key_entry(name: &str) -> KeyEntry {
+        KeyEntry {
+            display: sanitize(name),
+            raw: Some(name.to_string()),
+            size: Some(10),
+            writer: None,
+            created_at: None,
+            locality: Locality::Local,
+            stale: false,
+        }
+    }
+
+    fn snapshot_of(names: &[&str]) -> SessionViewSnapshot {
+        SessionViewSnapshot {
+            facts: SessionFacts {
+                name: "wf".to_string(),
+                session_id: None,
+                created_at: None,
+                intent: None,
+                template_name: None,
+                current_state: None,
+                directive: None,
+                execution_dir: None,
+                anchor: None,
+                store: None,
+            },
+            migrated: None,
+            keys: names.iter().map(|n| key_entry(n)).collect(),
+            unlisted_keys: 0,
+        }
+    }
+
+    fn text_preview() -> KeyPreview {
+        KeyPreview::Text {
+            excerpt: sanitize("x"),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn session_tab_loads_snapshot_once_per_mtime_and_one_preview_per_tick() {
+        let mut tab = SessionTabState::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let snapshots = RefCell::new(0usize);
+        let previews = RefCell::new(Vec::<String>::new());
+        let run_tick = |tab: &mut SessionTabState, mtime: SystemTime| {
+            tab.tick(
+                "wf",
+                mtime,
+                |_| {
+                    *snapshots.borrow_mut() += 1;
+                    Ok(snapshot_of(&["a", "b", "c"]))
+                },
+                |_, k| {
+                    previews.borrow_mut().push(k.to_string());
+                    text_preview()
+                },
+            );
+        };
+
+        // First tick on the tab: the snapshot and exactly one preview.
+        run_tick(&mut tab, t0);
+        assert_eq!(*snapshots.borrow(), 1);
+        assert_eq!(previews.borrow().as_slice(), ["a"]);
+        assert_eq!(tab.preview_reads, 1);
+
+        // Later ticks with the same mtime read nothing.
+        for _ in 0..5 {
+            run_tick(&mut tab, t0);
+        }
+        assert_eq!(*snapshots.borrow(), 1);
+        assert_eq!(tab.preview_reads, 1);
+
+        // Moving the cursor costs one read on the next tick, not before.
+        tab.move_cursor(1);
+        assert_eq!(tab.plan("wf", t0), SessionLoad::Preview("b".to_string()));
+        run_tick(&mut tab, t0);
+        run_tick(&mut tab, t0);
+        assert_eq!(previews.borrow().as_slice(), ["a", "b"]);
+
+        // A state-file change reloads the snapshot and re-reads the key.
+        let t1 = t0 + Duration::from_secs(1);
+        run_tick(&mut tab, t1);
+        assert_eq!(*snapshots.borrow(), 2);
+        assert_eq!(previews.borrow().as_slice(), ["a", "b", "b"]);
+        assert_eq!(
+            tab.cursor, 1,
+            "cursor survives a reload of the same session"
+        );
+    }
+
+    #[test]
+    fn session_tab_skips_preview_for_invalid_names_and_resets_on_session_change() {
+        let mut tab = SessionTabState::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let mut snap = snapshot_of(&["a", "b"]);
+        snap.keys[0].raw = None;
+        tab.tick("wf", t0, |_| Ok(snap.clone()), |_, _| panic!("no read"));
+        assert_eq!(tab.preview_reads, 0);
+
+        tab.move_cursor(1);
+        tab.tick("wf", t0, |_| unreachable!(), |_, _| text_preview());
+        assert_eq!(tab.preview_reads, 1);
+
+        tab.tick(
+            "other",
+            t0,
+            |_| Ok(snapshot_of(&["z"])),
+            |_, _| text_preview(),
+        );
+        assert_eq!(tab.cursor, 0);
+        assert_eq!(tab.loaded_session(), Some("other"));
+    }
+
+    #[test]
+    fn session_tab_keeps_an_error_as_sanitized_text_and_loads_no_preview() {
+        let mut tab = SessionTabState::default();
+        let t0 = SystemTime::UNIX_EPOCH;
+        tab.tick(
+            "wf",
+            t0,
+            |_| Err(SnapshotError::Corrupt("bad \u{1B}[2J".to_string())),
+            |_, _| panic!("no read"),
+        );
+        match &tab.snapshot {
+            Some(Err(reason)) => {
+                assert!(!reason.as_str().contains('\u{1B}'), "{reason}");
+                assert!(reason.as_str().contains("\\u{1B}[2J"), "{reason}");
+            }
+            other => panic!("expected a sanitized error, got {other:?}"),
+        }
+        assert_eq!(tab.plan("wf", t0), SessionLoad::Idle);
+    }
+
+    #[test]
+    fn session_tab_cursor_keys_walk_keys_in_detail_and_sessions_in_list() {
+        let mut state = DashboardAppState::new(500);
+        state.active_tab = DashboardTab::Session;
+        state.session_tab.snapshot = Some(Ok(snapshot_of(&["a", "b", "c"])));
+        state.view_mode = ViewMode::Detail;
+
+        state.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.session_tab.cursor, 2);
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.session_tab.cursor, 2, "bounded at the last key");
+        state.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(state.session_tab.cursor, 1);
+        state.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(state.session_tab.cursor, 0);
+        assert_eq!(state.cursor_idx, 0);
+
+        // In the list view the same key still moves the session cursor.
+        state.view_mode = ViewMode::List;
+        state.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(state.session_tab.cursor, 0);
     }
 
     // -----------------------------------------------------------------------

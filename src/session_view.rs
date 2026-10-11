@@ -201,6 +201,17 @@ impl fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
+impl SnapshotError {
+    /// The error as a surface may show it: sanitized and capped at
+    /// [`REASON_CAP`]. The wrapped message is raw `anyhow` text that can
+    /// carry log content or paths an agent controls, so every surface that
+    /// prints a snapshot error goes through this one path rather than
+    /// `to_string()`.
+    pub fn reason(&self) -> Sanitized {
+        sanitize_capped(&self.to_string(), REASON_CAP)
+    }
+}
+
 /// Where the migration marker says the session went.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigratedTo {
@@ -620,6 +631,30 @@ pub fn read_key_preview(backend: &Backend, name: &str, key: &str, bound: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_error_reason_is_sanitized_and_capped() {
+        let hostile = SnapshotError::Infrastructure(format!(
+            "open \u{1B}]0;title\u{7}\u{202E}{}",
+            "x".repeat(REASON_CAP * 2)
+        ));
+        let reason = hostile.reason();
+        let text = reason.as_str();
+        assert!(
+            !text.contains('\u{1B}') && !text.contains('\u{202E}'),
+            "{text}"
+        );
+        assert!(
+            text.contains("\\u{1B}") && text.contains("\\u{202E}"),
+            "{text}"
+        );
+        assert!(text.ends_with(CUT_MARKER), "capped with the marker: {text}");
+        assert_eq!(
+            text.chars().count(),
+            REASON_CAP + CUT_MARKER.chars().count(),
+            "exactly REASON_CAP characters before the marker"
+        );
+    }
 
     #[test]
     fn sanitize_escapes_each_class_with_the_exact_form() {

@@ -225,26 +225,37 @@ fn holdings_follow_the_last_writer_across_the_log() {
 /// budget however hostile the log.
 #[test]
 fn holdings_at_every_cap_stay_bounded() {
-    use koto::workflows_surface::{HoldingKey, Holdings, HOLDINGS_KEY_CAP};
+    use koto::session::validate::MAX_CONTEXT_KEY_LEN;
+    use koto::session_view::{CUT_MARKER, FACT_CAP};
+    use koto::workflows_surface::{HoldingKey, Holdings, HOLDINGS_KEY_CAP, HOLDINGS_STORE_CAP};
 
+    // The worst case each cap allows: the longest legal key names (ASCII
+    // by grammar), and anchor/store at their character caps plus the cut
+    // marker, built from 4-byte characters so the byte count is maximal.
+    let wide = '\u{1F600}';
     let holdings = Holdings {
         key_count: usize::MAX,
         total_bytes: u64::MAX,
         keys: (0..HOLDINGS_KEY_CAP)
-            .map(|i| HoldingKey {
-                // The key grammar caps names at 255 bytes.
-                key: format!("{i:03}{}", "k".repeat(252)),
-                size: u64::MAX,
+            .map(|i| {
+                let prefix = format!("{i:03}");
+                HoldingKey {
+                    key: format!("{prefix}{}", "k".repeat(MAX_CONTEXT_KEY_LEN - prefix.len())),
+                    size: u64::MAX,
+                }
             })
             .collect(),
         keys_truncated: true,
-        anchor: Some("a".repeat(1024)), // FACT_CAP
-        store: Some("s".repeat(64)),
+        anchor: Some(format!("{}{CUT_MARKER}", wide.to_string().repeat(FACT_CAP))),
+        store: Some(format!(
+            "{}{CUT_MARKER}",
+            wide.to_string().repeat(HOLDINGS_STORE_CAP)
+        )),
     };
     let bytes = serde_json::to_vec(&holdings).unwrap();
     assert!(
-        bytes.len() < 16 * 1024,
-        "holdings at every cap must stay under 16 KiB, got {}",
+        bytes.len() < 24 * 1024,
+        "holdings at every cap must stay under 24 KiB, got {}",
         bytes.len()
     );
 }
@@ -271,7 +282,21 @@ fn a_malformed_log_line_leaves_the_last_written_file_intact() {
         .unwrap();
 
     let path = wf_dir.path().join(workflow_filename("holdings-uuid"));
-    let before = std::fs::read(&path).expect("file written while the log was healthy");
+    let healthy = std::fs::read(&path).expect("file written while the log was healthy");
+
+    // Control: while the log is healthy, a further event DOES rewrite the
+    // file, so the equality asserted below is the render declining to write,
+    // not a render that would never have changed anything.
+    local.add("wf", "more.md", b"more").unwrap();
+    local
+        .append_event(
+            "wf",
+            &added_event("more.md", b"more", "agent"),
+            "2026-01-01T00:04:30Z",
+        )
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert_ne!(healthy, before, "a healthy event rewrites the file");
 
     // Corrupt the log the way a torn write would, then render again.
     let state_path = tmp.path().join("wf").join("koto-wf.state.jsonl");
