@@ -9,9 +9,12 @@ Session. It needs a terminal at least 80 columns wide to show both panes.
 
 | Key | Action |
 |-----|--------|
-| `j`, `k`, Down, Up | Move through the session list |
-| Enter | Open the focused session's detail pane |
+| `j`, Down | Focus the next session. At launch nothing is focused, so the first press focuses the first row |
+| `k`, Up | Focus the previous session |
+| Enter | Open the focused (or highlighted) session's detail pane, with its data loaded straight away |
 | Esc | Return to the list |
+| `j`, `k`, Down, Up on the Session tab | Walk the context keys instead of the sessions |
+| PageDown, PageUp on the Session tab | Move ten keys |
 | Tab | Switch to the next tab |
 | `a` | Show or hide finished and abandoned sessions |
 | `r` | Refresh now |
@@ -30,7 +33,10 @@ The top block lists the session's state, directive, anchor (the directory it
 was created in), execution directory, store origin, intent, template, session
 id and creation time. A field the session doesn't record prints its name
 followed by a dash, for example `Intent: —`, so a missing value is never a
-blank. The directive is shown behind a gutter, up to four lines.
+blank. The directive is shown behind a gutter, up to four lines. A long value,
+such as a store path, wraps onto indented continuation lines instead of being
+cut at the pane edge; a value that would take more than six lines ends in
+`…[cut]`.
 
 Below the facts is the key table, with one row per context key: its name,
 recorded size, writer, and where the content lives. The last column reads
@@ -49,7 +55,9 @@ a table row. What you see depends on the content:
 - Text shows up to the first 4096 bytes. A cut ends with a `…[cut]` marker, and
   so does an excerpt too long for the pane.
 - Binary content shows its type, recorded size and recorded hash, never the
-  bytes.
+  bytes. The hash is never split across lines: if the full 64 characters don't
+  fit the pane, it shows the first 16 and last 8 around `…`. `koto dashboard
+  <name> --detail` prints the full hash.
 - A remote-only key shows that it isn't local, with the recorded size and hash.
   koto doesn't download it.
 - A key whose content can't be read shows `unreadable` and the reason. The
@@ -57,10 +65,10 @@ a table row. What you see depends on the content:
 
 Open a session with Enter, switch to the Session tab with Tab, then use `j`,
 `k`, Down and Up to move the key cursor. PageDown and PageUp move ten keys. On
-this tab the detail view's cursor keys walk the keys instead of the session
-list; press Esc to go back to the list and pick another session. In the list
-view, `j` and `k` still move between sessions and the tab shows whichever
-session is focused.
+this tab, once a session is open, those keys walk the context keys instead of
+the session list; press Esc to go back to the list and pick another session.
+In the list view (before Enter), `j` and `k` still move between sessions and
+the tab shows whichever session is focused.
 
 ### Migrated sessions
 

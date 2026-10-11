@@ -415,24 +415,12 @@ pub fn run(args: DashboardArgs, backend: &crate::session::Backend) -> Result<()>
             dashboard_data::refresh(&mut state.tree, backend)?;
             state.clamp_cursor();
             state.tick_count = 0;
-
-            // Refresh detail cache for the focused session using mtime guard.
-            if let Some(ref id) = state.focused_id.clone() {
-                let current_mtime = state.tree.sessions.get(id).map(|s| s.mtime);
-                let path = state.tree.sessions.get(id).map(|s| s.state_path.clone());
-
-                let session_changed = state.detail_cache_session.as_deref() != Some(id.as_str());
-                let mtime_changed = current_mtime != state.detail_cache_mtime;
-
-                if session_changed || mtime_changed {
-                    if let Some(path) = path {
-                        state.detail_cache = dashboard_data::read_detail(&path, id);
-                        state.detail_cache_mtime = current_mtime;
-                        state.detail_cache_session = Some(id.clone());
-                    }
-                }
-            }
         }
+
+        // Refresh the detail cache for the focused session on every tick (not
+        // only on poll ticks) so opening a session shows its data at once; the
+        // session/mtime guard keeps this to a map lookup when nothing changed.
+        state.refresh_detail(dashboard_data::read_detail);
 
         // The Session tab loads on every tick but reads only when its plan
         // says the cached view is stale: the snapshot on entry or a
