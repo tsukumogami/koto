@@ -136,14 +136,18 @@ fn enriched_shape_matches_golden_fixture() {
     );
 }
 
-/// The fixture pins contract version 3 and the additive fields, holdings
+/// The fixture pins contract version 4 and the additive fields, holdings and
+/// the /workflows title fields
 /// included, so a future reader can assert the shape it targets.
 #[test]
-fn fixture_pins_contract_v3_and_new_fields() {
+fn fixture_pins_contract_v4_and_new_fields() {
     let fixture = std::fs::read_to_string(FIXTURE).unwrap();
     let v: serde_json::Value = serde_json::from_str(&fixture).unwrap();
     assert_eq!(v["koto"]["contractVersion"], CONTRACT_VERSION);
-    assert_eq!(v["koto"]["contractVersion"], 3);
+    assert_eq!(v["koto"]["contractVersion"], 4);
+    // v4: the /workflows screen titles an entry from workflowName.
+    assert!(v["workflowName"].is_string());
+    assert!(v["summary"].is_string());
     assert_eq!(v["status"], "blocked");
     // v3: the holdings summary carries names and sizes, never content.
     assert!(v["koto"]["holdings"]["keyCount"].is_u64());

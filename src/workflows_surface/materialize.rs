@@ -769,6 +769,12 @@ mod tests {
         }
         let v = read_file(wf.path(), "solo-uuid").expect("file written");
         assert_eq!(v["name"], "second intent");
+        // The /workflows screen titles the entry from workflowName.
+        assert_eq!(v["workflowName"], "second intent");
+        assert!(v["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("koto \u{b7} solo"));
     }
 
     fn read_file(dir: &Path, uuid: &str) -> Option<serde_json::Value> {
