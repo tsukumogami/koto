@@ -1361,7 +1361,13 @@ mod tests {
             |_| Err(SnapshotError::Corrupt("bad \u{1B}[2J".to_string())),
             |_, _| panic!("no read"),
         );
-        assert!(matches!(tab.snapshot, Some(Err(_))));
+        match &tab.snapshot {
+            Some(Err(reason)) => {
+                assert!(!reason.as_str().contains('\u{1B}'), "{reason}");
+                assert!(reason.as_str().contains("\\u{1B}[2J"), "{reason}");
+            }
+            other => panic!("expected a sanitized error, got {other:?}"),
+        }
         assert_eq!(tab.plan("wf", t0), SessionLoad::Idle);
     }
 

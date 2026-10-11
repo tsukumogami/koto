@@ -211,7 +211,10 @@ fn run_detail(name: &str, backend: &crate::session::Backend) -> ! {
         Err(SnapshotError::NotFound) => {
             exit_with_error_code(
                 serde_json::json!({
-                    "error": format!("session '{}' not found", name),
+                    "error": format!(
+                        "session '{}' not found",
+                        session_view::sanitize_capped(name, session_view::KEY_DISPLAY_CAP)
+                    ),
                     "command": "dashboard",
                 }),
                 EXIT_CALLER_ERROR,

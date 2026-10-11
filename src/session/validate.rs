@@ -55,7 +55,8 @@ pub fn validate_context_key(key: &str) -> anyhow::Result<()> {
 
     if key.len() > MAX_CONTEXT_KEY_LEN {
         anyhow::bail!(
-            "context key exceeds maximum length of 255 characters (got {})",
+            "context key exceeds maximum length of {} bytes (got {})",
+            MAX_CONTEXT_KEY_LEN,
             key.len()
         );
     }

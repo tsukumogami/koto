@@ -633,6 +633,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn snapshot_error_reason_is_sanitized_and_capped() {
+        let hostile = SnapshotError::Infrastructure(format!(
+            "open \u{1B}]0;title\u{7}\u{202E}{}",
+            "x".repeat(REASON_CAP * 2)
+        ));
+        let reason = hostile.reason();
+        let text = reason.as_str();
+        assert!(
+            !text.contains('\u{1B}') && !text.contains('\u{202E}'),
+            "{text}"
+        );
+        assert!(
+            text.contains("\\u{1B}") && text.contains("\\u{202E}"),
+            "{text}"
+        );
+        assert!(text.ends_with(CUT_MARKER), "capped with the marker: {text}");
+        assert_eq!(
+            text.chars().count(),
+            REASON_CAP + CUT_MARKER.chars().count(),
+            "exactly REASON_CAP characters before the marker"
+        );
+    }
+
+    #[test]
     fn sanitize_escapes_each_class_with_the_exact_form() {
         assert_eq!(sanitize("a\u{1B}b").as_str(), "a\\u{1B}b"); // ESC
         assert_eq!(sanitize("\u{9B}").as_str(), "\\u{9B}"); // 8-bit CSI
