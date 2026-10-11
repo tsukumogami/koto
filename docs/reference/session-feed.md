@@ -2287,7 +2287,13 @@ JSON's backslash doubling): roughly 28 KiB.
 
 On every event append, a session with a published `/workflows` location (the
 `workflows/publish-location` context key) writes a `koto-<uuid>.json` file into
-that directory for Claude Code's workflow view. Like the dashboard feed, the
+that directory for Claude Code's workflow view. The screen titles the entry
+from `workflowName` (the session's intent, else its template and state) and
+shows `summary` (`koto · <session> · <state>`) beneath it; `name` carries the
+same title for readers of contract versions before 4. These field names were
+observed in a native workflow file from Claude Code v2.1.296; Claude Code
+does not publish this format. Both strings pass the shared sanitizer and the
+1,024-character fact cap. Like the dashboard feed, the
 file is derived at write time from the data already in this contract — the
 event log and header — plus the compiled template for phase titles; nothing
 new is recorded in the log, and the render makes no remote request on a

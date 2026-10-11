@@ -19,8 +19,11 @@ use serde::Serialize;
 /// Version 2 adds the additive `phases` and `workflowProgress`
 /// fields and the `blocked` render status. Version 1's fields remain a valid
 /// subset, so a reader that ignores the new fields still renders the initial
-/// entry.
-pub const CONTRACT_VERSION: u32 = 3;
+/// entry. Version 3 adds the `holdings` block. Version 4 adds the top-level
+/// `workflowName` and `summary` fields the `/workflows` screen titles an entry
+/// with; `name` stays, carrying the same title, for readers of earlier
+/// versions.
+pub const CONTRACT_VERSION: u32 = 4;
 
 /// Render status mapped onto the `/workflows` vocabulary.
 ///
@@ -167,8 +170,23 @@ pub struct WorkflowFile {
     /// Entry id, koto-namespaced so it cannot collide with Claude Code's own
     /// `wf_*` ids: `koto-<session-uuid>`.
     pub id: String,
-    /// Human-readable entry name (the session's derived display label).
+    /// Human-readable entry name (the session's derived display label),
+    /// sanitized and capped. Kept for readers of contract versions 1-3; the
+    /// `/workflows` screen titles the entry from `workflow_name`.
     pub name: String,
+    /// The entry's title on Claude Code's `/workflows` screen: the same
+    /// sanitized label as `name`.
+    ///
+    /// Observed, not documented: the native workflow file Claude Code
+    /// v2.1.296 writes titles a run with `workflowName` and describes it with
+    /// `summary`, and an entry without `workflowName` is titled "Dynamic
+    /// Workflow" whatever its `name` says. If titles regress after a Claude
+    /// Code upgrade, compare against a fresh native file first.
+    #[serde(rename = "workflowName")]
+    pub workflow_name: String,
+    /// One-line description under the title: `koto · <session> · <state>`,
+    /// sanitized and capped like every printed fact.
+    pub summary: String,
     /// Running / completed / failed.
     pub status: RenderStatus,
     /// Start time in epoch milliseconds; Claude Code sorts entries by this.
@@ -199,9 +217,20 @@ impl WorkflowFile {
         status: RenderStatus,
         start_time: u64,
     ) -> Self {
+        use crate::session_view::{sanitize_capped, FACT_CAP};
+        // The label is user content (it carries the session's intent) shown
+        // in Claude Code's own screen, so it passes the shared sanitizer and
+        // cap before either field is written.
+        let title = sanitize_capped(&name, FACT_CAP).into_string();
+        let summary = match current_state.as_deref() {
+            Some(state) if !state.is_empty() => format!("koto \u{b7} {workflow} \u{b7} {state}"),
+            _ => format!("koto \u{b7} {workflow}"),
+        };
         WorkflowFile {
             id: entry_id(session_id),
-            name,
+            name: title.clone(),
+            workflow_name: title,
+            summary: sanitize_capped(&summary, FACT_CAP).into_string(),
             status,
             start_time,
             phases: Vec::new(),
@@ -307,9 +336,58 @@ mod tests {
     }
 
     #[test]
-    fn contract_version_is_three() {
-        // Version 3 added the holdings block; the guard/fixture anchors on it.
-        assert_eq!(CONTRACT_VERSION, 3);
+    fn contract_version_is_four() {
+        // Version 4 added workflowName and summary; the guard/fixture anchors
+        // on it.
+        assert_eq!(CONTRACT_VERSION, 4);
+    }
+
+    #[test]
+    fn title_and_summary_are_written_for_the_workflows_screen() {
+        let f = WorkflowFile::new(
+            "sid",
+            "release-notes",
+            "Draft the release notes".to_string(),
+            Some("review".to_string()),
+            RenderStatus::Running,
+            1,
+        );
+        let v: serde_json::Value = serde_json::from_slice(&f.to_json_bytes().unwrap()).unwrap();
+        assert_eq!(v["workflowName"], "Draft the release notes");
+        assert_eq!(v["name"], "Draft the release notes");
+        assert_eq!(v["summary"], "koto \u{b7} release-notes \u{b7} review");
+    }
+
+    #[test]
+    fn a_hostile_title_is_sanitized_and_capped_in_every_title_field() {
+        use crate::session_view::{CUT_MARKER, FACT_CAP};
+        let hostile = format!(
+            "evil\u{1B}[2J\u{1B}]0;title\u{7}\u{202E}flip{}",
+            "x".repeat(FACT_CAP * 2)
+        );
+        let f = WorkflowFile::new(
+            "sid",
+            "wf",
+            hostile,
+            Some("s\u{1B}[31m".to_string()),
+            RenderStatus::Running,
+            1,
+        );
+        let v: serde_json::Value = serde_json::from_slice(&f.to_json_bytes().unwrap()).unwrap();
+        for field in ["workflowName", "name", "summary"] {
+            let text = v[field].as_str().unwrap();
+            assert!(
+                !text
+                    .chars()
+                    .any(|c| c == '\u{1B}' || c == '\u{7}' || c == '\u{202E}'),
+                "{field} carries a raw control or bidi character: {text:?}"
+            );
+        }
+        let title = v["workflowName"].as_str().unwrap();
+        assert!(title.starts_with("evil\\u{1B}[2J"), "{title}");
+        assert!(title.contains("\\u{202E}flip"), "{title}");
+        assert!(title.ends_with(CUT_MARKER), "{title}");
+        assert_eq!(title.chars().count(), FACT_CAP + CUT_MARKER.chars().count());
     }
 
     #[test]
@@ -387,7 +465,7 @@ mod tests {
 
         // The initial fields are unchanged and present alongside the new ones.
         assert_eq!(v["id"], "koto-sid");
-        assert_eq!(v["koto"]["contractVersion"], 3);
+        assert_eq!(v["koto"]["contractVersion"], CONTRACT_VERSION);
     }
 
     #[test]

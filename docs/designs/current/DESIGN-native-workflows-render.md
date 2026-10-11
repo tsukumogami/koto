@@ -40,6 +40,20 @@ rationale: |
 
 Current
 
+**Correction (2026-10-11), the screen's title field is `workflowName`.** Two
+passages in Fork E said the screen shows the entry's `name`. A native
+workflow file written by Claude Code v2.1.296 titles a run with
+`workflowName` and describes it with `summary`, and on that version every
+koto entry, which carried only `name`, was titled "Dynamic Workflow". This is
+observed behavior of an undocumented surface, not a published contract. With
+the maintainers' approval, "the top-level fields Claude Code's `/workflows`
+renders (an id, a human name, a status, a `startTime`)" now reads "(an id, a
+title in `workflowName` with a `summary` beneath it, a status, a
+`startTime`)", and "renders as an entry showing the name and status" now
+reads "renders as an entry showing the title and status". The file contract
+moves to version 4, adding `workflowName` and `summary` and keeping `name`
+for earlier readers.
+
 Mechanism design for the initial single-session slice of koto's native Claude Code
 `/workflows` rendering, settling the forks left open by the Accepted
 `PRD-native-workflows-render`. The surface decision (koto produces the native
@@ -232,11 +246,11 @@ ancestor walk, just exercised over a real tree.
 ### Fork E -- The file contract shape
 
 **Chosen: a minimal, extensible JSON object carrying the top-level fields
-Claude Code's `/workflows` renders (an id, a human name, a status, a
-`startTime`) plus a koto-namespaced block (`koto: { sessionId, workflow,
+Claude Code's `/workflows` renders (an id, a title in `workflowName` with a
+`summary` beneath it, a status, a `startTime`) plus a koto-namespaced block (`koto: { sessionId, workflow,
 currentState, contractVersion }`) that identifies the file and versions the
 contract.** Claude Code applies defaults to every field and renders even `{}`,
-so a conservative minimal top-level set renders as an entry showing the name and
+so a conservative minimal top-level set renders as an entry showing the title and
 status; the current state is surfaced both in the koto block and reflected into
 the rendered entry. The struct is serde-modeled with room to grow: the
 phase-detail enrichment adds phase/agent detail as additional fields, the future

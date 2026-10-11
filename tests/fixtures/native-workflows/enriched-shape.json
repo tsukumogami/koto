@@ -1,6 +1,8 @@
 {
   "id": "koto-11111111-2222-4333-8444-555555555555",
   "name": "impl-feature · verify",
+  "workflowName": "impl-feature · verify",
+  "summary": "koto · impl-feature · verify",
   "status": "blocked",
   "startTime": 1700000000000,
   "phases": [
@@ -75,7 +77,7 @@
     "sessionId": "11111111-2222-4333-8444-555555555555",
     "workflow": "impl-feature",
     "currentState": "verify",
-    "contractVersion": 3,
+    "contractVersion": 4,
     "holdings": {
       "keyCount": 3,
       "totalBytes": 5160,
