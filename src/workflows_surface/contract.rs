@@ -20,7 +20,7 @@ use serde::Serialize;
 /// fields and the `blocked` render status. Version 1's fields remain a valid
 /// subset, so a reader that ignores the new fields still renders the initial
 /// entry.
-pub const CONTRACT_VERSION: u32 = 2;
+pub const CONTRACT_VERSION: u32 = 3;
 
 /// Render status mapped onto the `/workflows` vocabulary.
 ///
@@ -95,6 +95,44 @@ pub enum ProgressNode {
     },
 }
 
+/// One context key in the holdings summary: its name and recorded size.
+#[derive(Debug, Clone, Serialize)]
+pub struct HoldingKey {
+    pub key: String,
+    pub size: u64,
+}
+
+/// A compact account of what the session holds, folded from the context
+/// events in the log the projection already reads (contract v3). Names and
+/// sizes only — the file lives under the hosting application's directory,
+/// and key content never belongs in it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Holdings {
+    /// Every key the log's last-writer-wins fold leaves present, valid
+    /// names and invalid ones alike.
+    #[serde(rename = "keyCount")]
+    pub key_count: usize,
+    /// Recorded sizes summed with saturating addition.
+    #[serde(rename = "totalBytes")]
+    pub total_bytes: u64,
+    /// At most [`HOLDINGS_KEY_CAP`] grammar-valid key names with sizes, in
+    /// lexicographic order; an invalid name is counted above but never
+    /// listed.
+    pub keys: Vec<HoldingKey>,
+    /// Whether `keys` was cut at the cap.
+    #[serde(rename = "keysTruncated")]
+    pub keys_truncated: bool,
+    /// The session's execution anchor, sanitized and capped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+    /// The store origin kind (`local` or `cloud`), sanitized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
+}
+
+/// Most keys a holdings summary lists by name.
+pub const HOLDINGS_KEY_CAP: usize = 50;
+
 /// koto-namespaced identification and extension block. Nested under the `koto`
 /// key so it never clashes with Claude Code's own top-level fields.
 #[derive(Debug, Clone, Serialize)]
@@ -110,6 +148,10 @@ pub struct KotoBlock {
     /// The file-contract version (see [`CONTRACT_VERSION`]).
     #[serde(rename = "contractVersion")]
     pub contract_version: u32,
+    /// The holdings summary (contract v3). `None` on the minimal shape,
+    /// omitted from serialization so that render stays lean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holdings: Option<Holdings>,
 }
 
 /// The file koto writes as `koto-<session-uuid>.json`.
@@ -165,8 +207,17 @@ impl WorkflowFile {
                 workflow: workflow.to_string(),
                 current_state,
                 contract_version: CONTRACT_VERSION,
+                holdings: None,
             },
         }
+    }
+
+    /// Attach the holdings summary (contract v3). Additive like
+    /// [`WorkflowFile::with_detail`]: a file built without it carries no
+    /// `holdings` member at all.
+    pub fn with_holdings(mut self, holdings: Holdings) -> Self {
+        self.koto.holdings = Some(holdings);
+        self
     }
 
     /// Attach the enriched phase detail (ordered phases + progress tree).
@@ -252,9 +303,9 @@ mod tests {
     }
 
     #[test]
-    fn contract_version_is_two() {
-        // Version 2 bumped the contract; the guard/fixture anchors on it.
-        assert_eq!(CONTRACT_VERSION, 2);
+    fn contract_version_is_three() {
+        // Version 3 added the holdings block; the guard/fixture anchors on it.
+        assert_eq!(CONTRACT_VERSION, 3);
     }
 
     #[test]
@@ -332,7 +383,7 @@ mod tests {
 
         // The initial fields are unchanged and present alongside the new ones.
         assert_eq!(v["id"], "koto-sid");
-        assert_eq!(v["koto"]["contractVersion"], 2);
+        assert_eq!(v["koto"]["contractVersion"], 3);
     }
 
     #[test]

@@ -8,7 +8,9 @@
 //! shape-change / drift-guard obligation (whenever the emitted shape changes,
 //! this fixture must change with it, deliberately).
 
-use koto::workflows_surface::{Phase, ProgressNode, RenderStatus, WorkflowFile, CONTRACT_VERSION};
+use koto::workflows_surface::{
+    HoldingKey, Holdings, Phase, ProgressNode, RenderStatus, WorkflowFile, CONTRACT_VERSION,
+};
 
 const FIXTURE: &str = "tests/fixtures/native-workflows/enriched-shape.json";
 
@@ -88,6 +90,27 @@ fn canonical_enriched_file() -> WorkflowFile {
         1_700_000_000_000,
     )
     .with_detail(phases, workflow_progress)
+    .with_holdings(Holdings {
+        key_count: 3,
+        total_bytes: 5_160,
+        keys: vec![
+            HoldingKey {
+                key: "notes.md".to_string(),
+                size: 64,
+            },
+            HoldingKey {
+                key: "research/long.md".to_string(),
+                size: 1_000,
+            },
+            HoldingKey {
+                key: "data/blob.bin".to_string(),
+                size: 4_096,
+            },
+        ],
+        keys_truncated: false,
+        anchor: Some("/srv/checkout".to_string()),
+        store: Some("local".to_string()),
+    })
 }
 
 /// The emitted enriched shape must match the committed golden fixture. Drift
@@ -113,15 +136,20 @@ fn enriched_shape_matches_golden_fixture() {
     );
 }
 
-/// The fixture pins contract version 2 and the enriched additive fields, so a
-/// future reader can assert the shape it targets.
+/// The fixture pins contract version 3 and the additive fields, holdings
+/// included, so a future reader can assert the shape it targets.
 #[test]
-fn fixture_pins_contract_v2_and_new_fields() {
+fn fixture_pins_contract_v3_and_new_fields() {
     let fixture = std::fs::read_to_string(FIXTURE).unwrap();
     let v: serde_json::Value = serde_json::from_str(&fixture).unwrap();
     assert_eq!(v["koto"]["contractVersion"], CONTRACT_VERSION);
-    assert_eq!(v["koto"]["contractVersion"], 2);
+    assert_eq!(v["koto"]["contractVersion"], 3);
     assert_eq!(v["status"], "blocked");
+    // v3: the holdings summary carries names and sizes, never content.
+    assert!(v["koto"]["holdings"]["keyCount"].is_u64());
+    assert!(v["koto"]["holdings"]["totalBytes"].is_u64());
+    assert!(v["koto"]["holdings"]["keys"].is_array());
+    assert!(v["koto"]["holdings"]["keysTruncated"].is_boolean());
     assert!(v["phases"].is_array());
     assert!(v["workflowProgress"].is_array());
     // The initial top-level fields survive unchanged.

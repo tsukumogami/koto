@@ -2278,6 +2278,31 @@ instructions, a path, or a command. The worst-case rendered content per key
 is about seven times the 4,096-byte source bound (escape expansion, then
 JSON's backslash doubling): roughly 28 KiB.
 
+## Native `/workflows` File
+
+On every event append, a session with a published `/workflows` location (the
+`workflows/publish-location` context key) writes a `koto-<uuid>.json` file into
+that directory for Claude Code's workflow view. Like the dashboard feed, the
+file is derived at write time from the data already in this contract — the
+event log and header — plus the compiled template for phase titles; nothing
+new is recorded in the log, and the render makes no remote request on a
+cloud-backed session.
+
+From contract version 3 the file carries a `holdings` summary folded from the
+`context_added` / `context_removed` / `context_cleared` events: `keyCount`
+(every live key), `totalBytes` (their summed sizes, saturating), `keys` — up
+to 50 `{key, size}` rows in lexicographic key order, with
+`keysTruncated: true` when more grammar-valid names exist than the cap —
+and the session's execution `anchor` and `store` kind, each omitted when the
+session records none. **Key names and sizes are written to this file; key
+content and hashes never are.** The file lands in a directory outside the
+session store (wherever the hosting session published), so a key name is the
+most a reader of that directory learns about what the session holds. Names
+that fail the context-key grammar are counted in `keyCount` and `totalBytes`
+but never listed in `keys` (so `keyCount` can exceed the list length with
+`keysTruncated` still false), and anchor and store strings are sanitized and
+length-capped before they are written.
+
 ## Lifecycle Metadata Surface
 
 Session-level liveness — whether a session is active, idle, blocked, stalled, failed,
