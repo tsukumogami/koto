@@ -133,6 +133,10 @@ pub struct Holdings {
 /// Most keys a holdings summary lists by name.
 pub const HOLDINGS_KEY_CAP: usize = 50;
 
+/// Longest `holdings.store` value written, in characters, before the cut
+/// marker.
+pub const HOLDINGS_STORE_CAP: usize = 64;
+
 /// koto-namespaced identification and extension block. Nested under the `koto`
 /// key so it never clashes with Claude Code's own top-level fields.
 #[derive(Debug, Clone, Serialize)]

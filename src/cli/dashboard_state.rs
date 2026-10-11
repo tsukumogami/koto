@@ -10,9 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::session_view::{
-    sanitize_capped, KeyPreview, Sanitized, SessionViewSnapshot, SnapshotError, REASON_CAP,
-};
+use crate::session_view::{KeyPreview, Sanitized, SessionViewSnapshot, SnapshotError};
 
 use crate::cli::dashboard_data::liveness::{attention_key, idle_for, is_receded};
 use crate::cli::dashboard_data::{
@@ -257,8 +255,7 @@ impl SessionTabState {
             if self.session.as_deref() != Some(session) {
                 self.cursor = 0;
             }
-            self.snapshot =
-                Some(snapshot(session).map_err(|e| sanitize_capped(&e.to_string(), REASON_CAP)));
+            self.snapshot = Some(snapshot(session).map_err(|e| e.reason()));
             self.session = Some(session.to_string());
             self.mtime = Some(mtime);
             self.preview = None;

@@ -35,6 +35,9 @@ pub fn validate_session_id(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Longest context key the grammar accepts, in bytes.
+pub const MAX_CONTEXT_KEY_LEN: usize = 255;
+
 /// Validate a context key against the hierarchical key format.
 ///
 /// Valid keys use `/` as a namespace separator with these rules:
@@ -43,14 +46,14 @@ pub fn validate_session_id(id: &str) -> anyhow::Result<()> {
 /// - No consecutive slashes (`//`)
 /// - No `.` or `..` path components
 /// - Each component must match `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`
-/// - Maximum total length: 255 characters
+/// - Maximum total length: [`MAX_CONTEXT_KEY_LEN`] bytes
 /// - Empty string rejected
 pub fn validate_context_key(key: &str) -> anyhow::Result<()> {
     if key.is_empty() {
         anyhow::bail!("context key must not be empty");
     }
 
-    if key.len() > 255 {
+    if key.len() > MAX_CONTEXT_KEY_LEN {
         anyhow::bail!(
             "context key exceeds maximum length of 255 characters (got {})",
             key.len()

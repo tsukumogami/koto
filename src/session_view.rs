@@ -201,6 +201,17 @@ impl fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
+impl SnapshotError {
+    /// The error as a surface may show it: sanitized and capped at
+    /// [`REASON_CAP`]. The wrapped message is raw `anyhow` text that can
+    /// carry log content or paths an agent controls, so every surface that
+    /// prints a snapshot error goes through this one path rather than
+    /// `to_string()`.
+    pub fn reason(&self) -> Sanitized {
+        sanitize_capped(&self.to_string(), REASON_CAP)
+    }
+}
+
 /// Where the migration marker says the session went.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigratedTo {

@@ -220,10 +220,10 @@ fn fold_holdings(header: &StateFileHeader, events: &[Event]) -> Holdings {
         .map(cap_fact)
         .or_else(|| header.execution_dir.as_deref().map(cap_fact))
         .or_else(|| header.origin.as_ref().map(|o| cap_fact(&o.anchor)));
-    let store = header
-        .origin
-        .as_ref()
-        .map(|o| crate::session_view::sanitize_capped(&o.store.kind, 64).into_string());
+    let store = header.origin.as_ref().map(|o| {
+        crate::session_view::sanitize_capped(&o.store.kind, super::contract::HOLDINGS_STORE_CAP)
+            .into_string()
+    });
 
     Holdings {
         key_count: live.len(),
