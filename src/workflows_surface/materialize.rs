@@ -744,6 +744,33 @@ mod tests {
         assert!(!text.contains("deadbeef"), "no key hash in the file");
     }
 
+    /// The `/workflows` entry is labelled with the session's intent, which
+    /// koto records as `intent_updated` events (the header field stays
+    /// empty); the latest event wins.
+    #[test]
+    fn label_uses_the_intent_koto_records_as_events() {
+        let base = TempDir::new().unwrap();
+        let wf = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(base.path().to_path_buf());
+        init_session(&backend, "solo");
+        write_template(&backend, "solo", MULTI_PHASE_TEMPLATE);
+        discover::publish_location(&backend, &backend, "solo", wf.path().to_str().unwrap())
+            .unwrap();
+        for text in ["first intent", "second intent"] {
+            backend
+                .append_event(
+                    "solo",
+                    &EventPayload::IntentUpdated {
+                        intent: text.to_string(),
+                    },
+                    "2026-01-01T00:01:00Z",
+                )
+                .expect("append intent");
+        }
+        let v = read_file(wf.path(), "solo-uuid").expect("file written");
+        assert_eq!(v["name"], "second intent");
+    }
+
     fn read_file(dir: &Path, uuid: &str) -> Option<serde_json::Value> {
         let path = dir.join(workflow_filename(uuid));
         let bytes = std::fs::read(path).ok()?;

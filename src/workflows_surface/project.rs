@@ -89,7 +89,13 @@ fn project_from_log(
     // The workflow name is the stable header identity; session_id is the UUID
     // (may be empty on pre-UUID legacy state files -- callers fall back).
     let workflow = header.workflow.clone();
-    let display_name = derive_display_name(header, current_state.as_deref(), &workflow);
+    let intent = crate::engine::types::effective_intent(header, events);
+    let display_name = derive_display_name(
+        intent.as_deref(),
+        header,
+        current_state.as_deref(),
+        &workflow,
+    );
 
     Projection {
         session_id: header.session_id.clone(),
@@ -435,11 +441,12 @@ pub fn humanize_state(name: &str) -> String {
 /// `template_name · current_state`, else `untitled (template_name)`, else the
 /// bare workflow name.
 fn derive_display_name(
+    intent: Option<&str>,
     header: &crate::engine::types::StateFileHeader,
     current_state: Option<&str>,
     workflow: &str,
 ) -> String {
-    if let Some(intent) = header.intent.as_deref() {
+    if let Some(intent) = intent {
         if !intent.is_empty() {
             return intent.to_string();
         }
@@ -599,7 +606,7 @@ mod tests {
     fn label_prefers_intent() {
         let h = header(Some("fix the bug"), Some("tmpl"));
         assert_eq!(
-            derive_display_name(&h, Some("building"), "wf.name"),
+            derive_display_name(h.intent.as_deref(), &h, Some("building"), "wf.name"),
             "fix the bug"
         );
     }
@@ -608,7 +615,7 @@ mod tests {
     fn label_falls_back_to_template_and_state() {
         let h = header(None, Some("tmpl"));
         assert_eq!(
-            derive_display_name(&h, Some("building"), "wf.name"),
+            derive_display_name(h.intent.as_deref(), &h, Some("building"), "wf.name"),
             "tmpl \u{b7} building"
         );
     }
@@ -617,7 +624,7 @@ mod tests {
     fn label_falls_back_to_workflow_name() {
         let h = header(None, None);
         assert_eq!(
-            derive_display_name(&h, Some("building"), "wf.name"),
+            derive_display_name(h.intent.as_deref(), &h, Some("building"), "wf.name"),
             "wf.name"
         );
     }

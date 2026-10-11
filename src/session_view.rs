@@ -391,6 +391,7 @@ fn valid_hash(raw: &str) -> Option<Sanitized> {
 fn facts_from_header(
     name: &str,
     header: Option<&crate::engine::types::StateFileHeader>,
+    events: &[crate::engine::types::Event],
 ) -> SessionFacts {
     let mut facts = SessionFacts {
         name: name.to_string(),
@@ -409,7 +410,9 @@ fn facts_from_header(
             facts.session_id = Some(fact(&h.session_id));
         }
         facts.created_at = parse_timestamp(&h.created_at);
-        facts.intent = h.intent.as_deref().map(fact);
+        facts.intent = crate::engine::types::effective_intent(h, events)
+            .as_deref()
+            .map(fact);
         facts.template_name = h.template_name.as_deref().map(fact);
         facts.execution_dir = h
             .execution_dir
@@ -438,8 +441,8 @@ pub fn snapshot(backend: &Backend, name: &str) -> Result<SessionViewSnapshot, Sn
     if let Err(err) = backend.check_not_migrated(name) {
         if let Some(m) = err.downcast_ref::<SessionMigrated>() {
             let facts = match backend.read_events_local(name) {
-                Ok((header, _)) => facts_from_header(name, Some(&header)),
-                Err(_) => facts_from_header(name, None),
+                Ok((header, events)) => facts_from_header(name, Some(&header), &events),
+                Err(_) => facts_from_header(name, None, &[]),
             };
             return Ok(SessionViewSnapshot {
                 facts,
@@ -469,7 +472,7 @@ pub fn snapshot(backend: &Backend, name: &str) -> Result<SessionViewSnapshot, Sn
         Err(err) => return Err(SnapshotError::Corrupt(err.to_string())),
     };
 
-    let mut facts = facts_from_header(name, Some(&header));
+    let mut facts = facts_from_header(name, Some(&header), &events);
 
     // A session that never advanced derives no current state; that is
     // absence to show, not corruption (an unparseable log already failed
