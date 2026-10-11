@@ -82,5 +82,10 @@ bounded read of the focused key, cached until you move to another key or the
 state file changes, so a session with thousands of keys doesn't slow the
 refresh loop. The key table builds rows only for the part on screen.
 
+The state file is the only trigger. Every koto command that writes a key also
+appends to the state file, so the tab normally keeps up; but a change made to
+the context store directly, outside koto, doesn't show until the session's
+next event.
+
 Because the reads are synchronous, a session on a hung network filesystem
 stalls the dashboard the same way the History tab would.

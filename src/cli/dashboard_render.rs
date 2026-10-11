@@ -2131,6 +2131,9 @@ mod tests {
         assert!(!pane.contains("key-00000"), "{pane}");
     }
 
+    // Independence, not a pre-change golden: Summary, History and Remaining
+    // must not read Session-tab state. Their own render code is unchanged by
+    // the Session tab and stays pinned by the existing tests above.
     #[test]
     fn other_tabs_render_the_same_with_or_without_session_data() {
         let detail = || DetailData {
