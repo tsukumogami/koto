@@ -67,9 +67,19 @@ fn cloud_backend(s3: &FakeS3, base: &std::path::Path, prefix: &str) -> CloudBack
 ///
 /// The render is then run exactly as production runs it -- the local
 /// backend/store pair `LocalBackend::append_event` hands to
-/// `materialize_after_commit` -- with every object in the bucket set to
-/// fail on GET, PUT and DELETE. The file is written, no key content
-/// reaches it, and the fake S3 records zero requests.
+/// `materialize_after_commit` (src/session/local.rs) -- with every object
+/// in the bucket set to fail on GET, PUT and DELETE. The file is written,
+/// no key content reaches it, and the fake S3 records zero requests.
+///
+/// The construction limit, stated plainly: the local pair carries no S3
+/// client, so the zero-request assertion holds by construction for this
+/// invocation -- it documents the read-path contract rather than
+/// discovering it, and it cannot see a rewiring of the production call
+/// site itself (that line is `LocalBackend::append_event`'s). What the
+/// test does prove on a cloud-backed fixture is the part that matters to
+/// a reader of the file: the render handed the production pair writes the
+/// correct holdings from the local copy alone, with the bucket actively
+/// hostile.
 #[test]
 fn holdings_reflect_the_log_and_the_render_makes_no_remote_call() {
     let s3 = FakeS3::start(BUCKET);
@@ -207,4 +217,73 @@ fn holdings_follow_the_last_writer_across_the_log() {
         "the last write's size wins"
     );
     assert!(!keys.iter().any(|k| k["key"] == "b.md"), "removed key gone");
+}
+
+/// The whole holdings object is bounded at its caps: 50 longest-legal key
+/// names with maximal sizes plus a capped anchor and store serialize to a
+/// bounded blob, so the enriched file cannot grow past a glance surface's
+/// budget however hostile the log.
+#[test]
+fn holdings_at_every_cap_stay_bounded() {
+    use koto::workflows_surface::{HoldingKey, Holdings, HOLDINGS_KEY_CAP};
+
+    let holdings = Holdings {
+        key_count: usize::MAX,
+        total_bytes: u64::MAX,
+        keys: (0..HOLDINGS_KEY_CAP)
+            .map(|i| HoldingKey {
+                // The key grammar caps names at 255 bytes.
+                key: format!("{i:03}{}", "k".repeat(252)),
+                size: u64::MAX,
+            })
+            .collect(),
+        keys_truncated: true,
+        anchor: Some("a".repeat(1024)), // FACT_CAP
+        store: Some("s".repeat(64)),
+    };
+    let bytes = serde_json::to_vec(&holdings).unwrap();
+    assert!(
+        bytes.len() < 16 * 1024,
+        "holdings at every cap must stay under 16 KiB, got {}",
+        bytes.len()
+    );
+}
+
+/// A malformed line mid-log makes the projection underivable; the render
+/// then writes nothing, leaving the last good file intact rather than
+/// replacing it with a partial or empty one.
+#[test]
+fn a_malformed_log_line_leaves_the_last_written_file_intact() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let wf_dir = tempfile::TempDir::new().unwrap();
+    let local = LocalBackend::with_base_dir(tmp.path().to_path_buf());
+    local
+        .init_state_file("wf", header_of("wf"), vec![initialized()])
+        .unwrap();
+    publish_location(&local, &local, "wf", wf_dir.path().to_str().unwrap()).unwrap();
+    local.add("wf", "good.md", b"fine").unwrap();
+    local
+        .append_event(
+            "wf",
+            &added_event("good.md", b"fine", "agent"),
+            "2026-01-01T00:04:00Z",
+        )
+        .unwrap();
+
+    let path = wf_dir.path().join(workflow_filename("holdings-uuid"));
+    let before = std::fs::read(&path).expect("file written while the log was healthy");
+
+    // Corrupt the log the way a torn write would, then render again.
+    let state_path = tmp.path().join("wf").join("koto-wf.state.jsonl");
+    let mut log = std::fs::read_to_string(&state_path).unwrap();
+    log.push_str("{this is not json\n");
+    std::fs::write(&state_path, log).unwrap();
+
+    materialize_after_commit(&local, &local, "wf");
+
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(
+        before, after,
+        "an underivable projection must not touch the published file"
+    );
 }

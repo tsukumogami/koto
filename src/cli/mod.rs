@@ -403,6 +403,17 @@ pub struct DashboardArgs {
     /// (--once) Include the receded set (done + abandoned); default excludes it
     #[arg(long)]
     pub all: bool,
+
+    /// Print one JSON object describing the named session -- facts, every
+    /// context key with metadata, and bounded content previews -- and exit.
+    /// Requires the positional session name; exclusive with the feed and
+    /// TUI flags.
+    #[arg(
+        long,
+        requires = "name",
+        conflicts_with_all = ["once", "status", "needs_you", "all", "interval"]
+    )]
+    pub detail: bool,
 }
 
 #[derive(Subcommand)]

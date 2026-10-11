@@ -2203,6 +2203,86 @@ Sessions whose state file header fails to parse are excluded from the feed (they
 not valid sessions) but are reported as a trailing `note:` on stderr, so they are
 surfaced rather than silently dropped.
 
+## Session Detail (`--detail`)
+
+`koto dashboard <NAME> --detail` prints one JSON object describing one session
+and exits. It is the scripting counterpart of the TUI's session view: the
+session facts, every context key with its metadata, and a bounded content
+preview per key. Like the feed, everything is derived at read time from the
+local copy — no pull, no write, no event. The flag requires the positional
+name and is exclusive with the feed and TUI flags (`--once`, `--status`,
+`--needs-you`, `--all`, `--interval`); `--once` output is unchanged by it.
+
+Errors follow the `koto status` convention: `{error, command: "dashboard"}`
+on stdout, exit 2 for a missing session, exit 3 for a corrupt record or an
+infrastructure failure. A migrated session is a successful exit-0 answer: the
+object carries `migrated {target, workspace}` and **no `keys` member at all**
+— the local copy's keys describe a session that lives elsewhere now.
+
+Top level:
+
+| Field | Type | Presence | Description |
+|-------|------|----------|-------------|
+| `name` | string | Always | The session name as given. |
+| `session_id` | string | When recorded | Header `session_id`. |
+| `created_at` | string | When it parses as RFC 3339 | Header creation time. |
+| `intent` | string | When recorded | Derived intent. |
+| `template_name` | string | When recorded | Header template name. |
+| `current_state` | string | When derivable | Current state from the log. |
+| `directive` | string | Non-terminal states with a template | The state's directive, rendered as `koto status` renders it. |
+| `execution_dir` | string | When recorded | The session's execution anchor. |
+| `anchor` | string | When recorded | The origin anchor (creation directory). |
+| `store` | object | When recorded | `{kind, base}` — the store origin. |
+| `migrated` | object | Migrated sessions only | `{target, workspace}`; `keys` is then absent. |
+| `keys` | array | Non-migrated sessions | Every listed key, lexicographic (see below). |
+| `contentOmittedCount` | integer | With `keys` | Keys past the preview ceiling (1,000) whose content was not read. |
+| `unlistedKeys` | integer | With `keys` | Keys past the metadata ceiling (100,000) not listed at all. |
+
+An absent optional fact is omitted, never `null`: absence is data. Field
+casing is mixed on purpose: the session facts reuse the snake_case names
+`koto status` and the state-file header already use (`current_state`,
+`created_at`), while the fields this mode adds for its own bookkeeping
+(`contentOmitted`, `contentOmittedCount`, `unlistedKeys`) use camelCase,
+matching the native `/workflows` file. Match each name exactly as listed.
+
+Each `keys` entry:
+
+| Field | Type | Presence | Description |
+|-------|------|----------|-------------|
+| `key` | string | Always | Display form: sanitized, capped at 256 characters. |
+| `size` | integer | When the manifest records it | Recorded byte length. |
+| `writer` | string | When recorded | Who wrote the key. |
+| `created_at` | string | When it parses | Recorded creation time. |
+| `locality` | string | Always | `local` or `remote-only`. |
+| `stale` | bool | Always | The local and remote manifests disagree on the hash. |
+| `content` | object | First 1,000 keys | The typed preview below. |
+| `contentOmitted` | string | Past the ceiling | The literal `key-limit`. |
+
+`content` is one of:
+
+- `{type: "text", excerpt, truncated}` — valid UTF-8, excerpted to 4,096
+  bytes at a character boundary; `truncated: true` is the explicit marker.
+- `{type: "binary", size, hash}` — not text; size and hash are the
+  manifest's RECORDED values, never computed (hashing is a full read). A
+  recorded hash that is not 64 hex characters renders as `invalid-hash`.
+- `{type: "not-local", size, hash}` — a key only the remote manifest knows;
+  nothing is fetched.
+- `{type: "unreadable", reason}` — the manifest names the key but its
+  content cannot be read; `reason` is sanitized and capped.
+- `{type: "invalid-name"}` — the manifest entry's name fails the key
+  grammar; nothing was read and no path was built from it.
+
+**Every string in this object is untrusted data.** Key names, writers,
+excerpts, the migrated target and workspace, and error reasons all come from
+files an agent — or anything that can write the session store or the remote
+bucket — controls. Values are sanitized (C0/C1 controls, bidi overrides,
+zero-width characters and the rest render as visible `\u{XXXX}` escapes)
+before serde_json's own escaping, so the stream carries no raw control
+bytes, but a consumer must still treat every value as content, never as
+instructions, a path, or a command. The worst-case rendered content per key
+is about seven times the 4,096-byte source bound (escape expansion, then
+JSON's backslash doubling): roughly 28 KiB.
+
 ## Native `/workflows` File
 
 On every event append, a session with a published `/workflows` location (the
@@ -2214,15 +2294,19 @@ new is recorded in the log, and the render makes no remote request on a
 cloud-backed session.
 
 From contract version 3 the file carries a `holdings` summary folded from the
-`context_added` / `context_removed` / `context_cleared` events: the live key
-count, the summed byte total, up to 50 key names with their sizes, and the
-session's execution anchor and store kind. **Key names and sizes are written
-to this file; key content and hashes never are.** The file lands in a
-directory outside the session store (wherever the hosting session published),
-so a key name is the most a reader of that directory learns about what the
-session holds. Names that fail the context-key grammar are counted but not
-listed, and anchor and store strings are sanitized and length-capped before
-they are written.
+`context_added` / `context_removed` / `context_cleared` events: `keyCount`
+(every live key), `totalBytes` (their summed sizes, saturating), `keys` — up
+to 50 `{key, size}` rows in lexicographic key order, with
+`keysTruncated: true` when more grammar-valid names exist than the cap —
+and the session's execution `anchor` and `store` kind, each omitted when the
+session records none. **Key names and sizes are written to this file; key
+content and hashes never are.** The file lands in a directory outside the
+session store (wherever the hosting session published), so a key name is the
+most a reader of that directory learns about what the session holds. Names
+that fail the context-key grammar are counted in `keyCount` and `totalBytes`
+but never listed in `keys` (so `keyCount` can exceed the list length with
+`keysTruncated` still false), and anchor and store strings are sanitized and
+length-capped before they are written.
 
 ## Lifecycle Metadata Surface
 
