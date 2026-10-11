@@ -2048,14 +2048,14 @@ mod tests {
     #[test]
     fn session_tab_wraps_a_long_store_path_instead_of_cutting_it() {
         let tail = "sessions-end-marker";
-        let base = format!("/Users/someone/{}/{tail}", "deep-directory/".repeat(8));
+        let base = format!("/srv/koto/{}/{tail}", "deep-directory/".repeat(8));
         let mut snap = snapshot(vec![]);
         snap.facts.store = Some((sanitize("local"), sanitize(&base)));
         let (buffer, _) = draw(loaded(snap, 0, text("", false)));
         let rows = pane_rows(&buffer);
         let start = rows
             .iter()
-            .position(|r| r.starts_with("Store origin: local /Users/someone/"))
+            .position(|r| r.starts_with("Store origin: local /srv/koto/"))
             .expect("store row");
         // Rejoin the continuation rows (indented) and compare to the value.
         let mut joined = rows[start].trim_end().to_string();
@@ -2076,12 +2076,12 @@ mod tests {
 
     #[test]
     fn wrap_fact_breaks_a_path_after_a_slash_not_mid_segment() {
-        let value = "local /Users/danielgazineu/koto-session-view-demo/sessions";
+        let value = "local /srv/koto/workspaces/release-pipeline-demo-store/sessions";
         let rows = wrap_fact("Store origin", value, 70);
         assert_eq!(
             rows,
             vec![
-                "Store origin: local /Users/danielgazineu/koto-session-view-demo/".to_string(),
+                "Store origin: local /srv/koto/workspaces/release-pipeline-demo-store/".to_string(),
                 "  sessions".to_string(),
             ]
         );
