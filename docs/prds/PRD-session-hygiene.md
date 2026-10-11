@@ -14,8 +14,9 @@ goals: |
   session something still needs, and learn how a finished session ended
   after koto removed it. The run journal and migrated markers have bounded,
   stated retention that loses nothing a reader or a live host is owed.
-upstream: docs/briefs/BRIEF-session-hygiene.md
 source_issue: 308
+absorbed:
+  - docs/briefs/BRIEF-session-hygiene.md
 ---
 
 # PRD: session-hygiene
@@ -23,6 +24,27 @@ source_issue: 308
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-session-hygiene](docs/briefs/BRIEF-session-hygiene.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+The feature was framed before these requirements existed. koto's session
+store had become where every kind of state lives (workflow runs, skill
+sessions kept for a later run, coordinator records, test fixtures), and
+nothing could find that state by where it ran, clear it as a set, or tell a
+session that finished and was removed from one that was lost; the run journal
+and the bucket's migrated markers only grew. The framed outcome: an operator,
+a teardown or an agent manages the store rather than watching it accumulate.
+They find what a piece of work left without reading session files, clear it
+without risking a session something still needs, know what they'll remove
+before they remove it, and never have to guess whether a missing session
+finished; the journal's readers keep reading it whole while it stays bounded.
+The framing fixed the boundary this PRD's requirements and Out of Scope
+operationalize: no new journal record kinds, no change to which terminals koto
+removes, no retention for the request store or decider ledger, nothing on
+another host, and the pre-import bucket listing left to its own issue unless
+the design finds it covered.
 
 ## Problem Statement
 
@@ -94,7 +116,7 @@ The store can't be managed at that size:
 
 ## User Stories
 
-These carry the BRIEF's journeys forward at requirements altitude.
+These carry the framing's journeys forward at requirements altitude.
 
 1. As a coordinator's teardown, I want to list the sessions whose execution
    directory is under my worker's instance (workflow runs and test fixtures
