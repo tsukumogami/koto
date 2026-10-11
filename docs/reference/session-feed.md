@@ -2238,7 +2238,12 @@ Top level:
 | `contentOmittedCount` | integer | With `keys` | Keys past the preview ceiling (1,000) whose content was not read. |
 | `unlistedKeys` | integer | With `keys` | Keys past the metadata ceiling (100,000) not listed at all. |
 
-An absent optional fact is omitted, never `null`: absence is data.
+An absent optional fact is omitted, never `null`: absence is data. Field
+casing is mixed on purpose: the session facts reuse the snake_case names
+`koto status` and the state-file header already use (`current_state`,
+`created_at`), while the fields this mode adds for its own bookkeeping
+(`contentOmitted`, `contentOmittedCount`, `unlistedKeys`) use camelCase,
+matching the native `/workflows` file. Match each name exactly as listed.
 
 Each `keys` entry:
 
