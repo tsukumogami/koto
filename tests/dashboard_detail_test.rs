@@ -434,7 +434,7 @@ fn detail_leaves_the_feed_and_the_verb_list_untouched() {
         .skip_while(|l| !l.starts_with("Commands:"))
         .skip(1)
         .take_while(|l| l.starts_with("  "))
-        .filter_map(|l| l.trim().split_whitespace().next())
+        .filter_map(|l| l.split_whitespace().next())
         .collect();
     assert_eq!(
         verbs,
