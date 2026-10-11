@@ -75,6 +75,27 @@
     "sessionId": "11111111-2222-4333-8444-555555555555",
     "workflow": "impl-feature",
     "currentState": "verify",
-    "contractVersion": 2
+    "contractVersion": 3,
+    "holdings": {
+      "keyCount": 3,
+      "totalBytes": 5160,
+      "keys": [
+        {
+          "key": "notes.md",
+          "size": 64
+        },
+        {
+          "key": "research/long.md",
+          "size": 1000
+        },
+        {
+          "key": "data/blob.bin",
+          "size": 4096
+        }
+      ],
+      "keysTruncated": false,
+      "anchor": "/srv/checkout",
+      "store": "local"
+    }
   }
 }
