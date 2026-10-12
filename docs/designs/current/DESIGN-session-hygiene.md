@@ -252,8 +252,10 @@ would keep every finished session of the most common template.
 
 **Chosen: a finished record written before koto removes a session itself.**
 One JSON file per name at `<sessions base>/.finished/<name>.json`, written by
-the terminal tick and by the parent sweep, read by `koto status`, deleted when
-a session of that name is created, and removed by the prune.
+the terminal tick and by the parent sweep, read by `koto status`, and deleted
+when a session of that name is created or moved to it, when the removal it
+was written for fails, when a person removes a session a crash left one
+beside, or by the prune.
 
 *Alternative: stop removing success terminals and let the prune reclaim
 them.* `koto status` would answer from the session itself, with its full
@@ -291,9 +293,11 @@ shrunk file whose prefix no longer matches. That is the failure the readers'
 rule forbids.
 
 *Alternative: timestamp names (`_run_journal.20261011T234436Z.jsonl`).*
-Rejected: names would order by the host clock, which can step backwards. A sequence one past the highest existing rotated file orders
-by construction. It restarts at 1 only when no rotated file remains, and then
-there is nothing to order against.
+Rejected: names would order by the host clock, which can step backwards. A
+sequence one past the highest existing rotated file orders by construction.
+Retention always keeps the newest rotated file, so the sequence never
+restarts on its own; it restarts at 1 only if someone deletes every rotated
+file, and then there is nothing to order against.
 
 *Alternative: shift names (`.1` becomes `.2`, logrotate style).* Rejected: a
 rotation would rename every rotated file, so a reader holding a name would
@@ -316,9 +320,9 @@ last.**
 
 Removal deletes the old copy along with the marker, so the newer session has
 to exist, hold everything the old copy holds, and not have moved on again
-before anything goes. The present target is required on both branches. Age past the bound is the default evidence that
-the old host is gone; `--source-retired` lets a caller who knows sooner say
-so.
+before anything goes. The present target is required on both branches.
+Age past the bound is the default evidence that the old host is gone;
+`--source-retired` lets a caller who knows sooner say so.
 
 *Alternative: remove a marker whenever its target is present and not
 migrated away, with no caller statement.* Rejected: the marker is what stops
@@ -612,7 +616,8 @@ the old host, or retire it, before removing its markers.
 - Reader: `handle_status`. When `backend.exists(name)` is false and a record
   reads, it exits 0 with `name`, `current_state`, `is_terminal: true`,
   `result`, `removed: true`, `finished_at`, `session_id` and
-  `execution_dir`. A kept terminal session's answer already uses the first
+  `execution_dir`, plus `result_truncated: true` when the record kept only
+  the result's status and summary. A kept terminal session's answer already uses the first
   four with the same meanings (R14). With no record, it answers `not found`,
   exit 2, as today.
 - Contents: the record keeps the session's whole result, including any
@@ -732,7 +737,10 @@ failure mode is why rotation is off by default (below).
    end protects only the newer ones. A position matching no file protects
    nothing and is reported.
 3. Remove each rotated file whose mtime is older than
-   `run_journal.retain_days` and that no position protects.
+   `run_journal.retain_days` and that no position protects, except the
+   newest rotated file, which is always kept so the sequence never restarts
+   and name order stays rotation order. A retention bound therefore leaves
+   at least one rotated file behind, however old.
 
 Retention reads file names, `stat` metadata and position files, never a
 journal record (R21, D2).
@@ -767,8 +775,9 @@ prune --migrated-from ─ list prefix ─ GET markers ─ target status ─▶ t
 
 ## Implementation Approach
 
-The work lands as five pull requests, in this order. The listing comes first
-because the prune is built on its inspection helper.
+The work lands as five pull requests, in this order, and a sixth that
+follows the finished records. The listing comes first because the prune is
+built on its inspection helper.
 
 1. **Listing.** `session_inventory.rs`, `SessionInfo`'s two fields,
    `--execution-dir` and `--state`, the koto-user skill's command reference,
@@ -792,6 +801,10 @@ because the prune is built on its inspection helper.
    `--migrated-from` and `--source-retired`, `session.cloud.marker_retain_days`,
    and fake-S3 tests (R25 to R29). Depends on 2. It shares `src/config` with
    4, so it follows 4 to avoid a conflict there.
+6. **Finished-record clean-up.** The record deletions by
+   `koto session cleanup`, `koto cancel --cleanup`, a failed removal and
+   `relocate`, and the docs on the removed answer's fields and the record's
+   contents (R15). Follows 3.
 
 Each pull request carries its verbs' end-to-end tests, run against a scratch
 HOME or `KOTO_SESSIONS_BASE`, with cloud behavior on koto's fake S3 harness

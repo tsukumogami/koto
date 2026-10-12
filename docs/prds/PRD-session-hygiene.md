@@ -217,6 +217,7 @@ These carry the framing's journeys forward at requirements altitude.
   only in the bucket is never considered.
 - **R11.** A prune leaves the run journal byte-identical, and each pruned
   session's `run-journal.json` sidecar goes with its directory.
+
 ### Terminal signal
 
 - **R12.** When koto removes a finished session itself (at its own terminal
@@ -236,8 +237,12 @@ These carry the framing's journeys forward at requirements altitude.
 - **R14.** Those fields have the same names and meanings as in the answer
   `koto status` already gives a kept terminal session, so a caller reads
   both the same way.
-- **R15.** Creating a session under a name deletes that name's finished
-  record. While a session exists, `koto status` reports the session and
+- **R15.** Creating a session under a name, or moving a session to it,
+  deletes that name's finished record. A removal that fails after its record
+  was written deletes the record again. When `koto session cleanup` or
+  `koto cancel --cleanup` removes a session, it deletes a record a crash left
+  beside it; `koto session cleanup` on a name koto already removed finds no
+  session and keeps the record. While a session exists, `koto status` reports the session and
   ignores any record. `koto session list` and `koto workflows` never list a
   finished record as a session.
 - **R16.** The prune considers finished records too, under the same
@@ -403,6 +408,9 @@ Terminal signal:
   record, and `koto status` answers from the session. `koto cancel
   --cleanup` and `koto session cleanup` write no record either: an
   operator's removal is not koto's.
+- [ ] A record planted beside a kept session is deleted when
+  `koto session cleanup` or `koto cancel --cleanup` removes the session, and
+  `koto session cleanup` on a name koto already removed keeps its record.
 - [ ] A kept terminal session's `koto status` and the removed-session answer
   for an identical run carry equal `current_state`, `is_terminal` and
   `result` values.
