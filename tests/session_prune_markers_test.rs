@@ -692,6 +692,7 @@ fn a_target_log_behind_or_apart_from_the_source_or_an_unreadable_source_keeps_th
         "short",
         "torn-source",
         "no-log",
+        "grown",
         "untouched",
     ];
     for name in all_names {
@@ -731,6 +732,12 @@ fn a_target_log_behind_or_apart_from_the_source_or_an_unreadable_source_keeps_th
     // `no-log`'s source lost its state file to a removal that stopped part
     // way; the rest of the copy and the marker are still there.
     h.s3.remove(&log_key(&h.a, "no-log"));
+    // `grown`'s target ran on after the import: three more events, so its
+    // log still begins with the source's and is longer.
+    rewrite_log(&h, &log_key(&h.b, "grown"), |lines| {
+        with_more_events(lines, 3)
+    });
+    let no_log_objects = h.s3.keys_under(&h.source("no-log")).len();
     let kept = ["ahead", "tied", "altered", "short", "torn-source"];
     let before: BTreeMap<_, _> = kept
         .iter()
@@ -753,13 +760,14 @@ fn a_target_log_behind_or_apart_from_the_source_or_an_unreadable_source_keeps_th
             "{name}: {e:#}"
         );
     }
-    for name in ["no-log", "untouched"] {
+    for name in ["no-log", "grown", "untouched"] {
         assert_eq!(all[name]["target_status"], "present", "{name}");
         assert_eq!(all[name]["removable"], true, "{name}");
     }
+    assert_eq!(all["no-log"]["objects"], no_log_objects);
 
     let out = h.prune_ok(&["--apply", "--source-retired"]);
-    assert_eq!(names(&out["removed"]), vec!["no-log", "untouched"]);
+    assert_eq!(names(&out["removed"]), vec!["grown", "no-log", "untouched"]);
     for name in kept {
         assert_eq!(source_objects(&h, name), before[name], "{name}");
     }

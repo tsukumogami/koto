@@ -110,7 +110,8 @@ pub enum TargetStatus {
     /// The header names the marker's session id, but the copy can't be shown
     /// complete: the target's log doesn't read to the end, ends before the
     /// source's, holds a different event at some seq the source's reaches,
-    /// or the source's own log can't be read. The string says which.
+    /// or the source copy can't be listed or its log can't be read. The
+    /// string says which.
     Unverified(String),
     /// The listing or the read failed, or the header couldn't be read; the
     /// string says which.
@@ -1919,9 +1920,12 @@ struct SourceLog {
 /// Refuses (with the reason) a log this build can't carry intact: not
 /// UTF-8, no header, a `schema_version` other than 1, an event line that
 /// doesn't parse, or a gap in the sequence numbers. Blank lines are
-/// dropped. The marker prune reads both a migrated source's log and its
-/// target's with it, so "reads to the end" means the same there as here. The `template_hash` is checked by the caller, after it has
+/// dropped. The `template_hash` is checked by the caller, after it has
 /// refused a child session, whose hash may legitimately be empty.
+///
+/// The marker prune reads both a migrated source's log and its target's
+/// with it too, so "reads to the end" means the same there as here; the
+/// name and [`SourceLog`] say "source" because the import came first.
 fn parse_source_log(bytes: &[u8]) -> Result<SourceLog, String> {
     use crate::engine::types::{Event, StateFileHeader};
 

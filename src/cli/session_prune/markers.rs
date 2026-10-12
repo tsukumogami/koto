@@ -68,8 +68,8 @@ pub(super) struct MarkerEntry {
     pub target_status: Option<String>,
     pub removable: bool,
     /// How many objects the removal deletes under the source copy's prefix,
-    /// the marker included; `None` when the copy couldn't be listed or the
-    /// marker couldn't be read.
+    /// the marker included; `None` when the marker couldn't be read, or the
+    /// copy couldn't be listed or its log couldn't be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objects: Option<usize>,
     /// What decided it: the target status when it isn't `present`,
