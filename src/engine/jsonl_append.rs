@@ -213,6 +213,31 @@ pub fn append_bounded_lines_no_follow_within(
     Ok(flush)
 }
 
+/// A bounded lock wait ran out with the lock still held elsewhere. Callers
+/// tell it from other failures with [`is_lock_timeout`].
+#[derive(Debug)]
+pub struct LockTimeout {
+    waited: std::time::Duration,
+}
+
+impl std::fmt::Display for LockTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the lock is held by another writer (waited {} ms)",
+            self.waited.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for LockTimeout {}
+
+/// Whether `e` failed because a bounded lock wait ran out ([`LockTimeout`]),
+/// whatever context was added to it since.
+pub fn is_lock_timeout(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| cause.is::<LockTimeout>())
+}
+
 /// Take an exclusive `flock` on `fd`: blocking when `wait` is `None`,
 /// otherwise tried without blocking until `wait` has passed since `started`.
 /// A caller that may lock more than one file in turn passes the same
@@ -246,10 +271,7 @@ fn lock_exclusive(
         }
         let now = Instant::now();
         if now >= deadline {
-            anyhow::bail!(
-                "the lock is held by another writer (waited {} ms)",
-                wait.as_millis()
-            );
+            return Err(LockTimeout { waited: wait }.into());
         }
         std::thread::sleep(STEP.min(deadline - now));
     }
@@ -294,7 +316,7 @@ const REOPEN_ATTEMPTS: usize = 8;
 /// The bound covers waiting for locks only: once a lock is held, the work
 /// under it (`under_lock`, the writes, the flush) is never timed or cut
 /// short. A file moved away while this call waits is opened again for as
-/// long as the bound lasts, and at least [`REOPEN_ATTEMPTS`] times; without
+/// long as the bound lasts, and at least `REOPEN_ATTEMPTS` times; without
 /// a bound, exactly that many.
 ///
 /// Returns whether it flushed. No lines is a no-op that opens nothing, so

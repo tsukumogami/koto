@@ -150,8 +150,10 @@
 //! Every writer waits for that lock at most [`JOURNAL_LOCK_WAIT`] (five
 //! seconds; a `koto status` response, 30 milliseconds), then skips its
 //! batch with the same one warning, so a process that stopped while holding
-//! the lock can't hang a command. The wait covers taking the lock only:
-//! nothing done while holding it is cut short.
+//! the lock can't hang a command. Once one write has given up, the
+//! process's later writes try the lock once without waiting, so a held lock
+//! costs a command one wait however many batches it writes. The wait covers
+//! taking the lock only: nothing done while holding it is cut short.
 //!
 //! A write cut short (a crash, a full disk) can still leave a partial last
 //! line: the next writer sees, under the lock, that the file doesn't end in
@@ -348,14 +350,35 @@ fn warn_once(message: &str) {
     }
 }
 
-// In unit tests the cap and the warn-once flag are per thread, so a test
-// sees exactly the warnings its own commands caused. Unit tests reach a
+/// Set once a journal write in this process has given up waiting for the
+/// lock. A lock still held after a full wait most likely belongs to a
+/// writer that stopped, so every later write in the process tries the lock
+/// once, without waiting, and skips its batch (with the warning already
+/// printed) if it is still held. A held lock then costs a command one wait,
+/// not one per batch.
+#[cfg(not(test))]
+static GAVE_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(not(test))]
+fn gave_up() -> bool {
+    GAVE_UP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+fn give_up() {
+    GAVE_UP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+// In unit tests the cap, the warn-once flag and the gave-up flag are per
+// thread, so a test sees exactly the warnings and waits its own commands
+// caused. Unit tests reach a
 // journal only through a store built with
 // `LocalBackend::with_base_dir_and_journal` on a temporary directory.
 #[cfg(test)]
 thread_local! {
     static TEST_MAX_LINE: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_LINE_BYTES) };
     static TEST_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_GAVE_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_WARNINGS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// (batches written, batches flushed to disk) on this thread.
@@ -404,11 +427,22 @@ fn warn_once(message: &str) {
     }
 }
 
-/// Reset this thread's line cap and warnings.
+#[cfg(test)]
+fn gave_up() -> bool {
+    TEST_GAVE_UP.with(|g| g.get())
+}
+
+#[cfg(test)]
+fn give_up() {
+    TEST_GAVE_UP.with(|g| g.set(true));
+}
+
+/// Reset this thread's line cap, warnings and lock-wait state.
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
     TEST_MAX_LINE.with(|c| c.set(MAX_LINE_BYTES));
     TEST_WARNED.with(|w| w.set(false));
+    TEST_GAVE_UP.with(|g| g.set(false));
     TEST_WARNINGS.with(|w| w.borrow_mut().clear());
     TEST_BATCHES.with(|c| c.set((0, 0)));
     TEST_LOCK_WAIT.with(|c| c.set(JOURNAL_LOCK_WAIT));
@@ -435,7 +469,8 @@ pub(crate) fn warnings_for_test() -> Vec<String> {
 /// other: the batch is skipped with the one warning and this returns
 /// normally, so a writer that stopped while holding the lock can't hang the
 /// command. That includes the terminal tick, whose cleanup runs after its
-/// `terminal` record.
+/// `terminal` record. After one write has given up, later writes in the
+/// process don't wait at all (see [`GAVE_UP`]).
 ///
 /// The batch is flushed to disk only when it holds an identity record
 /// ([`IDENTITY_KINDS`]). Records relayed from check, decider and override
@@ -453,7 +488,8 @@ fn write(root: &Path, records: &[Record]) {
 /// is skipped, unless the caller passes a tighter bound. Generous enough
 /// that ordinary contention between koto commands never skips a record;
 /// short enough that a writer stopped while holding the lock can't hang a
-/// command for long. Not configurable.
+/// command for long. A process waits it out once: after a write gives up,
+/// later writes don't wait (see [`GAVE_UP`]). Not configurable.
 ///
 /// The bound covers acquiring the lock only. Once a writer holds the lock,
 /// what it does under it (the size check, a rotation's flush and rename,
@@ -492,7 +528,8 @@ fn journal_lock_wait() -> std::time::Duration {
     TEST_LOCK_WAIT.with(|c| c.get())
 }
 
-/// [`write`], waiting at most `lock_wait` for the journal's lock. A lock
+/// [`write`], waiting at most `lock_wait` for the journal's lock, or not at
+/// all once an earlier write in this process has given up on it. A lock
 /// still held after that is a failed write: one warning, and the batch is
 /// skipped.
 fn write_within(root: &Path, records: &[Record], lock_wait: std::time::Duration) {
@@ -522,6 +559,15 @@ fn write_within(root: &Path, records: &[Record], lock_wait: std::time::Duration)
         lines.push(line);
     }
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    // A zero wait still tries the lock once, so a lock that was freed in
+    // the meantime is taken and the batch written. Only the waiting is
+    // dropped: a writer that takes the lock does everything it would have
+    // under it, a rotation included.
+    let lock_wait = if gave_up() {
+        std::time::Duration::ZERO
+    } else {
+        lock_wait
+    };
     // The batch goes to one file whole: a rotation happens before it or
     // after it, never between two of its lines. The lock wait covers the
     // whole append, the fresh file's lock after a rotation included, but
@@ -543,7 +589,12 @@ fn write_within(root: &Path, records: &[Record], lock_wait: std::time::Duration)
                 count_batch(flushed);
             }
         }
-        Err(e) => warn_once(&format!("{}: {}", path.display(), e.root_cause())),
+        Err(e) => {
+            if crate::engine::jsonl_append::is_lock_timeout(&e) {
+                give_up();
+            }
+            warn_once(&format!("{}: {}", path.display(), e.root_cause()))
+        }
     }
 }
 

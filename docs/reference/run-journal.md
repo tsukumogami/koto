@@ -660,9 +660,13 @@ configurable.
 
 The wait covers taking the lock, and nothing else:
 
-- A command writes one batch per commit, and each waits on its own. A
-  command that writes several batches while the lock stays held can take
-  up to five seconds for each.
+- A command waits out a held lock once. A command writes one batch per
+  commit; after one of them has waited the full five seconds and given
+  up, the command's later batches try the lock once, without waiting, and
+  are skipped too if it's still held (the warning isn't repeated). A
+  command that writes several batches while the lock stays held takes
+  about five seconds, not five per batch. A later batch that finds the
+  lock free is written as usual.
 - A writer that holds the lock finishes what it does under it however
   long that takes. A rotation flushes the file it moves to disk and then
   runs retention, both under the lock (see [Rotation](#rotation)); on a

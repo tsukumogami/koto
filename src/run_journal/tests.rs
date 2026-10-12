@@ -1884,6 +1884,94 @@ fn a_status_response_takes_the_tighter_of_its_wait_and_the_journal_bound() {
     );
 }
 
+/// A held lock costs a process one wait: once a write has given up on it,
+/// the next write in the same process tries the lock once and returns at
+/// once, and the two skipped batches print one warning between them. With
+/// the lock free again, a later write takes it on that one try and is
+/// written.
+#[cfg(unix)]
+#[test]
+fn after_one_write_gives_up_later_writes_in_the_process_do_not_wait() {
+    use std::time::{Duration, Instant};
+    let f = session_in_a();
+    let journal = f.home.join(JOURNAL_FILE);
+    let before = std::fs::read_to_string(&journal).unwrap();
+    let bound = Duration::from_millis(200);
+    set_lock_wait_for_test(bound);
+    let holder = hold_journal_lock(&journal);
+    let next = || {
+        let started = Instant::now();
+        response(
+            Some(&f.home),
+            &f.backend,
+            "wf",
+            "a",
+            ResponseSource::Next,
+            "d",
+            None,
+        );
+        started.elapsed()
+    };
+
+    let first = next();
+    assert!(first >= bound, "{first:?}");
+    assert!(gave_up());
+    let second = next();
+    assert!(second < bound / 4, "{second:?}");
+    drop(holder);
+
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
+    let warnings = warnings_for_test();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("held by another writer"),
+        "{warnings:?}"
+    );
+
+    // The lock is free: the single try takes it.
+    let third = next();
+    assert!(third < bound / 4, "{third:?}");
+    assert_eq!(response_records(&f.journal()).len(), 1);
+    assert_eq!(warnings_for_test().len(), 1);
+}
+
+/// Only a lock wait that ran out sets the process to stop waiting: a write
+/// that failed for another reason (a record over the line cap) leaves the
+/// next write its full wait.
+#[cfg(unix)]
+#[test]
+fn a_write_that_fails_for_another_reason_keeps_the_wait() {
+    let f = session_in_a();
+    set_max_line_for_test(16);
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Next,
+        "d",
+        None,
+    );
+    assert_eq!(warnings_for_test().len(), 1);
+    assert!(!gave_up());
+
+    // A symlink at the journal's path fails the open, not the lock.
+    set_max_line_for_test(MAX_LINE_BYTES);
+    let journal = f.home.join(JOURNAL_FILE);
+    std::fs::remove_file(&journal).unwrap();
+    std::os::unix::fs::symlink(f.home.join("elsewhere"), &journal).unwrap();
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Next,
+        "d",
+        None,
+    );
+    assert!(!gave_up());
+}
+
 /// The terminal tick's record is bounded like the rest: with the lock held
 /// past the bound, `terminal` returns after about the bound with no record
 /// and one warning, so the tick's cleanup that follows it still runs.

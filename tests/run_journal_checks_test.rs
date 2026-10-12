@@ -1831,6 +1831,59 @@ fn koto_next_exits_normally_while_the_journal_lock_is_held_past_the_bound() {
     assert_eq!(env.responses("held").len(), 1);
 }
 
+/// A held lock costs a command one wait, not one per batch: a `koto next`
+/// that chains through four states writes five batches with the lock free,
+/// and with the lock held it gives up on the first after the bound and
+/// skips the other four without waiting. It finishes in about one bound,
+/// with the free run's exit code and standard output and one warning.
+#[test]
+fn a_chained_koto_next_waits_out_a_held_lock_once_not_once_per_batch() {
+    use std::time::Duration;
+    if !seams_available() {
+        return;
+    }
+    // Long enough that one wait per batch can't pass for one wait plus the
+    // command's own run time.
+    let bound = Duration::from_secs(1);
+    let env = Env::new();
+    let dir = twin_sessions(&env, "next-chained-held");
+    let go = ["--with-data", r#"{"go":"yes"}"#];
+    let lines = || {
+        std::fs::read_to_string(env.journal_path())
+            .unwrap()
+            .lines()
+            .count()
+    };
+    let before_free = lines();
+    let free = env.ok_in(&dir, &[&["next", "free"][..], &go].concat());
+    let batches = lines() - before_free;
+    assert_eq!(batches, 5, "four state entries and one response");
+    let journal_before = std::fs::read_to_string(env.journal_path()).unwrap();
+
+    let holder = hold_journal_lock(&env);
+    let started = std::time::Instant::now();
+    let child = bounded_cmd(&env, &dir, &[&["next", "held"][..], &go].concat())
+        .env(LOCK_WAIT_ENV, bound.as_millis().to_string())
+        .spawn()
+        .unwrap();
+    let (held, took) = finish(child, started, "the chained koto next");
+    drop(holder);
+
+    assert_eq!(held.code, free.code, "{}", held.stderr);
+    assert_eq!(held.code, Some(0));
+    assert_eq!(held.stdout, free.stdout);
+    assert_eq!(held.journal_warnings(), 1, "{}", held.stderr);
+    assert!(took >= bound, "took {took:?}");
+    assert!(
+        took < bound * 2,
+        "took {took:?}: more than one wait for {batches} batches"
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.journal_path()).unwrap(),
+        journal_before
+    );
+}
+
 /// A terminal tick with the journal's lock held past the bound still does
 /// everything after its `terminal` record: it exits with the free tick's
 /// code and output, appends the terminal index entry, and removes the
