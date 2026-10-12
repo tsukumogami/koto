@@ -184,6 +184,11 @@ fn rotate_locked(root: &Path, path: &Path, file: &std::fs::File, size: u64) -> a
         let mut f = file;
         f.write_all(b"\n")?;
     }
+    // Retention ages a rotated file by its modification time. Stamp it now so
+    // the age counts from the rotation, not from the last append: a journal
+    // left idle past the retention bound must not have its rotated file
+    // removed the moment it rotates.
+    file.set_modified(SystemTime::now())?;
 
     let next = root.join(rotated_name(next_sequence(root)?));
     std::fs::hard_link(path, &next)?;
@@ -359,6 +364,10 @@ fn retain(root: &Path, s: &Settings) {
         }
     }
     let keep_for = Duration::from_secs(s.retain_days.saturating_mul(86_400));
+    // The newest rotated file is never removed: the next number is one past
+    // the highest that exists, so keeping it is what keeps numbering from
+    // restarting, and with it the rule that name order is rotation order.
+    let needed_from = needed_from.min(files.len() - 1);
     for (i, (path, meta)) in files.iter().enumerate() {
         if i >= needed_from {
             break;
@@ -527,6 +536,49 @@ mod tests {
         append(root, &["{\"n\":3}"], MAX).unwrap();
         // File 1 is gone; file 2 is inside the bound; file 3 is new.
         assert_eq!(rotated(root), vec![rotated_name(2), rotated_name(3)]);
+    }
+
+    #[test]
+    fn the_newest_rotated_file_is_kept_so_numbering_never_restarts() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        set_settings_for_test(Settings {
+            rotate_bytes: 5,
+            retain_days: 0,
+            reader_stale_days: 90,
+        });
+        for n in 0..6 {
+            append(root, &[&format!("{{\"n\":{n}}}")], MAX).unwrap();
+            if n > 0 {
+                // With a zero-day bound only the newest survives each pass.
+                assert_eq!(rotated(root), vec![rotated_name(n)]);
+            }
+        }
+    }
+
+    #[test]
+    fn an_idle_journal_keeps_its_rotated_file_when_it_finally_rotates() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        set_settings_for_test(on(5));
+        append(root, &["{\"n\":0}"], MAX).unwrap();
+        append(root, &["{\"n\":1}"], MAX).unwrap();
+        // File 1 exists; the active journal then sits idle for 40 days.
+        set_mtime_days_ago(&root.join(JOURNAL_FILE), 40);
+        set_mtime_days_ago(&root.join(rotated_name(1)), 41);
+        append(root, &["{\"n\":2}"], MAX).unwrap();
+        // File 1 is old and goes; file 2 was rotated just now, so it counts
+        // as new whatever its last append's age.
+        assert_eq!(rotated(root), vec![rotated_name(2)]);
+        let age = SystemTime::now()
+            .duration_since(
+                std::fs::metadata(root.join(rotated_name(2)))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(age < Duration::from_secs(60), "{age:?}");
     }
 
     fn write_position(root: &Path, id: &str, file: &Path, offset: u64) {

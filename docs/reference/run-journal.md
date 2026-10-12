@@ -302,9 +302,11 @@ order.
 ### Retention
 
 Rotated files are removed only during a rotation, and only when two things
-hold: the file is older than the retention bound, measured from its last
-modification (its rotation), and no recorded reader position still needs
-it. The bound is 30 days by default:
+hold: the file is older than the retention bound, measured from its rotation
+(koto stamps the file's modification time when it rotates it), and no
+recorded reader position still needs it. The newest rotated file is never
+removed, so the numbering never restarts and name order stays rotation
+order. The bound is 30 days by default:
 
 ```bash
 koto config set run_journal.retain_days 30 --user

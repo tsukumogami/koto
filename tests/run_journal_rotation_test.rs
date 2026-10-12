@@ -487,11 +487,18 @@ fn retention_reads_positions_from_the_readers_directory() {
     assert!(env.rotated().len() > before);
 
     // Without the position, a zero-day bound lets the next rotation remove
-    // every rotated file, the one it just made included.
+    // every rotated file but the newest, which is always kept so numbering
+    // never restarts.
+    let highest = env.rotated().last().cloned().unwrap();
     std::fs::remove_file(env.root().join("_run_journal.readers/parked.json")).unwrap();
     for _ in 0..4 {
         env.tick("kept");
     }
     assert!(!oldest.exists());
-    assert!(env.rotated().is_empty(), "{:?}", env.rotated());
+    let left = env.rotated();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(
+        left[0] > highest,
+        "{left:?} should be numbered past {highest:?}"
+    );
 }
