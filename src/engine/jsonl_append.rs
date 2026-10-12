@@ -5,9 +5,10 @@
 //! [`append_bounded_line`] is the append discipline the workspace-wide
 //! JSONL files share: the terminal index (`_terminal_index.jsonl`) and the
 //! decider ledger (`_decider_ledger.jsonl`). The run journal
-//! (`_run_journal.jsonl`) uses [`append_bounded_line_no_follow`], the same
+//! (`_run_journal.jsonl`) uses [`append_bounded_lines_no_follow`], the same
 //! discipline with symlinks refused, under a lock that lets it recover from
-//! a partial last line.
+//! a partial last line, for several lines at a time and with the flush to
+//! disk left to the caller.
 //!
 //! ## Atomicity
 //!
@@ -99,14 +100,41 @@ pub fn append_bounded_line_no_follow(
     line: &str,
     max: usize,
 ) -> Result<()> {
-    let len = line.len() + 1;
-    if len > max {
-        anyhow::bail!(
-            "line for {} exceeds the PIPE_BUF append bound ({} bytes > {})",
-            path.display(),
-            len,
-            max
-        );
+    append_bounded_lines_no_follow(dir, path, &[line], max, true).map(|_| ())
+}
+
+/// [`append_bounded_line_no_follow`] for several lines at once, flushed to
+/// disk only when `flush` is set.
+///
+/// The lines go out in order under one lock, each in its own `write` (so
+/// each is within `max` and atomic on its own), after the same partial-line
+/// repair. Every line is checked against `max` before `path` is opened, and
+/// one over it refuses the whole call. With `flush`, one `sync_data` follows
+/// the last line; without it the lines reach the kernel and are made
+/// durable by the next flush of the file, or by the kernel's own writeback.
+/// A process that dies after the call returns loses nothing either way.
+///
+/// Returns whether it flushed. No lines is a no-op that opens nothing.
+pub fn append_bounded_lines_no_follow(
+    dir: &Path,
+    path: &Path,
+    lines: &[&str],
+    max: usize,
+    flush: bool,
+) -> Result<bool> {
+    for line in lines {
+        let len = line.len() + 1;
+        if len > max {
+            anyhow::bail!(
+                "line for {} exceeds the PIPE_BUF append bound ({} bytes > {})",
+                path.display(),
+                len,
+                max
+            );
+        }
+    }
+    if lines.is_empty() {
+        return Ok(false);
     }
 
     if !dir.exists() {
@@ -128,9 +156,8 @@ pub fn append_bounded_line_no_follow(
         .open(path)
         .with_context(|| format!("failed to open {} for append", path.display()))?;
 
-    let mut buf = String::with_capacity(len + 1);
     #[cfg(unix)]
-    {
+    let mut repair = {
         use std::os::unix::fs::FileExt;
         use std::os::unix::io::AsRawFd;
         // SAFETY: flock on a descriptor borrowed for the call; it neither
@@ -141,17 +168,28 @@ pub fn append_bounded_line_no_follow(
         }
         let size = file.metadata().map(|m| m.len()).unwrap_or(0);
         let mut last = [0u8; 1];
-        if size > 0 && file.read_at(&mut last, size - 1).is_ok() && last[0] != b'\n' {
+        size > 0 && file.read_at(&mut last, size - 1).is_ok() && last[0] != b'\n'
+    };
+    #[cfg(not(unix))]
+    let mut repair = false;
+    let mut buf = String::with_capacity(max + 1);
+    for line in lines {
+        buf.clear();
+        // The repair newline rides with the first line, as the single-line
+        // append has always written it.
+        if std::mem::take(&mut repair) {
             buf.push('\n');
         }
+        buf.push_str(line);
+        buf.push('\n');
+        file.write_all(buf.as_bytes())
+            .with_context(|| format!("failed to append to {}", path.display()))?;
     }
-    buf.push_str(line);
-    buf.push('\n');
-    file.write_all(buf.as_bytes())
-        .with_context(|| format!("failed to append to {}", path.display()))?;
-    file.sync_data()
-        .with_context(|| format!("failed to fsync {}", path.display()))?;
-    Ok(())
+    if flush {
+        file.sync_data()
+            .with_context(|| format!("failed to fsync {}", path.display()))?;
+    }
+    Ok(flush)
 }
 
 #[cfg(test)]
@@ -231,6 +269,58 @@ mod tests {
 
         let err = append_bounded_line_no_follow(tmp.path(), &fresh, "123456789", 9).unwrap_err();
         assert!(err.to_string().contains("10 bytes > 9"), "{}", err);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_batch_writes_its_lines_in_order_after_repairing_a_partial_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("j.jsonl");
+        std::fs::write(&path, "{\"a\":1}\n{\"torn\":").unwrap();
+        let flushed = append_bounded_lines_no_follow(
+            tmp.path(),
+            &path,
+            &["{\"b\":2}", "{\"c\":3}"],
+            64,
+            false,
+        )
+        .unwrap();
+        assert!(!flushed);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"a\":1}\n{\"torn\":\n{\"b\":2}\n{\"c\":3}\n"
+        );
+        // A batch asked to flush says so.
+        assert!(append_bounded_lines_no_follow(tmp.path(), &path, &["{}"], 64, true).unwrap());
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .ends_with("{\"c\":3}\n{}\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_batch_with_a_line_over_the_bound_writes_nothing_and_no_lines_opens_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("never-made");
+        let path = dir.join("j.jsonl");
+        let err = append_bounded_lines_no_follow(&dir, &path, &["ok", "1234567890"], 10, true)
+            .unwrap_err();
+        assert!(err.to_string().contains("11 bytes > 10"), "{}", err);
+        assert!(!dir.exists());
+        assert!(!append_bounded_lines_no_follow(&dir, &path, &[], 10, true).unwrap());
+        assert!(!dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_batch_refuses_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.txt");
+        std::fs::write(&target, "untouched\n").unwrap();
+        let link = tmp.path().join("j.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(append_bounded_lines_no_follow(tmp.path(), &link, &["{}"], 64, false).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched\n");
     }
 
     #[test]

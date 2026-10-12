@@ -90,6 +90,9 @@ fn every_kind_the_reference_names_is_one_koto_writes_and_the_reverse() {
         kinds,
         [
             "cancelled",
+            "check_evaluated",
+            "check_pending",
+            "check_rule",
             "driver_seen",
             "session_started",
             "state_entered",
@@ -106,8 +109,9 @@ fn every_kind_the_reference_names_is_one_koto_writes_and_the_reverse() {
             "{REFERENCE} names the kind `{kind}`, which {SOURCE_DIR} never writes"
         );
     }
-    // Every kind the module builds a record with is in the table.
-    let built = Regex::new(r#"Record::new\(\s*"([a-z_]+)""#).unwrap();
+    // Every kind the module builds a record with is in the table: identity
+    // records through `Record::new`, relayed ones through `Relay::record`.
+    let built = Regex::new(r#"(?:Record::new|\.record)\(\s*"([a-z_]+)""#).unwrap();
     for entry in std::fs::read_dir(root().join(SOURCE_DIR)).unwrap() {
         let path = entry.unwrap().path();
         if path.ends_with("tests.rs") {
@@ -151,6 +155,65 @@ fn every_field_the_reference_names_is_one_koto_writes_and_the_reverse() {
         assert!(
             text.contains(&format!("| `{field}` |")),
             "{REFERENCE} doesn't describe the envelope field `{field}`"
+        );
+    }
+}
+
+/// Each kind's own fields, from the second column of the kinds table.
+fn documented_kind_fields(text: &str) -> std::collections::BTreeMap<String, BTreeSet<String>> {
+    let section = text.split("### Record kinds").nth(1).unwrap();
+    let row = Regex::new(r"^\| `([a-z_]+)` \| ([^|]*) \|").unwrap();
+    section
+        .lines()
+        .skip_while(|l| !l.starts_with('|'))
+        .take_while(|l| l.starts_with('|'))
+        .filter_map(|l| row.captures(l))
+        .map(|c| {
+            let fields = spans(&c[2]).into_iter().collect();
+            (c[1].to_string(), fields)
+        })
+        .collect()
+}
+
+/// The check kinds' fields are listed in the kinds table, each has a row
+/// in its kind's field table, and every check field in the module is one
+/// the table lists.
+#[test]
+fn every_check_kind_lists_its_fields_and_describes_each() {
+    let text = reference();
+    let by_kind = documented_kind_fields(&text);
+    for kind in ["check_evaluated", "check_rule", "check_pending"] {
+        let fields = &by_kind[kind];
+        for common in ["koto.seq", "koto.visit.seq"] {
+            assert!(fields.contains(common), "{kind} doesn't list {common}");
+        }
+        let section = text
+            .split(&format!("### `{kind}`"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{REFERENCE} has no `{kind}` section"));
+        let section = section.split("\n### ").next().unwrap();
+        for field in fields {
+            if field == "koto.seq" || field == "koto.visit.seq" {
+                assert!(
+                    text.contains(&format!("| `{field}` | integer |")),
+                    "{field}"
+                );
+                continue;
+            }
+            assert!(
+                section.contains(&format!("| `{field}` |")),
+                "the `{kind}` section doesn't describe {field}"
+            );
+        }
+    }
+    let listed: BTreeSet<&String> = by_kind.values().flatten().collect();
+    for literal in source_literals()
+        .iter()
+        .filter(|l| l.starts_with("koto.") && !l.ends_with(".id"))
+    {
+        assert!(
+            listed.contains(literal),
+            "{SOURCE_DIR} writes `{literal}`, which no kind in the kinds table lists"
         );
     }
 }

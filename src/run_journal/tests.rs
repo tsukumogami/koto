@@ -650,3 +650,702 @@ fn a_lost_sidecar_records_the_driver_again_and_keeps_an_unresolved_run_id_uncach
     assert_eq!(cached.run_id.as_deref(), Some("gone-id"));
     assert_eq!(cached.driver.as_deref(), Some("driver-a"));
 }
+
+// ----- Check records -----
+
+use crate::engine::types::{CheckEventFields, PollRecord, RuleCount, RuleCounts};
+use std::collections::BTreeSet;
+
+const RELAY_FIELDS: &[&str] = &[
+    "kind",
+    "v",
+    "at",
+    "session",
+    "koto.session.id",
+    "koto.run.id",
+    "koto.seq",
+    "koto.visit.seq",
+];
+
+/// The fields a check kind may carry beyond [`RELAY_FIELDS`].
+fn check_kind_fields(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "check_evaluated" => &[
+            "koto.state",
+            "koto.check",
+            "koto.check.outcome",
+            "koto.attempt",
+            "koto.visit_attempt",
+            "koto.check.rule_count",
+            "koto.check.rule_counts_truncated",
+            "koto.check.duration_ms",
+            "koto.poll.status",
+            "koto.check.unanswered_count",
+            "koto.check.error",
+        ],
+        "check_rule" => &[
+            "koto.state",
+            "koto.check",
+            "koto.attempt",
+            "koto.visit_attempt",
+            "koto.rule.id",
+            "koto.rule.visit_count",
+            "koto.rule.session_count",
+        ],
+        "check_pending" => &[
+            "koto.state",
+            "koto.check",
+            "koto.poll.status",
+            "koto.poll.evaluations",
+            "koto.poll.elapsed_secs",
+        ],
+        other => panic!("not a check kind: {other}"),
+    }
+}
+
+/// The check records in `j`, each checked to carry `v` 1, both sequence
+/// numbers, and only its kind's fields.
+fn check_records(j: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    j.iter()
+        .filter(|r| r["kind"].as_str().unwrap().starts_with("check_"))
+        .map(|r| {
+            let kind = r["kind"].as_str().unwrap();
+            let allowed: BTreeSet<&str> = RELAY_FIELDS
+                .iter()
+                .chain(check_kind_fields(kind))
+                .copied()
+                .collect();
+            for (key, value) in r.as_object().unwrap() {
+                assert!(allowed.contains(key.as_str()), "{kind} carries {key}: {r}");
+                assert!(!value.is_null() && value != "", "{key}: {r}");
+            }
+            assert_eq!(r["v"], 1);
+            assert!(r["koto.seq"].is_u64(), "{r}");
+            assert!(r["koto.visit.seq"].is_u64(), "{r}");
+            r.clone()
+        })
+        .collect()
+}
+
+fn counts(rules: &[(&str, u64, u64)]) -> RuleCounts {
+    RuleCounts(
+        rules
+            .iter()
+            .map(|(id, visit, session)| {
+                (
+                    id.to_string(),
+                    RuleCount {
+                        visit: *visit,
+                        session: *session,
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
+fn stamped(attempt: u64, visit_attempt: u64, rules: Option<RuleCounts>) -> CheckEventFields {
+    CheckEventFields {
+        attempt: Some(attempt),
+        visit_attempt: Some(visit_attempt),
+        rule_counts: rules,
+        duration_ms: Some(12),
+        ..CheckEventFields::default()
+    }
+}
+
+fn gate_event(
+    state: &str,
+    gate: &str,
+    outcome: &str,
+    output: serde_json::Value,
+    check: CheckEventFields,
+    poll: Option<PollRecord>,
+) -> EventPayload {
+    EventPayload::GateEvaluated {
+        state: state.into(),
+        gate: gate.into(),
+        output,
+        outcome: outcome.into(),
+        timestamp: crate::engine::types::now_iso8601(),
+        check,
+        streams: None,
+        poll,
+    }
+}
+
+fn action_event(exit_code: i32, check: CheckEventFields) -> EventPayload {
+    EventPayload::DefaultActionExecuted {
+        state: "a".into(),
+        command: "PLANTED-COMMAND --flag".into(),
+        exit_code,
+        stdout: "PLANTED-STDOUT".into(),
+        stderr: String::new(),
+        truncated: false,
+        check,
+    }
+}
+
+fn poll(status: &str, evaluations: u64, elapsed_secs: u64) -> PollRecord {
+    PollRecord {
+        status: status.into(),
+        evaluations,
+        since: "2026-01-01T00:00:00Z".into(),
+        elapsed_secs,
+    }
+}
+
+fn command_output(exit_code: i64) -> serde_json::Value {
+    serde_json::json!({"exit_code": exit_code, "error": ""})
+}
+
+/// A session `wf` in state `a`: event 1 initializes it and event 2 enters
+/// `a`, so its first commit is seq 3 in the visit that opened at 2.
+fn session_in_a() -> Fixture {
+    let f = Fixture::new();
+    f.init("wf", header("wf", "wf-id", None), Some("a"));
+    f
+}
+
+#[test]
+fn a_failed_gate_relays_check_evaluated_then_one_check_rule_per_rule_in_order() {
+    let f = session_in_a();
+    let rules = counts(&[("Z9", 1, 4), ("E501", 2, 2), ("A1", 1, 1)]);
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event(
+            "a",
+            "lint",
+            "failed",
+            command_output(1),
+            stamped(3, 2, Some(rules)),
+            None,
+        ),
+    );
+    let j = f.journal();
+    let c = check_records(&j);
+    assert_eq!(
+        kinds(&c),
+        vec!["check_evaluated", "check_rule", "check_rule", "check_rule"]
+    );
+    let e = &c[0];
+    assert_eq!(e["session"], "wf");
+    assert_eq!(e["koto.session.id"], "wf-id");
+    assert_eq!(e["koto.run.id"], "wf-id");
+    assert_eq!(e["koto.seq"], 3);
+    assert_eq!(e["koto.visit.seq"], 2);
+    assert_eq!(e["koto.state"], "a");
+    assert_eq!(e["koto.check"], "lint");
+    assert_eq!(e["koto.check.outcome"], "failed");
+    assert_eq!(e["koto.attempt"], 3);
+    assert_eq!(e["koto.visit_attempt"], 2);
+    assert_eq!(e["koto.check.rule_count"], 3);
+    assert_eq!(e["koto.check.duration_ms"], 12);
+    for absent in [
+        "koto.check.rule_counts_truncated",
+        "koto.poll.status",
+        "koto.check.unanswered_count",
+        "koto.check.error",
+    ] {
+        assert!(e.get(absent).is_none(), "{absent}: {e}");
+    }
+    let ids: Vec<&str> = c[1..]
+        .iter()
+        .map(|r| r["koto.rule.id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["Z9", "E501", "A1"], "rule_counts order");
+    for r in &c[1..] {
+        assert_eq!(r["koto.seq"], 3, "a rule shares its evaluation's seq");
+        assert_eq!(r["koto.visit.seq"], 2);
+        assert_eq!(r["koto.state"], "a");
+        assert_eq!(r["koto.check"], "lint");
+        assert_eq!(r["koto.attempt"], 3);
+        assert_eq!(r["koto.visit_attempt"], 2);
+    }
+    assert_eq!(c[1]["koto.rule.visit_count"], 1);
+    assert_eq!(c[1]["koto.rule.session_count"], 4);
+    assert_eq!(c[2]["koto.rule.visit_count"], 2);
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("exit_code"), "{raw}");
+    assert!(warnings_for_test().is_empty());
+}
+
+#[test]
+fn gate_outcomes_are_written_as_logged_and_default_actions_map_to_failed_or_passed() {
+    let f = session_in_a();
+    for outcome in ["passed", "failed", "timed_out", "error"] {
+        commit_as(
+            &f,
+            None,
+            "wf",
+            &gate_event(
+                "a",
+                "g",
+                outcome,
+                command_output(0),
+                stamped(1, 1, None),
+                None,
+            ),
+        );
+    }
+    // A failed action; one that exits 0 but whose capture failed (it
+    // carries rule counts); and a passing one.
+    commit_as(&f, None, "wf", &action_event(2, stamped(1, 1, None)));
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &action_event(0, stamped(1, 1, Some(counts(&[("capture", 1, 1)])))),
+    );
+    commit_as(&f, None, "wf", &action_event(0, stamped(1, 1, None)));
+    let c = check_records(&f.journal());
+    let evaluated: Vec<(&str, &str)> = c
+        .iter()
+        .filter(|r| r["kind"] == "check_evaluated")
+        .map(|r| {
+            (
+                r["koto.check"].as_str().unwrap(),
+                r["koto.check.outcome"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        evaluated,
+        vec![
+            ("g", "passed"),
+            ("g", "failed"),
+            ("g", "timed_out"),
+            ("g", "error"),
+            ("__action__", "failed"),
+            ("__action__", "failed"),
+            ("__action__", "passed"),
+        ]
+    );
+    // The action's rule record names its check `__action__`.
+    let rule = c.iter().find(|r| r["kind"] == "check_rule").unwrap();
+    assert_eq!(rule["koto.check"], "__action__");
+    assert_eq!(rule["koto.rule.id"], "capture");
+    // Seqs follow the log: init took 1 and 2.
+    let seqs: Vec<u64> = c
+        .iter()
+        .filter(|r| r["kind"] == "check_evaluated")
+        .map(|r| r["koto.seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs, (3..=9).collect::<Vec<_>>());
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("PLANTED"), "{raw}");
+}
+
+#[test]
+fn no_rule_counts_write_a_zero_count_and_fifty_with_truncation_write_fifty_rules() {
+    let f = session_in_a();
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event(
+            "a",
+            "g",
+            "failed",
+            command_output(1),
+            stamped(1, 1, None),
+            None,
+        ),
+    );
+    let ids: Vec<String> = (0..50).map(|i| format!("R{i:02}")).collect();
+    let rules: Vec<(&str, u64, u64)> = ids.iter().map(|id| (id.as_str(), 1, 1)).collect();
+    let mut check = stamped(2, 2, Some(counts(&rules)));
+    check.rule_counts_truncated = true;
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event("a", "g", "failed", command_output(1), check, None),
+    );
+    let c = check_records(&f.journal());
+    assert_eq!(c[0]["kind"], "check_evaluated");
+    assert_eq!(c[0]["koto.check.rule_count"], 0);
+    assert!(c[0].get("koto.check.rule_counts_truncated").is_none());
+    assert_eq!(c[1]["kind"], "check_evaluated");
+    assert_eq!(c[1]["koto.check.rule_count"], 50);
+    assert_eq!(c[1]["koto.check.rule_counts_truncated"], true);
+    let written: Vec<&str> = c[2..]
+        .iter()
+        .map(|r| r["koto.rule.id"].as_str().unwrap())
+        .collect();
+    assert_eq!(written.len(), 50);
+    assert_eq!(written, ids.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
+#[test]
+fn each_when_field_is_present_exactly_under_its_condition() {
+    let f = session_in_a();
+    let decider = |unanswered: &[&str], error: &str| serde_json::json!({"failed": [], "unanswered": unanswered, "error": error});
+    let no_duration = CheckEventFields {
+        duration_ms: None,
+        ..stamped(1, 1, None)
+    };
+    let payloads = [
+        // A command gate: duration, no poll, no decider fields.
+        gate_event(
+            "a",
+            "cmd",
+            "passed",
+            command_output(0),
+            stamped(1, 1, None),
+            None,
+        ),
+        // A context gate: no duration.
+        gate_event(
+            "a",
+            "ctx",
+            "passed",
+            serde_json::json!({"exists": true, "error": ""}),
+            no_duration,
+            None,
+        ),
+        // A resolved polling gate.
+        gate_event(
+            "a",
+            "ci",
+            "passed",
+            command_output(0),
+            stamped(1, 1, None),
+            Some(poll("done", 3, 40)),
+        ),
+        // Decider checks with nothing and one criterion unanswered, and
+        // one that logged why nothing could be graded.
+        gate_event(
+            "a",
+            "d0",
+            "passed",
+            decider(&[], ""),
+            stamped(1, 1, None),
+            None,
+        ),
+        gate_event(
+            "a",
+            "d1",
+            "passed",
+            decider(&["r"], ""),
+            stamped(1, 1, None),
+            None,
+        ),
+        gate_event(
+            "a",
+            "d2",
+            "passed",
+            decider(&["r", "s"], "log_unreadable"),
+            stamped(1, 1, None),
+            None,
+        ),
+        // A gate event from before attempt numbers existed.
+        gate_event(
+            "a",
+            "old",
+            "failed",
+            command_output(1),
+            CheckEventFields::default(),
+            None,
+        ),
+    ];
+    for p in &payloads {
+        commit_as(&f, None, "wf", p);
+    }
+    let c = check_records(&f.journal());
+    let by = |check: &str| c.iter().find(|r| r["koto.check"] == check).unwrap().clone();
+    assert_eq!(by("cmd")["koto.check.duration_ms"], 12);
+    assert!(by("ctx").get("koto.check.duration_ms").is_none());
+    assert_eq!(by("ci")["koto.poll.status"], "done");
+    assert!(by("cmd").get("koto.poll.status").is_none());
+    assert_eq!(by("d0")["koto.check.unanswered_count"], 0);
+    assert_eq!(by("d1")["koto.check.unanswered_count"], 1);
+    assert_eq!(by("d2")["koto.check.unanswered_count"], 2);
+    for plain in ["cmd", "ctx", "ci", "old"] {
+        assert!(
+            by(plain).get("koto.check.unanswered_count").is_none(),
+            "{plain}"
+        );
+        assert!(by(plain).get("koto.check.error").is_none(), "{plain}");
+    }
+    assert!(by("d0").get("koto.check.error").is_none());
+    assert!(by("d1").get("koto.check.error").is_none());
+    assert_eq!(by("d2")["koto.check.error"], "log_unreadable");
+    let old = by("old");
+    for absent in [
+        "koto.attempt",
+        "koto.visit_attempt",
+        "koto.check.duration_ms",
+    ] {
+        assert!(old.get(absent).is_none(), "{absent}: {old}");
+    }
+    assert_eq!(old["koto.check.rule_count"], 0);
+}
+
+#[test]
+fn a_pending_evaluation_writes_check_pending_with_the_poll_and_nothing_judged() {
+    let f = session_in_a();
+    let pending = CheckEventFields {
+        duration_ms: Some(5),
+        ..CheckEventFields::default()
+    };
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event(
+            "a",
+            "ci",
+            "pending",
+            serde_json::json!({"exit_code": 75, "error": ""}),
+            pending,
+            Some(poll("pending", 2, 31)),
+        ),
+    );
+    let c = check_records(&f.journal());
+    assert_eq!(kinds(&c), vec!["check_pending"]);
+    let p = &c[0];
+    assert_eq!(p["koto.state"], "a");
+    assert_eq!(p["koto.check"], "ci");
+    assert_eq!(p["koto.poll.status"], "pending");
+    assert_eq!(p["koto.poll.evaluations"], 2);
+    assert_eq!(p["koto.poll.elapsed_secs"], 31);
+    assert_eq!(p["koto.seq"], 3);
+    assert_eq!(p["koto.visit.seq"], 2);
+}
+
+#[test]
+fn rule_ids_outside_the_name_shape_are_digested_the_same_way_every_time() {
+    use sha2::{Digest, Sha256};
+    let digest = |s: &str| {
+        let hex = hex::encode(Sha256::digest(s.as_bytes()));
+        format!("sha256:{}", &hex[..32])
+    };
+    let odd = "no explicit any [x]";
+    assert_eq!(name_or_digest(odd), digest(odd));
+    assert_eq!(name_or_digest(odd), name_or_digest(odd));
+    assert_eq!(name_or_digest(odd).len(), "sha256:".len() + 32);
+    assert!(is_name(&name_or_digest(odd)));
+    let longest = "r".repeat(128);
+    for kept in [
+        "@typescript-eslint/no-explicit-any",
+        "E501",
+        longest.as_str(),
+    ] {
+        assert_eq!(name_or_digest(kept), kept);
+    }
+    for digested in [
+        "r".repeat(129),
+        "règle".to_string(),
+        "/abs/rule".to_string(),
+        String::new(),
+    ] {
+        assert_eq!(name_or_digest(&digested), digest(&digested), "{digested}");
+    }
+
+    // Through a commit, in two sessions.
+    let f = Fixture::new();
+    for name in ["one", "two"] {
+        f.init(name, header(name, &format!("{name}-id"), None), Some("a"));
+        commit_as(
+            &f,
+            None,
+            name,
+            &gate_event(
+                "a",
+                "lint",
+                "failed",
+                command_output(1),
+                stamped(1, 1, Some(counts(&[(odd, 1, 1)]))),
+                None,
+            ),
+        );
+    }
+    let rules: Vec<serde_json::Value> = check_records(&f.journal())
+        .into_iter()
+        .filter(|r| r["kind"] == "check_rule")
+        .collect();
+    assert_eq!(rules.len(), 2);
+    for r in &rules {
+        assert_eq!(r["koto.rule.id"], digest(odd).as_str());
+    }
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("explicit"), "{raw}");
+}
+
+/// A commit whose records are all check records is written in one batch
+/// and not flushed; a state entry's batch is. A `context_read` writes no
+/// batch at all.
+#[test]
+fn a_batch_with_no_identity_record_is_not_flushed() {
+    let f = session_in_a();
+    reset_for_test();
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event(
+            "a",
+            "lint",
+            "failed",
+            command_output(1),
+            stamped(1, 1, Some(counts(&[("R1", 1, 1), ("R2", 1, 1)]))),
+            None,
+        ),
+    );
+    assert_eq!(
+        batches_for_test(),
+        (1, 0),
+        "three records, one batch, no flush"
+    );
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::ContextRead {
+            key: "notes.md".into(),
+            reader: "gate".into(),
+            state: "a".into(),
+            present: false,
+            hash: None,
+            access: None,
+            gate: Some("lint".into()),
+        },
+    );
+    assert_eq!(batches_for_test(), (1, 0), "a context read writes nothing");
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b"));
+    assert_eq!(batches_for_test(), (2, 1), "a state entry is flushed");
+    // A check event under a new driver carries `driver_seen`, so its batch
+    // is flushed with it.
+    commit_as(
+        &f,
+        Some("driver-z"),
+        "wf",
+        &gate_event(
+            "b",
+            "g",
+            "passed",
+            command_output(0),
+            stamped(1, 1, None),
+            None,
+        ),
+    );
+    assert_eq!(batches_for_test(), (3, 2));
+    let j = f.journal();
+    let tail: Vec<String> = kinds(&j).into_iter().rev().take(2).rev().collect();
+    assert_eq!(tail, vec!["driver_seen", "check_evaluated"]);
+    assert!(warnings_for_test().is_empty());
+}
+
+/// The check records of a commit come after the identity records of the
+/// same batch, and the visit follows arrivals: a self-transition keeps it,
+/// an arrival elsewhere and a rewind open new ones.
+#[test]
+fn the_visit_seq_follows_arrivals_and_survives_a_self_transition() {
+    let f = session_in_a();
+    let check = |f: &Fixture, state: &str| {
+        commit_as(
+            f,
+            None,
+            "wf",
+            &gate_event(
+                state,
+                "g",
+                "passed",
+                command_output(0),
+                stamped(1, 1, None),
+                None,
+            ),
+        )
+    };
+    check(&f, "a"); // 3, visit 2
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "a")); // 4
+    check(&f, "a"); // 5, visit 2
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 6
+    check(&f, "b"); // 7, visit 6
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::Rewound {
+            from: "b".into(),
+            to: "a".into(),
+            rationale: None,
+        },
+    ); // 8
+    check(&f, "a"); // 9, visit 8
+    let visits: Vec<(u64, u64)> = check_records(&f.journal())
+        .iter()
+        .map(|r| {
+            (
+                r["koto.seq"].as_u64().unwrap(),
+                r["koto.visit.seq"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(visits, vec![(3, 2), (5, 2), (7, 6), (9, 8)]);
+}
+
+/// With the longest names koto keeps, a 255-byte session name and fifty
+/// 128-byte rule ids, every check record fits the line cap and every rule
+/// is written.
+#[test]
+fn check_records_fit_the_line_cap_at_the_longest_names() {
+    let session = "s".repeat(255);
+    let state = "t".repeat(128);
+    let gate = "g".repeat(128);
+    let ids: Vec<String> = (0..50)
+        .map(|i| format!("{i:02}{}", "r".repeat(126)))
+        .collect();
+    let rules: Vec<(&str, u64, u64)> = ids
+        .iter()
+        .map(|id| (id.as_str(), u64::MAX, u64::MAX))
+        .collect();
+    let mut check = CheckEventFields {
+        attempt: Some(u64::MAX),
+        visit_attempt: Some(u64::MAX),
+        rule_counts: Some(counts(&rules)),
+        duration_ms: Some(u64::MAX),
+        ..CheckEventFields::default()
+    };
+    check.rule_counts_truncated = true;
+    let id = "i".repeat(128);
+    let relay = Relay {
+        session: &session,
+        session_id: &id,
+        run_id: Some(&id),
+        seq: u64::MAX,
+        visit_seq: Some(u64::MAX),
+    };
+    let unanswered = vec!["x"; 50];
+    let decider_output = serde_json::json!({
+        "failed": [],
+        "unanswered": unanswered,
+        "error": "e".repeat(128),
+    });
+    let mut lines: Vec<String> = Vec::new();
+    for (outcome, output, poll_record) in [
+        (
+            "failed",
+            decider_output.clone(),
+            Some(poll("timed_out", u64::MAX, u64::MAX)),
+        ),
+        (
+            "pending",
+            command_output(75),
+            Some(poll("pending", u64::MAX, u64::MAX)),
+        ),
+    ] {
+        let payload = gate_event(&state, &gate, outcome, output, check.clone(), poll_record);
+        lines.extend(relayed(&payload, &relay).iter().map(Record::to_line));
+    }
+    assert_eq!(lines.len(), 1 + 50 + 1);
+    for line in &lines {
+        assert!(line.len() < MAX_LINE_BYTES, "{} bytes: {line}", line.len());
+    }
+    for id in &ids {
+        assert!(lines.iter().any(|l| l.contains(id.as_str())), "{id}");
+    }
+}
