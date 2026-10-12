@@ -45,6 +45,7 @@ use crate::cli::session_inventory::{
     TemplateCache,
 };
 use crate::session::cloud::RemoteCopy;
+use crate::session::finished::{self, FinishedRecord};
 use crate::session::validate::validate_session_id;
 use crate::session::{state_file_name, Backend, SessionBackend, SessionError};
 
@@ -60,6 +61,10 @@ const EXIT_PLAN_REFUSED: i32 = 4;
 
 /// The exit code when a removal failed.
 const EXIT_REMOVAL_FAILED: i32 = 3;
+
+/// The kinds of entry the would-remove list holds.
+const KIND_SESSION: &str = "session";
+const KIND_RECORD: &str = "record";
 
 /// The largest `chain/parent` value read; a session id is far shorter.
 const MAX_CHAIN_PARENT_BYTES: u64 = 1024;
@@ -204,6 +209,8 @@ struct Inventory {
     /// Sessions whose header couldn't be read, so what they reference is
     /// unknown (see [`Facts::headerless`]).
     headerless: BTreeSet<String>,
+    /// The finished records of sessions koto removed itself.
+    records: Vec<FinishedRecord>,
 }
 
 impl Inventory {
@@ -233,11 +240,18 @@ impl Inventory {
             .filter(|(_, s)| s.header.is_none())
             .map(|(name, _)| name.clone())
             .collect();
+        // A records directory that can't be read leaves the records out; the
+        // sessions are judged all the same.
+        let records = finished::list(base).unwrap_or_else(|e| {
+            eprintln!("warning: finished records can't be read: {e:#}");
+            Vec::new()
+        });
         Ok(Inventory {
             base: base.to_path_buf(),
             sessions,
             referencers,
             headerless,
+            records,
         })
     }
 }
@@ -438,21 +452,31 @@ struct Filters {
 
 impl Filters {
     fn pass(&self, session: &Session, now: SystemTime) -> bool {
-        if let Some(filter) = &self.execution_dir {
-            let recorded = session
+        self.pass_fields(
+            session
                 .header
                 .as_ref()
-                .and_then(|h| h.execution_dir.as_deref());
-            if !recorded.is_some_and(|dir| under_dir(dir, filter)) {
+                .and_then(|h| h.execution_dir.as_deref()),
+            session.seen.finished_at.as_deref(),
+            now,
+        )
+    }
+
+    /// The filters over an execution directory and a finish time, which a
+    /// session and a finished record both carry.
+    fn pass_fields(
+        &self,
+        execution_dir: Option<&Path>,
+        finished_at: Option<&str>,
+        now: SystemTime,
+    ) -> bool {
+        if let Some(filter) = &self.execution_dir {
+            if !execution_dir.is_some_and(|dir| under_dir(dir, filter)) {
                 return false;
             }
         }
         if let Some(min_age) = self.older_than {
-            let finished = session
-                .seen
-                .finished_at
-                .as_deref()
-                .and_then(crate::engine::wake::parse_rfc3339_millis);
+            let finished = finished_at.and_then(crate::engine::wake::parse_rfc3339_millis);
             let Some(finished) = finished else {
                 return false;
             };
@@ -502,7 +526,7 @@ fn judge(inv: &Inventory, filters: &Filters, backend: &Backend) -> Verdict {
                 detail,
             }),
             None => remove.push(RemoveEntry {
-                kind: "session".to_string(),
+                kind: KIND_SESSION.to_string(),
                 name: name.clone(),
                 session_id: session.header.as_ref().and_then(|h| h.session_id.clone()),
                 status: Some(session.seen.status),
@@ -515,6 +539,32 @@ fn judge(inv: &Inventory, filters: &Filters, backend: &Backend) -> Verdict {
                     .and_then(|h| h.execution_dir.clone()),
             }),
         }
+    }
+    // Finished records have no rules: koto writes one only when it removes a
+    // session itself, after the session's parent had its result, so nothing
+    // still needs a record to learn how a session ended.
+    for record in &inv.records {
+        if !filters.pass_fields(
+            record.execution_dir.as_deref(),
+            Some(record.finished_at.as_str()),
+            now,
+        ) {
+            continue;
+        }
+        remove.push(RemoveEntry {
+            kind: KIND_RECORD.to_string(),
+            name: record.name.clone(),
+            session_id: record.session_id.clone(),
+            status: Some(if record.status == finished::STATUS_CANCELLED {
+                SessionStatus::Cancelled
+            } else {
+                SessionStatus::Terminal
+            }),
+            state: Some(record.state.clone()),
+            failure: record.failure,
+            finished_at: Some(record.finished_at.clone()),
+            execution_dir: record.execution_dir.clone(),
+        });
     }
     let token = plan_token(&remove);
     Verdict {
@@ -790,7 +840,10 @@ fn remove_one(
 ) -> std::result::Result<(), Refusal> {
     // Everything below removes a session directory. Another kind of entry
     // needs its own removal, never this one.
-    if entry.kind != "session" {
+    if entry.kind == KIND_RECORD {
+        return remove_record(&inv.base, entry);
+    }
+    if entry.kind != KIND_SESSION {
         return Err(Refusal::Skipped(format!(
             "this koto can't remove a {:?} entry",
             entry.kind
@@ -878,6 +931,26 @@ fn remove_one(
     std::fs::remove_dir_all(base.join(name))
         .map_err(|e| Refusal::Failed(format!("the local directory wasn't removed: {e}")))?;
     Ok(())
+}
+
+/// Remove a finished record, after reading it again: a record rewritten
+/// since the judgment (another session of the name finished and was removed)
+/// is a different record, and is skipped.
+fn remove_record(base: &Path, entry: &RemoveEntry) -> std::result::Result<(), Refusal> {
+    let current = match finished::read(base, &entry.name) {
+        Ok(Some(record)) => record,
+        Ok(None) => return Err(Refusal::Skipped("the record is already gone".to_string())),
+        Err(e) => return Err(Refusal::Skipped(format!("the record can't be read: {e:#}"))),
+    };
+    if current.session_id != entry.session_id
+        || Some(current.finished_at.as_str()) != entry.finished_at.as_deref()
+    {
+        return Err(Refusal::Skipped(
+            "the record was replaced since the preview".to_string(),
+        ));
+    }
+    finished::remove(base, &entry.name)
+        .map_err(|e| Refusal::Failed(format!("the record wasn't removed: {e:#}")))
 }
 
 fn status_word(status: SessionStatus) -> &'static str {
@@ -1234,6 +1307,61 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("rule b"));
+    }
+
+    #[test]
+    fn a_record_replaced_since_the_judgment_is_skipped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::new(tmp.path());
+        let record = |finished_at: &str| FinishedRecord {
+            v: finished::RECORD_VERSION,
+            name: "rec".to_string(),
+            session_id: Some("id-1".to_string()),
+            execution_dir: None,
+            state: "done".to_string(),
+            status: finished::STATUS_TERMINAL.to_string(),
+            failure: false,
+            result: None,
+            truncated: false,
+            finished_at: finished_at.to_string(),
+            removed_by: finished::REMOVED_BY_TERMINAL.to_string(),
+        };
+        finished::write(&store.base, &record("2026-10-12T00:00:00.000Z")).unwrap();
+        finished::write(
+            &store.base,
+            &FinishedRecord {
+                name: "other".to_string(),
+                ..record("2026-10-12T00:00:00.000Z")
+            },
+        )
+        .unwrap();
+        let backend = Backend::Local(crate::session::local::LocalBackend::with_base_dir(
+            store.base.clone(),
+        ));
+        let inv = Inventory::read(&store.base).unwrap();
+        let filters = Filters {
+            execution_dir: None,
+            older_than: None,
+        };
+        let verdict = judge(&inv, &filters, &backend);
+        let kinds: Vec<_> = verdict
+            .remove
+            .iter()
+            .map(|e| (e.kind.as_str(), e.name.as_str()))
+            .collect();
+        assert_eq!(kinds, vec![("record", "other"), ("record", "rec")]);
+
+        // Another session of the name finished and was removed since.
+        finished::write(&store.base, &record("2026-10-12T01:00:00.000Z")).unwrap();
+        let outcome = apply(&backend, &inv, &verdict);
+        let removed: Vec<_> = outcome.removed.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(removed, vec!["other"]);
+        assert_eq!(outcome.skipped.len(), 1);
+        assert!(outcome.skipped[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("replaced"));
+        assert!(finished::read(&store.base, "rec").unwrap().is_some());
     }
 
     #[test]
