@@ -14,6 +14,8 @@ pub struct KotoConfig {
     pub request_store: RequestStoreConfig,
     #[serde(default)]
     pub workflows: WorkflowsConfig,
+    #[serde(default)]
+    pub run_journal: RunJournalConfig,
     /// Opt-in decider settings. Omitted from `koto config list` output
     /// when nothing is set, so configs without a `[decider]` table print
     /// exactly as before.
@@ -375,6 +377,44 @@ fn default_request_leg_cap() -> u32 {
     256
 }
 
+/// Run journal rotation and retention (`src/run_journal/rotate.rs`).
+///
+/// Rotation is off by default: with `rotate_bytes` at 0 the journal is
+/// never moved, whatever its size. A non-zero bound makes the append that
+/// finds the journal at or over that many bytes move it to the next
+/// `_run_journal.NNNNNNNNNN.jsonl` name first. Rotated files older than
+/// `retain_days` are removed at a later rotation unless a reader's position
+/// file, refreshed within `reader_stale_days`, still needs them.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RunJournalConfig {
+    #[serde(default = "default_run_journal_rotate_bytes")]
+    pub rotate_bytes: u64,
+    #[serde(default = "default_run_journal_retain_days")]
+    pub retain_days: u64,
+    #[serde(default = "default_run_journal_reader_stale_days")]
+    pub reader_stale_days: u64,
+}
+
+impl Default for RunJournalConfig {
+    fn default() -> Self {
+        Self {
+            rotate_bytes: default_run_journal_rotate_bytes(),
+            retain_days: default_run_journal_retain_days(),
+            reader_stale_days: default_run_journal_reader_stale_days(),
+        }
+    }
+}
+
+fn default_run_journal_rotate_bytes() -> u64 {
+    0
+}
+fn default_run_journal_retain_days() -> u64 {
+    30
+}
+fn default_run_journal_reader_stale_days() -> u64 {
+    90
+}
+
 /// Session-related configuration.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct SessionConfig {
@@ -451,6 +491,9 @@ pub fn get_value(config: &KotoConfig, key: &str) -> Option<String> {
         }
         "request_store.request_leg_cap" => Some(config.request_store.request_leg_cap.to_string()),
         "workflows.native" => Some(config.workflows.native.to_string()),
+        "run_journal.rotate_bytes" => Some(config.run_journal.rotate_bytes.to_string()),
+        "run_journal.retain_days" => Some(config.run_journal.retain_days.to_string()),
+        "run_journal.reader_stale_days" => Some(config.run_journal.reader_stale_days.to_string()),
         // The effective mode (global minimum project), shown only when a
         // mode is configured somewhere.
         "decider.mode" => {
@@ -544,6 +587,25 @@ pub fn set_value_in_toml(doc: &mut toml::Value, key: &str, value: &str) -> Resul
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
             let rs_table = rs.as_table_mut().ok_or("request_store is not a table")?;
             rs_table.insert(field.to_string(), toml::Value::Integer(parsed));
+        }
+        "run_journal.rotate_bytes"
+        | "run_journal.retain_days"
+        | "run_journal.reader_stale_days" => {
+            let field = key.strip_prefix("run_journal.").unwrap();
+            let parsed: i64 = value
+                .parse()
+                .map_err(|e| format!("value for {} must parse as an integer: {}", key, e))?;
+            if parsed < 0 {
+                return Err(format!(
+                    "value for {} must be non-negative (got {})",
+                    key, parsed
+                ));
+            }
+            let rj = table
+                .entry("run_journal")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            let rj_table = rj.as_table_mut().ok_or("run_journal is not a table")?;
+            rj_table.insert(field.to_string(), toml::Value::Integer(parsed));
         }
         k if k.starts_with("request_store.recursion.") => {
             // The recursion namespace is reserved-but-ignored at V1
@@ -658,6 +720,17 @@ pub fn unset_value_in_toml(doc: &mut toml::Value, key: &str) -> Result<bool, Str
             }
             Ok(false)
         }
+        "run_journal.rotate_bytes"
+        | "run_journal.retain_days"
+        | "run_journal.reader_stale_days" => {
+            let field = key.strip_prefix("run_journal.").unwrap();
+            if let Some(rj) = table.get_mut("run_journal") {
+                if let Some(rj_table) = rj.as_table_mut() {
+                    return Ok(rj_table.remove(field).is_some());
+                }
+            }
+            Ok(false)
+        }
         k if k.starts_with("request_store.recursion.") => {
             let field = k.strip_prefix("request_store.recursion.").unwrap();
             if field.is_empty() || field.contains('.') {
@@ -715,6 +788,9 @@ pub const ALL_KEYS: &[&str] = &[
     "request_store.request_leg_append_cap",
     "request_store.request_leg_cap",
     "workflows.native",
+    "run_journal.rotate_bytes",
+    "run_journal.retain_days",
+    "run_journal.reader_stale_days",
     "decider.mode",
     "decider.api_key",
     "decider.endpoint",
@@ -1096,6 +1172,62 @@ mod tests {
         set_value_in_toml(&mut doc, "workflows.native", "true").unwrap();
         assert!(unset_value_in_toml(&mut doc, "workflows.native").unwrap());
         assert!(!unset_value_in_toml(&mut doc, "workflows.native").unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // run_journal.* coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_run_journal_defaults_leave_rotation_off() {
+        let config = KotoConfig::default();
+        assert_eq!(config.run_journal, RunJournalConfig::default());
+        assert_eq!(
+            get_value(&config, "run_journal.rotate_bytes"),
+            Some("0".to_string())
+        );
+        assert_eq!(
+            get_value(&config, "run_journal.retain_days"),
+            Some("30".to_string())
+        );
+        assert_eq!(
+            get_value(&config, "run_journal.reader_stale_days"),
+            Some("90".to_string())
+        );
+        // A file without the table gets the same defaults.
+        let cfg: KotoConfig = toml::from_str("[session]\nbackend = \"local\"\n").unwrap();
+        assert_eq!(cfg.run_journal, RunJournalConfig::default());
+    }
+
+    #[test]
+    fn test_run_journal_set_get_unset_round_trip() {
+        let keys = [
+            ("run_journal.rotate_bytes", "67108864"),
+            ("run_journal.retain_days", "7"),
+            ("run_journal.reader_stale_days", "14"),
+        ];
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        for (k, v) in keys {
+            assert!(ALL_KEYS.contains(&k), "{k}");
+            set_value_in_toml(&mut doc, k, v).unwrap();
+        }
+        let cfg: KotoConfig = doc.clone().try_into().unwrap();
+        assert_eq!(cfg.run_journal.rotate_bytes, 67_108_864);
+        assert_eq!(cfg.run_journal.retain_days, 7);
+        assert_eq!(cfg.run_journal.reader_stale_days, 14);
+        for (k, v) in keys {
+            assert_eq!(get_value(&cfg, k), Some(v.to_string()), "{k}");
+        }
+        for bad in ["-1", "ten"] {
+            assert!(set_value_in_toml(&mut doc, "run_journal.rotate_bytes", bad).is_err());
+        }
+        assert!(set_value_in_toml(&mut doc, "run_journal.bogus", "1").is_err());
+        for (k, _) in keys {
+            assert!(unset_value_in_toml(&mut doc, k).unwrap(), "{k}");
+            assert!(!unset_value_in_toml(&mut doc, k).unwrap(), "{k}");
+        }
+        let cfg: KotoConfig = doc.try_into().unwrap();
+        assert_eq!(cfg.run_journal, RunJournalConfig::default());
     }
 
     #[test]
