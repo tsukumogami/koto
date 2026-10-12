@@ -545,5 +545,5 @@ Documentation and verification:
 
 ## Downstream Artifacts
 
-- `docs/designs/current/DESIGN-session-hygiene.md` (planned): how each verb, the
+- `docs/designs/current/DESIGN-session-hygiene.md` (current): how each verb, the
   finished record, the rotation and the marker rule are built.
