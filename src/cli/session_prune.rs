@@ -719,6 +719,14 @@ fn remove_one(
     entry: &RemoveEntry,
     cache: &mut TemplateCache,
 ) -> std::result::Result<(), Refusal> {
+    // Everything below removes a session directory. Another kind of entry
+    // needs its own removal, never this one.
+    if entry.kind != "session" {
+        return Err(Refusal::Skipped(format!(
+            "this koto can't remove a {:?} entry",
+            entry.kind
+        )));
+    }
     let base = &inv.base;
     let name = entry.name.as_str();
     let _lock = match backend.lock_state_file(name) {
@@ -1119,6 +1127,47 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("rule b"));
+    }
+
+    #[test]
+    fn a_preview_removes_plans_older_than_a_day_and_keeps_the_rest() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let old = dir.join("old.json");
+        let fresh = dir.join("fresh.json");
+        std::fs::write(&old, "{}").unwrap();
+        std::fs::write(&fresh, "{}").unwrap();
+        let day_and_a_bit = SystemTime::now() - PLAN_MAX_AGE - Duration::from_secs(60);
+        filetime::set_file_mtime(&old, filetime::FileTime::from_system_time(day_and_a_bit))
+            .unwrap();
+        let almost_a_day = SystemTime::now() - PLAN_MAX_AGE + Duration::from_secs(60);
+        filetime::set_file_mtime(&fresh, filetime::FileTime::from_system_time(almost_a_day))
+            .unwrap();
+        expire_plans(dir);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn an_entry_that_isnt_a_session_is_never_removed_as_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::new(tmp.path());
+        store.finished("both", "id-both");
+        let backend = Backend::Local(crate::session::local::LocalBackend::with_base_dir(
+            store.base.clone(),
+        ));
+        let inv = Inventory::read(&store.base).unwrap();
+        let mut record = entry("both", "id-both");
+        record.kind = "record".to_string();
+        let verdict = Verdict {
+            remove: vec![record],
+            kept: Vec::new(),
+            token: String::new(),
+        };
+        let outcome = apply(&backend, &inv, &verdict);
+        assert!(outcome.removed.is_empty());
+        assert_eq!(outcome.skipped.len(), 1);
+        assert!(store.base.join("both").is_dir());
     }
 
     #[test]
