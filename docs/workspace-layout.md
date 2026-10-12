@@ -96,8 +96,11 @@ each record 0600. A record keeps the session's whole result, including
 any payload its result map carries, until the name is reused or the
 prune removes it. It is derived and safe to delete: a missing record
 only makes `koto status` answer `not found` for a name koto removed.
-Creating a session deletes its name's record, `koto session prune`
-lists and removes records, and nothing that lists sessions shows them.
+Creating a session deletes its name's record, as does a rewind that
+moves a child session to a new name, and so does a person's removal
+(`koto session cleanup`, `koto cancel --cleanup`) of a session a crash
+left a record beside. `koto session prune` lists and removes records,
+and nothing that lists sessions shows them.
 A redirected store keeps its own records, and the cloud backend keeps
 them in its local store; they never sync.
 

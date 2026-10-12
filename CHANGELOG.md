@@ -269,8 +269,8 @@ to `0.9.x`).
   read `removed: true` instead. `not found` now means no session and no
   record: the name never existed, a person removed it with
   `koto session cleanup` or `koto cancel --cleanup`, or `koto session
-  prune` removed its record. Creating a session under the name deletes the
-  record.
+  prune` removed its record. Creating a session under the name, or a rewind
+  moving a child session to it, deletes the record.
 
 - **Gates and default actions run in an environment fixed when the session
   is created (koto#261).** Until now every command gate and default action

@@ -3377,8 +3377,9 @@ pub(crate) fn write_finished_record(
     }
 }
 
-/// Delete the finished record written for a session whose removal then
-/// failed, so the session that stays isn't later answered for as removed.
+/// Delete the finished record under `name`, so it doesn't answer for the
+/// name as removed by koto: after a removal that failed (the session stays),
+/// or after a person's removal of a session a crash left a record beside.
 #[cfg(unix)]
 pub(crate) fn forget_finished_record(backend: &dyn SessionBackend, name: &str) {
     let session_dir = backend.session_dir(name);
