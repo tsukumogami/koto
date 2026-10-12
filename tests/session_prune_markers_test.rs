@@ -683,9 +683,18 @@ fn a_truncated_or_corrupt_target_log_keeps_the_marker_and_the_source_through_pre
 }
 
 #[test]
-fn a_source_log_past_the_targets_or_unreadable_keeps_the_marker() {
+fn a_target_log_behind_or_apart_from_the_source_or_an_unreadable_source_keeps_the_marker() {
     let h = Hosts::new();
-    for name in ["ahead", "torn-source", "level"] {
+    let all_names = [
+        "ahead",
+        "tied",
+        "altered",
+        "short",
+        "torn-source",
+        "no-log",
+        "untouched",
+    ];
+    for name in all_names {
         h.migrate(name);
     }
     // `ahead`'s source log gains two events past the target's last, which
@@ -693,21 +702,47 @@ fn a_source_log_past_the_targets_or_unreadable_keeps_the_marker() {
     rewrite_log(&h, &log_key(&h.a, "ahead"), |lines| {
         with_more_events(lines, 2)
     });
+    // `tied`'s source log gains one: it ends at the same seq as the target's,
+    // but its last event isn't the import's.
+    rewrite_log(&h, &log_key(&h.a, "tied"), |lines| {
+        with_more_events(lines, 1)
+    });
+    // `altered`'s source log has its first event (the line after the
+    // header) changed in place.
+    rewrite_log(&h, &log_key(&h.a, "altered"), |mut lines| {
+        let mut first: Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(first["seq"], 1, "{first}");
+        first["timestamp"] = Value::from("2001-01-01T00:00:00Z");
+        lines[1] = first.to_string();
+        lines
+    });
+    // `short`'s target log loses its last two events whole, so it parses
+    // and ends before the source's.
+    rewrite_log(&h, &log_key(&h.b, "short"), |mut lines| {
+        assert!(lines.len() > 2, "{lines:?}");
+        lines.truncate(lines.len() - 2);
+        lines
+    });
     // `torn-source`'s source log ends in a line that doesn't parse.
     rewrite_log(&h, &log_key(&h.a, "torn-source"), |mut lines| {
         lines.push("{\"seq\":".to_string());
         lines
     });
-    // `level`'s source log gains one: it now ends where the target's does.
-    rewrite_log(&h, &log_key(&h.a, "level"), |lines| {
-        with_more_events(lines, 1)
-    });
-    let ahead_before = source_objects(&h, "ahead");
-    let torn_before = source_objects(&h, "torn-source");
+    // `no-log`'s source lost its state file to a removal that stopped part
+    // way; the rest of the copy and the marker are still there.
+    h.s3.remove(&log_key(&h.a, "no-log"));
+    let kept = ["ahead", "tied", "altered", "short", "torn-source"];
+    let before: BTreeMap<_, _> = kept
+        .iter()
+        .map(|name| (*name, source_objects(&h, name)))
+        .collect();
 
     let all = entries(&h.prune_ok(&["--source-retired"]));
     for (name, says) in [
         ("ahead", "the source's runs to seq"),
+        ("tied", "differs from the source's"),
+        ("altered", "event at seq 1 differs from the source's"),
+        ("short", "the source's runs to seq"),
         ("torn-source", "the source copy can't be read"),
     ] {
         let e = &all[name];
@@ -718,11 +753,15 @@ fn a_source_log_past_the_targets_or_unreadable_keeps_the_marker() {
             "{name}: {e:#}"
         );
     }
-    assert_eq!(all["level"]["target_status"], "present");
-    assert_eq!(all["level"]["removable"], true);
+    for name in ["no-log", "untouched"] {
+        assert_eq!(all[name]["target_status"], "present", "{name}");
+        assert_eq!(all[name]["removable"], true, "{name}");
+    }
 
     let out = h.prune_ok(&["--apply", "--source-retired"]);
-    assert_eq!(names(&out["removed"]), vec!["level"]);
-    assert_eq!(source_objects(&h, "ahead"), ahead_before);
-    assert_eq!(source_objects(&h, "torn-source"), torn_before);
+    assert_eq!(names(&out["removed"]), vec!["no-log", "untouched"]);
+    for name in kept {
+        assert_eq!(source_objects(&h, name), before[name], "{name}");
+    }
+    assert!(h.s3.keys_under(&h.source("no-log")).is_empty());
 }

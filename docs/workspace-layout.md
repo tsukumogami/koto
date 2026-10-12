@@ -439,8 +439,8 @@ marker in the bucket beside the session it moved, and the prune above
 leaves those markers alone. They can now be removed too, with
 `koto session prune --migrated-from <old workspace>`: a marker goes,
 together with the old copy beside it, only when the session it points
-at is present at its target, with a log that reads through at least the
-old copy's last event, and the marker is at least
+at is present at its target, with a log that reads cleanly and begins
+with every event of the old copy's log, and the marker is at least
 `session.cloud.marker_retain_days` old (or `--source-retired` says the
 old host is gone). That mode works on the bucket only and never touches
 `$HOME/.koto/sessions/` beyond its stored plan; see

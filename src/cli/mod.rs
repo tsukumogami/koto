@@ -557,8 +557,8 @@ pub enum SessionCommand {
     /// `--migrated-from <workspace-path>` (cloud backend only) previews and
     /// removes instead the migration markers `koto session import` left
     /// under that workspace's bucket prefix. A marker is removable only when
-    /// its target is present, with a log that reads through at least the
-    /// old copy's last event, and then once at least
+    /// its target is present, with a log that reads cleanly and begins with
+    /// every event of the old copy's log, and then once at least
     /// `session.cloud.marker_retain_days` old or with `--source-retired`;
     /// removal deletes everything under the old session's prefix, the
     /// marker last.

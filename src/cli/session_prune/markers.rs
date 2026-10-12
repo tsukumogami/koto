@@ -6,9 +6,9 @@
 //! owns, so it goes only when the session it points at is safe elsewhere:
 //! its target must be `present` (the target's state file header carries
 //! the session id the marker names, and its whole log reads with no error
-//! and reaches at least the last seq of the source's log, so a truncated
-//! or corrupt copy, or one behind the source, never stands in for the
-//! source), and then the marker must be at least
+//! and begins with every event of the source's log, unchanged, so a
+//! truncated or corrupt copy, or one behind or apart from the source,
+//! never stands in for it), and then the marker must be at least
 //! `session.cloud.marker_retain_days` old, or the caller must say the source
 //! host is gone with `--source-retired`. Any other target status keeps the
 //! marker whatever its age, and so does a marker that can't be read.
@@ -292,10 +292,7 @@ fn evaluate(
         &body.target.prefix,
         &body.target.session,
         &body.target.session_id,
-        source
-            .as_ref()
-            .map(|copy| copy.last_seq)
-            .map_err(String::as_str),
+        source.as_ref().map_err(String::as_str),
     );
     // A marker dated in the future is as young as it gets.
     let age = now.duration_since(body.at).unwrap_or(Duration::ZERO);

@@ -88,8 +88,8 @@ pub enum RemoteCopy {
 pub struct SourceCopy {
     /// The objects under the copy's prefix, the marker included.
     pub objects: usize,
-    /// The last seq of its log; 0 when it has no state file.
-    pub last_seq: u64,
+    /// Its log's event lines, verbatim; none when it has no state file.
+    pub events: Vec<String>,
 }
 
 /// What a migration marker's target holds, as
@@ -99,8 +99,8 @@ pub enum TargetStatus {
     /// The target carries a marker of its own: it moved on again.
     Migrated,
     /// The target's state file header names the marker's session id, and
-    /// its whole log reads with no error and reaches at least the source
-    /// log's last seq.
+    /// its whole log reads with no error and begins with every event of the
+    /// source's log, unchanged.
     Present,
     /// A state file is there, but its header names another session id (a
     /// later session under the same name).
@@ -109,8 +109,8 @@ pub enum TargetStatus {
     Absent,
     /// The header names the marker's session id, but the copy can't be shown
     /// complete: the target's log doesn't read to the end, ends before the
-    /// source's, or the source's own log can't be read. The string says
-    /// which.
+    /// source's, holds a different event at some seq the source's reaches,
+    /// or the source's own log can't be read. The string says which.
     Unverified(String),
     /// The listing or the read failed, or the header couldn't be read; the
     /// string says which.
@@ -637,11 +637,12 @@ impl CloudBackend {
 
     /// What the bucket holds of the migrated source copy `<source_prefix>/<name>/`:
     /// how many objects a removal would delete, the marker included, and the
-    /// last seq of its log. The log is read to the end under the import's own
-    /// rule (no unparseable line, a final one included, and no seq gap); a
-    /// copy with no state file left, as a removal that stopped part way can
-    /// leave it, has nothing to lose and counts as seq 0. `Err` says why the
-    /// copy can't be read.
+    /// event lines of its log. The log is read to the end under the import's
+    /// own rule (no unparseable line, a final one included, and no seq gap).
+    /// A copy with no state file left has no events to lose: only a removal
+    /// that stopped part way leaves it so, because the import never deletes
+    /// the source's log and a removal deletes the marker last, and a retry
+    /// must be able to finish. `Err` says why the copy can't be read.
     pub(crate) fn migrated_source_copy(
         &self,
         source_prefix: &str,
@@ -663,23 +664,23 @@ impl CloudBackend {
             .filter(|key| key.starts_with(&session))
             .collect();
         let state_key = format!("{}{}", session, state_file_name(name));
-        let last_seq = if keys.contains(&state_key.as_str()) {
+        let events = if keys.contains(&state_key.as_str()) {
             match self.fetch_object(&state_key) {
                 Ok(Some(bytes)) => {
                     parse_source_log(&bytes)
                         .map_err(|e| format!("the source's log doesn't read to the end: {e}"))?
-                        .last_seq
+                        .event_lines
                 }
                 // Removed between the listing and the GET.
-                Ok(None) => 0,
+                Ok(None) => Vec::new(),
                 Err(e) => return Err(without_url_userinfo(&format!("{e:#}"))),
             }
         } else {
-            0
+            Vec::new()
         };
         Ok(SourceCopy {
             objects: keys.len(),
-            last_seq,
+            events,
         })
     }
 
@@ -688,16 +689,18 @@ impl CloudBackend {
     /// from matching `foo-2`), and a GET of the state file when there is one.
     /// Its header's `session_id` tells the session apart from a later one
     /// under the name, and its whole log must then read with no error and
-    /// reach `source_last_seq`, the migrated source log's last seq, before
-    /// the target counts as present: a truncated or corrupt copy, or one
-    /// behind the source, is `Unverified`, and so is any target when the
-    /// source's log can't be read (`Err`, saying why).
+    /// begin with every event line of `source`, the migrated source copy,
+    /// unchanged (the import carries them verbatim, and the target only
+    /// appends after them) before the target counts as present. A truncated
+    /// or corrupt copy, one behind the source, or one that differs from it
+    /// at any seq is `Unverified`, and so is any target when the source's
+    /// log can't be read (`Err`, saying why).
     pub(crate) fn marker_target_status(
         &self,
         target_prefix: &str,
         target_session: &str,
         target_session_id: &str,
-        source_last_seq: Result<u64, &str>,
+        source: Result<&SourceCopy, &str>,
     ) -> TargetStatus {
         if !is_workspace_prefix(target_prefix)
             || crate::session::validate::validate_session_id(target_session).is_err()
@@ -746,21 +749,39 @@ impl CloudBackend {
                 )
             }
         }
-        let source_last_seq = match source_last_seq {
-            Ok(seq) => seq,
+        let source = match source {
+            Ok(source) => source,
             Err(why) => {
                 return TargetStatus::Unverified(format!("the source copy can't be read: {why}"))
             }
         };
-        match parse_source_log(&bytes) {
+        let target = match parse_source_log(&bytes) {
+            Ok(log) => log,
             Err(e) => {
-                TargetStatus::Unverified(format!("the target's log doesn't read to the end: {e}"))
+                return TargetStatus::Unverified(format!(
+                    "the target's log doesn't read to the end: {e}"
+                ))
             }
-            Ok(log) if log.last_seq < source_last_seq => TargetStatus::Unverified(format!(
+        };
+        // Both logs start at seq 1 with no gap, so index i holds seq i + 1.
+        if target.event_lines.len() < source.events.len() {
+            return TargetStatus::Unverified(format!(
                 "the target's log ends at seq {} and the source's runs to seq {}",
-                log.last_seq, source_last_seq
+                target.event_lines.len(),
+                source.events.len()
+            ));
+        }
+        match target
+            .event_lines
+            .iter()
+            .zip(&source.events)
+            .position(|(target, source)| target != source)
+        {
+            Some(i) => TargetStatus::Unverified(format!(
+                "the target's event at seq {} differs from the source's",
+                i + 1
             )),
-            Ok(_) => TargetStatus::Present,
+            None => TargetStatus::Present,
         }
     }
 
@@ -1898,7 +1919,8 @@ struct SourceLog {
 /// Refuses (with the reason) a log this build can't carry intact: not
 /// UTF-8, no header, a `schema_version` other than 1, an event line that
 /// doesn't parse, or a gap in the sequence numbers. Blank lines are
-/// dropped. The `template_hash` is checked by the caller, after it has
+/// dropped. The marker prune reads both a migrated source's log and its
+/// target's with it, so "reads to the end" means the same there as here. The `template_hash` is checked by the caller, after it has
 /// refused a child session, whose hash may legitimately be empty.
 fn parse_source_log(bytes: &[u8]) -> Result<SourceLog, String> {
     use crate::engine::types::{Event, StateFileHeader};
@@ -1910,7 +1932,7 @@ fn parse_source_log(bytes: &[u8]) -> Result<SourceLog, String> {
         .map_err(|e| format!("the state file's header doesn't parse: {}", e))?;
     if header.schema_version != 1 {
         return Err(format!(
-            "the state file has schema_version {}; this koto imports version 1",
+            "the state file has schema_version {}; this koto reads version 1",
             header.schema_version
         ));
     }
@@ -2887,6 +2909,12 @@ fn is_migration_marker(session_prefix: &str, key: &str) -> bool {
 
 /// The `session_id` in a state file's header line (its first non-empty
 /// line), or `None` when the header doesn't parse or has none.
+///
+/// Deliberately looser than [`parse_source_log`]: the marker judge reads
+/// the header with this first, to tell a target that is another session
+/// (`Replaced`) or has no usable header (`Unknown`) from the right session
+/// with a damaged log (`Unverified`). Reading it with the strict parser
+/// would fold the first two into the third.
 fn header_session_id(state: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(state);
     let line = text.lines().find(|l| !l.trim().is_empty())?;
