@@ -19,8 +19,8 @@ decision: |
   `koto status` answers from it. The run journal rotates on append by a
   no-replace rename to a sequence-numbered name, writers re-check identity
   after locking, and retention keeps any file a reader's recorded position
-  needs. `--migrated-from` removes migration markers by age or by a present
-  target plus a retired source, marker last.
+  needs. `--migrated-from` removes migration markers whose target is
+  present, by age or with a stated retired source, marker last.
 rationale: |
   Each mechanism reads what koto already records (headers, logs, context
   keys, leg pointers, file metadata) and adds one small file kind where
@@ -286,16 +286,26 @@ behavior.
 ### Decision 6: Migrated-marker removal
 
 **Chosen: `koto session prune --migrated-from <workspace-path>`, reusing the
-prune's preview and token contract. A marker is removable by age, or with a
-present target and `--source-retired`. Removal deletes the source's whole
-prefix, marker last.**
+prune's preview and token contract. A marker is removable only when its
+target is present, and then either by age or with `--source-retired`.
+Removal deletes the source's whole prefix, marker last.**
+
+Removal deletes the old copy along with the marker, so the newer session has
+to exist and not have moved on again before anything goes. The present target
+is required on both branches. Age past the bound is the default evidence that
+the old host is gone; `--source-retired` lets a caller who knows sooner say
+so.
 
 *Alternative: remove a marker whenever its target is present and not
 migrated away, with no caller statement.* Rejected: the marker is what stops
 a source host that comes back from advancing its old copy, and a present
 target says nothing about that host. Tying that branch to an explicit
-`--source-retired` keeps both halves of the stated rule while making the risky
-one a deliberate act.
+`--source-retired` makes the risky case a deliberate act.
+
+*Alternative: remove by age alone, whatever the target's status.* Rejected:
+a marker whose target is gone, replaced or migrated again points at nothing
+that holds the session, and removing it would also delete the only remaining
+copy beside it.
 
 *Alternative: remove only `migrated.json`, leaving the source's other
 objects.* Rejected: with the marker gone, the old copy reads as a live,
@@ -329,9 +339,9 @@ verb:
   and keeps every one that a reader's recorded `(device, inode, offset)`
   position still needs (R18 to R24).
 - `--migrated-from` extends the prune to markers in one old workspace's
-  bucket prefix. A marker goes when it is older than its bound, or when its
-  target is present (same session id) and `--source-retired` is given
-  (R25 to R28). koto#343, listing a source workspace's sessions
+  bucket prefix. A marker goes only when its target is present (same session
+  id, not migrated again), and then when it is older than its bound or
+  `--source-retired` is given (R25 to R28). koto#343, listing a source workspace's sessions
   before an import, isn't covered: the marker preview lists markers only, and
   a session listing is a different read with different callers (R29).
 
@@ -489,10 +499,10 @@ cloud):
    and one with another id makes it `replaced` (a later session under the
    same name). No state file makes it `absent`. A failed listing or read
    makes it `unknown`. Only `present` can satisfy the retired-source branch.
-4. Removable when its age (now minus `migrated_at`) is at least
-   `session.cloud.marker_retain_days` (default 30), or when the target is
-   `present` and `--source-retired` was given. All others are kept with
-   their reason.
+4. Removable when the target is `present` and either its age (now minus
+   `migrated_at`) is at least `session.cloud.marker_retain_days` (default
+   30) or `--source-retired` was given. All others are kept, and the preview
+   names the target status or the age as the reason.
 5. The token covers lines `marker\t<name>\t<migrated_at>\n`.
 6. Apply re-reads each marker (same `migrated_at`) and re-evaluates its
    rule, so a target that changed status since the preview is skipped. It
@@ -587,6 +597,12 @@ loops, up to eight times:
 
 After eight failed identity checks the record is dropped with the journal's
 usual one-time warning, like any other failed journal write.
+
+The size check runs once per locked append, before anything is written. When
+the append carries several lines under one lock (one commit's records written
+as a batch), the batch is one unit: rotation happens before it or after it,
+never between two of its lines. `run_journal::write` keeps its signature;
+rotation wraps the one call it makes to the append helper.
 
 **Naming rule.** Rotated files are `_run_journal.NNNNNNNNNN.jsonl`, ten
 decimal digits, zero-padded, in the journal's own directory. The next number
@@ -770,7 +786,9 @@ HOME or `KOTO_SESSIONS_BASE`, with cloud behavior on koto's fake S3 harness
 - The rules know one context key by name, `chain/parent`, so a consumer
   linking sessions any other way gets no protection from rule c.
 - Marker removal by age relies on the stopped-source rule. A host revived
-  after the bound could advance its old copy again.
+  after the bound could advance its old copy again. The repository owner
+  accepts this risk for multi-host use, which koto treats as a migration and
+  never as a shared session.
 - Under the cloud backend a preview makes one remote request per candidate
   session for rule g.
 

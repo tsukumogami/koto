@@ -296,10 +296,13 @@ These carry the framing's journeys forward at requirements altitude.
   target's state file is there, else `absent`, or `unknown` when the bucket
   can't be checked), and whether it is removable under R26 and why. Under
   the local backend the flag is refused as a usage error.
-- **R26.** A marker is removable when (a) it is older than the marker bound
-  (default 30 days, configurable), or (b) its target is `present` and the
-  caller passes a flag stating the source host is retired. Every other
-  marker, including one whose body can't be read, is kept.
+- **R26.** A marker is removable only when its target is `present` (the
+  newer session exists and hasn't itself been migrated away), and then
+  either (a) it is older than the marker bound (default 30 days,
+  configurable), or (b) the caller passes a flag stating the source host is
+  retired. Every other marker is kept, including one whose target is
+  `migrated`, `absent` or `unknown` and one whose body can't be read, and the
+  preview says why. Nothing removes a marker except an explicit apply.
 - **R27.** Removing a marker removes every object under the source session's
   prefix, the marker last, so a failure part way leaves the marker refusing
   as before and a retry finishes the removal.
@@ -442,10 +445,11 @@ Migrated markers (fake S3 harness):
 - [ ] The marker preview lists each marker under the source prefix with its
   target, age, target status and removability; the four target statuses are
   each produced by a test.
-- [ ] A marker older than the bound is removable; a marker inside the bound
-  with a `present` target is removable only with the retired-source flag; a
-  marker with a `migrated`, `absent` or `unknown` target inside the bound is
-  kept even with the flag; an unreadable marker is kept.
+- [ ] A marker older than the bound with a `present` target is removable; a
+  marker inside the bound with a `present` target is removable only with the
+  retired-source flag; a marker with a `migrated`, `absent` or `unknown`
+  target is kept at any age and with or without the flag, and the preview
+  names the target status as the reason; an unreadable marker is kept.
 - [ ] Applying removes every object under the source session's prefix,
   marker last; with a delete failure injected part way, the marker is still
   there and the old name still refuses with `session_migrated`, and a retry
@@ -493,7 +497,8 @@ Documentation and verification:
   protecting its files; koto warns, and removal proceeds.
 - Removing a marker by age relies on the stopped-source rule koto already
   documents for import: a source host revived after the bound could advance
-  its old copy again.
+  its old copy again. The repository owner accepts that risk for multi-host
+  use.
 - Finished records are kept until a prune removes them or the name is
   reused.
 
@@ -510,10 +515,14 @@ Documentation and verification:
 - **A finished record instead of keeping finished sessions.** Keeping every
   finished session until a prune would answer koto#234 by changing what the
   terminal tick does. A record keeps today's removal and makes it visible.
-- **Marker removal: age, or a present target plus a retired source.** A
-  marker's job is to stop a stale source host from advancing its copy. The
-  newer session being present proves the session survived the move, not
-  that the old host is gone, so that branch needs the caller to state it.
+- **Marker removal: a present target, plus age or a retired source.** A
+  marker's job is to stop a stale source host from advancing its copy, and
+  removing it deletes the old copy too, so the newer session must exist and
+  not have moved on again before anything goes. Age past the bound is the
+  default proof that the old host is gone; a caller who knows sooner states
+  it with the retired-source flag. Past the bound a revived source host could
+  still fork its old copy; the repository owner accepts that risk for
+  multi-host use, which is a migration, never a shared session.
 - **Reader positions are written by the readers.** koto reads only the
   positions, never the journal's records, so retention never depends on
   journal content and nothing in the session store depends on the journal.
