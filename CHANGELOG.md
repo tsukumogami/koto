@@ -37,6 +37,21 @@ to `0.9.x`).
   nothing. No line holds a probability, hash, threshold, endpoint, rule
   reference, rationale or override value.
 
+- **The run journal records the context keys each state visit read.** When
+  a visit ends (an arrival elsewhere, a rewind, a cancel, or a terminal's
+  result), the journal gets one `context_reads` line per distinct key,
+  reader and access the visit read, in first-read order, with the read
+  count, how many reads found the key, and the first and last content
+  hashes. A visit writes at most 51 such lines: past 50 tuples, one
+  overflow line sums the rest. The lines come right before the
+  `state_entered`, `cancelled` or `terminal` that ends the visit, carry
+  `koto.seq` and `koto.visit.seq`, and never hold a context value, though
+  the key's name and the content's unsalted SHA-256 can reveal what a
+  session read, so the lines are host-local data to forward with care. A
+  key, reader or access outside the journal's name shape is written as its
+  digest. Reads made after a visit's terminal or cancel, and reads carried
+  in by `koto session import`, aren't journaled.
+
 - **The run journal records the size of each printed directive.** When
   `koto next` or `koto status` prints a non-terminal state's directive, koto
   now adds a `response` line with the state, the command (`next` or

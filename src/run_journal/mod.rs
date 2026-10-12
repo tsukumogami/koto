@@ -77,7 +77,16 @@
 //! reference, rationale, override value or output, and `koto.visit.seq` is
 //! always koto's visit, never the `visit_seq` a decider event carries.
 //!
-//! One more relays no event: `response`, written after `koto next` or
+//! One more sums a visit's `context_read` events when the visit ends (see
+//! `context_reads`). It carries `koto.seq` (the sequence number of the
+//! event that ended the visit) and `koto.visit.seq` (the visit that ended):
+//!
+//! - `context_reads`: one per distinct (key, reader, access) read in the
+//!   visit, in first-read order, with read and present counts and the first
+//!   and last present hashes; past 50 tuples, one overflow record sums the
+//!   rest. A key outside the name shape is written as its digest.
+//!
+//! And one relays no event: `response`, written after `koto next` or
 //! `koto status` prints a non-terminal state's directive, with the byte
 //! lengths of the printed `directive` and `details` (never their text).
 //! Its `koto.seq` is the highest sequence number in the session's log when
@@ -93,7 +102,8 @@
 //! `koto.response.source`). A value outside its shape is left out and the
 //! record is still written, with one exception: a rule id outside the name
 //! shape, a decider criterion's id included, is written as its digest
-//! ([`name_or_digest`]), never dropped.
+//! ([`name_or_digest`]), never dropped, and so is a `context_reads` key,
+//! reader or access.
 //!
 //! ## When records are written
 //!
@@ -108,12 +118,15 @@
 //!   `workflow_cancelled`, the check kinds for `gate_evaluated` and
 //!   `default_action_executed`, and the decider and override kinds for
 //!   `decider_consulted`, `decider_checked` and `gate_override_recorded`.
-//!   Before those, on any committed payload, it writes `driver_seen` when
-//!   the process's driver (`CLAUDE_CODE_SESSION_ID`, when id-shaped)
-//!   differs from the one the session's sidecar caches, or the sidecar
-//!   caches none, and then caches the new driver. No driver is never a
-//!   change. Two commands racing under one new driver can each write a
-//!   `driver_seen`; readers take the distinct values.
+//!   A commit that ends a visit (an arrival, a rewind, a cancel, or the
+//!   terminal tick's `request_store.result`) writes the visit's
+//!   `context_reads` just before its own record. Before those, on any
+//!   committed payload, it writes `driver_seen` when the process's driver
+//!   (`CLAUDE_CODE_SESSION_ID`, when id-shaped) differs from the one the
+//!   session's sidecar caches, or the sidecar caches none, and then caches
+//!   the new driver. No driver is never a change. Two commands racing under
+//!   one new driver can each write a `driver_seen`; readers take the
+//!   distinct values.
 //! - [`terminal`], from the terminal tick, writes `terminal` once per
 //!   arrival.
 //! - [`response`], from `koto next`'s two print sites and from
@@ -158,6 +171,7 @@
 //! state. Cloud sync and `koto session import` carry neither: they move the
 //! state log, version, template and context files only.
 
+mod context_reads;
 mod driver;
 mod fixture;
 #[cfg(unix)]
@@ -561,8 +575,9 @@ fn record_for(
     }
 }
 
-/// Whether a payload writes a record, without reading anything. A
-/// `context_read`, the commonest payload, never does.
+/// Whether a payload writes a record of its own, without reading anything.
+/// A `context_read`, the commonest payload, never does. (A payload that
+/// ends a visit can also write that visit's reads; see [`after_commit`].)
 fn journals(payload: &EventPayload) -> bool {
     matches!(
         payload,
@@ -919,9 +934,18 @@ pub(crate) fn after_init(
 /// first, whatever the payload, and the sidecar is then rewritten with the
 /// new driver. Two commands racing under the same new driver can each
 /// write one; readers take the distinct values, so the duplicate is
-/// harmless. Without a driver change, payloads other than state entries,
-/// cancels and check events write nothing and read nothing beyond the
-/// sidecar.
+/// harmless.
+///
+/// A payload that ends a visit (see `context_reads::closes_visit`: an
+/// arrival, a rewind, a cancel, or the terminal tick's
+/// `request_store.result`) first folds that visit's `context_read` events
+/// out of `commit`'s copy of the log, and writes the resulting
+/// `context_reads` after any `driver_seen` and before its own record. A
+/// `request_store.result` writes nothing else, so when its visit has no
+/// reads left to write, it reads nothing more. Without a driver change, a
+/// payload that is none of these (a state entry, a cancel, that result, a
+/// check, decider or override event) writes nothing and reads nothing
+/// beyond the sidecar.
 ///
 /// A check event (`gate_evaluated`, `default_action_executed`) relays its
 /// `check_evaluated` and `check_rule` records, or a `check_pending`; a
@@ -943,7 +967,15 @@ pub(crate) fn after_commit(
     };
     let session_dir = backend.session_dir(session);
     let new_driver = changed_driver(&session_dir);
-    if new_driver.is_none() && !journals(payload) {
+    // The visit a closing commit ends, and its reads still to be written.
+    // Folded before anything else is read, so a closing commit with nothing
+    // to write (a `request_store.result` in a visit with no reads) stops
+    // here.
+    let reads = context_reads::closes_visit(payload)
+        .then(|| commit.prior_visit_seq())
+        .flatten()
+        .and_then(|visit| Some((visit, context_reads::fold(&commit.prior_log, visit)?)));
+    if new_driver.is_none() && reads.is_none() && !journals(payload) {
         return;
     }
     let header = match header_of(commit, backend, session) {
@@ -970,9 +1002,21 @@ pub(crate) fn after_commit(
             .id("koto.driver.session.id", Some(d)),
         );
     }
+    // A commit that ends a visit writes that visit's reads first, before
+    // the `state_entered` or `cancelled` it maps to.
+    if let Some((visit_seq, fold)) = reads {
+        records.extend(fold.into_records(&Relay {
+            session,
+            session_id: &header.session_id,
+            run_id: run_id.as_deref(),
+            seq: commit.seq,
+            visit_seq: Some(visit_seq),
+        }));
+    }
     records.extend(record_for(payload, session, &header, run_id.as_deref()));
     // The visit is worked out only here, for a payload that relays records
-    // of its own: every other commit skips the scan of the log.
+    // of its own. Apart from the closing commits above, every other commit
+    // skips the scan of the log.
     if relays(payload) {
         records.extend(relayed(
             payload,

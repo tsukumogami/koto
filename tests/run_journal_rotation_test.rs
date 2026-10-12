@@ -209,7 +209,8 @@ fn session_of(line: &str) -> String {
 /// it. One command's commit is one batch: `koto init` writes
 /// `session_started` and the initial `state_entered`; a `driver_seen` rides
 /// with the record that follows it; a check event's records all carry its
-/// `koto.seq`.
+/// `koto.seq`, and so do a closing visit's `context_reads`, which ride with
+/// the `state_entered` or `cancelled` that follows them.
 fn same_batch(prev: &str, line: &str) -> bool {
     let p: Value = serde_json::from_str(prev).unwrap();
     let l: Value = serde_json::from_str(line).unwrap();
@@ -218,6 +219,8 @@ fn same_batch(prev: &str, line: &str) -> bool {
     }
     (p["kind"] == "session_started" && l["kind"] == "state_entered")
         || p["kind"] == "driver_seen"
+        || (p["kind"] == "context_reads"
+            && (l["kind"] == "state_entered" || l["kind"] == "cancelled"))
         || (!l["koto.seq"].is_null() && p["koto.seq"] == l["koto.seq"])
 }
 
@@ -354,6 +357,170 @@ fn eight_concurrent_writers_across_rotations_lose_and_repeat_nothing() {
     }
     let rotated = env.rotated();
     assert!(rotated.len() >= 2, "only {} rotations", rotated.len());
+    assert_rotated_at_the_bound(&rotated, bound);
+}
+
+/// `read` checks two context keys and moves on to `rest`, which loops back
+/// on `again: yes`. Each tick past the first enters `read`, whose gates read
+/// both keys and pass, so the tick then leaves `read`: that commit writes
+/// the visit's two `context_reads` and the `state_entered` for `rest` as one
+/// batch.
+const CONTEXT_TEMPLATE: &str = r#"---
+name: rotation-context
+version: "1.0"
+initial_state: read
+states:
+  read:
+    gates:
+      has_spec:
+        type: context-exists
+        key: spec
+      note_ok:
+        type: context-matches
+        key: note
+        pattern: "^ok"
+    transitions:
+      - target: rest
+  rest:
+    accepts:
+      again:
+        type: enum
+        required: true
+        values: ["yes", "no"]
+    transitions:
+      - target: read
+        when:
+          again: "yes"
+      - target: done
+        when:
+          again: "no"
+  done:
+    terminal: true
+---
+
+## read
+
+Read.
+
+## rest
+
+Rest.
+
+## done
+
+Done.
+"#;
+
+/// Four writers each end eleven visits that read context, under a bound
+/// smaller than one closing batch, so nearly every closing commit finds the
+/// journal over the bound. Each visit's two `context_reads` land in the
+/// same file as the `state_entered` that ends the visit, right before it,
+/// whatever the other writers do, and every session has exactly the lines
+/// its visits call for.
+#[test]
+fn a_closing_batch_with_context_reads_lands_whole_in_one_file() {
+    const WRITERS: usize = 4;
+    const TICKS: usize = 10;
+    let bound = 700;
+
+    let env = Env::new();
+    env.set_bound(bound);
+    let template = env.work.join("rotation-context.md");
+    std::fs::write(&template, CONTEXT_TEMPLATE).unwrap();
+    let content = env.work.join("context-input.txt");
+    std::fs::write(&content, "ok, the note").unwrap();
+    for w in 0..WRITERS {
+        let name = format!("c{w}");
+        env.ok(&["init", &name, "--template", template.to_str().unwrap()]);
+        for key in ["spec", "note"] {
+            env.ok(&[
+                "context",
+                "add",
+                &name,
+                key,
+                "--from-file",
+                content.to_str().unwrap(),
+            ]);
+        }
+    }
+    std::thread::scope(|s| {
+        for w in 0..WRITERS {
+            let env = &env;
+            s.spawn(move || {
+                let name = format!("c{w}");
+                // The first tick evaluates `read`'s gates and leaves it.
+                let out = env.run(&["next", &name, "--no-cleanup"]);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(out.status.success(), "koto next {name}: {stderr}");
+                assert!(!stderr.contains("run journal"), "{stderr}");
+                for _ in 0..TICKS {
+                    env.tick(&name);
+                }
+            });
+        }
+    });
+
+    // Every line, with the index of the file it is in.
+    let mut lines: Vec<(usize, Value)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (i, f) in env.all_files().iter().enumerate() {
+        for line in std::fs::read_to_string(f).unwrap().lines() {
+            assert!(seen.insert(line.to_string()), "line written twice: {line}");
+            let v: Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("torn line ({e}): {line}"));
+            lines.push((i, v));
+        }
+    }
+
+    // Walk each run of one session's `context_reads` sharing a `koto.seq`.
+    let mut runs: BTreeMap<String, usize> = BTreeMap::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let (file, first) = &lines[i];
+        if first["kind"] != "context_reads" {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < lines.len()
+            && lines[j].1["kind"] == "context_reads"
+            && lines[j].1["session"] == first["session"]
+            && lines[j].1["koto.seq"] == first["koto.seq"]
+        {
+            assert_eq!(lines[j].0, *file, "a visit's reads span two files");
+            j += 1;
+        }
+        let keys: Vec<&str> = lines[i..j]
+            .iter()
+            .map(|(_, r)| r["koto.context.key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, vec!["spec", "note"], "{first}");
+        let (end_file, ender) = lines
+            .get(j)
+            .unwrap_or_else(|| panic!("the journal ends after a visit's reads: {first}"));
+        assert_eq!(
+            *end_file, *file,
+            "the reads and their state entry split: {ender}"
+        );
+        assert_eq!(ender["kind"], "state_entered", "{ender}");
+        assert_eq!(ender["session"], first["session"], "{ender}");
+        assert_eq!(ender["koto.state"], "rest", "{ender}");
+        *runs
+            .entry(first["session"].as_str().unwrap().to_string())
+            .or_default() += 1;
+        i = j + 1;
+    }
+    for w in 0..WRITERS {
+        let name = format!("c{w}");
+        assert_eq!(runs.get(&name), Some(&(TICKS + 1)), "{name}: {runs:?}");
+        let reads = lines
+            .iter()
+            .filter(|(_, r)| r["session"] == name.as_str() && r["kind"] == "context_reads")
+            .count();
+        assert_eq!(reads, 2 * (TICKS + 1), "{name}");
+    }
+    let rotated = env.rotated();
+    assert!(rotated.len() >= 4, "only {} rotations", rotated.len());
     assert_rotated_at_the_bound(&rotated, bound);
 }
 
