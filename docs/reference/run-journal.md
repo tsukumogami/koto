@@ -3,8 +3,9 @@
 The run journal is a local record of session identity and progress for
 tooling outside koto. koto appends one JSON object per line as sessions
 start, enter states, reach a terminal, are cancelled, or are driven by a new
-Claude Code session, and each time koto evaluates one of their checks. The
-journal is append-only: koto never rewrites or reads back its records, so a
+Claude Code session, each time koto evaluates one of their checks, and once
+per state visit for the context keys the visit read. The journal is
+append-only: koto never rewrites or reads back its records, so a
 session's lines outlive the session itself, including sessions koto removes
 at their terminal tick or on `koto session cleanup`.
 
@@ -55,13 +56,14 @@ Records start with these fields:
 
 A field with no value is left out, never written as `null` or an empty
 string. Ids (every `*.id` field except `koto.rule.id`, and
-`koto.template.hash`) must match `^[A-Za-z0-9._:-]{1,128}$`. Names
-(`koto.template.name`, `koto.state`, `koto.terminal`, `koto.check`, and
-the string values of the check kinds) must match
+`koto.template.hash`, `koto.context.first_hash` and `koto.context.last_hash`)
+must match `^[A-Za-z0-9._:-]{1,128}$`. Names (`koto.template.name`,
+`koto.state`, `koto.terminal`, `koto.check`, `koto.context.key`, and the
+string values of the check and context kinds) must match
 `^[A-Za-z0-9._:/@-]{1,128}$` and not start with `/` or `~`. A value outside
-its shape is left out and the record is still written. `koto.rule.id` is
-never left out: a rule id outside the name shape is written as its digest
-(see [Rule ids](#rule-ids)).
+its shape is left out and the record is still written. `koto.rule.id` and
+`koto.context.key` are never left out: a rule id or context key outside the
+name shape is written as its digest (see [Rule ids](#rule-ids)).
 
 ### Record kinds
 
@@ -75,9 +77,11 @@ never left out: a rule id outside the name shape is written as its digest
 | `check_evaluated` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.check.outcome`, `koto.attempt`, `koto.visit_attempt`, `koto.check.rule_count`, `koto.check.rule_counts_truncated`, `koto.check.duration_ms`, `koto.poll.status`, `koto.check.unanswered_count`, `koto.check.error` | koto evaluates a gate and the result isn't pending, or runs a state's default action. |
 | `check_rule` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.rule.visit_count`, `koto.rule.session_count` | Once for each error rule of a check evaluation, after its `check_evaluated`. |
 | `check_pending` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.poll.status`, `koto.poll.evaluations`, `koto.poll.elapsed_secs` | A polling gate's evaluation is still pending. |
+| `context_reads` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.context.key`, `koto.context.reader`, `koto.context.access`, `koto.context.overflow`, `koto.context.read_count`, `koto.context.present_count`, `koto.context.first_hash`, `koto.context.last_hash` | A state visit that read context keys ends. |
 
-The first five are the identity kinds. The last three are the check kinds,
-described in [Check records](#check-records).
+The first five are the identity kinds. The three `check_` kinds are the
+check kinds, described in [Check records](#check-records). `context_reads`
+is described in [Context reads](#context-reads).
 
 `session_started`'s fields:
 
@@ -236,6 +240,75 @@ literal id of that form can't be told apart from a digest.
 {"kind":"check_pending","v":1,"at":"2026-10-10T03:21:40.502Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":19,"koto.visit.seq":17,"koto.state":"ci","koto.check":"ci","koto.poll.status":"pending","koto.poll.evaluations":2,"koto.poll.elapsed_secs":31}
 ```
 
+## Context reads
+
+koto logs every read of a context key it makes on a session's behalf (a
+context gate's check, `koto context get` and `koto context exists`, a
+terminal's result map, a decider's context input) as an event in the
+session's log. The journal never gets a line per read. When a state visit
+ends, koto sums the visit's reads into `context_reads` records: one per
+distinct key, reader and access, in the order each was first read. A visit's
+first 50 distinct tuples get records of their own. The reads of any further
+tuples are summed into one more record, marked `koto.context.overflow`, that
+names no key, reader or access. So a visit writes at most 51 context lines.
+
+A context-read record carries `koto.seq` and `koto.visit.seq` like a check
+record, with two differences: `koto.seq` is the sequence number of the
+session-log event that ended the visit (the highest in the log when the
+record is written), and `koto.visit.seq` is the visit that ended, not the
+one that event begins. No record holds a context value, only its hash.
+
+### When a visit's reads are written
+
+The records go in the same write as the record of the event that ends the
+visit, right before it:
+
+- An arrival in another state, or a rewind: before its `state_entered`.
+- `koto cancel` or a respawn fallback's cancellation: before `cancelled`.
+- A terminal: the terminal state's own visit, whose reads are the result
+  map's, ends with the result event koto's terminal tick appends to the
+  session's log. Its context lines are written then, and the `terminal`
+  record follows at once.
+
+A transition from a state to itself stays in the visit and writes none.
+A visit's reads are written once. If the terminal tick couldn't append its
+result event, the terminal visit's reads stay open and the next arrival
+(a rewind out of the terminal) writes them.
+
+### `context_reads`
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.state` | string | always | The state of the visit, as its reads name it. |
+| `koto.context.key` | string | except on the overflow record | The key, or its digest when it's outside the name shape (any key longer than 128 bytes), computed as for [Rule ids](#rule-ids). |
+| `koto.context.reader` | string | except on the overflow record | Who read it: `gate`, `cli`, `result` or `decider`. |
+| `koto.context.access` | string | except on the overflow record | `content` for a read that fetched the content, `presence` for one that asked only whether the key exists. |
+| `koto.context.overflow` | boolean | on the overflow record only | `true`: the record sums the reads of every tuple past the visit's first 50. |
+| `koto.context.read_count` | integer | always | Reads of the tuple in the visit, at least 1. |
+| `koto.context.present_count` | integer | always | Those of them that found the key. |
+| `koto.context.first_hash` | string | when `koto.context.present_count` is at least 1, except on the overflow record | The SHA-256 of the content the first read that found the key saw, in lowercase hex, as the session log records it. |
+| `koto.context.last_hash` | string | as `koto.context.first_hash` | The same for the last such read. Equal to the first when the content didn't change. |
+
+### What writes no context-read record
+
+- Reads koto doesn't log: `koto status`, and koto's own bookkeeping.
+- Reads in a visit after its `terminal` or `cancelled` record was written,
+  such as `koto context get` on a kept terminal session or on a cancelled
+  one.
+- The reads in a log carried in by `koto session import`. An imported
+  session's open visit counts only the reads made after the import.
+- A visit still open when the session is removed without a `terminal` or
+  `cancelled` record.
+- Reads logged by a koto that predates context-read records, in a visit
+  that ended before the upgrade.
+
+### Example
+
+```json
+{"kind":"context_reads","v":1,"at":"2026-10-10T03:40:11.207Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":31,"koto.visit.seq":17,"koto.state":"ci","koto.context.key":"review/notes.md","koto.context.reader":"gate","koto.context.access":"content","koto.context.read_count":3,"koto.context.present_count":2,"koto.context.first_hash":"5f0c2a6b1d4e8f3a9c7b2e1d0f4a6c8b3e5d7f9a1c2b4d6e8f0a3c5b7d9e1f2a","koto.context.last_hash":"9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d"}
+{"kind":"state_entered","v":1,"at":"2026-10-10T03:40:11.207Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.state":"merge"}
+```
+
 ## Run ids
 
 A run is a root session and every session spawned under it, at any depth.
@@ -272,11 +345,16 @@ An imported session is a new run: its own id is its run id.
 - Order one session's check records by `koto.seq`, then by file order.
   A `check_evaluated` comes before its own `check_rule` records, which
   share its `koto.seq`.
+- A visit's `context_reads` come after any `driver_seen` of the same
+  command and right before the `state_entered`, `cancelled` or `terminal`
+  that ends the visit, and share its `koto.seq`. Records of one visit
+  differ in their key, reader and access.
 - A copy of the journal that delivered some lines more than once (a
   sender that retries, for example) holds exact duplicates. Treat two
-  check records as duplicates only when every field, `at` included, is
-  equal. Distinct check records differ in `kind`, `at`, `koto.seq` or
-  `koto.rule.id`.
+  check and context-read records as duplicates only when every field, `at`
+  included, is equal. Distinct check records differ in `kind`, `at`,
+  `koto.seq` or `koto.rule.id`, and distinct context-read records in `at`,
+  `koto.seq` or their key, reader and access.
 - `koto session import` writes the imported session's `session_started` and
   one `state_entered` for the state it's in, both timed at the import,
   exactly once per imported session. A retry or a rerun that adopts an
@@ -368,7 +446,9 @@ they're written, so a koto process that crashes or is killed loses none of
 them, and the next identity record's flush (the session's next state
 entry, terminal or cancel) makes them durable along with it. An operating
 system crash or a power loss can lose check records written since the
-journal's last flush.
+journal's last flush. Context-read records are written with the identity
+record that ends their visit, or, at a terminal, just before the flushed
+`terminal`, so they're made durable with it.
 
 ## Retention
 
@@ -377,8 +457,9 @@ No session-lifecycle command deletes or rewrites the journal:
 at its terminal tick, a parent's sweep of its children,
 `koto init --replace-terminal` and `koto session import` all leave existing
 lines byte-identical. koto doesn't rotate or prune it yet, so it grows by
-a few hundred bytes per state entered and per check evaluation, and by up
-to 50 more lines for a check that reports many error rules.
+a few hundred bytes per state entered and per check evaluation, by up to
+50 more lines for a check that reports many error rules, and by up to 51
+lines per visit for the context keys it read.
 
 To remove it by hand, delete the file (or move it aside) while no koto
 command is running. The next record creates a new file. Lines removed this

@@ -1444,3 +1444,627 @@ fn check_records_fit_the_line_cap_at_the_longest_names() {
         assert!(lines.iter().any(|l| l.contains(id.as_str())), "{id}");
     }
 }
+
+// ----- Context reads -----
+
+/// The fields a `context_reads` record may carry beyond [`RELAY_FIELDS`].
+const CONTEXT_READS_FIELDS: &[&str] = &[
+    "koto.state",
+    "koto.context.key",
+    "koto.context.reader",
+    "koto.context.access",
+    "koto.context.overflow",
+    "koto.context.read_count",
+    "koto.context.present_count",
+    "koto.context.first_hash",
+    "koto.context.last_hash",
+];
+
+/// The `context_reads` records in `j`, each checked to carry `v` 1, both
+/// sequence numbers, only the kind's fields, and each field exactly when
+/// the reference says: the tuple's names unless it is the overflow record,
+/// the hashes only when a read found the key.
+fn context_records(j: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    j.iter()
+        .filter(|r| r["kind"] == "context_reads")
+        .map(|r| {
+            let allowed: BTreeSet<&str> = RELAY_FIELDS
+                .iter()
+                .chain(CONTEXT_READS_FIELDS)
+                .copied()
+                .collect();
+            for (key, value) in r.as_object().unwrap() {
+                assert!(
+                    allowed.contains(key.as_str()),
+                    "context_reads carries {key}: {r}"
+                );
+                assert!(!value.is_null() && value != "", "{key}: {r}");
+            }
+            assert_eq!(r["v"], 1);
+            assert!(r["koto.seq"].is_u64(), "{r}");
+            assert!(r["koto.visit.seq"].is_u64(), "{r}");
+            assert!(r["koto.state"].is_string(), "{r}");
+            assert!(r["koto.context.read_count"].is_u64(), "{r}");
+            assert!(r["koto.context.present_count"].is_u64(), "{r}");
+            let overflow = r.get("koto.context.overflow").is_some();
+            if overflow {
+                assert_eq!(r["koto.context.overflow"], true, "{r}");
+            }
+            for named in [
+                "koto.context.key",
+                "koto.context.reader",
+                "koto.context.access",
+            ] {
+                assert_eq!(r.get(named).is_some(), !overflow, "{named}: {r}");
+            }
+            let found = r["koto.context.present_count"].as_u64().unwrap() > 0 && !overflow;
+            for hash in ["koto.context.first_hash", "koto.context.last_hash"] {
+                assert_eq!(r.get(hash).is_some(), found, "{hash}: {r}");
+            }
+            r.clone()
+        })
+        .collect()
+}
+
+/// A logged read of `key` by `reader` in `state`: present with `content`'s
+/// hash, or absent.
+fn read_of(
+    state: &str,
+    key: &str,
+    reader: &str,
+    access: &str,
+    content: Option<&str>,
+) -> EventPayload {
+    EventPayload::ContextRead {
+        key: key.into(),
+        reader: reader.into(),
+        state: state.into(),
+        present: content.is_some(),
+        hash: content.map(|c| crate::cache::sha256_hex(c.as_bytes())),
+        access: Some(access.into()),
+        gate: (reader == "gate").then(|| "g".to_string()),
+    }
+}
+
+fn gate_read(state: &str, key: &str, content: Option<&str>) -> EventPayload {
+    read_of(state, key, "gate", "content", content)
+}
+
+fn cli_read(state: &str, key: &str, content: Option<&str>) -> EventPayload {
+    read_of(state, key, "cli", "content", content)
+}
+
+fn hash_of(content: &str) -> String {
+    crate::cache::sha256_hex(content.as_bytes())
+}
+
+fn rewound(from: &str, to: &str) -> EventPayload {
+    EventPayload::Rewound {
+        from: from.into(),
+        to: to.into(),
+        rationale: None,
+    }
+}
+
+fn cancelled(state: &str) -> EventPayload {
+    EventPayload::WorkflowCancelled {
+        state: state.into(),
+        reason: "PLANTED-REASON".into(),
+    }
+}
+
+fn store_result() -> EventPayload {
+    EventPayload::RequestStoreResult {
+        result: crate::engine::types::WorkflowResult::with_string_payload(
+            crate::engine::types::TerminalOutcome::Success,
+            "PLANTED-SUMMARY",
+            [("pr", "PLANTED-RESULT-VALUE")],
+        ),
+        failure_reason: None,
+    }
+}
+
+/// The session's last event's `seq`, read from its log.
+fn last_seq(f: &Fixture, session: &str) -> u64 {
+    f.backend
+        .read_events(session)
+        .unwrap()
+        .1
+        .last()
+        .unwrap()
+        .seq
+}
+
+/// (key, reader, access, read count, present count) of each record.
+fn tuples(c: &[serde_json::Value]) -> Vec<(String, String, String, u64, u64)> {
+    c.iter()
+        .map(|r| {
+            let s = |k: &str| r[k].as_str().unwrap_or("-").to_string();
+            (
+                s("koto.context.key"),
+                s("koto.context.reader"),
+                s("koto.context.access"),
+                r["koto.context.read_count"].as_u64().unwrap(),
+                r["koto.context.present_count"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Within one visit: two keys a gate reads and one `koto context get`
+/// reads give three records, in first-read order; a key read once absent
+/// and twice present counts 3 and 2, with the second and third reads'
+/// hashes. They are written at the arrival that ends the visit, before its
+/// `state_entered`, in the same flushed batch, carrying the arrival's seq
+/// (the highest in the log when they're written) and the closing visit's.
+#[test]
+fn a_visits_reads_fold_into_one_record_per_tuple_before_the_arrival_that_ends_it() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &gate_read("a", "notes", None)); // 3
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &read_of("a", "spec", "gate", "presence", Some("s1")),
+    ); // 4
+    commit_as(&f, None, "wf", &gate_read("a", "notes", Some("n1"))); // 5
+    commit_as(&f, None, "wf", &cli_read("a", "plan", Some("p1"))); // 6
+    commit_as(&f, None, "wf", &gate_read("a", "notes", Some("n2"))); // 7
+    reset_for_test();
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 8
+    assert_eq!(batches_for_test(), (1, 1), "one flushed batch");
+    assert_eq!(last_seq(&f, "wf"), 8);
+
+    let j = f.journal();
+    let tail: Vec<String> = kinds(&j).into_iter().rev().take(4).rev().collect();
+    assert_eq!(
+        tail,
+        vec![
+            "context_reads",
+            "context_reads",
+            "context_reads",
+            "state_entered"
+        ]
+    );
+    let c = context_records(&j);
+    let t = |k: &str, r: &str, a: &str, n, p| (k.into(), r.into(), a.into(), n, p);
+    assert_eq!(
+        tuples(&c),
+        vec![
+            t("notes", "gate", "content", 3, 2),
+            t("spec", "gate", "presence", 1, 1),
+            t("plan", "cli", "content", 1, 1),
+        ]
+    );
+    assert_eq!(c[0]["koto.context.first_hash"], hash_of("n1"));
+    assert_eq!(c[0]["koto.context.last_hash"], hash_of("n2"));
+    assert_eq!(c[1]["koto.context.first_hash"], hash_of("s1"));
+    assert_eq!(c[1]["koto.context.last_hash"], hash_of("s1"));
+    for r in &c {
+        assert_eq!(r["koto.seq"], 8);
+        assert_eq!(r["koto.visit.seq"], 2);
+        assert_eq!(r["koto.state"], "a");
+        assert_eq!(r["koto.run.id"], "wf-id");
+    }
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    for content in ["n1", "n2", "s1", "p1"] {
+        assert!(!raw.contains(&format!("\"{content}\"")), "{raw}");
+    }
+
+    // The next visit's arrival writes that visit's reads only.
+    commit_as(&f, None, "wf", &gate_read("b", "notes", Some("n2"))); // 9
+    commit_as(&f, None, "wf", &transitioned(Some("b"), "c")); // 10
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 4);
+    assert_eq!(tuples(&c[3..]), vec![t("notes", "gate", "content", 1, 1)]);
+    assert_eq!(c[3]["koto.visit.seq"], 8);
+    assert_eq!(c[3]["koto.seq"], 10);
+    assert_eq!(c[3]["koto.state"], "b");
+}
+
+/// A self-transition stays in the visit, so it writes no reads, and the
+/// reads on both sides of it are one visit's.
+#[test]
+fn a_self_transition_writes_no_reads_and_keeps_counting_the_visit() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &gate_read("a", "k", None)); // 3
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "a")); // 4
+    assert!(context_records(&f.journal()).is_empty());
+    commit_as(&f, None, "wf", &gate_read("a", "k", Some("v"))); // 5
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 6
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0]["koto.context.read_count"], 2);
+    assert_eq!(c[0]["koto.visit.seq"], 2);
+}
+
+/// 52 distinct keys read in one visit write 50 records and one overflow
+/// record, which sums the reads of the other two and names none of them.
+/// A tuple already kept goes on counting in its own record.
+#[test]
+fn fifty_two_keys_write_fifty_records_and_one_overflow_record() {
+    let f = session_in_a();
+    for i in 0..52 {
+        commit_as(&f, None, "wf", &gate_read("a", &format!("k{i:02}"), None));
+    }
+    commit_as(&f, None, "wf", &gate_read("a", "k50", Some("x")));
+    commit_as(&f, None, "wf", &gate_read("a", "k51", Some("y")));
+    commit_as(&f, None, "wf", &gate_read("a", "k00", Some("z")));
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b"));
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 51);
+    let keys: Vec<String> = c[..50]
+        .iter()
+        .map(|r| r["koto.context.key"].as_str().unwrap().to_string())
+        .collect();
+    let expected: Vec<String> = (0..50).map(|i| format!("k{i:02}")).collect();
+    assert_eq!(keys, expected);
+    assert_eq!(c[0]["koto.context.read_count"], 2);
+    assert_eq!(c[0]["koto.context.present_count"], 1);
+    let overflow = &c[50];
+    assert_eq!(overflow["koto.context.overflow"], true);
+    assert_eq!(overflow["koto.context.read_count"], 4);
+    assert_eq!(overflow["koto.context.present_count"], 2);
+    assert_eq!(overflow["koto.state"], "a");
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("k50") && !raw.contains("k51"), "{raw}");
+}
+
+/// A key outside the name shape (longer than 128 bytes) is written as its
+/// digest, and one at 128 bytes as itself.
+#[test]
+fn a_key_outside_the_name_shape_is_digested() {
+    let f = session_in_a();
+    let long = format!("k{}", "e".repeat(200));
+    let edge = "q".repeat(128);
+    commit_as(&f, None, "wf", &gate_read("a", &long, None));
+    commit_as(&f, None, "wf", &gate_read("a", &edge, None));
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b"));
+    let c = context_records(&f.journal());
+    assert_eq!(c[0]["koto.context.key"], name_or_digest(&long).as_str());
+    assert!(c[0]["koto.context.key"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert_eq!(c[1]["koto.context.key"], edge.as_str());
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains(&long), "{raw}");
+}
+
+/// A rewind ends the visit it leaves: its reads are written before the
+/// rewind's `state_entered`, and the visit it opens counts from zero.
+#[test]
+fn a_rewind_writes_the_visit_it_leaves_once() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 3
+    commit_as(&f, None, "wf", &gate_read("b", "k", Some("v"))); // 4
+    commit_as(&f, None, "wf", &rewound("b", "a")); // 5
+    commit_as(&f, None, "wf", &gate_read("a", "k", None)); // 6
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 7
+    let j = f.journal();
+    let c = context_records(&j);
+    let seqs: Vec<(u64, u64, &str, u64)> = c
+        .iter()
+        .map(|r| {
+            (
+                r["koto.seq"].as_u64().unwrap(),
+                r["koto.visit.seq"].as_u64().unwrap(),
+                r["koto.state"].as_str().unwrap(),
+                r["koto.context.read_count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(seqs, vec![(5, 3, "b", 1), (7, 5, "a", 1)]);
+    // Each before the `state_entered` of the event that ended its visit.
+    let k = kinds(&j);
+    let positions: Vec<usize> = k
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| *k == "context_reads")
+        .map(|(i, _)| i)
+        .collect();
+    for i in positions {
+        assert_eq!(k[i + 1], "state_entered");
+    }
+}
+
+/// A cancel writes the open visit's reads before `cancelled`. Reads after
+/// it aren't journaled: a second cancel and a later rewind write no reads.
+#[test]
+fn a_cancel_writes_the_open_visit_and_a_second_cancel_writes_nothing_more() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &gate_read("a", "k", Some("v"))); // 3
+    commit_as(&f, None, "wf", &gate_read("a", "k", Some("v"))); // 4
+    reset_for_test();
+    commit_as(&f, None, "wf", &cancelled("a")); // 5
+    assert_eq!(batches_for_test(), (1, 1));
+    let tail: Vec<String> = kinds(&f.journal())
+        .into_iter()
+        .rev()
+        .take(2)
+        .rev()
+        .collect();
+    assert_eq!(tail, vec!["context_reads", "cancelled"]);
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0]["koto.context.read_count"], 2);
+    assert_eq!(c[0]["koto.seq"], 5);
+    assert_eq!(c[0]["koto.visit.seq"], 2);
+
+    // A read after the cancel, a second cancel (another process racing the
+    // first, or a respawn fallback), then a rewind out of it.
+    commit_as(&f, None, "wf", &cli_read("a", "k", Some("v"))); // 6
+    commit_as(&f, None, "wf", &cancelled("a")); // 7
+    commit_as(&f, None, "wf", &rewound("a", "a")); // 8
+    let j = f.journal();
+    assert_eq!(context_records(&j).len(), 1, "{j:?}");
+    let tail: Vec<String> = kinds(&j).into_iter().rev().take(2).rev().collect();
+    assert_eq!(tail, vec!["cancelled", "state_entered"]);
+    // The rewind opened a visit of its own, which counts its own reads.
+    commit_as(&f, None, "wf", &gate_read("a", "k", None)); // 9
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 10
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 2);
+    assert_eq!(c[1]["koto.visit.seq"], 8);
+    assert_eq!(c[1]["koto.context.read_count"], 1);
+}
+
+/// The terminal tick's `request_store.result` ends the terminal state's
+/// visit: its batch holds the visit's reads alone, unflushed, and the
+/// `terminal` record's flushed write follows. A read on the kept terminal
+/// afterwards isn't journaled, and a rewind out of it writes no reads.
+#[test]
+fn request_store_result_writes_the_terminal_visit_and_a_rewind_out_of_it_writes_nothing() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &gate_read("a", "k", Some("v"))); // 3
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "done")); // 4
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &read_of("done", "k", "result", "content", Some("v")),
+    ); // 5
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &read_of("done", "gone", "result", "content", None),
+    ); // 6
+    reset_for_test();
+    commit_as(&f, None, "wf", &store_result()); // 7
+    assert_eq!(batches_for_test(), (1, 0), "context reads alone, unflushed");
+    let header = f.backend.read_header("wf").unwrap();
+    terminal(Some(&f.home), &f.backend, "wf", &header, "done");
+    assert_eq!(batches_for_test(), (2, 1), "the terminal is flushed");
+
+    let j = f.journal();
+    let tail: Vec<String> = kinds(&j).into_iter().rev().take(3).rev().collect();
+    assert_eq!(tail, vec!["context_reads", "context_reads", "terminal"]);
+    let c = context_records(&j);
+    let t = |k: &str, n, p| {
+        (
+            k.to_string(),
+            "result".to_string(),
+            "content".to_string(),
+            n,
+            p,
+        )
+    };
+    assert_eq!(tuples(&c[1..]), vec![t("k", 1, 1), t("gone", 1, 0)]);
+    for r in &c[1..] {
+        assert_eq!(r["koto.seq"], 7);
+        assert_eq!(r["koto.visit.seq"], 4);
+        assert_eq!(r["koto.state"], "done");
+    }
+
+    // `koto context get` on the kept terminal, then a rewind out of it.
+    commit_as(&f, None, "wf", &cli_read("done", "k", Some("v"))); // 8
+    commit_as(&f, None, "wf", &rewound("done", "a")); // 9
+    let j = f.journal();
+    assert_eq!(context_records(&j).len(), 3, "nothing more: {j:?}");
+    assert_eq!(kinds(&j).last().unwrap(), "state_entered");
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("PLANTED"), "{raw}");
+}
+
+/// When the terminal tick's `request_store.result` failed to commit, the
+/// terminal visit's reads stay in the log, and the next arrival writes
+/// them once.
+#[test]
+fn a_failed_request_store_result_leaves_the_visit_to_the_next_arrival() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "failed")); // 3
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &read_of("failed", "failure_reason", "result", "content", Some("r")),
+    ); // 4
+       // No `request_store.result`: its append failed. The terminal is still
+       // recorded.
+    let header = f.backend.read_header("wf").unwrap();
+    terminal(Some(&f.home), &f.backend, "wf", &header, "failed");
+    assert!(context_records(&f.journal()).is_empty());
+    commit_as(&f, None, "wf", &rewound("failed", "a")); // 5
+    let j = f.journal();
+    let c = context_records(&j);
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0]["koto.state"], "failed");
+    assert_eq!(c[0]["koto.seq"], 5);
+    assert_eq!(c[0]["koto.visit.seq"], 3);
+    assert_eq!(c[0]["koto.context.read_count"], 1);
+    let tail: Vec<String> = kinds(&j).into_iter().rev().take(2).rev().collect();
+    assert_eq!(tail, vec!["context_reads", "state_entered"]);
+    // Another arrival writes nothing more for that visit.
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 6
+    assert_eq!(context_records(&f.journal()).len(), 1);
+}
+
+/// An imported session's log carries the source's reads in its open visit,
+/// before its `session_imported`. Only the reads after the import are
+/// written when that visit ends.
+#[test]
+fn an_imported_sessions_visit_counts_only_the_reads_after_the_import() {
+    let f = Fixture::new();
+    let events = vec![
+        event(
+            1,
+            EventPayload::WorkflowInitialized {
+                template_path: String::new(),
+                variables: Default::default(),
+                spawn_entry: None,
+            },
+        ),
+        event(2, transitioned(None, "a")),
+        event(3, gate_read("a", "k", Some("v"))),
+        event(4, gate_read("a", "k", Some("v"))),
+        event(
+            5,
+            EventPayload::SessionImported {
+                from_workspace: "PLANTED-WORKSPACE".into(),
+                from_session: "wf".into(),
+                from_session_id: "src-id".into(),
+                machine_id: "m".into(),
+            },
+        ),
+    ];
+    f.backend
+        .init_state_file("wf", header("wf", "wf-id", None), events)
+        .unwrap();
+    commit_as(&f, None, "wf", &gate_read("a", "k", None)); // 6
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 7
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0]["koto.context.read_count"], 1);
+    assert_eq!(c[0]["koto.context.present_count"], 0);
+    assert_eq!(c[0]["koto.visit.seq"], 2);
+    assert_eq!(c[0]["koto.seq"], 7);
+
+    // An import with no read after it writes nothing.
+    let g = Fixture::new();
+    let mut events = vec![
+        event(
+            1,
+            EventPayload::WorkflowInitialized {
+                template_path: String::new(),
+                variables: Default::default(),
+                spawn_entry: None,
+            },
+        ),
+        event(2, transitioned(None, "a")),
+        event(3, gate_read("a", "k", Some("v"))),
+    ];
+    events.push(event(
+        4,
+        EventPayload::SessionImported {
+            from_workspace: "w".into(),
+            from_session: "wf".into(),
+            from_session_id: "src-id".into(),
+            machine_id: "m".into(),
+        },
+    ));
+    g.backend
+        .init_state_file("wf", header("wf", "wf-id", None), events)
+        .unwrap();
+    commit_as(&g, None, "wf", &transitioned(Some("a"), "b"));
+    assert!(context_records(&g.journal()).is_empty());
+}
+
+/// Under a new driver, an arrival's batch is `driver_seen`, the visit's
+/// reads, then `state_entered`.
+#[test]
+fn a_new_drivers_record_comes_before_the_visits_reads() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &gate_read("a", "k", None));
+    commit_as(&f, Some("driver-z"), "wf", &transitioned(Some("a"), "b"));
+    let tail: Vec<String> = kinds(&f.journal())
+        .into_iter()
+        .rev()
+        .take(3)
+        .rev()
+        .collect();
+    assert_eq!(tail, vec!["driver_seen", "context_reads", "state_entered"]);
+}
+
+/// A visit of 10,000 events (reads of 60 keys, check events with output,
+/// evidence; a 4 MB log) keeps the arrival that ends it within the hot-path
+/// budget: the work the fold adds to that commit (finding the visit and
+/// folding its reads) takes under 15 ms, and the visit writes 51 lines.
+///
+/// The budget is for release builds, which is how koto's hot-path cost is
+/// measured; an optimized test run (`cargo test --release`) holds it. A
+/// debug build parses JSON tens of times slower, so there the bound only
+/// catches work that grows faster than the visit.
+#[test]
+fn a_ten_thousand_event_visit_folds_within_budget() {
+    let f = Fixture::new();
+    let mut events = vec![
+        event(
+            1,
+            EventPayload::WorkflowInitialized {
+                template_path: String::new(),
+                variables: Default::default(),
+                spawn_entry: None,
+            },
+        ),
+        event(2, transitioned(None, "a")),
+    ];
+    let output = serde_json::json!({"exit_code": 1, "error": "", "stdout": "x".repeat(2000)});
+    for i in 0..10_000u64 {
+        let payload = match i % 10 {
+            0 => gate_event(
+                "a",
+                "lint",
+                "failed",
+                output.clone(),
+                stamped(i + 1, i + 1, None),
+                None,
+            ),
+            1 => evidence("a"),
+            n => gate_read("a", &format!("key-{}", (i / 10 * 8 + n) % 60), Some("v")),
+        };
+        events.push(event(3 + i, payload));
+    }
+    f.backend
+        .init_state_file("wf", header("wf", "wf-id", None), events)
+        .unwrap();
+    let path = f
+        .backend
+        .session_dir("wf")
+        .join(crate::session::state_file_name("wf"));
+    let log = std::fs::read_to_string(&path).unwrap();
+    let relay = Relay {
+        session: "wf",
+        session_id: "wf-id",
+        run_id: Some("wf-id"),
+        seq: 10_003,
+        visit_seq: Some(2),
+    };
+    let mut times = Vec::new();
+    let mut lines = 0;
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        let visit = crate::engine::persistence::visit_start(&log).unwrap();
+        lines = context_reads::records(&log, visit, &relay).len();
+        times.push(started.elapsed());
+    }
+    times.sort();
+    let median = times[2];
+    assert_eq!(lines, 51, "50 tuples of 60, and the overflow");
+    let budget = if cfg!(debug_assertions) {
+        std::time::Duration::from_secs(2)
+    } else {
+        std::time::Duration::from_millis(15)
+    };
+    assert!(median < budget, "the fold took {median:?}");
+
+    // Through the commit itself.
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b"));
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 51);
+    let total: u64 = c
+        .iter()
+        .map(|r| r["koto.context.read_count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 8_000);
+}

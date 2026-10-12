@@ -25,6 +25,19 @@ to `0.9.x`).
   ones written since the session's last state entry; a process crash loses
   none. `docs/reference/run-journal.md` documents the three kinds.
 
+- **The run journal records the context keys each state visit read.** When
+  a visit ends (an arrival elsewhere, a rewind, a cancel, or a terminal's
+  result), the journal gets one `context_reads` line per distinct key,
+  reader and access the visit read, in first-read order, with the read
+  count, how many reads found the key, and the first and last content
+  hashes. A visit writes at most 51 such lines: past 50 tuples, one
+  overflow line sums the rest. The lines come right before the
+  `state_entered`, `cancelled` or `terminal` that ends the visit, carry
+  `koto.seq` and `koto.visit.seq`, and never hold a context value. A key
+  outside the journal's name shape is written as its digest. Reads made
+  after a visit's terminal or cancel, and reads carried in by `koto session
+  import`, aren't journaled.
+
 - **A session waiting on a request leg is woken when the leg changes.** Every
   write that records a leg's result (a promoted worker result, `koto request
   resolve`, or a refusal `koto init --koto-leg` records), abandons a leg or a

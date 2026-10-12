@@ -60,6 +60,15 @@
 //! - `check_pending`: one per pending `gate_evaluated` of a polling gate,
 //!   with the poll's run count and elapsed seconds, never an outcome.
 //!
+//! One more sums a visit's `context_read` events when the visit ends (see
+//! `context_reads`). It carries `koto.seq` (the sequence number of the
+//! event that ended the visit) and `koto.visit.seq` (the visit that ended):
+//!
+//! - `context_reads`: one per distinct (key, reader, access) read in the
+//!   visit, in first-read order, with read and present counts and the first
+//!   and last present hashes; past 50 tuples, one overflow record sums the
+//!   rest. A key outside the name shape is written as its digest.
+//!
 //! A field with no value is left out, never written as null or empty. Ids
 //! must match `^[A-Za-z0-9._:-]{1,128}$` and names `^[A-Za-z0-9._:/@-]{1,128}$`
 //! without a leading `/` or `~`. Names cover template and state names,
@@ -80,7 +89,10 @@
 //!   `/workflows` hook, writes `state_entered` for each `transitioned`,
 //!   `directed_transition` and `rewound` event, `cancelled` for
 //!   `workflow_cancelled`, and the check kinds for `gate_evaluated` and
-//!   `default_action_executed`. Before those, on any committed payload, it
+//!   `default_action_executed`. A commit that ends a visit (an arrival, a
+//!   rewind, a cancel, or the terminal tick's `request_store.result`)
+//!   writes the visit's `context_reads` just before its own record. Before
+//!   those, on any committed payload, it
 //!   writes `driver_seen` when the process's driver (`CLAUDE_CODE_SESSION_ID`,
 //!   when id-shaped) differs from the one the session's sidecar caches, or
 //!   the sidecar caches none, and then caches the new driver. No driver is
@@ -121,6 +133,7 @@
 //! state. Cloud sync and `koto session import` carry neither: they move the
 //! state log, version, template and context files only.
 
+mod context_reads;
 mod driver;
 mod fixture;
 mod run_id;
@@ -451,6 +464,7 @@ fn journals(payload: &EventPayload) -> bool {
             | EventPayload::Rewound { .. }
             | EventPayload::WorkflowCancelled { .. }
     ) || relays(payload)
+        || context_reads::closes_visit(payload)
 }
 
 /// Whether a payload relays check records (see [`relayed`]).
@@ -731,7 +745,9 @@ pub(crate) fn after_init(
 /// A check event (`gate_evaluated`, `default_action_executed`) relays its
 /// `check_evaluated` and `check_rule` records, or a `check_pending`, each
 /// carrying `commit`'s `seq` as `koto.seq` and the visit the event belongs
-/// to as `koto.visit.seq`. The header comes from `commit`'s copy of the
+/// to as `koto.visit.seq`. A payload that ends a visit writes that visit's
+/// `context_reads` after any `driver_seen` and before its own record, folded
+/// from `commit`'s copy of the log (see `context_reads`). The header comes from `commit`'s copy of the
 /// log, so nothing is read again. A commit's records are written as one
 /// batch, flushed only when it holds an identity record (see [`write`]).
 /// `journal_root` is the store's journal home; `None` writes nothing.
@@ -774,9 +790,26 @@ pub(crate) fn after_commit(
             .id("koto.driver.session.id", Some(d)),
         );
     }
+    // A commit that ends a visit writes that visit's reads first, before
+    // the `state_entered` or `cancelled` it maps to.
+    if context_reads::closes_visit(payload) {
+        if let Some(visit_seq) = commit.prior_visit_seq() {
+            records.extend(context_reads::records(
+                &commit.prior_log,
+                visit_seq,
+                &Relay {
+                    session,
+                    session_id: &header.session_id,
+                    run_id: run_id.as_deref(),
+                    seq: commit.seq,
+                    visit_seq: Some(visit_seq),
+                },
+            ));
+        }
+    }
     records.extend(record_for(payload, session, &header, run_id.as_deref()));
     // The visit is worked out only here, for a payload that relays check
-    // records: every other commit skips the scan of the log.
+    // records or ends a visit: every other commit skips the scan of the log.
     if relays(payload) {
         records.extend(relayed(
             payload,

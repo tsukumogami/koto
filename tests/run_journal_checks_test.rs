@@ -46,6 +46,7 @@ const PLANTED: &[&str] = &[
     "planted-arg-5e1f",
     "planted-rationale-5e1f",
     "planted-directive-5e1f",
+    "planted-context-5e1f",
 ];
 
 /// A check script: run `n` exits with line `n` of `codes.txt` (0 past the
@@ -1234,6 +1235,495 @@ fn an_unwritable_journal_changes_nothing_but_one_warning_per_command() {
             assert_eq!(code, e_code, "{label} step {i}");
             assert_eq!(stdout, e_stdout, "{label} step {i}");
             assert_eq!(*warnings, 1, "{label} step {i}");
+        }
+        assert_eq!(log, expected_log, "{label}");
+    }
+}
+
+// ----- Context reads -----
+
+/// `check` waits on a context-matches gate over `note` and a
+/// context-exists gate over `spec`, then moves to `work`; `work` goes back
+/// to `check` or on to `done`, a terminal whose result map reads `note`.
+const CONTEXT: &str = r#"---
+name: journal-context
+version: "1.0"
+initial_state: check
+states:
+  check:
+    gates:
+      note_ok:
+        type: context-matches
+        key: note
+        pattern: "^ok"
+      has_spec:
+        type: context-exists
+        key: spec
+    transitions:
+      - target: work
+  work:
+    accepts:
+      go:
+        type: enum
+        required: true
+        values: [back, done]
+    transitions:
+      - target: check
+        when:
+          go: back
+      - target: done
+        when:
+          go: done
+  done:
+    terminal: true
+    result:
+      note: "${context.note}"
+---
+
+## check
+
+Write the note. planted-directive-5e1f
+
+## work
+
+Work.
+
+## done
+
+Done.
+"#;
+
+/// A context value that must never reach the journal.
+fn planted(label: &str) -> String {
+    format!("{label} planted-context-5e1f")
+}
+
+impl Env {
+    /// A working directory for one session of [`CONTEXT`], initialized.
+    fn context_session(&self, name: &str) -> PathBuf {
+        let dir = self.work.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = self.template(&dir, CONTEXT);
+        self.ok_in(&dir, &["init", name, "--template", t.to_str().unwrap()]);
+        dir
+    }
+
+    /// `koto context add` of `content` under `key`.
+    fn add(&self, dir: &Path, name: &str, key: &str, content: &str) {
+        let file = dir.join("context-input.txt");
+        std::fs::write(&file, content).unwrap();
+        self.ok_in(
+            dir,
+            &[
+                "context",
+                "add",
+                name,
+                key,
+                "--from-file",
+                file.to_str().unwrap(),
+            ],
+        );
+    }
+
+    fn context_records(&self, session: &str) -> Vec<Value> {
+        self.records(session)
+            .into_iter()
+            .filter(|r| r["kind"] == "context_reads")
+            .collect()
+    }
+}
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(s.as_bytes()))
+}
+
+/// The seq of the first event in `log` at or after `from` that `pred`
+/// matches.
+fn seq_where(log: &[Value], from: u64, pred: impl Fn(&Value) -> bool) -> u64 {
+    log.iter()
+        .find(|e| e["seq"].as_u64().unwrap() >= from && pred(e))
+        .unwrap_or_else(|| panic!("no such event from {from}"))["seq"]
+        .as_u64()
+        .unwrap()
+}
+
+fn entered(e: &Value, to: &str) -> bool {
+    (e["type"] == "transitioned" || e["type"] == "rewound") && e["payload"]["to"] == to
+}
+
+/// The (key, reader, access) tuples of the `context_read` events with seq
+/// in `(after, until)`, in first-read order.
+fn first_reads(log: &[Value], after: u64, until: u64) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    for e in log {
+        let seq = e["seq"].as_u64().unwrap();
+        if e["type"] != "context_read" || seq <= after || seq >= until {
+            continue;
+        }
+        let p = &e["payload"];
+        let t = (
+            p["key"].as_str().unwrap().to_string(),
+            p["reader"].as_str().unwrap().to_string(),
+            p["access"].as_str().unwrap_or("content").to_string(),
+        );
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+fn tuple_of(r: &Value) -> (String, String, String) {
+    let s = |k: &str| r[k].as_str().unwrap().to_string();
+    (
+        s("koto.context.key"),
+        s("koto.context.reader"),
+        s("koto.context.access"),
+    )
+}
+
+/// A state with context gates is evaluated on three ticks, left,
+/// re-entered and evaluated once, then the session reaches its terminal.
+/// Each visit's reads are written once, in first-read order, right before
+/// the `state_entered` (or, for the terminal's result reads, the
+/// `terminal`) that ended it. Within the first visit, two keys the gates
+/// read and one `koto context get` read give three records, and the note,
+/// read once absent and twice present, counts 3 and 2 with the second and
+/// third reads' hashes. Reads on the kept terminal afterwards aren't
+/// journaled, and a rewind out of it writes no reads.
+#[test]
+fn context_reads_are_written_once_per_visit_before_the_record_that_ends_it() {
+    let env = Env::new();
+    let dir = env.context_session("ctx");
+    env.add(&dir, "ctx", "spec", &planted("spec"));
+    let blocked = env.koto_in(&dir, &["next", "ctx", "--no-cleanup"]);
+    assert!(
+        blocked.stdout.contains("gate_blocked"),
+        "{}",
+        blocked.stdout
+    );
+    assert_eq!(blocked.journal_warnings(), 0, "{}", blocked.stderr);
+    let nope = planted("nope");
+    env.add(&dir, "ctx", "note", &nope);
+    env.koto_in(&dir, &["next", "ctx", "--no-cleanup"]);
+    env.add(&dir, "ctx", "plan", &planted("plan"));
+    env.ok_in(&dir, &["context", "get", "ctx", "plan"]);
+    let ok = format!("ok {}", planted("note"));
+    env.add(&dir, "ctx", "note", &ok);
+    let moved = env.ok_in(&dir, &["next", "ctx", "--no-cleanup"]);
+    assert!(moved.stdout.contains("\"work\""), "{}", moved.stdout);
+    env.ok_in(
+        &dir,
+        &[
+            "next",
+            "ctx",
+            "--no-cleanup",
+            "--with-data",
+            r#"{"go": "back"}"#,
+        ],
+    );
+    env.ok_in(
+        &dir,
+        &[
+            "next",
+            "ctx",
+            "--no-cleanup",
+            "--with-data",
+            r#"{"go": "done"}"#,
+        ],
+    );
+
+    let log = env.events("ctx");
+    let first = seq_where(&log, 0, |e| entered(e, "check"));
+    let left = seq_where(&log, first, |e| entered(e, "work"));
+    let back = seq_where(&log, left, |e| entered(e, "check"));
+    let left_again = seq_where(&log, back, |e| entered(e, "work"));
+    let terminal = seq_where(&log, left_again, |e| entered(e, "done"));
+    let result = seq_where(&log, terminal, |e| e["type"] == "request_store.result");
+
+    let c = env.context_records("ctx");
+    let visit = |v: u64| -> Vec<&Value> { c.iter().filter(|r| r["koto.visit.seq"] == v).collect() };
+    // The first visit: the gates' two keys and the `context get`, in the
+    // order they were first read.
+    let one = visit(first);
+    assert_eq!(
+        one.iter().map(|r| tuple_of(r)).collect::<Vec<_>>(),
+        first_reads(&log, first, left)
+    );
+    assert_eq!(one.len(), 3, "{one:?}");
+    let note = one
+        .iter()
+        .find(|r| r["koto.context.key"] == "note")
+        .unwrap();
+    assert_eq!(note["koto.context.reader"], "gate");
+    assert_eq!(note["koto.context.read_count"], 3);
+    assert_eq!(note["koto.context.present_count"], 2);
+    assert_eq!(note["koto.context.first_hash"], sha256_hex(&nope));
+    assert_eq!(note["koto.context.last_hash"], sha256_hex(&ok));
+    let spec = one
+        .iter()
+        .find(|r| r["koto.context.key"] == "spec")
+        .unwrap();
+    assert_eq!(spec["koto.context.access"], "presence");
+    assert_eq!(spec["koto.context.read_count"], 3);
+    let plan = one
+        .iter()
+        .find(|r| r["koto.context.key"] == "plan")
+        .unwrap();
+    assert_eq!(plan["koto.context.reader"], "cli");
+    assert_eq!(plan["koto.context.read_count"], 1);
+    // The second visit to `check`, evaluated once.
+    let two = visit(back);
+    assert_eq!(
+        two.iter().map(|r| tuple_of(r)).collect::<Vec<_>>(),
+        first_reads(&log, back, left_again)
+    );
+    let note_two = two
+        .iter()
+        .find(|r| r["koto.context.key"] == "note")
+        .unwrap();
+    assert_eq!(note_two["koto.context.read_count"], 1);
+    // The terminal's result reads.
+    let done = visit(terminal);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0]["koto.context.reader"], "result");
+    assert_eq!(done[0]["koto.state"], "done");
+    assert_eq!(c.len(), 3 + two.len() + 1, "{c:?}");
+
+    // Each record carries the seq of the event that ended its visit, the
+    // highest in the log when it was written.
+    for (records, closer, state) in [
+        (&one, left, "check"),
+        (&two, left_again, "check"),
+        (&done, result, "done"),
+    ] {
+        for r in records {
+            assert_eq!(r["koto.seq"], closer, "{r}");
+            assert_eq!(r["koto.state"], state, "{r}");
+        }
+    }
+
+    // File order: each visit's reads, then the record that ended it.
+    let records = env.records("ctx");
+    let k = kinds(&records);
+    let mut i = 0;
+    let mut enders = Vec::new();
+    while i < k.len() {
+        if k[i] == "context_reads" {
+            while k[i] == "context_reads" {
+                i += 1;
+            }
+            enders.push((k[i], records[i]["koto.state"].clone()));
+        }
+        i += 1;
+    }
+    assert_eq!(
+        enders,
+        vec![
+            ("state_entered", Value::from("work")),
+            ("state_entered", Value::from("work")),
+            ("terminal", Value::Null),
+        ]
+    );
+
+    // Reads on the kept terminal, then a rewind out of it.
+    env.ok_in(&dir, &["context", "get", "ctx", "note"]);
+    env.ok_in(&dir, &["rewind", "ctx"]);
+    assert_eq!(env.context_records("ctx").len(), c.len());
+    assert_eq!(kinds(&env.records("ctx")).last(), Some(&"state_entered"));
+}
+
+/// A cancel writes the open visit's reads right before `cancelled`, and a
+/// read after the cancel writes nothing.
+#[test]
+fn a_cancel_writes_the_open_visits_reads_before_cancelled() {
+    let env = Env::new();
+    let dir = env.context_session("gone");
+    env.add(&dir, "gone", "spec", &planted("spec"));
+    env.koto_in(&dir, &["next", "gone"]);
+    env.koto_in(&dir, &["next", "gone"]);
+    env.ok_in(&dir, &["cancel", "gone"]);
+    env.ok_in(&dir, &["context", "get", "gone", "spec"]);
+    let log = env.events("gone");
+    let cancel = seq_where(&log, 0, |e| e["type"] == "workflow_cancelled");
+    let records = env.records("gone");
+    let k = kinds(&records);
+    assert_eq!(
+        &k[k.len() - 3..],
+        &["context_reads", "context_reads", "cancelled"]
+    );
+    for r in env.context_records("gone") {
+        assert_eq!(r["koto.context.read_count"], 2, "{r}");
+        assert_eq!(r["koto.seq"], cancel);
+        assert_eq!(r["koto.state"], "check");
+    }
+}
+
+/// A respawn fallback in another process cancels a session whose reads
+/// this process's `koto next` logged: that cancel writes them.
+#[test]
+fn a_respawn_cancel_from_another_process_writes_the_open_visits_reads() {
+    use koto::engine::respawn::{
+        execute_respawn, RespawnExecuted, RespawnExecution, RespawnRequest, SubstrateRespawner,
+    };
+    use koto::engine::types::ValidatedSessionId;
+    use koto::session::local::LocalBackend;
+    use koto::session::SessionBackend;
+    use std::time::{Duration, SystemTime};
+
+    struct Refuses;
+    impl SubstrateRespawner for Refuses {
+        fn respawn(&self, r: &RespawnRequest) -> Result<(), koto::engine::errors::EngineError> {
+            Err(koto::engine::errors::EngineError::StateNotFound(
+                r.session_id.as_str().to_string(),
+            ))
+        }
+    }
+
+    let env = Env::new();
+    let dir = env.context_session("req");
+    env.koto_in(&dir, &["next", "req"]);
+    // This process has no driver, as the koto commands above had none.
+    std::env::remove_var("CLAUDE_CODE_SESSION_ID");
+    let backend =
+        LocalBackend::with_base_dir_and_journal(env.koto_home().join("sessions"), env.koto_home());
+    let header = backend.read_header("req").unwrap();
+    assert!(header.role.is_none());
+    let sid = ValidatedSessionId::new("req").unwrap();
+    let now = SystemTime::now();
+    let woken_at = now - Duration::from_secs(60 * 60 * 24 * 60);
+    let outcome = execute_respawn(
+        &RespawnExecution {
+            backend: &backend,
+            header: &header,
+            coord_id: "coord",
+            requester_session_id: &sid,
+            woken_at: Some(woken_at),
+            last_log_activity: woken_at - Duration::from_secs(60),
+            now,
+            retention_floor: Duration::from_secs(60 * 60 * 24 * 30),
+            cap: 2,
+            template_exists: true,
+        },
+        &Refuses,
+    )
+    .unwrap();
+    assert!(
+        matches!(outcome, RespawnExecuted::Abandoned { .. }),
+        "{outcome:?}"
+    );
+
+    let log = env.events("req");
+    let cancel = seq_where(&log, 0, |e| e["type"] == "workflow_cancelled");
+    let records = env.records("req");
+    let k = kinds(&records);
+    assert_eq!(k.last(), Some(&"cancelled"));
+    let c = env.context_records("req");
+    assert_eq!(c.len(), 2, "{c:?}");
+    for r in &c {
+        assert_eq!(r["koto.context.read_count"], 1, "{r}");
+        assert_eq!(r["koto.seq"], cancel);
+    }
+    assert_eq!(
+        &k[k.len() - 3..k.len() - 1],
+        &["context_reads", "context_reads"]
+    );
+}
+
+/// The context scenario's commands in `env`: each one's exit code, masked
+/// standard output and journal warning count, whether it wrote to the
+/// journal, then the masked session log.
+fn context_outcome(env: &Env) -> (Vec<(Step, bool)>, Vec<Value>) {
+    let dir = env.work.join("same");
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = env.template(&dir, CONTEXT);
+    let input = dir.join("input.txt");
+    std::fs::write(&input, planted("ok")).unwrap();
+    let tmp = env.tmp.path().to_string_lossy().to_string();
+    let file = input.to_string_lossy().to_string();
+    let steps: Vec<Vec<&str>> = vec![
+        vec!["init", "same", "--template", t.to_str().unwrap()],
+        vec!["next", "same", "--no-cleanup"],
+        vec!["context", "add", "same", "spec", "--from-file", &file],
+        vec!["context", "add", "same", "note", "--from-file", &file],
+        vec!["context", "get", "same", "note"],
+        vec!["next", "same", "--no-cleanup"],
+        vec![
+            "next",
+            "same",
+            "--no-cleanup",
+            "--with-data",
+            r#"{"go":"done"}"#,
+        ],
+    ];
+    let mut outs = Vec::new();
+    for args in &steps {
+        let before = std::fs::metadata(env.journal_path()).map_or(0, |m| m.len());
+        let out = env.koto_in(&dir, args);
+        let after = std::fs::metadata(env.journal_path()).map_or(0, |m| m.len());
+        let json: Value = serde_json::from_str(out.stdout.trim()).unwrap_or(Value::Null);
+        outs.push((
+            (out.code, masked(&json, &tmp), out.journal_warnings()),
+            after != before,
+        ));
+    }
+    let log = std::fs::read_to_string(env.state_path("same"))
+        .unwrap()
+        .lines()
+        .map(|l| masked(&serde_json::from_str(l).unwrap(), &tmp))
+        .collect();
+    (outs, log)
+}
+
+/// With the journal unwritable, the context scenario gives the same exit
+/// codes, standard output and session log as with a writable one, and each
+/// command that writes records prints exactly one run-journal warning.
+#[test]
+fn an_unwritable_journal_changes_nothing_in_the_context_scenario() {
+    if running_as_root() {
+        eprintln!("skipped: permissions don't bind this user");
+        return;
+    }
+    let good = Env::new();
+    let (expected, expected_log) = context_outcome(&good);
+    assert!(expected.iter().all(|((_, _, w), _)| *w == 0));
+    assert!(
+        good.context_records("same").len() >= 3,
+        "{:?}",
+        good.records("same")
+    );
+
+    let read_only = Env::new();
+    std::fs::create_dir_all(read_only.koto_home().join("sessions")).unwrap();
+    std::fs::set_permissions(
+        read_only.koto_home(),
+        std::fs::Permissions::from_mode(0o500),
+    )
+    .unwrap();
+    let got = context_outcome(&read_only);
+    std::fs::set_permissions(
+        read_only.koto_home(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+
+    let linked = Env::new();
+    std::fs::create_dir_all(linked.koto_home()).unwrap();
+    let target = linked.tmp.path().join("not-the-journal.txt");
+    std::fs::write(&target, "untouched\n").unwrap();
+    std::os::unix::fs::symlink(&target, linked.journal_path()).unwrap();
+    let got_linked = context_outcome(&linked);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched\n");
+
+    for (label, (outs, log)) in [("read-only", got), ("symlink", got_linked)] {
+        assert_eq!(outs.len(), expected.len());
+        for (i, (((code, stdout, warnings), _), ((e_code, e_stdout, _), wrote))) in
+            outs.iter().zip(&expected).enumerate()
+        {
+            assert_eq!(code, e_code, "{label} step {i}");
+            assert_eq!(stdout, e_stdout, "{label} step {i}");
+            assert_eq!(*warnings, usize::from(*wrote), "{label} step {i}");
         }
         assert_eq!(log, expected_log, "{label}");
     }
