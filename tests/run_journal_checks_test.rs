@@ -1875,8 +1875,11 @@ fn a_chained_koto_next_waits_out_a_held_lock_once_not_once_per_batch() {
 /// everything after its `terminal` record: it exits with the free tick's
 /// code and output, appends the terminal index entry, and removes the
 /// session, or keeps it under `--no-cleanup`, exactly as the free tick
-/// does. Neither the `state_entered` nor the `terminal` record is written,
-/// and one warning names the journal.
+/// does. A removed session leaves its finished record, so `koto status`
+/// still answers for it with `removed: true`, as it does for the free
+/// twin; a kept one has no record and answers as a kept session. Neither
+/// the `state_entered` nor the `terminal` record is written, and one
+/// warning names the journal.
 #[test]
 fn a_terminal_tick_finishes_its_cleanup_while_the_journal_lock_is_held() {
     if !seams_available() {
@@ -1931,6 +1934,36 @@ fn a_terminal_tick_finishes_its_cleanup_while_the_journal_lock_is_held() {
                 index.contains(&format!(r#""session_id":"{name}""#)),
                 "{index}"
             );
+        }
+
+        // The finished record is written just before the removal, after
+        // the skipped `terminal` record, and only when the session is
+        // removed; `koto status` reads it back.
+        let record = |name: &str| {
+            env.koto_home()
+                .join("sessions")
+                .join(".finished")
+                .join(format!("{name}.json"))
+        };
+        let status = |name: &str| -> Value {
+            let out = env.ok_in(&dir, &["status", name]);
+            serde_json::from_str(&out.stdout).unwrap()
+        };
+        let (free_status, held_status) = (status("free"), status("held"));
+        for field in ["current_state", "is_terminal", "result"] {
+            assert_eq!(held_status[field], free_status[field], "{field}");
+        }
+        assert_eq!(held_status["current_state"], "done");
+        assert_eq!(held_status["is_terminal"], true);
+        if no_cleanup {
+            assert!(!record("held").exists());
+            assert!(!record("free").exists());
+            assert!(held_status.get("removed").is_none(), "{held_status}");
+        } else {
+            assert!(record("held").is_file());
+            assert!(record("free").is_file());
+            assert_eq!(held_status["removed"], true, "{held_status}");
+            assert_eq!(free_status["removed"], true, "{free_status}");
         }
     }
 }
