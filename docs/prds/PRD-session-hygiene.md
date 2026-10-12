@@ -299,17 +299,22 @@ These carry the framing's journeys forward at requirements altitude.
   cloud backend, previews the migration markers under that workspace's
   bucket prefix: each marker's session name, target (session and
   workspace), age (from the `migrated_at` it records), target status
-  (`migrated` when the target has its own marker, else `present` when the
-  target's state file is there, else `absent`, or `unknown` when the bucket
-  can't be checked), and whether it is removable under R26 and why. Under
+  (`migrated` when the target has its own marker, else `replaced` when the
+  target's state file belongs to another session, else `present` when it is
+  the marker's session and holds every event of the old copy's log,
+  unchanged, else `unverified` when its log or the old copy's doesn't read
+  to the end or the target's falls short of or differs from the old copy's,
+  else `absent`, or `unknown` when the bucket can't be checked), and whether
+  it is removable under R26 and why. Under
   the local backend the flag is refused as a usage error.
 - **R26.** A marker is removable only when its target is `present` (the
-  newer session exists and hasn't itself been migrated away), and then
+  newer session exists, holds everything the old copy holds, and hasn't
+  itself been migrated away), and then
   either (a) it is older than the marker bound (default 30 days,
   configurable), or (b) the caller passes a flag stating the source host is
   retired. Every other marker is kept, including one whose target is
-  `migrated`, `absent` or `unknown` and one whose body can't be read, and the
-  preview says why. Nothing removes a marker except an explicit apply.
+  `migrated`, `replaced`, `unverified`, `absent` or `unknown` and one whose
+  body can't be read, and the preview says why. Nothing removes a marker except an explicit apply.
 - **R27.** Removing a marker removes every object under the source session's
   prefix, the marker last, so a failure part way leaves the marker refusing
   as before and a retry finishes the removal.
@@ -451,12 +456,12 @@ Run journal:
 Migrated markers (fake S3 harness):
 
 - [ ] The marker preview lists each marker under the source prefix with its
-  target, age, target status and removability; the four target statuses are
-  each produced by a test.
+  target, age, target status and removability; every target status is
+  produced by a test, and a truncated, corrupt, shorter or differing target
+  log is `unverified`.
 - [ ] A marker older than the bound with a `present` target is removable; a
   marker inside the bound with a `present` target is removable only with the
-  retired-source flag; a marker with a `migrated`, `absent` or `unknown`
-  target is kept at any age and with or without the flag, and the preview
+  retired-source flag; a marker with any other target status is kept at any age and with or without the flag, and the preview
   names the target status as the reason; an unreadable marker is kept.
 - [ ] Applying removes every object under the source session's prefix,
   marker last; with a delete failure injected part way, the marker is still
