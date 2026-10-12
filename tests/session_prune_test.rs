@@ -369,11 +369,7 @@ fn build_store(env: &Env) -> BTreeMap<&'static str, &'static str> {
     env.init("free-cancelled");
     env.ok(&["cancel", "free-cancelled"]);
     env.done("free-released");
-    env.point_at_leg(
-        "free-released",
-        "req-missing-for-prune-test",
-        "reviewer",
-    );
+    env.point_at_leg("free-released", "req-missing-for-prune-test", "reviewer");
 
     BTreeMap::from([
         ("a-running", "a"),
