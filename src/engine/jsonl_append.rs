@@ -154,6 +154,111 @@ pub fn append_bounded_line_no_follow(
     Ok(())
 }
 
+/// What a [`append_bounded_lines_current`] caller decided while holding the
+/// lock on the file it is about to append to.
+#[cfg(unix)]
+pub enum UnderLock {
+    /// Append to this file.
+    Write,
+    /// The file was moved away under the lock: open the path again.
+    Reopen,
+}
+
+/// How many times [`append_bounded_lines_current`] opens the path before it
+/// gives up on a file that keeps being moved.
+#[cfg(unix)]
+const REOPEN_ATTEMPTS: usize = 8;
+
+/// Append `lines`, as one write, to whatever file is at `path` once the
+/// lock is held, never to a file that was renamed away in between.
+///
+/// [`append_bounded_line_no_follow`]'s open and lock, plus two things a file
+/// that can be rotated needs. After the lock is taken, the descriptor's
+/// `(dev, ino)` is compared with the path's (`lstat`): a writer that opened
+/// the file just before another process moved it away sees the mismatch and
+/// opens the path again, so no line lands in a file after its rename. And
+/// `under_lock` runs with the lock held and the file's size known, before
+/// anything is written, so a caller can move the file away there (and answer
+/// [`UnderLock::Reopen`]); the batch then goes whole into the next file.
+/// Each line is bounded by `max` on its own; the partial-last-line repair is
+/// the same as [`append_bounded_line_no_follow`]'s.
+#[cfg(unix)]
+pub fn append_bounded_lines_current(
+    dir: &Path,
+    path: &Path,
+    lines: &[&str],
+    max: usize,
+    under_lock: &mut dyn FnMut(&std::fs::File, u64) -> UnderLock,
+) -> Result<()> {
+    use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::io::AsRawFd;
+
+    for line in lines {
+        let len = line.len() + 1;
+        if len > max {
+            anyhow::bail!(
+                "line for {} exceeds the PIPE_BUF append bound ({} bytes > {})",
+                path.display(),
+                len,
+                max
+            );
+        }
+    }
+    if !dir.exists() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+
+    for _ in 0..REOPEN_ATTEMPTS {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| format!("failed to open {} for append", path.display()))?;
+        // SAFETY: flock on a descriptor borrowed for the call; it neither
+        // closes nor retains it. The lock is released when `file` closes.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to lock {}", path.display()));
+        }
+        let held = file
+            .metadata()
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        match std::fs::symlink_metadata(path) {
+            Ok(at_path) if at_path.dev() == held.dev() && at_path.ino() == held.ino() => {}
+            // Moved away, or replaced, between the open and the lock.
+            _ => continue,
+        }
+        if let UnderLock::Reopen = under_lock(&file, held.len()) {
+            continue;
+        }
+
+        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut buf = String::new();
+        let mut last = [0u8; 1];
+        if size > 0 && file.read_at(&mut last, size - 1).is_ok() && last[0] != b'\n' {
+            buf.push('\n');
+        }
+        for line in lines {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+        file.write_all(buf.as_bytes())
+            .with_context(|| format!("failed to append to {}", path.display()))?;
+        file.sync_data()
+            .with_context(|| format!("failed to fsync {}", path.display()))?;
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} was moved away {} times while opening it",
+        path.display(),
+        REOPEN_ATTEMPTS
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -99,6 +99,7 @@
 
 mod driver;
 mod fixture;
+pub(crate) mod rotate;
 mod run_id;
 mod sidecar;
 
@@ -280,9 +281,7 @@ fn write(root: &Path, records: &[Record]) {
     let max = max_line_bytes();
     for record in records {
         let line = record.to_line();
-        if let Err(e) =
-            crate::engine::jsonl_append::append_bounded_line_no_follow(root, &path, &line, max)
-        {
+        if let Err(e) = rotate::append(root, &[&line], max) {
             warn_once(&format!("{}: {}", path.display(), e.root_cause()));
         }
     }

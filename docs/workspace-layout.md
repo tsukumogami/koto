@@ -38,6 +38,8 @@ of authority for this document).
 │   └── <session-id>                           # one opaque line per wake
 ├── _decider_ledger.jsonl                      # AUTHORITATIVE state (decider consultations and answers)
 ├── _run_journal.jsonl                         # host-local record for external readers (see below)
+├── _run_journal.NNNNNNNNNN.jsonl              # rotated journal files, when rotation is on
+├── _run_journal.readers/                      # reader positions, written by readers (see below)
 ├── _terminal_index.jsonl                      # derived (request-store skip-list)
 └── _terminal_index.compact.lock               # derived (request-store compaction lease)
 ```
@@ -267,9 +269,16 @@ there), and `<base>/_run_journal.jsonl` for a store redirected with
 derived too, goes with the session directory, and is rebuilt from the
 header when missing.
 
-No session-lifecycle command deletes or rewrites the journal, and koto
-doesn't prune it yet. `docs/reference/run-journal.md` documents the
-record format, the reader rules and how to remove it by hand.
+No session-lifecycle command deletes or rewrites the journal. Rotation is
+off by default. With a size bound set in user config, the write that finds
+the journal at or over the bound moves it to `_run_journal.NNNNNNNNNN.jsonl`
+(ten digits, numbered in rotation order) and starts a fresh journal; rotated
+files older than the retention bound (30 days by default) are removed at a
+later rotation unless a reader's position in `_run_journal.readers/` still
+needs them. The rotated files are as derived as the journal itself; the
+readers directory holds files readers write, which koto only reads.
+`docs/reference/run-journal.md` documents the record format, the rotation
+and reader rules, the settings and how to remove the journal by hand.
 
 ## Derived files introduced by the request-store
 
