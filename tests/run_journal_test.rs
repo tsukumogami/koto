@@ -1979,9 +1979,11 @@ fn a_full_journal_file_system_costs_one_warning_and_nothing_else() {
             r#"{"go": "yes"}"#.into(),
         ],
     ];
-    // A step warns only when it has a record to write: the bare `next`
-    // waits on evidence in `start`, changes nothing, and journals nothing.
-    let records = [true, false, true];
+    // A step warns only when it has a record to write, and every step here
+    // has one: `init` its session start, the bare `next` the `response`
+    // for the `start` directive it prints (it changes no state), and the
+    // last `next` its state entries and terminal.
+    let records = [true, true, true];
     let mut outs = Vec::new();
     for (i, step) in steps.into_iter().enumerate() {
         // 64 blocks of 512 bytes: room for the session's own files, none
