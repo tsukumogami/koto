@@ -413,8 +413,8 @@ fn write(root: &Path, records: &[Record]) {
     write_within(root, records, None)
 }
 
-/// How long a `response` record waits for the journal's lock before it is
-/// skipped (see [`response`]).
+/// How long a `koto status` `response` record waits for the journal's lock
+/// before it is skipped (see [`response`]).
 const RESPONSE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(30);
 
 /// [`write`], waiting at most `lock_wait` for the journal's lock when it is
@@ -1022,11 +1022,13 @@ fn response_record(
 /// state.
 ///
 /// This hook writes nothing but the record. The run id comes from the
-/// session's sidecar, or is derived from the header without caching it. The
-/// journal's lock is waited for at most [`RESPONSE_LOCK_WAIT`], so a writer
-/// that stopped while holding it can't hang `koto status`, which an agent
-/// uses to recover; past that, the record is skipped with the one warning.
-/// The record is written without a flush, like the check records.
+/// session's sidecar, or is derived from the header without caching it. For
+/// `koto status` the journal's lock is waited for at most
+/// [`RESPONSE_LOCK_WAIT`], so a writer that stopped while holding it can't
+/// hang the command an agent uses to recover; past that, the record is
+/// skipped with the one warning. `koto next` waits for the lock like every
+/// other journal write, so its records aren't lost to a busy journal. The
+/// record is written without a flush, like the check records.
 /// `journal_root` is the store's journal home; `None` writes nothing.
 ///
 /// [`persistence::visit_start`]: crate::engine::persistence::visit_start
@@ -1082,10 +1084,14 @@ pub(crate) fn response(
         seq,
         visit_seq: Some(visit_seq),
     };
+    let lock_wait = match source {
+        ResponseSource::Status => Some(RESPONSE_LOCK_WAIT),
+        ResponseSource::Next => None,
+    };
     write_within(
         root,
         &[response_record(&relay, state, source, directive, details)],
-        Some(RESPONSE_LOCK_WAIT),
+        lock_wait,
     );
 }
 

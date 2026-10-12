@@ -393,11 +393,13 @@ These write no `response` record:
 - A response whose session another command moved to a different state
   between the print and the record. The record would place the response
   in a state it doesn't describe, so it's skipped.
-- A response that finds the journal locked by another writer for more
-  than a few tens of milliseconds. A writer that stopped while holding
-  the lock must not hang `koto next` or `koto status`, which an agent
-  relies on to recover, so the record is skipped with the warning
-  [Failures](#failures) describes.
+- A `koto status` response that finds the journal locked by another
+  writer for more than about 30 milliseconds. A writer that stopped while
+  holding the lock must not hang `koto status`, which an agent relies on
+  to recover, so the record is skipped with the warning
+  [Failures](#failures) describes. A `koto next` response waits for the
+  lock like every other journal write and is never skipped for this
+  reason.
 
 Two `response` records of one session written in the same millisecond with
 no event committed between them are equal in every field. A reader that
@@ -607,10 +609,10 @@ never truncated or rewritten in place:
   one moved it notices, once it holds the lock, that the path now names a
   different file, and opens the path again. No record is written to a file
   after it was moved.
-- **Responses.** A `response` record's short wait for the lock covers the
-  whole write, the fresh file's lock after a rotation included, so turning
-  rotation on doesn't let a held lock stall `koto next` or `koto status`.
-  When the wait runs out the record is skipped, as
+- **Responses.** The short wait a `koto status` response gives the lock
+  covers the whole write, the fresh file's lock after a rotation included,
+  so turning rotation on doesn't let a held lock stall `koto status`. When
+  the wait runs out the record is skipped, as
   [Response records](#response-records) describes, whether or not the
   journal was rotated first.
 - **Failure.** A move that fails prints one warning on standard error, and

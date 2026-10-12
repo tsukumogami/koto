@@ -1729,8 +1729,9 @@ fn a_response_derives_the_run_id_without_writing_the_sidecar() {
     assert_eq!(files_after, files_before);
 }
 
-/// With the journal's lock held by another writer, the hook gives up after
-/// its short wait: no record, one warning, and no hang.
+/// With the journal's lock held by another writer, a `koto status`
+/// response gives up after its short wait: no record, one warning, and no
+/// hang.
 #[test]
 fn a_response_skips_its_record_while_another_writer_holds_the_lock() {
     use std::os::unix::io::AsRawFd;
@@ -1761,6 +1762,43 @@ fn a_response_skips_its_record_while_another_writer_holds_the_lock() {
         "{warnings:?}"
     );
     drop(holder);
+}
+
+/// `koto next`'s response waits for the journal's lock like every other
+/// journal write: held well past the status bound, the lock is waited out,
+/// and the record is written once it's released, with no warning.
+#[test]
+fn a_next_response_waits_for_a_held_lock_and_is_written() {
+    use std::os::unix::io::AsRawFd;
+    use std::time::{Duration, Instant};
+    let f = session_in_a();
+    let journal = f.home.join(JOURNAL_FILE);
+    let holder = std::fs::File::open(&journal).unwrap();
+    // SAFETY: flock on a descriptor `holder` owns until it is dropped.
+    assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let hold = RESPONSE_LOCK_WAIT * 5;
+    let started = Instant::now();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        drop(holder);
+    });
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Next,
+        "d",
+        None,
+    );
+    let took = started.elapsed();
+    release.join().unwrap();
+    assert!(took >= hold, "{took:?}");
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    let r = response_records(&f.journal());
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["koto.response.source"], "next");
+    assert!(warnings_for_test().is_empty(), "{:?}", warnings_for_test());
 }
 
 /// Rotation with a bound every journal is past.

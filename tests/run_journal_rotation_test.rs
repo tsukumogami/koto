@@ -136,15 +136,10 @@ impl Env {
         self.ok(&["init", name, "--template", self.template.to_str().unwrap()]);
     }
 
+    /// One `koto next` round of the loop. Every journal write it makes,
+    /// its `response` record included, waits for the lock, so it never
+    /// prints a journal warning, however many writers contend.
     fn tick(&self, name: &str) {
-        self.tick_skips(name);
-    }
-
-    /// [`Env::tick`], returning how many `response` records it skipped. A
-    /// `response` waits only briefly for the journal's lock and is skipped
-    /// with one warning when another writer holds it longer; that is the
-    /// only journal warning a tick here may print.
-    fn tick_skips(&self, name: &str) -> usize {
         let out = self.run(&[
             "next",
             name,
@@ -154,14 +149,10 @@ impl Env {
         ]);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "koto next {name}: {stderr}");
-        let warnings: Vec<&str> = stderr
-            .lines()
-            .filter(|l| l.contains("run journal"))
-            .collect();
-        for w in &warnings {
-            assert!(w.contains("held by another writer"), "{stderr}");
-        }
-        warnings.len()
+        assert!(
+            !stderr.contains("run journal"),
+            "koto next {name}: {stderr}"
+        );
     }
 
     /// Rotated files, oldest first, by the naming rule.
@@ -206,11 +197,6 @@ fn is_rotated_name(name: &str) -> bool {
     name.strip_prefix("_run_journal.")
         .and_then(|r| r.strip_suffix(".jsonl"))
         .is_some_and(|d| d.len() == 10 && d.bytes().all(|b| b.is_ascii_digit()))
-}
-
-fn is_response(line: &str) -> bool {
-    let v: Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("torn line ({e}): {line}"));
-    v["kind"] == "response"
 }
 
 fn session_of(line: &str) -> String {
@@ -328,63 +314,41 @@ fn eight_concurrent_writers_across_rotations_lose_and_repeat_nothing() {
     const TICKS: usize = 15;
     let bound = 1000;
 
-    // The same run without rotation, for the expected count per session:
-    // `response` records apart, since under contention a tick may skip its
-    // own (with a warning) rather than wait.
+    // The same run without rotation, for the expected count per session.
     let control = Env::new();
     control.start("control");
     for _ in 0..TICKS {
         control.tick("control");
     }
-    let lines = control.all_lines();
-    let responses_per_session = lines.iter().filter(|l| is_response(l)).count();
-    let per_session = lines.len() - responses_per_session;
-    assert_eq!(responses_per_session, TICKS);
+    let per_session = control.all_lines().len();
 
     let env = Env::new();
     env.set_bound(bound);
     for w in 0..WRITERS {
         env.start(&format!("w{w}"));
     }
-    let skipped: BTreeMap<String, usize> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..WRITERS)
-            .map(|w| {
-                let env = &env;
-                s.spawn(move || {
-                    let name = format!("w{w}");
-                    let skips = (0..TICKS).map(|_| env.tick_skips(&name)).sum();
-                    (name, skips)
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    std::thread::scope(|s| {
+        for w in 0..WRITERS {
+            let env = &env;
+            s.spawn(move || {
+                for _ in 0..TICKS {
+                    env.tick(&format!("w{w}"));
+                }
+            });
+        }
     });
 
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    let mut responses: BTreeMap<String, usize> = BTreeMap::new();
     let mut seen = std::collections::HashSet::new();
     for line in env.all_lines() {
-        let tally = if is_response(&line) {
-            &mut responses
-        } else {
-            &mut counts
-        };
-        *tally.entry(session_of(&line)).or_default() += 1;
+        *counts.entry(session_of(&line)).or_default() += 1;
         assert!(seen.insert(line.clone()), "line written twice: {line}");
     }
     assert_eq!(counts.len(), WRITERS);
     for (session, n) in counts {
         assert_eq!(
             n, per_session,
-            "{session} has {n} lines besides responses, expected {per_session}"
-        );
-        // Every response a tick didn't warn about is there.
-        let written = responses.get(&session).copied().unwrap_or(0);
-        assert_eq!(
-            written + skipped[&session],
-            responses_per_session,
-            "{session} wrote {written} responses and skipped {}",
-            skipped[&session]
+            "{session} has {n} lines, expected {per_session}"
         );
     }
     let rotated = env.rotated();
