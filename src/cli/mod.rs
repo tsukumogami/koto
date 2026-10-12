@@ -17,6 +17,7 @@ pub mod overrides;
 pub mod request;
 pub mod retry;
 pub mod session;
+pub mod session_inventory;
 pub mod task_spawn_error;
 pub mod validate_feed;
 pub mod vars;
@@ -513,7 +514,23 @@ pub enum SessionCommand {
         name: String,
     },
     /// List all sessions as JSON
-    List,
+    ///
+    /// Each row carries the session's execution directory and session id.
+    /// `--state` adds where each session stands (`state`, `status`,
+    /// `failure`, `finished_at`), which reads every session's log.
+    List {
+        /// Only sessions whose execution directory is this directory or lies
+        /// under it, compared by whole path components. Implies `--state`,
+        /// and prints `{"sessions": [...], "excluded_remote_only": N}`.
+        #[arg(long = "execution-dir", value_name = "DIR")]
+        execution_dir: Option<String>,
+
+        /// Add each session's state, status (`running`, `terminal`,
+        /// `cancelled` or `unreadable`), failure flag and the time of its last
+        /// event.
+        #[arg(long)]
+        state: bool,
+    },
     /// Remove a session directory (idempotent)
     Cleanup {
         /// Session name
@@ -1553,7 +1570,10 @@ pub fn run(app: App) -> Result<()> {
                     coordinator_of_record.as_deref(),
                 ),
                 SessionCommand::Dir { name } => session::handle_dir(&backend, &name),
-                SessionCommand::List => session::handle_list(&backend),
+                SessionCommand::List {
+                    execution_dir,
+                    state,
+                } => session::handle_list(&backend, execution_dir.as_deref(), state),
                 SessionCommand::Cleanup { name } => {
                     // Query children before cleanup so the parent is still visible.
                     let children = query_children(&backend, &name);

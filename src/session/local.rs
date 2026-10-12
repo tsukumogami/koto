@@ -161,12 +161,15 @@ impl SessionBackend for LocalBackend {
                 Ok(header) => {
                     // Compute from the header already in memory -- no new I/O.
                     let template_source_status = check_template_source_dir(&header);
+                    let session_id = (!header.session_id.is_empty()).then_some(header.session_id);
                     results.push(SessionInfo {
                         id: dir_name,
                         created_at: header.created_at,
                         template_hash: header.template_hash,
                         parent_workflow: header.parent_workflow,
                         template_source_status,
+                        execution_dir: header.execution_dir,
+                        session_id,
                     });
                 }
                 Err(_) => {

@@ -764,6 +764,8 @@ mod tests {
             template_hash: "h".to_string(),
             parent_workflow: parent.map(str::to_string),
             template_source_status: None,
+            execution_dir: None,
+            session_id: None,
         };
         // Listed out of order on purpose.
         let sessions = vec![
@@ -787,6 +789,8 @@ mod tests {
                 template_hash: "h0".to_string(),
                 parent_workflow: None,
                 template_source_status: None,
+                execution_dir: None,
+                session_id: None,
             },
             SessionInfo {
                 id: "child-a".to_string(),
@@ -794,6 +798,8 @@ mod tests {
                 template_hash: "h0".to_string(),
                 parent_workflow: Some("root".to_string()),
                 template_source_status: None,
+                execution_dir: None,
+                session_id: None,
             },
             SessionInfo {
                 id: "child-b".to_string(),
@@ -801,6 +807,8 @@ mod tests {
                 template_hash: "h0".to_string(),
                 parent_workflow: Some("root".to_string()),
                 template_source_status: None,
+                execution_dir: None,
+                session_id: None,
             },
             SessionInfo {
                 id: "grandchild".to_string(),
@@ -808,6 +816,8 @@ mod tests {
                 template_hash: "h0".to_string(),
                 parent_workflow: Some("child-a".to_string()),
                 template_source_status: None,
+                execution_dir: None,
+                session_id: None,
             },
             SessionInfo {
                 id: "unrelated".to_string(),
@@ -815,6 +825,8 @@ mod tests {
                 template_hash: "h0".to_string(),
                 parent_workflow: None,
                 template_source_status: None,
+                execution_dir: None,
+                session_id: None,
             },
         ];
 
@@ -835,6 +847,8 @@ mod tests {
             template_hash: "h0".to_string(),
             parent_workflow: None,
             template_source_status: None,
+            execution_dir: None,
+            session_id: None,
         }];
         let descendants = collect_descendants("lonely", &sessions);
         assert!(descendants.is_empty());

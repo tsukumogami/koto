@@ -657,7 +657,7 @@ The path always ends with the session name as the last component. This is the sa
 ## koto session list
 
 ```
-koto session list
+koto session list [--state] [--execution-dir <dir>]
 ```
 
 Lists all sessions as a JSON array, sorted alphabetically by `id`.
@@ -668,12 +668,17 @@ Lists all sessions as a JSON array, sorted alphabetically by `id`.
   {
     "id": "my-workflow",
     "created_at": "2026-01-15T10:30:00Z",
-    "template_hash": "abc123..."
+    "template_hash": "abc123...",
+    "execution_dir": "/work/repo",
+    "session_id": "b43af83c-5948-4cf2-8424-563d8436f02e"
   }
 ]
 ```
 
 Note: this command uses `id` where `koto workflows` uses `name`. Both refer to the same session identifier. Returns `[]` when no sessions exist.
+
+- `--state` adds `state`, `status` (`running`, `terminal`, `cancelled` or `unreadable`), `failure` and `finished_at` to each row.
+- `--execution-dir <dir>` keeps only sessions whose `execution_dir` is `<dir>` or lies under it (whole path components, so `/work/a` doesn't match `/work/ab`), implies `--state`, and prints `{"sessions": [...], "excluded_remote_only": N}`. Use it to find the sessions a piece of work left in a directory and which of them are finished.
 
 ---
 

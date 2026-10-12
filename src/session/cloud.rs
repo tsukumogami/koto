@@ -859,6 +859,8 @@ fn placeholder_session_info(id: String) -> SessionInfo {
         template_hash: String::new(),
         parent_workflow: None,
         template_source_status: None,
+        execution_dir: None,
+        session_id: None,
     }
 }
 

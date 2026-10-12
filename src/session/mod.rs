@@ -209,6 +209,15 @@ pub struct SessionInfo {
     /// This ambiguity is a known, accepted limitation -- not a bug to fix
     /// here. See DESIGN-orphaned-session-detection.md for the rationale.
     pub template_source_status: Option<TemplateSourceStatus>,
+
+    /// The directory the session's ticks run in, from the header
+    /// (`execution_dir`). `None` when the header records none, and for the
+    /// cloud backend's remote-only placeholder rows, which have no header.
+    pub execution_dir: Option<PathBuf>,
+
+    /// The header's `session_id`. `None` for a header written before the
+    /// field existed, and for remote-only placeholder rows.
+    pub session_id: Option<String>,
 }
 
 /// Return the state file name for a given session ID.

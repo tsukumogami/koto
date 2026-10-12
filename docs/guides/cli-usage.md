@@ -526,6 +526,35 @@ Each object contains the session id (same as the workflow name), creation timest
 
 Each row also carries `template_source_status`, describing whether the directory the session's template was loaded from (at `koto init` time) still resolves on this machine: `{"path": "...", "exists": true|false, "machine_id": "..."}`, or `null` when the session recorded no `template_source_dir` (or, under a cloud backend, when the row is a remote-only placeholder that has not been synced locally yet). When `exists` is `false`, the object gains a `note` field explaining the staleness. The wording is backend-aware: a local session gets a direct note ("template source directory no longer exists"), while a cloud-backed session gets a softened note, since the directory may simply be missing because the session came from another host: `koto session import` keeps the template directory the source host recorded (see "Moving a session to another host" in `docs/guides/cloud-sync-setup.md`).
 
+Every row also carries `execution_dir`, the directory the session's ticks run in, and `session_id`, both from the session's header. Either is `null` when the header doesn't record it, and both are `null` on a remote-only placeholder row.
+
+**Optional flags:**
+- `--state` -- Add where each session stands: `state` (the current state's name), `status` (`running`, `terminal`, `cancelled` or `unreadable`), `failure` (`true` for a terminal declared `failure: true`) and `finished_at` (the time of the last event in its log). This reads every session's log, where the plain listing reads only headers. A session is `cancelled` when its log records a cancellation that no later transition or rewind follows, and `unreadable` when its log or template can't be read; `state` is `null` for an unreadable session. All four are `null` on a remote-only placeholder row.
+- `--execution-dir <dir>` -- List only the sessions whose execution directory is `<dir>` or lies under it, compared by whole path components: `/work/a` matches `/work/a` and `/work/a/b`, not `/work/ab`. `<dir>` is resolved (symlinks included) when it exists on this machine and compared as given otherwise, and a trailing slash makes no difference; `/` matches every session. Implies `--state`, and the output becomes an object:
+
+```json
+{
+  "sessions": [
+    {
+      "id": "issue_42",
+      "created_at": "2026-10-11T23:44:36.123Z",
+      "template_hash": "a1b2c3...",
+      "parent_workflow": null,
+      "template_source_status": null,
+      "execution_dir": "/work/repo",
+      "session_id": "b43af83c-5948-4cf2-8424-563d8436f02e",
+      "state": "done",
+      "status": "terminal",
+      "failure": false,
+      "finished_at": "2026-10-11T23:50:02.410Z"
+    }
+  ],
+  "excluded_remote_only": 0
+}
+```
+
+`excluded_remote_only` counts the cloud backend's remote-only placeholder rows the filter left out: they have no header on this machine, so their execution directory isn't known. A teardown that wants the sessions a piece of work left runs `koto session list --execution-dir <its directory>` and reads `status` to tell the finished ones from the running ones.
+
 #### session recover
 
 Lists, and optionally restores, the sessions the old-layout migration moved aside because their name was already taken. See [Session storage](#session-storage) for how they get there.
