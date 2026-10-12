@@ -41,7 +41,7 @@ settings to `src/config`.
 
 Every outline lands with end-to-end tests that create sessions with real
 koto commands. They run under a scratch HOME or `KOTO_SESSIONS_BASE`, never
-the real `~/.koto`, and the cloud cases run on koto's fake S3 harness. Each
+the real `$HOME/.koto`, and the cloud cases run on koto's fake S3 harness. Each
 outline also updates the koto-user skill wherever it adds agent-visible
 surface.
 

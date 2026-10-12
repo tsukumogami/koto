@@ -2,7 +2,7 @@
 schema: prd/v1
 status: In Progress
 problem: |
-  koto's session store under ~/.koto/sessions holds every kind of state its
+  koto's session store under $HOME/.koto/sessions holds every kind of state its
   users keep, about a thousand session directories on one workstation, and
   nothing finds it by where it ran or clears it as a set. A session removed
   at its terminal tick answers `not found` to `koto status`, the same as one
@@ -48,7 +48,7 @@ the design finds it covered.
 
 ## Problem Statement
 
-koto keeps a directory per session under `~/.koto/sessions` (or under the
+koto keeps a directory per session under `$HOME/.koto/sessions` (or under the
 base a `KOTO_SESSIONS_BASE` redirect names). It was built for workflow runs
 that remove themselves at their terminal tick, and it now holds everything:
 skill sessions kept with `--no-cleanup` so a later run can read them,
@@ -249,7 +249,7 @@ These carry the framing's journeys forward at requirements altitude.
 
 ### Run journal retention
 
-- **R18.** Every append to the run journal (`~/.koto/_run_journal.jsonl`,
+- **R18.** Every append to the run journal (`$HOME/.koto/_run_journal.jsonl`,
   and `<base>/_run_journal.jsonl` for a redirected store) checks the file's
   size; when it is at or over the size bound, the journal is renamed to a
   rotated name and the record goes to a fresh file. The journal is never
@@ -317,7 +317,7 @@ These carry the framing's journeys forward at requirements altitude.
   development machine; the measurement is recorded in the pull request that
   adds them.
 - **R31.** Every test of a removing verb runs against a scratch HOME or a
-  redirected store, never the real `~/.koto`. Cloud behavior is tested
+  redirected store, never the real `$HOME/.koto`. Cloud behavior is tested
   against koto's fake S3 harness, and the docs and the pull request say so.
 - **R32.** Each new verb and flag has an automated end-to-end test that
   creates its sessions with real koto commands and runs the real command.

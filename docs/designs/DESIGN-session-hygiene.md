@@ -44,7 +44,7 @@ Planned
 
 ## Context and Problem Statement
 
-A koto session is a directory under the store's base (`~/.koto/sessions`, or
+A koto session is a directory under the store's base (`$HOME/.koto/sessions`, or
 the base `KOTO_SESSIONS_BASE` names) holding `koto-<name>.state.jsonl`: a
 header line, then the event log. The header records `execution_dir`, the
 canonical directory the session's ticks run in, along with `session_id`,
@@ -127,7 +127,7 @@ up in its compiled template. Templates are read and parsed once per path per
 run, since most sessions in a store share a few templates. Listing and prune
 both use it.
 
-*Alternative: read the terminal index.* `~/.koto/_terminal_index.jsonl`
+*Alternative: read the terminal index.* `$HOME/.koto/_terminal_index.jsonl`
 records `completed` or `abandoned` per session name with the header's mtime,
 and discovery already trusts an entry only when its mtime is current. It would
 save the log read for finished sessions. Rejected: the index lives at
