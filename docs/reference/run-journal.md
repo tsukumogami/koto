@@ -401,11 +401,11 @@ These write no `response` record:
   in a state it doesn't describe, so it's skipped.
 - A `koto status` response that finds the journal locked by another
   writer for more than about 30 milliseconds. A writer that stopped while
-  holding the lock must not hang `koto status`, which an agent relies on
-  to recover, so the record is skipped with the warning
+  holding the lock must not hold up `koto status`, which an agent relies
+  on to recover, so the record is skipped with the warning
   [Failures](#failures) describes. A `koto next` response waits for the
-  lock like every other journal write and is never skipped for this
-  reason.
+  lock as long as every other journal write, up to five seconds (see
+  [Waiting for the lock](#waiting-for-the-lock)).
 
 Two `response` records of one session written in the same millisecond with
 no event committed between them are equal in every field. A reader that
@@ -449,9 +449,9 @@ session read:
   confirm it, and a short or guessable value (a branch name, a yes or no, a
   small number) is easy to recover from its hash.
 
-Treat context-read records as host-local data that can reveal what a
-session read and, for guessable content, what it said. Don't forward them
-off the host without that in mind.
+Context-read records hold key names and content hashes. koto never sends
+journal lines off the host; a tool that does must leave out every
+`context_reads` line.
 
 ### When a visit's reads are written
 
@@ -481,7 +481,7 @@ before that rewind's `state_entered`.
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|
 | `koto.state` | string | always | The state of the visit, as its reads name it. |
-| `koto.context.key` | string | except on the overflow record | The key's name, verbatim, when it has the name shape; otherwise (any key longer than 128 bytes) its digest, computed as for [Rule ids](#rule-ids). |
+| `koto.context.key` | string | except on the overflow record | The key's name, verbatim, when it has the name shape; otherwise (any key outside the name shape, such as one longer than 128 bytes or one with a space or a non-ASCII character) its digest, computed as for [Rule ids](#rule-ids). |
 | `koto.context.reader` | string | except on the overflow record | Who read it: `gate`, `cli`, `result` or `decider`. A value outside the name shape is written as its digest. |
 | `koto.context.access` | string | except on the overflow record | `content` for a read that fetched the content, `presence` for one that asked only whether the key exists. A value outside the name shape is written as its digest. |
 | `koto.context.overflow` | boolean | on the overflow record only | `true`: the record sums the reads of every tuple past the visit's first 50. |
@@ -540,7 +540,8 @@ An imported session is a new run: its own id is its run id.
 - Writers take an advisory lock on the file for each commit's records,
   so records are never interleaved. Records from concurrent commands on
   different sessions interleave line by line in the order they were
-  written.
+  written. A writer that can't take the lock in time skips its records
+  (see [Waiting for the lock](#waiting-for-the-lock)).
 - `at` is the time the record was written, not the time of the event it
   describes, and it isn't guaranteed to increase down the file across
   processes. Use file order within a session.
@@ -549,9 +550,15 @@ An imported session is a new run: its own id is its run id.
   `check_rule` records, which share its `koto.seq`. A `response` comes
   after the records of the events committed before it printed.
 - A visit's `context_reads` come after any `driver_seen` of the same
-  command and right before the `state_entered`, `cancelled` or `terminal`
-  that ends the visit, and share its `koto.seq`. Records of one visit
-  differ in their key, reader and access.
+  command. A visit that ends in another state, a rewind or a cancel has
+  them right before the `state_entered` or `cancelled` that ends it, in
+  the same write, sharing that event's `koto.seq`. A terminal visit's are
+  written with the commit of the result event the terminal tick appends
+  to the session's log (see [When a visit's reads are
+  written](#when-a-visits-reads-are-written)), and carry that event's
+  `koto.seq`; the `terminal` record, which has no `koto.seq`, follows in
+  a write of its own. Records of one visit differ in their key, reader
+  and access.
 - A copy of the journal that delivered some lines more than once (a
   sender that retries, for example) holds exact duplicates. Treat two
   check, decider, override, response or context-read records as duplicates
@@ -643,6 +650,39 @@ The next writer notices, under the lock, that the file doesn't end in a
 newline and starts its record on a line of its own, so only the partial
 line is lost.
 
+### Waiting for the lock
+
+Every write waits at most five seconds for the journal's lock, so ordinary
+contention between koto commands doesn't lose records. A `koto status`
+response waits at most 30 milliseconds. When the wait runs out, because
+another process holds the lock (one that stopped or hung while writing,
+say), the write's records are skipped with the warning above and the
+command carries on. Its standard output and exit code are the ones it
+would have had, and so is everything it does after the write: a terminal
+tick that can't write its `terminal` record still notifies the session's
+parent and removes the session, or keeps it, as it would have. The skipped
+records aren't written later. The wait isn't configurable.
+
+A process waits out a held lock once. After one write has waited the full
+five seconds and given up, the process's later writes try the lock once,
+without waiting, and are skipped too if it's still held (the warning isn't
+repeated), so a command that writes several batches while the lock stays
+held takes about five seconds, not five per batch. The first later write
+that finds the lock free is written as usual and gives the writes after it
+their full wait again, so a long-running command (a `koto next` polling a
+gate) recovers once the holder lets go.
+
+The wait covers taking the lock, and nothing else. A writer that holds the
+lock finishes what it does under it however long that takes. A rotation
+flushes the file it moves to disk and then runs retention, both under the
+lock (see [Rotation](#rotation)); on a slow disk that can take longer than
+the wait, and it isn't cut short. The writers waiting behind it are the
+ones that give up, each after its own wait. The rotating writer then gets
+a full wait of its own for the fresh file's lock, so a slow rotation
+doesn't make it drop the records it rotated for. If it still can't take
+that lock, its records are skipped, and the process's later writes keep
+their full wait.
+
 ## Durability
 
 Identity records are flushed to disk as they're written. Check, decider,
@@ -715,12 +755,13 @@ file. The journal is never truncated or rewritten in place:
   one moved it notices, once it holds the lock, that the path now names a
   different file, and opens the path again. No record is written to a file
   after it was moved.
-- **Responses.** The short wait a `koto status` response gives the lock
-  covers the whole write, the fresh file's lock after a rotation included,
-  so turning rotation on doesn't let a held lock stall `koto status`. When
-  the wait runs out the record is skipped, as
-  [Response records](#response-records) describes, whether or not the
-  journal was rotated first.
+- **Waiting.** A write's wait for the lock (see
+  [Waiting for the lock](#waiting-for-the-lock)) covers the whole write,
+  including the lock of a fresh file it finds after another command's
+  rotation, so turning rotation on doesn't lengthen it. The rotation itself
+  isn't timed: its flush and its retention pass run under the lock to the
+  end, and the writers behind them wait no longer for it. The writer that
+  rotated then gets a full wait of its own for the fresh file's lock.
 - **Failure.** A move that fails prints one warning on standard error, and
   the record goes to the unrotated journal. That command doesn't try to
   rotate again.
