@@ -281,7 +281,7 @@ committed `decider_consulted` event.
 | `koto.decider.output_tokens` | integer | when logged | Output tokens of the billed answer. |
 | `koto.decider.unread_usage_attempts` | integer | always | Billed answers whose token usage couldn't be read, so an undercount of the two counts above is visible. 0 when the event doesn't log it. |
 | `koto.decider.latency_ms` | integer | always | Wall time of the provider call, in milliseconds. |
-| `koto.decider.directive_bytes` | integer | always | Byte length of the directive and details the agent would have received for the state. |
+| `koto.decider.directive_bytes` | integer | always | UTF-8 bytes of the directive plus its details (and the recovery pointer a state with details gets) that `koto next` would have returned to the agent for the consulted state, had the routing decider not been consulted; details already delivered in that visit don't count, and an applied consultation spares the agent these bytes. This differs from a `response` record's `koto.response.directive_bytes`, which counts only the printed directive. |
 
 ### `decider_checked`
 
