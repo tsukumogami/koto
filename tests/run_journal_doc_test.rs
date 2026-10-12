@@ -94,6 +94,7 @@ fn every_kind_the_reference_names_is_one_koto_writes_and_the_reverse() {
             "check_overridden",
             "check_pending",
             "check_rule",
+            "context_reads",
             "decider_checked",
             "decider_consulted",
             "driver_seen",
@@ -180,9 +181,9 @@ fn documented_kind_fields(text: &str) -> std::collections::BTreeMap<String, BTre
 }
 
 /// The fields of the kinds that carry sequence numbers (check, decider,
-/// override and response) are listed in the kinds table, each has a row in
-/// its kind's field table, and every such field in the module is one the
-/// table lists.
+/// override, response and context reads) are listed in the kinds table,
+/// each has a row in its kind's field table, and every such field in the
+/// module is one the table lists.
 #[test]
 fn every_check_kind_lists_its_fields_and_describes_each() {
     let text = reference();
@@ -191,6 +192,7 @@ fn every_check_kind_lists_its_fields_and_describes_each() {
         "check_evaluated",
         "check_rule",
         "check_pending",
+        "context_reads",
         "decider_consulted",
         "decider_checked",
         "check_overridden",
