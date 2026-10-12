@@ -242,7 +242,8 @@ These carry the framing's journeys forward at requirements altitude.
   was written deletes the record again. When `koto session cleanup` or
   `koto cancel --cleanup` removes a session, it deletes a record a crash left
   beside it; `koto session cleanup` on a name koto already removed finds no
-  session and keeps the record. While a session exists, `koto status` reports the session and
+  session and keeps the record. While a session exists, `koto status`
+  reports the session and
   ignores any record. `koto session list` and `koto workflows` never list a
   finished record as a session.
 - **R16.** The prune considers finished records too, under the same
@@ -287,7 +288,9 @@ These carry the framing's journeys forward at requirements altitude.
   position at or past a rotated file's end needs only the newer ones. A
   position file not modified for longer than the stale bound, or one that
   can't be read or parsed, protects nothing, and koto prints a warning naming
-  it. With no positions recorded, the retention bound alone applies.
+  it. With no positions recorded, the retention bound alone applies. The
+  newest rotated file is always kept, however old, so the sequence numbering
+  never restarts.
 - **R23.** Rotation is off by default (a size bound of 0) and turned on
   through `koto config` by setting a size bound, such as 64 MiB. It stays off
   by default until the journal's consumers list rotated files; turning the
@@ -319,7 +322,8 @@ These carry the framing's journeys forward at requirements altitude.
   configurable), or (b) the caller passes a flag stating the source host is
   retired. Every other marker is kept, including one whose target is
   `migrated`, `replaced`, `unverified`, `absent` or `unknown` and one whose
-  body can't be read, and the preview says why. Nothing removes a marker except an explicit apply.
+  body can't be read, and the preview says why. Nothing removes a marker
+  except an explicit apply.
 - **R27.** Removing a marker removes every object under the source session's
   prefix, the marker last, so a failure part way leaves the marker refusing
   as before and a retry finishes the removal.
@@ -443,7 +447,8 @@ Run journal:
   its rename.
 - [ ] The R24 offset-reader test passes.
 - [ ] A rotated file older than the retention bound is removed at the next
-  rotation; one inside the bound is kept; one a fresh recorded position
+  rotation unless it is the newest rotated file; one inside the bound is
+  kept; one a fresh recorded position
   points into is kept past the bound; with two readers, the lagging one
   keeps its file; a position older than the stale bound no longer keeps its
   file and the rotation prints a warning naming it.
@@ -469,7 +474,8 @@ Migrated markers (fake S3 harness):
   log is `unverified`.
 - [ ] A marker older than the bound with a `present` target is removable; a
   marker inside the bound with a `present` target is removable only with the
-  retired-source flag; a marker with any other target status is kept at any age and with or without the flag, and the preview
+  retired-source flag; a marker with any other target status is kept at any
+  age and with or without the flag, and the preview
   names the target status as the reason; an unreadable marker is kept.
 - [ ] Applying removes every object under the source session's prefix,
   marker last; with a delete failure injected part way, the marker is still

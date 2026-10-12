@@ -379,7 +379,8 @@ verb:
   bucket prefix. A marker goes only when its target is present (same session
   id, not migrated again, and a log that reads cleanly and begins with every
   event of the old copy's), and then when it is at least as old as its bound
-  or `--source-retired` is given (R25 to R28). koto#343, listing a source workspace's sessions
+  or `--source-retired` is given (R25 to R28). koto#343, listing a source
+  workspace's sessions
   before an import, isn't covered: the marker preview lists markers only, and
   a session listing is a different read with different callers (R29).
 
@@ -470,7 +471,8 @@ Session mode:
    rules a to g in order, so a running or unreadable session shows on `kept`
    under rule a. The first rule that applies puts the session on `kept` with
    that rule's letter and a detail (the referencing or referenced name, the
-   request id); a candidate no rule keeps goes on the would-remove list. Records have
+   request id); a candidate no rule keeps goes on the would-remove list.
+   Records have
    no rules: koto writes one only when it removes a session itself, and that
    removal already waited until the session's parent had its
    `child_completed` (the terminal tick defers removal when that append
@@ -557,7 +559,9 @@ cloud):
    satisfy either branch.
 4. Removable when the target is `present` and either its age (now minus
    `migrated_at`) is at least `session.cloud.marker_retain_days` (default
-   30; 0 makes every such marker removable at once) or `--source-retired`
+   30; 0 makes every such marker removable at once; read from user config
+   only, since it guards a deletion and a cloned repository's project file
+   must not shorten it) or `--source-retired`
    was given. All others are kept, and the preview names the target status
    or the age as the reason, with `objects`, the number of objects the
    removal deletes, when the old copy could be listed and its log read.
@@ -712,7 +716,8 @@ read it from your offset to its end, then read every newer rotated file (by
 name) from byte 0, then the open active file from byte 0, and keep the new
 identity and offset. If another rotation lands during the pass, the file
 open as "active" turns up among the rotated files; skip it there by
-identity, since it is read last. A reader that finds no file with its inode lost its place to
+identity, since it is read last. A reader that finds no file with its
+inode lost its place to
 retention, and only a reader that recorded no position, or let it go stale,
 can be in that state.
 
@@ -752,7 +757,11 @@ off; 67108864 is a reasonable value to opt in with),
 did. Rotation stays off by default until the journal's consumers list rotated
 files; turning it on by default then is a one-line change to the default, not
 part of this design. With rotation off, the size check is a comparison
-against 0 and nothing else changes on the append path. They're settable with `koto config set` in user or project config.
+against 0 and nothing else changes on the append path. All three settings
+are read from user config only, like the marker bound: the journal lives
+beside the user's session store, so a project file in a cloned repository
+must not turn rotation on or shorten retention, and `koto config set`
+refuses them without `--user`.
 `run_journal::write` resolves them once per process into a `OnceLock`, with
 a test override like the module's existing ones.
 
