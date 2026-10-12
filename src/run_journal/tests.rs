@@ -1729,6 +1729,70 @@ fn a_key_outside_the_name_shape_is_digested() {
     assert_eq!(c[1]["koto.context.key"], edge.as_str());
     let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
     assert!(!raw.contains(&long), "{raw}");
+
+    // A reader or access outside the shape is digested the same way, so
+    // two odd values stay two records.
+    let g = session_in_a();
+    for reader in ["odd reader", "odd  reader"] {
+        commit_as(
+            &g,
+            None,
+            "wf",
+            &read_of("a", "k", reader, "odd access", None),
+        );
+    }
+    commit_as(&g, None, "wf", &transitioned(Some("a"), "b"));
+    let c = context_records(&g.journal());
+    assert_eq!(c.len(), 2);
+    for (r, reader) in c.iter().zip(["odd reader", "odd  reader"]) {
+        assert_eq!(r["koto.context.reader"], name_or_digest(reader).as_str());
+        assert_eq!(
+            r["koto.context.access"],
+            name_or_digest("odd access").as_str()
+        );
+    }
+}
+
+/// The tuple is the key, the reader and the access together: one key read
+/// in one visit by `koto context get` (cli, content), a context-exists
+/// gate (gate, presence) and a context-matches gate (gate, content) gives
+/// three records, in first-read order, each with its own counts.
+#[test]
+fn one_key_read_by_two_readers_and_two_accesses_gives_one_record_per_tuple() {
+    let f = session_in_a();
+    let exists = |content| read_of("a", "notes", "gate", "presence", Some(content));
+    commit_as(&f, None, "wf", &cli_read("a", "notes", Some("n1"))); // 3
+    commit_as(&f, None, "wf", &exists("n1")); // 4
+    commit_as(&f, None, "wf", &gate_read("a", "notes", None)); // 5
+    commit_as(&f, None, "wf", &exists("n2")); // 6
+    commit_as(&f, None, "wf", &gate_read("a", "notes", Some("n2"))); // 7
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 8
+    let c = context_records(&f.journal());
+    let t = |r: &str, a: &str, n, p| ("notes".into(), r.into(), a.into(), n, p);
+    assert_eq!(
+        tuples(&c),
+        vec![
+            t("cli", "content", 1, 1),
+            t("gate", "presence", 2, 2),
+            t("gate", "content", 2, 1),
+        ]
+    );
+    assert_eq!(c[0]["koto.context.last_hash"], hash_of("n1"));
+    assert_eq!(c[1]["koto.context.first_hash"], hash_of("n1"));
+    assert_eq!(c[1]["koto.context.last_hash"], hash_of("n2"));
+    assert_eq!(c[2]["koto.context.first_hash"], hash_of("n2"));
+}
+
+/// A `request_store.result` whose visit has no read left to write writes
+/// nothing at all.
+#[test]
+fn a_result_with_no_reads_to_write_writes_nothing() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "done"));
+    reset_for_test();
+    commit_as(&f, None, "wf", &store_result());
+    assert_eq!(batches_for_test(), (0, 0));
+    assert!(warnings_for_test().is_empty());
 }
 
 /// A rewind ends the visit it leaves: its reads are written before the
@@ -1868,36 +1932,43 @@ fn request_store_result_writes_the_terminal_visit_and_a_rewind_out_of_it_writes_
 }
 
 /// When the terminal tick's `request_store.result` failed to commit, the
-/// terminal visit's reads stay in the log, and the next arrival writes
-/// them once.
+/// terminal visit stays open: its reads stay in the log, a read made after
+/// the `terminal` record joins them (the one exception to reads after a
+/// terminal going unjournaled), and the next arrival writes them once.
 #[test]
 fn a_failed_request_store_result_leaves_the_visit_to_the_next_arrival() {
     let f = session_in_a();
     commit_as(&f, None, "wf", &transitioned(Some("a"), "failed")); // 3
-    commit_as(
-        &f,
-        None,
-        "wf",
-        &read_of("failed", "failure_reason", "result", "content", Some("r")),
-    ); // 4
-       // No `request_store.result`: its append failed. The terminal is still
-       // recorded.
+    let reason = read_of("failed", "failure_reason", "result", "content", Some("r"));
+    commit_as(&f, None, "wf", &reason); // 4
+
+    // No `request_store.result`: its append failed. The terminal is still
+    // recorded.
     let header = f.backend.read_header("wf").unwrap();
     terminal(Some(&f.home), &f.backend, "wf", &header, "failed");
     assert!(context_records(&f.journal()).is_empty());
-    commit_as(&f, None, "wf", &rewound("failed", "a")); // 5
+    // `koto context get` on the kept failure terminal.
+    let late = cli_read("failed", "failure_reason", Some("r"));
+    commit_as(&f, None, "wf", &late); // 5
+    commit_as(&f, None, "wf", &rewound("failed", "a")); // 6
     let j = f.journal();
     let c = context_records(&j);
-    assert_eq!(c.len(), 1);
-    assert_eq!(c[0]["koto.state"], "failed");
-    assert_eq!(c[0]["koto.seq"], 5);
-    assert_eq!(c[0]["koto.visit.seq"], 3);
-    assert_eq!(c[0]["koto.context.read_count"], 1);
-    let tail: Vec<String> = kinds(&j).into_iter().rev().take(2).rev().collect();
-    assert_eq!(tail, vec!["context_reads", "state_entered"]);
+    assert_eq!(c.len(), 2);
+    let t = |r: &str, n, p| ("failure_reason".into(), r.into(), "content".into(), n, p);
+    assert_eq!(tuples(&c), vec![t("result", 1, 1), t("cli", 1, 1)]);
+    for r in &c {
+        assert_eq!(r["koto.state"], "failed");
+        assert_eq!(r["koto.seq"], 6);
+        assert_eq!(r["koto.visit.seq"], 3);
+    }
+    let tail: Vec<String> = kinds(&j).into_iter().rev().take(3).rev().collect();
+    assert_eq!(
+        tail,
+        vec!["context_reads", "context_reads", "state_entered"]
+    );
     // Another arrival writes nothing more for that visit.
-    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 6
-    assert_eq!(context_records(&f.journal()).len(), 1);
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 7
+    assert_eq!(context_records(&f.journal()).len(), 2);
 }
 
 /// An imported session's log carries the source's reads in its open visit,
@@ -1986,17 +2057,9 @@ fn a_new_drivers_record_comes_before_the_visits_reads() {
     assert_eq!(tail, vec!["driver_seen", "context_reads", "state_entered"]);
 }
 
-/// A visit of 10,000 events (reads of 60 keys, check events with output,
-/// evidence; a 4 MB log) keeps the arrival that ends it within the hot-path
-/// budget: the work the fold adds to that commit (finding the visit and
-/// folding its reads) takes under 15 ms, and the visit writes 51 lines.
-///
-/// The budget is for release builds, which is how koto's hot-path cost is
-/// measured; an optimized test run (`cargo test --release`) holds it. A
-/// debug build parses JSON tens of times slower, so there the bound only
-/// catches work that grows faster than the visit.
-#[test]
-fn a_ten_thousand_event_visit_folds_within_budget() {
+/// A session whose current visit holds 10,000 events (reads of 60 keys,
+/// failed check events with 2 KB of output, evidence): a 4 MB log.
+fn ten_thousand_event_visit() -> Fixture {
     let f = Fixture::new();
     let mut events = vec![
         event(
@@ -2028,6 +2091,39 @@ fn a_ten_thousand_event_visit_folds_within_budget() {
     f.backend
         .init_state_file("wf", header("wf", "wf-id", None), events)
         .unwrap();
+    f
+}
+
+/// The arrival that ends a 10,000-event visit writes 51 lines (50 of the
+/// 60 tuples and the overflow) whose counts add up to the visit's 8,000
+/// reads.
+#[test]
+fn a_ten_thousand_event_visit_writes_fifty_one_lines() {
+    let f = ten_thousand_event_visit();
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b"));
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 51);
+    assert_eq!(c[50]["koto.context.overflow"], true);
+    let total: u64 = c
+        .iter()
+        .map(|r| r["koto.context.read_count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 8_000);
+    for r in &c {
+        assert_eq!(r["koto.seq"], 10_003);
+        assert_eq!(r["koto.visit.seq"], 2);
+    }
+}
+
+/// The work the fold adds to the arrival that ends a 10,000-event visit
+/// (finding the visit and folding its reads) stays within the 15 ms the
+/// hot path allows a tick. The budget is for release builds on an idle
+/// machine, so the test is left out of the default run. Run it with
+/// `cargo test --release --lib a_ten_thousand -- --ignored`.
+#[test]
+#[ignore = "wall-clock budget for release builds"]
+fn a_ten_thousand_event_visit_folds_within_budget() {
+    let f = ten_thousand_event_visit();
     let path = f
         .backend
         .session_dir("wf")
@@ -2041,30 +2137,17 @@ fn a_ten_thousand_event_visit_folds_within_budget() {
         visit_seq: Some(2),
     };
     let mut times = Vec::new();
-    let mut lines = 0;
     for _ in 0..5 {
         let started = std::time::Instant::now();
         let visit = crate::engine::persistence::visit_start(&log).unwrap();
-        lines = context_reads::records(&log, visit, &relay).len();
+        let lines = context_reads::records(&log, visit, &relay).len();
         times.push(started.elapsed());
+        assert_eq!(lines, 51);
     }
     times.sort();
     let median = times[2];
-    assert_eq!(lines, 51, "50 tuples of 60, and the overflow");
-    let budget = if cfg!(debug_assertions) {
-        std::time::Duration::from_secs(2)
-    } else {
-        std::time::Duration::from_millis(15)
-    };
-    assert!(median < budget, "the fold took {median:?}");
-
-    // Through the commit itself.
-    commit_as(&f, None, "wf", &transitioned(Some("a"), "b"));
-    let c = context_records(&f.journal());
-    assert_eq!(c.len(), 51);
-    let total: u64 = c
-        .iter()
-        .map(|r| r["koto.context.read_count"].as_u64().unwrap())
-        .sum();
-    assert_eq!(total, 8_000);
+    assert!(
+        median < std::time::Duration::from_millis(15),
+        "the fold took {median:?}"
+    );
 }

@@ -3,7 +3,7 @@
 //!
 //! koto logs one `context_read` event per read of a context key. The journal
 //! never gets one line per read: when a commit closes a visit (see
-//! [`closes_visit`]), [`records`] reads that visit's `context_read` events
+//! [`closes_visit`]), [`fold`] reads that visit's `context_read` events
 //! out of the log bytes the commit already read under its lock and writes
 //! one record per distinct (key, reader, access) tuple, in first-read
 //! order. Nothing is kept between processes, because the session's log
@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use super::{name_or_digest, Record, Relay};
 use crate::engine::persistence::opens_visit;
-use crate::engine::types::EventPayload;
+use crate::engine::types::{Event, EventPayload};
 
 /// The most tuples one visit writes a record of their own for. Reads of
 /// any further tuple are summed into one overflow record, so a visit writes
@@ -34,6 +34,15 @@ const CONTEXT_READ: &str = "context_read";
 const SESSION_IMPORTED: &str = "session_imported";
 const REQUEST_STORE_RESULT: &str = "request_store.result";
 const WORKFLOW_CANCELLED: &str = "workflow_cancelled";
+/// The state-entry types, one of which opens every visit.
+const ENTRY_TYPES: [&str; 3] = ["transitioned", "directed_transition", "rewound"];
+
+/// How far into an event line [`head`] looks for the type word. `seq` (at
+/// most 20 digits) and an RFC 3339 timestamp come first, which puts the
+/// type key within about 80 bytes; stopping here keeps a line that isn't
+/// laid out that way from being searched end to end, since a check event's
+/// logged output can run to kilobytes.
+const HEAD_BYTES: usize = 96;
 
 /// Whether committing `payload` ends the visit the log was in: an arrival
 /// (a transition or directed transition from a different state, or any
@@ -47,17 +56,12 @@ pub(super) fn closes_visit(payload: &EventPayload) -> bool {
     ) || opens_visit(payload)
 }
 
-/// The `context_reads` records for the visit that opened at `visit_seq`
-/// and that the commit described by `relay` closes, read from `log`, the
-/// session's log as it stood before that commit. Empty when the visit
-/// logged no read, or when its reads were already written.
-///
-/// Each record carries `relay`'s `koto.seq` (the closing event's) and
-/// `koto.visit.seq`, and the state the visit's reads name.
-pub(super) fn records(log: &str, visit_seq: u64, relay: &Relay<'_>) -> Vec<Record> {
-    let Some(window) = window(log, visit_seq) else {
-        return Vec::new();
-    };
+/// The reads of the visit that opened at `visit_seq`, folded from `log`,
+/// the session's log as it stood before the commit that closes the visit.
+/// `None` when the visit logged no read, or when its reads were already
+/// written, so the caller can skip everything else a record needs.
+pub(super) fn fold(log: &str, visit_seq: u64) -> Option<Fold> {
+    let window = window(log, visit_seq)?;
     let mut fold = Fold::default();
     for line in window.lines() {
         if head(line).is_some_and(|(_, kind)| kind == CONTEXT_READ) {
@@ -66,7 +70,15 @@ pub(super) fn records(log: &str, visit_seq: u64, relay: &Relay<'_>) -> Vec<Recor
             }
         }
     }
-    fold.into_records(relay)
+    (!fold.is_empty()).then_some(fold)
+}
+
+/// [`fold`], as the `context_reads` records of the commit `relay`
+/// describes. Each carries `relay`'s `koto.seq` (the closing event's) and
+/// `koto.visit.seq`, and the state the visit's reads name.
+#[cfg(test)]
+pub(super) fn records(log: &str, visit_seq: u64, relay: &Relay<'_>) -> Vec<Record> {
+    fold(log, visit_seq).map_or_else(Vec::new, |f| f.into_records(relay))
 }
 
 /// The part of `log` whose reads belong to the visit that opened at
@@ -82,7 +94,10 @@ pub(super) fn records(log: &str, visit_seq: u64, relay: &Relay<'_>) -> Vec<Recor
 /// visit's reads twice.
 ///
 /// Scans backwards from the end, reading only each line's leading `seq`
-/// and type word, so the work is bounded by the visit's length.
+/// and type word, so the work is bounded by the visit's length. It stops
+/// at `visit_seq`, or earlier at the last line that opens a visit by
+/// itself (a state entry other than a self-transition), so the window
+/// never reaches back past an arrival whatever `visit_seq` says.
 fn window(log: &str, visit_seq: u64) -> Option<&str> {
     for line in log.lines().rev() {
         let Some((seq, kind)) = head(line) else {
@@ -94,10 +109,17 @@ fn window(log: &str, visit_seq: u64) -> Option<&str> {
         match kind.as_ref() {
             SESSION_IMPORTED => return Some(after(log, line)),
             REQUEST_STORE_RESULT | WORKFLOW_CANCELLED => return None,
+            k if ENTRY_TYPES.contains(&k) && opens_a_visit(line) => return Some(after(log, line)),
             _ => {}
         }
     }
     None
+}
+
+/// Whether a state-entry line opens a visit. Only entry lines get here,
+/// and a visit has one at its start, so few are parsed.
+fn opens_a_visit(line: &str) -> bool {
+    serde_json::from_str::<Event>(line.trim()).is_ok_and(|e| opens_visit(&e.payload))
 }
 
 /// The rest of `log` after `line`, which is a slice of it.
@@ -124,7 +146,7 @@ fn head(line: &str) -> Option<(u64, Cow<'_, str>)> {
         let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
         let seq = rest[..digits].parse::<u64>().ok()?;
         let bytes = rest.as_bytes();
-        let head = &bytes[..bytes.len().min(96)];
+        let head = &bytes[..bytes.len().min(HEAD_BYTES)];
         let at = head.windows(TYPE_KEY.len()).position(|w| w == TYPE_KEY)? + TYPE_KEY.len();
         // `at` follows an ASCII quote, so it is a character boundary.
         let word = &rest[at..];
@@ -197,13 +219,17 @@ struct Tuple {
 /// A visit's reads so far: the state they name, up to [`MAX_TUPLES`] tuples
 /// in first-read order, and the summed reads of every tuple past those.
 #[derive(Debug, Default)]
-struct Fold {
+pub(super) struct Fold {
     state: Option<String>,
     tuples: Vec<Tuple>,
     overflow: Counts,
 }
 
 impl Fold {
+    fn is_empty(&self) -> bool {
+        self.tuples.is_empty() && self.overflow.reads == 0
+    }
+
     fn add(&mut self, read: &Read<'_>) {
         if self.state.is_none() {
             self.state = Some(read.state.to_string());
@@ -242,7 +268,11 @@ impl Fold {
         }
     }
 
-    fn into_records(self, relay: &Relay<'_>) -> Vec<Record> {
+    /// The `context_reads` records, in first-read order, then the overflow
+    /// record when any read went past [`MAX_TUPLES`] tuples. The key, reader
+    /// and access are written as themselves when they have the name shape,
+    /// and as their digests otherwise, so two odd values stay distinct.
+    pub(super) fn into_records(self, relay: &Relay<'_>) -> Vec<Record> {
         let state = self.state.as_deref();
         let mut out = Vec::with_capacity(self.tuples.len() + 1);
         for t in &self.tuples {
@@ -250,8 +280,14 @@ impl Fold {
                 .record("context_reads")
                 .name("koto.state", state)
                 .name("koto.context.key", Some(name_or_digest(&t.key).as_str()))
-                .name("koto.context.reader", Some(t.reader.as_str()))
-                .name("koto.context.access", Some(t.access.as_str()))
+                .name(
+                    "koto.context.reader",
+                    Some(name_or_digest(&t.reader).as_str()),
+                )
+                .name(
+                    "koto.context.access",
+                    Some(name_or_digest(&t.access).as_str()),
+                )
                 .int("koto.context.read_count", Some(t.counts.reads))
                 .int("koto.context.present_count", Some(t.counts.present));
             if t.counts.present > 0 {
@@ -280,9 +316,8 @@ mod tests {
     use super::*;
 
     fn line(seq: u64, kind: &str, payload: &str) -> String {
-        format!(
-            r#"{{"seq":{seq},"timestamp":"2026-10-11T00:00:00.000Z","type":"{kind}","payload":{payload}}}"#
-        )
+        let stamp = "2026-10-11T00:00:00.000Z";
+        format!(r#"{{"seq":{seq},"timestamp":"{stamp}","type":"{kind}","payload":{payload}}}"#)
     }
 
     fn read(seq: u64, key: &str, present: bool) -> String {
@@ -295,7 +330,13 @@ mod tests {
             seq,
             CONTEXT_READ,
             &format!(
-                r#"{{"key":"{key}","reader":"gate","state":"a","present":{present}{hash},"access":"content","gate":"g"}}"#
+                concat!(
+                    r#"{{"key":"{key}","reader":"gate","state":"a","#,
+                    r#""present":{present}{hash},"access":"content","gate":"g"}}"#
+                ),
+                key = key,
+                present = present,
+                hash = hash
             ),
         )
     }
@@ -345,6 +386,61 @@ mod tests {
             );
             assert!(window(&closed, 2).is_none(), "{closer}");
         }
+    }
+
+    fn entry(seq: u64, payload: EventPayload) -> String {
+        serde_json::to_string(&Event {
+            seq,
+            timestamp: "2026-10-11T00:00:00.000Z".into(),
+            event_type: payload.type_name().into(),
+            payload,
+            idempotency_hash: None,
+        })
+        .unwrap()
+    }
+
+    fn moved(from: &str, to: &str) -> EventPayload {
+        EventPayload::Transitioned {
+            from: Some(from.into()),
+            to: to.into(),
+            condition_type: "auto".into(),
+            skip_if_matched: None,
+            context_assignments: None,
+            vars_matched: None,
+        }
+    }
+
+    /// The scan stops at the last arrival even when told of an older visit,
+    /// and passes over a self-transition, which opens nothing.
+    #[test]
+    fn the_window_stops_at_the_last_arrival_and_not_at_a_self_transition() {
+        let log = [
+            r#"{"schema_version":1}"#.to_string(),
+            entry(1, moved("x", "a")),
+            read(2, "old", true),
+            entry(3, moved("a", "b")),
+            read(4, "kept", true),
+            entry(5, moved("b", "b")),
+            read(6, "also", true),
+        ]
+        .join("\n");
+        let w = window(&log, 1).unwrap();
+        assert!(!w.contains("\"old\""), "{w}");
+        assert!(w.contains("\"kept\"") && w.contains("\"also\""), "{w}");
+        let rewind = format!(
+            "{log}\n{}\n{}",
+            entry(
+                7,
+                EventPayload::Rewound {
+                    from: "b".into(),
+                    to: "b".into(),
+                    rationale: None,
+                }
+            ),
+            read(8, "after", true)
+        );
+        let w = window(&rewind, 1).unwrap();
+        assert!(w.contains("after") && !w.contains("kept"), "{w}");
     }
 
     fn read_payload<'a>(key: &'a str, reader: &'a str, hash: Option<&'a str>) -> Read<'a> {

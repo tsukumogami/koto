@@ -92,10 +92,10 @@
 //!   `default_action_executed`. A commit that ends a visit (an arrival, a
 //!   rewind, a cancel, or the terminal tick's `request_store.result`)
 //!   writes the visit's `context_reads` just before its own record. Before
-//!   those, on any committed payload, it
-//!   writes `driver_seen` when the process's driver (`CLAUDE_CODE_SESSION_ID`,
-//!   when id-shaped) differs from the one the session's sidecar caches, or
-//!   the sidecar caches none, and then caches the new driver. No driver is
+//!   those, on any committed payload, it writes `driver_seen` when the
+//!   process's driver (`CLAUDE_CODE_SESSION_ID`, when id-shaped) differs
+//!   from the one the session's sidecar caches, or the sidecar caches none,
+//!   and then caches the new driver. No driver is
 //!   never a change. Two commands racing under one new driver can each
 //!   write a `driver_seen`; readers take the distinct values.
 //! - [`terminal`], from the terminal tick, writes `terminal` once per
@@ -454,8 +454,9 @@ fn record_for(
     }
 }
 
-/// Whether a payload writes a record, without reading anything. A
-/// `context_read`, the commonest payload, never does.
+/// Whether a payload writes a record of its own, without reading anything.
+/// A `context_read`, the commonest payload, never does. (A payload that
+/// ends a visit can also write that visit's reads; see [`after_commit`].)
 fn journals(payload: &EventPayload) -> bool {
     matches!(
         payload,
@@ -464,7 +465,6 @@ fn journals(payload: &EventPayload) -> bool {
             | EventPayload::Rewound { .. }
             | EventPayload::WorkflowCancelled { .. }
     ) || relays(payload)
-        || context_reads::closes_visit(payload)
 }
 
 /// Whether a payload relays check records (see [`relayed`]).
@@ -738,16 +738,22 @@ pub(crate) fn after_init(
 /// first, whatever the payload, and the sidecar is then rewritten with the
 /// new driver. Two commands racing under the same new driver can each
 /// write one; readers take the distinct values, so the duplicate is
-/// harmless. Without a driver change, payloads other than state entries,
-/// cancels and check events write nothing and read nothing beyond the
-/// sidecar.
+/// harmless.
+///
+/// A payload that ends a visit (see `context_reads::closes_visit`: an
+/// arrival, a rewind, a cancel, or the terminal tick's
+/// `request_store.result`) first folds that visit's `context_read` events
+/// out of `commit`'s copy of the log, and writes the resulting
+/// `context_reads` after any `driver_seen` and before its own record. A
+/// `request_store.result` writes nothing else, so when its visit has no
+/// reads left to write, it reads nothing more. Without a driver change, a
+/// payload that is none of these (a state entry, a cancel, that result, a
+/// check event) writes nothing and reads nothing beyond the sidecar.
 ///
 /// A check event (`gate_evaluated`, `default_action_executed`) relays its
 /// `check_evaluated` and `check_rule` records, or a `check_pending`, each
 /// carrying `commit`'s `seq` as `koto.seq` and the visit the event belongs
-/// to as `koto.visit.seq`. A payload that ends a visit writes that visit's
-/// `context_reads` after any `driver_seen` and before its own record, folded
-/// from `commit`'s copy of the log (see `context_reads`). The header comes from `commit`'s copy of the
+/// to as `koto.visit.seq`. The header comes from `commit`'s copy of the
 /// log, so nothing is read again. A commit's records are written as one
 /// batch, flushed only when it holds an identity record (see [`write`]).
 /// `journal_root` is the store's journal home; `None` writes nothing.
@@ -763,7 +769,15 @@ pub(crate) fn after_commit(
     };
     let session_dir = backend.session_dir(session);
     let new_driver = changed_driver(&session_dir);
-    if new_driver.is_none() && !journals(payload) {
+    // The visit a closing commit ends, and its reads still to be written.
+    // Folded before anything else is read, so a closing commit with nothing
+    // to write (a `request_store.result` in a visit with no reads) stops
+    // here.
+    let reads = context_reads::closes_visit(payload)
+        .then(|| commit.prior_visit_seq())
+        .flatten()
+        .and_then(|visit| Some((visit, context_reads::fold(&commit.prior_log, visit)?)));
+    if new_driver.is_none() && reads.is_none() && !journals(payload) {
         return;
     }
     let header = match header_of(commit, backend, session) {
@@ -792,24 +806,18 @@ pub(crate) fn after_commit(
     }
     // A commit that ends a visit writes that visit's reads first, before
     // the `state_entered` or `cancelled` it maps to.
-    if context_reads::closes_visit(payload) {
-        if let Some(visit_seq) = commit.prior_visit_seq() {
-            records.extend(context_reads::records(
-                &commit.prior_log,
-                visit_seq,
-                &Relay {
-                    session,
-                    session_id: &header.session_id,
-                    run_id: run_id.as_deref(),
-                    seq: commit.seq,
-                    visit_seq: Some(visit_seq),
-                },
-            ));
-        }
+    if let Some((visit_seq, fold)) = reads {
+        records.extend(fold.into_records(&Relay {
+            session,
+            session_id: &header.session_id,
+            run_id: run_id.as_deref(),
+            seq: commit.seq,
+            visit_seq: Some(visit_seq),
+        }));
     }
     records.extend(record_for(payload, session, &header, run_id.as_deref()));
-    // The visit is worked out only here, for a payload that relays check
-    // records or ends a visit: every other commit skips the scan of the log.
+    // A check event's own visit is worked out only here. Apart from the
+    // closing commits above, every other commit skips the scan of the log.
     if relays(payload) {
         records.extend(relayed(
             payload,

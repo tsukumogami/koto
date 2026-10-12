@@ -33,10 +33,12 @@ to `0.9.x`).
   hashes. A visit writes at most 51 such lines: past 50 tuples, one
   overflow line sums the rest. The lines come right before the
   `state_entered`, `cancelled` or `terminal` that ends the visit, carry
-  `koto.seq` and `koto.visit.seq`, and never hold a context value. A key
-  outside the journal's name shape is written as its digest. Reads made
-  after a visit's terminal or cancel, and reads carried in by `koto session
-  import`, aren't journaled.
+  `koto.seq` and `koto.visit.seq`, and never hold a context value, though
+  the key's name and the content's unsalted SHA-256 can reveal what a
+  session read, so the lines are host-local data to forward with care. A
+  key, reader or access outside the journal's name shape is written as its
+  digest. Reads made after a visit's terminal or cancel, and reads carried
+  in by `koto session import`, aren't journaled.
 
 - **A session waiting on a request leg is woken when the leg changes.** Every
   write that records a leg's result (a promoted worker result, `koto request

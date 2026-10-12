@@ -62,8 +62,9 @@ must match `^[A-Za-z0-9._:-]{1,128}$`. Names (`koto.template.name`,
 string values of the check and context kinds) must match
 `^[A-Za-z0-9._:/@-]{1,128}$` and not start with `/` or `~`. A value outside
 its shape is left out and the record is still written. `koto.rule.id` and
-`koto.context.key` are never left out: a rule id or context key outside the
-name shape is written as its digest (see [Rule ids](#rule-ids)).
+`koto.context.key`, `koto.context.reader` and `koto.context.access` are
+never left out: such a value outside the name shape is written as its
+digest (see [Rule ids](#rule-ids)).
 
 ### Record kinds
 
@@ -256,7 +257,23 @@ A context-read record carries `koto.seq` and `koto.visit.seq` like a check
 record, with two differences: `koto.seq` is the sequence number of the
 session-log event that ended the visit (the highest in the log when the
 record is written), and `koto.visit.seq` is the visit that ended, not the
-one that event begins. No record holds a context value, only its hash.
+one that event begins.
+
+No record holds a context value as such, but the records do say what a
+session read:
+
+- `koto.context.key` is the key's name, verbatim, whenever it fits the
+  name shape. Only a key outside the shape is written as its digest, and
+  that digest is for shape, not secrecy (see [Rule ids](#rule-ids)).
+- `koto.context.first_hash` and `koto.context.last_hash` are the plain,
+  unsalted SHA-256 of the content. The same content gives the same hash on
+  every host and in every session, so anyone holding a candidate value can
+  confirm it, and a short or guessable value (a branch name, a yes or no, a
+  small number) is easy to recover from its hash.
+
+Treat context-read records as host-local data that can reveal what a
+session read and, for guessable content, what it said. Don't forward them
+off the host without that in mind.
 
 ### When a visit's reads are written
 
@@ -271,22 +288,27 @@ visit, right before it:
   record follows at once.
 
 A transition from a state to itself stays in the visit and writes none.
-A visit's reads are written once. If the terminal tick couldn't append its
-result event, the terminal visit's reads stay open and the next arrival
-(a rewind out of the terminal) writes them.
+A visit's reads are written once.
+
+The one exception to the rule below that reads after a `terminal` aren't
+journaled: if the terminal tick couldn't append its result event to the
+session's log, the terminal visit stays open. Its reads, and any read made
+after the `terminal` record (a `koto context get` on the kept session, say),
+are written at the visit's next end, such as a rewind out of the terminal,
+before that rewind's `state_entered`.
 
 ### `context_reads`
 
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|
 | `koto.state` | string | always | The state of the visit, as its reads name it. |
-| `koto.context.key` | string | except on the overflow record | The key, or its digest when it's outside the name shape (any key longer than 128 bytes), computed as for [Rule ids](#rule-ids). |
-| `koto.context.reader` | string | except on the overflow record | Who read it: `gate`, `cli`, `result` or `decider`. |
-| `koto.context.access` | string | except on the overflow record | `content` for a read that fetched the content, `presence` for one that asked only whether the key exists. |
+| `koto.context.key` | string | except on the overflow record | The key's name, verbatim, when it has the name shape; otherwise (any key longer than 128 bytes) its digest, computed as for [Rule ids](#rule-ids). |
+| `koto.context.reader` | string | except on the overflow record | Who read it: `gate`, `cli`, `result` or `decider`. A value outside the name shape is written as its digest. |
+| `koto.context.access` | string | except on the overflow record | `content` for a read that fetched the content, `presence` for one that asked only whether the key exists. A value outside the name shape is written as its digest. |
 | `koto.context.overflow` | boolean | on the overflow record only | `true`: the record sums the reads of every tuple past the visit's first 50. |
 | `koto.context.read_count` | integer | always | Reads of the tuple in the visit, at least 1. |
 | `koto.context.present_count` | integer | always | Those of them that found the key. |
-| `koto.context.first_hash` | string | when `koto.context.present_count` is at least 1, except on the overflow record | The SHA-256 of the content the first read that found the key saw, in lowercase hex, as the session log records it. |
+| `koto.context.first_hash` | string | when `koto.context.present_count` is at least 1, except on the overflow record | The unsalted SHA-256 of the content the first read that found the key saw, in lowercase hex, as the session log records it. |
 | `koto.context.last_hash` | string | as `koto.context.first_hash` | The same for the last such read. Equal to the first when the content didn't change. |
 
 ### What writes no context-read record
@@ -294,7 +316,8 @@ result event, the terminal visit's reads stay open and the next arrival
 - Reads koto doesn't log: `koto status`, and koto's own bookkeeping.
 - Reads in a visit after its `terminal` or `cancelled` record was written,
   such as `koto context get` on a kept terminal session or on a cancelled
-  one.
+  one, except after a terminal whose result event couldn't be appended
+  (see above).
 - The reads in a log carried in by `koto session import`. An imported
   session's open visit counts only the reads made after the import.
 - A visit still open when the session is removed without a `terminal` or
