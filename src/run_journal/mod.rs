@@ -60,19 +60,39 @@
 //! - `check_pending`: one per pending `gate_evaluated` of a polling gate,
 //!   with the poll's run count and elapsed seconds, never an outcome.
 //!
+//! Three more are relayed the same way, with the same two sequence
+//! numbers, from decider and override events:
+//!
+//! - `decider_consulted`: one per `decider_consulted` event, with the
+//!   provider, model, outcome, token counts and timings.
+//! - `decider_checked`: one per `decider_checked` event (one criterion of a
+//!   decider check), with the gate as `koto.check`, the criterion's id as
+//!   `koto.rule.id` (digested like a rule id), the mode, outcome, reason,
+//!   whether it blocked, tokens and timings. A verdict koto reuses appends
+//!   no event, so it writes no record.
+//! - `check_overridden`: one per `gate_override_recorded`, with the state
+//!   and gate only.
+//!
+//! None of them copies a probability, hash, threshold, endpoint, rule
+//! reference, rationale, override value or output, and `koto.visit.seq` is
+//! always koto's visit, never the `visit_seq` a decider event carries.
+//!
 //! One more relays no event: `response`, written after `koto next` or
 //! `koto status` prints a non-terminal state's directive, with the byte
 //! lengths of the printed `directive` and `details` (never their text).
 //! Its `koto.seq` is the highest sequence number in the session's log when
 //! it is written, and its `koto.visit.seq` the visit the log is in.
 //!
-//! A field with no value is left out, never written as null or empty. Ids
-//! must match `^[A-Za-z0-9._:-]{1,128}$` and names `^[A-Za-z0-9._:/@-]{1,128}$`
-//! without a leading `/` or `~`. Names cover template and state names,
-//! `koto.check`, and the short vocabulary values the check kinds carry
-//! (`koto.check.outcome`, `koto.poll.status`, `koto.check.error`). A value
-//! outside its shape is left out and the record is still written, with one
-//! exception: a rule id outside the name shape is written as its digest
+//! A field with no value is left out, never written as null or empty.
+//! Ids must match `^[A-Za-z0-9._:-]{1,128}$`, and names
+//! `^[A-Za-z0-9._:/@-]{1,128}$` without a leading `/` or `~`. Names cover
+//! template and state names, `koto.check`, the decider's provider and
+//! model, and the short vocabulary values the other kinds carry
+//! (`koto.check.outcome`, `koto.poll.status`, `koto.check.error`, the
+//! `koto.decider.` outcome, mode, reason and error class, and
+//! `koto.response.source`). A value outside its shape is left out and the
+//! record is still written, with one exception: a rule id outside the name
+//! shape, a decider criterion's id included, is written as its digest
 //! ([`name_or_digest`]), never dropped.
 //!
 //! ## When records are written
@@ -85,13 +105,15 @@
 //! - [`after_commit`], from `LocalBackend::append_event` next to the
 //!   `/workflows` hook, writes `state_entered` for each `transitioned`,
 //!   `directed_transition` and `rewound` event, `cancelled` for
-//!   `workflow_cancelled`, and the check kinds for `gate_evaluated` and
-//!   `default_action_executed`. Before those, on any committed payload, it
-//!   writes `driver_seen` when the process's driver (`CLAUDE_CODE_SESSION_ID`,
-//!   when id-shaped) differs from the one the session's sidecar caches, or
-//!   the sidecar caches none, and then caches the new driver. No driver is
-//!   never a change. Two commands racing under one new driver can each
-//!   write a `driver_seen`; readers take the distinct values.
+//!   `workflow_cancelled`, the check kinds for `gate_evaluated` and
+//!   `default_action_executed`, and the decider and override kinds for
+//!   `decider_consulted`, `decider_checked` and `gate_override_recorded`.
+//!   Before those, on any committed payload, it writes `driver_seen` when
+//!   the process's driver (`CLAUDE_CODE_SESSION_ID`, when id-shaped)
+//!   differs from the one the session's sidecar caches, or the sidecar
+//!   caches none, and then caches the new driver. No driver is never a
+//!   change. Two commands racing under one new driver can each write a
+//!   `driver_seen`; readers take the distinct values.
 //! - [`terminal`], from the terminal tick, writes `terminal` once per
 //!   arrival.
 //! - [`response`], from `koto next`'s two print sites and from
@@ -117,9 +139,9 @@
 //! a newline and starts its record on a line of its own, so only the
 //! partial line is lost. Readers skip lines that don't parse as JSON.
 //!
-//! A batch holding an identity record is flushed to disk; a batch of check
-//! or response records alone isn't, and is made durable by the next flush
-//! (see [`write`]).
+//! A batch holding an identity record is flushed to disk; a batch of
+//! relayed or response records alone isn't, and is made durable by the next
+//! flush (see [`write`]).
 //!
 //! ## Files
 //!
@@ -185,7 +207,8 @@ pub(crate) fn is_name(value: &str) -> bool {
 
 /// `value` when it has the name shape, otherwise `sha256:` and the first 32
 /// lowercase hex characters of the SHA-256 of its UTF-8 bytes. Used for
-/// rule ids, which koto doesn't restrict: the same id gives the same value
+/// rule ids and decider criterion ids, which koto doesn't restrict to the
+/// name shape: the same id gives the same value
 /// in every session, and the result always has the name shape, so an odd
 /// id keeps its identity without its text reaching the journal.
 pub(crate) fn name_or_digest(value: &str) -> String {
@@ -198,8 +221,9 @@ pub(crate) fn name_or_digest(value: &str) -> String {
 }
 
 /// The record kinds that describe a session's identity and progress. A
-/// batch holding one is flushed to disk; the kinds relayed from check
-/// events never are on their own (see [`write`]).
+/// batch holding one is flushed to disk; the kinds relayed from check,
+/// decider and override events, and `response`, never are on their own
+/// (see [`write`]).
 const IDENTITY_KINDS: &[&str] = &[
     "session_started",
     "state_entered",
@@ -376,13 +400,13 @@ pub(crate) fn warnings_for_test() -> Vec<String> {
 /// warning and the rest are still written.
 ///
 /// The batch is flushed to disk only when it holds an identity record
-/// ([`IDENTITY_KINDS`]). Records relayed from check events are never
-/// flushed on their own: a flush takes milliseconds, and a blocked tick
-/// relays several. They reach the kernel at once, so a process that dies
-/// loses none of them, and the next identity record's flush (a state entry,
-/// a terminal, a cancel) makes them durable with it, since a flush covers
-/// the whole file. Only an OS crash or power loss before then can lose
-/// them.
+/// ([`IDENTITY_KINDS`]). Records relayed from check, decider and override
+/// events, and `response` records, are never flushed on their own: a flush
+/// takes milliseconds, and a blocked tick writes several. They reach the
+/// kernel at once, so a process that dies loses none of them, and the next
+/// identity record's flush (a state entry, a terminal, a cancel) makes them
+/// durable with it, since a flush covers the whole file. Only an OS crash
+/// or power loss before then can lose them.
 fn write(root: &Path, records: &[Record]) {
     write_within(root, records, None)
 }
@@ -473,11 +497,15 @@ fn journals(payload: &EventPayload) -> bool {
     ) || relays(payload)
 }
 
-/// Whether a payload relays check records (see [`relayed`]).
+/// Whether a payload relays records of its own (see [`relayed`]).
 fn relays(payload: &EventPayload) -> bool {
     matches!(
         payload,
-        EventPayload::GateEvaluated { .. } | EventPayload::DefaultActionExecuted { .. }
+        EventPayload::GateEvaluated { .. }
+            | EventPayload::DefaultActionExecuted { .. }
+            | EventPayload::DeciderConsulted(_)
+            | EventPayload::DeciderChecked(_)
+            | EventPayload::GateOverrideRecorded { .. }
     )
 }
 
@@ -508,14 +536,18 @@ impl Relay<'_> {
     }
 }
 
-/// The records a committed check event relays: `check_pending` for a
-/// pending polling gate; otherwise `check_evaluated`, then one `check_rule`
-/// per key of the event's `rule_counts`, in their order. Every other
-/// payload relays nothing.
+/// The records a committed event relays. A check event writes a
+/// `check_pending` for a pending polling gate; otherwise a
+/// `check_evaluated`, then one `check_rule` per key of the event's
+/// `rule_counts`, in their order. A `decider_consulted` or
+/// `decider_checked` event writes one record of its own name, and a
+/// `gate_override_recorded` one `check_overridden`. Every other payload
+/// relays nothing.
 ///
 /// Each field is copied by name from the event, never by stripping it, so
 /// nothing the event carries beyond these (output, streams, findings,
-/// commands) can reach the journal.
+/// commands, probabilities, hashes, thresholds, rationales, override
+/// values) can reach the journal.
 fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
     match payload {
         EventPayload::GateEvaluated {
@@ -569,8 +601,72 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
             let evaluated = check_evaluated(relay, state, ACTION_CHECK, outcome, check);
             with_rules(evaluated, relay, state, ACTION_CHECK, check)
         }
+        EventPayload::DeciderConsulted(c) => vec![decider_consulted(relay, c)],
+        EventPayload::DeciderChecked(c) => vec![decider_checked(relay, c)],
+        // The override event doesn't say which rules it moved past; a reader
+        // joins it to the evaluation it overrode (the reference's "Joining
+        // an override"). Its rationale and values stay in the log.
+        EventPayload::GateOverrideRecorded { state, gate, .. } => vec![relay
+            .record("check_overridden")
+            .name("koto.state", Some(state.as_str()))
+            .name("koto.check", Some(gate.as_str()))],
         _ => Vec::new(),
     }
+}
+
+/// A `decider_consulted` record: the routing decider's provider, model,
+/// outcome, tokens and timings. The event's own `visit_seq` isn't copied:
+/// `koto.visit.seq` comes from `relay`, by koto's visit rule, like every
+/// relayed record's.
+fn decider_consulted(relay: &Relay<'_>, c: &crate::decider::DeciderConsultation) -> Record {
+    relay
+        .record("decider_consulted")
+        .name("koto.state", Some(c.state.as_str()))
+        .name("koto.decider.provider", Some(c.provider.as_str()))
+        .name("koto.decider.model", Some(c.model.as_str()))
+        .name("koto.decider.outcome", Some(c.outcome.as_str()))
+        .name(
+            "koto.decider.error_class",
+            c.error_class.as_ref().map(|e| e.as_str()),
+        )
+        .int("koto.decider.input_tokens", c.input_tokens)
+        .int("koto.decider.output_tokens", c.output_tokens)
+        .int(
+            "koto.decider.unread_usage_attempts",
+            Some(u64::from(c.unread_usage_attempts)),
+        )
+        .int("koto.decider.latency_ms", Some(c.latency_ms))
+        .int("koto.decider.directive_bytes", Some(c.directive_bytes))
+}
+
+/// A `decider_checked` record: one decider-check criterion's verdict, under
+/// its gate as `koto.check` and its id (or the id's digest) as
+/// `koto.rule.id`. Like [`decider_consulted`], the event's own `visit_seq`
+/// isn't copied.
+fn decider_checked(relay: &Relay<'_>, c: &crate::decider::check::DeciderCheck) -> Record {
+    relay
+        .record("decider_checked")
+        .name("koto.state", Some(c.state.as_str()))
+        .name("koto.check", Some(c.gate.as_str()))
+        .name("koto.rule.id", Some(name_or_digest(&c.rule_id).as_str()))
+        .name("koto.decider.provider", Some(c.provider.as_str()))
+        .name("koto.decider.model", Some(c.model.as_str()))
+        .name("koto.decider.mode", Some(c.mode.as_str()))
+        .name("koto.decider.outcome", Some(c.outcome.as_str()))
+        .name("koto.decider.reason", c.reason.map(|r| r.as_str()))
+        .flag("koto.decider.blocked", c.blocked)
+        .name(
+            "koto.decider.error_class",
+            c.error_class.as_ref().map(|e| e.as_str()),
+        )
+        .int("koto.decider.input_tokens", c.input_tokens)
+        .int("koto.decider.output_tokens", c.output_tokens)
+        .int(
+            "koto.decider.unread_usage_attempts",
+            Some(u64::from(c.unread_usage_attempts)),
+        )
+        .int("koto.decider.attempts", Some(u64::from(c.attempts)))
+        .int("koto.decider.latency_ms", Some(c.latency_ms))
 }
 
 /// A `check_evaluated` record's fields common to gates and default actions.
@@ -752,9 +848,10 @@ pub(crate) fn after_init(
 /// sidecar.
 ///
 /// A check event (`gate_evaluated`, `default_action_executed`) relays its
-/// `check_evaluated` and `check_rule` records, or a `check_pending`, each
-/// carrying `commit`'s `seq` as `koto.seq` and the visit the event belongs
-/// to as `koto.visit.seq`. The header comes from `commit`'s copy of the
+/// `check_evaluated` and `check_rule` records, or a `check_pending`; a
+/// decider or override event its one record (see [`relayed`]). Each carries
+/// `commit`'s `seq` as `koto.seq` and the visit the event belongs to as
+/// `koto.visit.seq`. The header comes from `commit`'s copy of the
 /// log, so nothing is read again. A commit's records are written as one
 /// batch, flushed only when it holds an identity record (see [`write`]).
 /// `journal_root` is the store's journal home; `None` writes nothing.
@@ -798,8 +895,8 @@ pub(crate) fn after_commit(
         );
     }
     records.extend(record_for(payload, session, &header, run_id.as_deref()));
-    // The visit is worked out only here, for a payload that relays check
-    // records: every other commit skips the scan of the log.
+    // The visit is worked out only here, for a payload that relays records
+    // of its own: every other commit skips the scan of the log.
     if relays(payload) {
         records.extend(relayed(
             payload,

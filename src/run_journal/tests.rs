@@ -1762,3 +1762,425 @@ fn a_response_skips_its_record_while_another_writer_holds_the_lock() {
     );
     drop(holder);
 }
+
+// ----- Decider and override records -----
+
+use crate::decider::check::{DeciderCheck, RecordedOutcome, UnansweredReason};
+use crate::decider::types::{ErrorClass, SettingOrigin};
+use crate::decider::{ConsultationOutcome, DeciderConsultation, FieldConsultation};
+use crate::template::decider_check::CheckMode;
+
+/// The fields a decider or override kind may carry beyond [`RELAY_FIELDS`].
+fn decider_kind_fields(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "decider_consulted" => &[
+            "koto.state",
+            "koto.decider.provider",
+            "koto.decider.model",
+            "koto.decider.outcome",
+            "koto.decider.error_class",
+            "koto.decider.input_tokens",
+            "koto.decider.output_tokens",
+            "koto.decider.unread_usage_attempts",
+            "koto.decider.latency_ms",
+            "koto.decider.directive_bytes",
+        ],
+        "decider_checked" => &[
+            "koto.state",
+            "koto.check",
+            "koto.rule.id",
+            "koto.decider.provider",
+            "koto.decider.model",
+            "koto.decider.mode",
+            "koto.decider.outcome",
+            "koto.decider.reason",
+            "koto.decider.blocked",
+            "koto.decider.error_class",
+            "koto.decider.input_tokens",
+            "koto.decider.output_tokens",
+            "koto.decider.unread_usage_attempts",
+            "koto.decider.attempts",
+            "koto.decider.latency_ms",
+        ],
+        "check_overridden" => &["koto.state", "koto.check"],
+        other => panic!("not a decider or override kind: {other}"),
+    }
+}
+
+/// The decider and override records in `j`, each checked to carry `v` 1,
+/// both sequence numbers, and only its kind's fields.
+fn decider_records(j: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    j.iter()
+        .filter(|r| {
+            matches!(
+                r["kind"].as_str().unwrap(),
+                "decider_consulted" | "decider_checked" | "check_overridden"
+            )
+        })
+        .map(|r| {
+            let kind = r["kind"].as_str().unwrap();
+            let allowed: BTreeSet<&str> = RELAY_FIELDS
+                .iter()
+                .chain(decider_kind_fields(kind))
+                .copied()
+                .collect();
+            for (key, value) in r.as_object().unwrap() {
+                assert!(allowed.contains(key.as_str()), "{kind} carries {key}: {r}");
+                assert!(!value.is_null() && value != "", "{key}: {r}");
+            }
+            assert_eq!(r["v"], 1);
+            assert!(r["koto.seq"].is_u64(), "{r}");
+            assert!(r["koto.visit.seq"].is_u64(), "{r}");
+            r.clone()
+        })
+        .collect()
+}
+
+/// A routing consultation of state `a` whose own `visit_seq` (99) is not
+/// koto's visit, with a planted hash and a probability in its field detail.
+fn consultation() -> DeciderConsultation {
+    let mut probabilities = std::collections::BTreeMap::new();
+    probabilities.insert("proceed".to_string(), 0.4321);
+    let mut fields = std::collections::BTreeMap::new();
+    fields.insert(
+        "verdict".to_string(),
+        FieldConsultation {
+            declaration_hash: "PLANTED-DECLARATION-HASH".into(),
+            modes: Default::default(),
+            probabilities,
+            winning: Some("proceed".into()),
+            confidence: Some(0.4321),
+            threshold: Some(0.875),
+            at_threshold: false,
+            outcome: None,
+        },
+    );
+    DeciderConsultation {
+        state: "a".into(),
+        visit_seq: 99,
+        provider: "jev".into(),
+        model: "jev-test-1.2.3".into(),
+        input_sha256: Some("PLANTED-INPUT-HASH".into()),
+        outcome: ConsultationOutcome::NotApplied,
+        error_class: None,
+        latency_ms: 321,
+        directive_bytes: 4567,
+        endpoint_origin: SettingOrigin::Env,
+        fields,
+        input_tokens: Some(812),
+        output_tokens: Some(9),
+        unread_usage_attempts: 0,
+    }
+}
+
+/// One criterion's verdict on gate `comments` in state `a`, whose own
+/// `visit_seq` (99) is not koto's visit, with a planted rule reference,
+/// hashes, threshold and probability.
+fn criterion_check(rule_id: &str) -> DeciderCheck {
+    let mut probabilities = std::collections::BTreeMap::new();
+    probabilities.insert("fail".to_string(), 0.4321);
+    DeciderCheck {
+        state: "a".into(),
+        visit_seq: 99,
+        gate: "comments".into(),
+        rule_id: rule_id.into(),
+        rule_ref: "https://example.org/PLANTED-RULE-REF".into(),
+        declaration_hash: "PLANTED-DECLARATION-HASH".into(),
+        mode: CheckMode::Veto,
+        threshold: 0.875,
+        outcome: RecordedOutcome::Fail,
+        reason: None,
+        blocked: true,
+        provider: "jev".into(),
+        model: "jev-test-1.2.3".into(),
+        probabilities,
+        input_sha256: Some("PLANTED-INPUT-HASH".into()),
+        input_bytes: Some(34),
+        input_tokens: Some(100),
+        output_tokens: Some(3),
+        unread_usage_attempts: 0,
+        attempts: 1,
+        latency_ms: 12,
+        error_class: None,
+        endpoint_origin: Some(SettingOrigin::Env),
+    }
+}
+
+/// Nothing the decider events carry beyond the record's fields reaches the
+/// journal.
+fn assert_no_decider_content(f: &Fixture) {
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    for absent in [
+        "PLANTED",
+        "0.4321",
+        "0.875",
+        "probabilit",
+        "threshold",
+        "endpoint",
+        "rule_ref",
+        "verdict",
+        "proceed",
+        "\"env\"",
+    ] {
+        assert!(!raw.contains(absent), "{absent} in {raw}");
+    }
+}
+
+#[test]
+fn a_consultation_relays_decider_consulted_with_the_events_values() {
+    let f = session_in_a();
+    reset_for_test();
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::DeciderConsulted(consultation()),
+    );
+    // An error with no usage read: tokens absent, the error class present,
+    // the unread count as logged.
+    let failed = DeciderConsultation {
+        outcome: ConsultationOutcome::Error,
+        error_class: Some(ErrorClass::Timeout),
+        model: "unknown".into(),
+        input_tokens: None,
+        output_tokens: None,
+        unread_usage_attempts: 2,
+        ..consultation()
+    };
+    commit_as(&f, None, "wf", &EventPayload::DeciderConsulted(failed));
+    assert_eq!(
+        batches_for_test(),
+        (2, 0),
+        "relayed, so never flushed alone"
+    );
+
+    let d = decider_records(&f.journal());
+    assert_eq!(kinds(&d), vec!["decider_consulted", "decider_consulted"]);
+    let r = &d[0];
+    assert_eq!(r["session"], "wf");
+    assert_eq!(r["koto.session.id"], "wf-id");
+    assert_eq!(r["koto.run.id"], "wf-id");
+    assert_eq!(r["koto.seq"], 3);
+    assert_eq!(r["koto.visit.seq"], 2, "koto's visit, not the event's 99");
+    assert_eq!(r["koto.state"], "a");
+    assert_eq!(r["koto.decider.provider"], "jev");
+    assert_eq!(r["koto.decider.model"], "jev-test-1.2.3");
+    assert_eq!(r["koto.decider.outcome"], "not_applied");
+    assert_eq!(r["koto.decider.input_tokens"], 812);
+    assert_eq!(r["koto.decider.output_tokens"], 9);
+    assert_eq!(r["koto.decider.unread_usage_attempts"], 0);
+    assert_eq!(r["koto.decider.latency_ms"], 321);
+    assert_eq!(r["koto.decider.directive_bytes"], 4567);
+    assert!(r.get("koto.decider.error_class").is_none(), "{r}");
+
+    let r = &d[1];
+    assert_eq!(r["koto.seq"], 4);
+    assert_eq!(r["koto.visit.seq"], 2);
+    assert_eq!(r["koto.decider.outcome"], "error");
+    assert_eq!(r["koto.decider.error_class"], "timeout");
+    assert_eq!(r["koto.decider.model"], "unknown");
+    assert_eq!(r["koto.decider.unread_usage_attempts"], 2);
+    for absent in ["koto.decider.input_tokens", "koto.decider.output_tokens"] {
+        assert!(r.get(absent).is_none(), "{absent}: {r}");
+    }
+    assert_no_decider_content(&f);
+    assert!(warnings_for_test().is_empty());
+}
+
+#[test]
+fn a_criterion_relays_decider_checked_with_the_events_values() {
+    let f = session_in_a();
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::DeciderChecked(criterion_check("comment_reason")),
+    );
+    // A shadow criterion left unanswered: the reason and error class
+    // present, no tokens, nothing sent.
+    let unanswered = DeciderCheck {
+        mode: CheckMode::Shadow,
+        outcome: RecordedOutcome::Unanswered,
+        reason: Some(UnansweredReason::Busy),
+        blocked: false,
+        model: "unknown".into(),
+        probabilities: Default::default(),
+        input_tokens: None,
+        output_tokens: None,
+        unread_usage_attempts: 1,
+        attempts: 0,
+        latency_ms: 0,
+        error_class: Some(ErrorClass::HttpStatus),
+        ..criterion_check("no reason [x]")
+    };
+    commit_as(&f, None, "wf", &EventPayload::DeciderChecked(unanswered));
+
+    let d = decider_records(&f.journal());
+    assert_eq!(kinds(&d), vec!["decider_checked", "decider_checked"]);
+    let r = &d[0];
+    assert_eq!(r["koto.seq"], 3);
+    assert_eq!(r["koto.visit.seq"], 2, "koto's visit, not the event's 99");
+    assert_eq!(r["koto.state"], "a");
+    assert_eq!(r["koto.check"], "comments");
+    assert_eq!(r["koto.rule.id"], "comment_reason");
+    assert_eq!(r["koto.decider.provider"], "jev");
+    assert_eq!(r["koto.decider.model"], "jev-test-1.2.3");
+    assert_eq!(r["koto.decider.mode"], "veto");
+    assert_eq!(r["koto.decider.outcome"], "fail");
+    assert_eq!(r["koto.decider.blocked"], true);
+    assert_eq!(r["koto.decider.input_tokens"], 100);
+    assert_eq!(r["koto.decider.output_tokens"], 3);
+    assert_eq!(r["koto.decider.unread_usage_attempts"], 0);
+    assert_eq!(r["koto.decider.attempts"], 1);
+    assert_eq!(r["koto.decider.latency_ms"], 12);
+    for absent in ["koto.decider.reason", "koto.decider.error_class"] {
+        assert!(r.get(absent).is_none(), "{absent}: {r}");
+    }
+
+    let r = &d[1];
+    assert_eq!(r["koto.seq"], 4);
+    assert_eq!(
+        r["koto.rule.id"],
+        name_or_digest("no reason [x]").as_str(),
+        "a criterion id outside the name shape is digested"
+    );
+    assert_eq!(r["koto.decider.mode"], "shadow");
+    assert_eq!(r["koto.decider.outcome"], "unanswered");
+    assert_eq!(r["koto.decider.reason"], "busy");
+    assert_eq!(r["koto.decider.blocked"], false);
+    assert_eq!(r["koto.decider.error_class"], "http_status");
+    assert_eq!(r["koto.decider.unread_usage_attempts"], 1);
+    assert_eq!(r["koto.decider.attempts"], 0);
+    assert_eq!(r["koto.decider.latency_ms"], 0);
+    for absent in ["koto.decider.input_tokens", "koto.decider.output_tokens"] {
+        assert!(r.get(absent).is_none(), "{absent}: {r}");
+    }
+    assert_no_decider_content(&f);
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("no reason"), "{raw}");
+}
+
+#[test]
+fn an_override_relays_check_overridden_with_its_state_and_gate_only() {
+    let f = session_in_a();
+    reset_for_test();
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::GateOverrideRecorded {
+            state: "a".into(),
+            gate: "lint".into(),
+            rationale: "PLANTED-RATIONALE".into(),
+            override_applied: serde_json::json!({"exit_code": 0, "note": "PLANTED-VALUE"}),
+            actual_output: serde_json::json!({"exit_code": 1, "error": "PLANTED-OUTPUT"}),
+            timestamp: crate::engine::types::now_iso8601(),
+        },
+    );
+    assert_eq!(batches_for_test(), (1, 0));
+    let d = decider_records(&f.journal());
+    assert_eq!(kinds(&d), vec!["check_overridden"]);
+    let keys: BTreeSet<&str> = d[0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let expected: BTreeSet<&str> = RELAY_FIELDS
+        .iter()
+        .copied()
+        .chain(["koto.state", "koto.check"])
+        .collect();
+    assert_eq!(keys, expected);
+    assert_eq!(d[0]["koto.seq"], 3);
+    assert_eq!(d[0]["koto.visit.seq"], 2);
+    assert_eq!(d[0]["koto.state"], "a");
+    assert_eq!(d[0]["koto.check"], "lint");
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    for absent in ["PLANTED", "exit_code", "rationale"] {
+        assert!(!raw.contains(absent), "{absent} in {raw}");
+    }
+}
+
+/// With the longest names koto keeps, a 255-byte session name, 128-byte
+/// provider, model, state, gate and criterion names, and the largest
+/// numbers, every decider and override record fits the line cap, and a
+/// 129-byte criterion id is digested.
+#[test]
+fn decider_and_override_records_fit_the_line_cap_at_the_longest_names() {
+    let session = "s".repeat(255);
+    let id = "i".repeat(128);
+    let name = "n".repeat(128);
+    let relay = Relay {
+        session: &session,
+        session_id: &id,
+        run_id: Some(&id),
+        seq: u64::MAX,
+        visit_seq: Some(u64::MAX),
+    };
+    let consulted = DeciderConsultation {
+        state: name.clone(),
+        provider: name.clone(),
+        model: name.clone(),
+        error_class: Some(ErrorClass::HttpStatus),
+        input_tokens: Some(u64::MAX),
+        output_tokens: Some(u64::MAX),
+        unread_usage_attempts: u32::MAX,
+        latency_ms: u64::MAX,
+        directive_bytes: u64::MAX,
+        outcome: ConsultationOutcome::InputUnavailable,
+        ..consultation()
+    };
+    let checked = |rule_id: &str| DeciderCheck {
+        state: name.clone(),
+        gate: name.clone(),
+        provider: name.clone(),
+        model: name.clone(),
+        outcome: RecordedOutcome::Unanswered,
+        reason: Some(UnansweredReason::UnreadableResponse),
+        error_class: Some(ErrorClass::HttpStatus),
+        input_tokens: Some(u64::MAX),
+        output_tokens: Some(u64::MAX),
+        unread_usage_attempts: u32::MAX,
+        attempts: u32::MAX,
+        latency_ms: u64::MAX,
+        ..criterion_check(rule_id)
+    };
+    let longest = "r".repeat(128);
+    let over = "r".repeat(129);
+    let overridden = EventPayload::GateOverrideRecorded {
+        state: name.clone(),
+        gate: name.clone(),
+        rationale: "x".repeat(8192),
+        override_applied: serde_json::json!({"v": "x".repeat(8192)}),
+        actual_output: serde_json::json!({"v": "x".repeat(8192)}),
+        timestamp: crate::engine::types::now_iso8601(),
+    };
+    let mut records = Vec::new();
+    for payload in [
+        EventPayload::DeciderConsulted(consulted),
+        EventPayload::DeciderChecked(checked(&longest)),
+        EventPayload::DeciderChecked(checked(&over)),
+        overridden,
+    ] {
+        records.extend(relayed(&payload, &relay));
+    }
+    assert_eq!(records.len(), 4);
+    let lines: Vec<String> = records.iter().map(Record::to_line).collect();
+    for line in &lines {
+        assert!(line.len() < MAX_LINE_BYTES, "{} bytes: {line}", line.len());
+    }
+    let parsed: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let parsed = decider_records(&parsed);
+    assert_eq!(parsed[0]["koto.decider.model"], name.as_str());
+    assert_eq!(parsed[1]["koto.rule.id"], longest.as_str());
+    assert_eq!(parsed[2]["koto.rule.id"], name_or_digest(&over).as_str());
+    assert!(parsed[2]["koto.rule.id"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert_eq!(parsed[3]["koto.check"], name.as_str());
+}

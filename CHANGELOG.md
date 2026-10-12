@@ -25,6 +25,18 @@ to `0.9.x`).
   ones written since the session's last state entry; a process crash loses
   none. `docs/reference/run-journal.md` documents the three kinds.
 
+- **The run journal records decider calls and overrides.** Each decider
+  consultation a session commits adds a `decider_consulted` line (provider,
+  model, outcome, token counts, latency), each graded decider-check
+  criterion a `decider_checked` line (the gate, the criterion's id, mode,
+  outcome, reason, whether it blocked, tokens, attempts, latency), and each
+  `koto overrides record` a `check_overridden` line naming the state and
+  gate. They carry `koto.seq` and `koto.visit.seq` like check lines, so an
+  override can be joined to the evaluation it moved past and decider tokens
+  summed per model from the journal alone. A verdict koto reuses writes
+  nothing. No line holds a probability, hash, threshold, endpoint, rule
+  reference, rationale or override value.
+
 - **The run journal records the size of each printed directive.** When
   `koto next` or `koto status` prints a non-terminal state's directive, koto
   now adds a `response` line with the state, the command (`next` or
