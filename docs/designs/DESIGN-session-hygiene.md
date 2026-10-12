@@ -182,7 +182,7 @@ still protect one inside them. For each session it reads:
 | Rule | Keeps | How the prune knows |
 |------|-------|---------------------|
 | a | a running or unreadable session | the inspection: status `running` or `unreadable` (log, template or header unreadable, or the session directory is a symlink) |
-| b | a session some running or unreadable session references | the reverse of the reference map below, checked against each referencer's status |
+| b | a session some running or unreadable session references, or any finished session while some session's header can't be read | the reverse of the reference map below, checked against each referencer's status; a session whose header doesn't parse has no known references, so it counts as a possible referencer of every session and is named in each kept reason |
 | c | a finished session that references a running or unreadable one | the reference map, checked against the referenced session's status; a reference to a name with no session protects nothing |
 | d | a session with a malformed `chain/parent` | the context key exists but its content isn't exactly one name passing `validate_session_id` (no surrounding whitespace or newline) |
 | e | a session bound to a waiting or unreadable request leg | `request-leg.toml` in the session directory; the request is read with `request_store::read_view`; kept when the request is open with the leg open, or when the pointer or the request can't be read or parsed; a request that doesn't exist releases it |
@@ -204,7 +204,13 @@ push didn't land, which the removal loses nothing by. A remote `version.json`
 the local copy has none to compare with keeps the session too.
 
 An unreadable session counts as possibly running for rules b and c, so it
-protects what it references and what references it, as rule a keeps it.
+protects what it references and what references it, as rule a keeps it. When
+the unreadable part is the header, what it references is unknown: its
+`parent_workflow` is in the header it lost. So while any session's header
+can't be read, rule b keeps every finished session and names that session,
+so a person can inspect or remove it and let the prune go on. Nothing
+narrows the set, since the execution directory that could scope it is in the
+header too.
 
 The reference map has an edge A to B when A's header `parent_workflow` is B,
 or A's context key `chain/parent` holds exactly B. The context key is read from
@@ -781,16 +787,21 @@ HOME or `KOTO_SESSIONS_BASE`, with cloud behavior on koto's fake S3 harness
   the removal, as they can race `koto session cleanup` today. A session
   created between the inventory and a removal that newly references the
   removed session is not seen. A remote advance between rule g's check and
-  the remote delete is the same one-removal window. These windows are
-  accepted and documented.
+  the remote delete is the same one-removal window; the remote delete isn't
+  conditional, so it can't close without conditional deletes. These windows
+  are accepted and documented.
 - **Another host's newer copy.** Under the cloud backend a removal deletes
   remote objects too, so the prune keeps any session whose remote state
   log is longer than the local one, or whose remote `version.json` is ahead
   of, diverged from, or unreadable against the local copy (rule g), and
   re-checks it at apply. A remote delete that fails is
-  reported, not swallowed.
+  reported, not swallowed. Without a remote `version.json`, the check
+  compares only the pushed log's length, so a remote log that diverged
+  without growing longer than the local one isn't caught.
 - **Mistyped scope.** An unattended `--apply` needs an explicit filter or
-  `--all`, and the token mode refuses a plan it didn't store.
+  `--all`, and the token mode refuses a plan it didn't store. The unattended
+  form removes in one step with no preview anyone read: the rules still
+  apply, but only `--plan` guarantees that what goes is what someone saw.
 - **Disclosure.** Finished records hold a session's result, which `koto
   status` already printed to anyone who could read the session. They stay in
   the store's base, mode 0600, under a 0700 directory, and never sync.
