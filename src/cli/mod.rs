@@ -18,6 +18,8 @@ pub mod request;
 pub mod retry;
 pub mod session;
 pub(crate) mod session_inventory;
+#[cfg(unix)]
+pub(crate) mod session_prune;
 pub mod task_spawn_error;
 pub mod validate_feed;
 pub mod vars;
@@ -535,6 +537,47 @@ pub enum SessionCommand {
     Cleanup {
         /// Session name
         name: String,
+    },
+    /// Preview, then remove, finished sessions as a set.
+    ///
+    /// Without `--apply`, prints the sessions it would remove, the sessions
+    /// it keeps with the rule that keeps each, and a plan token, and changes
+    /// nothing but its stored plan. `--apply --plan <token>` removes exactly
+    /// that preview's sessions, or nothing (exit 4) when the set has changed
+    /// since. `--apply` without `--plan` removes the set it computes now, and
+    /// needs `--execution-dir`, `--older-than` or `--all`.
+    ///
+    /// A session is kept when it is running or unreadable (rule a), a running
+    /// session references it (b), it references a running session (c), its
+    /// `chain/parent` context key is malformed (d), it is bound to a request
+    /// leg still waiting (e), it is a coordinator's session (f), or, under the
+    /// cloud backend, its remote copy may be newer (g). A failed removal
+    /// exits 3.
+    Prune {
+        /// Only sessions whose execution directory is this directory or lies
+        /// under it. A session outside the filter still protects the sessions
+        /// it references.
+        #[arg(long = "execution-dir", value_name = "DIR")]
+        execution_dir: Option<String>,
+
+        /// Only sessions whose last event is at least this old: a whole
+        /// number and a unit, `s`, `m`, `h` or `d` (for example `30d`).
+        #[arg(long = "older-than", value_name = "AGE")]
+        older_than: Option<String>,
+
+        /// Every finished session. Required for `--apply` without `--plan`
+        /// when no other filter is given.
+        #[arg(long)]
+        all: bool,
+
+        /// Remove the sessions instead of previewing them.
+        #[arg(long)]
+        apply: bool,
+
+        /// The token a preview printed; with `--apply`, remove exactly that
+        /// preview's sessions.
+        #[arg(long, value_name = "TOKEN")]
+        plan: Option<String>,
     },
     /// Resolve a session version conflict
     Resolve {
@@ -1587,6 +1630,27 @@ pub fn run(app: App) -> Result<()> {
                         }))?
                     );
                     Ok(())
+                }
+                #[cfg(unix)]
+                SessionCommand::Prune {
+                    execution_dir,
+                    older_than,
+                    all,
+                    apply,
+                    plan,
+                } => session_prune::handle_prune(
+                    &backend,
+                    session_prune::PruneArgs {
+                        execution_dir: execution_dir.as_deref(),
+                        older_than: older_than.as_deref(),
+                        all,
+                        apply,
+                        plan: plan.as_deref(),
+                    },
+                ),
+                #[cfg(not(unix))]
+                SessionCommand::Prune { .. } => {
+                    anyhow::bail!("koto session prune is only supported on Unix platforms")
                 }
                 SessionCommand::Resolve {
                     name,

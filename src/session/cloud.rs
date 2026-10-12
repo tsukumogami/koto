@@ -65,6 +65,21 @@ pub enum ChildResolution {
     },
 }
 
+/// What [`CloudBackend::remote_copy_check`] found in the bucket's copy of a
+/// session, set against the local one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteCopy {
+    /// No remote copy, or one that is no newer than the local copy.
+    Safe,
+    /// The remote copy is ahead of the local one or diverged from it; the
+    /// string says which.
+    NotSafe(String),
+    /// The check couldn't be made: the listing failed, the local log or a
+    /// version file couldn't be read, or a version file didn't parse. The
+    /// string says which.
+    Unreadable(String),
+}
+
 /// S3-backed session storage that delegates to `LocalBackend` for all
 /// filesystem operations and syncs state to an S3-compatible bucket.
 ///
@@ -372,6 +387,139 @@ impl CloudBackend {
                     prefix, e
                 );
             }
+        }
+    }
+
+    /// [`CloudBackend::sync_delete_session`] for a caller that must know
+    /// whether the remote copy is gone: every object under the session's
+    /// prefix except its migration marker is deleted, and the first failure
+    /// (the listing, or any delete) is returned after the rest were tried.
+    /// `koto session prune` removes the local copy only after this succeeds,
+    /// so a failure leaves something a later prune can retry.
+    pub fn delete_remote_session_checked(&self, id: &str) -> anyhow::Result<()> {
+        let prefix = self.session_prefix(id);
+        let results = self.bucket.list(prefix.clone(), None).map_err(|e| {
+            anyhow::anyhow!(
+                "listing {} failed: {}",
+                prefix,
+                without_url_userinfo(&e.to_string())
+            )
+        })?;
+        let mut first: Option<anyhow::Error> = None;
+        for list in &results {
+            for obj in &list.contents {
+                if is_migration_marker(&prefix, &obj.key) {
+                    continue;
+                }
+                if let Err(e) = self.bucket.delete_object(&obj.key) {
+                    first.get_or_insert_with(|| {
+                        anyhow::anyhow!(
+                            "deleting {} failed: {}",
+                            obj.key,
+                            without_url_userinfo(&e.to_string())
+                        )
+                    });
+                }
+            }
+        }
+        match first {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the bucket's copy of session `id` may hold anything its local
+    /// copy doesn't. One listing of the session's prefix answers two
+    /// questions. A remote state log longer than the local one has events
+    /// this host never saw (another host advanced or rewound the session).
+    /// And the two `version.json` files, compared with
+    /// [`crate::session::version::check_sync`], show a context write this
+    /// host never saw. A remote copy with neither is no newer than the local
+    /// one. Anything that can't be read, or a remote version the local copy
+    /// has nothing to compare with, can't be shown to be no newer, so it
+    /// isn't `Safe`.
+    pub fn remote_copy_check(&self, id: &str) -> RemoteCopy {
+        use crate::session::version::{check_sync, SessionVersion, SyncCheck};
+
+        let prefix = self.session_prefix(id);
+        let listing = match self.bucket.list(prefix.clone(), None) {
+            Ok(listing) => listing,
+            Err(e) => {
+                return RemoteCopy::Unreadable(format!(
+                    "listing {} failed: {}",
+                    prefix,
+                    without_url_userinfo(&e.to_string())
+                ))
+            }
+        };
+        let size_of = |key: &str| {
+            listing
+                .iter()
+                .flat_map(|page| page.contents.iter())
+                .find(|obj| obj.key == key)
+                .map(|obj| obj.size)
+        };
+
+        if let Some(remote_len) = size_of(&self.state_key(id)) {
+            let local_path = self.local.session_dir(id).join(state_file_name(id));
+            let local_len = match std::fs::metadata(&local_path) {
+                Ok(meta) => meta.len(),
+                Err(e) => {
+                    return RemoteCopy::Unreadable(format!("the local log can't be read: {e}"))
+                }
+            };
+            if remote_len > local_len {
+                return RemoteCopy::NotSafe(format!(
+                    "the remote log is ahead ({remote_len} bytes against {local_len} here)"
+                ));
+            }
+        }
+
+        let version_key = self.version_key(id);
+        if size_of(&version_key).is_none() {
+            return RemoteCopy::Safe;
+        }
+        let remote = match self.fetch_object(&version_key) {
+            // Removed between the listing and the GET.
+            Ok(None) => return RemoteCopy::Safe,
+            Ok(Some(bytes)) => match serde_json::from_slice::<SessionVersion>(&bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    return RemoteCopy::Unreadable(format!(
+                        "the remote version.json doesn't parse: {e}"
+                    ))
+                }
+            },
+            Err(e) => {
+                return RemoteCopy::Unreadable(without_url_userinfo(&format!("{e:#}")));
+            }
+        };
+        let local = match SessionVersion::load(&self.local_version_path(id)) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return RemoteCopy::NotSafe(
+                    "the remote copy has a version and the local copy has none".to_string(),
+                )
+            }
+            Err(e) => {
+                return RemoteCopy::Unreadable(format!(
+                    "the local version.json can't be read: {e:#}"
+                ))
+            }
+        };
+        match check_sync(&local, Some(&remote)) {
+            SyncCheck::Safe => RemoteCopy::Safe,
+            SyncCheck::RemoteNewer => RemoteCopy::NotSafe(format!(
+                "the remote copy is ahead (version {} against local {})",
+                remote.version, local.version
+            )),
+            SyncCheck::Conflict {
+                local_version,
+                remote_version,
+                ..
+            } => RemoteCopy::NotSafe(format!(
+                "the remote copy diverged (version {remote_version} against local {local_version})"
+            )),
         }
     }
 

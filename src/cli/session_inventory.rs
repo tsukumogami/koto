@@ -18,7 +18,7 @@ use crate::session::state_file_name;
 use crate::template::types::CompiledTemplate;
 
 /// Where a session stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     /// Readable and not finished.
@@ -68,8 +68,28 @@ impl TemplateCache {
     }
 }
 
+/// The header fields `koto session prune` reads alongside an [`Inspection`].
+#[derive(Debug, Clone, Default)]
+pub struct HeaderFields {
+    /// The header's `session_id`; `None` when it is empty.
+    pub session_id: Option<String>,
+    pub execution_dir: Option<PathBuf>,
+    pub parent_workflow: Option<String>,
+}
+
 /// Inspect session `name` under the local store `base`.
 pub fn inspect(base: &Path, name: &str, cache: &mut TemplateCache) -> Inspection {
+    inspect_full(base, name, cache).0
+}
+
+/// [`inspect`], plus the header fields when the header could be read. A
+/// session whose header parses but whose log or template doesn't is still
+/// `Unreadable`, and its header fields are still returned.
+pub fn inspect_full(
+    base: &Path,
+    name: &str,
+    cache: &mut TemplateCache,
+) -> (Inspection, Option<HeaderFields>) {
     let unreadable = || Inspection {
         status: SessionStatus::Unreadable,
         state: None,
@@ -80,20 +100,25 @@ pub fn inspect(base: &Path, name: &str, cache: &mut TemplateCache) -> Inspection
     let session_dir = base.join(name);
     match std::fs::symlink_metadata(&session_dir) {
         Ok(meta) if meta.file_type().is_dir() => {}
-        _ => return unreadable(),
+        _ => return (unreadable(), None),
     }
     let state_path = session_dir.join(state_file_name(name));
 
     let Ok((header, events)) = persistence::read_events(&state_path) else {
-        return unreadable();
+        return (unreadable(), None);
+    };
+    let fields = HeaderFields {
+        session_id: Some(header.session_id.clone()).filter(|id| !id.is_empty()),
+        execution_dir: header.execution_dir.clone(),
+        parent_workflow: header.parent_workflow.clone(),
     };
     let finished_at = events.last().map(|e| e.timestamp.clone());
 
     let Some(machine) = persistence::derive_machine_state(&header, &events, &session_dir) else {
-        return unreadable();
+        return (unreadable(), Some(fields));
     };
     let Some(compiled) = cache.get(&machine.template_path) else {
-        return unreadable();
+        return (unreadable(), Some(fields));
     };
     let template_state = compiled.states.get(&machine.current_state);
 
@@ -106,12 +131,15 @@ pub fn inspect(base: &Path, name: &str, cache: &mut TemplateCache) -> Inspection
     };
     let failure = status == SessionStatus::Terminal && template_state.is_some_and(|s| s.failure);
 
-    Inspection {
-        status,
-        state: Some(machine.current_state),
-        failure,
-        finished_at,
-    }
+    (
+        Inspection {
+            status,
+            state: Some(machine.current_state),
+            failure,
+            finished_at,
+        },
+        Some(fields),
+    )
 }
 
 /// True when the log holds a `workflow_cancelled` that no transition,
