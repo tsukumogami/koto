@@ -150,7 +150,14 @@ pub(crate) fn append(root: &Path, lines: &[&str], max: usize, flush: bool) -> an
     let path = root.join(JOURNAL_FILE);
     let s = settings();
     append_bounded_lines_current(root, &path, lines, max, flush, &mut |file, size| {
-        if s.rotate_bytes == 0 || size < s.rotate_bytes || rotation_disabled() {
+        if s.rotate_bytes == 0 || rotation_disabled() {
+            return UnderLock::Write;
+        }
+        // A second name on the journal is a move cut short between its link
+        // and its unlink: finish it now rather than keep writing into a
+        // rotated file.
+        let interrupted = file.metadata().is_ok_and(|m| m.nlink() > 1);
+        if size < s.rotate_bytes && !interrupted {
             return UnderLock::Write;
         }
         match rotate_locked(root, &path, file, size) {
@@ -194,6 +201,20 @@ fn rotate_locked(root: &Path, path: &Path, file: &std::fs::File, size: u64) -> a
     // flush of the journal to make them durable. That flush goes to the new
     // file, so flush this one before it stops being written.
     file.sync_data()?;
+
+    // A crash between an earlier rotation's link and its unlink left the
+    // journal under a rotated name too. Removing the journal's name finishes
+    // that move; linking it again would give one file two rotated names, and
+    // a reader would read it twice.
+    let held = file.metadata()?;
+    let already = rotated_files(root)
+        .into_iter()
+        .any(|(_, m)| m.dev() == held.dev() && m.ino() == held.ino());
+    if already {
+        std::fs::remove_file(path)?;
+        ensure_readers_dir(root);
+        return Ok(());
+    }
 
     let next = root.join(rotated_name(next_sequence(root)?));
     std::fs::hard_link(path, &next)?;
@@ -488,6 +509,22 @@ mod tests {
         let first = std::fs::read_to_string(tmp.path().join(rotated_name(1))).unwrap();
         assert_eq!(first, "{\"n\":1}\n");
         assert_eq!(journal(tmp.path()), "{\"n\":2}\n{\"n\":3}\n{\"n\":4}\n");
+    }
+
+    #[test]
+    fn a_move_cut_short_after_its_link_is_finished_not_linked_again() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // A crash after the link left the journal under both names, under
+        // the bound.
+        std::fs::write(root.join(JOURNAL_FILE), "{\"n\":1}\n").unwrap();
+        std::fs::hard_link(root.join(JOURNAL_FILE), root.join(rotated_name(1))).unwrap();
+        set_settings_for_test(on(1_000_000));
+        append(root, &["{\"n\":2}"], MAX, true).unwrap();
+        assert_eq!(rotated(root), vec![rotated_name(1)]);
+        let first = std::fs::read_to_string(root.join(rotated_name(1))).unwrap();
+        assert_eq!(first, "{\"n\":1}\n");
+        assert_eq!(journal(root), "{\"n\":2}\n");
     }
 
     #[test]

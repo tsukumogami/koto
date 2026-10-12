@@ -418,7 +418,10 @@ rewritten in place:
 - **The move.** A rotation links the file to its new name, which fails rather
   than replace an existing file, and then removes the old name. The file keeps
   its device and inode number. A partial last line (a write cut short) gets
-  its newline first, so no rotated file ends mid-line.
+  its newline first, so no rotated file ends mid-line. A crash between the
+  link and the removal leaves the file under both names; the next write
+  finishes the move by removing the journal's name, so a file never gets two
+  rotated names.
 - **No late writes.** A command that opened the journal just before another
   one moved it notices, once it holds the lock, that the path now names a
   different file, and opens the path again. No record is written to a file
@@ -434,7 +437,10 @@ file it's reading: its device, its inode and the offset it has read up to.
 On each pass:
 
 1. Open `_run_journal.jsonl` and `fstat` the open file. (Stat-then-open could
-   race a rotation.)
+   race a rotation.) If it doesn't exist, a rotation has moved it and no
+   record has been written since. Do step 3 without the new file: read the
+   rest of yours and every newer rotated file, keep the last one's device,
+   inode and end offset, and look again on the next pass.
 2. If the device and inode are the ones you kept, read from your offset.
 3. Otherwise the file you were reading was rotated. Find the rotated file
    with your device and inode, read it from your offset to its end, then read
