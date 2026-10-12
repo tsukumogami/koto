@@ -5,13 +5,18 @@
 //! A marker is what makes the source host refuse a session it no longer
 //! owns, so it goes only when the session it points at is safe elsewhere:
 //! its target must be `present` (the target's state file header carries
-//! the session id the marker names), and then the marker must be at least
+//! the session id the marker names, and its whole log reads with no error
+//! and reaches at least the last seq of the source's log, so a truncated
+//! or corrupt copy, or one behind the source, never stands in for the
+//! source), and then the marker must be at least
 //! `session.cloud.marker_retain_days` old, or the caller must say the source
 //! host is gone with `--source-retired`. Any other target status keeps the
 //! marker whatever its age, and so does a marker that can't be read.
 //!
 //! Removal deletes everything under `<source prefix>/<name>/`, the marker
-//! last, so a removal that stops part way leaves the marker refusing.
+//! last, so a removal that stops part way leaves the marker refusing. The
+//! apply judges each marker again just before its removal, but nothing
+//! locks the bucket between that judgement and the deletes.
 //! No local session is read or removed; the only local file read or
 //! written is the stored plan.
 
@@ -57,11 +62,16 @@ pub(super) struct MarkerEntry {
     pub age_days: Option<u64>,
     #[serde(default)]
     pub target: Option<Target>,
-    /// `migrated`, `present`, `replaced`, `absent` or `unknown`; `None` when
-    /// the marker itself couldn't be read.
+    /// `migrated`, `present`, `replaced`, `absent`, `unverified` or
+    /// `unknown`; `None` when the marker itself couldn't be read.
     #[serde(default)]
     pub target_status: Option<String>,
     pub removable: bool,
+    /// How many objects the removal deletes under the source copy's prefix,
+    /// the marker included; `None` when the copy couldn't be listed or the
+    /// marker couldn't be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objects: Option<usize>,
     /// What decided it: the target status when it isn't `present`,
     /// `unreadable` for a marker that can't be read, else `age` or
     /// `source_retired`.
@@ -96,6 +106,7 @@ impl MarkerEntry {
             target: None,
             target_status: None,
             removable: false,
+            objects: None,
             reason: "unreadable".to_string(),
             detail,
         }
@@ -237,6 +248,14 @@ fn decide(
             "the target has no state file in the bucket, so this old copy may be the only one"
                 .to_string(),
         ),
+        TargetStatus::Unverified(why) => (
+            false,
+            "unverified",
+            format!(
+                "the target's copy can't be shown to hold everything the source's does, so \
+                 this old copy may be the only complete one: {why}"
+            ),
+        ),
         TargetStatus::Unknown(why) => (
             false,
             "unknown",
@@ -268,10 +287,15 @@ fn evaluate(
         Ok(body) => body,
         Err(why) => return Some(MarkerEntry::unreadable(name, why)),
     };
+    let source = cloud.migrated_source_copy(source_prefix, name);
     let status = cloud.marker_target_status(
         &body.target.prefix,
         &body.target.session,
         &body.target.session_id,
+        source
+            .as_ref()
+            .map(|copy| copy.last_seq)
+            .map_err(String::as_str),
     );
     // A marker dated in the future is as young as it gets.
     let age = now.duration_since(body.at).unwrap_or(Duration::ZERO);
@@ -290,6 +314,7 @@ fn evaluate(
         target: Some(body.target),
         target_status: Some(status.as_str().to_string()),
         removable,
+        objects: source.ok().map(|copy| copy.objects),
         reason: reason.to_string(),
         detail,
     })
@@ -663,6 +688,10 @@ mod tests {
             (TargetStatus::Replaced("id-2".to_string()), "replaced"),
             (TargetStatus::Absent, "absent"),
             (
+                TargetStatus::Unverified("the target's log ends first".to_string()),
+                "unverified",
+            ),
+            (
                 TargetStatus::Unknown("listing failed".to_string()),
                 "unknown",
             ),
@@ -687,6 +716,7 @@ mod tests {
             target: None,
             target_status: Some("present".to_string()),
             removable: true,
+            objects: Some(3),
             reason: "age".to_string(),
             detail: String::new(),
         };

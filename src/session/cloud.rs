@@ -83,19 +83,35 @@ pub enum RemoteCopy {
     Unreadable(String),
 }
 
+/// A migrated source copy, as [`CloudBackend::migrated_source_copy`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCopy {
+    /// The objects under the copy's prefix, the marker included.
+    pub objects: usize,
+    /// The last seq of its log; 0 when it has no state file.
+    pub last_seq: u64,
+}
+
 /// What a migration marker's target holds, as
 /// [`CloudBackend::marker_target_status`] finds it in the bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetStatus {
     /// The target carries a marker of its own: it moved on again.
     Migrated,
-    /// The target's state file header names the marker's session id.
+    /// The target's state file header names the marker's session id, and
+    /// its whole log reads with no error and reaches at least the source
+    /// log's last seq.
     Present,
     /// A state file is there, but its header names another session id (a
     /// later session under the same name).
     Replaced(String),
     /// No state file under the target's prefix.
     Absent,
+    /// The header names the marker's session id, but the copy can't be shown
+    /// complete: the target's log doesn't read to the end, ends before the
+    /// source's, or the source's own log can't be read. The string says
+    /// which.
+    Unverified(String),
     /// The listing or the read failed, or the header couldn't be read; the
     /// string says which.
     Unknown(String),
@@ -109,6 +125,7 @@ impl TargetStatus {
             TargetStatus::Present => "present",
             TargetStatus::Replaced(_) => "replaced",
             TargetStatus::Absent => "absent",
+            TargetStatus::Unverified(_) => "unverified",
             TargetStatus::Unknown(_) => "unknown",
         }
     }
@@ -618,15 +635,69 @@ impl CloudBackend {
             .map_err(|e| anyhow::anyhow!("{}", without_url_userinfo(&format!("{e:#}"))))
     }
 
+    /// What the bucket holds of the migrated source copy `<source_prefix>/<name>/`:
+    /// how many objects a removal would delete, the marker included, and the
+    /// last seq of its log. The log is read to the end under the import's own
+    /// rule (no unparseable line, a final one included, and no seq gap); a
+    /// copy with no state file left, as a removal that stopped part way can
+    /// leave it, has nothing to lose and counts as seq 0. `Err` says why the
+    /// copy can't be read.
+    pub(crate) fn migrated_source_copy(
+        &self,
+        source_prefix: &str,
+        name: &str,
+    ) -> Result<SourceCopy, String> {
+        crate::session::validate::validate_session_id(name).map_err(|e| format!("{e:#}"))?;
+        let session = format!("{}/{}/", source_prefix, name);
+        let listing = self.bucket.list(session.clone(), None).map_err(|e| {
+            format!(
+                "listing {} failed: {}",
+                session,
+                without_url_userinfo(&e.to_string())
+            )
+        })?;
+        let keys: Vec<&str> = listing
+            .iter()
+            .flat_map(|page| page.contents.iter())
+            .map(|obj| obj.key.as_str())
+            .filter(|key| key.starts_with(&session))
+            .collect();
+        let state_key = format!("{}{}", session, state_file_name(name));
+        let last_seq = if keys.contains(&state_key.as_str()) {
+            match self.fetch_object(&state_key) {
+                Ok(Some(bytes)) => {
+                    parse_source_log(&bytes)
+                        .map_err(|e| format!("the source's log doesn't read to the end: {e}"))?
+                        .last_seq
+                }
+                // Removed between the listing and the GET.
+                Ok(None) => 0,
+                Err(e) => return Err(without_url_userinfo(&format!("{e:#}"))),
+            }
+        } else {
+            0
+        };
+        Ok(SourceCopy {
+            objects: keys.len(),
+            last_seq,
+        })
+    }
+
     /// What the bucket holds for a marker's target: one listing of
     /// `<target_prefix>/<target_session>/` (the trailing slash keeps `foo`
-    /// from matching `foo-2`), and a GET of the state file when there is one
-    /// to read its header's `session_id`.
+    /// from matching `foo-2`), and a GET of the state file when there is one.
+    /// Its header's `session_id` tells the session apart from a later one
+    /// under the name, and its whole log must then read with no error and
+    /// reach `source_last_seq`, the migrated source log's last seq, before
+    /// the target counts as present: a truncated or corrupt copy, or one
+    /// behind the source, is `Unverified`, and so is any target when the
+    /// source's log can't be read (`Err`, saying why).
     pub(crate) fn marker_target_status(
         &self,
         target_prefix: &str,
         target_session: &str,
         target_session_id: &str,
+        source_last_seq: Result<u64, &str>,
     ) -> TargetStatus {
         if !is_workspace_prefix(target_prefix)
             || crate::session::validate::validate_session_id(target_session).is_err()
@@ -667,11 +738,29 @@ impl CloudBackend {
             }
         };
         match header_session_id(&bytes) {
-            Some(id) if id == target_session_id => TargetStatus::Present,
-            Some(id) => TargetStatus::Replaced(id),
-            None => TargetStatus::Unknown(
-                "the target's state file header doesn't parse or has no session_id".to_string(),
-            ),
+            Some(id) if id == target_session_id => {}
+            Some(id) => return TargetStatus::Replaced(id),
+            None => {
+                return TargetStatus::Unknown(
+                    "the target's state file header doesn't parse or has no session_id".to_string(),
+                )
+            }
+        }
+        let source_last_seq = match source_last_seq {
+            Ok(seq) => seq,
+            Err(why) => {
+                return TargetStatus::Unverified(format!("the source copy can't be read: {why}"))
+            }
+        };
+        match parse_source_log(&bytes) {
+            Err(e) => {
+                TargetStatus::Unverified(format!("the target's log doesn't read to the end: {e}"))
+            }
+            Ok(log) if log.last_seq < source_last_seq => TargetStatus::Unverified(format!(
+                "the target's log ends at seq {} and the source's runs to seq {}",
+                log.last_seq, source_last_seq
+            )),
+            Ok(_) => TargetStatus::Present,
         }
     }
 

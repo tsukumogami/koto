@@ -572,3 +572,157 @@ fn arguments_and_the_local_backend_are_checked_before_anything_runs() {
 
     assert_eq!(h.bucket(), before);
 }
+
+/// The state log key of session `name` under host `host`'s prefix.
+fn log_key(host: &Host, name: &str) -> String {
+    format!("{}/{name}/koto-{name}.state.jsonl", host.prefix())
+}
+
+/// Rewrite the log object at `key` line by line.
+fn rewrite_log(h: &Hosts, key: &str, f: impl FnOnce(Vec<String>) -> Vec<String>) {
+    let bytes =
+        h.s3.object(key)
+            .unwrap_or_else(|| panic!("no log at {key}"));
+    let lines: Vec<String> = String::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut out = f(lines).join("\n");
+    out.push('\n');
+    h.s3.put(key, out.as_bytes());
+}
+
+/// `lines` with `n` more events after the last, each a copy of it with the
+/// next seq.
+fn with_more_events(mut lines: Vec<String>, n: u64) -> Vec<String> {
+    let mut last: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    for _ in 0..n {
+        last["seq"] = Value::from(last["seq"].as_u64().unwrap() + 1);
+        lines.push(last.to_string());
+    }
+    lines
+}
+
+/// Every object under `<A>/<name>/` with its bytes.
+fn source_objects(h: &Hosts, name: &str) -> BTreeMap<String, Vec<u8>> {
+    let mut all = h.bucket();
+    all.retain(|k, _| k.starts_with(&h.source(name)));
+    all
+}
+
+#[test]
+fn a_truncated_or_corrupt_target_log_keeps_the_marker_and_the_source_through_preview_and_apply() {
+    let h = Hosts::new();
+    for name in ["cut", "garbled", "whole"] {
+        h.migrate(name);
+    }
+    let preview = h.prune_ok(&["--source-retired"]);
+    assert_eq!(names(&preview["remove"]), vec!["cut", "garbled", "whole"]);
+    let stale = preview["plan"].as_str().unwrap().to_string();
+    let whole = &entries(&preview)["whole"];
+    assert_eq!(
+        whole["objects"],
+        h.s3.keys_under(&h.source("whole")).len(),
+        "{whole:#}"
+    );
+
+    // `cut`'s target log loses half its final line, as a torn write leaves
+    // it; `garbled`'s first event no longer parses. Both headers still name
+    // the marker's session id.
+    rewrite_log(&h, &log_key(&h.b, "cut"), |mut lines| {
+        let last = lines.pop().unwrap();
+        lines.push(last[..last.len() / 2].to_string());
+        lines
+    });
+    rewrite_log(&h, &log_key(&h.b, "garbled"), |mut lines| {
+        assert!(lines.len() > 2, "{lines:?}");
+        lines[1] = "{not an event".to_string();
+        lines
+    });
+    let cut_before = source_objects(&h, "cut");
+    let garbled_before = source_objects(&h, "garbled");
+
+    // The plan previewed while they were whole is stale now.
+    let before = h.bucket();
+    let run = h.prune(&["--apply", "--plan", &stale]);
+    refused(&run, "prune_plan_stale", 4);
+    assert_eq!(names(&run.json["error"]["dropped"]), vec!["cut", "garbled"]);
+    assert_eq!(h.bucket(), before, "a stale plan removed something");
+
+    // A fresh preview keeps both, whatever the age or the flag.
+    for extra in [&[][..], &["--source-retired"][..]] {
+        let all = entries(&h.prune_ok(extra));
+        for name in ["cut", "garbled"] {
+            let e = &all[name];
+            assert_eq!(e["target_status"], "unverified", "{name}: {e:#}");
+            assert_eq!(e["reason"], "unverified", "{name}: {e:#}");
+            assert_eq!(e["removable"], false, "{name}: {e:#}");
+            assert!(
+                e["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("doesn't read to the end"),
+                "{name}: {e:#}"
+            );
+        }
+    }
+
+    // An apply with no plan judges again and removes only `whole`.
+    let out = h.prune_ok(&["--apply", "--source-retired"]);
+    assert_eq!(names(&out["removed"]), vec!["whole"]);
+    assert_eq!(names(&out["kept"]), vec!["cut", "garbled"]);
+    assert!(h.s3.keys_under(&h.source("whole")).is_empty());
+    assert_eq!(source_objects(&h, "cut"), cut_before);
+    assert_eq!(source_objects(&h, "garbled"), garbled_before);
+    // The old copies still refuse on the source host.
+    for name in ["cut", "garbled"] {
+        refused(&h.a.koto(&["next", name]), "session_migrated", 2);
+    }
+}
+
+#[test]
+fn a_source_log_past_the_targets_or_unreadable_keeps_the_marker() {
+    let h = Hosts::new();
+    for name in ["ahead", "torn-source", "level"] {
+        h.migrate(name);
+    }
+    // `ahead`'s source log gains two events past the target's last, which
+    // carries the source's events plus the import's one.
+    rewrite_log(&h, &log_key(&h.a, "ahead"), |lines| {
+        with_more_events(lines, 2)
+    });
+    // `torn-source`'s source log ends in a line that doesn't parse.
+    rewrite_log(&h, &log_key(&h.a, "torn-source"), |mut lines| {
+        lines.push("{\"seq\":".to_string());
+        lines
+    });
+    // `level`'s source log gains one: it now ends where the target's does.
+    rewrite_log(&h, &log_key(&h.a, "level"), |lines| {
+        with_more_events(lines, 1)
+    });
+    let ahead_before = source_objects(&h, "ahead");
+    let torn_before = source_objects(&h, "torn-source");
+
+    let all = entries(&h.prune_ok(&["--source-retired"]));
+    for (name, says) in [
+        ("ahead", "the source's runs to seq"),
+        ("torn-source", "the source copy can't be read"),
+    ] {
+        let e = &all[name];
+        assert_eq!(e["target_status"], "unverified", "{name}: {e:#}");
+        assert_eq!(e["removable"], false, "{name}: {e:#}");
+        assert!(
+            e["detail"].as_str().unwrap().contains(says),
+            "{name}: {e:#}"
+        );
+    }
+    assert_eq!(all["level"]["target_status"], "present");
+    assert_eq!(all["level"]["removable"], true);
+
+    let out = h.prune_ok(&["--apply", "--source-retired"]);
+    assert_eq!(names(&out["removed"]), vec!["level"]);
+    assert_eq!(source_objects(&h, "ahead"), ahead_before);
+    assert_eq!(source_objects(&h, "torn-source"), torn_before);
+}
