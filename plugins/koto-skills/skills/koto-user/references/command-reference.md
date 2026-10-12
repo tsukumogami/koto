@@ -21,6 +21,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session dir` | Runner — primary |
 | `koto session list` | Runner — primary |
 | `koto session cleanup` | Runner — primary |
+| `koto session prune` | Runner and operator — removing finished sessions in bulk |
 | `koto session recover` | Operator — one-time migration recovery |
 | `koto session rebind` | Runner — after a checkout moves |
 | `koto session import` | Runner — cloud backend only, after a session moves to another host or workspace |
@@ -690,7 +691,28 @@ koto session cleanup <name>
 
 Removes the entire session directory for the named workflow. Idempotent — succeeds even if the session does not exist. Produces no stdout output.
 
-`koto next` removes a session at its terminal state unless the terminal is declared `failure: true` or the tick passed `--no-cleanup` (the response's `retention` field says which). Use this command to remove a kept session once its record is no longer needed, or after an abandoned workflow. It removes only the named session: a kept parent's kept children are left, listed by `koto workflows --orphaned`. A parent koto removes at its own terminal, or replaces with `koto init --attach-live --replace-terminal`, takes its terminal descendants with it, and `koto workspace prune --root` removes a finished tree.
+`koto next` removes a session at its terminal state unless the terminal is declared `failure: true` or the tick passed `--no-cleanup` (the response's `retention` field says which). Use this command to remove a kept session once its record is no longer needed, or after an abandoned workflow. It removes only the named session: a kept parent's kept children are left, listed by `koto workflows --orphaned`. A parent koto removes at its own terminal, or replaces with `koto init --attach-live --replace-terminal`, takes its terminal descendants with it, and `koto workspace prune --root` removes a finished tree. To remove many finished sessions at once, use `koto session prune`.
+
+---
+
+## koto session prune
+
+```
+koto session prune [--execution-dir <dir>] [--older-than <age>] [--all]
+koto session prune --apply --plan <token>
+koto session prune --apply (--execution-dir <dir> | --older-than <age> | --all)
+```
+
+Previews, then removes, finished sessions as a set. Without `--apply` it removes nothing and prints `{"mode": "preview", "plan": "<token>", "remove": [...], "kept": [...]}`: the finished sessions it would remove (the `session list --state` fields plus `kind`), and every session it keeps with a `rule` letter and a `detail`. `--older-than` takes a whole number and `s`, `m`, `h` or `d`.
+
+A session is kept when it is running or unreadable (`a`), a running or unreadable session references it by `parent_workflow` or the `chain/parent` context key (`b`), it references one (`c`), its `chain/parent` isn't exactly one session name (`d`), it is bound to a request leg still waiting or unreadable (`e`), its name starts with `coordinate-` (`f`), or, under the cloud backend, its remote copy may be newer (`g`). A session outside the filters still protects what it references.
+
+- `--apply --plan <token>` removes exactly what that preview listed, using the filters the preview ran with (don't pass them again). If the set changed, it removes nothing and exits 4 with `prune_plan_stale` and `added`/`dropped` lists; a token with no stored plan exits 4 with `prune_plan_unknown`.
+- `--apply` without `--plan` removes the set as it stands now, and needs `--execution-dir`, `--older-than` or `--all`.
+- Apply prints `{"mode": "apply", "removed": [...], "skipped": [...], "kept": [...], "failed": [...]}`. A session another koto process holds, or one that changed since it was judged, is `skipped` (exit 0). A removal that failed is listed under `failed` and the command exits 3.
+- A malformed token or age, `--plan` without `--apply` or with a filter, or a bare `--apply` exits 2 with `invalid_arguments`.
+
+Clean up after your own work with `koto session prune --execution-dir <your directory>`, read the preview, then apply its token.
 
 ---
 

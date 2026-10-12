@@ -25,8 +25,10 @@ of authority for this document).
 │   │   ├── koto-<session-id>.state.jsonl      # header + event log
 │   │   ├── run-journal.json                   # derived (run journal cache: run id, last driver)
 │   │   └── claim.lock                         # derived (request-store sidecar)
-│   └── .migration-conflicts/                  # AUTHORITATIVE state (see below)
-│       └── <repo-id>/<session-id>/
+│   ├── .migration-conflicts/                  # AUTHORITATIVE state (see below)
+│   │   └── <repo-id>/<session-id>/
+│   └── .prune-plans/                          # derived (koto session prune previews)
+│       └── <token>.json
 ├── requests/                                  # AUTHORITATIVE state
 │   └── <request_id>/
 │       ├── request.jsonl                      # header + event log
@@ -43,7 +45,8 @@ of authority for this document).
 ```
 
 Sessions under `~/.koto/sessions/` ARE the authoritative state and
-must not be deleted manually except via `koto session cleanup`.
+must not be deleted manually except via `koto session cleanup` or
+`koto session prune`.
 
 ### How long a session directory lives
 
@@ -66,7 +69,19 @@ A kept session is removed later by:
   request leg still waits for its result; on the terminal tick only a
   parent with a batch hook or a `ChildCompleted` in its log is swept);
 - `koto workspace prune --root <root>` on the finished root above it;
+- `koto session prune`, which removes finished sessions as a previewed
+  set and keeps any a running session references, any that reference
+  a running session, and the other protected cases its guide entry
+  lists;
 - `koto session cleanup <name>`.
+
+`sessions/.prune-plans/` holds the would-remove list of each `koto
+session prune` preview, one `<token>.json` per plan, so that `koto
+session prune --apply --plan <token>` can say what changed since the
+preview. The directory is created mode 0700 and each plan 0600. It is
+derived and safe to delete: a missing plan only makes `--apply --plan`
+refuse with `prune_plan_unknown`, and a preview removes plans older
+than a day.
 
 Storage cost: one session directory per kept session, the size it
 already had at its terminal. On one developer workstation on
@@ -382,7 +397,17 @@ koto workspace prune --root <session-id>
 
 The verb does NOT delete session directories under
 `~/.koto/sessions/`. Session cleanup is the
-operator-driven `koto session cleanup <session-id>` path.
+operator-driven `koto session cleanup <session-id>` path for one
+session, and `koto session prune` for finished sessions as a set:
+
+```bash
+# Preview, then remove exactly what the preview listed
+koto session prune --older-than 30d
+koto session prune --apply --plan <token>
+
+# Unattended: remove what is finished and unprotected at run time
+0 3 * * 0 /usr/local/bin/koto session prune --apply --older-than 30d >/dev/null 2>&1
+```
 
 ### Sizing your prune cadence
 
