@@ -622,7 +622,7 @@ impl CloudBackend {
     /// `<target_prefix>/<target_session>/` (the trailing slash keeps `foo`
     /// from matching `foo-2`), and a GET of the state file when there is one
     /// to read its header's `session_id`.
-    pub fn marker_target_status(
+    pub(crate) fn marker_target_status(
         &self,
         target_prefix: &str,
         target_session: &str,
@@ -705,6 +705,9 @@ impl CloudBackend {
         };
         for page in &results {
             for obj in &page.contents {
+                // The listing's prefix already holds every key under
+                // `session`; the check keeps a key some endpoint returned
+                // anyway from ever reaching a delete.
                 if obj.key == marker || !obj.key.starts_with(&session) {
                     continue;
                 }

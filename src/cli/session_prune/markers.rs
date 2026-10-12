@@ -12,8 +12,8 @@
 //!
 //! Removal deletes everything under `<source prefix>/<name>/`, the marker
 //! last, so a removal that stops part way leaves the marker refusing.
-//! Nothing local is read or removed; the only local write is the stored
-//! plan.
+//! No local session is read or removed; the only local file read or
+//! written is the stored plan.
 
 use std::collections::BTreeSet;
 use std::path::Path;
