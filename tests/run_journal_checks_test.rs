@@ -1,11 +1,15 @@
 //! Check records in the run journal (`check_evaluated`, `check_rule`,
-//! `check_pending`), written by koto commands and read back the way tooling
-//! outside koto reads them (see `docs/reference/run-journal.md`).
+//! `check_pending`), and the decider and override records relayed beside
+//! them (`decider_consulted`, `decider_checked`, `check_overridden`),
+//! written by koto commands and read back the way tooling outside koto
+//! reads them (see `docs/reference/run-journal.md`).
 //!
 //! Every test runs the koto binary with `HOME` in its own temporary
 //! directory, `KOTO_SESSIONS_BASE` unset and `CLAUDE_CODE_SESSION_ID`
 //! cleared, so the session store and the journal are that test's own and
-//! the developer's journal is never touched.
+//! the developer's journal is never touched. A test that consults the
+//! decider points it at the in-process stub, so no test reaches a real
+//! provider.
 //!
 //! Every journal line a test reads goes through [`Env::journal`], which
 //! checks it against the reference itself: its kind must be in the
@@ -18,7 +22,11 @@
 
 #![cfg(unix)]
 
+#[path = "support/decider_stub.rs"]
+mod decider_stub;
+
 use assert_cmd::Command;
+use decider_stub::{DeciderStub, Reply};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
@@ -46,7 +54,17 @@ const PLANTED: &[&str] = &[
     "planted-arg-5e1f",
     "planted-rationale-5e1f",
     "planted-directive-5e1f",
+    "planted-ref-5e1f",
+    "planted-question-5e1f",
+    "planted-slice-5e1f",
+    // The decider's key and the stub's endpoint.
+    DECIDER_KEY,
+    "127.0.0.1",
+    "systemone",
 ];
+
+/// The key every command that consults the decider sends.
+const DECIDER_KEY: &str = "sk-journal-planted-key-5e1f";
 
 /// A check script: run `n` exits with line `n` of `codes.txt` (0 past the
 /// end) and prints `findings.txt`, when present, as koto findings.
@@ -868,11 +886,14 @@ fn an_overridden_gate_writes_no_check_record() {
         "terminal",
         "the override let the session move on: {records:?}"
     );
-    assert_eq!(
-        env.check_records("over").len(),
-        2,
-        "nothing more was relayed"
-    );
+    // The override itself is relayed as `check_overridden`; no evaluation
+    // is.
+    let (overridden, evaluations): (Vec<Value>, Vec<Value>) = env
+        .check_records("over")
+        .into_iter()
+        .partition(|r| r["kind"] == "check_overridden");
+    assert_eq!(overridden.len(), 1, "{overridden:?}");
+    assert_eq!(evaluations.len(), 2, "nothing more was evaluated");
     let runs = std::fs::read_to_string(dir.join("runs.log")).unwrap();
     assert_eq!(runs.lines().count(), 1, "the check didn't run again");
 }
@@ -1123,6 +1144,7 @@ fn masked(value: &Value, tmp: &str) -> Value {
                     let v = if matches!(
                         k.as_str(),
                         "duration_ms"
+                            | "latency_ms"
                             | "elapsed_secs"
                             | "since"
                             | "timestamp"
@@ -1224,6 +1246,889 @@ fn an_unwritable_journal_changes_nothing_but_one_warning_per_command() {
     std::fs::write(&target, "untouched\n").unwrap();
     std::os::unix::fs::symlink(&target, linked.journal_path()).unwrap();
     let got_linked = retry_outcome(&linked);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched\n");
+
+    for (label, (outs, log)) in [("read-only", got), ("symlink", got_linked)] {
+        assert_eq!(outs.len(), expected.len());
+        for (i, ((code, stdout, warnings), (e_code, e_stdout, _))) in
+            outs.iter().zip(&expected).enumerate()
+        {
+            assert_eq!(code, e_code, "{label} step {i}");
+            assert_eq!(stdout, e_stdout, "{label} step {i}");
+            assert_eq!(*warnings, 1, "{label} step {i}");
+        }
+        assert_eq!(log, expected_log, "{label}");
+    }
+}
+
+// ----- Decider and override records -----
+
+/// `koto args` in `cwd` with the decider on (`auto`) and pointed at `stub`.
+fn decider_in(env: &Env, cwd: &Path, stub: &DeciderStub, args: &[&str]) -> Out {
+    let output = env
+        .cmd(cwd)
+        .env("KOTO_DECIDER", "auto")
+        .env("KOTO_DECIDER_API_KEY", DECIDER_KEY)
+        .env("KOTO_DECIDER_ENDPOINT", stub.url())
+        .args(args)
+        .output()
+        .unwrap();
+    Out {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    }
+}
+
+/// The decider and override records of `session`.
+fn decider_records(env: &Env, session: &str) -> Vec<Value> {
+    env.records(session)
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                r["kind"].as_str().unwrap(),
+                "decider_consulted" | "decider_checked" | "check_overridden"
+            )
+        })
+        .collect()
+}
+
+/// A decider answer giving criterion `rule_id` a verdict of `verdict`
+/// (`pass` or `fail`), billed on `model` at the given token counts.
+fn criterion_answer(rule_id: &str, verdict: &str, model: &str, tokens: (u64, u64)) -> Reply {
+    let (pass, fail) = if verdict == "pass" {
+        (0.95, 0.02)
+    } else {
+        (0.02, 0.95)
+    };
+    Reply::json(&serde_json::json!({
+        "model": model,
+        "answers": {rule_id: {"type": "choice", "choice": verdict,
+            "probabilities": {"pass": pass, "fail": fail, "unclear": 0.03}}},
+        "usage": {"input_tokens": tokens.0, "output_tokens": tokens.1}
+    }))
+}
+
+/// A routing answer of `go`, billed on `model` with `usage`.
+fn route_answer(model: &str, usage: Value) -> Reply {
+    Reply::json(&serde_json::json!({
+        "model": model,
+        "answers": {"verdict": {"type": "choice", "choice": "go",
+            "probabilities": {"go": 0.97, "stop": 0.02, "unclear": 0.01}}},
+        "usage": usage
+    }))
+}
+
+const MODEL_A: &str = "jev-test-1.2.3";
+const MODEL_B: &str = "jev-test-2.0.0";
+
+/// One decider-check criterion, `id`, in `mode`.
+fn decider_criterion(id: &str, mode: &str) -> String {
+    format!(
+        r#"          "{id}":
+            rule_ref: "https://example.org/rules/planted-ref-5e1f"
+            question: "Does each comment give a reason? planted-question-5e1f"
+            pass: "Every comment says why."
+            fail: "A comment restates the code."
+            escape: "No comment, or can't tell."
+            mode: {mode}"#
+    )
+}
+
+/// `review` holds the decider check `comments` over `slice.txt`, with
+/// criteria `a` (veto), `s` (shadow) and `b` (veto), and moves to `done`
+/// once nothing blocks. With `routing`, the session starts in `triage`,
+/// whose evidence the decider answers, and `go` leads to `review`.
+fn decider_template(routing: bool, criteria: &[(&str, &str)]) -> String {
+    let criteria: Vec<String> = criteria
+        .iter()
+        .map(|(id, mode)| decider_criterion(id, mode))
+        .collect();
+    let triage = if routing {
+        r#"  triage:
+    accepts:
+      verdict:
+        type: enum
+        values: [go, stop]
+        required: true
+        description: Go?
+        decider:
+          answers:
+            go: {description: "Yes.", mode: auto}
+            stop: {description: "No.", mode: never}
+          escape: {value: unclear, description: "Unknown."}
+          inputs:
+            - {var: PLAN_DOC, label: plan_path}
+    transitions:
+      - target: review
+        when: {verdict: go}
+      - target: done
+        when: {verdict: stop}
+"#
+    } else {
+        ""
+    };
+    format!(
+        r#"---
+name: journal-decider
+version: "1.0"
+initial_state: {initial}
+variables:
+  PLAN_DOC:
+    description: plan
+    default: docs/plan.md
+states:
+{triage}  review:
+    gates:
+      comments:
+        type: decider-check
+        command: "cat slice.txt"
+        label: comments
+        criteria:
+{criteria}
+    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## triage
+
+Triage. planted-directive-5e1f
+
+## review
+
+Review the comments. planted-directive-5e1f
+
+## done
+
+Done.
+"#,
+        initial = if routing { "triage" } else { "review" },
+        criteria = criteria.join("\n"),
+    )
+}
+
+/// The three criteria of the decider-check scenario: a veto criterion that
+/// fails, a shadow criterion, and a veto criterion left unanswered.
+const SCENARIO_CRITERIA: &[(&str, &str)] = &[("a", "veto"), ("s", "shadow"), ("b", "veto")];
+
+/// Queue the stub's answers to [`SCENARIO_CRITERIA`], in the order koto
+/// asks: `a` fails on [`MODEL_A`], `s` fails on [`MODEL_B`] (a shadow
+/// verdict never blocks), and `b` gets a status koto doesn't retry, so it
+/// stays unanswered.
+fn queue_scenario_answers(stub: &DeciderStub) {
+    stub.push(criterion_answer("a", "fail", MODEL_A, (100, 3)));
+    stub.push(criterion_answer("s", "fail", MODEL_B, (40, 2)));
+    stub.push(Reply::status(401));
+}
+
+/// A working directory for a decider-check session: the template and the
+/// slice the check sends.
+fn decider_dir(env: &Env, label: &str, template: &str) -> PathBuf {
+    let dir = env.work.join(label);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("slice.txt"),
+        "planted-slice-5e1f let total = a + b; // add a and b\n",
+    )
+    .unwrap();
+    env.template(&dir, template);
+    dir
+}
+
+/// Init `name` on the decider-check scenario and run its first `koto next`,
+/// which grades the three criteria and blocks on `a`.
+fn decider_scenario(env: &Env, name: &str, stub: &DeciderStub) -> PathBuf {
+    let dir = decider_dir(env, name, &decider_template(false, SCENARIO_CRITERIA));
+    env.ok_in(&dir, &["init", name, "--template", "template.md"]);
+    queue_scenario_answers(stub);
+    let out = decider_in(env, &dir, stub, &["next", name, "--no-cleanup"]);
+    assert_eq!(out.journal_warnings(), 0, "{}", out.stderr);
+    let json: Value = serde_json::from_str(out.stdout.trim()).unwrap();
+    assert_eq!(json["action"], "gate_blocked", "{json}");
+    assert_eq!(stub.request_count(), 3);
+    dir
+}
+
+/// The journal's `check_evaluated` an override moved past, and that
+/// evaluation's rule records, found from journal lines alone: the same
+/// session, state and check, and the highest `koto.seq` below the
+/// override's.
+fn overridden_evaluation(lines: &[Value], overridden: &Value) -> Option<(Value, Vec<Value>)> {
+    let same = |r: &Value| {
+        r["koto.session.id"] == overridden["koto.session.id"]
+            && r["koto.state"] == overridden["koto.state"]
+            && r["koto.check"] == overridden["koto.check"]
+    };
+    let below = overridden["koto.seq"].as_u64().unwrap();
+    let evaluation = lines
+        .iter()
+        .filter(|r| r["kind"] == "check_evaluated" && same(r))
+        .filter(|r| r["koto.seq"].as_u64().unwrap() < below)
+        .max_by_key(|r| r["koto.seq"].as_u64().unwrap())?
+        .clone();
+    let rules = lines
+        .iter()
+        .filter(|r| r["kind"] == "check_rule" && same(r))
+        .filter(|r| r["koto.seq"] == evaluation["koto.seq"])
+        .cloned()
+        .collect();
+    Some((evaluation, rules))
+}
+
+/// Every journal line, parsed, read without the reference checks: what a
+/// reader outside koto starts from.
+fn journal_lines(env: &Env) -> Vec<Value> {
+    std::fs::read_to_string(env.journal_path())
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// Take a session's decider lock, as another `koto next` would.
+fn hold_decider_lock(env: &Env, name: &str) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(env.session_dir(name).join("decider.lock"))
+        .unwrap();
+    // SAFETY: the descriptor belongs to `f`, which outlives the call.
+    assert_eq!(
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    f
+}
+
+/// With a stub decider, one decider check has a veto criterion that fails,
+/// a shadow criterion and a veto criterion left unanswered. Three
+/// `decider_checked` records come before the gate's `check_evaluated`,
+/// which is `failed` with one unanswered criterion and one `check_rule`.
+///
+/// koto can only leave a criterion `busy` when it can't take the session's
+/// decider lock, and then it asks about none of the criteria it doesn't
+/// reuse, so `busy` can't sit beside a fresh verdict in one evaluation. The
+/// unanswered criterion of the first evaluation fails at the provider; the
+/// next evaluation in the same visit, with the lock held elsewhere, reuses
+/// the two verdicts (writing no record for them) and leaves the third
+/// `busy`.
+#[test]
+fn a_decider_check_writes_one_decider_checked_per_criterion_before_its_evaluation() {
+    let env = Env::new();
+    let stub = DeciderStub::start();
+    decider_scenario(&env, "dc", &stub);
+
+    let log = env.events("dc");
+    let arrival = log
+        .iter()
+        .find(|e| e["type"] == "transitioned" && e["payload"]["to"] == "review")
+        .unwrap()["seq"]
+        .clone();
+    let checked_events: Vec<&Value> = log
+        .iter()
+        .filter(|e| e["type"] == "decider_checked")
+        .collect();
+    let evaluated_event = log.iter().find(|e| e["type"] == "gate_evaluated").unwrap();
+
+    let records: Vec<Value> = env
+        .records("dc")
+        .into_iter()
+        .filter(|r| r["kind"] != "session_started" && r["kind"] != "state_entered")
+        .collect();
+    assert_eq!(
+        kinds(&records),
+        vec![
+            "decider_checked",
+            "decider_checked",
+            "decider_checked",
+            "check_evaluated",
+            "check_rule"
+        ]
+    );
+    for (record, event) in records[..3].iter().zip(&checked_events) {
+        let p = &event["payload"];
+        assert_eq!(record["koto.seq"], event["seq"], "{record}");
+        assert!(record["koto.seq"].as_u64() < evaluated_event["seq"].as_u64());
+        assert_eq!(record["koto.visit.seq"], arrival, "{record}");
+        assert_eq!(record["koto.state"], "review");
+        assert_eq!(record["koto.check"], "comments");
+        assert_eq!(record["koto.rule.id"], p["rule_id"]);
+        assert_eq!(record["koto.decider.provider"], p["provider"]);
+        assert_eq!(record["koto.decider.model"], p["model"]);
+        assert_eq!(record["koto.decider.mode"], p["mode"]);
+        assert_eq!(record["koto.decider.outcome"], p["outcome"]);
+        assert_eq!(record["koto.decider.blocked"], p["blocked"]);
+        assert_eq!(record["koto.decider.attempts"], p["attempts"]);
+        assert_eq!(record["koto.decider.latency_ms"], p["latency_ms"]);
+        assert_eq!(
+            record["koto.decider.unread_usage_attempts"],
+            p["unread_usage_attempts"]
+        );
+        for (field, key) in [
+            ("koto.decider.reason", "reason"),
+            ("koto.decider.error_class", "error_class"),
+            ("koto.decider.input_tokens", "input_tokens"),
+            ("koto.decider.output_tokens", "output_tokens"),
+        ] {
+            assert_eq!(record.get(field), p.get(key), "{field}: {record}");
+        }
+    }
+    let modes: Vec<(&str, &str, &str, bool)> = records[..3]
+        .iter()
+        .map(|r| {
+            (
+                r["koto.rule.id"].as_str().unwrap(),
+                r["koto.decider.mode"].as_str().unwrap(),
+                r["koto.decider.outcome"].as_str().unwrap(),
+                r["koto.decider.blocked"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        modes,
+        vec![
+            ("a", "veto", "fail", true),
+            ("s", "shadow", "fail", false),
+            ("b", "veto", "unanswered", false),
+        ]
+    );
+    assert_eq!(records[0]["koto.decider.model"], MODEL_A);
+    assert_eq!(records[0]["koto.decider.input_tokens"], 100);
+    assert_eq!(records[0]["koto.decider.output_tokens"], 3);
+    assert_eq!(records[1]["koto.decider.model"], MODEL_B);
+    assert_eq!(records[2]["koto.decider.reason"], "provider_error");
+    assert!(records[2].get("koto.decider.input_tokens").is_none());
+
+    let e = &records[3];
+    assert_eq!(e["koto.seq"], evaluated_event["seq"]);
+    assert_eq!(e["koto.check.outcome"], "failed");
+    assert_eq!(e["koto.check.unanswered_count"], 1);
+    assert_eq!(e["koto.check.rule_count"], 1);
+    assert_eq!(records[4]["koto.rule.id"], "a");
+    assert_eq!(records[4]["koto.rule.visit_count"], 1);
+
+    // The same visit again, with another command holding the decider lock:
+    // `a` and `s` are reused and write nothing, and `b` is `busy`.
+    std::fs::write(
+        env.koto_home().join("config.toml"),
+        "[decider]\ntimeout_ms = 50\n",
+    )
+    .unwrap();
+    let lock = hold_decider_lock(&env, "dc");
+    let dir = env.work.join("dc");
+    let out = decider_in(&env, &dir, &stub, &["next", "dc", "--no-cleanup"]);
+    drop(lock);
+    assert_eq!(out.journal_warnings(), 0, "{}", out.stderr);
+    assert_eq!(stub.request_count(), 3, "nothing more was asked");
+    let after: Vec<Value> = env.records("dc").into_iter().skip(2 + 5).collect();
+    assert_eq!(
+        kinds(&after),
+        vec!["decider_checked", "check_evaluated", "check_rule"],
+        "reused verdicts write no decider_checked"
+    );
+    assert_eq!(after[0]["koto.rule.id"], "b");
+    assert_eq!(after[0]["koto.decider.outcome"], "unanswered");
+    assert_eq!(after[0]["koto.decider.reason"], "busy");
+    assert_eq!(after[0]["koto.decider.attempts"], 0);
+    assert_eq!(after[0]["koto.visit.seq"], arrival);
+    assert_eq!(after[1]["koto.check.outcome"], "failed");
+    assert_eq!(after[1]["koto.check.unanswered_count"], 1);
+    assert_eq!(after[2]["koto.rule.id"], "a");
+    assert_eq!(after[2]["koto.rule.visit_count"], 2);
+    let logged = env
+        .events("dc")
+        .iter()
+        .filter(|e| e["type"] == "decider_checked")
+        .count();
+    assert_eq!(logged, 4, "the log agrees: one more decider_checked");
+
+    // Nothing the decider events carry beyond the record's fields.
+    let raw = std::fs::read_to_string(env.journal_path()).unwrap();
+    for event in &checked_events {
+        let p = &event["payload"];
+        for hash in ["declaration_hash", "input_sha256"] {
+            let value = p[hash].as_str().unwrap();
+            assert!(!raw.contains(value), "{hash} in the journal");
+        }
+    }
+    for absent in ["probabilit", "threshold", "endpoint", "rule_ref", "0.95"] {
+        assert!(!raw.contains(absent), "{absent} in {raw}");
+    }
+}
+
+/// From the decider-check scenario's journal lines alone, preceded by a
+/// routing consultation, the tokens per model match the stub's answers and
+/// the session log, summed over both decider kinds.
+#[test]
+fn the_journal_alone_sums_decider_tokens_per_model() {
+    let env = Env::new();
+    let stub = DeciderStub::start();
+    let dir = decider_dir(&env, "spend", &decider_template(true, SCENARIO_CRITERIA));
+    env.ok_in(&dir, &["init", "spend", "--template", "template.md"]);
+    stub.push(route_answer(
+        MODEL_B,
+        serde_json::json!({"input_tokens": 250, "output_tokens": 7}),
+    ));
+    queue_scenario_answers(&stub);
+    let out = decider_in(&env, &dir, &stub, &["next", "spend", "--no-cleanup"]);
+    assert_eq!(out.journal_warnings(), 0, "{}", out.stderr);
+    assert_eq!(stub.request_count(), 4);
+
+    type Spend = BTreeMap<String, (u64, u64)>;
+    let sum = |records: &mut dyn Iterator<Item = (String, u64, u64)>| -> Spend {
+        let mut spend = Spend::new();
+        for (model, input, output) in records {
+            let entry = spend.entry(model).or_default();
+            entry.0 += input;
+            entry.1 += output;
+        }
+        spend
+    };
+    let from_journal = sum(&mut journal_lines(&env)
+        .into_iter()
+        .filter(|r| r["kind"] == "decider_checked" || r["kind"] == "decider_consulted")
+        .map(|r| {
+            (
+                r["koto.decider.model"].as_str().unwrap().to_string(),
+                r["koto.decider.input_tokens"].as_u64().unwrap_or(0),
+                r["koto.decider.output_tokens"].as_u64().unwrap_or(0),
+            )
+        }));
+    let from_log = sum(&mut env
+        .events("spend")
+        .into_iter()
+        .filter(|e| e["type"] == "decider_checked" || e["type"] == "decider_consulted")
+        .map(|e| {
+            let p = &e["payload"];
+            (
+                p["model"].as_str().unwrap().to_string(),
+                p["input_tokens"].as_u64().unwrap_or(0),
+                p["output_tokens"].as_u64().unwrap_or(0),
+            )
+        }));
+    let expected: Spend = [
+        (MODEL_A.to_string(), (100, 3)),
+        (MODEL_B.to_string(), (250 + 40, 7 + 2)),
+        ("unknown".to_string(), (0, 0)),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(from_journal, expected);
+    assert_eq!(from_log, expected);
+}
+
+/// The routing decider's consultation writes `decider_consulted` with the
+/// event's provider, model, outcome, tokens and timings, under koto's
+/// visit; without usage in the answer, the token fields are left out.
+#[test]
+fn a_consultation_writes_decider_consulted_with_the_events_values() {
+    let env = Env::new();
+    for (name, usage) in [
+        (
+            "routed",
+            serde_json::json!({"input_tokens": 250, "output_tokens": 7}),
+        ),
+        ("unbilled", serde_json::json!({})),
+    ] {
+        let stub = DeciderStub::start();
+        let dir = decider_dir(&env, name, &decider_template(true, &[("a", "veto")]));
+        env.ok_in(&dir, &["init", name, "--template", "template.md"]);
+        stub.push(route_answer(MODEL_B, usage.clone()));
+        stub.push(criterion_answer("a", "pass", MODEL_A, (100, 3)));
+        let out = decider_in(&env, &dir, &stub, &["next", name, "--no-cleanup"]);
+        assert_eq!(out.journal_warnings(), 0, "{}", out.stderr);
+
+        let log = env.events(name);
+        let event = log
+            .iter()
+            .find(|e| e["type"] == "decider_consulted")
+            .expect("the decider was consulted");
+        let arrival = log
+            .iter()
+            .find(|e| e["type"] == "transitioned" && e["payload"]["to"] == "triage")
+            .unwrap()["seq"]
+            .clone();
+        let consulted: Vec<Value> = decider_records(&env, name)
+            .into_iter()
+            .filter(|r| r["kind"] == "decider_consulted")
+            .collect();
+        assert_eq!(consulted.len(), 1, "{consulted:?}");
+        let r = &consulted[0];
+        let p = &event["payload"];
+        assert_eq!(r["koto.seq"], event["seq"]);
+        assert_eq!(r["koto.visit.seq"], arrival);
+        assert_eq!(r["koto.state"], "triage");
+        assert_eq!(r["koto.decider.provider"], p["provider"]);
+        assert_eq!(r["koto.decider.model"], MODEL_B);
+        assert_eq!(r["koto.decider.outcome"], p["outcome"]);
+        assert_eq!(r["koto.decider.outcome"], "applied");
+        assert_eq!(r["koto.decider.latency_ms"], p["latency_ms"]);
+        assert_eq!(r["koto.decider.directive_bytes"], p["directive_bytes"]);
+        assert_eq!(
+            r["koto.decider.unread_usage_attempts"],
+            p["unread_usage_attempts"]
+        );
+        assert!(r.get("koto.decider.error_class").is_none(), "{r}");
+        for (field, key) in [
+            ("koto.decider.input_tokens", "input_tokens"),
+            ("koto.decider.output_tokens", "output_tokens"),
+        ] {
+            assert_eq!(r.get(field), p.get(key), "{name} {field}: {r}");
+        }
+        if name == "routed" {
+            assert_eq!(r["koto.decider.input_tokens"], 250);
+            assert_eq!(r["koto.decider.output_tokens"], 7);
+        } else {
+            assert!(r.get("koto.decider.input_tokens").is_none(), "{r}");
+        }
+        let raw = std::fs::read_to_string(env.journal_path()).unwrap();
+        assert!(!raw.contains(p["input_sha256"].as_str().unwrap()));
+        assert!(!raw.contains("plan_path"), "{raw}");
+    }
+}
+
+/// A criterion id outside the name shape is written as its digest, on its
+/// `decider_checked` and on the rule record of the evaluation it failed.
+#[test]
+fn an_odd_criterion_id_is_written_as_its_digest() {
+    let env = Env::new();
+    let stub = DeciderStub::start();
+    let odd = "no reason [x]";
+    let dir = decider_dir(&env, "oddc", &decider_template(false, &[(odd, "veto")]));
+    env.ok_in(&dir, &["init", "oddc", "--template", "template.md"]);
+    stub.push(criterion_answer(odd, "fail", MODEL_A, (100, 3)));
+    decider_in(&env, &dir, &stub, &["next", "oddc", "--no-cleanup"]);
+    let checked: Vec<Value> = decider_records(&env, "oddc");
+    assert_eq!(kinds(&checked), vec!["decider_checked"]);
+    assert_eq!(checked[0]["koto.rule.id"], digest(odd).as_str());
+    assert_eq!(checked[0]["koto.decider.outcome"], "fail");
+    let rules: Vec<Value> = env
+        .check_records("oddc")
+        .into_iter()
+        .filter(|r| r["kind"] == "check_rule")
+        .collect();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0]["koto.rule.id"], digest(odd).as_str());
+    let raw = std::fs::read_to_string(env.journal_path()).unwrap();
+    assert!(!raw.contains("no reason"), "{raw}");
+}
+
+/// `koto overrides record` on the gate that failed four times in one visit
+/// writes a `check_overridden` whose highest earlier same-check
+/// `check_evaluated` is the fourth attempt, with the rule it failed.
+#[test]
+fn an_override_after_a_loop_joins_to_the_fourth_attempt() {
+    let env = Env::new();
+    let dir = run_retry(&env, "loop6", &[1, 1, 1, 1], &["E501"], false);
+    env.ok_in(
+        &dir,
+        &[
+            "overrides",
+            "record",
+            "loop6",
+            "--gate",
+            "lint",
+            "--rationale",
+            "planted-rationale-5e1f",
+        ],
+    );
+    let overridden = decider_records(&env, "loop6");
+    assert_eq!(kinds(&overridden), vec!["check_overridden"]);
+    let o = &overridden[0];
+    let keys: BTreeSet<&str> = o.as_object().unwrap().keys().map(String::as_str).collect();
+    let expected: BTreeSet<&str> = ENVELOPE
+        .iter()
+        .copied()
+        .chain(["koto.seq", "koto.visit.seq", "koto.state", "koto.check"])
+        .collect();
+    assert_eq!(keys, expected, "only the envelope, the two seqs and names");
+    let event = env
+        .events("loop6")
+        .into_iter()
+        .find(|e| e["type"] == "gate_override_recorded")
+        .unwrap();
+    assert_eq!(o["koto.seq"], event["seq"]);
+    assert_eq!(o["koto.state"], "work");
+    assert_eq!(o["koto.check"], "lint");
+
+    let lines = journal_lines(&env);
+    let (evaluation, rules) = overridden_evaluation(&lines, o).expect("an evaluation");
+    assert_eq!(evaluation["koto.visit_attempt"], 4);
+    assert_eq!(evaluation["koto.check.outcome"], "failed");
+    assert_eq!(evaluation["koto.visit.seq"], o["koto.visit.seq"]);
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0]["koto.rule.id"], "E501");
+    assert_eq!(rules[0]["koto.rule.visit_count"], 4);
+}
+
+/// An override recorded before the gate was ever evaluated writes its
+/// record, and the join finds no evaluation.
+#[test]
+fn an_override_with_no_earlier_evaluation_joins_to_nothing() {
+    let env = Env::new();
+    let dir = env.check_dir("early", &[1], &[finding("E501")]);
+    let t = env.template(&dir, RETRY);
+    env.ok_in(&dir, &["init", "early", "--template", t.to_str().unwrap()]);
+    env.ok_in(
+        &dir,
+        &[
+            "overrides",
+            "record",
+            "early",
+            "--gate",
+            "lint",
+            "--rationale",
+            "planted-rationale-5e1f",
+        ],
+    );
+    let overridden = decider_records(&env, "early");
+    assert_eq!(kinds(&overridden), vec!["check_overridden"]);
+    assert_eq!(env.check_records("early").len(), 1, "the override only");
+    assert!(overridden_evaluation(&journal_lines(&env), &overridden[0]).is_none());
+}
+
+/// Overriding the decider check of the decider-check scenario writes one
+/// `check_overridden`, not one per criterion, and the evaluation it joins to
+/// names the failed criterion through its rule record.
+#[test]
+fn a_decider_check_override_is_one_record_and_its_join_names_the_failed_criterion() {
+    let env = Env::new();
+    let stub = DeciderStub::start();
+    let dir = decider_scenario(&env, "dco", &stub);
+    let out = decider_in(
+        &env,
+        &dir,
+        &stub,
+        &[
+            "overrides",
+            "record",
+            "dco",
+            "--gate",
+            "comments",
+            "--rationale",
+            "planted-rationale-5e1f",
+        ],
+    );
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    let overridden: Vec<Value> = decider_records(&env, "dco")
+        .into_iter()
+        .filter(|r| r["kind"] == "check_overridden")
+        .collect();
+    assert_eq!(overridden.len(), 1, "{overridden:?}");
+    assert_eq!(overridden[0]["koto.check"], "comments");
+    let (evaluation, rules) =
+        overridden_evaluation(&journal_lines(&env), &overridden[0]).expect("an evaluation");
+    assert_eq!(evaluation["koto.check.unanswered_count"], 1);
+    let ids: Vec<&str> = rules
+        .iter()
+        .map(|r| r["koto.rule.id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["a"],
+        "the failed criterion, not the shadow or unanswered one"
+    );
+}
+
+/// `check` runs `lint`; evidence moves it to `other` and back.
+const OVERRIDE_VISITS: &str = r#"---
+name: journal-override-visits
+version: "1.0"
+initial_state: check
+states:
+  check:
+    accepts:
+      verdict:
+        type: enum
+        required: true
+        values: [leave, finish]
+    gates:
+      lint:
+        type: command
+        command: "./check.sh"
+        timeout: 600
+    transitions:
+      - target: other
+        when:
+          verdict: leave
+      - target: done
+        when:
+          verdict: finish
+  other:
+    accepts:
+      verdict:
+        type: enum
+        required: true
+        values: [back]
+    transitions:
+      - target: check
+        when:
+          verdict: back
+  done:
+    terminal: true
+---
+
+## check
+
+Check.
+
+## other
+
+Elsewhere.
+
+## done
+
+Done.
+"#;
+
+/// An override recorded in a later visit than the evaluation that failed
+/// joins to that evaluation.
+#[test]
+fn an_override_in_a_later_visit_joins_to_the_earlier_evaluation() {
+    let env = Env::new();
+    let dir = env.check_dir("later", &[1], &[finding("E501")]);
+    let t = env.template(&dir, OVERRIDE_VISITS);
+    env.ok_in(&dir, &["init", "later", "--template", t.to_str().unwrap()]);
+    env.koto_in(&dir, &["next", "later", "--no-cleanup"]);
+    env.ok_in(&dir, &["next", "later", "--to", "other"]);
+    env.ok_in(&dir, &["next", "later", "--to", "check"]);
+    env.ok_in(
+        &dir,
+        &[
+            "overrides",
+            "record",
+            "later",
+            "--gate",
+            "lint",
+            "--rationale",
+            "planted-rationale-5e1f",
+        ],
+    );
+    let runs = std::fs::read_to_string(dir.join("runs.log")).unwrap();
+    assert_eq!(
+        runs.lines().count(),
+        1,
+        "the check ran in the first visit only"
+    );
+    let overridden = decider_records(&env, "later");
+    assert_eq!(kinds(&overridden), vec!["check_overridden"]);
+    let o = &overridden[0];
+    let (evaluation, rules) =
+        overridden_evaluation(&journal_lines(&env), o).expect("an evaluation");
+    assert_ne!(
+        evaluation["koto.visit.seq"], o["koto.visit.seq"],
+        "the evaluation is in the earlier visit"
+    );
+    assert!(evaluation["koto.visit.seq"].as_u64() < o["koto.visit.seq"].as_u64());
+    assert_eq!(evaluation["koto.check.outcome"], "failed");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0]["koto.rule.id"], "E501");
+}
+
+/// The decider and override scenario's commands in `env`: each one's exit
+/// code, masked standard output and journal warning count, then the masked
+/// session log. The routing decider answers `go`, the decider check blocks
+/// on `a`, an override moves past it, and the session finishes.
+fn decider_outcome(env: &Env) -> (Vec<Step>, Vec<Value>) {
+    let stub = DeciderStub::start();
+    let dir = decider_dir(env, "same", &decider_template(true, SCENARIO_CRITERIA));
+    stub.push(route_answer(
+        MODEL_B,
+        serde_json::json!({"input_tokens": 250, "output_tokens": 7}),
+    ));
+    queue_scenario_answers(&stub);
+    let tmp = env.tmp.path().to_string_lossy().to_string();
+    let steps: [&[&str]; 4] = [
+        &["init", "same", "--template", "template.md"],
+        &["next", "same", "--no-cleanup"],
+        &[
+            "overrides",
+            "record",
+            "same",
+            "--gate",
+            "comments",
+            "--rationale",
+            "planted-rationale-5e1f",
+        ],
+        &["next", "same", "--no-cleanup"],
+    ];
+    let mut outs = Vec::new();
+    for args in steps {
+        let out = decider_in(env, &dir, &stub, args);
+        let json: Value = serde_json::from_str(out.stdout.trim()).unwrap_or(Value::Null);
+        outs.push((out.code, masked(&json, &tmp), out.journal_warnings()));
+    }
+    assert_eq!(stub.request_count(), 4, "one routing call, three criteria");
+    let log = std::fs::read_to_string(env.state_path("same"))
+        .unwrap()
+        .lines()
+        .map(|l| masked(&serde_json::from_str(l).unwrap(), &tmp))
+        .collect();
+    (outs, log)
+}
+
+/// With the journal unwritable (a read-only koto home, or a symlink at its
+/// path), the decider and override scenario gives the same exit codes,
+/// standard output and session log as with a writable journal, and each
+/// command prints exactly one run-journal warning.
+#[test]
+fn an_unwritable_journal_changes_nothing_for_decider_and_override_commands() {
+    if running_as_root() {
+        eprintln!("skipped: permissions don't bind this user");
+        return;
+    }
+    let good = Env::new();
+    let (expected, expected_log) = decider_outcome(&good);
+    assert!(expected.iter().all(|(_, _, w)| *w == 0), "{expected:?}");
+    assert!(
+        expected.iter().all(|(_, json, _)| json.is_object()),
+        "{expected:?}"
+    );
+    let written = kinds(&decider_records(&good, "same"))
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        written,
+        vec![
+            "decider_consulted",
+            "decider_checked",
+            "decider_checked",
+            "decider_checked",
+            "check_overridden"
+        ]
+    );
+    assert_eq!(
+        good.records("same").last().unwrap()["kind"],
+        "terminal",
+        "the override let the session finish"
+    );
+
+    let read_only = Env::new();
+    std::fs::create_dir_all(read_only.koto_home().join("sessions")).unwrap();
+    std::fs::set_permissions(
+        read_only.koto_home(),
+        std::fs::Permissions::from_mode(0o500),
+    )
+    .unwrap();
+    let got = decider_outcome(&read_only);
+    std::fs::set_permissions(
+        read_only.koto_home(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert!(!read_only.journal_path().exists());
+
+    let linked = Env::new();
+    std::fs::create_dir_all(linked.koto_home()).unwrap();
+    let target = linked.tmp.path().join("not-the-journal.txt");
+    std::fs::write(&target, "untouched\n").unwrap();
+    std::os::unix::fs::symlink(&target, linked.journal_path()).unwrap();
+    let got_linked = decider_outcome(&linked);
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched\n");
 
     for (label, (outs, log)) in [("read-only", got), ("symlink", got_linked)] {

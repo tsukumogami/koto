@@ -3,8 +3,9 @@
 The run journal is a local record of session identity and progress for
 tooling outside koto. koto appends one JSON object per line as sessions
 start, enter states, reach a terminal, are cancelled, or are driven by a new
-Claude Code session, and each time koto evaluates one of their checks. The
-journal is append-only: koto never rewrites or reads back its records, so a
+Claude Code session, each time koto evaluates one of their checks or
+consults the decider, and each time an override is recorded. The journal
+is append-only: koto never rewrites or reads back its records, so a
 session's lines outlive the session itself, including sessions koto removes
 at their terminal tick or on `koto session cleanup`.
 
@@ -57,11 +58,11 @@ A field with no value is left out, never written as `null` or an empty
 string. Ids (every `*.id` field except `koto.rule.id`, and
 `koto.template.hash`) must match `^[A-Za-z0-9._:-]{1,128}$`. Names
 (`koto.template.name`, `koto.state`, `koto.terminal`, `koto.check`, and
-the string values of the check kinds) must match
+the string values of the check, decider and override kinds) must match
 `^[A-Za-z0-9._:/@-]{1,128}$` and not start with `/` or `~`. A value outside
 its shape is left out and the record is still written. `koto.rule.id` is
-never left out: a rule id outside the name shape is written as its digest
-(see [Rule ids](#rule-ids)).
+never left out: a rule id outside the name shape, a decider criterion's id
+included, is written as its digest (see [Rule ids](#rule-ids)).
 
 ### Record kinds
 
@@ -75,9 +76,14 @@ never left out: a rule id outside the name shape is written as its digest
 | `check_evaluated` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.check.outcome`, `koto.attempt`, `koto.visit_attempt`, `koto.check.rule_count`, `koto.check.rule_counts_truncated`, `koto.check.duration_ms`, `koto.poll.status`, `koto.check.unanswered_count`, `koto.check.error` | koto evaluates a gate and the result isn't pending, or runs a state's default action. |
 | `check_rule` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.rule.visit_count`, `koto.rule.session_count` | Once for each error rule of a check evaluation, after its `check_evaluated`. |
 | `check_pending` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.poll.status`, `koto.poll.evaluations`, `koto.poll.elapsed_secs` | A polling gate's evaluation is still pending. |
+| `decider_consulted` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.outcome`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.latency_ms`, `koto.decider.directive_bytes` | koto consults the decider about a state's evidence. |
+| `decider_checked` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.mode`, `koto.decider.outcome`, `koto.decider.reason`, `koto.decider.blocked`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.attempts`, `koto.decider.latency_ms` | koto grades one criterion of a decider check. |
+| `check_overridden` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check` | An override is recorded for a gate. |
 
-The first five are the identity kinds. The last three are the check kinds,
-described in [Check records](#check-records).
+The first five are the identity kinds. The next three are the check kinds,
+described in [Check records](#check-records), and the last three are the
+decider and override kinds, described in
+[Decider and override records](#decider-and-override-records).
 
 `session_started`'s fields:
 
@@ -125,7 +131,10 @@ commits for it: a gate's `gate_evaluated`, or a state's default action's
 written after its event commits, and a failed commit writes none. Check
 records copy names, counts and short vocabulary values out of the event
 field by field. They never hold check output, a finding's message, path or
-location, a rule reference, a command, or any filesystem path.
+location, a rule reference or a command, and koto adds no filesystem path
+of its own. A rule id is passed through as the check reported it, or as its
+digest (see [Rule ids](#rule-ids)): the name shape admits `/` and `@`, so
+an id such as `@typescript-eslint/no-explicit-any` is written unchanged.
 
 Every check record carries two sequence numbers after `koto.run.id`:
 
@@ -151,7 +160,7 @@ One record per check evaluation: a `gate_evaluated` whose outcome isn't
 |-------|------|---------|-------------|
 | `koto.state` | string | always | The state the check belongs to. |
 | `koto.check` | string | always | The gate's name, or `__action__` for a default action. |
-| `koto.check.outcome` | string | always | For a gate, its logged outcome: `passed`, `failed`, `timed_out` or `error`. For a default action, `failed` when its exit code isn't 0 or it logged rule counts (a capture failure after exit 0 always does), otherwise `passed`. |
+| `koto.check.outcome` | string | always | For a gate, its logged outcome: `passed`, `failed`, `timed_out` or `error`. For a default action, `failed` when its exit code isn't 0 or it logged rule counts (a capture failure after exit 0 always does), otherwise `passed`. A default action that timed out or couldn't be spawned is `failed` too: its event carries no outcome of its own, and its exit code of -1 stands for a timeout, a spawn failure and a failed wait alike. |
 | `koto.attempt` | integer | when logged | The state's attempt number in the session. Every check evaluation from koto v0.15.0 on carries it. |
 | `koto.visit_attempt` | integer | when logged | The state's attempt number in the current visit. |
 | `koto.check.rule_count` | integer | always | How many error rules the evaluation counted, the keys of its `rule_counts`; 0 when it has none. |
@@ -236,6 +245,109 @@ literal id of that form can't be told apart from a digest.
 {"kind":"check_pending","v":1,"at":"2026-10-10T03:21:40.502Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":19,"koto.visit.seq":17,"koto.state":"ci","koto.check":"ci","koto.poll.status":"pending","koto.poll.evaluations":2,"koto.poll.elapsed_secs":31}
 ```
 
+## Decider and override records
+
+koto relays each decider consultation and each recorded override from the
+event the session's log commits for it, after the commit, as it relays
+checks. Like check records, they carry `koto.seq` and `koto.visit.seq` after
+`koto.run.id`. `koto.visit.seq` is koto's visit, by the rule in
+[Check records](#check-records). A decider event carries a `visit_seq` of
+its own, which isn't copied.
+
+These records copy names, counts and short vocabulary values field by
+field. They never hold a probability, an input or declaration hash, a
+threshold, the endpoint or where it came from, a criterion's rule
+reference, question or descriptions, the slice a decider check sent, a
+routing consultation's per-field detail, an override's rationale, its
+values or the output it moved past.
+
+### `decider_consulted`
+
+One record per consultation of the decider about a state's evidence: a
+committed `decider_consulted` event.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.state` | string | always | The state consulted. |
+| `koto.decider.provider` | string | always | The provider's name, such as `jev`. |
+| `koto.decider.model` | string | always | The model the provider reported, or `unknown`. |
+| `koto.decider.outcome` | string | always | How the consultation ended: `applied`, `not_applied`, `input_unavailable` or `error`. |
+| `koto.decider.error_class` | string | when logged | Why the provider call failed, such as `timeout`, `connect`, `http_status`, `malformed` or `mismatched`. |
+| `koto.decider.input_tokens` | integer | when logged | Input tokens of the billed answer. |
+| `koto.decider.output_tokens` | integer | when logged | Output tokens of the billed answer. |
+| `koto.decider.unread_usage_attempts` | integer | always | Billed answers whose token usage couldn't be read, so an undercount of the two counts above is visible. 0 when the event doesn't log it. |
+| `koto.decider.latency_ms` | integer | always | Wall time of the provider call, in milliseconds. |
+| `koto.decider.directive_bytes` | integer | always | Byte length of the directive and details the agent would have received for the state. |
+
+### `decider_checked`
+
+One record per criterion koto grades on a decider check: a committed
+`decider_checked` event. A decider check's records come before its gate's
+`check_evaluated`, each with a lower `koto.seq`. A verdict koto reuses
+within a visit appends no event, so it writes no record.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.state` | string | always | The state the check belongs to. |
+| `koto.check` | string | always | The decider check's gate name. |
+| `koto.rule.id` | string | always | The criterion's id, or its digest (see [Rule ids](#rule-ids)). |
+| `koto.decider.provider` | string | always | The provider's name. |
+| `koto.decider.model` | string | always | The model the provider reported, or `unknown`. |
+| `koto.decider.mode` | string | always | The criterion's effective mode: `veto` or `shadow`. |
+| `koto.decider.outcome` | string | always | `pass`, `fail`, `escape`, `unanswered` or `not_graded`. |
+| `koto.decider.reason` | string | when logged | Why a criterion got no verdict: `provider_error`, `unreadable_response`, `over_budget`, `extraction_failed`, `cap_spent` or `busy`. |
+| `koto.decider.blocked` | boolean | always | Whether this verdict blocked the state. |
+| `koto.decider.error_class` | string | when logged | Why the last provider call failed. |
+| `koto.decider.input_tokens` | integer | when logged | Input tokens, summed over the attempts that reported usage. |
+| `koto.decider.output_tokens` | integer | when logged | Output tokens, likewise. |
+| `koto.decider.unread_usage_attempts` | integer | always | Billed attempts whose token usage couldn't be read. |
+| `koto.decider.attempts` | integer | always | Provider calls made for this criterion, 0 when none was sent. |
+| `koto.decider.latency_ms` | integer | always | Wall time of those calls, in milliseconds. |
+
+A failing veto criterion is also one of its gate's error rules, so the
+gate's `check_evaluated` that follows has a `check_rule` for it under the
+same `koto.rule.id`.
+
+To total decider tokens, sum `koto.decider.input_tokens` and
+`koto.decider.output_tokens` over both decider kinds, by
+`koto.decider.model` and `koto.run.id`. Keep `unknown` as a model of its
+own.
+
+### `check_overridden`
+
+One record per committed `gate_override_recorded` event, for any gate type.
+koto writes one per override, not one per criterion of a decider check.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.state` | string | always | The state the override was recorded in. |
+| `koto.check` | string | always | The overridden gate's name. |
+
+### Joining an override
+
+The evaluation an override moved past is the `check_evaluated` with the
+same `koto.session.id`, `koto.state` and `koto.check` and the highest
+`koto.seq` below the override's. It may belong to an earlier visit. Its
+`check_rule` records name the rules the override moved past; for a decider
+check, those are the criteria that failed. When there's no such record, as
+for an override recorded before the gate was ever evaluated, the override
+names no rule.
+
+### What writes no decider or override record
+
+- A decider-check verdict koto reuses within a visit, which appends no
+  `decider_checked`.
+- Events committed by a koto that predates these records.
+
+### Example
+
+```json
+{"kind":"decider_checked","v":1,"at":"2026-10-10T03:16:40.207Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":22,"koto.visit.seq":9,"koto.state":"implement","koto.check":"comments","koto.rule.id":"comment_reason","koto.decider.provider":"jev","koto.decider.model":"jev-1.2.3","koto.decider.mode":"veto","koto.decider.outcome":"fail","koto.decider.blocked":true,"koto.decider.input_tokens":812,"koto.decider.output_tokens":3,"koto.decider.unread_usage_attempts":0,"koto.decider.attempts":1,"koto.decider.latency_ms":640}
+{"kind":"check_evaluated","v":1,"at":"2026-10-10T03:16:40.209Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":23,"koto.visit.seq":9,"koto.state":"implement","koto.check":"comments","koto.check.outcome":"failed","koto.attempt":3,"koto.visit_attempt":3,"koto.check.rule_count":1,"koto.check.duration_ms":12,"koto.check.unanswered_count":0}
+{"kind":"check_rule","v":1,"at":"2026-10-10T03:16:40.209Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":23,"koto.visit.seq":9,"koto.state":"implement","koto.check":"comments","koto.attempt":3,"koto.visit_attempt":3,"koto.rule.id":"comment_reason","koto.rule.visit_count":1,"koto.rule.session_count":1}
+{"kind":"check_overridden","v":1,"at":"2026-10-10T03:18:02.731Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":25,"koto.visit.seq":9,"koto.state":"implement","koto.check":"comments"}
+```
+
 ## Run ids
 
 A run is a root session and every session spawned under it, at any depth.
@@ -269,14 +381,14 @@ An imported session is a new run: its own id is its run id.
 - `at` is the time the record was written, not the time of the event it
   describes, and it isn't guaranteed to increase down the file across
   processes. Use file order within a session.
-- Order one session's check records by `koto.seq`, then by file order.
-  A `check_evaluated` comes before its own `check_rule` records, which
-  share its `koto.seq`.
+- Order one session's check, decider and override records by
+  `koto.seq`, then by file order. A `check_evaluated` comes before its own
+  `check_rule` records, which share its `koto.seq`.
 - A copy of the journal that delivered some lines more than once (a
   sender that retries, for example) holds exact duplicates. Treat two
-  check records as duplicates only when every field, `at` included, is
-  equal. Distinct check records differ in `kind`, `at`, `koto.seq` or
-  `koto.rule.id`.
+  check, decider or override records as duplicates only when every field,
+  `at` included, is equal. Distinct records of these kinds differ in
+  `kind`, `at`, `koto.seq` or `koto.rule.id`.
 - `koto session import` writes the imported session's `session_started` and
   one `state_entered` for the state it's in, both timed at the import,
   exactly once per imported session. A retry or a rerun that adopts an
@@ -361,14 +473,14 @@ line is lost.
 
 ## Durability
 
-Identity records are flushed to disk as they're written. Check records
-aren't flushed on their own, since a blocked tick writes several and a
-flush takes milliseconds. They reach the operating system as soon as
-they're written, so a koto process that crashes or is killed loses none of
-them, and the next identity record's flush (the session's next state
-entry, terminal or cancel) makes them durable along with it. An operating
-system crash or a power loss can lose check records written since the
-journal's last flush.
+Identity records are flushed to disk as they're written. Check, decider
+and override records aren't flushed on their own, since a blocked tick
+writes several and a flush takes milliseconds. They reach the operating
+system as soon as they're written, so a koto process that crashes or is
+killed loses none of them, and the next identity record's flush (the
+session's next state entry, terminal or cancel) makes them durable along
+with it. An operating system crash or a power loss can lose check, decider and override records
+written since the journal's last flush.
 
 ## Retention
 
@@ -377,8 +489,9 @@ No session-lifecycle command deletes or rewrites the journal:
 at its terminal tick, a parent's sweep of its children,
 `koto init --replace-terminal` and `koto session import` all leave existing
 lines byte-identical. koto doesn't rotate or prune it yet, so it grows by
-a few hundred bytes per state entered and per check evaluation, and by up
-to 50 more lines for a check that reports many error rules.
+a few hundred bytes per state entered, per check evaluation, decider call
+and override, and by up to 50 more lines for a check that reports many
+error rules.
 
 To remove it by hand, delete the file (or move it aside) while no koto
 command is running. The next record creates a new file. Lines removed this
