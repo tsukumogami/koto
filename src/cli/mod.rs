@@ -17,7 +17,7 @@ pub mod overrides;
 pub mod request;
 pub mod retry;
 pub mod session;
-pub mod session_inventory;
+pub(crate) mod session_inventory;
 pub mod task_spawn_error;
 pub mod validate_feed;
 pub mod vars;

@@ -1,5 +1,5 @@
-//! One read of a session's standing: what `koto session list --state` and
-//! the prune report about each session.
+//! One read of a session's standing: what `koto session list --state`
+//! reports about each session.
 //!
 //! [`inspect`] reads a session's header and log from the local store and
 //! looks its current state up in the compiled template, which a
@@ -33,22 +33,9 @@ pub enum SessionStatus {
     Unreadable,
 }
 
-impl SessionStatus {
-    /// Terminal or cancelled.
-    pub fn is_finished(self) -> bool {
-        matches!(self, SessionStatus::Terminal | SessionStatus::Cancelled)
-    }
-}
-
 /// What [`inspect`] learned about one session.
 #[derive(Debug, Clone)]
 pub struct Inspection {
-    pub name: String,
-    /// `None` for an unreadable header, or one written before the field
-    /// existed (an empty `session_id`).
-    pub session_id: Option<String>,
-    pub execution_dir: Option<PathBuf>,
-    pub parent_workflow: Option<String>,
     pub status: SessionStatus,
     /// The current state's name; `None` when it couldn't be derived.
     pub state: Option<String>,
@@ -83,11 +70,7 @@ impl TemplateCache {
 
 /// Inspect session `name` under the local store `base`.
 pub fn inspect(base: &Path, name: &str, cache: &mut TemplateCache) -> Inspection {
-    let unreadable = |session_id, execution_dir, parent_workflow| Inspection {
-        name: name.to_string(),
-        session_id,
-        execution_dir,
-        parent_workflow,
+    let unreadable = || Inspection {
         status: SessionStatus::Unreadable,
         state: None,
         failure: false,
@@ -97,30 +80,20 @@ pub fn inspect(base: &Path, name: &str, cache: &mut TemplateCache) -> Inspection
     let session_dir = base.join(name);
     match std::fs::symlink_metadata(&session_dir) {
         Ok(meta) if meta.file_type().is_dir() => {}
-        _ => return unreadable(None, None, None),
+        _ => return unreadable(),
     }
     let state_path = session_dir.join(state_file_name(name));
 
-    let (header, events) = match persistence::read_events(&state_path) {
-        Ok(read) => read,
-        Err(_) => {
-            // The log failed; the header alone may still name the session.
-            return match persistence::read_header(&state_path) {
-                Ok(h) => unreadable(non_empty(h.session_id), h.execution_dir, h.parent_workflow),
-                Err(_) => unreadable(None, None, None),
-            };
-        }
+    let Ok((header, events)) = persistence::read_events(&state_path) else {
+        return unreadable();
     };
-    let session_id = non_empty(header.session_id.clone());
-    let execution_dir = header.execution_dir.clone();
-    let parent_workflow = header.parent_workflow.clone();
     let finished_at = events.last().map(|e| e.timestamp.clone());
 
     let Some(machine) = persistence::derive_machine_state(&header, &events, &session_dir) else {
-        return unreadable(session_id, execution_dir, parent_workflow);
+        return unreadable();
     };
     let Some(compiled) = cache.get(&machine.template_path) else {
-        return unreadable(session_id, execution_dir, parent_workflow);
+        return unreadable();
     };
     let template_state = compiled.states.get(&machine.current_state);
 
@@ -134,10 +107,6 @@ pub fn inspect(base: &Path, name: &str, cache: &mut TemplateCache) -> Inspection
     let failure = status == SessionStatus::Terminal && template_state.is_some_and(|s| s.failure);
 
     Inspection {
-        name: name.to_string(),
-        session_id,
-        execution_dir,
-        parent_workflow,
         status,
         state: Some(machine.current_state),
         failure,
@@ -158,14 +127,6 @@ fn cancelled_last(events: &[crate::engine::types::Event]) -> bool {
         }
     }
     false
-}
-
-fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
 }
 
 /// Whether `recorded` is `filter` or lies under it, compared by whole path
@@ -205,11 +166,47 @@ mod tests {
         );
     }
 
+    fn event(seq: u64, payload: EventPayload) -> crate::engine::types::Event {
+        crate::engine::types::Event {
+            seq,
+            timestamp: "2026-10-12T00:00:00Z".to_string(),
+            event_type: String::new(),
+            payload,
+            idempotency_hash: None,
+        }
+    }
+
+    #[test]
+    fn a_cancel_counts_only_until_the_log_moves_on() {
+        let cancel = || EventPayload::WorkflowCancelled {
+            state: "start".to_string(),
+            reason: "test".to_string(),
+        };
+        let rewind = || EventPayload::Rewound {
+            from: "start".to_string(),
+            to: "start".to_string(),
+            rationale: None,
+        };
+        assert!(cancelled_last(&[event(1, cancel())]));
+        assert!(!cancelled_last(&[event(1, cancel()), event(2, rewind())]));
+        assert!(cancelled_last(&[event(1, rewind()), event(2, cancel())]));
+        assert!(!cancelled_last(&[]));
+    }
+
+    #[test]
+    fn a_symlinked_session_directory_is_unreadable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("linked")).unwrap();
+        let got = inspect(tmp.path(), "linked", &mut TemplateCache::new());
+        assert_eq!(got.status, SessionStatus::Unreadable);
+    }
+
     #[test]
     fn a_missing_session_is_unreadable() {
         let tmp = tempfile::TempDir::new().unwrap();
         let got = inspect(tmp.path(), "absent", &mut TemplateCache::new());
         assert_eq!(got.status, SessionStatus::Unreadable);
-        assert!(!got.status.is_finished());
     }
 }

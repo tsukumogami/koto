@@ -382,7 +382,7 @@ Work.
 Done.
 "#;
 
-/// R30's measurement: 1,000 sessions, each a copy of one koto drove through
+/// The store-scale measurement: 1,000 sessions, each a copy of one koto drove through
 /// at least 20 events, listed with `--execution-dir`. Run it with
 /// `cargo test --release --test session_list_test -- --ignored --nocapture`;
 /// it prints the time and fails above 2 seconds.
