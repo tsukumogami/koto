@@ -853,4 +853,47 @@ mod tests {
         assert_eq!(first, "{\"n\":1}\n");
         assert_eq!(journal(&root), "{\"n\":2}\n");
     }
+
+    /// A rotation slower than its writer's whole bound still delivers the
+    /// batch it rotated for. The rotator holds its slow step past its bound
+    /// while a second writer waits behind it with a longer one; once the
+    /// rotation lets go, the second writer follows the move to the fresh
+    /// file and writes there too, so the two contend for the fresh file's
+    /// lock. The rotator's wait for that lock is a fresh one, not what its
+    /// slow step left, so both batches land in the fresh file.
+    #[test]
+    fn a_rotation_slower_than_its_bound_still_writes_its_batch() {
+        use std::sync::mpsc;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        // Past a 30-byte bound, so the first write rotates; the fresh file
+        // stays under it with both batches in.
+        let old = "{\"n\":1,\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxx\"}\n";
+        std::fs::write(root.join(JOURNAL_FILE), old).unwrap();
+        let bound = Duration::from_millis(100);
+        let (inside_tx, inside_rx) = mpsc::channel::<()>();
+        let rotating = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                set_settings_for_test(on(30));
+                hold_next_rotation_for_test(move || {
+                    inside_tx.send(()).unwrap();
+                    std::thread::sleep(bound * 3);
+                });
+                append(&root, &["{\"n\":2}"], MAX, true, bound).map_err(|e| format!("{e:#}"))
+            })
+        };
+        inside_rx.recv().unwrap();
+        // The second writer, rotation on too, waits out the slow step.
+        set_settings_for_test(on(30));
+        append(&root, &["{\"n\":3}"], MAX, true, WAIT).unwrap();
+        assert_eq!(rotating.join().unwrap(), Ok(true));
+
+        assert_eq!(rotated(&root), vec![rotated_name(1)]);
+        let first = std::fs::read_to_string(root.join(rotated_name(1))).unwrap();
+        assert_eq!(first, old);
+        let mut fresh: Vec<String> = journal(&root).lines().map(str::to_string).collect();
+        fresh.sort();
+        assert_eq!(fresh, vec!["{\"n\":2}", "{\"n\":3}"]);
+    }
 }

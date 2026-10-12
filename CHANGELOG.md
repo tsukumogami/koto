@@ -349,12 +349,14 @@ to `0.9.x`).
   keeps its 30 milliseconds), then skips that write's records with the
   usual one warning and carries on: the command's output, exit code and
   everything it does afterwards, a terminal tick's cleanup included, are
-  unchanged. Once one write has given up, the command's later writes try
-  the lock once without waiting, so a held lock costs a command one wait,
-  not one per write. The wait isn't configurable and covers only taking
-  the lock; a rotation that is slow while holding it still finishes, and
-  the writers behind it are the ones that give up. A write's records still
-  go to one file whole. `docs/reference/run-journal.md` describes the wait.
+  unchanged. Once one write has given up, later writes try the lock once
+  without waiting until one takes it again, so a held lock costs a
+  command one wait, not one per write, and a long-running command
+  recovers once the holder lets go. The wait isn't configurable and
+  covers only taking the lock: a rotation that is slow while holding it
+  still finishes, the writers behind it are the ones that give up, and the
+  rotating writer gets a full wait of its own for the fresh file. A
+  write's records still go to one file whole. `docs/reference/run-journal.md` describes the wait.
 
 - **A failed batch offers its retry after the parent leaves the batching
   state (koto#277).** `reserved_actions` was built only from the batch

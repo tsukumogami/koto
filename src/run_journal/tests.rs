@@ -1802,15 +1802,52 @@ fn a_next_response_waits_for_a_held_lock_and_is_written() {
     assert!(warnings_for_test().is_empty(), "{:?}", warnings_for_test());
 }
 
-/// Hold `journal`'s lock from this thread, as a stopped writer would, until
-/// the returned file is dropped.
+/// How long [`hold_journal_lock`] holds the lock at most. Far past every
+/// bound these tests set, so a write that waited without a bound would
+/// fail their timing checks rather than hang the test run.
 #[cfg(unix)]
-fn hold_journal_lock(journal: &Path) -> std::fs::File {
+const HOLD_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The journal's lock, held by a thread of its own as a stopped writer
+/// would hold it, until this is dropped or [`HOLD_WATCHDOG`] passes.
+#[cfg(unix)]
+struct LockHolder {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl Drop for LockHolder {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
+}
+
+/// Take `journal`'s lock from another thread (see [`LockHolder`]) and
+/// return once it is held.
+#[cfg(unix)]
+fn hold_journal_lock(journal: &Path) -> LockHolder {
     use std::os::unix::io::AsRawFd;
-    let holder = std::fs::File::open(journal).unwrap();
-    // SAFETY: flock on a descriptor `holder` owns until it is dropped.
-    assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
-    holder
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let path = journal.to_path_buf();
+    let thread = std::thread::spawn(move || {
+        let holder = std::fs::File::open(&path).unwrap();
+        // SAFETY: flock on a descriptor `holder` owns until it is dropped.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+        locked_tx.send(()).unwrap();
+        // Released when the test drops its `LockHolder`, or by the watchdog.
+        let _ = release_rx.recv_timeout(HOLD_WATCHDOG);
+        drop(holder);
+    });
+    locked_rx.recv().unwrap();
+    LockHolder {
+        release: Some(release_tx),
+        thread: Some(thread),
+    }
 }
 
 /// Every journal write has a bound, not only `koto status`'s: with the
@@ -1928,11 +1965,68 @@ fn after_one_write_gives_up_later_writes_in_the_process_do_not_wait() {
         "{warnings:?}"
     );
 
-    // The lock is free: the single try takes it.
+    // The lock is free: the single try takes it, and clears the state.
     let third = next();
     assert!(third < bound / 4, "{third:?}");
     assert_eq!(response_records(&f.journal()).len(), 1);
     assert_eq!(warnings_for_test().len(), 1);
+    assert!(!gave_up());
+}
+
+/// The process stops waiting only until a write takes the lock again: after
+/// a write gives up, one that finds the lock free clears the state, and the
+/// next contended write waits its full bound again instead of skipping at
+/// once. A long-running process recovers from one stall.
+#[cfg(unix)]
+#[test]
+fn a_write_that_takes_the_lock_restores_the_full_wait() {
+    use std::time::{Duration, Instant};
+    let f = session_in_a();
+    let journal = f.home.join(JOURNAL_FILE);
+    let bound = Duration::from_millis(150);
+    set_lock_wait_for_test(bound);
+    let next = || {
+        let started = Instant::now();
+        response(
+            Some(&f.home),
+            &f.backend,
+            "wf",
+            "a",
+            ResponseSource::Next,
+            "d",
+            None,
+        );
+        started.elapsed()
+    };
+
+    // A stall: the write gives up at its bound.
+    let holder = hold_journal_lock(&journal);
+    let stalled = next();
+    drop(holder);
+    assert!(stalled >= bound, "{stalled:?}");
+    assert!(gave_up());
+
+    // The stall passes: a write takes the lock and clears the state.
+    let free = next();
+    assert!(free < bound / 2, "{free:?}");
+    assert!(!gave_up());
+    assert_eq!(response_records(&f.journal()).len(), 1);
+
+    // The next contended write waits its full bound again, and gets the
+    // lock once it is released within that bound.
+    let holder = hold_journal_lock(&journal);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(bound / 3);
+        drop(holder);
+    });
+    let contended = next();
+    release.join().unwrap();
+    assert!(contended >= bound / 3, "{contended:?}");
+    assert!(contended < bound * 2, "{contended:?}");
+    assert_eq!(response_records(&f.journal()).len(), 2);
+    assert!(!gave_up());
+    // The one warning, from the stall.
+    assert_eq!(warnings_for_test().len(), 1, "{:?}", warnings_for_test());
 }
 
 /// Only a lock wait that ran out sets the process to stop waiting: a write

@@ -214,10 +214,20 @@ pub fn append_bounded_lines_no_follow_within(
 }
 
 /// A bounded lock wait ran out with the lock still held elsewhere. Callers
-/// tell it from other failures with [`is_lock_timeout`].
+/// find it among other failures with [`lock_timeout`].
 #[derive(Debug)]
 pub struct LockTimeout {
     waited: std::time::Duration,
+    after_own_move: bool,
+}
+
+impl LockTimeout {
+    /// Whether the wait that ran out was for the fresh file at the path
+    /// after this writer had moved the old one away itself, under its own
+    /// lock (see [`append_bounded_lines_current`]).
+    pub fn after_own_move(&self) -> bool {
+        self.after_own_move
+    }
 }
 
 impl std::fmt::Display for LockTimeout {
@@ -232,10 +242,11 @@ impl std::fmt::Display for LockTimeout {
 
 impl std::error::Error for LockTimeout {}
 
-/// Whether `e` failed because a bounded lock wait ran out ([`LockTimeout`]),
+/// The [`LockTimeout`] `e` failed with, when a bounded lock wait ran out,
 /// whatever context was added to it since.
-pub fn is_lock_timeout(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| cause.is::<LockTimeout>())
+pub fn lock_timeout(e: &anyhow::Error) -> Option<&LockTimeout> {
+    e.chain()
+        .find_map(|cause| cause.downcast_ref::<LockTimeout>())
 }
 
 /// Take an exclusive `flock` on `fd`: blocking when `wait` is `None`,
@@ -271,7 +282,11 @@ fn lock_exclusive(
         }
         let now = Instant::now();
         if now >= deadline {
-            return Err(LockTimeout { waited: wait }.into());
+            return Err(LockTimeout {
+                waited: wait,
+                after_own_move: false,
+            }
+            .into());
         }
         std::thread::sleep(STEP.min(deadline - now));
     }
@@ -310,9 +325,14 @@ const REOPEN_ATTEMPTS: usize = 8;
 ///
 /// `lock_wait` bounds the wait for the lock as in
 /// [`append_bounded_lines_no_follow_within`], over the whole call: a file
-/// opened again after a move gets what is left of the bound (and always one
-/// try), not a fresh one. Past the bound the call fails without writing
-/// anything; `under_lock` has then run only for files whose lock was taken.
+/// opened again because another writer moved it gets what is left of the
+/// bound (and always one try), not a fresh one. The one exception is a move
+/// this call made itself: after the first [`UnderLock::Reopen`], the fresh
+/// file's lock gets a fresh `lock_wait`, so a slow move under the writer's
+/// own lock doesn't use up the wait for the file its batch is going to. A
+/// timeout after that is a [`LockTimeout`] whose `after_own_move` is set.
+/// Past the bound the call fails without writing anything; `under_lock` has
+/// then run only for files whose lock was taken.
 /// The bound covers waiting for locks only: once a lock is held, the work
 /// under it (`under_lock`, the writes, the flush) is never timed or cut
 /// short. A file moved away while this call waits is opened again for as
@@ -353,8 +373,9 @@ pub fn append_bounded_lines_current(
             .with_context(|| format!("failed to create {}", dir.display()))?;
     }
 
-    let started = std::time::Instant::now();
+    let mut started = std::time::Instant::now();
     let mut attempts = 0;
+    let mut own_move = false;
     loop {
         // A bounded wait gives up on a file that keeps moving when its time
         // is up, not after a count: a writer polling for the lock can see
@@ -377,8 +398,16 @@ pub fn append_bounded_lines_current(
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .with_context(|| format!("failed to open {} for append", path.display()))?;
-        lock_exclusive(file.as_raw_fd(), lock_wait, started)
-            .with_context(|| format!("failed to lock {}", path.display()))?;
+        if let Err(e) = lock_exclusive(file.as_raw_fd(), lock_wait, started) {
+            let e = match e.downcast::<LockTimeout>() {
+                Ok(timeout) => anyhow::Error::from(LockTimeout {
+                    after_own_move: own_move,
+                    ..timeout
+                }),
+                Err(e) => e,
+            };
+            return Err(e.context(format!("failed to lock {}", path.display())));
+        }
         let held = file
             .metadata()
             .with_context(|| format!("failed to stat {}", path.display()))?;
@@ -388,6 +417,15 @@ pub fn append_bounded_lines_current(
             _ => continue,
         }
         if let UnderLock::Reopen = under_lock(&file, held.len()) {
+            // This writer moved the file itself (a rotation), and however
+            // long that took under its own lock isn't waiting: the fresh
+            // file's lock gets a full wait of its own. Only the first move
+            // restarts the clock, so a caller that kept answering `Reopen`
+            // still runs out of time.
+            if !own_move {
+                own_move = true;
+                started = std::time::Instant::now();
+            }
             continue;
         }
 
@@ -582,13 +620,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":1}\n{}\n");
     }
 
-    /// A bounded wait covers the whole call: when the file is moved away
-    /// under the lock and the fresh one at the path is locked elsewhere, the
-    /// call gives up after about the bound, not the bound again, and writes
-    /// nothing to either file.
+    /// After its own move, a writer waits for the fresh file's lock once
+    /// more, a full bound, however long the move took; when that lock stays
+    /// held elsewhere it gives up after that one more bound, writes nothing
+    /// to either file, and says the timeout followed its own move.
     #[cfg(unix)]
     #[test]
-    fn a_bounded_wait_covers_the_file_opened_again_after_a_move() {
+    fn a_bounded_wait_gives_the_fresh_file_one_more_bound_after_its_own_move() {
         use std::os::unix::io::AsRawFd;
         use std::time::{Duration, Instant};
         let tmp = tempfile::tempdir().unwrap();
@@ -599,6 +637,7 @@ mod tests {
         let mut calls = 0;
         let wait = Duration::from_millis(30);
         let started = Instant::now();
+        let mut moved_at = None;
         let err = append_bounded_lines_current(
             tmp.path(),
             &path,
@@ -608,6 +647,8 @@ mod tests {
             Some(wait),
             &mut |_, _| {
                 calls += 1;
+                // A slow move, past the whole bound.
+                std::thread::sleep(wait * 2);
                 std::fs::rename(&path, &moved).unwrap();
                 std::fs::write(&path, "").unwrap();
                 let h = std::fs::File::open(&path).unwrap();
@@ -615,21 +656,77 @@ mod tests {
                 // open until the test ends.
                 assert_eq!(unsafe { libc::flock(h.as_raw_fd(), libc::LOCK_EX) }, 0);
                 holder = Some(h);
+                moved_at = Some(Instant::now());
                 UnderLock::Reopen
             },
         )
         .unwrap_err();
+        let after_move = moved_at.unwrap().elapsed();
         let took = started.elapsed();
         assert!(
             format!("{err:#}").contains("held by another writer"),
             "{err:#}"
         );
+        assert!(lock_timeout(&err).unwrap().after_own_move());
         assert_eq!(calls, 1);
-        assert!(took >= wait, "{took:?}");
+        assert!(after_move >= wait, "{after_move:?}");
         assert!(took < Duration::from_secs(2), "{took:?}");
         assert_eq!(std::fs::read_to_string(&moved).unwrap(), "{\"a\":1}\n");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
         drop(holder);
+    }
+
+    /// A rotation slower than the whole bound doesn't cost the rotating
+    /// writer its batch when the fresh file is briefly locked by another
+    /// writer: the fresh file's lock gets a full wait of its own, the other
+    /// writer lets go within it, and the batch is written there.
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_own_move_still_waits_for_a_briefly_held_fresh_file() {
+        use std::os::unix::io::AsRawFd;
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("j.jsonl");
+        let moved = tmp.path().join("moved.jsonl");
+        std::fs::write(&path, "{\"a\":1}\n").unwrap();
+        let wait = Duration::from_millis(100);
+        let mut release = None;
+        let mut calls = 0;
+        let flushed = append_bounded_lines_current(
+            tmp.path(),
+            &path,
+            &["{\"b\":2}"],
+            64,
+            true,
+            Some(wait),
+            &mut |_, _| {
+                calls += 1;
+                if calls > 1 {
+                    return UnderLock::Write;
+                }
+                // The slow step, past the whole bound.
+                std::thread::sleep(wait * 2);
+                std::fs::rename(&path, &moved).unwrap();
+                // Another writer takes the fresh file's lock and lets go
+                // within the bound.
+                std::fs::write(&path, "").unwrap();
+                let h = std::fs::File::open(&path).unwrap();
+                // SAFETY: flock on a descriptor `h` owns until the thread
+                // below drops it.
+                assert_eq!(unsafe { libc::flock(h.as_raw_fd(), libc::LOCK_EX) }, 0);
+                release = Some(std::thread::spawn(move || {
+                    std::thread::sleep(wait / 3);
+                    drop(h);
+                }));
+                UnderLock::Reopen
+            },
+        )
+        .unwrap();
+        release.unwrap().join().unwrap();
+        assert!(flushed);
+        assert_eq!(calls, 2);
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "{\"a\":1}\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"b\":2}\n");
     }
 
     /// A move that takes longer than the bound doesn't cost the batch: the

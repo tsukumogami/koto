@@ -151,9 +151,11 @@
 //! seconds; a `koto status` response, 30 milliseconds), then skips its
 //! batch with the same one warning, so a process that stopped while holding
 //! the lock can't hang a command. Once one write has given up, the
-//! process's later writes try the lock once without waiting, so a held lock
-//! costs a command one wait however many batches it writes. The wait covers
-//! taking the lock only: nothing done while holding it is cut short.
+//! process's later writes try the lock once without waiting until one takes
+//! it again, so a held lock costs a command one wait however many batches
+//! it writes. The wait covers taking the lock only: nothing done while
+//! holding it is cut short, and a writer that rotated the journal gets a
+//! full wait of its own for the fresh file's lock.
 //!
 //! A write cut short (a crash, a full disk) can still leave a partial last
 //! line: the next writer sees, under the lock, that the file doesn't end in
@@ -350,12 +352,16 @@ fn warn_once(message: &str) {
     }
 }
 
-/// Set once a journal write in this process has given up waiting for the
-/// lock. A lock still held after a full wait most likely belongs to a
-/// writer that stopped, so every later write in the process tries the lock
-/// once, without waiting, and skips its batch (with the warning already
-/// printed) if it is still held. A held lock then costs a command one wait,
-/// not one per batch.
+/// Set when a journal write in this process has given up waiting for the
+/// lock, and cleared by the next write that takes it. A lock still held
+/// after a full wait most likely belongs to a writer that stopped, so while
+/// this is set every write tries the lock once, without waiting, and skips
+/// its batch (with the warning already printed) if it is still held: a held
+/// lock costs a command one wait, not one per batch. A write that takes the
+/// lock clears it, so a long-running process (a `koto next` polling a gate)
+/// waits normally again after a stall has passed. A rotating writer that
+/// can't lock the fresh file after its own move doesn't set it: that wait
+/// says nothing about a stopped writer (see [`write_within`]).
 #[cfg(not(test))]
 static GAVE_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -365,14 +371,13 @@ fn gave_up() -> bool {
 }
 
 #[cfg(not(test))]
-fn give_up() {
-    GAVE_UP.store(true, std::sync::atomic::Ordering::Relaxed);
+fn set_gave_up(value: bool) {
+    GAVE_UP.store(value, std::sync::atomic::Ordering::Relaxed);
 }
 
 // In unit tests the cap, the warn-once flag and the gave-up flag are per
 // thread, so a test sees exactly the warnings and waits its own commands
-// caused. Unit tests reach a
-// journal only through a store built with
+// caused. Unit tests reach a journal only through a store built with
 // `LocalBackend::with_base_dir_and_journal` on a temporary directory.
 #[cfg(test)]
 thread_local! {
@@ -433,8 +438,8 @@ fn gave_up() -> bool {
 }
 
 #[cfg(test)]
-fn give_up() {
-    TEST_GAVE_UP.with(|g| g.set(true));
+fn set_gave_up(value: bool) {
+    TEST_GAVE_UP.with(|g| g.set(value));
 }
 
 /// Reset this thread's line cap, warnings and lock-wait state.
@@ -470,7 +475,7 @@ pub(crate) fn warnings_for_test() -> Vec<String> {
 /// normally, so a writer that stopped while holding the lock can't hang the
 /// command. That includes the terminal tick, whose cleanup runs after its
 /// `terminal` record. After one write has given up, later writes in the
-/// process don't wait at all (see [`GAVE_UP`]).
+/// process don't wait until one takes the lock again (see [`GAVE_UP`]).
 ///
 /// The batch is flushed to disk only when it holds an identity record
 /// ([`IDENTITY_KINDS`]). Records relayed from check, decider and override
@@ -488,8 +493,9 @@ fn write(root: &Path, records: &[Record]) {
 /// is skipped, unless the caller passes a tighter bound. Generous enough
 /// that ordinary contention between koto commands never skips a record;
 /// short enough that a writer stopped while holding the lock can't hang a
-/// command for long. A process waits it out once: after a write gives up,
-/// later writes don't wait (see [`GAVE_UP`]). Not configurable.
+/// command for long. A process waits it out once per stall: after a write
+/// gives up, later writes don't wait until one takes the lock again (see
+/// [`GAVE_UP`]). Not configurable.
 ///
 /// The bound covers acquiring the lock only. Once a writer holds the lock,
 /// what it does under it (the size check, a rotation's flush and rename,
@@ -585,13 +591,19 @@ fn write_within(root: &Path, records: &[Record], lock_wait: std::time::Duration)
     );
     match written {
         Ok(flushed) => {
+            // No lines opens nothing; any other success took the lock.
             if !refs.is_empty() {
                 count_batch(flushed);
+                set_gave_up(false);
             }
         }
         Err(e) => {
-            if crate::engine::jsonl_append::is_lock_timeout(&e) {
-                give_up();
+            // Only a wait that ran out on another writer's lock means a
+            // writer may have stopped. A rotating writer whose own move
+            // left it short of the fresh file's lock had its full wait
+            // there and simply lost a race.
+            if crate::engine::jsonl_append::lock_timeout(&e).is_some_and(|t| !t.after_own_move()) {
+                set_gave_up(true);
             }
             warn_once(&format!("{}: {}", path.display(), e.root_cause()))
         }

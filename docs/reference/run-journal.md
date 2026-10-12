@@ -449,9 +449,9 @@ session read:
   confirm it, and a short or guessable value (a branch name, a yes or no, a
   small number) is easy to recover from its hash.
 
-Context-read records hold key names and content hashes, so they stay on
-the host: no carrier or exporter forwards them. A tool that sends journal
-lines elsewhere leaves out every `context_reads` line.
+Context-read records hold key names and content hashes. koto never sends
+journal lines off the host; a tool that does must leave out every
+`context_reads` line.
 
 ### When a visit's reads are written
 
@@ -652,33 +652,36 @@ line is lost.
 
 ### Waiting for the lock
 
-Every write waits at most five seconds for the journal's lock, enough that
-koto commands contending for the journal never lose a record to each
-other. A `koto status` response waits at most 30 milliseconds. When the
-wait runs out, because another process holds the lock (one that stopped
-or hung while writing, say), the write's records are skipped with the
-warning above and the command carries on. Its standard output and exit
-code are the ones it would have had, and so is everything it does after
-the write: a terminal tick that can't write its `terminal` record still
-notifies the session's parent and removes the session, or keeps it, as it
-would have. The skipped records aren't written later. The wait isn't
-configurable.
+Every write waits at most five seconds for the journal's lock, so ordinary
+contention between koto commands doesn't lose records. A `koto status`
+response waits at most 30 milliseconds. When the wait runs out, because
+another process holds the lock (one that stopped or hung while writing,
+say), the write's records are skipped with the warning above and the
+command carries on. Its standard output and exit code are the ones it
+would have had, and so is everything it does after the write: a terminal
+tick that can't write its `terminal` record still notifies the session's
+parent and removes the session, or keeps it, as it would have. The skipped
+records aren't written later. The wait isn't configurable.
 
-The wait covers taking the lock, and nothing else:
+A process waits out a held lock once. After one write has waited the full
+five seconds and given up, the process's later writes try the lock once,
+without waiting, and are skipped too if it's still held (the warning isn't
+repeated), so a command that writes several batches while the lock stays
+held takes about five seconds, not five per batch. The first later write
+that finds the lock free is written as usual and gives the writes after it
+their full wait again, so a long-running command (a `koto next` polling a
+gate) recovers once the holder lets go.
 
-- A command waits out a held lock once. A command writes one batch per
-  commit; after one of them has waited the full five seconds and given
-  up, the command's later batches try the lock once, without waiting, and
-  are skipped too if it's still held (the warning isn't repeated). A
-  command that writes several batches while the lock stays held takes
-  about five seconds, not five per batch. A later batch that finds the
-  lock free is written as usual.
-- A writer that holds the lock finishes what it does under it however
-  long that takes. A rotation flushes the file it moves to disk and then
-  runs retention, both under the lock (see [Rotation](#rotation)); on a
-  slow disk that can take longer than the wait, and it isn't cut short.
-  The writers waiting behind it are the ones that give up, each after its
-  own wait.
+The wait covers taking the lock, and nothing else. A writer that holds the
+lock finishes what it does under it however long that takes. A rotation
+flushes the file it moves to disk and then runs retention, both under the
+lock (see [Rotation](#rotation)); on a slow disk that can take longer than
+the wait, and it isn't cut short. The writers waiting behind it are the
+ones that give up, each after its own wait. The rotating writer then gets
+a full wait of its own for the fresh file's lock, so a slow rotation
+doesn't make it drop the records it rotated for. If it still can't take
+that lock, its records are skipped, and the process's later writes keep
+their full wait.
 
 ## Durability
 
@@ -754,11 +757,11 @@ file. The journal is never truncated or rewritten in place:
   after it was moved.
 - **Waiting.** A write's wait for the lock (see
   [Waiting for the lock](#waiting-for-the-lock)) covers the whole write,
-  the fresh file's lock after a rotation included, so turning rotation on
-  doesn't lengthen it: a writer that rotated and then can't lock the fresh
-  file in what's left of its wait skips its records. The rotation itself
-  isn't timed. Its flush and its retention pass run under the lock to the
-  end, and the writers behind them wait no longer for it.
+  including the lock of a fresh file it finds after another command's
+  rotation, so turning rotation on doesn't lengthen it. The rotation itself
+  isn't timed: its flush and its retention pass run under the lock to the
+  end, and the writers behind them wait no longer for it. The writer that
+  rotated then gets a full wait of its own for the fresh file's lock.
 - **Failure.** A move that fails prints one warning on standard error, and
   the record goes to the unrotated journal. That command doesn't try to
   rotate again.
