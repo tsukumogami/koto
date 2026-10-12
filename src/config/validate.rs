@@ -13,6 +13,7 @@ const PROJECT_ALLOWLIST: &[&str] = &[
     "session.cloud.bucket",
     "session.cloud.region",
     "session.cloud.path_style",
+    "session.cloud.marker_retain_days",
     "decider.mode",
 ];
 

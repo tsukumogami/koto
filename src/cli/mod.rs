@@ -553,6 +553,13 @@ pub enum SessionCommand {
     /// leg still waiting (e), it is a coordinator's session (f), or, under the
     /// cloud backend, its remote copy may be newer (g). A failed removal
     /// exits 3.
+    ///
+    /// `--migrated-from <workspace-path>` (cloud backend only) previews and
+    /// removes instead the migration markers `koto session import` left
+    /// under that workspace's bucket prefix. A marker is removable only when
+    /// its target is present, and then once older than
+    /// `session.cloud.marker_retain_days` or with `--source-retired`;
+    /// removal deletes the source's whole prefix, the marker last.
     Prune {
         /// Only sessions whose execution directory is this directory or lies
         /// under it. A session outside the filter still protects the sessions
@@ -578,6 +585,19 @@ pub enum SessionCommand {
         /// preview's sessions.
         #[arg(long, value_name = "TOKEN")]
         plan: Option<String>,
+
+        /// Remove migration markers, and the old copies beside them, under
+        /// this source workspace's bucket prefix instead of finished local
+        /// sessions. Cloud backend only. Takes none of `--execution-dir`,
+        /// `--older-than` or `--all`.
+        #[arg(long = "migrated-from", value_name = "WORKSPACE")]
+        migrated_from: Option<String>,
+
+        /// With `--migrated-from`: the source host is gone for good, so a
+        /// marker whose target is present is removable inside
+        /// `session.cloud.marker_retain_days` too.
+        #[arg(long = "source-retired")]
+        source_retired: bool,
     },
     /// Resolve a session version conflict
     Resolve {
@@ -1638,6 +1658,8 @@ pub fn run(app: App) -> Result<()> {
                     all,
                     apply,
                     plan,
+                    migrated_from,
+                    source_retired,
                 } => session_prune::handle_prune(
                     &backend,
                     session_prune::PruneArgs {
@@ -1646,6 +1668,12 @@ pub fn run(app: App) -> Result<()> {
                         all,
                         apply,
                         plan: plan.as_deref(),
+                        migrated_from: migrated_from.as_deref(),
+                        source_retired,
+                        marker_retain_days: crate::config::resolve::load_config()?
+                            .session
+                            .cloud
+                            .marker_retain_days(),
                     },
                 ),
                 #[cfg(not(unix))]

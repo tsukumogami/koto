@@ -383,6 +383,9 @@ fn merge_config(target: &mut KotoConfig, source: &LoadedConfig) {
     if source.config.session.cloud.path_style.is_some() {
         target.session.cloud.path_style = source.config.session.cloud.path_style;
     }
+    if source.config.session.cloud.marker_retain_days.is_some() {
+        target.session.cloud.marker_retain_days = source.config.session.cloud.marker_retain_days;
+    }
 
     for key in &source.request_store_keys {
         match key.as_str() {

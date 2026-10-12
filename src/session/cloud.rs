@@ -28,7 +28,10 @@ use crate::session::{
 };
 
 /// File name of the marker `koto session import` leaves beside a source
-/// session's remote objects. koto never deletes one.
+/// session's remote objects. Only `koto session prune --migrated-from`
+/// deletes one, together with everything else under the source session's
+/// prefix and only after the rest is gone (see
+/// [`CloudBackend::delete_migrated_source`]).
 pub(crate) const MIGRATED_MARKER: &str = "migrated.json";
 
 /// File name of the compiled template a cloud session's init pushes beside
@@ -78,6 +81,47 @@ pub enum RemoteCopy {
     /// version file couldn't be read, or a version file didn't parse. The
     /// string says which.
     Unreadable(String),
+}
+
+/// What a migration marker's target holds, as
+/// [`CloudBackend::marker_target_status`] finds it in the bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetStatus {
+    /// The target carries a marker of its own: it moved on again.
+    Migrated,
+    /// The target's state file header names the marker's session id.
+    Present,
+    /// A state file is there, but its header names another session id (a
+    /// later session under the same name).
+    Replaced(String),
+    /// No state file under the target's prefix.
+    Absent,
+    /// The listing or the read failed, or the header couldn't be read; the
+    /// string says which.
+    Unknown(String),
+}
+
+impl TargetStatus {
+    /// The word the prune prints for this status.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TargetStatus::Migrated => "migrated",
+            TargetStatus::Present => "present",
+            TargetStatus::Replaced(_) => "replaced",
+            TargetStatus::Absent => "absent",
+            TargetStatus::Unknown(_) => "unknown",
+        }
+    }
+}
+
+/// Whether `prefix` has the shape of a workspace prefix koto derives: 16
+/// lowercase hex digits. A marker's `target.prefix` comes from the bucket,
+/// so it is checked before any key is built from it.
+pub(crate) fn is_workspace_prefix(prefix: &str) -> bool {
+    prefix.len() == 16
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// S3-backed session storage that delegates to `LocalBackend` for all
@@ -521,6 +565,153 @@ impl CloudBackend {
                 "the remote copy diverged (version {remote_version} against local {local_version})"
             )),
         }
+    }
+
+    /// The names of the sessions under workspace prefix `source_prefix` that
+    /// carry a migration marker. One paginated listing of `<prefix>/`
+    /// collects exactly the keys `<prefix>/<name>/migrated.json` whose
+    /// `<name>` is a valid session id; a context key named `migrated.json`
+    /// sits deeper and is not one. Sorted.
+    pub(crate) fn migration_marker_names(
+        &self,
+        source_prefix: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let listing_prefix = format!("{}/", source_prefix);
+        let suffix = format!("/{}", MIGRATED_MARKER);
+        let results = self
+            .bucket
+            .list(listing_prefix.clone(), None)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "listing {} failed: {}",
+                    listing_prefix,
+                    without_url_userinfo(&e.to_string())
+                )
+            })?;
+        let mut names = std::collections::BTreeSet::new();
+        for page in &results {
+            for obj in &page.contents {
+                let Some(name) = obj
+                    .key
+                    .strip_prefix(&listing_prefix)
+                    .and_then(|rest| rest.strip_suffix(&suffix))
+                else {
+                    continue;
+                };
+                if crate::session::validate::validate_session_id(name).is_ok() {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    /// GET the migration marker of session `name` under `source_prefix`:
+    /// `Ok(None)` when it is gone.
+    pub(crate) fn read_migration_marker(
+        &self,
+        source_prefix: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        crate::session::validate::validate_session_id(name)?;
+        self.fetch_object(&format!("{}/{}/{}", source_prefix, name, MIGRATED_MARKER))
+            .map_err(|e| anyhow::anyhow!("{}", without_url_userinfo(&format!("{e:#}"))))
+    }
+
+    /// What the bucket holds for a marker's target: one listing of
+    /// `<target_prefix>/<target_session>/` (the trailing slash keeps `foo`
+    /// from matching `foo-2`), and a GET of the state file when there is one
+    /// to read its header's `session_id`.
+    pub fn marker_target_status(
+        &self,
+        target_prefix: &str,
+        target_session: &str,
+        target_session_id: &str,
+    ) -> TargetStatus {
+        if !is_workspace_prefix(target_prefix)
+            || crate::session::validate::validate_session_id(target_session).is_err()
+        {
+            return TargetStatus::Unknown(
+                "the marker's target isn't a workspace prefix and a session name".to_string(),
+            );
+        }
+        let session = format!("{}/{}/", target_prefix, target_session);
+        let listing = match self.bucket.list(session.clone(), None) {
+            Ok(listing) => listing,
+            Err(e) => {
+                return TargetStatus::Unknown(format!(
+                    "listing {} failed: {}",
+                    session,
+                    without_url_userinfo(&e.to_string())
+                ))
+            }
+        };
+        let keys: Vec<&str> = listing
+            .iter()
+            .flat_map(|page| page.contents.iter())
+            .map(|obj| obj.key.as_str())
+            .collect();
+        if keys.iter().any(|k| is_migration_marker(&session, k)) {
+            return TargetStatus::Migrated;
+        }
+        let state_key = format!("{}{}", session, state_file_name(target_session));
+        if !keys.contains(&state_key.as_str()) {
+            return TargetStatus::Absent;
+        }
+        let bytes = match self.fetch_object(&state_key) {
+            Ok(Some(bytes)) => bytes,
+            // Removed between the listing and the GET.
+            Ok(None) => return TargetStatus::Absent,
+            Err(e) => {
+                return TargetStatus::Unknown(without_url_userinfo(&format!("{e:#}")));
+            }
+        };
+        match header_session_id(&bytes) {
+            Some(id) if id == target_session_id => TargetStatus::Present,
+            Some(id) => TargetStatus::Replaced(id),
+            None => TargetStatus::Unknown(
+                "the target's state file header doesn't parse or has no session_id".to_string(),
+            ),
+        }
+    }
+
+    /// Delete every object under `<source_prefix>/<name>/`, the migration
+    /// marker last. The first delete that fails stops the removal and is
+    /// returned, so the marker is still there and the old copy still
+    /// refuses; running it again finishes the job.
+    pub(crate) fn delete_migrated_source(
+        &self,
+        source_prefix: &str,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        crate::session::validate::validate_session_id(name)?;
+        let session = format!("{}/{}/", source_prefix, name);
+        let marker = format!("{}{}", session, MIGRATED_MARKER);
+        let results = self.bucket.list(session.clone(), None).map_err(|e| {
+            anyhow::anyhow!(
+                "listing {} failed: {}",
+                session,
+                without_url_userinfo(&e.to_string())
+            )
+        })?;
+        let delete = |key: &str| {
+            self.bucket.delete_object(key).map(|_| ()).map_err(|e| {
+                anyhow::anyhow!(
+                    "deleting {} failed: {}",
+                    key,
+                    without_url_userinfo(&e.to_string())
+                )
+            })
+        };
+        for page in &results {
+            for obj in &page.contents {
+                if obj.key == marker || !obj.key.starts_with(&session) {
+                    continue;
+                }
+                delete(&obj.key)?;
+            }
+        }
+        delete(&marker)
     }
 
     /// List session IDs present in S3 under this backend's prefix.
@@ -2602,6 +2793,15 @@ fn is_migration_marker(session_prefix: &str, key: &str) -> bool {
     key.strip_prefix(session_prefix) == Some(MIGRATED_MARKER)
 }
 
+/// The `session_id` in a state file's header line (its first non-empty
+/// line), or `None` when the header doesn't parse or has none.
+fn header_session_id(state: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(state);
+    let line = text.lines().find(|l| !l.trim().is_empty())?;
+    let header: serde_json::Value = serde_json::from_str(line).ok()?;
+    header.get("session_id")?.as_str().map(str::to_string)
+}
+
 /// Build the refusal a marker's bytes describe for session `id`.
 ///
 /// Read leniently: a field that is missing or of another shape reads as
@@ -3795,6 +3995,7 @@ mod tests {
             access_key: Some("k".to_string()),
             secret_key: Some("s".to_string()),
             path_style: Some(true),
+            marker_retain_days: None,
         };
         let bucket = create_bucket(&config).unwrap();
         assert!(bucket.is_path_style());
@@ -3992,6 +4193,32 @@ mod tests {
         // deletes it like any other.
         assert!(!is_migration_marker("p/wf/", "p/wf/ctx/migrated.json"));
         assert!(!is_migration_marker("p/wf/", "p/other/migrated.json"));
+    }
+
+    #[test]
+    fn a_marker_target_prefix_must_be_sixteen_lowercase_hex() {
+        assert!(is_workspace_prefix("0123456789abcdef"));
+        for bad in [
+            "",
+            "0123456789ABCDEF",
+            "0123456789abcde",
+            "0123456789abcdef0",
+            "../../0123456789",
+            "0123456789abcde/",
+        ] {
+            assert!(!is_workspace_prefix(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_target_session_id_is_read_from_the_header_line() {
+        assert_eq!(
+            header_session_id(b"\n{\"workflow\":\"foo\",\"session_id\":\"id-1\"}\n{\"seq\":1}\n"),
+            Some("id-1".to_string())
+        );
+        assert_eq!(header_session_id(b"{\"workflow\":\"foo\"}\n"), None);
+        assert_eq!(header_session_id(b"not json\n"), None);
+        assert_eq!(header_session_id(b""), None);
     }
 
     // -- the import's source checks --
