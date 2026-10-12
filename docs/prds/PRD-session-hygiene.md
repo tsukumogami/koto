@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   koto's session store under ~/.koto/sessions holds every kind of state its
   users keep, about a thousand session directories on one workstation, and
@@ -23,7 +23,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-session-hygiene](docs/briefs/BRIEF-session-hygiene.md); carried in Absorbed Brief.
 
