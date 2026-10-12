@@ -710,18 +710,64 @@ fn status_returns_promptly_while_a_batch_scoped_parents_lock_is_held() {
 
 /// The held-lock and mid-tick races above show `status` doesn't wait on
 /// contention, but neither discriminates a correct implementation from
-/// one that wrongly attempts a non-blocking lock: on a non-batch session
-/// no lock exists to contend over, so both would return immediately
-/// either way. This test is the one that does discriminate -- it traces
-/// the process with `strace` and asserts no `flock` syscall is made at
-/// all. Skips (rather than fails) when `strace` isn't on `PATH`, since
-/// its presence isn't guaranteed on every dev machine; GitHub's
-/// `ubuntu-latest` runner ships it, so CI still gets the real check.
+/// one that wrongly attempts a non-blocking lock on the session: on a
+/// non-batch session no lock exists to contend over, so both would return
+/// immediately either way. This test is the one that does discriminate --
+/// it traces the process with `strace -y`, which names the file behind
+/// each descriptor, and asserts that the only `flock` syscalls `status`
+/// makes are on the run journal, for the `response` record it appends
+/// after printing the directive, and that each is non-blocking
+/// (`LOCK_NB`), so a stopped journal writer can't hang it either. No
+/// `flock` touches the session's files. Skips (rather than fails) when
+/// `strace` isn't on `PATH`, since its presence isn't guaranteed on every
+/// dev machine; GitHub's `ubuntu-latest` runner ships it, so CI still gets
+/// the real check.
 #[test]
-fn status_attempts_no_lock_syscall_on_a_non_batch_session() {
+fn status_attempts_no_session_lock_syscall_on_a_non_batch_session() {
+    let Some(flocks) = trace_status_flocks(false) else {
+        return;
+    };
+    // The directive was printed, so the journal was locked for its record:
+    // the trace saw the calls it is checking.
+    assert!(
+        !flocks.is_empty(),
+        "expected the run journal's lock for the response record"
+    );
+}
+
+/// The same with journal rotation on and the journal past its bound, so
+/// `status` rotates it before writing its `response` record. Rotation
+/// takes no lock of its own and locks no other file: the trace holds
+/// exactly two `flock` calls, both non-blocking and both on
+/// `_run_journal.jsonl` (the journal before its move, then the fresh one),
+/// none on the rotated name.
+#[test]
+fn status_attempts_no_session_lock_syscall_on_a_non_batch_session_with_rotation_on() {
+    let Some(flocks) = trace_status_flocks(true) else {
+        return;
+    };
+    assert_eq!(flocks.len(), 2, "{flocks:#?}");
+}
+
+/// Run `koto status wf` under `strace -f -y -e trace=flock` on a fresh
+/// non-batch session, with rotation on at a 1-byte bound when `rotate` is
+/// set, and check that every `flock` it makes is a non-blocking one on the
+/// run journal. Returns those calls, or `None` when `strace` isn't on
+/// `PATH`.
+fn trace_status_flocks(rotate: bool) -> Option<Vec<String>> {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     init_workflow_with_vars(root, "wf", PHASES_TEMPLATE, &["ORG=acme"]);
+    let journal = sessions_base(root).join("_run_journal.jsonl");
+    let rotated = sessions_base(root).join("_run_journal.0000000001.jsonl");
+    if rotate {
+        koto_cmd(root)
+            .args(["config", "set", "run_journal.rotate_bytes", "1", "--user"])
+            .assert()
+            .success();
+    }
+    let before = std::fs::read_to_string(&journal).unwrap();
+    assert!(!before.is_empty());
 
     let trace_path = root.join("status.strace");
     let koto_bin = assert_cmd::cargo::cargo_bin("koto");
@@ -729,6 +775,7 @@ fn status_attempts_no_lock_syscall_on_a_non_batch_session() {
     let spawn = std::process::Command::new("strace")
         .args([
             "-f",
+            "-y",
             "-e",
             "trace=flock",
             "-o",
@@ -749,7 +796,7 @@ fn status_attempts_no_lock_syscall_on_a_non_batch_session() {
         Ok(output) => output,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!("skipping: `strace` not found on PATH");
-            return;
+            return None;
         }
         Err(e) => panic!("failed to spawn strace: {e}"),
     };
@@ -761,10 +808,35 @@ fn status_attempts_no_lock_syscall_on_a_non_batch_session() {
     );
 
     let trace = std::fs::read_to_string(&trace_path).unwrap();
-    assert!(
-        !trace.contains("flock("),
-        "status must not attempt any flock syscall on a non-batch session; strace output:\n{trace}"
-    );
+    let flocks: Vec<String> = trace
+        .lines()
+        .filter(|l| l.contains("flock("))
+        .map(str::to_string)
+        .collect();
+    for call in &flocks {
+        assert!(
+            call.contains("_run_journal.jsonl>"),
+            "status must not flock anything but the run journal; strace output:\n{trace}"
+        );
+        assert!(
+            call.contains("LOCK_NB"),
+            "status must only try the run journal's lock without blocking; strace output:\n{trace}"
+        );
+    }
+
+    // The record went where rotation says: after the old journal, or, with
+    // rotation on, alone into the fresh file once the old one moved whole.
+    let after = std::fs::read_to_string(&journal).unwrap();
+    if rotate {
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), before);
+        assert_eq!(after.lines().count(), 1, "{after}");
+        assert!(after.contains("\"kind\":\"response\""), "{after}");
+    } else {
+        assert!(!rotated.exists());
+        assert!(after.starts_with(&before));
+        assert_eq!(after[before.len()..].lines().count(), 1, "{after}");
+    }
+    Some(flocks)
 }
 
 #[test]

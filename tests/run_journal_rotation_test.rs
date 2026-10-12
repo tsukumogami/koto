@@ -136,14 +136,23 @@ impl Env {
         self.ok(&["init", name, "--template", self.template.to_str().unwrap()]);
     }
 
+    /// One `koto next` round of the loop. Every journal write it makes,
+    /// its `response` record included, waits for the lock, so it never
+    /// prints a journal warning, however many writers contend.
     fn tick(&self, name: &str) {
-        self.ok(&[
+        let out = self.run(&[
             "next",
             name,
             "--with-data",
             r#"{"again": "yes"}"#,
             "--no-cleanup",
         ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "koto next {name}: {stderr}");
+        assert!(
+            !stderr.contains("run journal"),
+            "koto next {name}: {stderr}"
+        );
     }
 
     /// Rotated files, oldest first, by the naming rule.
@@ -400,7 +409,17 @@ fn an_offset_reader_stopped_mid_file_neither_loses_nor_repeats_a_line() {
     let env = Env::new();
     env.set_bound(600);
     env.start("followed");
-    env.tick("followed");
+    // Tick until the active file holds at least two lines (a tick writes a
+    // `state_entered` and then a `response`, and either may rotate first).
+    let path = env.root().join(JOURNAL);
+    let mut text = String::new();
+    for _ in 0..5 {
+        env.tick("followed");
+        text = std::fs::read_to_string(&path).unwrap();
+        if text.lines().count() >= 2 {
+            break;
+        }
+    }
 
     // The reader has read everything rotated so far and stops part-way
     // through the active file, at a line boundary.
@@ -409,8 +428,6 @@ fn an_offset_reader_stopped_mid_file_neither_loses_nor_repeats_a_line() {
         .iter()
         .map(|f| std::fs::read_to_string(f).unwrap())
         .collect();
-    let path = env.root().join(JOURNAL);
-    let text = std::fs::read_to_string(&path).unwrap();
     let cut = text.find('\n').unwrap() as u64 + 1;
     assert!(cut < text.len() as u64, "the active file has one line");
     let meta = std::fs::metadata(&path).unwrap();
