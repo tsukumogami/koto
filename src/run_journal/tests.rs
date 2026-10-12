@@ -954,7 +954,7 @@ fn no_rule_counts_write_a_zero_count_and_fifty_with_truncation_write_fifty_rules
             None,
         ),
     );
-    let ids: Vec<String> = (0..50).map(|i| format!("R{i:02}")).collect();
+    let ids: Vec<String> = (0..50).map(|i| format!("E{:03}", 100 + i)).collect();
     let rules: Vec<(&str, u64, u64)> = ids.iter().map(|id| (id.as_str(), 1, 1)).collect();
     let mut check = stamped(2, 2, Some(counts(&rules)));
     check.rule_counts_truncated = true;
@@ -1116,6 +1116,97 @@ fn a_pending_evaluation_writes_check_pending_with_the_poll_and_nothing_judged() 
     assert_eq!(p["koto.visit.seq"], 2);
 }
 
+/// A pending event that carries an attempt stamp and rule counts anyway
+/// (koto doesn't write one, but a log can hold anything) still relays a
+/// bare `check_pending`: nothing judged, and no rule record.
+#[test]
+fn a_pending_evaluation_carrying_judged_fields_still_writes_none_of_them() {
+    let f = session_in_a();
+    let mut judged = stamped(
+        4,
+        2,
+        Some(counts(&[("E501", 2, 3), ("no-unused-vars", 1, 1)])),
+    );
+    judged.rule_counts_truncated = true;
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event(
+            "a",
+            "ci",
+            "pending",
+            serde_json::json!({"exit_code": 75, "error": ""}),
+            judged,
+            Some(poll("pending", 1, 0)),
+        ),
+    );
+    let c = check_records(&f.journal());
+    assert_eq!(kinds(&c), vec!["check_pending"]);
+    for absent in [
+        "koto.check.outcome",
+        "koto.attempt",
+        "koto.visit_attempt",
+        "koto.check.rule_count",
+        "koto.check.rule_counts_truncated",
+        "koto.check.duration_ms",
+        "koto.rule.id",
+        "koto.rule.visit_count",
+        "koto.rule.session_count",
+    ] {
+        assert!(c[0].get(absent).is_none(), "{absent}: {}", c[0]);
+    }
+    assert_eq!(c[0]["koto.poll.evaluations"], 1);
+    assert_eq!(c[0]["koto.poll.elapsed_secs"], 0);
+}
+
+/// The flush follows the records actually written: an identity record
+/// dropped for the line cap doesn't make the check records beside it
+/// flush.
+#[test]
+fn a_batch_whose_only_identity_record_is_dropped_is_not_flushed() {
+    let f = Fixture::new();
+    std::fs::create_dir_all(&f.home).unwrap();
+    let relay = Relay {
+        session: "wf",
+        session_id: "wf-id",
+        run_id: Some("wf-id"),
+        seq: 3,
+        visit_seq: Some(2),
+    };
+    let check = relayed(
+        &gate_event(
+            "a",
+            "g",
+            "passed",
+            command_output(0),
+            stamped(1, 1, None),
+            None,
+        ),
+        &relay,
+    );
+    // A state entry under a long session name, longer than the check.
+    let long_name = "w".repeat(255);
+    let big = Record::new("state_entered", &long_name, "wf-id", Some("wf-id"))
+        .name("koto.state", Some(&"s".repeat(128)[..]));
+    let cap = check[0].to_line().len() + 1;
+    assert!(
+        big.to_line().len() + 1 > cap,
+        "the identity record is the longer one"
+    );
+    set_max_line_for_test(cap);
+    let mut records = vec![big];
+    records.extend(check);
+    write(&f.home, &records);
+    assert_eq!(
+        batches_for_test(),
+        (1, 0),
+        "only the check record was written"
+    );
+    assert_eq!(kinds(&f.journal()), vec!["check_evaluated"]);
+    assert_eq!(warnings_for_test().len(), 1);
+}
+
 #[test]
 fn rule_ids_outside_the_name_shape_are_digested_the_same_way_every_time() {
     use sha2::{Digest, Sha256};
@@ -1191,7 +1282,11 @@ fn a_batch_with_no_identity_record_is_not_flushed() {
             "lint",
             "failed",
             command_output(1),
-            stamped(1, 1, Some(counts(&[("R1", 1, 1), ("R2", 1, 1)]))),
+            stamped(
+                1,
+                1,
+                Some(counts(&[("E501", 1, 1), ("no-unused-vars", 1, 1)])),
+            ),
             None,
         ),
     );

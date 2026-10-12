@@ -85,15 +85,17 @@ pub fn append_bounded_line(dir: &Path, path: &Path, line: &str, max: usize) -> R
 /// [`append_bounded_line`] for a file that must not be reached through a
 /// symlink and may hold a partial last line.
 ///
-/// The run journal (`_run_journal.jsonl`) uses it. On unix the file is
-/// opened with `O_NOFOLLOW`, so a symlink planted at `path` makes the open
-/// fail instead of appending to whatever the link points at. The append
-/// holds an exclusive advisory lock (`flock`), and under it a file that
-/// doesn't end in a newline (a write cut short by a crash or a full disk)
-/// gets one before the line, so the line starts on its own and only the
-/// partial line is lost. The lock is what makes that check safe: without
-/// it, a line another writer is still appending would look partial. The
-/// bound and mode 0600 on create are the same as [`append_bounded_line`].
+/// The one-line, always-flushed form of [`append_bounded_lines_no_follow`],
+/// which the run journal (`_run_journal.jsonl`) writes through. On unix the
+/// file is opened with `O_NOFOLLOW`, so a symlink planted at `path` makes
+/// the open fail instead of appending to whatever the link points at. The
+/// append holds an exclusive advisory lock (`flock`), and under it a file
+/// that doesn't end in a newline (a write cut short by a crash or a full
+/// disk) gets one before the line, so the line starts on its own and only
+/// the partial line is lost. The lock is what makes that check safe:
+/// without it, a line another writer is still appending would look partial.
+/// The bound, the `sync_data` and mode 0600 on create are the same as
+/// [`append_bounded_line`].
 pub fn append_bounded_line_no_follow(
     dir: &Path,
     path: &Path,

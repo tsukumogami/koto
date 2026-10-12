@@ -166,23 +166,27 @@ pub fn append_event_in<H: LogHeader>(
 pub(crate) struct CommitInfo {
     /// The committed event's `seq`.
     pub seq: u64,
-    /// The `seq` of the event that opened the visit the log was in before
-    /// this event, by [`visit_start`]'s rule. `None` for a log with no
-    /// state entry.
-    pub prior_visit_seq: Option<u64>,
     /// The log as it stood before this event: the bytes the append read to
     /// find the next `seq`, moved rather than copied.
     pub prior_log: String,
 }
 
 impl CommitInfo {
+    /// The `seq` of the event that opened the visit the log was in before
+    /// this event, by [`visit_start`]'s rule; `None` for a log with no state
+    /// entry. Computed from [`prior_log`](Self::prior_log) on each call, so
+    /// a commit nobody asks about pays nothing for it.
+    pub(crate) fn prior_visit_seq(&self) -> Option<u64> {
+        visit_start(&self.prior_log)
+    }
+
     /// The visit `payload` (the committed event) belongs to: its own `seq`
     /// when it opens a visit itself, otherwise the visit the log was in.
     pub(crate) fn visit_seq_for(&self, payload: &EventPayload) -> Option<u64> {
         if opens_visit(payload) {
             Some(self.seq)
         } else {
-            self.prior_visit_seq
+            self.prior_visit_seq()
         }
     }
 }
@@ -195,12 +199,7 @@ pub(crate) fn append_event_tracked(
     timestamp: &str,
 ) -> anyhow::Result<CommitInfo> {
     let (seq, prior_log) = append_event_reading::<StateFileHeader>(path, payload, timestamp)?;
-    let prior_visit_seq = visit_start(&prior_log);
-    Ok(CommitInfo {
-        seq,
-        prior_visit_seq,
-        prior_log,
-    })
+    Ok(CommitInfo { seq, prior_log })
 }
 
 /// The one append: returns the `seq` taken and the log's bytes as read
@@ -1425,6 +1424,9 @@ fn may_be_entry(line: &str) -> bool {
     const ENTRY_TYPES: [&[u8]; 3] = [b"transitioned\"", b"directed_transition\"", b"rewound\""];
     const TYPE_KEY: &[u8] = b"\"type\":\"";
     let bytes = line.as_bytes();
+    // Fast path: relies on `impl Serialize for Event` writing `seq`, then
+    // `timestamp`, then `type`, so the first `"type":"` within the head is
+    // the event's own. Reorder that serializer and this must change with it.
     let head = &bytes[..bytes.len().min(96)];
     if let Some(at) = head.windows(TYPE_KEY.len()).position(|w| w == TYPE_KEY) {
         let word = &bytes[at + TYPE_KEY.len()..];
@@ -2298,7 +2300,7 @@ mod tests {
             let commit = append_event_tracked(&path, payload, ts).unwrap();
             assert_eq!(commit.seq, i as u64 + 1, "step {i}");
             assert_eq!(commit.prior_log, before, "step {i}");
-            assert_eq!(commit.prior_visit_seq, *prior, "step {i}");
+            assert_eq!(commit.prior_visit_seq(), *prior, "step {i}");
             assert_eq!(commit.visit_seq_for(payload), *own, "step {i}");
         }
         // The tracked append writes exactly what a plain append writes.

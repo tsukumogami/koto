@@ -61,9 +61,13 @@
 //!   with the poll's run count and elapsed seconds, never an outcome.
 //!
 //! A field with no value is left out, never written as null or empty. Ids
-//! must match `^[A-Za-z0-9._:-]{1,128}$` and names (template and state
-//! names) `^[A-Za-z0-9._:/@-]{1,128}$` without a leading `/`; a value
-//! outside its shape is left out and the record is still written.
+//! must match `^[A-Za-z0-9._:-]{1,128}$` and names `^[A-Za-z0-9._:/@-]{1,128}$`
+//! without a leading `/` or `~`. Names cover template and state names,
+//! `koto.check`, and the short vocabulary values the check kinds carry
+//! (`koto.check.outcome`, `koto.poll.status`, `koto.check.error`). A value
+//! outside its shape is left out and the record is still written, with one
+//! exception: a rule id outside the name shape is written as its digest
+//! ([`name_or_digest`]), never dropped.
 //!
 //! ## When records are written
 //!
@@ -377,6 +381,7 @@ fn write(root: &Path, records: &[Record]) {
     let path = root.join(JOURNAL_FILE);
     let max = max_line_bytes();
     let mut lines = Vec::with_capacity(records.len());
+    let mut flush = false;
     for record in records {
         let line = record.to_line();
         if line.len() + 1 > max {
@@ -392,9 +397,9 @@ fn write(root: &Path, records: &[Record]) {
             ));
             continue;
         }
+        flush |= record.is_identity();
         lines.push(line);
     }
-    let flush = records.iter().any(Record::is_identity);
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
     match crate::engine::jsonl_append::append_bounded_lines_no_follow(
         root, &path, &refs, max, flush,
@@ -445,8 +450,14 @@ fn journals(payload: &EventPayload) -> bool {
             | EventPayload::DirectedTransition { .. }
             | EventPayload::Rewound { .. }
             | EventPayload::WorkflowCancelled { .. }
-            | EventPayload::GateEvaluated { .. }
-            | EventPayload::DefaultActionExecuted { .. }
+    ) || relays(payload)
+}
+
+/// Whether a payload relays check records (see [`relayed`]).
+fn relays(payload: &EventPayload) -> bool {
+    matches!(
+        payload,
+        EventPayload::GateEvaluated { .. } | EventPayload::DefaultActionExecuted { .. }
     )
 }
 
@@ -764,16 +775,20 @@ pub(crate) fn after_commit(
         );
     }
     records.extend(record_for(payload, session, &header, run_id.as_deref()));
-    records.extend(relayed(
-        payload,
-        &Relay {
-            session,
-            session_id: &header.session_id,
-            run_id: run_id.as_deref(),
-            seq: commit.seq,
-            visit_seq: commit.visit_seq_for(payload),
-        },
-    ));
+    // The visit is worked out only here, for a payload that relays check
+    // records: every other commit skips the scan of the log.
+    if relays(payload) {
+        records.extend(relayed(
+            payload,
+            &Relay {
+                session,
+                session_id: &header.session_id,
+                run_id: run_id.as_deref(),
+                seq: commit.seq,
+                visit_seq: commit.visit_seq_for(payload),
+            },
+        ));
+    }
     write(root, &records);
     // The cache moves only after the journal write, so a crash between the
     // two repeats the `driver_seen` on the next command rather than losing

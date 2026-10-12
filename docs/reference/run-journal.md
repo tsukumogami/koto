@@ -3,11 +3,10 @@
 The run journal is a local record of session identity and progress for
 tooling outside koto. koto appends one JSON object per line as sessions
 start, enter states, reach a terminal, are cancelled, or are driven by a new
-Claude Code session, and as it evaluates their checks. The journal is
-append-only: koto never rewrites or
-reads back its records, so a session's lines outlive the session itself,
-including sessions koto removes at their terminal tick or on
-`koto session cleanup`.
+Claude Code session, and each time koto evaluates one of their checks. The
+journal is append-only: koto never rewrites or reads back its records, so a
+session's lines outlive the session itself, including sessions koto removes
+at their terminal tick or on `koto session cleanup`.
 
 It sits beside the decider ledger and the terminal index and, like them,
 stays on the host that wrote it. It's derived, written from what sessions
@@ -276,7 +275,7 @@ An imported session is a new run: its own id is its run id.
 - A copy of the journal that delivered some lines more than once (a
   sender that retries, for example) holds exact duplicates. Treat two
   check records as duplicates only when every field, `at` included, is
-  equal. Distinct check records differ in `at`, `koto.seq` or
+  equal. Distinct check records differ in `kind`, `at`, `koto.seq` or
   `koto.rule.id`.
 - `koto session import` writes the imported session's `session_started` and
   one `state_entered` for the state it's in, both timed at the import,

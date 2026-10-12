@@ -331,6 +331,12 @@ fn digest(value: &str) -> String {
 }
 
 // ----- Templates -----
+//
+// Every gate sets `timeout: 600` rather than koto's 30-second default, and
+// the hold test holds for up to 120 seconds, so a loaded machine slows these
+// tests down instead of turning a check into `timed_out`. No assertion
+// depends on how long a run takes: each script's answers come from its run
+// count, and a held poll stops at its first passing run.
 
 /// `work` runs the `lint` check and moves to `done` once it passes.
 const RETRY: &str = r#"---
@@ -343,6 +349,7 @@ states:
       lint:
         type: command
         command: "./check.sh planted-arg-5e1f"
+        timeout: 600
     transitions:
       - target: done
         when:
@@ -373,6 +380,7 @@ states:
       ci:
         type: command
         command: ./check.sh
+        timeout: 600
         poll:
           interval_secs: 1
           timeout_secs: 600
@@ -412,6 +420,7 @@ states:
       probe:
         type: command
         command: "true"
+        timeout: 600
     transitions:
       - target: a
         when:
@@ -429,6 +438,7 @@ states:
       probe:
         type: command
         command: "true"
+        timeout: 600
     transitions:
       - target: done
         when:
@@ -471,11 +481,11 @@ fn run_retry(env: &Env, name: &str, codes: &[i32], rules: &[&str], cleanup: bool
 
 // ----- Restated scenarios -----
 
-/// A check fails rule R1 on three attempts of one visit, then passes.
+/// A check fails rule E501 on three attempts of one visit, then passes.
 #[test]
 fn a_converged_retry_writes_four_evaluations_and_three_rule_records() {
     let env = Env::new();
-    run_retry(&env, "converge", &[1, 1, 1, 0], &["R1"], false);
+    run_retry(&env, "converge", &[1, 1, 1, 0], &["E501"], false);
     let c = env.check_records("converge");
     let evaluated: Vec<&Value> = c
         .iter()
@@ -502,18 +512,18 @@ fn a_converged_retry_writes_four_evaluations_and_three_rule_records() {
             )
         })
         .collect();
-    assert_eq!(rules, vec![("R1", 1), ("R1", 2), ("R1", 3)]);
+    assert_eq!(rules, vec![("E501", 1), ("E501", 2), ("E501", 3)]);
     for r in &c {
         assert_eq!(r["koto.state"], "work");
         assert_eq!(r["koto.check"], "lint");
     }
 }
 
-/// The same check fails R1 on four attempts of one visit.
+/// The same check fails E501 on four attempts of one visit.
 #[test]
 fn a_loop_writes_a_fourth_rule_record_with_visit_count_four() {
     let env = Env::new();
-    run_retry(&env, "loops", &[1, 1, 1, 1], &["R1"], false);
+    run_retry(&env, "loops", &[1, 1, 1, 1], &["E501"], false);
     let rules: Vec<Value> = env
         .check_records("loops")
         .into_iter()
@@ -610,7 +620,7 @@ fn an_odd_rule_id_is_written_as_its_digest() {
 #[test]
 fn check_records_outlive_a_session_removed_at_its_terminal() {
     let env = Env::new();
-    run_retry(&env, "removed", &[1, 1, 1, 0], &["R1"], true);
+    run_retry(&env, "removed", &[1, 1, 1, 0], &["E501"], true);
     assert!(
         !env.session_dir("removed").exists(),
         "the session was removed"
@@ -629,8 +639,8 @@ fn check_records_outlive_a_session_removed_at_its_terminal() {
 #[test]
 fn the_journal_alone_separates_a_converged_retry_from_a_loop() {
     let env = Env::new();
-    run_retry(&env, "converge", &[1, 1, 1, 0], &["R1"], true);
-    run_retry(&env, "loops", &[1, 1, 1, 1], &["R1"], true);
+    run_retry(&env, "converge", &[1, 1, 1, 0], &["E501"], true);
+    run_retry(&env, "loops", &[1, 1, 1, 1], &["E501"], true);
     let lines = std::fs::read_to_string(env.journal_path()).unwrap();
     let bound = 3;
 
@@ -683,8 +693,8 @@ fn the_journal_alone_separates_a_converged_retry_from_a_loop() {
             .unwrap()
             .to_string()
     };
-    assert_eq!(converged, vec![(id_of("converge"), "R1".to_string(), 3)]);
-    assert_eq!(loops, vec![(id_of("loops"), "R1".to_string(), 4)]);
+    assert_eq!(converged, vec![(id_of("converge"), "E501".to_string(), 3)]);
+    assert_eq!(loops, vec![(id_of("loops"), "E501".to_string(), 4)]);
 }
 
 // ----- Sequence and visit -----
@@ -695,7 +705,13 @@ fn the_journal_alone_separates_a_converged_retry_from_a_loop() {
 #[test]
 fn koto_seq_is_the_relayed_events_seq_and_rules_share_it() {
     let env = Env::new();
-    run_retry(&env, "seqs", &[1, 1, 1, 0], &["R3", "R1", "R2"], false);
+    run_retry(
+        &env,
+        "seqs",
+        &[1, 1, 1, 0],
+        &["W605", "E501", "no-unused-vars"],
+        false,
+    );
     let log = env.events("seqs");
     let evaluated: Vec<u64> = log
         .iter()
@@ -726,7 +742,7 @@ fn koto_seq_is_the_relayed_events_seq_and_rules_share_it() {
         .iter()
         .map(|r| r["koto.rule.id"].as_str().unwrap())
         .collect();
-    assert_eq!(first_rules, vec!["R3", "R1", "R2"]);
+    assert_eq!(first_rules, vec!["W605", "E501", "no-unused-vars"]);
 }
 
 /// A passing check that prints an error-level finding writes no rule
@@ -734,7 +750,7 @@ fn koto_seq_is_the_relayed_events_seq_and_rules_share_it() {
 #[test]
 fn a_passing_check_with_an_error_finding_writes_no_rule_record() {
     let env = Env::new();
-    run_retry(&env, "clean", &[0], &["R1"], false);
+    run_retry(&env, "clean", &[0], &["E501"], false);
     let c = env.check_records("clean");
     assert_eq!(kinds(&c), vec!["check_evaluated"]);
     assert_eq!(c[0]["koto.check.outcome"], "passed");
@@ -824,7 +840,7 @@ fn a_self_transition_keeps_the_visit_and_a_move_and_a_rewind_open_new_ones() {
 #[test]
 fn an_overridden_gate_writes_no_check_record() {
     let env = Env::new();
-    let dir = env.check_dir("over", &[1, 1], &[finding("R1")]);
+    let dir = env.check_dir("over", &[1, 1], &[finding("E501")]);
     let t = env.template(&dir, RETRY);
     env.ok_in(&dir, &["init", "over", "--template", t.to_str().unwrap()]);
     env.koto_in(&dir, &["next", "over", "--no-cleanup"]);
@@ -867,7 +883,7 @@ fn an_overridden_gate_writes_no_check_record() {
 fn re_runs_inside_one_polling_evaluation_write_one_record() {
     let env = Env::new();
     let dir = env.check_dir("hold", &[75, 75, 0], &[]);
-    let t = env.template(&dir, &polling("          hold_secs: 10\n"));
+    let t = env.template(&dir, &polling("          hold_secs: 120\n"));
     env.ok_in(&dir, &["init", "hold", "--template", t.to_str().unwrap()]);
     env.koto_in(&dir, &["next", "hold", "--no-cleanup"]);
     let runs = std::fs::read_to_string(dir.join("runs.log")).unwrap();
@@ -876,6 +892,87 @@ fn re_runs_inside_one_polling_evaluation_write_one_record() {
     assert_eq!(kinds(&c), vec!["check_evaluated"]);
     assert_eq!(c[0]["koto.check.outcome"], "passed");
     assert_eq!(c[0]["koto.poll.status"], "done");
+}
+
+/// A default action that exits 0 but whose `capture_stdout_as` can't be
+/// delivered (it printed nothing) is a failed check: `failed` on its
+/// `check_evaluated`, under `__action__`, with the rule record koto counted
+/// for the capture failure.
+#[test]
+fn a_default_action_whose_capture_fails_after_exit_zero_is_journaled_as_failed() {
+    let body = r#"---
+name: capture-fails
+version: "1.0"
+initial_state: detect
+states:
+  detect:
+    default_action:
+      command: "printf ' '"
+      capture_stdout_as: BRANCH
+      fallback: "Find the branch name yourself."
+    transitions:
+      - target: report
+  report:
+    accepts:
+      ack:
+        type: enum
+        required: true
+        values: [ok]
+    transitions:
+      - target: done
+        when:
+          ack: ok
+  done:
+    terminal: true
+---
+
+## detect
+
+Detect the branch.
+
+## report
+
+Working on branch {{BRANCH}}.
+
+## done
+
+Done.
+"#;
+    let env = Env::new();
+    let dir = env.work.join("capture");
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = env.template(&dir, body);
+    env.ok_in(
+        &dir,
+        &["init", "capture", "--template", t.to_str().unwrap()],
+    );
+    env.koto_in(&dir, &["next", "capture", "--no-cleanup"]);
+
+    // The log records an exit code of 0 and the capture failure's rule.
+    let action = env
+        .events("capture")
+        .into_iter()
+        .find(|e| e["type"] == "default_action_executed")
+        .expect("the action ran");
+    assert_eq!(action["payload"]["exit_code"], 0, "{action}");
+    let logged: Vec<String> = action["payload"]["rule_counts"]
+        .as_object()
+        .expect("a capture failure carries rule counts")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(logged.len(), 1, "{action}");
+
+    let c = env.check_records("capture");
+    assert_eq!(kinds(&c), vec!["check_evaluated", "check_rule"], "{c:?}");
+    assert_eq!(c[0]["koto.check"], "__action__");
+    assert_eq!(c[0]["koto.state"], "detect");
+    assert_eq!(c[0]["koto.check.outcome"], "failed");
+    assert_eq!(c[0]["koto.check.rule_count"], 1);
+    assert_eq!(c[0]["koto.seq"], action["seq"]);
+    assert_eq!(c[1]["koto.check"], "__action__");
+    assert_eq!(c[1]["koto.seq"], action["seq"]);
+    assert_eq!(c[1]["koto.rule.id"], logged[0].as_str());
 }
 
 /// A gate or default action refused before it runs (it reads a capture
@@ -978,7 +1075,7 @@ fn a_failed_commit_writes_no_check_record() {
         return;
     }
     let env = Env::new();
-    let dir = env.check_dir("locked", &[1], &[finding("R1")]);
+    let dir = env.check_dir("locked", &[1], &[finding("E501")]);
     let t = env.template(&dir, RETRY);
     env.ok_in(&dir, &["init", "locked", "--template", t.to_str().unwrap()]);
     let before = std::fs::read_to_string(env.journal_path()).unwrap();
@@ -1050,7 +1147,7 @@ type Step = (Option<i32>, Value, usize);
 /// The converged retry's commands in `env`: each one's exit code, masked
 /// standard output and journal warning count, then the masked session log.
 fn retry_outcome(env: &Env) -> (Vec<Step>, Vec<Value>) {
-    let dir = env.check_dir("same", &[1, 1, 1, 0], &[finding("R1")]);
+    let dir = env.check_dir("same", &[1, 1, 1, 0], &[finding("E501")]);
     let t = env.template(&dir, RETRY);
     let tmp = env.tmp.path().to_string_lossy().to_string();
     let mut steps = vec![vec![
