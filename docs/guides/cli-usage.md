@@ -164,6 +164,7 @@ A kept session stays until one of these removes it:
 - it is retried or rewound and then reaches a success terminal without `--no-cleanup`, and is removed on that tick;
 - koto removes its parent at the parent's own terminal, or `koto init --attach-live --replace-terminal` replaces the parent; either removes the parent's terminal descendants first, including children kept with `--no-cleanup`. (On the terminal tick this runs only for a parent whose template has a batch hook or whose log holds a `ChildCompleted`; a hook-less parent that never received a child's notice leaves that child for `koto workflows --orphaned`.) It never removes a descendant that is still running, one with anything running under it, one it can't read, or one whose request leg still waits for its result. A parent that is itself kept keeps its children;
 - `koto workspace prune --root <root>` removes a finished root and everything under it;
+- `koto session prune` removes finished sessions as a previewed set, keeping any that something still needs (see [session prune](#session-prune));
 - `koto session cleanup <name>` removes one session.
 
 A kept session costs its directory on disk, typically tens of kilobytes. Under a root that is itself kept, which is how skills that pass `--no-cleanup` on every tick run, kept children stay until the root is pruned.
@@ -605,6 +606,71 @@ koto session cleanup <name>
 ```
 
 Produces no output on success. This is the manual equivalent of the removal `koto next` performs at a terminal state, and the way to remove a session koto kept: one at a failure terminal, or one ticked with `--no-cleanup`. It removes only the named session; a kept parent's kept children are left for `koto workflows --orphaned` and `koto workspace prune`.
+
+#### session prune
+
+Removes finished sessions as a set, after showing the set first.
+
+```bash
+koto session prune [--execution-dir <dir>] [--older-than <age>] [--all]
+koto session prune --apply --plan <token>
+koto session prune --apply (--execution-dir <dir> | --older-than <age> | --all)...
+```
+
+Without `--apply` nothing is removed. The command prints the finished sessions it would remove, every session it keeps with the rule that keeps it, and a plan token, and stores the would-remove list as `.prune-plans/<token>.json` under the sessions directory (a private file in a private directory; a preview removes stored plans older than a day).
+
+**Optional flags:**
+- `--execution-dir <dir>` -- Only sessions whose execution directory is `<dir>` or lies under it, matched the way [session list](#session-list) matches it.
+- `--older-than <age>` -- Only sessions whose last event is at least `<age>` old: a whole number and a unit, `s`, `m`, `h` or `d`, such as `30d`. A session whose last event's time can't be read is left out.
+- `--all` -- No filter: every finished session is judged. A preview without filters already covers them all; `--all` is what an `--apply` without `--plan` names when no other filter is given.
+- `--apply` -- Remove instead of previewing.
+- `--plan <token>` -- With `--apply`, remove exactly the sessions the preview that printed `<token>` listed.
+
+The filters choose which sessions are judged, not which sessions count as references: a session left out by a filter still protects the sessions it references. A session is kept, and listed under `kept` with the first rule that applies, when:
+
+| Rule | Keeps a session that |
+|------|----------------------|
+| `a` | is running, or can't be read (its header, log or template is unreadable, or its directory is a symlink) |
+| `b` | a running or unreadable session references, or any finished session while some session's header can't be read (it could name any session as its parent; the reason names it, so you can inspect or remove it) |
+| `c` | references a running or unreadable session |
+| `d` | has a `chain/parent` context key that isn't exactly one session name |
+| `e` | is bound to a request leg that is still waiting, or whose leg pointer or request can't be read |
+| `f` | is a coordinator's session (its name starts with `coordinate-`) |
+| `g` | under the cloud backend, has a remote copy that may be newer: a pushed log longer than the local one, a `version.json` ahead of or diverged from the local one, or a remote copy that can't be checked |
+
+A session references the session its header's `parent_workflow` names and the one its `chain/parent` context key names. A reference to a name with no session protects nothing, and a request that no longer exists releases a session bound to it. Everything the rules read is on this host (the sessions directory, and the request store for rule e) except rule g. Without a remote `version.json`, rule g compares only the pushed log's length, so a remote log that diverged without growing longer than the local one isn't caught.
+
+**Preview output (JSON):**
+
+```json
+{
+  "mode": "preview",
+  "plan": "3f6c1e0a9b2d4c58e7f1a0b3c5d7e9f1",
+  "remove": [
+    {"kind": "session", "name": "review-12", "session_id": "<session-id>",
+     "status": "terminal", "state": "done", "failure": false,
+     "finished_at": "2026-10-11T23:50:02.410Z", "execution_dir": "/work/project"}
+  ],
+  "kept": [
+    {"name": "plan-7", "rule": "b", "detail": "referenced by running session 'plan-7.task-2'"}
+  ]
+}
+```
+
+The token is the first 32 hex digits of a SHA-256 over the would-remove list's names and session ids, so it changes when a session joins or leaves the list, or a removed name is taken by a new session, and not when anything outside the list changes.
+
+**Applying.** `--apply --plan <token>` works the set out again, with the filters the preview ran with (the stored plan records them, and passing a filter alongside `--plan` is an error), and removes it only when its token is still `<token>`. Otherwise it removes nothing, exits 4 with `prune_plan_stale`, and lists under `added` and `dropped` how the set changed. A token with no stored plan (it expired, was applied, or was previewed on another host) also exits 4, with `prune_plan_unknown`. `--apply` without `--plan` removes the set it works out now, in one step with no preview anyone read, and needs `--execution-dir`, `--older-than` or `--all` so that a bare `--apply` can't empty the store by mistake. It is the form for scheduled runs; the rules apply to it all the same, but only `--plan` guarantees that what goes is what someone saw.
+
+Sessions are removed children first. Each is locked, read again, and judged again against the sessions it references and the referencing sessions the judgment found (a session created after the judgment that names it isn't seen); one that another koto process holds, one that is no longer finished (rewound, say), one replaced by a new session under the same name, and one a rule now keeps go to `skipped` with the reason. Under the cloud backend a session's remote copy is deleted before its local directory, apart from a migration marker, so a failure leaves the local copy for a later prune to retry. The remote delete isn't conditional: a push from another host that lands between rule g's check and the delete is lost with it; that window can't close without conditional deletes. The prune never touches the run journal.
+
+**Apply output (JSON):** `{"mode": "apply", "plan": ..., "removed": [...], "skipped": [{"name", "reason"}], "kept": [...], "failed": [{"name", "error"}]}`.
+
+| Exit code | Meaning |
+|-----------|---------|
+| 0 | Previewed, or applied with nothing failed (skipped sessions included) |
+| 2 | `invalid_arguments`: a malformed token or age, `--plan` without `--apply` or with a filter, or `--apply` with nothing naming the set |
+| 3 | A session couldn't be removed; it is listed under `failed` |
+| 4 | `prune_plan_stale` or `prune_plan_unknown`; nothing was removed |
 
 ### context
 
