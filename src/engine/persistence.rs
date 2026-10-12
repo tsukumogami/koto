@@ -1452,6 +1452,13 @@ fn may_be_entry(line: &str) -> bool {
 /// the log. `None` when the log holds no state entry. A line that doesn't
 /// parse is skipped, as [`read_events`] skips it.
 pub(crate) fn visit_start(log: &str) -> Option<u64> {
+    current_visit(log).map(|(_, seq)| seq)
+}
+
+/// [`visit_start`], together with the state the log ends in (the state its
+/// last state entry names, as [`derive_state_from_log`] reads it), both
+/// from one scan of the same bytes.
+pub(crate) fn current_visit(log: &str) -> Option<(String, u64)> {
     let mut current: Option<String> = None;
     for line in log.lines().rev() {
         if !may_be_entry(line) {
@@ -1465,17 +1472,19 @@ pub(crate) fn visit_start(log: &str) -> Option<u64> {
         };
         let state = current.get_or_insert_with(|| to.to_string());
         if opens_window(&event.payload, state, Boundary::ArrivalFromElsewhere) {
-            return Some(event.seq);
+            return current.map(|state| (state, event.seq));
         }
     }
     None
 }
 
 /// The highest `seq` in a session's log, read from its raw bytes (header
-/// line included): the `seq` of the last line that parses as an event.
-/// Appends take strictly increasing seqs, so the last event holds the
-/// highest. A line that doesn't parse (a partial write) is skipped, as
-/// [`read_events`] skips it. `None` for a log with no event.
+/// line included): the `seq` of the last non-empty line that parses as a
+/// JSON object with an unsigned `seq`. Appends take strictly increasing
+/// seqs, so the last event holds the highest. Lines that don't parse that
+/// way, such as a partial last write, are passed over. This is a cheaper
+/// reading than [`read_events`] and doesn't promise to agree with it on a
+/// damaged log. `None` when no line carries a `seq`.
 pub(crate) fn last_seq(log: &str) -> Option<u64> {
     #[derive(serde::Deserialize)]
     struct Seq {
@@ -2359,6 +2368,9 @@ mod tests {
         let idx = arrival_index(&events, "b").unwrap();
         assert_eq!(visit_start(&log), Some(events[idx].seq));
         assert_eq!(visit_start(&log), Some(2));
+        // The state comes from the same scan, and agrees with the log's.
+        assert_eq!(current_visit(&log), Some(("b".to_string(), 2)));
+        assert_eq!(derive_state_from_log(&events).as_deref(), Some("b"));
         // A log with no state entry has no visit.
         assert_eq!(visit_start(log.lines().next().unwrap()), None);
 

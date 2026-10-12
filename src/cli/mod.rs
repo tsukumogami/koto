@@ -7200,11 +7200,13 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     // additionally absent when the phase declares none. Neither absence
     // is an error.
     //
-    // This retrieval always returns the full instructions regardless of
-    // the delivery rule `koto next` applies (PRD R10), and it appends
+    // This retrieval always returns the full instructions, whether or not
+    // `koto next` has already delivered them in this visit, and it appends
     // nothing to the session: no delivery record, no other event, and no
-    // session lock is taken anywhere in this function. The run journal's
-    // `response` record written at the end takes only the journal's lock.
+    // session lock is taken anywhere in this function. The one thing it
+    // writes is the run journal's `response` record at the end, which waits
+    // only briefly for the journal's lock and never touches the session's
+    // files (see `crate::run_journal::response`).
     if let Some(state) = current_template_state {
         if !state.terminal {
             // Re-validates values as defense in depth, mirroring
@@ -7323,8 +7325,9 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
 
     println!("{}", serde_json::to_string(&response)?);
     // A printed directive (present only for a non-terminal state) is
-    // journaled as a `response`; a terminal's status prints none and
-    // writes nothing. See `crate::run_journal::response`.
+    // journaled as a `response`, the only write this command makes; a
+    // terminal's status prints none and writes nothing. See
+    // `crate::run_journal::response`.
     if let Some(directive) = response.get("directive").and_then(|d| d.as_str()) {
         crate::run_journal::response(
             backend.journal_root(),

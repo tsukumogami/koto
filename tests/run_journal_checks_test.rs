@@ -1546,6 +1546,81 @@ fn response_bytes_summed_per_visit_match_the_printed_responses() {
     assert_eq!(env.responses("v").len(), steps.len());
 }
 
+/// `koto status` never waits long on the journal: with the journal's lock
+/// held by another process, it returns promptly with the same standard
+/// output and exit code, prints the one run-journal warning, and writes no
+/// record. Once the lock is free it writes one again.
+#[test]
+fn koto_status_returns_promptly_while_the_journal_lock_is_held() {
+    use std::os::unix::io::AsRawFd;
+    use std::time::{Duration, Instant};
+    let env = Env::new();
+    let dir = env.work.join("locked-journal");
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = env.template(&dir, CHAINED);
+    env.ok_in(&dir, &["init", "held", "--template", t.to_str().unwrap()]);
+    let free = env.ok_in(&dir, &["status", "held"]);
+    assert_eq!(env.responses("held").len(), 1);
+    let journal_before = std::fs::read_to_string(env.journal_path()).unwrap();
+
+    let holder = std::fs::File::open(env.journal_path()).unwrap();
+    // SAFETY: flock on a descriptor `holder` owns until it is dropped.
+    assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+    // The same command `Env::cmd` builds, spawned so the test can bound
+    // how long it waits.
+    let mut status = std::process::Command::new(assert_cmd::cargo::cargo_bin("koto"));
+    status
+        .current_dir(&dir)
+        .env("HOME", &env.home)
+        .env("XDG_CACHE_HOME", env.tmp.path().join("cache"));
+    for unset in [
+        "KOTO_SESSIONS_BASE",
+        "KOTO_HOME",
+        "XDG_CONFIG_HOME",
+        "KOTO_WORKFLOWS_DIR",
+        "KOTO_DECIDER",
+        "KOTO_DECIDER_API_KEY",
+        "KOTO_DECIDER_ENDPOINT",
+        "CLAUDE_CODE_SESSION_ID",
+    ] {
+        status.env_remove(unset);
+    }
+    let mut child = status
+        .args(["status", "held"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    // A status that hung would block here forever; fail instead.
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(20) {
+            child.kill().unwrap();
+            panic!("koto status hung behind the journal lock");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    let took = started.elapsed();
+    drop(holder);
+    let held = Out {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    };
+    assert!(took < Duration::from_secs(5), "took {took:?}");
+    assert_eq!(held.code, Some(0), "{}", held.stderr);
+    assert_eq!(held.stdout, free.stdout);
+    assert_eq!(held.journal_warnings(), 1, "{}", held.stderr);
+    assert_eq!(
+        std::fs::read_to_string(env.journal_path()).unwrap(),
+        journal_before
+    );
+
+    env.ok_in(&dir, &["status", "held"]);
+    assert_eq!(env.responses("held").len(), 2);
+}
+
 // ----- A journal koto can't write -----
 
 fn running_as_root() -> bool {

@@ -35,6 +35,9 @@ to `0.9.x`).
   sum the instruction bytes an agent received per visit. A chained tick
   writes one line, for the state it stopped in; terminal ticks, errors and
   refusals write none. The `instructions_delivered` event is unchanged.
+  Writing the line never holds up `koto status`: it waits at most a few
+  tens of milliseconds for the journal's lock and otherwise skips the line
+  with the usual one warning, and it writes nothing else.
 
 - **A session waiting on a request leg is woken when the leg changes.** Every
   write that records a leg's result (a promoted worker result, `koto request

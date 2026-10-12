@@ -268,6 +268,14 @@ These write no `response` record:
 - A command that prints an error, such as a `koto next` whose evidence is
   refused at validation, or a `koto status` of a session that doesn't
   exist.
+- A response whose session another command moved to a different state
+  between the print and the record. The record would place the response
+  in a state it doesn't describe, so it's skipped.
+- A response that finds the journal locked by another writer for more
+  than a few tens of milliseconds. A writer that stopped while holding
+  the lock must not hang `koto next` or `koto status`, which an agent
+  relies on to recover, so the record is skipped with the warning
+  [Failures](#failures) describes.
 
 Two `response` records of one session written in the same millisecond with
 no event committed between them are equal in every field. A reader that
@@ -322,7 +330,9 @@ An imported session is a new run: its own id is its run id.
   sender that retries, for example) holds exact duplicates. Treat two
   check or response records as duplicates only when every field, `at`
   included, is equal. Distinct check records differ in `kind`, `at`,
-  `koto.seq` or `koto.rule.id`.
+  `koto.seq` or `koto.rule.id`. Two `response` records can be equal
+  without being a duplicate; see the note on responses printed in the
+  same millisecond under [Response records](#response-records).
 - `koto session import` writes the imported session's `session_started` and
   one `state_entered` for the state it's in, both timed at the import,
   exactly once per imported session. A retry or a rerun that adopts an

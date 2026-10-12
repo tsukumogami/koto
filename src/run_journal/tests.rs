@@ -706,7 +706,7 @@ fn check_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.response.directive_bytes",
             "koto.response.details_bytes",
         ],
-        other => panic!("not a check kind: {other}"),
+        other => panic!("not a check or response kind: {other}"),
     }
 }
 
@@ -1473,7 +1473,7 @@ fn response_records(j: &[serde_json::Value]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// The log of `wf` as it stands, read the way the hook reads it.
+/// The log of `session` as it stands, read the way `response` reads it.
 fn log_of(f: &Fixture, session: &str) -> String {
     std::fs::read_to_string(
         f.backend
@@ -1660,4 +1660,105 @@ fn a_response_record_fits_the_line_cap_at_the_longest_names() {
     assert!(line.len() < MAX_LINE_BYTES, "{} bytes: {line}", line.len());
     assert!(line.contains(&state));
     assert!(line.contains(&format!("\"koto.response.directive_bytes\":{}", 1 << 20)));
+}
+
+/// When the log no longer stands in the printed state (another command
+/// advanced the session between the print and the record), no record is
+/// written and nothing warns.
+#[test]
+fn a_response_for_a_state_the_log_has_left_is_skipped() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 3
+    let before = f.journal().len();
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Status,
+        "d",
+        None,
+    );
+    assert_eq!(f.journal().len(), before, "printed a, the log is in b");
+    assert!(warnings_for_test().is_empty());
+    // The state the log is in is still recorded.
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "b",
+        ResponseSource::Status,
+        "d",
+        None,
+    );
+    let r = response_records(&f.journal());
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["koto.state"], "b");
+    assert_eq!(r[0]["koto.seq"], 3);
+    assert_eq!(r[0]["koto.visit.seq"], 3);
+}
+
+/// The hook writes only the journal: a session with no sidecar gets its
+/// run id derived from the header, and still has no sidecar afterwards.
+#[test]
+fn a_response_derives_the_run_id_without_writing_the_sidecar() {
+    let f = session_in_a();
+    let sidecar_path = f.backend.session_dir("wf").join(sidecar::SIDECAR_FILE);
+    std::fs::remove_file(&sidecar_path).unwrap();
+    let files_before: Vec<_> = std::fs::read_dir(f.backend.session_dir("wf"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Status,
+        "d",
+        None,
+    );
+    let r = response_records(&f.journal());
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["koto.run.id"], "wf-id");
+    assert!(!sidecar_path.exists(), "the hook wrote the sidecar");
+    let files_after: Vec<_> = std::fs::read_dir(f.backend.session_dir("wf"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(files_after, files_before);
+}
+
+/// With the journal's lock held by another writer, the hook gives up after
+/// its short wait: no record, one warning, and no hang.
+#[test]
+fn a_response_skips_its_record_while_another_writer_holds_the_lock() {
+    use std::os::unix::io::AsRawFd;
+    let f = session_in_a();
+    let journal = f.home.join(JOURNAL_FILE);
+    let before = std::fs::read_to_string(&journal).unwrap();
+    let holder = std::fs::File::open(&journal).unwrap();
+    // SAFETY: flock on a descriptor `holder` owns until it is dropped.
+    assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let started = std::time::Instant::now();
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Status,
+        "d",
+        None,
+    );
+    let took = started.elapsed();
+    assert!(took >= RESPONSE_LOCK_WAIT, "{took:?}");
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
+    let warnings = warnings_for_test();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("held by another writer"),
+        "{warnings:?}"
+    );
+    drop(holder);
 }

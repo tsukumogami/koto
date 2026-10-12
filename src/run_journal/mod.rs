@@ -384,6 +384,17 @@ pub(crate) fn warnings_for_test() -> Vec<String> {
 /// the whole file. Only an OS crash or power loss before then can lose
 /// them.
 fn write(root: &Path, records: &[Record]) {
+    write_within(root, records, None)
+}
+
+/// How long a `response` record waits for the journal's lock before it is
+/// skipped (see [`response`]).
+const RESPONSE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// [`write`], waiting at most `lock_wait` for the journal's lock when it is
+/// set. A lock still held after that is a failed write: one warning, and
+/// the batch is skipped.
+fn write_within(root: &Path, records: &[Record], lock_wait: Option<std::time::Duration>) {
     if records.is_empty() {
         return;
     }
@@ -410,8 +421,8 @@ fn write(root: &Path, records: &[Record]) {
         lines.push(line);
     }
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-    match crate::engine::jsonl_append::append_bounded_lines_no_follow(
-        root, &path, &refs, max, flush,
+    match crate::engine::jsonl_append::append_bounded_lines_no_follow_within(
+        root, &path, &refs, max, flush, lock_wait,
     ) {
         Ok(flushed) => {
             if !refs.is_empty() {
@@ -473,20 +484,23 @@ fn relays(payload: &EventPayload) -> bool {
 /// The check name a default action's records carry.
 const ACTION_CHECK: &str = "__action__";
 
-/// What every record relayed from one committed event shares.
+/// What every record placed in a session's log shares: the records relayed
+/// from one committed event, or a `response` record.
 struct Relay<'a> {
     session: &'a str,
     session_id: &'a str,
     run_id: Option<&'a str>,
-    /// The event's own `seq`.
+    /// For relayed records, the committed event's own `seq`; for a
+    /// `response`, the highest `seq` in the log when it is written.
     seq: u64,
-    /// The visit the event belongs to.
+    /// The visit the event belongs to, or, for a `response`, the visit the
+    /// log is in when it is written.
     visit_seq: Option<u64>,
 }
 
 impl Relay<'_> {
-    /// A relayed record of `kind`: the identity fields, then `koto.seq` and
-    /// `koto.visit.seq`.
+    /// A record of `kind` placed in the log: the identity fields, then
+    /// `koto.seq` and `koto.visit.seq`.
     fn record(&self, kind: &str) -> Record {
         Record::new(kind, self.session, self.session_id, self.run_id)
             .int("koto.seq", Some(self.seq))
@@ -893,11 +907,21 @@ fn response_record(
 ///
 /// The session's log is read once, straight from the session directory and
 /// never through the backend's own read (which, for the cloud store, can
-/// fetch the log from the remote), for its header, its highest `seq`
-/// (`koto.seq`) and, by [`persistence::visit_start`]'s rule, the visit it
-/// is in (`koto.visit.seq`). The record is written without a flush, like
-/// the check records. `journal_root` is the store's journal home; `None`
-/// writes nothing.
+/// fetch the log from the remote). That one read gives the header, the
+/// highest `seq` (`koto.seq`), and the state the log is in with the visit
+/// that state's arrival opened (`koto.visit.seq`, by
+/// [`persistence::visit_start`]'s rule). When the log's state isn't
+/// `state`, another command advanced the session after this one printed,
+/// and no record is written: its position would describe a different
+/// state.
+///
+/// This hook writes nothing but the record. The run id comes from the
+/// session's sidecar, or is derived from the header without caching it. The
+/// journal's lock is waited for at most [`RESPONSE_LOCK_WAIT`], so a writer
+/// that stopped while holding it can't hang `koto status`, which an agent
+/// uses to recover; past that, the record is skipped with the one warning.
+/// The record is written without a flush, like the check records.
+/// `journal_root` is the store's journal home; `None` writes nothing.
 ///
 /// [`persistence::visit_start`]: crate::engine::persistence::visit_start
 pub(crate) fn response(
@@ -909,7 +933,7 @@ pub(crate) fn response(
     directive: &str,
     details: Option<&str>,
 ) {
-    use crate::engine::persistence::{last_seq, visit_start};
+    use crate::engine::persistence::{current_visit, last_seq};
     let Some(root) = journal_root else {
         return;
     };
@@ -936,17 +960,26 @@ pub(crate) fn response(
         ));
         return;
     };
-    let run_id = cached_run_id(backend, &session_dir, &header);
+    let Some((current, visit_seq)) = current_visit(&log) else {
+        return;
+    };
+    if current != state {
+        return;
+    }
+    let run_id = sidecar::read(&session_dir)
+        .and_then(|c| c.run_id)
+        .or_else(|| run_id::run_id(backend, &header));
     let relay = Relay {
         session,
         session_id: &header.session_id,
         run_id: run_id.as_deref(),
         seq,
-        visit_seq: visit_start(&log),
+        visit_seq: Some(visit_seq),
     };
-    write(
+    write_within(
         root,
         &[response_record(&relay, state, source, directive, details)],
+        Some(RESPONSE_LOCK_WAIT),
     );
 }
 

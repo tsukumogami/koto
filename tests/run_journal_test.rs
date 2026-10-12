@@ -1274,10 +1274,8 @@ Done.
 "#;
 
 /// `(kind, the driver or the state it names)` for each of `session`'s
-/// records after `session_started`.
-/// The session's identity records after its `session_started`, as (kind,
-/// state or driver) pairs. `response` records follow what a command
-/// printed, not who drove it, and are left out.
+/// records after `session_started`. `response` records follow what a
+/// command printed, not who drove it, and are left out.
 fn driven_sequence(env: &Env, session: &str) -> Vec<(String, String)> {
     env.records(session)
         .iter()
