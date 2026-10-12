@@ -625,7 +625,7 @@ koto session prune --apply --plan <token>
 koto session prune --apply (--execution-dir <dir> | --older-than <age> | --all)...
 ```
 
-Without `--apply` nothing is removed. The command prints the finished sessions it would remove, every session it keeps with the rule that keeps it, and a plan token, and stores the would-remove list as `.prune-plans/<token>.json` under the sessions directory (a private file in a private directory; a preview removes stored plans older than a day).
+Without `--apply` nothing is removed. The command prints the finished sessions and finished records it would remove, every session it keeps with the rule that keeps it, and a plan token, and stores the would-remove list as `.prune-plans/<token>.json` under the sessions directory (a private file in a private directory; a preview removes stored plans older than a day).
 
 **Optional flags:**
 - `--execution-dir <dir>` -- Only sessions whose execution directory is `<dir>` or lies under it, matched the way [session list](#session-list) matches it.
@@ -647,6 +647,8 @@ The filters choose which sessions are judged, not which sessions count as refere
 | `g` | under the cloud backend, has a remote copy that may be newer: a pushed log longer than the local one, a `version.json` ahead of or diverged from the local one, or a remote copy that can't be checked |
 
 A session references the session its header's `parent_workflow` names and the one its `chain/parent` context key names. A reference to a name with no session protects nothing, and a request that no longer exists releases a session bound to it. Everything the rules read is on this host (the sessions directory, and the request store for rule e) except rule g. Without a remote `version.json`, rule g compares only the pushed log's length, so a remote log that diverged without growing longer than the local one isn't caught.
+
+**Finished records.** The would-remove list also holds the finished records koto wrote for sessions it removed itself (see [status](#status)), as `"kind": "record"` entries beside the `"kind": "session"` ones. A record carries the removed session's `session_id`, `state`, `status` (`terminal` or `cancelled`), `failure`, `finished_at` and `execution_dir`, and `--execution-dir` and `--older-than` match it by those last two. No rule keeps a record: koto writes one only once the session's parent already had its result, so nothing still needs it. Removing a record makes `koto status` answer `not found` for the name. Applying reads each record again and skips one rewritten since the preview (another session of the name finished and was removed in between).
 
 **Preview output (JSON):**
 

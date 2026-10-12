@@ -7321,6 +7321,9 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
                     "session_id": record.session_id,
                     "execution_dir": record.execution_dir,
                 });
+                // A kept cancelled session's answer reads its state from the
+                // log; a record has no log, so it says it was cancelled.
+                // `result.status` is the result's own outcome.
                 if record.status == crate::session::finished::STATUS_CANCELLED {
                     response["status"] = serde_json::json!(record.status);
                 }
@@ -9813,7 +9816,8 @@ Done.
     /// Points `$HOME` at a scratch directory for one test and restores it,
     /// so the terminal tick's writes under `$HOME/.koto` (the terminal index)
     /// land there. Env mutation is process-global; CI runs
-    /// `--test-threads=1`, as the workflows surface tests that do the same
+    /// `--test-threads=1` (a parallel local run can race another test that
+    /// reads `$HOME`), as the workflows surface tests that do the same
     /// rely on.
     #[cfg(unix)]
     struct ScratchHome {

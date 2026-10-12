@@ -149,6 +149,10 @@ pub fn write(base: &Path, record: &FinishedRecord) -> Result<()> {
     };
     let bytes = encode(record)?;
     let tmp = dir.join(format!(".{}.{}.tmp", record.name, std::process::id()));
+    // A temporary file of this name can only be left by an earlier process
+    // with the same pid that died mid-write; clear it so the write below
+    // isn't refused for good.
+    let _ = std::fs::remove_file(&tmp);
     let result = (|| -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
