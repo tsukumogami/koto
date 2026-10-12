@@ -927,7 +927,18 @@ pub fn handle_recover(backend: &Backend, apply: bool, sessions: &[String]) -> Re
 
 /// Remove a session directory. Idempotent: succeeds even if the session doesn't exist.
 pub fn handle_cleanup(backend: &dyn SessionBackend, name: &str) -> Result<()> {
+    // Whether a session directory was there to remove. Cleanup is idempotent,
+    // and on a name koto already removed itself the record is the answer
+    // `koto status` gives, so it must stay.
+    let had_session = backend.session_dir(name).is_dir();
     backend.cleanup(name)?;
+    // A person's removal leaves no finished record: one a crash left beside
+    // the session (written just before a removal that never happened) must
+    // not answer for it as removed by koto.
+    #[cfg(unix)]
+    if had_session {
+        super::forget_finished_record(backend, name);
+    }
     Ok(())
 }
 

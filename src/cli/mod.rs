@@ -3412,8 +3412,9 @@ pub(crate) fn write_finished_record(
     }
 }
 
-/// Delete the finished record written for a session whose removal then
-/// failed, so the session that stays isn't later answered for as removed.
+/// Delete the finished record under `name`, so it doesn't answer for the
+/// name as removed by koto: after a removal that failed (the session stays),
+/// or after a person's removal of a session a crash left a record beside.
 #[cfg(unix)]
 pub(crate) fn forget_finished_record(backend: &dyn SessionBackend, name: &str) {
     let session_dir = backend.session_dir(name);
@@ -8021,7 +8022,13 @@ fn handle_cancel(backend: &dyn SessionBackend, name: &str, cleanup: bool) -> Res
     // them so the caller has the same visibility regardless of --cleanup.
     let cleaned = if cleanup {
         match backend.cleanup(name) {
-            Ok(()) => true,
+            Ok(()) => {
+                // As for `koto session cleanup`: a person's removal leaves no
+                // finished record, including one a crash left behind.
+                #[cfg(unix)]
+                forget_finished_record(backend, name);
+                true
+            }
             Err(e) => {
                 // The cancel event is already persisted; surface the
                 // cleanup failure without rolling back.

@@ -484,7 +484,7 @@ For batch parents and sessions bound to a request leg, `koto status` also carrie
 {"name":"deploy","current_state":"done","is_terminal":true,"result":{"status":"success","summary":"completed at done"},"removed":true,"finished_at":"2026-10-11T23:44:36.123Z","session_id":"<session-id>","execution_dir":"/work/project"}
 ```
 
-`current_state`, `is_terminal` and `result` mean what they mean for a kept terminal session, so the same run kept with `--no-cleanup` answers the same three. A child that had been cancelled before its parent removed it answers with its cancel state, a null `result` and `"status": "cancelled"`. A result too large for the record (over 64 KiB) keeps its `status` and `summary`, and the answer carries `"result_truncated": true`. A session removed by a person (`koto session cleanup`, `koto cancel --cleanup`) leaves no record, nor does one whose removal failed (its record is deleted again), so a name that never existed, a name removed that way, and a name whose record was pruned all answer `not found`, exit 2. Creating a session under the name deletes its record.
+`current_state`, `is_terminal` and `result` mean what they mean for a kept terminal session, so the same run kept with `--no-cleanup` answers the same three. The answer isn't a superset of a kept session's, though: with no session left to read, it has no `template_path`, `template_hash`, `batch` or `leg`. A child that had been cancelled before its parent removed it answers with its cancel state, a null `result` and `"status": "cancelled"`. A result too large for the record (over 64 KiB) keeps its `status` and `summary`, and the answer carries `"result_truncated": true`. A session removed by a person (`koto session cleanup`, `koto cancel --cleanup`) leaves no record. When those verbs remove a session, they also delete a record a crash left beside it, written just before a removal that never happened. A session whose removal failed keeps no record either, since koto deletes it again. So a name that never existed, a name a person removed, and a name whose record was pruned all answer `not found`, exit 2. Creating a session under the name deletes its record. The record keeps the session's whole result, including any payload its terminal state's result map carries, in a file only the user can read (mode 0600), until the name is reused or `koto session prune` removes it.
 
 ### session
 
@@ -613,7 +613,7 @@ Removes a session directory and all its contents. Idempotent -- succeeds even if
 koto session cleanup <name>
 ```
 
-Produces no output on success. This is the manual equivalent of the removal `koto next` performs at a terminal state, and the way to remove a session koto kept: one at a failure terminal, or one ticked with `--no-cleanup`. It removes only the named session; a kept parent's kept children are left for `koto workflows --orphaned` and `koto workspace prune`.
+Produces no output on success. When it removes a session, it also deletes a finished record a crash left under the name; on a name koto already removed itself it removes nothing, and the record stays the `koto status` answer. This is the manual equivalent of the removal `koto next` performs at a terminal state, and the way to remove a session koto kept: one at a failure terminal, or one ticked with `--no-cleanup`. It removes only the named session; a kept parent's kept children are left for `koto workflows --orphaned` and `koto workspace prune`.
 
 #### session prune
 

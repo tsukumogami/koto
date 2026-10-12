@@ -403,6 +403,14 @@ impl SessionBackend for LocalBackend {
         rename_state_file(&to_dir, from, to)?;
         rewrite_header_identity(&to_dir, to)?;
 
+        // A live session now holds `to`, so a finished record left under that
+        // name must not answer for it once it is removed later; `init_state_file`
+        // makes the same removal for a new session. The session moved here is
+        // live, so it has no record of its own to carry along.
+        if let Err(e) = crate::session::finished::remove(&self.base_dir, to) {
+            eprintln!("warning: could not remove the finished record for {to}: {e:#}");
+        }
+
         Ok(())
     }
 
@@ -2410,6 +2418,37 @@ mod tests {
             respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
+    }
+
+    #[test]
+    fn relocate_clears_a_finished_record_under_the_target_name() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        write_state_file_with_parent(tmp.path(), "parent.task-a", Some("parent"));
+        let stale = crate::session::finished::FinishedRecord {
+            v: crate::session::finished::RECORD_VERSION,
+            name: "parent~1.task-a".to_string(),
+            session_id: Some("id-old".to_string()),
+            execution_dir: None,
+            state: "done".to_string(),
+            status: crate::session::finished::STATUS_TERMINAL.to_string(),
+            failure: false,
+            result: None,
+            truncated: false,
+            finished_at: "2026-10-12T00:00:00.000Z".to_string(),
+            removed_by: crate::session::finished::REMOVED_BY_TERMINAL.to_string(),
+        };
+        crate::session::finished::write(tmp.path(), &stale).unwrap();
+
+        backend
+            .relocate("parent.task-a", "parent~1.task-a")
+            .unwrap();
+
+        assert!(
+            crate::session::finished::read(tmp.path(), "parent~1.task-a")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
