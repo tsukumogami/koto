@@ -45,10 +45,29 @@
 //! - `driver_seen`: `koto.driver.session.id`, the Claude Code session now
 //!   driving the session, when it differs from the last one recorded.
 //!
+//! Those five are the identity kinds. Three more are relayed from check
+//! events, and each carries `koto.seq` (the relayed event's sequence
+//! number in the session's log) and `koto.visit.seq` (the sequence number
+//! of the event that opened the visit it belongs to, by
+//! `persistence::visit_start`'s rule):
+//!
+//! - `check_evaluated`: one per `gate_evaluated` that isn't pending and per
+//!   `default_action_executed` (check `__action__`), with the outcome,
+//!   attempt numbers, rule count and run time.
+//! - `check_rule`: one per key of that event's `rule_counts`, after its
+//!   `check_evaluated`, with the rule's visit and session counts. A rule id
+//!   outside the name shape is written as its digest ([`name_or_digest`]).
+//! - `check_pending`: one per pending `gate_evaluated` of a polling gate,
+//!   with the poll's run count and elapsed seconds, never an outcome.
+//!
 //! A field with no value is left out, never written as null or empty. Ids
-//! must match `^[A-Za-z0-9._:-]{1,128}$` and names (template and state
-//! names) `^[A-Za-z0-9._:/@-]{1,128}$` without a leading `/`; a value
-//! outside its shape is left out and the record is still written.
+//! must match `^[A-Za-z0-9._:-]{1,128}$` and names `^[A-Za-z0-9._:/@-]{1,128}$`
+//! without a leading `/` or `~`. Names cover template and state names,
+//! `koto.check`, and the short vocabulary values the check kinds carry
+//! (`koto.check.outcome`, `koto.poll.status`, `koto.check.error`). A value
+//! outside its shape is left out and the record is still written, with one
+//! exception: a rule id outside the name shape is written as its digest
+//! ([`name_or_digest`]), never dropped.
 //!
 //! ## When records are written
 //!
@@ -59,8 +78,9 @@
 //!   `session_started` and a `state_entered` for the initial state.
 //! - [`after_commit`], from `LocalBackend::append_event` next to the
 //!   `/workflows` hook, writes `state_entered` for each `transitioned`,
-//!   `directed_transition` and `rewound` event and `cancelled` for
-//!   `workflow_cancelled`. Before those, on any committed payload, it
+//!   `directed_transition` and `rewound` event, `cancelled` for
+//!   `workflow_cancelled`, and the check kinds for `gate_evaluated` and
+//!   `default_action_executed`. Before those, on any committed payload, it
 //!   writes `driver_seen` when the process's driver (`CLAUDE_CODE_SESSION_ID`,
 //!   when id-shaped) differs from the one the session's sidecar caches, or
 //!   the sidecar caches none, and then caches the new driver. No driver is
@@ -81,12 +101,16 @@
 //! on. Nothing about the command's output, exit code, session state or
 //! gate decisions changes.
 //!
-//! Writers take an advisory lock on the journal for each record, so a
-//! record is never interleaved with another. A write cut short (a crash, a
-//! full disk) can still leave a partial last line: the next writer sees,
-//! under the lock, that the file doesn't end in a newline and starts its
-//! record on a line of its own, so only the partial line is lost. Readers
-//! skip lines that don't parse as JSON.
+//! Writers take an advisory lock on the journal for each commit's records,
+//! written as one batch, so a record is never interleaved with another. A
+//! write cut short (a crash, a full disk) can still leave a partial last
+//! line: the next writer sees, under the lock, that the file doesn't end in
+//! a newline and starts its record on a line of its own, so only the
+//! partial line is lost. Readers skip lines that don't parse as JSON.
+//!
+//! A batch holding an identity record is flushed to disk; a batch of check
+//! records alone isn't, and is made durable by the next flush (see
+//! [`write`]).
 //!
 //! ## Files
 //!
@@ -108,7 +132,8 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::engine::types::{now_iso8601, Event, EventPayload, StateFileHeader};
+use crate::engine::persistence::CommitInfo;
+use crate::engine::types::{now_iso8601, CheckEventFields, Event, EventPayload, StateFileHeader};
 use crate::session::SessionBackend;
 
 pub(crate) use driver::driver;
@@ -151,6 +176,31 @@ pub(crate) fn is_name(value: &str) -> bool {
         })
 }
 
+/// `value` when it has the name shape, otherwise `sha256:` and the first 32
+/// lowercase hex characters of the SHA-256 of its UTF-8 bytes. Used for
+/// rule ids, which koto doesn't restrict: the same id gives the same value
+/// in every session, and the result always has the name shape, so an odd
+/// id keeps its identity without its text reaching the journal.
+pub(crate) fn name_or_digest(value: &str) -> String {
+    if is_name(value) {
+        return value.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    let hex = hex::encode(Sha256::digest(value.as_bytes()));
+    format!("sha256:{}", &hex[..32])
+}
+
+/// The record kinds that describe a session's identity and progress. A
+/// batch holding one is flushed to disk; the kinds relayed from check
+/// events never are on their own (see [`write`]).
+const IDENTITY_KINDS: &[&str] = &[
+    "session_started",
+    "state_entered",
+    "terminal",
+    "cancelled",
+    "driver_seen",
+];
+
 /// One journal record, its fields in the order they are written.
 #[derive(Debug, Clone)]
 struct Record {
@@ -192,6 +242,23 @@ impl Record {
     fn flag(mut self, key: &'static str, value: bool) -> Self {
         self.fields.push((key, Value::from(value)));
         self
+    }
+
+    /// Add `key` when `value` is present.
+    fn int(mut self, key: &'static str, value: Option<u64>) -> Self {
+        if let Some(v) = value {
+            self.fields.push((key, Value::from(v)));
+        }
+        self
+    }
+
+    /// Whether this is one of the five identity kinds, which are flushed to
+    /// disk with the batch that carries them.
+    fn is_identity(&self) -> bool {
+        self.fields
+            .first()
+            .and_then(|(_, kind)| kind.as_str())
+            .is_some_and(|kind| IDENTITY_KINDS.contains(&kind))
     }
 
     fn to_line(&self) -> String {
@@ -238,6 +305,27 @@ thread_local! {
     static TEST_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_WARNINGS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// (batches written, batches flushed to disk) on this thread.
+    static TEST_BATCHES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Count one written batch, and whether the append reported a flush.
+#[cfg(test)]
+fn count_batch(flushed: bool) {
+    TEST_BATCHES.with(|c| {
+        let (written, synced) = c.get();
+        c.set((written + 1, synced + usize::from(flushed)));
+    });
+}
+
+#[cfg(not(test))]
+fn count_batch(_flushed: bool) {}
+
+/// The batches this thread has written since `reset_for_test`, and how many
+/// of them were flushed to disk.
+#[cfg(test)]
+pub(crate) fn batches_for_test() -> (usize, usize) {
+    TEST_BATCHES.with(|c| c.get())
 }
 
 #[cfg(test)]
@@ -261,6 +349,7 @@ pub(crate) fn reset_for_test() {
     TEST_MAX_LINE.with(|c| c.set(MAX_LINE_BYTES));
     TEST_WARNED.with(|w| w.set(false));
     TEST_WARNINGS.with(|w| w.borrow_mut().clear());
+    TEST_BATCHES.with(|c| c.set((0, 0)));
 }
 
 /// Lower (or restore) this thread's line cap.
@@ -275,25 +364,59 @@ pub(crate) fn warnings_for_test() -> Vec<String> {
     TEST_WARNINGS.with(|w| w.borrow().clone())
 }
 
-/// Append `records` in order to the journal under `root`. A record that
-/// can't be written is skipped and the rest are still tried.
+/// Append `records` in order to the journal under `root`, as one batch: one
+/// lock, one write per line. A record over the line cap is skipped with a
+/// warning and the rest are still written.
+///
+/// The batch is flushed to disk only when it holds an identity record
+/// ([`IDENTITY_KINDS`]). Records relayed from check events are never
+/// flushed on their own: a flush takes milliseconds, and a blocked tick
+/// relays several. They reach the kernel at once, so a process that dies
+/// loses none of them, and the next identity record's flush (a state entry,
+/// a terminal, a cancel) makes them durable with it, since a flush covers
+/// the whole file. Only an OS crash or power loss before then can lose
+/// them.
 fn write(root: &Path, records: &[Record]) {
+    if records.is_empty() {
+        return;
+    }
     let path = root.join(JOURNAL_FILE);
     let max = max_line_bytes();
-    // One locked append per record, so a record that can't be written is
-    // skipped without losing the others. Each record lands whole in one file;
-    // a rotation can fall between two of them. `rotate::append` takes several
-    // lines when a caller wants them kept together.
+    let mut lines = Vec::with_capacity(records.len());
+    let mut flush = false;
     for record in records {
         let line = record.to_line();
-        #[cfg(unix)]
-        let written = rotate::append(root, &[&line], max);
-        #[cfg(not(unix))]
-        let written =
-            crate::engine::jsonl_append::append_bounded_line_no_follow(root, &path, &line, max);
-        if let Err(e) = written {
-            warn_once(&format!("{}: {}", path.display(), e.root_cause()));
+        if line.len() + 1 > max {
+            warn_once(&format!(
+                "{}: a {} record exceeds the {}-byte line cap",
+                path.display(),
+                record
+                    .fields
+                    .first()
+                    .and_then(|(_, k)| k.as_str())
+                    .unwrap_or("journal"),
+                max
+            ));
+            continue;
         }
+        flush |= record.is_identity();
+        lines.push(line);
+    }
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    // The batch goes to one file whole: a rotation happens before it or
+    // after it, never between two of its lines.
+    #[cfg(unix)]
+    let written = rotate::append(root, &refs, max, flush);
+    #[cfg(not(unix))]
+    let written =
+        crate::engine::jsonl_append::append_bounded_lines_no_follow(root, &path, &refs, max, flush);
+    match written {
+        Ok(flushed) => {
+            if !refs.is_empty() {
+                count_batch(flushed);
+            }
+        }
+        Err(e) => warn_once(&format!("{}: {}", path.display(), e.root_cause())),
     }
 }
 
@@ -325,7 +448,8 @@ fn record_for(
     }
 }
 
-/// Whether a payload writes a record, without reading anything.
+/// Whether a payload writes a record, without reading anything. A
+/// `context_read`, the commonest payload, never does.
 fn journals(payload: &EventPayload) -> bool {
     matches!(
         payload,
@@ -333,7 +457,154 @@ fn journals(payload: &EventPayload) -> bool {
             | EventPayload::DirectedTransition { .. }
             | EventPayload::Rewound { .. }
             | EventPayload::WorkflowCancelled { .. }
+    ) || relays(payload)
+}
+
+/// Whether a payload relays check records (see [`relayed`]).
+fn relays(payload: &EventPayload) -> bool {
+    matches!(
+        payload,
+        EventPayload::GateEvaluated { .. } | EventPayload::DefaultActionExecuted { .. }
     )
+}
+
+/// The check name a default action's records carry.
+const ACTION_CHECK: &str = "__action__";
+
+/// What every record relayed from one committed event shares.
+struct Relay<'a> {
+    session: &'a str,
+    session_id: &'a str,
+    run_id: Option<&'a str>,
+    /// The event's own `seq`.
+    seq: u64,
+    /// The visit the event belongs to.
+    visit_seq: Option<u64>,
+}
+
+impl Relay<'_> {
+    /// A relayed record of `kind`: the identity fields, then `koto.seq` and
+    /// `koto.visit.seq`.
+    fn record(&self, kind: &str) -> Record {
+        Record::new(kind, self.session, self.session_id, self.run_id)
+            .int("koto.seq", Some(self.seq))
+            .int("koto.visit.seq", self.visit_seq)
+    }
+}
+
+/// The records a committed check event relays: `check_pending` for a
+/// pending polling gate; otherwise `check_evaluated`, then one `check_rule`
+/// per key of the event's `rule_counts`, in their order. Every other
+/// payload relays nothing.
+///
+/// Each field is copied by name from the event, never by stripping it, so
+/// nothing the event carries beyond these (output, streams, findings,
+/// commands) can reach the journal.
+fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
+    match payload {
+        EventPayload::GateEvaluated {
+            state,
+            gate,
+            output,
+            outcome,
+            check,
+            poll,
+            ..
+        } => {
+            if outcome == "pending" {
+                return vec![relay
+                    .record("check_pending")
+                    .name("koto.state", Some(state.as_str()))
+                    .name("koto.check", Some(gate.as_str()))
+                    .name("koto.poll.status", Some("pending"))
+                    .int(
+                        "koto.poll.evaluations",
+                        poll.as_ref().map(|p| p.evaluations),
+                    )
+                    .int(
+                        "koto.poll.elapsed_secs",
+                        poll.as_ref().map(|p| p.elapsed_secs),
+                    )];
+            }
+            // Only a decider check's output carries an `unanswered` list.
+            let unanswered = output.get("unanswered").and_then(Value::as_array);
+            let error = unanswered
+                .and(output.get("error"))
+                .and_then(Value::as_str)
+                .filter(|e| !e.is_empty());
+            let evaluated = check_evaluated(relay, state, gate, outcome, check)
+                .name("koto.poll.status", poll.as_ref().map(|p| p.status.as_str()))
+                .int(
+                    "koto.check.unanswered_count",
+                    unanswered.map(|u| u.len() as u64),
+                )
+                .name("koto.check.error", error);
+            with_rules(evaluated, relay, state, gate, check)
+        }
+        EventPayload::DefaultActionExecuted {
+            state,
+            exit_code,
+            check,
+            ..
+        } => {
+            // A capture failure after exit 0 always carries `rule_counts`.
+            let failed = *exit_code != 0 || check.rule_counts.is_some();
+            let outcome = if failed { "failed" } else { "passed" };
+            let evaluated = check_evaluated(relay, state, ACTION_CHECK, outcome, check);
+            with_rules(evaluated, relay, state, ACTION_CHECK, check)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// A `check_evaluated` record's fields common to gates and default actions.
+fn check_evaluated(
+    relay: &Relay<'_>,
+    state: &str,
+    check_name: &str,
+    outcome: &str,
+    check: &CheckEventFields,
+) -> Record {
+    let rule_count = check.rule_counts.as_ref().map_or(0, |r| r.0.len()) as u64;
+    let mut record = relay
+        .record("check_evaluated")
+        .name("koto.state", Some(state))
+        .name("koto.check", Some(check_name))
+        .name("koto.check.outcome", Some(outcome))
+        .int("koto.attempt", check.attempt)
+        .int("koto.visit_attempt", check.visit_attempt)
+        .int("koto.check.rule_count", Some(rule_count));
+    if check.rule_counts_truncated {
+        record = record.flag("koto.check.rule_counts_truncated", true);
+    }
+    record.int("koto.check.duration_ms", check.duration_ms)
+}
+
+/// `evaluated`, followed by one `check_rule` per error rule.
+fn with_rules(
+    evaluated: Record,
+    relay: &Relay<'_>,
+    state: &str,
+    check_name: &str,
+    check: &CheckEventFields,
+) -> Vec<Record> {
+    let rules = check.rule_counts.as_ref().map_or(&[][..], |r| &r.0[..]);
+    let mut records = Vec::with_capacity(1 + rules.len());
+    records.push(evaluated);
+    for (rule_id, count) in rules {
+        records.push(
+            relay
+                .record("check_rule")
+                .name("koto.state", Some(state))
+                .name("koto.check", Some(check_name))
+                .int("koto.attempt", check.attempt)
+                .int("koto.visit_attempt", check.visit_attempt)
+                .name("koto.rule.id", Some(name_or_digest(rule_id).as_str()))
+                .int("koto.rule.visit_count", Some(count.visit))
+                .int("koto.rule.session_count", Some(count.session)),
+        );
+    }
+    records
 }
 
 fn session_started(
@@ -389,6 +660,24 @@ fn cached_run_id(
     run_id
 }
 
+/// The session's header: the first line of the log `commit` read under its
+/// lock, or, should that not parse, the backend's own read.
+fn header_of(
+    commit: &CommitInfo,
+    backend: &dyn SessionBackend,
+    session: &str,
+) -> anyhow::Result<StateFileHeader> {
+    let parsed = commit
+        .prior_log
+        .lines()
+        .next()
+        .and_then(|line| serde_json::from_str::<StateFileHeader>(line.trim()).ok());
+    match parsed {
+        Some(header) => Ok(header),
+        None => backend.read_header(session),
+    }
+}
+
 /// The driver of this process when it differs from the one the session's
 /// sidecar caches, or when the sidecar caches none: a change of driving
 /// session that [`after_commit`] records. `None` when this process has no
@@ -442,15 +731,23 @@ pub(crate) fn after_init(
 /// first, whatever the payload, and the sidecar is then rewritten with the
 /// new driver. Two commands racing under the same new driver can each
 /// write one; readers take the distinct values, so the duplicate is
-/// harmless. Without a driver change, payloads other than state entries
-/// and cancels write nothing and read nothing beyond the sidecar; a driver
-/// change or a journaled payload also reads the session's header.
+/// harmless. Without a driver change, payloads other than state entries,
+/// cancels and check events write nothing and read nothing beyond the
+/// sidecar.
+///
+/// A check event (`gate_evaluated`, `default_action_executed`) relays its
+/// `check_evaluated` and `check_rule` records, or a `check_pending`, each
+/// carrying `commit`'s `seq` as `koto.seq` and the visit the event belongs
+/// to as `koto.visit.seq`. The header comes from `commit`'s copy of the
+/// log, so nothing is read again. A commit's records are written as one
+/// batch, flushed only when it holds an identity record (see [`write`]).
 /// `journal_root` is the store's journal home; `None` writes nothing.
 pub(crate) fn after_commit(
     journal_root: Option<&Path>,
     backend: &dyn SessionBackend,
     session: &str,
     payload: &EventPayload,
+    commit: &CommitInfo,
 ) {
     let Some(root) = journal_root else {
         return;
@@ -460,7 +757,7 @@ pub(crate) fn after_commit(
     if new_driver.is_none() && !journals(payload) {
         return;
     }
-    let header = match backend.read_header(session) {
+    let header = match header_of(commit, backend, session) {
         Ok(h) => h,
         Err(e) => {
             warn_once(&format!(
@@ -485,6 +782,20 @@ pub(crate) fn after_commit(
         );
     }
     records.extend(record_for(payload, session, &header, run_id.as_deref()));
+    // The visit is worked out only here, for a payload that relays check
+    // records: every other commit skips the scan of the log.
+    if relays(payload) {
+        records.extend(relayed(
+            payload,
+            &Relay {
+                session,
+                session_id: &header.session_id,
+                run_id: run_id.as_deref(),
+                seq: commit.seq,
+                visit_seq: commit.visit_seq_for(payload),
+            },
+        ));
+    }
     write(root, &records);
     // The cache moves only after the journal write, so a crash between the
     // two repeats the `driver_seen` on the next command rather than losing

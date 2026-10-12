@@ -195,14 +195,45 @@ fn session_of(line: &str) -> String {
     v["session"].as_str().unwrap().to_string()
 }
 
+/// Whether `line` was written in the same batch as `prev`, the line before
+/// it. One command's commit is one batch: `koto init` writes
+/// `session_started` and the initial `state_entered`; a `driver_seen` rides
+/// with the record that follows it; a check event's records all carry its
+/// `koto.seq`.
+fn same_batch(prev: &str, line: &str) -> bool {
+    let p: Value = serde_json::from_str(prev).unwrap();
+    let l: Value = serde_json::from_str(line).unwrap();
+    if p["session"] != l["session"] {
+        return false;
+    }
+    (p["kind"] == "session_started" && l["kind"] == "state_entered")
+        || p["kind"] == "driver_seen"
+        || (!l["koto.seq"].is_null() && p["koto.seq"] == l["koto.seq"])
+}
+
 /// Every rotated file was moved only once it reached the bound, and nothing
-/// was written to it after: all of it but its last line is under the bound.
+/// was written to it after: all of it but its last batch is under the
+/// bound. And no batch was split: the first line of each later file starts
+/// a batch of its own.
 fn assert_rotated_at_the_bound(files: &[PathBuf], bound: u64) {
+    let mut prev_last: Option<String> = None;
     for f in files {
         let text = std::fs::read_to_string(f).unwrap();
         let size = text.len() as u64;
-        let last = text.trim_end_matches('\n').rsplit('\n').next().unwrap();
-        let before_last = size - (last.len() as u64 + 1);
+        let lines: Vec<&str> = text.lines().collect();
+        if let Some(prev) = &prev_last {
+            assert!(
+                !same_batch(prev, lines[0]),
+                "a batch was split across files at {}",
+                f.display()
+            );
+        }
+        let mut start = lines.len() - 1;
+        while start > 0 && same_batch(lines[start - 1], lines[start]) {
+            start -= 1;
+        }
+        let last_batch: u64 = lines[start..].iter().map(|l| l.len() as u64 + 1).sum();
+        let before_last = size - last_batch;
         assert!(
             size >= bound,
             "{} is {size} bytes, under {bound}",
@@ -210,9 +241,10 @@ fn assert_rotated_at_the_bound(files: &[PathBuf], bound: u64) {
         );
         assert!(
             before_last < bound,
-            "{} grew past the bound before its last line ({before_last} >= {bound})",
+            "{} grew past the bound before its last batch ({before_last} >= {bound})",
             f.display()
         );
+        prev_last = Some(lines[lines.len() - 1].to_string());
     }
 }
 

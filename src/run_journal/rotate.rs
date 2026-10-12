@@ -141,14 +141,15 @@ pub(crate) fn warnings_for_test() -> Vec<String> {
     TEST_WARNINGS.with(|w| w.borrow().clone())
 }
 
-/// Append `lines` to the journal under `root` as one write, rotating first
-/// when the journal is at or over the configured bound. The size is checked
-/// once, under the lock, before anything is written, so a batch is never
-/// split across two files.
-pub(crate) fn append(root: &Path, lines: &[&str], max: usize) -> anyhow::Result<()> {
+/// Append `lines` to the journal under `root` under one lock, rotating
+/// first when the journal is at or over the configured bound, and flush them
+/// to disk when `flush` is set. The size is checked once, under the lock,
+/// before anything is written, so a batch is never split across two files.
+/// Returns whether it flushed.
+pub(crate) fn append(root: &Path, lines: &[&str], max: usize, flush: bool) -> anyhow::Result<bool> {
     let path = root.join(JOURNAL_FILE);
     let s = settings();
-    append_bounded_lines_current(root, &path, lines, max, &mut |file, size| {
+    append_bounded_lines_current(root, &path, lines, max, flush, &mut |file, size| {
         if s.rotate_bytes == 0 || size < s.rotate_bytes || rotation_disabled() {
             return UnderLock::Write;
         }
@@ -189,6 +190,10 @@ fn rotate_locked(root: &Path, path: &Path, file: &std::fs::File, size: u64) -> a
     // left idle past the retention bound must not have its rotated file
     // removed the moment it rotates.
     file.set_modified(SystemTime::now())?;
+    // Records written without a flush (check records) count on the next
+    // flush of the journal to make them durable. That flush goes to the new
+    // file, so flush this one before it stops being written.
+    file.sync_data()?;
 
     let next = root.join(rotated_name(next_sequence(root)?));
     std::fs::hard_link(path, &next)?;
@@ -431,7 +436,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         set_settings_for_test(on(0));
         for _ in 0..50 {
-            append(tmp.path(), &["{\"kind\":\"x\"}"], MAX).unwrap();
+            append(tmp.path(), &["{\"kind\":\"x\"}"], MAX, true).unwrap();
         }
         assert!(rotated(tmp.path()).is_empty());
         assert_eq!(journal(tmp.path()).lines().count(), 50);
@@ -445,9 +450,9 @@ mod tests {
         // append writes to the same file.
         let under = TempDir::new().unwrap();
         set_settings_for_test(on(27));
-        append(under.path(), &[line], MAX).unwrap();
-        append(under.path(), &[line], MAX).unwrap();
-        append(under.path(), &[line], MAX).unwrap();
+        append(under.path(), &[line], MAX, true).unwrap();
+        append(under.path(), &[line], MAX, true).unwrap();
+        append(under.path(), &[line], MAX, true).unwrap();
         assert!(rotated(under.path()).is_empty());
         assert_eq!(journal(under.path()).len(), 39);
 
@@ -455,10 +460,10 @@ mod tests {
         // rotates first.
         let at = TempDir::new().unwrap();
         set_settings_for_test(on(26));
-        append(at.path(), &[line], MAX).unwrap();
-        append(at.path(), &[line], MAX).unwrap();
+        append(at.path(), &[line], MAX, true).unwrap();
+        append(at.path(), &[line], MAX, true).unwrap();
         assert!(rotated(at.path()).is_empty());
-        append(at.path(), &[line], MAX).unwrap();
+        append(at.path(), &[line], MAX, true).unwrap();
         assert_eq!(rotated(at.path()), vec![rotated_name(1)]);
         let first = std::fs::read_to_string(at.path().join(rotated_name(1))).unwrap();
         assert_eq!(first.len(), 26);
@@ -470,13 +475,35 @@ mod tests {
     fn a_batch_is_never_split_across_files() {
         let tmp = TempDir::new().unwrap();
         set_settings_for_test(on(5));
-        append(tmp.path(), &["{\"n\":1}"], MAX).unwrap();
+        append(tmp.path(), &["{\"n\":1}"], MAX, true).unwrap();
         // The journal is already over the bound: the batch goes, whole, to
         // the fresh file.
-        append(tmp.path(), &["{\"n\":2}", "{\"n\":3}", "{\"n\":4}"], MAX).unwrap();
+        append(
+            tmp.path(),
+            &["{\"n\":2}", "{\"n\":3}", "{\"n\":4}"],
+            MAX,
+            true,
+        )
+        .unwrap();
         let first = std::fs::read_to_string(tmp.path().join(rotated_name(1))).unwrap();
         assert_eq!(first, "{\"n\":1}\n");
         assert_eq!(journal(tmp.path()), "{\"n\":2}\n{\"n\":3}\n{\"n\":4}\n");
+    }
+
+    #[test]
+    fn an_unflushed_batch_rotates_like_a_flushed_one_and_no_lines_opens_nothing() {
+        let tmp = TempDir::new().unwrap();
+        set_settings_for_test(on(5));
+        assert!(!append(tmp.path(), &["{\"n\":1}", "{\"n\":2}"], MAX, false).unwrap());
+        assert!(append(tmp.path(), &["{\"n\":3}"], MAX, true).unwrap());
+        let first = std::fs::read_to_string(tmp.path().join(rotated_name(1))).unwrap();
+        assert_eq!(first, "{\"n\":1}\n{\"n\":2}\n");
+        assert_eq!(journal(tmp.path()), "{\"n\":3}\n");
+
+        let empty = TempDir::new().unwrap();
+        let root = empty.path().join("never-made");
+        assert!(!append(&root, &[], MAX, true).unwrap());
+        assert!(!root.exists());
     }
 
     #[test]
@@ -484,7 +511,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(JOURNAL_FILE), "{\"n\":1}\n{\"tor").unwrap();
         set_settings_for_test(on(5));
-        append(tmp.path(), &["{\"n\":2}"], MAX).unwrap();
+        append(tmp.path(), &["{\"n\":2}"], MAX, true).unwrap();
         let first = std::fs::read_to_string(tmp.path().join(rotated_name(1))).unwrap();
         assert!(first.ends_with('\n'), "{first:?}");
         assert_eq!(journal(tmp.path()), "{\"n\":2}\n");
@@ -495,7 +522,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(JOURNAL_FILE), "not json at all\n").unwrap();
         set_settings_for_test(on(5));
-        append(tmp.path(), &["also not json"], MAX).unwrap();
+        append(tmp.path(), &["also not json"], MAX, true).unwrap();
         assert_eq!(rotated(tmp.path()), vec![rotated_name(1)]);
     }
 
@@ -511,8 +538,8 @@ mod tests {
         std::fs::write(root.join(JOURNAL_FILE), "{\"n\":1}\n").unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
         set_settings_for_test(on(5));
-        let first = append(&root, &["{\"n\":2}"], MAX);
-        let second = append(&root, &["{\"n\":3}"], MAX);
+        let first = append(&root, &["{\"n\":2}"], MAX, true);
+        let second = append(&root, &["{\"n\":3}"], MAX, true);
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         first.unwrap();
         second.unwrap();
@@ -527,13 +554,13 @@ mod tests {
         let root = tmp.path();
         set_settings_for_test(on(5));
         for n in 0..3 {
-            append(root, &[&format!("{{\"n\":{n}}}")], MAX).unwrap();
+            append(root, &[&format!("{{\"n\":{n}}}")], MAX, true).unwrap();
         }
         // Two rotations so far; age the oldest past the bound.
         assert_eq!(rotated(root), vec![rotated_name(1), rotated_name(2)]);
         set_mtime_days_ago(&root.join(rotated_name(1)), 31);
         set_mtime_days_ago(&root.join(rotated_name(2)), 29);
-        append(root, &["{\"n\":3}"], MAX).unwrap();
+        append(root, &["{\"n\":3}"], MAX, true).unwrap();
         // File 1 is gone; file 2 is inside the bound; file 3 is new.
         assert_eq!(rotated(root), vec![rotated_name(2), rotated_name(3)]);
     }
@@ -548,7 +575,7 @@ mod tests {
             reader_stale_days: 90,
         });
         for n in 0..6 {
-            append(root, &[&format!("{{\"n\":{n}}}")], MAX).unwrap();
+            append(root, &[&format!("{{\"n\":{n}}}")], MAX, true).unwrap();
             if n > 0 {
                 // With a zero-day bound only the newest survives each pass.
                 assert_eq!(rotated(root), vec![rotated_name(n)]);
@@ -561,12 +588,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         set_settings_for_test(on(5));
-        append(root, &["{\"n\":0}"], MAX).unwrap();
-        append(root, &["{\"n\":1}"], MAX).unwrap();
+        append(root, &["{\"n\":0}"], MAX, true).unwrap();
+        append(root, &["{\"n\":1}"], MAX, true).unwrap();
         // File 1 exists; the active journal then sits idle for 40 days.
         set_mtime_days_ago(&root.join(JOURNAL_FILE), 40);
         set_mtime_days_ago(&root.join(rotated_name(1)), 41);
-        append(root, &["{\"n\":2}"], MAX).unwrap();
+        append(root, &["{\"n\":2}"], MAX, true).unwrap();
         // File 1 is old and goes; file 2 was rotated just now, so it counts
         // as new whatever its last append's age.
         assert_eq!(rotated(root), vec![rotated_name(2)]);
@@ -602,7 +629,7 @@ mod tests {
         let root = tmp.path();
         set_settings_for_test(on(5));
         for n in 0..4 {
-            append(root, &[&format!("{{\"n\":{n}}}")], MAX).unwrap();
+            append(root, &[&format!("{{\"n\":{n}}}")], MAX, true).unwrap();
         }
         // Rotated 1, 2, 3; a lagging reader mid-way through file 2, a
         // reader at the end of file 2 (which needs only 3 on).
@@ -611,7 +638,7 @@ mod tests {
         for n in 1..=3 {
             set_mtime_days_ago(&root.join(rotated_name(n)), 40);
         }
-        append(root, &["{\"n\":4}"], MAX).unwrap();
+        append(root, &["{\"n\":4}"], MAX, true).unwrap();
         assert_eq!(
             rotated(root),
             vec![rotated_name(2), rotated_name(3), rotated_name(4)]
@@ -621,7 +648,7 @@ mod tests {
         let len = std::fs::metadata(root.join(rotated_name(2))).unwrap().len();
         write_position(root, "lagging", &root.join(rotated_name(2)), len);
         set_mtime_days_ago(&root.join(rotated_name(4)), 40);
-        append(root, &["{\"n\":5}"], MAX).unwrap();
+        append(root, &["{\"n\":5}"], MAX, true).unwrap();
         // File 2 goes; 3 and everything newer stay, 4 included despite its
         // age, because the readers still need file 3 onward.
         assert_eq!(
@@ -636,13 +663,13 @@ mod tests {
         let root = tmp.path();
         set_settings_for_test(on(5));
         for n in 0..2 {
-            append(root, &[&format!("{{\"n\":{n}}}")], MAX).unwrap();
+            append(root, &[&format!("{{\"n\":{n}}}")], MAX, true).unwrap();
         }
         write_position(root, "stale", &root.join(rotated_name(1)), 0);
         set_mtime_days_ago(&root.join(READERS_DIR).join("stale.json"), 91);
         std::fs::write(root.join(READERS_DIR).join("broken.json"), "{not json").unwrap();
         set_mtime_days_ago(&root.join(rotated_name(1)), 40);
-        append(root, &["{\"n\":2}"], MAX).unwrap();
+        append(root, &["{\"n\":2}"], MAX, true).unwrap();
         assert!(!root.join(rotated_name(1)).exists());
         let warnings = warnings_for_test().join("\n");
         assert!(warnings.contains("stale.json"), "{warnings}");
