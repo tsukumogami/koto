@@ -1452,6 +1452,13 @@ fn may_be_entry(line: &str) -> bool {
 /// the log. `None` when the log holds no state entry. A line that doesn't
 /// parse is skipped, as [`read_events`] skips it.
 pub(crate) fn visit_start(log: &str) -> Option<u64> {
+    current_visit(log).map(|(_, seq)| seq)
+}
+
+/// [`visit_start`], together with the state the log ends in (the state its
+/// last state entry names, as [`derive_state_from_log`] reads it), both
+/// from one scan of the same bytes.
+pub(crate) fn current_visit(log: &str) -> Option<(String, u64)> {
     let mut current: Option<String> = None;
     for line in log.lines().rev() {
         if !may_be_entry(line) {
@@ -1465,10 +1472,29 @@ pub(crate) fn visit_start(log: &str) -> Option<u64> {
         };
         let state = current.get_or_insert_with(|| to.to_string());
         if opens_window(&event.payload, state, Boundary::ArrivalFromElsewhere) {
-            return Some(event.seq);
+            return current.map(|state| (state, event.seq));
         }
     }
     None
+}
+
+/// The highest `seq` in a session's log, read from its raw bytes (header
+/// line included): the `seq` of the last non-empty line that parses as a
+/// JSON object with an unsigned `seq`. Appends take strictly increasing
+/// seqs, so the last event holds the highest. Lines that don't parse that
+/// way, such as a partial last write, are passed over. This is a cheaper
+/// reading than [`read_events`] and doesn't promise to agree with it on a
+/// damaged log. `None` when no line carries a `seq`.
+pub(crate) fn last_seq(log: &str) -> Option<u64> {
+    #[derive(serde::Deserialize)]
+    struct Seq {
+        seq: u64,
+    }
+    log.lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .find_map(|line| serde_json::from_str::<Seq>(line.trim()).ok())
+        .map(|s| s.seq)
 }
 
 /// Index of the event that began `current_state`'s current epoch: the last
@@ -2342,6 +2368,9 @@ mod tests {
         let idx = arrival_index(&events, "b").unwrap();
         assert_eq!(visit_start(&log), Some(events[idx].seq));
         assert_eq!(visit_start(&log), Some(2));
+        // The state comes from the same scan, and agrees with the log's.
+        assert_eq!(current_visit(&log), Some(("b".to_string(), 2)));
+        assert_eq!(derive_state_from_log(&events).as_deref(), Some("b"));
         // A log with no state entry has no visit.
         assert_eq!(visit_start(log.lines().next().unwrap()), None);
 
@@ -2357,6 +2386,24 @@ mod tests {
         assert!(may_be_entry(&reordered));
         let log = format!("{log}{reordered}\n");
         assert_eq!(visit_start(&log), Some(9));
+    }
+
+    /// `last_seq` is the last event's seq, skips a partial last line, and
+    /// is `None` for a log holding only its header.
+    #[test]
+    fn last_seq_reads_the_last_event_and_skips_a_partial_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("koto-last.state.jsonl");
+        append_header(&path, &make_header()).unwrap();
+        let header_only = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(last_seq(&header_only), None);
+        let ts = "2026-01-01T00:00:00Z";
+        append_event(&path, &moved(None, "a"), ts).unwrap();
+        append_event(&path, &moved(Some("a"), "b"), ts).unwrap();
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(last_seq(&log), Some(2));
+        let torn = format!("{log}{{\"seq\":3,\"timest");
+        assert_eq!(last_seq(&torn), Some(2));
     }
 
     // -----------------------------------------------------------------------

@@ -98,6 +98,7 @@ fn every_kind_the_reference_names_is_one_koto_writes_and_the_reverse() {
             "decider_checked",
             "decider_consulted",
             "driver_seen",
+            "response",
             "session_started",
             "state_entered",
             "terminal"
@@ -179,10 +180,10 @@ fn documented_kind_fields(text: &str) -> std::collections::BTreeMap<String, BTre
         .collect()
 }
 
-/// The relayed kinds' fields (check, decider and override) and the
-/// context-read kind's are listed in the kinds table, each has a row in its
-/// kind's field table, and every such field in the module is one the table
-/// lists.
+/// The fields of the kinds that carry sequence numbers (check, decider,
+/// override, response and context reads) are listed in the kinds table,
+/// each has a row in its kind's field table, and every such field in the
+/// module is one the table lists.
 #[test]
 fn every_check_kind_lists_its_fields_and_describes_each() {
     let text = reference();
@@ -195,13 +196,19 @@ fn every_check_kind_lists_its_fields_and_describes_each() {
         "decider_consulted",
         "decider_checked",
         "check_overridden",
+        "response",
     ] {
         let fields = &by_kind[kind];
         for common in ["koto.seq", "koto.visit.seq"] {
             assert!(fields.contains(common), "{kind} doesn't list {common}");
         }
+        // `response` has a section of its own rather than a subsection.
+        let heading = match kind {
+            "response" => "## Response records".to_string(),
+            _ => format!("### `{kind}`"),
+        };
         let section = text
-            .split(&format!("### `{kind}`"))
+            .split(&heading)
             .nth(1)
             .unwrap_or_else(|| panic!("{REFERENCE} has no `{kind}` section"));
         let section = section.split("\n### ").next().unwrap();

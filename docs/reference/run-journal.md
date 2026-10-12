@@ -4,8 +4,9 @@ The run journal is a local record of session identity and progress for
 tooling outside koto. koto appends one JSON object per line as sessions
 start, enter states, reach a terminal, are cancelled, or are driven by a new
 Claude Code session, each time koto evaluates one of their checks or
-consults the decider, each time an override is recorded, and once per
-state visit for the context keys the visit read. The journal is
+consults the decider, each time an override is recorded, once per state
+visit for the context keys the visit read, and each time `koto next` or
+`koto status` prints a state's directive. The journal is
 append-only: koto never rewrites or reads back its records, so a
 session's lines outlive the session itself, including sessions koto removes
 at their terminal tick or on `koto session cleanup`.
@@ -60,12 +61,13 @@ string. Ids (every `*.id` field except `koto.rule.id`, and
 `koto.template.hash`, `koto.context.first_hash` and `koto.context.last_hash`)
 must match `^[A-Za-z0-9._:-]{1,128}$`. Names (`koto.template.name`,
 `koto.state`, `koto.terminal`, `koto.check`, `koto.context.key`, and the
-string values of the check, decider, override and context kinds) must match
-`^[A-Za-z0-9._:/@-]{1,128}$` and not start with `/` or `~`. A value outside
-its shape is left out and the record is still written. `koto.rule.id`,
-`koto.context.key`, `koto.context.reader` and `koto.context.access` are
-never left out: a rule id outside the name shape, a decider criterion's id
-included, and such a context value are written as their digest (see
+string values of the check, decider, override, response and context kinds)
+must match `^[A-Za-z0-9._:/@-]{1,128}$` and not start with `/` or `~`. A
+value outside its shape is left out and the record is still written.
+`koto.rule.id`, `koto.context.key`, `koto.context.reader` and
+`koto.context.access` are never left out: a rule id outside the name shape,
+a decider criterion's id included, and such a context value are written as
+their digest (see
 [Rule ids](#rule-ids)).
 
 ### Record kinds
@@ -83,13 +85,15 @@ included, and such a context value are written as their digest (see
 | `decider_consulted` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.outcome`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.latency_ms`, `koto.decider.directive_bytes` | koto consults the decider about a state's evidence. |
 | `decider_checked` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.mode`, `koto.decider.outcome`, `koto.decider.reason`, `koto.decider.blocked`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.attempts`, `koto.decider.latency_ms` | koto grades one criterion of a decider check. |
 | `check_overridden` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check` | An override is recorded for a gate. |
+| `response` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.response.source`, `koto.response.directive_bytes`, `koto.response.details_bytes` | `koto next` or `koto status` has printed a non-terminal state's directive. |
 | `context_reads` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.context.key`, `koto.context.reader`, `koto.context.access`, `koto.context.overflow`, `koto.context.read_count`, `koto.context.present_count`, `koto.context.first_hash`, `koto.context.last_hash` | A state visit that read context keys ends. |
 
 The first five are the identity kinds. The next three are the check kinds,
-described in [Check records](#check-records), the three after them the
+described in [Check records](#check-records), the three after them are the
 decider and override kinds, described in
-[Decider and override records](#decider-and-override-records), and
-`context_reads` is described in [Context reads](#context-reads).
+[Decider and override records](#decider-and-override-records), `response`
+is described in [Response records](#response-records), and `context_reads`
+in [Context reads](#context-reads).
 
 `session_started`'s fields:
 
@@ -283,7 +287,7 @@ committed `decider_consulted` event.
 | `koto.decider.output_tokens` | integer | when logged | Output tokens of the billed answer. |
 | `koto.decider.unread_usage_attempts` | integer | always | Billed answers whose token usage couldn't be read, so an undercount of the two counts above is visible. 0 when the event doesn't log it. |
 | `koto.decider.latency_ms` | integer | always | Wall time of the provider call, in milliseconds. |
-| `koto.decider.directive_bytes` | integer | always | Byte length of the directive and details the agent would have received for the state. |
+| `koto.decider.directive_bytes` | integer | always | UTF-8 bytes of the directive plus its details (and the recovery pointer a state with details gets) that `koto next` would have returned to the agent for the consulted state, had the routing decider not been consulted; details already delivered in that visit don't count, and an applied consultation spares the agent these bytes. This differs from a `response` record's `koto.response.directive_bytes`, which counts only the printed directive. |
 
 ### `decider_checked`
 
@@ -363,6 +367,58 @@ join finds the evaluation before the transition.
 {"kind":"check_overridden","v":1,"at":"2026-10-10T03:18:02.731Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":25,"koto.visit.seq":9,"koto.state":"implement","koto.check":"comments"}
 ```
 
+## Response records
+
+koto writes one `response` record each time `koto next` or `koto status`
+prints a directive, right after printing it. It records how much
+instruction text koto handed the agent, never the text itself.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.seq` | integer | always | The highest sequence number in the session's log when the record was written. A response relays no event, so this places it among the session's check, decider and override records: after every event committed before it printed. |
+| `koto.visit.seq` | integer | always | The visit the session is in, as for check records. |
+| `koto.state` | string | always | The state whose directive was printed. |
+| `koto.response.source` | string | always | `next` or `status`: the command that printed it. |
+| `koto.response.directive_bytes` | integer | always | The UTF-8 byte length of the printed `directive` string, after JSON decoding: escapes don't count, multi-byte characters count every byte, and text koto adds to the directive (the pointer to `koto status`, a notice) counts. |
+| `koto.response.details_bytes` | integer | always | The same for the printed `details` string, or 0 when the response printed none, including when koto left the details out because this visit already received them. |
+
+`koto next` writes its record after the response's `instructions_delivered`
+event, when it has one, so `koto.seq` covers that event. A `koto next` that
+chains through several states prints, and records, only the state it
+stopped in. Summing a state's `koto.response.directive_bytes` and
+`koto.response.details_bytes` per `koto.visit.seq` gives the instruction
+bytes the agent received in each visit.
+
+These write no `response` record:
+
+- A `koto next` that lands on a terminal state, or a `koto status` of a
+  session in one, since neither prints a directive.
+- A command that prints an error, such as a `koto next` whose evidence is
+  refused at validation, or a `koto status` of a session that doesn't
+  exist.
+- A response whose session another command moved to a different state
+  between the print and the record. The record would place the response
+  in a state it doesn't describe, so it's skipped.
+- A `koto status` response that finds the journal locked by another
+  writer for more than about 30 milliseconds. A writer that stopped while
+  holding the lock must not hang `koto status`, which an agent relies on
+  to recover, so the record is skipped with the warning
+  [Failures](#failures) describes. A `koto next` response waits for the
+  lock like every other journal write and is never skipped for this
+  reason.
+
+Two `response` records of one session written in the same millisecond with
+no event committed between them are equal in every field. A reader that
+removes exact duplicates (see [Write and ordering
+rules](#write-and-ordering-rules)) counts them once; koto takes longer than
+that to answer a command, so this is rare.
+
+### Example
+
+```json
+{"kind":"response","v":1,"at":"2026-10-10T03:15:02.131Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":15,"koto.visit.seq":9,"koto.state":"implement","koto.response.source":"next","koto.response.directive_bytes":1342,"koto.response.details_bytes":0}
+```
+
 ## Context reads
 
 koto logs every read of a context key it makes on a session's behalf (a
@@ -407,7 +463,8 @@ visit, right before it:
 - A terminal: the terminal state's own visit, whose reads are the result
   map's, ends with the result event koto's terminal tick appends to the
   session's log. Its context lines are written then, and the `terminal`
-  record follows at once.
+  record follows at once, in a write of its own, so a
+  [rotation](#rotation) can fall between them.
 
 A transition from a state to itself stays in the visit and writes none.
 A visit's reads are written once.
@@ -487,20 +544,23 @@ An imported session is a new run: its own id is its run id.
 - `at` is the time the record was written, not the time of the event it
   describes, and it isn't guaranteed to increase down the file across
   processes. Use file order within a session.
-- Order one session's check, decider and override records by
+- Order one session's check, decider, override and response records by
   `koto.seq`, then by file order. A `check_evaluated` comes before its own
-  `check_rule` records, which share its `koto.seq`.
+  `check_rule` records, which share its `koto.seq`. A `response` comes
+  after the records of the events committed before it printed.
 - A visit's `context_reads` come after any `driver_seen` of the same
   command and right before the `state_entered`, `cancelled` or `terminal`
   that ends the visit, and share its `koto.seq`. Records of one visit
   differ in their key, reader and access.
 - A copy of the journal that delivered some lines more than once (a
   sender that retries, for example) holds exact duplicates. Treat two
-  check, decider, override or context-read records as duplicates only when
-  every field, `at` included, is equal. Distinct check, decider and
-  override records differ in `kind`, `at`, `koto.seq` or `koto.rule.id`,
-  and distinct context-read records in `at`, `koto.seq` or their key,
-  reader and access.
+  check, decider, override, response or context-read records as duplicates
+  only when every field, `at` included, is equal. Distinct check, decider
+  and override records differ in `kind`, `at`, `koto.seq` or
+  `koto.rule.id`, and distinct context-read records in `at`, `koto.seq` or
+  their key, reader and access. Two `response` records can be equal without
+  being a duplicate; see the note on responses printed in the same
+  millisecond under [Response records](#response-records).
 - `koto session import` writes the imported session's `session_started` and
   one `state_entered` for the state it's in, both timed at the import,
   exactly once per imported session. A retry or a rerun that adopts an
@@ -585,17 +645,17 @@ line is lost.
 
 ## Durability
 
-Identity records are flushed to disk as they're written. Check, decider
-and override records aren't flushed on their own, since a blocked tick
-writes several and a flush takes milliseconds. They reach the operating
-system as soon as they're written, so a koto process that crashes or is
-killed loses none of them, and the next identity record's flush (the
-session's next state entry, terminal or cancel) makes them durable along
-with it. An operating system crash or a power loss can lose check,
-decider and override records written since the journal's last flush.
-Context-read records are written with the identity record that ends their
-visit, or, at a terminal, just before the flushed `terminal`, so they're
-made durable with it.
+Identity records are flushed to disk as they're written. Check, decider,
+override and response records aren't flushed on their own, since a blocked
+tick writes several and a flush takes milliseconds. They reach the
+operating system as soon as they're written, so a koto process that
+crashes or is killed loses none of them, and the next identity record's
+flush (the session's next state entry, terminal or cancel) makes them
+durable along with it. An operating system crash or a power loss can lose
+check, decider, override and response records written since the journal's
+last flush. Context-read records are written with the identity record that
+ends their visit, or, at a terminal, just before the flushed `terminal`, so
+they're made durable with it.
 
 ## Retention
 
@@ -603,14 +663,145 @@ No session-lifecycle command deletes or rewrites the journal:
 `koto session cleanup`, `koto cancel --cleanup`, the removal of a session
 at its terminal tick, a parent's sweep of its children,
 `koto init --replace-terminal` and `koto session import` all leave existing
-lines byte-identical. koto doesn't rotate or prune it yet, so it grows by
-a few hundred bytes per state entered, per check evaluation, decider call
-and override, by up to 50 more lines for a check that reports many error
+lines byte-identical. The journal grows by a few hundred bytes per state
+entered, per check evaluation, decider call, override and printed
+directive, by up to 50 more lines for a check that reports many error
 rules, and by up to 51 lines per visit for the context keys it read.
 
 To remove it by hand, delete the file (or move it aside) while no koto
 command is running. The next record creates a new file. Lines removed this
 way can't be rebuilt once the sessions they describe are gone.
+
+### Rotation
+
+Rotation is off by default, and stays off by default until the journal's
+consumers list rotated files. Turn it on with a size bound in user config,
+for example 64 MiB:
+
+```bash
+koto config set run_journal.rotate_bytes 67108864 --user
+```
+
+The settings are read from user config only; `koto config set` refuses
+them without `--user`, and a project's `.koto/config.toml` can't change them,
+since the journal belongs to the user's store rather than to any one
+repository. A bound of 0 turns rotation off again.
+
+With a bound set, the write that finds the journal at or over the bound
+first moves the journal to the next rotated name, then writes its records to
+a fresh `_run_journal.jsonl`. The check runs once per write, under the
+journal's lock and before anything is written. A write is one commit's
+records (a check's `check_evaluated` and its `check_rule` records, say, or a
+visit's `context_reads` and the `state_entered` that ends the visit), so
+they always land together in one file; a rotation can fall between two
+writes of the same command. The file being moved is flushed to disk first,
+so the check, decider, override, response and context-read records it holds
+that weren't flushed yet don't wait on a flush that will now go to the new
+file. The journal is never truncated or rewritten in place:
+
+- **Naming.** Rotated files sit beside the journal as
+  `_run_journal.NNNNNNNNNN.jsonl`: ten decimal digits, zero-padded, starting
+  at `_run_journal.0000000001.jsonl`. Each new one is numbered one past the
+  highest that exists, so sorting the names gives rotation order, oldest
+  first, and `_run_journal.jsonl` is always the newest file.
+- **The move.** A rotation links the file to its new name, which fails rather
+  than replace an existing file, and then removes the old name. The file keeps
+  its device and inode number. A partial last line (a write cut short) gets
+  its newline first, so no rotated file ends mid-line. A crash between the
+  link and the removal leaves the file under both names; the next write
+  finishes the move by removing the journal's name, so a file never gets two
+  rotated names.
+- **No late writes.** A command that opened the journal just before another
+  one moved it notices, once it holds the lock, that the path now names a
+  different file, and opens the path again. No record is written to a file
+  after it was moved.
+- **Responses.** The short wait a `koto status` response gives the lock
+  covers the whole write, the fresh file's lock after a rotation included,
+  so turning rotation on doesn't let a held lock stall `koto status`. When
+  the wait runs out the record is skipped, as
+  [Response records](#response-records) describes, whether or not the
+  journal was rotated first.
+- **Failure.** A move that fails prints one warning on standard error, and
+  the record goes to the unrotated journal. That command doesn't try to
+  rotate again.
+
+### Reading across a rotation
+
+A reader that follows the journal by byte offset keeps three numbers for the
+file it's reading: its device, its inode and the offset it has read up to.
+On each pass:
+
+1. Open `_run_journal.jsonl` and `fstat` the open file. (Stat-then-open could
+   race a rotation.) If it doesn't exist, a rotation has moved it and no
+   record has been written since. Do step 3 without the new file: read the
+   rest of yours and every newer rotated file, keep the last one's device,
+   inode and end offset, and look again on the next pass.
+2. If the device and inode are the ones you kept, read from your offset.
+3. Otherwise the file you were reading was rotated. Find the rotated file
+   with your device and inode, read it from your offset to its end, then read
+   every newer rotated file, in name order, from its first byte, then the
+   file you opened in step 1 from its first byte. If that file shows up among
+   the rotated ones (another rotation happened during the pass), skip it
+   there, since you read it last. Keep its device and inode and the new
+   offset.
+
+A reader that doesn't follow by offset but copies the live journal by its
+exact name every so often, keeping a shrunk or changed file as a new
+version, needs one more step to stay lossless. The lines written after its
+last copy and before a rotation exist only in the rotated file. So on every
+pass, before copying `_run_journal.jsonl`, it lists the rotated files by the
+naming rule and copies each one newer than the last it copied, in name
+order.
+
+### Retention
+
+Rotated files are removed only during a rotation, and only when two things
+hold: the file is older than the retention bound, measured from its rotation
+(koto stamps the file's modification time when it rotates it), and no
+recorded reader position still needs it. The newest rotated file is never
+removed, so the numbering never restarts and name order stays rotation
+order. The bound is 30 days by default:
+
+```bash
+koto config set run_journal.retain_days 30 --user
+```
+
+A reader that wants its unread files kept past the bound records its
+position in a file of its own in `_run_journal.readers/` beside the journal,
+named `<reader-id>.json`, where the id is 1 to 64 letters, digits, dots,
+underscores or hyphens. koto creates the directory, mode 0700, at the first
+rotation, and never writes a position itself. The file holds one JSON
+object:
+
+```text
+{"v": 1, "dev": 16777231, "inode": 1234567, "offset": 52311,
+ "file": "_run_journal.0000000007.jsonl"}
+```
+
+`dev` and `inode` name the journal file the reader is in, and `offset` is
+how many bytes of it it has read. `file` is optional and only informational.
+A reader that copies whole files records the device and inode of the last
+file it copied and that file's length. Write the position to a temporary
+file and rename it into place, and refresh it on every pass.
+
+A position needs the file it names and every newer one, except that a
+position at or past the end of a rotated file needs only the newer ones.
+koto reads position files and the journal files' names and metadata, never a
+journal record. A position file that is larger than 4 KiB, a symlink, or
+doesn't parse protects nothing, and neither does one not modified within the
+stale bound (90 days by default); each is named in a warning on standard
+error. A position whose device and inode match no journal file (its file
+was already removed) protects nothing either, and is reported at each
+rotation until the reader updates or removes it. Change the stale bound
+with:
+
+```bash
+koto config set run_journal.reader_stale_days 90 --user
+```
+
+With no positions recorded, the retention bound alone decides. A reader that
+records no position and stays away longer than the bound misses the files
+removed in the meantime.
 
 ## Reading the journal
 

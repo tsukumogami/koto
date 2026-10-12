@@ -86,17 +86,24 @@
 //!   and last present hashes; past 50 tuples, one overflow record sums the
 //!   rest. A key outside the name shape is written as its digest.
 //!
+//! And one relays no event: `response`, written after `koto next` or
+//! `koto status` prints a non-terminal state's directive, with the byte
+//! lengths of the printed `directive` and `details` (never their text).
+//! Its `koto.seq` is the highest sequence number in the session's log when
+//! it is written, and its `koto.visit.seq` the visit the log is in.
+//!
 //! A field with no value is left out, never written as null or empty.
 //! Ids must match `^[A-Za-z0-9._:-]{1,128}$`, and names
 //! `^[A-Za-z0-9._:/@-]{1,128}$` without a leading `/` or `~`. Names cover
 //! template and state names, `koto.check`, the decider's provider and
-//! model, and the short vocabulary values the relayed kinds carry
-//! (`koto.check.outcome`, `koto.poll.status`, `koto.check.error`, and the
-//! `koto.decider.` outcome, mode, reason and error class). A value outside
-//! its shape is left out and the record is still written, with one
-//! exception: a rule id outside the name shape, a decider criterion's id
-//! included, is written as its digest ([`name_or_digest`]), never dropped,
-//! and so is a `context_reads` key, reader or access.
+//! model, and the short vocabulary values the other kinds carry
+//! (`koto.check.outcome`, `koto.poll.status`, `koto.check.error`, the
+//! `koto.decider.` outcome, mode, reason and error class, and
+//! `koto.response.source`). A value outside its shape is left out and the
+//! record is still written, with one exception: a rule id outside the name
+//! shape, a decider criterion's id included, is written as its digest
+//! ([`name_or_digest`]), never dropped, and so is a `context_reads` key,
+//! reader or access.
 //!
 //! ## When records are written
 //!
@@ -122,6 +129,9 @@
 //!   distinct values.
 //! - [`terminal`], from the terminal tick, writes `terminal` once per
 //!   arrival.
+//! - [`response`], from `koto next`'s two print sites and from
+//!   `koto status`, writes `response` after a directive is printed. It
+//!   describes output rather than a commit, so it follows the print.
 //! - [`imported`], from `koto session import`, writes the imported
 //!   session's `session_started` and a `state_entered` for the state it is
 //!   in, once per imported session.
@@ -143,8 +153,8 @@
 //! partial line is lost. Readers skip lines that don't parse as JSON.
 //!
 //! A batch holding an identity record is flushed to disk; a batch of
-//! relayed records alone isn't, and is made durable by the next flush (see
-//! [`write`]).
+//! relayed or response records alone isn't, and is made durable by the next
+//! flush (see [`write`]).
 //!
 //! ## Files
 //!
@@ -158,6 +168,8 @@
 mod context_reads;
 mod driver;
 mod fixture;
+#[cfg(unix)]
+pub(crate) mod rotate;
 mod run_id;
 mod sidecar;
 
@@ -226,7 +238,8 @@ pub(crate) fn name_or_digest(value: &str) -> String {
 
 /// The record kinds that describe a session's identity and progress. A
 /// batch holding one is flushed to disk; the kinds relayed from check,
-/// decider and override events never are on their own (see [`write`]).
+/// decider and override events, and `response`, never are on their own
+/// (see [`write`]).
 const IDENTITY_KINDS: &[&str] = &[
     "session_started",
     "state_entered",
@@ -404,13 +417,24 @@ pub(crate) fn warnings_for_test() -> Vec<String> {
 ///
 /// The batch is flushed to disk only when it holds an identity record
 /// ([`IDENTITY_KINDS`]). Records relayed from check, decider and override
-/// events are never flushed on their own: a flush takes milliseconds, and a blocked tick
-/// relays several. They reach the kernel at once, so a process that dies
-/// loses none of them, and the next identity record's flush (a state entry,
-/// a terminal, a cancel) makes them durable with it, since a flush covers
-/// the whole file. Only an OS crash or power loss before then can lose
-/// them.
+/// events, and `response` records, are never flushed on their own: a flush
+/// takes milliseconds, and a blocked tick writes several. They reach the
+/// kernel at once, so a process that dies loses none of them, and the next
+/// identity record's flush (a state entry, a terminal, a cancel) makes them
+/// durable with it, since a flush covers the whole file. Only an OS crash
+/// or power loss before then can lose them.
 fn write(root: &Path, records: &[Record]) {
+    write_within(root, records, None)
+}
+
+/// How long a `koto status` `response` record waits for the journal's lock
+/// before it is skipped (see [`response`]).
+const RESPONSE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// [`write`], waiting at most `lock_wait` for the journal's lock when it is
+/// set. A lock still held after that is a failed write: one warning, and
+/// the batch is skipped.
+fn write_within(root: &Path, records: &[Record], lock_wait: Option<std::time::Duration>) {
     if records.is_empty() {
         return;
     }
@@ -437,9 +461,16 @@ fn write(root: &Path, records: &[Record]) {
         lines.push(line);
     }
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-    match crate::engine::jsonl_append::append_bounded_lines_no_follow(
-        root, &path, &refs, max, flush,
-    ) {
+    // The batch goes to one file whole: a rotation happens before it or
+    // after it, never between two of its lines. A bounded lock wait covers
+    // the whole append, the fresh file's lock after a rotation included.
+    #[cfg(unix)]
+    let written = rotate::append(root, &refs, max, flush, lock_wait);
+    #[cfg(not(unix))]
+    let written = crate::engine::jsonl_append::append_bounded_lines_no_follow_within(
+        root, &path, &refs, max, flush, lock_wait,
+    );
+    match written {
         Ok(flushed) => {
             if !refs.is_empty() {
                 count_batch(flushed);
@@ -505,20 +536,23 @@ fn relays(payload: &EventPayload) -> bool {
 /// The check name a default action's records carry.
 const ACTION_CHECK: &str = "__action__";
 
-/// What every record relayed from one committed event shares.
+/// What every record placed in a session's log shares: the records relayed
+/// from one committed event, or a `response` record.
 struct Relay<'a> {
     session: &'a str,
     session_id: &'a str,
     run_id: Option<&'a str>,
-    /// The event's own `seq`.
+    /// For relayed records, the committed event's own `seq`; for a
+    /// `response`, the highest `seq` in the log when it is written.
     seq: u64,
-    /// The visit the event belongs to.
+    /// The visit the event belongs to, or, for a `response`, the visit the
+    /// log is in when it is written.
     visit_seq: Option<u64>,
 }
 
 impl Relay<'_> {
-    /// A relayed record of `kind`: the identity fields, then `koto.seq` and
-    /// `koto.visit.seq`.
+    /// A record of `kind` placed in the log: the identity fields, then
+    /// `koto.seq` and `koto.visit.seq`.
     fn record(&self, kind: &str) -> Record {
         Record::new(kind, self.session, self.session_id, self.run_id)
             .int("koto.seq", Some(self.seq))
@@ -965,6 +999,143 @@ pub(crate) fn terminal(
             Record::new("terminal", session, &header.session_id, run_id.as_deref())
                 .name("koto.terminal", Some(final_state)),
         ],
+    );
+}
+
+/// The command that printed a response: `koto next` or `koto status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponseSource {
+    Next,
+    Status,
+}
+
+impl ResponseSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            ResponseSource::Next => "next",
+            ResponseSource::Status => "status",
+        }
+    }
+}
+
+/// A `response` record: the state whose directive was printed, the command
+/// that printed it, and the byte lengths of the printed `directive` and
+/// `details` (0 when none was printed). Never the text itself.
+fn response_record(
+    relay: &Relay<'_>,
+    state: &str,
+    source: ResponseSource,
+    directive: &str,
+    details: Option<&str>,
+) -> Record {
+    relay
+        .record("response")
+        .name("koto.state", Some(state))
+        .name("koto.response.source", Some(source.as_str()))
+        .int(
+            "koto.response.directive_bytes",
+            Some(directive.len() as u64),
+        )
+        .int(
+            "koto.response.details_bytes",
+            Some(details.map_or(0, str::len) as u64),
+        )
+}
+
+/// Journal a response that has just been printed: one `response` record for
+/// `state`, the non-terminal state whose `directive` (and `details`, when it
+/// carried them) the command printed. `koto next` calls this at its two
+/// print sites, after the response and its `instructions_delivered` event,
+/// and `koto status` at its end; a terminal, an error or a refusal prints no
+/// directive and calls nothing. A chained `koto next` prints, and records,
+/// only the state it stopped in.
+///
+/// The byte counts are the UTF-8 lengths of the strings the response
+/// serialized, which are the printed JSON's strings after decoding: escapes
+/// don't count, and text koto adds to the directive (the recovery pointer,
+/// a notice) does.
+///
+/// The session's log is read once, straight from the session directory and
+/// never through the backend's own read (which, for the cloud store, can
+/// fetch the log from the remote). That one read gives the header, the
+/// highest `seq` (`koto.seq`), and the state the log is in with the visit
+/// that state's arrival opened (`koto.visit.seq`, by
+/// [`persistence::visit_start`]'s rule). When the log's state isn't
+/// `state`, another command advanced the session after this one printed,
+/// and no record is written: its position would describe a different
+/// state.
+///
+/// This hook writes nothing but the record. The run id comes from the
+/// session's sidecar, or is derived from the header without caching it. For
+/// `koto status` the journal's lock is waited for at most
+/// [`RESPONSE_LOCK_WAIT`], so a writer that stopped while holding it can't
+/// hang the command an agent uses to recover; past that, the record is
+/// skipped with the one warning. `koto next` waits for the lock like every
+/// other journal write, so its records aren't lost to a busy journal. The
+/// record is written without a flush, like the check records.
+/// `journal_root` is the store's journal home; `None` writes nothing.
+///
+/// [`persistence::visit_start`]: crate::engine::persistence::visit_start
+pub(crate) fn response(
+    journal_root: Option<&Path>,
+    backend: &dyn SessionBackend,
+    session: &str,
+    state: &str,
+    source: ResponseSource,
+    directive: &str,
+    details: Option<&str>,
+) {
+    use crate::engine::persistence::{current_visit, last_seq};
+    let Some(root) = journal_root else {
+        return;
+    };
+    let session_dir = backend.session_dir(session);
+    let log =
+        match std::fs::read_to_string(session_dir.join(crate::session::state_file_name(session))) {
+            Ok(log) => log,
+            Err(e) => {
+                warn_once(&format!(
+                    "could not read the log of session {}: {}",
+                    session, e
+                ));
+                return;
+            }
+        };
+    let header = log
+        .lines()
+        .next()
+        .and_then(|line| serde_json::from_str::<StateFileHeader>(line.trim()).ok());
+    let (Some(header), Some(seq)) = (header, last_seq(&log)) else {
+        warn_once(&format!(
+            "could not read the header and events of session {}",
+            session
+        ));
+        return;
+    };
+    let Some((current, visit_seq)) = current_visit(&log) else {
+        return;
+    };
+    if current != state {
+        return;
+    }
+    let run_id = sidecar::read(&session_dir)
+        .and_then(|c| c.run_id)
+        .or_else(|| run_id::run_id(backend, &header));
+    let relay = Relay {
+        session,
+        session_id: &header.session_id,
+        run_id: run_id.as_deref(),
+        seq,
+        visit_seq: Some(visit_seq),
+    };
+    let lock_wait = match source {
+        ResponseSource::Status => Some(RESPONSE_LOCK_WAIT),
+        ResponseSource::Next => None,
+    };
+    write_within(
+        root,
+        &[response_record(&relay, state, source, directive, details)],
+        lock_wait,
     );
 }
 
