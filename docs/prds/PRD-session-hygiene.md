@@ -76,10 +76,10 @@ The store can't be managed at that size:
   `workflow '<name>' not found` with exit 2, the same answer a lost or
   never-created session gets, and the outcome is gone (koto#234).
 - **Unbounded derived files.** The run journal gains a line for every state
-  any session enters and is never rotated. Two readers on the host follow
-  it: one by byte offset, shipping it off the host, and one archiving the
-  whole file and keeping a shrunk or changed file as a new version. A
-  careless rotation loses or repeats their lines. Every
+  any session enters and is never rotated. External readers follow it,
+  for example one copying the live file by its exact name on an interval
+  and keeping a shrunk or changed file as a new version. A careless rotation
+  loses or repeats their lines. Every
   `koto session import` leaves a `migrated.json` marker beside the source in
   the bucket, and nothing removes one.
 
@@ -134,9 +134,10 @@ These carry the framing's journeys forward at requirements altitude.
    byte offset, I want a rotation to leave the file I was reading where I
    can find it, so that my next pass finishes it and starts the new journal
    at its first byte with no line lost or sent twice.
-6. As an operator running a tool that archives the journal file by file, I
-   want to find every rotated file by name and in order, so that each file
-   is archived once and complete.
+6. As an operator running a tool that copies the live journal by its exact
+   name on an interval, I want to find every rotated file by name and in
+   order, so that each line is archived once and none written just before a
+   rotation is missed.
 7. As an operator who imported sessions from an old host, I want to see
    which markers under the old workspace's bucket prefix are safe to remove
    and why, and remove them, so that the old workspace's prefix stops
@@ -260,9 +261,13 @@ These carry the framing's journeys forward at requirements altitude.
   reader identifies the file it is reading by inode. After a rotation it
   finds that inode among the rotated files, reads it from its offset to the
   end, then reads each newer rotated file from byte 0 in name order, then
-  the active file from byte 0. The rule is documented in
-  `docs/reference/run-journal.md`. A rename that fails costs one warning on
-  stderr and the record is appended to the unrotated file.
+  the active file from byte 0. A reader that instead copies the live journal
+  by its exact name on an interval stays lossless only if it also lists the
+  rotated files by the naming rule and copies any newer than its last copy:
+  lines written after its last copy and before a rotation exist only in a
+  rotated file. The rules are documented in `docs/reference/run-journal.md`.
+  A rename that fails costs one warning on stderr and the record is appended
+  to the unrotated file.
 - **R20.** No record is written to a file after it was renamed: a writer
   that raced the rotation writes to the new file.
 - **R21.** A reader may record its position in a file of its own in a
@@ -278,9 +283,11 @@ These carry the framing's journeys forward at requirements altitude.
   position file not modified for longer than the stale bound, or one that
   can't be read or parsed, protects nothing, and koto prints a warning naming
   it. With no positions recorded, the retention bound alone applies.
-- **R23.** Defaults: size bound 64 MiB, retention bound 30 days, stale bound
-  90 days. Each is configurable through `koto config`; a size bound of 0
-  turns rotation off.
+- **R23.** Rotation is off by default (a size bound of 0) and turned on
+  through `koto config` by setting a size bound, such as 64 MiB. It stays off
+  by default until the journal's consumers list rotated files; turning the
+  default on later is a one-line change outside this feature. The retention
+  bound defaults to 30 days and the stale bound to 90 days, both configurable.
 - **R24.** An offset reader that stopped mid-file and follows the documented
   rule finishes the old file and reads the new one from byte 0 without
   losing or repeating a line, across a rotation done by an ordinary koto
@@ -427,9 +434,10 @@ Run journal:
   points into is kept past the bound; with two readers, the lagging one
   keeps its file; a position older than the stale bound no longer keeps its
   file and the rotation prints a warning naming it.
-- [ ] Setting each bound with `koto config set` changes the behavior above;
-  a size bound of 0 never rotates; `koto config get` of each key with
-  nothing set prints the R23 default.
+- [ ] With nothing configured the journal never rotates, however large it
+  grows; setting each bound with `koto config set` changes the behavior
+  above; a size bound of 0 never rotates; `koto config get` of each key with
+  nothing set prints the R23 default (0, 30, 90).
 - [ ] A journal one byte under the size bound doesn't rotate on the next
   append; one at the bound does.
 - [ ] An unparseable position file protects nothing and its name appears in

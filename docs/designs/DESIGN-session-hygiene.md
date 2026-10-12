@@ -28,9 +28,10 @@ rationale: |
   finished sessions or reading the journal back would have answered the
   status gap more cheaply, but the first changes what every terminal tick
   does and the second makes the store depend on a derived file. Rename-based
-  rotation with inode-keyed reader positions is the only scheme in which
-  both of the journal's existing readers keep every line without koto ever
-  parsing a record.
+  rotation with a published naming rule and optional reader positions is the
+  only scheme in which an external reader can keep every line without koto
+  ever parsing a record; it ships off by default until consumers list
+  rotated files.
 upstream: docs/prds/PRD-session-hygiene.md
 user_visible_surface: true
 decision_provenance: inline-resolved
@@ -104,10 +105,12 @@ migrated_at}` (R25 to R29).
 - **D4. Scale.** Listing and a full preview over 1,000 sessions finish in
   under 2 seconds (R30), so per-session cost has to stay at one header, one
   log, and one template read shared across sessions.
-- **D5. The journal's two readers.** One follows by byte offset; one archives
-  whole files and keeps a shrunk or changed file as a new version. Rotation
-  can't truncate, rewrite or drop a line either might still read (R18 to
-  R22).
+- **D5. The journal's external readers.** A reader may follow the file by
+  byte offset, or copy the live file by its exact name on an interval and
+  keep a shrunk or changed file as a new version. Rotation can't truncate,
+  rewrite or drop a line either might still read (R18 to R22), and since an
+  interval copier that doesn't yet list rotated files would miss lines,
+  rotation can't be on by default (R23).
 - **D6. Coexistence with the gate-and-decider journal work.** That work adds
   record kinds and may flush a per-visit aggregate before the terminal record.
   This design adds no kind, treats every kind alike, keeps the terminal tick's
@@ -254,8 +257,8 @@ retention rule of its own, which makes it this record with a worse location.
 
 **Chosen: rotate on append under the journal's own lock, by a no-replace
 move to a sequence-numbered name; writers re-check identity after locking;
-readers record positions keyed by device and inode; retention runs at
-rotation.**
+readers may record positions keyed by device and inode; retention runs at
+rotation; the whole mechanism is off until a size bound is configured.**
 
 *Alternative: rotate from a separate verb or from cron.* Rejected: the bound
 would hold only if someone scheduled the verb. A writer-side size check costs
@@ -622,8 +625,9 @@ count.
 
 `dev` and `inode` name the journal file the reader is in, and survive that
 file's rotation. `offset` is the byte count it has consumed. `file` is
-informational. A whole-file archiver writes the identity of the last file it
-archived and that file's length. A reader writes its position by temporary
+informational. A reader that archives whole files and wants this protection
+writes the identity of the last file it archived and that file's length.
+Recording a position is optional. A reader writes its position by temporary
 file and rename, and refreshes it on every pass, since the stale bound goes
 by the position file's modification time. koto creates the directory (mode
 0700) on first rotation and never writes a position itself. A reused inode
@@ -640,9 +644,18 @@ identity and offset. If another rotation lands during the pass, the file
 open as "active" turns up among the rotated files; skip it there by
 identity, since it is read last. A reader that finds no file with its inode lost its place to
 retention, and only a reader that recorded no position, or let it go stale,
-can be in that state. The archiver's rule is the same walk at file
-granularity: archive every rotated file newer than the last one it archived,
-then treat the active file as it does today.
+can be in that state.
+
+**The interval copier's rule.** A reader may not follow the file at all and
+instead copy the live journal by its exact name every so often, keeping a
+shrunk or changed file as a new version. Rotation alone would cost such a
+reader the lines written after its last copy and before the rotation: they
+exist only in the rotated file, which it never looks at. To stay lossless it
+must, on every pass, also list the rotated files by the naming rule and copy
+each one newer than the last it copied, in name order, before copying the
+live file. A reader like this needs no position file; age-based retention
+covers it as long as it runs more often than the retention bound. This
+failure mode is why rotation is off by default (below).
 
 **Retention.** It runs after each rotation, under the rotated file's lock:
 
@@ -659,10 +672,14 @@ then treat the active file as it does today.
 Retention reads file names, `stat` metadata and position files, never a
 journal record (R21, D2).
 
-**Settings.** `run_journal.rotate_bytes` (default 67108864, 0 disables),
+**Settings.** `run_journal.rotate_bytes` (default 0, which means rotation is
+off; 67108864 is a reasonable value to opt in with),
 `run_journal.retain_days` (default 30) and `run_journal.reader_stale_days`
 (default 90) join `src/config` the way `request_store.terminal_index_compact_lines`
-did. They're settable with `koto config set` in user or project config.
+did. Rotation stays off by default until the journal's consumers list rotated
+files; turning it on by default then is a one-line change to the default, not
+part of this design. With rotation off, the size check is a comparison
+against 0 and nothing else changes on the append path. They're settable with `koto config set` in user or project config.
 `run_journal::write` resolves them once per process into a `OnceLock`, with
 a test override like the module's existing ones.
 
@@ -770,8 +787,8 @@ HOME or `KOTO_SESSIONS_BASE`, with cloud behavior on koto's fake S3 harness
   says exactly why anything stayed.
 - `koto status` tells a clean finish from a missing session, with the
   result, for every session koto itself removed.
-- The journal's growth is bounded, and both existing readers keep every line
-  by following one stated rule.
+- An operator can bound the journal's growth with one setting, and a reader
+  that follows the stated rule keeps every line.
 - Old workspaces' bucket prefixes can be emptied once their sessions have
   moved.
 
@@ -783,6 +800,8 @@ HOME or `KOTO_SESSIONS_BASE`, with cloud behavior on koto's fake S3 harness
   or the name is reused.
 - A reader that never records a position can lose files once they pass the
   retention bound.
+- The journal stays unbounded by default: rotation is opt-in until the
+  journal's consumers list rotated files.
 - The rules know one context key by name, `chain/parent`, so a consumer
   linking sessions any other way gets no protection from rule c.
 - Marker removal by age relies on the stopped-source rule. A host revived
@@ -799,8 +818,10 @@ HOME or `KOTO_SESSIONS_BASE`, with cloud behavior on koto's fake S3 harness
 - `koto session prune` removes records under the same filters, and the
   records are a few hundred bytes each.
 - The rule and the position format are in `docs/reference/run-journal.md`,
-  and the default bound (30 days) is far longer than either reader's polling
-  interval.
+  and the default retention bound (30 days) is far longer than any polling
+  interval a reader would use.
+- Turning rotation on by default later is a one-line change to one setting's
+  default, made once consumers list rotated files.
 - Rule c reads one key with a fixed name. Adding a second reference key later
   is an additive change to the reference map.
 - Marker removal by age is opt-in per run and previewed, and the preview shows

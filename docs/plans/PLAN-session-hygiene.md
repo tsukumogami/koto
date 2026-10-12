@@ -127,7 +127,7 @@ surface.
 
 **Group**: journal-rotation
 
-**Goal**: The run journal rotates on append when it reaches its size bound. It moves to `_run_journal.NNNNNNNNNN.jsonl` without replacing anything, writers re-check the file's identity after locking, and rotated files are removed only past the retention bound and only when no reader's recorded position needs them. Record kinds are untouched (PRD R18 to R24).
+**Goal**: When an operator configures a size bound (rotation is off by default), the run journal rotates on append once it reaches that bound. It moves to `_run_journal.NNNNNNNNNN.jsonl` without replacing anything, writers re-check the file's identity after locking, and rotated files are removed only past the retention bound and only when no reader's recorded position needs them. Record kinds are untouched (PRD R18 to R24).
 
 **Acceptance Criteria**:
 - [ ] `run_journal::write` appends through a new `src/run_journal/rotate.rs`, backed by an identity-checked variant of `engine::jsonl_append`'s helper. It opens with `O_APPEND|O_CREAT|O_NOFOLLOW`, takes `flock`, and retries when the descriptor's `(dev, ino)` differs from the path's (at most eight attempts). It rotates under the lock when the size is at or over the bound: newline-terminate a partial last line, `link` to the next ten-digit name, `unlink` the old path, run retention, retry. A failed link or unlink warns once and appends to the unrotated file. `run_journal::write` keeps its signature, and when one locked append carries several lines (a batch), a test shows rotation lands before or after the batch, never between its lines.
@@ -136,10 +136,10 @@ surface.
 - [ ] A test reader implementing the documented offset rule (identity by `(dev, inode)`, open then `fstat`) stops mid-file. After a rotation done by an ordinary koto command, it finishes the old file and reads the new one from byte 0 with no line lost or repeated.
 - [ ] Retention reads only `_run_journal.readers/*.json` positions (lstat-checked, at most 4 KiB, strict parse) and file metadata, never journal records. A journal of non-JSON lines rotates and retains exactly like a valid one.
 - [ ] A rotated file older than `retain_days` is removed at the next rotation, and one inside the bound is kept. A file a fresh position points into is kept past the bound, and a position at or past a rotated file's end releases that file. With two readers the lagging one keeps its file. A position older than `reader_stale_days`, or unparseable, protects nothing and is named in a warning.
-- [ ] `run_journal.rotate_bytes` (default 67108864, 0 disables), `run_journal.retain_days` (30) and `run_journal.reader_stale_days` (90) are settable with `koto config set`. `koto config get` prints the defaults when nothing is set. Settings resolve once per process.
+- [ ] `run_journal.rotate_bytes` (default 0: rotation off), `run_journal.retain_days` (30) and `run_journal.reader_stale_days` (90) are settable with `koto config set`. `koto config get` prints the defaults when nothing is set. Settings resolve once per process. With nothing configured, a journal far past any size never rotates (test), and the rotation tests set a size bound explicitly.
 - [ ] A redirected store (`KOTO_SESSIONS_BASE`) rotates its own journal, and `koto session list`, `koto workflows` and the layout migration ignore rotated files and the readers directory.
 - [ ] No journal record kind is added or changed, and the `run-journal.json` sidecar is untouched.
-- [ ] `docs/reference/run-journal.md` states the naming rule, the reader rule for offset readers and archivers, the position file's directory and format, and the three defaults, replacing "koto doesn't rotate or prune it yet". `docs/workspace-layout.md` lists the rotated files and the readers directory.
+- [ ] `docs/reference/run-journal.md` states the naming rule, the reader rules for an offset reader and for a reader that copies the live file by exact name on an interval (which must also list rotated files), the optional position file's directory and format, the three defaults, and that rotation is off by default until consumers list rotated files, replacing "koto doesn't rotate or prune it yet". `docs/workspace-layout.md` lists the rotated files and the readers directory.
 
 **Dependencies**: None
 
