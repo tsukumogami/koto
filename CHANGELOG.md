@@ -326,6 +326,19 @@ to `0.9.x`).
 
 ### Fixed
 
+- **A held run-journal lock can no longer hang a koto command (koto#354).**
+  Run-journal writes waited for the journal's lock with no limit, so a
+  process that stopped while holding it left every later `koto next`
+  stuck after printing its directive, never reaching its exit. Every
+  journal write now waits at most five seconds for the lock (`koto status`
+  keeps its 30 milliseconds), then skips that write's records with the
+  usual one warning and carries on: the command's output, exit code and
+  everything it does afterwards, a terminal tick's cleanup included, are
+  unchanged. The wait isn't configurable and covers only taking the lock;
+  a rotation that is slow while holding it still finishes, and the
+  writers behind it are the ones that give up. A write's records still go
+  to one file whole. `docs/reference/run-journal.md` describes the wait.
+
 - **A failed batch offers its retry after the parent leaves the batching
   state (koto#277).** `reserved_actions` was built only from the batch
   scheduler, which runs only in a state that declares

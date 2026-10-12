@@ -266,7 +266,8 @@ pub enum UnderLock {
 }
 
 /// How many times [`append_bounded_lines_current`] opens the path before it
-/// gives up on a file that keeps being moved.
+/// gives up on a file that keeps being moved. With a bounded lock wait it
+/// keeps opening the path until the bound has passed as well.
 #[cfg(unix)]
 const REOPEN_ATTEMPTS: usize = 8;
 
@@ -290,6 +291,11 @@ const REOPEN_ATTEMPTS: usize = 8;
 /// opened again after a move gets what is left of the bound (and always one
 /// try), not a fresh one. Past the bound the call fails without writing
 /// anything; `under_lock` has then run only for files whose lock was taken.
+/// The bound covers waiting for locks only: once a lock is held, the work
+/// under it (`under_lock`, the writes, the flush) is never timed or cut
+/// short. A file moved away while this call waits is opened again for as
+/// long as the bound lasts, and at least [`REOPEN_ATTEMPTS`] times; without
+/// a bound, exactly that many.
 ///
 /// Returns whether it flushed. No lines is a no-op that opens nothing, so
 /// `under_lock` doesn't run either.
@@ -326,7 +332,21 @@ pub fn append_bounded_lines_current(
     }
 
     let started = std::time::Instant::now();
-    for _ in 0..REOPEN_ATTEMPTS {
+    let mut attempts = 0;
+    loop {
+        // A bounded wait gives up on a file that keeps moving when its time
+        // is up, not after a count: a writer polling for the lock can see
+        // several rotations go by while it waits, each moving the file it
+        // opened, and the bound is what promises it a fair wait.
+        let out_of_time = lock_wait.is_none_or(|wait| started.elapsed() >= wait);
+        if attempts >= REOPEN_ATTEMPTS && out_of_time {
+            anyhow::bail!(
+                "{} was moved away {} times while opening it",
+                path.display(),
+                attempts
+            );
+        }
+        attempts += 1;
         let mut file = OpenOptions::new()
             .read(true)
             .create(true)
@@ -369,11 +389,6 @@ pub fn append_bounded_lines_current(
         }
         return Ok(flush);
     }
-    anyhow::bail!(
-        "{} was moved away {} times while opening it",
-        path.display(),
-        REOPEN_ATTEMPTS
-    )
 }
 
 #[cfg(test)]
@@ -631,6 +646,51 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "{\"b\":2}\n{\"c\":3}\n"
         );
+    }
+
+    /// A writer whose file keeps being moved away while it waits opens the
+    /// path again for as long as its bound lasts, past the attempt count an
+    /// unbounded call stops at, and writes its batch whole to the file it
+    /// finally holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_wait_keeps_reopening_a_moved_file_until_its_time_is_up() {
+        use std::time::Duration;
+        let moves = REOPEN_ATTEMPTS + 3;
+        let run = |lock_wait: Option<Duration>| {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("j.jsonl");
+            let mut calls = 0;
+            let result = append_bounded_lines_current(
+                tmp.path(),
+                &path,
+                &["{\"b\":2}", "{\"c\":3}"],
+                64,
+                false,
+                lock_wait,
+                &mut |_, _| {
+                    calls += 1;
+                    if calls > moves {
+                        return UnderLock::Write;
+                    }
+                    let moved = tmp.path().join(format!("moved-{calls}.jsonl"));
+                    std::fs::rename(&path, moved).unwrap();
+                    UnderLock::Reopen
+                },
+            );
+            let written = std::fs::read_to_string(&path).unwrap_or_default();
+            (result.map_err(|e| format!("{e:#}")), calls, written)
+        };
+
+        let (result, calls, written) = run(Some(Duration::from_secs(5)));
+        assert_eq!(result, Ok(false));
+        assert_eq!(calls, moves + 1);
+        assert_eq!(written, "{\"b\":2}\n{\"c\":3}\n");
+
+        let (result, calls, written) = run(None);
+        assert!(result.unwrap_err().contains("moved away"));
+        assert_eq!(calls, REOPEN_ATTEMPTS);
+        assert_eq!(written, "");
     }
 
     #[test]

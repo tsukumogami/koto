@@ -1764,9 +1764,10 @@ fn a_response_skips_its_record_while_another_writer_holds_the_lock() {
     drop(holder);
 }
 
-/// `koto next`'s response waits for the journal's lock like every other
-/// journal write: held well past the status bound, the lock is waited out,
-/// and the record is written once it's released, with no warning.
+/// `koto next`'s response waits for the journal's lock as long as every
+/// other journal write: held well past the status bound but released within
+/// the journal's, the lock is waited out, and the record is written once
+/// it's released, with no warning.
 #[test]
 fn a_next_response_waits_for_a_held_lock_and_is_written() {
     use std::os::unix::io::AsRawFd;
@@ -1799,6 +1800,131 @@ fn a_next_response_waits_for_a_held_lock_and_is_written() {
     assert_eq!(r.len(), 1);
     assert_eq!(r[0]["koto.response.source"], "next");
     assert!(warnings_for_test().is_empty(), "{:?}", warnings_for_test());
+}
+
+/// Hold `journal`'s lock from this thread, as a stopped writer would, until
+/// the returned file is dropped.
+#[cfg(unix)]
+fn hold_journal_lock(journal: &Path) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let holder = std::fs::File::open(journal).unwrap();
+    // SAFETY: flock on a descriptor `holder` owns until it is dropped.
+    assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+    holder
+}
+
+/// Every journal write has a bound, not only `koto status`'s: with the
+/// lock held past it, a `koto next` response gives up after about the
+/// bound, writes nothing, and warns once.
+#[cfg(unix)]
+#[test]
+fn a_next_response_skips_its_record_once_the_journal_bound_passes() {
+    use std::time::{Duration, Instant};
+    let f = session_in_a();
+    let journal = f.home.join(JOURNAL_FILE);
+    let before = std::fs::read_to_string(&journal).unwrap();
+    let bound = Duration::from_millis(50);
+    set_lock_wait_for_test(bound);
+    let holder = hold_journal_lock(&journal);
+    let started = Instant::now();
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Next,
+        "d",
+        None,
+    );
+    let took = started.elapsed();
+    drop(holder);
+    assert!(took >= bound, "{took:?}");
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
+    let warnings = warnings_for_test();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("held by another writer"),
+        "{warnings:?}"
+    );
+}
+
+/// A `koto status` response waits no longer than the journal's own bound
+/// when that is the tighter one.
+#[cfg(unix)]
+#[test]
+fn a_status_response_takes_the_tighter_of_its_wait_and_the_journal_bound() {
+    use std::time::Duration;
+    let f = session_in_a();
+    set_lock_wait_for_test(Duration::from_millis(5));
+    assert_eq!(journal_lock_wait(), Duration::from_millis(5));
+    let journal = f.home.join(JOURNAL_FILE);
+    let before = std::fs::read_to_string(&journal).unwrap();
+    let holder = hold_journal_lock(&journal);
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Status,
+        "d",
+        None,
+    );
+    drop(holder);
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
+    assert_eq!(warnings_for_test().len(), 1);
+    // Outside tests the journal's bound is the five seconds, and a status
+    // response keeps its 30 milliseconds.
+    reset_for_test();
+    assert_eq!(journal_lock_wait(), JOURNAL_LOCK_WAIT);
+    assert_eq!(JOURNAL_LOCK_WAIT, Duration::from_secs(5));
+    assert_eq!(
+        RESPONSE_LOCK_WAIT.min(JOURNAL_LOCK_WAIT),
+        RESPONSE_LOCK_WAIT
+    );
+}
+
+/// The terminal tick's record is bounded like the rest: with the lock held
+/// past the bound, `terminal` returns after about the bound with no record
+/// and one warning, so the tick's cleanup that follows it still runs.
+#[cfg(unix)]
+#[test]
+fn a_terminal_record_is_skipped_and_returns_once_the_bound_passes() {
+    use std::time::{Duration, Instant};
+    let f = session_in_a();
+    let journal = f.home.join(JOURNAL_FILE);
+    let before = std::fs::read_to_string(&journal).unwrap();
+    let batches = batches_for_test();
+    let bound = Duration::from_millis(50);
+    set_lock_wait_for_test(bound);
+    let holder = hold_journal_lock(&journal);
+    let started = Instant::now();
+    terminal(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        &header("wf", "wf-id", None),
+        "done",
+    );
+    let took = started.elapsed();
+    drop(holder);
+    assert!(took >= bound, "{took:?}");
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
+    assert_eq!(warnings_for_test().len(), 1, "{:?}", warnings_for_test());
+    assert_eq!(batches_for_test(), batches);
+
+    // With the lock free again the next terminal is written.
+    terminal(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        &header("wf", "wf-id", None),
+        "done",
+    );
+    let last = f.journal().pop().unwrap();
+    assert_eq!(last["kind"], "terminal");
+    assert_eq!(last["koto.terminal"], "done");
 }
 
 /// Rotation with a bound every journal is past.

@@ -395,11 +395,11 @@ These write no `response` record:
   in a state it doesn't describe, so it's skipped.
 - A `koto status` response that finds the journal locked by another
   writer for more than about 30 milliseconds. A writer that stopped while
-  holding the lock must not hang `koto status`, which an agent relies on
-  to recover, so the record is skipped with the warning
+  holding the lock must not hold up `koto status`, which an agent relies
+  on to recover, so the record is skipped with the warning
   [Failures](#failures) describes. A `koto next` response waits for the
-  lock like every other journal write and is never skipped for this
-  reason.
+  lock as long as every other journal write, up to five seconds (see
+  [Waiting for the lock](#waiting-for-the-lock)).
 
 Two `response` records of one session written in the same millisecond with
 no event committed between them are equal in every field. A reader that
@@ -442,7 +442,8 @@ An imported session is a new run: its own id is its run id.
 - Writers take an advisory lock on the file for each commit's records,
   so records are never interleaved. Records from concurrent commands on
   different sessions interleave line by line in the order they were
-  written.
+  written. A writer that can't take the lock in time skips its records
+  (see [Waiting for the lock](#waiting-for-the-lock)).
 - `at` is the time the record was written, not the time of the event it
   describes, and it isn't guaranteed to increase down the file across
   processes. Use file order within a session.
@@ -540,6 +541,32 @@ The next writer notices, under the lock, that the file doesn't end in a
 newline and starts its record on a line of its own, so only the partial
 line is lost.
 
+### Waiting for the lock
+
+Every write waits at most five seconds for the journal's lock, enough that
+koto commands contending for the journal never lose a record to each
+other. A `koto status` response waits at most 30 milliseconds. When the
+wait runs out, because another process holds the lock (one that stopped
+or hung while writing, say), the write's records are skipped with the
+warning above and the command carries on. Its standard output and exit
+code are the ones it would have had, and so is everything it does after
+the write: a terminal tick that can't write its `terminal` record still
+notifies the session's parent and removes the session, or keeps it, as it
+would have. The skipped records aren't written later. The wait isn't
+configurable.
+
+The wait covers taking the lock, and nothing else:
+
+- A command writes one batch per commit, and each waits on its own. A
+  command that writes several batches while the lock stays held can take
+  up to five seconds for each.
+- A writer that holds the lock finishes what it does under it however
+  long that takes. A rotation flushes the file it moves to disk and then
+  runs retention, both under the lock (see [Rotation](#rotation)); on a
+  slow disk that can take longer than the wait, and it isn't cut short.
+  The writers waiting behind it are the ones that give up, each after its
+  own wait.
+
 ## Durability
 
 Identity records are flushed to disk as they're written. Check, decider,
@@ -609,12 +636,13 @@ never truncated or rewritten in place:
   one moved it notices, once it holds the lock, that the path now names a
   different file, and opens the path again. No record is written to a file
   after it was moved.
-- **Responses.** The short wait a `koto status` response gives the lock
-  covers the whole write, the fresh file's lock after a rotation included,
-  so turning rotation on doesn't let a held lock stall `koto status`. When
-  the wait runs out the record is skipped, as
-  [Response records](#response-records) describes, whether or not the
-  journal was rotated first.
+- **Waiting.** A write's wait for the lock (see
+  [Waiting for the lock](#waiting-for-the-lock)) covers the whole write,
+  the fresh file's lock after a rotation included, so turning rotation on
+  doesn't lengthen it: a writer that rotated and then can't lock the fresh
+  file in what's left of its wait skips its records. The rotation itself
+  isn't timed. Its flush and its retention pass run under the lock to the
+  end, and the writers behind them wait no longer for it.
 - **Failure.** A move that fails prints one warning on standard error, and
   the record goes to the unrotated journal. That command doesn't try to
   rotate again.
