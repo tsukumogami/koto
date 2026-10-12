@@ -442,7 +442,7 @@ together with the old copy beside it, only when the session it points
 at is present at its target and the marker is older than
 `session.cloud.marker_retain_days` (or `--source-retired` says the old
 host is gone). That mode works on the bucket only and never touches
-`~/.koto/sessions/` beyond its stored plan; see
+`$HOME/.koto/sessions/` beyond its stored plan; see
 `docs/guides/cloud-sync-setup.md` for the rule.
 
 ### Sizing your prune cadence
