@@ -154,6 +154,8 @@
 
 mod driver;
 mod fixture;
+#[cfg(unix)]
+pub(crate) mod rotate;
 mod run_id;
 mod sidecar;
 
@@ -445,9 +447,16 @@ fn write_within(root: &Path, records: &[Record], lock_wait: Option<std::time::Du
         lines.push(line);
     }
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-    match crate::engine::jsonl_append::append_bounded_lines_no_follow_within(
+    // The batch goes to one file whole: a rotation happens before it or
+    // after it, never between two of its lines. A bounded lock wait covers
+    // the whole append, the fresh file's lock after a rotation included.
+    #[cfg(unix)]
+    let written = rotate::append(root, &refs, max, flush, lock_wait);
+    #[cfg(not(unix))]
+    let written = crate::engine::jsonl_append::append_bounded_lines_no_follow_within(
         root, &path, &refs, max, flush, lock_wait,
-    ) {
+    );
+    match written {
         Ok(flushed) => {
             if !refs.is_empty() {
                 count_batch(flushed);

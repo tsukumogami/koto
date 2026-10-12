@@ -63,6 +63,7 @@ pub fn load_config() -> Result<KotoConfig> {
             let user_config = load_config_file(&user_path, "user config")?;
             record_file_secrets(&mut config.secret_sources, &user_config.config);
             merge_config(&mut config, &user_config);
+            merge_run_journal(&mut config, &user_config);
             merge_decider(
                 &mut config.decider,
                 &user_config.config.decider,
@@ -246,6 +247,12 @@ fn load_config_file(path: &Path, label: &'static str) -> Result<LoadedConfig> {
         .and_then(|v| v.as_table())
         .and_then(|t| t.get("recursion"))
         .is_some();
+    let run_journal_keys = raw
+        .as_table()
+        .and_then(|t| t.get("run_journal"))
+        .and_then(|v| v.as_table())
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default();
     let workflows_native_present = raw
         .as_table()
         .and_then(|t| t.get("workflows"))
@@ -256,6 +263,7 @@ fn load_config_file(path: &Path, label: &'static str) -> Result<LoadedConfig> {
         config,
         request_store_keys,
         request_store_has_recursion,
+        run_journal_keys,
         workflows_native_present,
     })
 }
@@ -345,6 +353,7 @@ struct LoadedConfig {
     config: KotoConfig,
     request_store_keys: Vec<String>,
     request_store_has_recursion: bool,
+    run_journal_keys: Vec<String>,
     workflows_native_present: bool,
 }
 
@@ -424,6 +433,27 @@ fn merge_config(target: &mut KotoConfig, source: &LoadedConfig) {
     }
     if source.workflows_native_present {
         target.workflows.native = source.config.workflows.native;
+    }
+}
+
+/// Apply the `[run_journal]` keys a config file sets. Called for the user
+/// layer only: the journal lives beside the user's session store, so a
+/// project file in a cloned repository must not turn rotation on or shorten
+/// retention for it (`koto config set` refuses these keys without `--user`).
+fn merge_run_journal(target: &mut KotoConfig, source: &LoadedConfig) {
+    for key in &source.run_journal_keys {
+        match key.as_str() {
+            "rotate_bytes" => {
+                target.run_journal.rotate_bytes = source.config.run_journal.rotate_bytes;
+            }
+            "retain_days" => {
+                target.run_journal.retain_days = source.config.run_journal.retain_days;
+            }
+            "reader_stale_days" => {
+                target.run_journal.reader_stale_days = source.config.run_journal.reader_stale_days;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -975,11 +1005,13 @@ mod tests {
                 },
                 request_store: RequestStoreConfig::default(),
                 workflows: Default::default(),
+                run_journal: Default::default(),
                 decider: Default::default(),
                 secret_sources: Default::default(),
             },
             request_store_keys: vec![],
             request_store_has_recursion: false,
+            run_journal_keys: vec![],
             workflows_native_present: false,
         };
 
@@ -998,6 +1030,7 @@ mod tests {
             config: KotoConfig::default(),
             request_store_keys: vec![],
             request_store_has_recursion: false,
+            run_journal_keys: vec![],
             workflows_native_present: false,
         };
         merge_config(&mut base, &overlay);
@@ -1019,6 +1052,7 @@ mod tests {
             config: KotoConfig::default(),
             request_store_keys: vec![],
             request_store_has_recursion: false,
+            run_journal_keys: vec![],
             workflows_native_present: false,
         };
         merge_config(&mut base, &unset);
@@ -1031,6 +1065,7 @@ mod tests {
             config: off,
             request_store_keys: vec![],
             request_store_has_recursion: false,
+            run_journal_keys: vec![],
             workflows_native_present: false,
         };
         merge_config(&mut base, &overlay);
@@ -1057,6 +1092,33 @@ mod tests {
         let loaded = load_config_file(&path, "user config").unwrap();
         assert!(loaded.config.workflows.native);
         assert!(loaded.workflows_native_present);
+    }
+
+    #[test]
+    fn test_run_journal_keys_apply_from_the_user_layer_only() {
+        let tmp = TempDir::new().unwrap();
+        let user = tmp.path().join("user.toml");
+        fs::write(
+            &user,
+            "[run_journal]\nrotate_bytes = 4096\nretain_days = 3\n",
+        )
+        .unwrap();
+        let project = tmp.path().join("project.toml");
+        fs::write(&project, "[run_journal]\nretain_days = 5\n").unwrap();
+
+        let mut config = KotoConfig::default();
+        let user_layer = load_config_file(&user, "user config").unwrap();
+        merge_config(&mut config, &user_layer);
+        merge_run_journal(&mut config, &user_layer);
+        // The project layer goes through merge_config only, which leaves
+        // [run_journal] alone.
+        merge_config(
+            &mut config,
+            &load_config_file(&project, "project config").unwrap(),
+        );
+        assert_eq!(config.run_journal.rotate_bytes, 4096);
+        assert_eq!(config.run_journal.retain_days, 3);
+        assert_eq!(config.run_journal.reader_stale_days, 90);
     }
 
     #[test]
@@ -1093,6 +1155,7 @@ mod tests {
             config: off,
             request_store_keys: vec![],
             request_store_has_recursion: false,
+            run_journal_keys: vec![],
             workflows_native_present: true,
         };
         merge_config(&mut base, &optout);
@@ -1108,6 +1171,7 @@ mod tests {
             config: KotoConfig::default(),
             request_store_keys: vec![],
             request_store_has_recursion: false,
+            run_journal_keys: vec![],
             workflows_native_present: false,
         };
         merge_config(&mut base_off, &absent);
@@ -1392,6 +1456,7 @@ mod tests {
                 config: toml::from_str("[decider]\nmode = \"auto\"\napi_key = \"x\"\n").unwrap(),
                 request_store_keys: vec![],
                 request_store_has_recursion: false,
+                run_journal_keys: vec![],
                 workflows_native_present: false,
             };
             merge_config(&mut base, &loaded);

@@ -1763,6 +1763,95 @@ fn a_response_skips_its_record_while_another_writer_holds_the_lock() {
     drop(holder);
 }
 
+/// Rotation with a bound every journal is past.
+#[cfg(unix)]
+fn rotate_at_one_byte() {
+    rotate::set_settings_for_test(rotate::Settings {
+        rotate_bytes: 1,
+        retain_days: 30,
+        reader_stale_days: 90,
+    });
+}
+
+/// With rotation on and the journal past its bound, a response rotates the
+/// journal before writing: the rotated file keeps every byte it had, and
+/// the record lands whole, alone, in the fresh journal.
+#[cfg(unix)]
+#[test]
+fn a_response_lands_whole_in_the_fresh_journal_after_a_rotation() {
+    let f = session_in_a();
+    let journal = f.home.join(JOURNAL_FILE);
+    let before = std::fs::read_to_string(&journal).unwrap();
+    assert!(!before.is_empty());
+    rotate_at_one_byte();
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Status,
+        "directive",
+        Some("details"),
+    );
+    let rotated = f.home.join(rotate::rotated_name(1));
+    assert_eq!(std::fs::read_to_string(&rotated).unwrap(), before);
+    let fresh = std::fs::read_to_string(&journal).unwrap();
+    assert!(fresh.ends_with('\n'), "{fresh:?}");
+    let j = f.journal();
+    assert_eq!(j.len(), 1, "{fresh}");
+    let r = response_records(&j);
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["session"], "wf");
+    assert_eq!(r[0]["koto.state"], "a");
+    assert_eq!(r[0]["koto.response.source"], "status");
+    assert_eq!(r[0]["koto.response.directive_bytes"], 9);
+    assert_eq!(r[0]["koto.response.details_bytes"], 7);
+    assert!(warnings_for_test().is_empty(), "{:?}", warnings_for_test());
+    assert!(
+        rotate::warnings_for_test().is_empty(),
+        "{:?}",
+        rotate::warnings_for_test()
+    );
+}
+
+/// Rotation doesn't lengthen a response's wait for a held lock, and nothing
+/// is rotated while it's held: the journal past its bound stays where it
+/// is, unchanged, and the record is skipped with the one warning.
+#[cfg(unix)]
+#[test]
+fn a_response_skips_its_record_while_the_lock_is_held_with_rotation_on() {
+    use std::os::unix::io::AsRawFd;
+    let f = session_in_a();
+    let journal = f.home.join(JOURNAL_FILE);
+    let before = std::fs::read_to_string(&journal).unwrap();
+    rotate_at_one_byte();
+    let holder = std::fs::File::open(&journal).unwrap();
+    // SAFETY: flock on a descriptor `holder` owns until it is dropped.
+    assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let started = std::time::Instant::now();
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Status,
+        "d",
+        None,
+    );
+    let took = started.elapsed();
+    drop(holder);
+    assert!(took >= RESPONSE_LOCK_WAIT, "{took:?}");
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
+    assert!(!f.home.join(rotate::rotated_name(1)).exists());
+    let warnings = warnings_for_test();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("held by another writer"),
+        "{warnings:?}"
+    );
+}
+
 // ----- Decider and override records -----
 
 use crate::decider::check::{DeciderCheck, RecordedOutcome, UnansweredReason};

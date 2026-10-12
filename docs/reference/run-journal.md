@@ -556,14 +556,144 @@ No session-lifecycle command deletes or rewrites the journal:
 `koto session cleanup`, `koto cancel --cleanup`, the removal of a session
 at its terminal tick, a parent's sweep of its children,
 `koto init --replace-terminal` and `koto session import` all leave existing
-lines byte-identical. koto doesn't rotate or prune it yet, so it grows by
-a few hundred bytes per state entered, per check evaluation, decider call,
-override and printed directive, and by up to 50 more lines for a check that
-reports many error rules.
+lines byte-identical. The journal grows by a few hundred bytes per state
+entered, per check evaluation, decider call, override and printed
+directive, and by up to 50 more lines for a check that reports many error
+rules.
 
 To remove it by hand, delete the file (or move it aside) while no koto
 command is running. The next record creates a new file. Lines removed this
 way can't be rebuilt once the sessions they describe are gone.
+
+### Rotation
+
+Rotation is off by default, and stays off by default until the journal's
+consumers list rotated files. Turn it on with a size bound in user config,
+for example 64 MiB:
+
+```bash
+koto config set run_journal.rotate_bytes 67108864 --user
+```
+
+The settings are read from user config only; `koto config set` refuses
+them without `--user`, and a project's `.koto/config.toml` can't change them,
+since the journal belongs to the user's store rather than to any one
+repository. A bound of 0 turns rotation off again.
+
+With a bound set, the write that finds the journal at or over the bound
+first moves the journal to the next rotated name, then writes its records to
+a fresh `_run_journal.jsonl`. The check runs once per write, under the
+journal's lock and before anything is written. A write is one commit's
+records (a check's `check_evaluated` and its `check_rule` records, say), so
+they always land together in one file; a rotation can fall between two
+writes of the same command. The file being moved is flushed to disk first,
+so the check, decider, override and response records it holds that weren't
+flushed yet don't wait on a flush that will now go to the new file. The journal is
+never truncated or rewritten in place:
+
+- **Naming.** Rotated files sit beside the journal as
+  `_run_journal.NNNNNNNNNN.jsonl`: ten decimal digits, zero-padded, starting
+  at `_run_journal.0000000001.jsonl`. Each new one is numbered one past the
+  highest that exists, so sorting the names gives rotation order, oldest
+  first, and `_run_journal.jsonl` is always the newest file.
+- **The move.** A rotation links the file to its new name, which fails rather
+  than replace an existing file, and then removes the old name. The file keeps
+  its device and inode number. A partial last line (a write cut short) gets
+  its newline first, so no rotated file ends mid-line. A crash between the
+  link and the removal leaves the file under both names; the next write
+  finishes the move by removing the journal's name, so a file never gets two
+  rotated names.
+- **No late writes.** A command that opened the journal just before another
+  one moved it notices, once it holds the lock, that the path now names a
+  different file, and opens the path again. No record is written to a file
+  after it was moved.
+- **Responses.** A `response` record's short wait for the lock covers the
+  whole write, the fresh file's lock after a rotation included, so turning
+  rotation on doesn't let a held lock stall `koto next` or `koto status`.
+  When the wait runs out the record is skipped, as
+  [Response records](#response-records) describes, whether or not the
+  journal was rotated first.
+- **Failure.** A move that fails prints one warning on standard error, and
+  the record goes to the unrotated journal. That command doesn't try to
+  rotate again.
+
+### Reading across a rotation
+
+A reader that follows the journal by byte offset keeps three numbers for the
+file it's reading: its device, its inode and the offset it has read up to.
+On each pass:
+
+1. Open `_run_journal.jsonl` and `fstat` the open file. (Stat-then-open could
+   race a rotation.) If it doesn't exist, a rotation has moved it and no
+   record has been written since. Do step 3 without the new file: read the
+   rest of yours and every newer rotated file, keep the last one's device,
+   inode and end offset, and look again on the next pass.
+2. If the device and inode are the ones you kept, read from your offset.
+3. Otherwise the file you were reading was rotated. Find the rotated file
+   with your device and inode, read it from your offset to its end, then read
+   every newer rotated file, in name order, from its first byte, then the
+   file you opened in step 1 from its first byte. If that file shows up among
+   the rotated ones (another rotation happened during the pass), skip it
+   there, since you read it last. Keep its device and inode and the new
+   offset.
+
+A reader that doesn't follow by offset but copies the live journal by its
+exact name every so often, keeping a shrunk or changed file as a new
+version, needs one more step to stay lossless. The lines written after its
+last copy and before a rotation exist only in the rotated file. So on every
+pass, before copying `_run_journal.jsonl`, it lists the rotated files by the
+naming rule and copies each one newer than the last it copied, in name
+order.
+
+### Retention
+
+Rotated files are removed only during a rotation, and only when two things
+hold: the file is older than the retention bound, measured from its rotation
+(koto stamps the file's modification time when it rotates it), and no
+recorded reader position still needs it. The newest rotated file is never
+removed, so the numbering never restarts and name order stays rotation
+order. The bound is 30 days by default:
+
+```bash
+koto config set run_journal.retain_days 30 --user
+```
+
+A reader that wants its unread files kept past the bound records its
+position in a file of its own in `_run_journal.readers/` beside the journal,
+named `<reader-id>.json`, where the id is 1 to 64 letters, digits, dots,
+underscores or hyphens. koto creates the directory, mode 0700, at the first
+rotation, and never writes a position itself. The file holds one JSON
+object:
+
+```text
+{"v": 1, "dev": 16777231, "inode": 1234567, "offset": 52311,
+ "file": "_run_journal.0000000007.jsonl"}
+```
+
+`dev` and `inode` name the journal file the reader is in, and `offset` is
+how many bytes of it it has read. `file` is optional and only informational.
+A reader that copies whole files records the device and inode of the last
+file it copied and that file's length. Write the position to a temporary
+file and rename it into place, and refresh it on every pass.
+
+A position needs the file it names and every newer one, except that a
+position at or past the end of a rotated file needs only the newer ones.
+koto reads position files and the journal files' names and metadata, never a
+journal record. A position file that is larger than 4 KiB, a symlink, or
+doesn't parse protects nothing, and neither does one not modified within the
+stale bound (90 days by default); each is named in a warning on standard
+error. A position whose device and inode match no journal file (its file
+was already removed) protects nothing either, and is reported at each
+rotation until the reader updates or removes it. Change the stale bound
+with:
+
+```bash
+koto config set run_journal.reader_stale_days 90 --user
+```
+
+With no positions recorded, the retention bound alone decides. A reader that
+records no position and stays away longer than the bound misses the files
+removed in the meantime.
 
 ## Reading the journal
 

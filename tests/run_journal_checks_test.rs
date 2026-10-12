@@ -1528,6 +1528,39 @@ fn response_bytes_summed_per_visit_match_the_printed_responses() {
 /// record. Once the lock is free it writes one again.
 #[test]
 fn koto_status_returns_promptly_while_the_journal_lock_is_held() {
+    status_while_the_journal_lock_is_held(None);
+}
+
+/// The same with rotation on and the journal already past its bound: the
+/// held lock is waited for no longer than without rotation, and nothing is
+/// rotated while it's held. Once the lock is free, the next `koto status`
+/// rotates the journal and its `response` record lands whole in the fresh
+/// file.
+#[test]
+fn koto_status_returns_promptly_while_the_journal_lock_is_held_with_rotation_on() {
+    status_while_the_journal_lock_is_held(Some(1));
+}
+
+/// The rotated files beside the journal, by the naming rule, oldest first.
+fn rotated_journals(env: &Env) -> Vec<PathBuf> {
+    let mut names: Vec<String> = std::fs::read_dir(env.koto_home())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| {
+            n.strip_prefix("_run_journal.")
+                .and_then(|r| r.strip_suffix(".jsonl"))
+                .is_some_and(|d| d.len() == 10 && d.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect();
+    names.sort();
+    names.into_iter().map(|n| env.koto_home().join(n)).collect()
+}
+
+/// `koto status` against a journal whose lock another process holds, with
+/// `run_journal.rotate_bytes` set to `rotate_bytes` (left unset for
+/// `None`) once the session's first response is written.
+fn status_while_the_journal_lock_is_held(rotate_bytes: Option<u64>) {
     use std::os::unix::io::AsRawFd;
     use std::time::{Duration, Instant};
     let env = Env::new();
@@ -1537,7 +1570,22 @@ fn koto_status_returns_promptly_while_the_journal_lock_is_held() {
     env.ok_in(&dir, &["init", "held", "--template", t.to_str().unwrap()]);
     let free = env.ok_in(&dir, &["status", "held"]);
     assert_eq!(env.responses("held").len(), 1);
+    if let Some(bytes) = rotate_bytes {
+        env.ok_in(
+            &dir,
+            &[
+                "config",
+                "set",
+                "run_journal.rotate_bytes",
+                &bytes.to_string(),
+                "--user",
+            ],
+        );
+    }
     let journal_before = std::fs::read_to_string(env.journal_path()).unwrap();
+    if let Some(bytes) = rotate_bytes {
+        assert!(journal_before.len() as u64 >= bytes);
+    }
 
     let holder = std::fs::File::open(env.journal_path()).unwrap();
     // SAFETY: flock on a descriptor `holder` owns until it is dropped.
@@ -1592,9 +1640,29 @@ fn koto_status_returns_promptly_while_the_journal_lock_is_held() {
         std::fs::read_to_string(env.journal_path()).unwrap(),
         journal_before
     );
+    assert!(rotated_journals(&env).is_empty());
 
     env.ok_in(&dir, &["status", "held"]);
-    assert_eq!(env.responses("held").len(), 2);
+    if rotate_bytes.is_none() {
+        assert_eq!(env.responses("held").len(), 2);
+        assert!(rotated_journals(&env).is_empty());
+        return;
+    }
+    // The journal as it stood moved, byte for byte, to the first rotated
+    // name; the fresh journal holds the one response and nothing else.
+    let rotated = rotated_journals(&env);
+    assert_eq!(rotated.len(), 1, "{rotated:?}");
+    assert!(rotated[0].ends_with("_run_journal.0000000001.jsonl"));
+    assert_eq!(
+        std::fs::read_to_string(&rotated[0]).unwrap(),
+        journal_before
+    );
+    let fresh = std::fs::read_to_string(env.journal_path()).unwrap();
+    assert_eq!(fresh.lines().count(), 1, "{fresh}");
+    assert!(fresh.ends_with('\n'), "{fresh:?}");
+    let records = env.responses("held");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["koto.response.source"], "status");
 }
 
 // ----- A journal koto can't write -----
