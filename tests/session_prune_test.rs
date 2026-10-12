@@ -371,7 +371,7 @@ fn build_store(env: &Env) -> BTreeMap<&'static str, &'static str> {
     env.done("free-released");
     env.point_at_leg(
         "free-released",
-        "req-00000000-0000-4000-8000-000000000000",
+        "req-missing-for-prune-test",
         "reviewer",
     );
 

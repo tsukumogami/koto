@@ -649,7 +649,7 @@ A session references the session its header's `parent_workflow` names and the on
   "remove": [
     {"kind": "session", "name": "review-12", "session_id": "<session-id>",
      "status": "terminal", "state": "done", "failure": false,
-     "finished_at": "2026-10-11T23:50:02.410Z", "execution_dir": "/home/user/project"}
+     "finished_at": "2026-10-11T23:50:02.410Z", "execution_dir": "/work/project"}
   ],
   "kept": [
     {"name": "plan-7", "rule": "b", "detail": "referenced by running session 'plan-7.task-2'"}
