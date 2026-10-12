@@ -231,17 +231,32 @@ fn an_unknown_name_and_a_pruned_record_answer_not_found() {
 /// Leave a finished record beside a kept session, as a crash between the
 /// record's write and the session's removal would.
 fn crash_leaves_a_record(env: &Env, name: &str) {
+    // Kept at its terminal with `--no-cleanup`, so the session is still there.
     env.init(name);
     env.finish(name, "yes", true);
-    let template = env.record_path("template");
-    // Any finished record will do; the session's own fields aren't checked.
-    env.init("template");
-    env.finish("template", "yes", false);
-    let mut record = env.record("template");
+    // A donor session koto removes gives a real record to copy under `name`;
+    // the copy's own fields aren't checked.
+    env.init("donor");
+    env.finish("donor", "yes", false);
+    let mut record = env.record("donor");
     record["name"] = Value::from(name);
     std::fs::write(env.record_path(name), serde_json::to_vec(&record).unwrap()).unwrap();
-    let _ = std::fs::remove_file(template);
+    std::fs::remove_file(env.record_path("donor")).unwrap();
     assert!(env.sessions().join(name).is_dir());
+    assert!(env.record_path(name).exists());
+}
+
+#[test]
+fn cleanup_of_a_name_koto_already_removed_keeps_its_record() {
+    let env = Env::new();
+    env.init("done-already");
+    env.finish("done-already", "yes", false);
+    assert!(!env.sessions().join("done-already").exists());
+    // Cleanup is idempotent; on a name koto removed it removes nothing, and
+    // the record stays the status answer.
+    env.ok(&["session", "cleanup", "done-already"]);
+    assert!(env.record_path("done-already").exists());
+    assert_eq!(json(&env.status("done-already"))["removed"], true);
 }
 
 #[test]

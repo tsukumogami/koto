@@ -404,9 +404,9 @@ impl SessionBackend for LocalBackend {
         rewrite_header_identity(&to_dir, to)?;
 
         // A live session now holds `to`, so a finished record left under that
-        // name must not answer for it once it is removed later, as `init`
-        // ensures for a new session. The session moved here is live, so it
-        // has no record of its own to carry along.
+        // name must not answer for it once it is removed later; `init_state_file`
+        // makes the same removal for a new session. The session moved here is
+        // live, so it has no record of its own to carry along.
         if let Err(e) = crate::session::finished::remove(&self.base_dir, to) {
             eprintln!("warning: could not remove the finished record for {to}: {e:#}");
         }
