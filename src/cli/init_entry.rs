@@ -635,7 +635,7 @@ fn create(
         // cleanup below then fails, the replace is refused with the old
         // session in place and its kept children already gone; they were
         // terminal, so nothing live is lost.
-        super::workspace::sweep_terminal_descendants(backend, name);
+        super::workspace::sweep_terminal_descendants(backend, backend, name);
         if let Err(e) = backend.cleanup(name) {
             refuse(
                 entry,

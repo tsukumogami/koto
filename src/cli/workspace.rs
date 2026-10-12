@@ -338,6 +338,7 @@ fn collect_descendants(root: &str, sessions: &[SessionInfo]) -> Vec<String> {
 /// behind, visible in `koto workflows --orphaned`.
 pub(crate) fn sweep_if_parent(
     backend: &dyn SessionBackend,
+    context_store: &dyn crate::session::context::ContextStore,
     name: &str,
     compiled: &CompiledTemplate,
 ) {
@@ -352,7 +353,7 @@ pub(crate) fn sweep_if_parent(
                 .any(|e| matches!(e.payload, EventPayload::ChildCompleted { .. }))
         });
     if had_children {
-        sweep_terminal_descendants(backend, name);
+        sweep_terminal_descendants(backend, context_store, name);
     }
 }
 
@@ -375,7 +376,11 @@ pub(crate) fn sweep_if_parent(
 ///   the window in which a concurrent `koto rewind` could bring it back;
 /// - a failed removal warns and the walk continues; the caller removes the
 ///   parent either way, and a leftover shows in `koto workflows --orphaned`.
-pub(crate) fn sweep_terminal_descendants(backend: &dyn SessionBackend, parent: &str) {
+pub(crate) fn sweep_terminal_descendants(
+    backend: &dyn SessionBackend,
+    context_store: &dyn crate::session::context::ContextStore,
+    parent: &str,
+) {
     let sessions = match backend.list() {
         Ok(s) => s,
         Err(e) => {
@@ -390,7 +395,7 @@ pub(crate) fn sweep_terminal_descendants(backend: &dyn SessionBackend, parent: &
         }
     }
     let mut visited: HashSet<String> = HashSet::from([parent.to_string()]);
-    sweep_children(backend, parent, &children, &mut visited, 0);
+    sweep_children(backend, context_store, parent, &children, &mut visited, 0);
 }
 
 /// Deeper than any real fan-out; only a corrupted header graph reaches it.
@@ -399,6 +404,7 @@ const MAX_SWEEP_DEPTH: usize = 1000;
 /// Sweep the children of `id`. Returns true when every child was removed.
 fn sweep_children(
     backend: &dyn SessionBackend,
+    context_store: &dyn crate::session::context::ContextStore,
     id: &str,
     children: &HashMap<&str, Vec<&str>>,
     visited: &mut HashSet<String>,
@@ -421,7 +427,7 @@ fn sweep_children(
             all_removed = false;
             continue;
         }
-        if !sweep_children(backend, child, children, visited, depth + 1) {
+        if !sweep_children(backend, context_store, child, children, visited, depth + 1) {
             all_removed = false;
             continue;
         }
@@ -429,6 +435,12 @@ fn sweep_children(
         if !is_terminal_session(backend, child) {
             all_removed = false;
             continue;
+        }
+        // Its finished record first, so `koto status` can answer for it once
+        // it is gone.
+        #[cfg(unix)]
+        if let Some(record) = super::finished_record_for_child(backend, context_store, child) {
+            super::write_finished_record(backend, &record);
         }
         match backend.cleanup(child) {
             Ok(()) => {}
@@ -728,7 +740,7 @@ mod tests {
             .init_state_file("leaf", header("leaf"), vec![])
             .unwrap();
 
-        sweep_if_parent(&backend, "leaf", &leaf_template());
+        sweep_if_parent(&backend, &backend.inner, "leaf", &leaf_template());
         assert_eq!(
             backend.lists.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -750,7 +762,7 @@ mod tests {
                 "2026-01-01T00:00:01Z",
             )
             .unwrap();
-        sweep_if_parent(&backend, "leaf", &leaf_template());
+        sweep_if_parent(&backend, &backend.inner, "leaf", &leaf_template());
         assert_eq!(backend.lists.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 

@@ -319,6 +319,8 @@ Returns read-only state metadata for a workflow. No gates are evaluated, no acti
 }
 ```
 
+A session koto removed itself (at its success terminal, or with its parent) still answers, exit 0, from the finished record koto wrote before removing it: `current_state`, `is_terminal: true` and `result` mean what they do for a kept terminal session, plus `removed: true`, `finished_at`, `session_id` and `execution_dir`. `not found` (exit 2) means no session and no record; see `error-handling.md`.
+
 ### Retrieving the current phase's instructions
 
 When the workflow is not at a terminal state, the response also carries the
