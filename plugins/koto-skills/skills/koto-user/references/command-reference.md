@@ -319,7 +319,7 @@ Returns read-only state metadata for a workflow. No gates are evaluated, no acti
 }
 ```
 
-A session koto removed itself (at its success terminal, or with its parent) still answers, exit 0, from the finished record koto wrote before removing it: `current_state`, `is_terminal: true` and `result` mean what they do for a kept terminal session, plus `removed: true`, `finished_at`, `session_id` and `execution_dir`. `not found` (exit 2) means no session and no record; see `error-handling.md`.
+A session koto removed itself (at its success terminal, or with its parent) still answers, exit 0, from the finished record koto wrote before removing it: `current_state`, `is_terminal: true` and `result` mean what they do for a kept terminal session, plus `removed: true`, `finished_at`, `session_id` and `execution_dir`. A child cancelled before its parent removed it also carries `status: "cancelled"` and a null `result`, and a result too large for the record carries `result_truncated: true` with only its `status` and `summary`. `not found` (exit 2) means no session and no record; see `error-handling.md`.
 
 ### Retrieving the current phase's instructions
 
