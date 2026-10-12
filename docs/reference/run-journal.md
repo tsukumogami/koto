@@ -4,8 +4,9 @@ The run journal is a local record of session identity and progress for
 tooling outside koto. koto appends one JSON object per line as sessions
 start, enter states, reach a terminal, are cancelled, or are driven by a new
 Claude Code session, each time koto evaluates one of their checks or
-consults the decider, and each time an override is recorded. The journal
-is append-only: koto never rewrites or reads back its records, so a
+consults the decider, each time an override is recorded, and each time
+`koto next` or `koto status` prints a state's directive. The journal is
+append-only: koto never rewrites or reads back its records, so a
 session's lines outlive the session itself, including sessions koto removes
 at their terminal tick or on `koto session cleanup`.
 
@@ -58,11 +59,12 @@ A field with no value is left out, never written as `null` or an empty
 string. Ids (every `*.id` field except `koto.rule.id`, and
 `koto.template.hash`) must match `^[A-Za-z0-9._:-]{1,128}$`. Names
 (`koto.template.name`, `koto.state`, `koto.terminal`, `koto.check`, and
-the string values of the check, decider and override kinds) must match
-`^[A-Za-z0-9._:/@-]{1,128}$` and not start with `/` or `~`. A value outside
-its shape is left out and the record is still written. `koto.rule.id` is
-never left out: a rule id outside the name shape, a decider criterion's id
-included, is written as its digest (see [Rule ids](#rule-ids)).
+the string values of the check, decider, override and response kinds)
+must match `^[A-Za-z0-9._:/@-]{1,128}$` and not start with `/` or `~`. A
+value outside its shape is left out and the record is still written.
+`koto.rule.id` is never left out: a rule id outside the name shape, a
+decider criterion's id included, is written as its digest (see
+[Rule ids](#rule-ids)).
 
 ### Record kinds
 
@@ -79,11 +81,13 @@ included, is written as its digest (see [Rule ids](#rule-ids)).
 | `decider_consulted` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.outcome`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.latency_ms`, `koto.decider.directive_bytes` | koto consults the decider about a state's evidence. |
 | `decider_checked` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.mode`, `koto.decider.outcome`, `koto.decider.reason`, `koto.decider.blocked`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.attempts`, `koto.decider.latency_ms` | koto grades one criterion of a decider check. |
 | `check_overridden` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check` | An override is recorded for a gate. |
+| `response` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.response.source`, `koto.response.directive_bytes`, `koto.response.details_bytes` | `koto next` or `koto status` has printed a non-terminal state's directive. |
 
 The first five are the identity kinds. The next three are the check kinds,
-described in [Check records](#check-records), and the last three are the
+described in [Check records](#check-records), the three after them are the
 decider and override kinds, described in
-[Decider and override records](#decider-and-override-records).
+[Decider and override records](#decider-and-override-records), and
+`response` is described in [Response records](#response-records).
 
 `session_started`'s fields:
 
@@ -277,7 +281,7 @@ committed `decider_consulted` event.
 | `koto.decider.output_tokens` | integer | when logged | Output tokens of the billed answer. |
 | `koto.decider.unread_usage_attempts` | integer | always | Billed answers whose token usage couldn't be read, so an undercount of the two counts above is visible. 0 when the event doesn't log it. |
 | `koto.decider.latency_ms` | integer | always | Wall time of the provider call, in milliseconds. |
-| `koto.decider.directive_bytes` | integer | always | Byte length of the directive and details the agent would have received for the state. |
+| `koto.decider.directive_bytes` | integer | always | UTF-8 bytes of the directive plus its details (and the recovery pointer a state with details gets) that `koto next` would have returned to the agent for the consulted state, had the routing decider not been consulted; details already delivered in that visit don't count, and an applied consultation spares the agent these bytes. This differs from a `response` record's `koto.response.directive_bytes`, which counts only the printed directive. |
 
 ### `decider_checked`
 
@@ -357,6 +361,58 @@ join finds the evaluation before the transition.
 {"kind":"check_overridden","v":1,"at":"2026-10-10T03:18:02.731Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":25,"koto.visit.seq":9,"koto.state":"implement","koto.check":"comments"}
 ```
 
+## Response records
+
+koto writes one `response` record each time `koto next` or `koto status`
+prints a directive, right after printing it. It records how much
+instruction text koto handed the agent, never the text itself.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.seq` | integer | always | The highest sequence number in the session's log when the record was written. A response relays no event, so this places it among the session's check, decider and override records: after every event committed before it printed. |
+| `koto.visit.seq` | integer | always | The visit the session is in, as for check records. |
+| `koto.state` | string | always | The state whose directive was printed. |
+| `koto.response.source` | string | always | `next` or `status`: the command that printed it. |
+| `koto.response.directive_bytes` | integer | always | The UTF-8 byte length of the printed `directive` string, after JSON decoding: escapes don't count, multi-byte characters count every byte, and text koto adds to the directive (the pointer to `koto status`, a notice) counts. |
+| `koto.response.details_bytes` | integer | always | The same for the printed `details` string, or 0 when the response printed none, including when koto left the details out because this visit already received them. |
+
+`koto next` writes its record after the response's `instructions_delivered`
+event, when it has one, so `koto.seq` covers that event. A `koto next` that
+chains through several states prints, and records, only the state it
+stopped in. Summing a state's `koto.response.directive_bytes` and
+`koto.response.details_bytes` per `koto.visit.seq` gives the instruction
+bytes the agent received in each visit.
+
+These write no `response` record:
+
+- A `koto next` that lands on a terminal state, or a `koto status` of a
+  session in one, since neither prints a directive.
+- A command that prints an error, such as a `koto next` whose evidence is
+  refused at validation, or a `koto status` of a session that doesn't
+  exist.
+- A response whose session another command moved to a different state
+  between the print and the record. The record would place the response
+  in a state it doesn't describe, so it's skipped.
+- A `koto status` response that finds the journal locked by another
+  writer for more than about 30 milliseconds. A writer that stopped while
+  holding the lock must not hang `koto status`, which an agent relies on
+  to recover, so the record is skipped with the warning
+  [Failures](#failures) describes. A `koto next` response waits for the
+  lock like every other journal write and is never skipped for this
+  reason.
+
+Two `response` records of one session written in the same millisecond with
+no event committed between them are equal in every field. A reader that
+removes exact duplicates (see [Write and ordering
+rules](#write-and-ordering-rules)) counts them once; koto takes longer than
+that to answer a command, so this is rare.
+
+### Example
+
+```json
+{"kind":"response","v":1,"at":"2026-10-10T03:15:02.131Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":15,"koto.visit.seq":9,"koto.state":"implement","koto.response.source":"next","koto.response.directive_bytes":1342,"koto.response.details_bytes":0}
+```
+
 ## Run ids
 
 A run is a root session and every session spawned under it, at any depth.
@@ -390,14 +446,18 @@ An imported session is a new run: its own id is its run id.
 - `at` is the time the record was written, not the time of the event it
   describes, and it isn't guaranteed to increase down the file across
   processes. Use file order within a session.
-- Order one session's check, decider and override records by
+- Order one session's check, decider, override and response records by
   `koto.seq`, then by file order. A `check_evaluated` comes before its own
-  `check_rule` records, which share its `koto.seq`.
+  `check_rule` records, which share its `koto.seq`. A `response` comes
+  after the records of the events committed before it printed.
 - A copy of the journal that delivered some lines more than once (a
   sender that retries, for example) holds exact duplicates. Treat two
-  check, decider or override records as duplicates only when every field,
-  `at` included, is equal. Distinct records of these kinds differ in
-  `kind`, `at`, `koto.seq` or `koto.rule.id`.
+  check, decider, override or response records as duplicates only when
+  every field, `at` included, is equal. Distinct check, decider and
+  override records differ in `kind`, `at`, `koto.seq` or `koto.rule.id`.
+  Two `response` records can be equal without being a duplicate; see the
+  note on responses printed in the same millisecond under [Response
+  records](#response-records).
 - `koto session import` writes the imported session's `session_started` and
   one `state_entered` for the state it's in, both timed at the import,
   exactly once per imported session. A retry or a rerun that adopts an
@@ -482,14 +542,15 @@ line is lost.
 
 ## Durability
 
-Identity records are flushed to disk as they're written. Check, decider
-and override records aren't flushed on their own, since a blocked tick
-writes several and a flush takes milliseconds. They reach the operating
-system as soon as they're written, so a koto process that crashes or is
-killed loses none of them, and the next identity record's flush (the
-session's next state entry, terminal or cancel) makes them durable along
-with it. An operating system crash or a power loss can lose check,
-decider and override records written since the journal's last flush.
+Identity records are flushed to disk as they're written. Check, decider,
+override and response records aren't flushed on their own, since a blocked
+tick writes several and a flush takes milliseconds. They reach the
+operating system as soon as they're written, so a koto process that
+crashes or is killed loses none of them, and the next identity record's
+flush (the session's next state entry, terminal or cancel) makes them
+durable along with it. An operating system crash or a power loss can lose
+check, decider, override and response records written since the journal's
+last flush.
 
 ## Retention
 
@@ -498,8 +559,9 @@ No session-lifecycle command deletes or rewrites the journal:
 at its terminal tick, a parent's sweep of its children,
 `koto init --replace-terminal` and `koto session import` all leave existing
 lines byte-identical. The journal grows by a few hundred bytes per state
-entered, per check evaluation, decider call and override, and by up to 50
-more lines for a check that reports many error rules.
+entered, per check evaluation, decider call, override and printed
+directive, and by up to 50 more lines for a check that reports many error
+rules.
 
 To remove it by hand, delete the file (or move it aside) while no koto
 command is running. The next record creates a new file. Lines removed this
@@ -527,8 +589,8 @@ journal's lock and before anything is written. A write is one commit's
 records (a check's `check_evaluated` and its `check_rule` records, say), so
 they always land together in one file; a rotation can fall between two
 writes of the same command. The file being moved is flushed to disk first,
-so the check, decider and override records it holds that weren't flushed
-yet don't wait on a flush that will now go to the new file. The journal is
+so the check, decider, override and response records it holds that weren't
+flushed yet don't wait on a flush that will now go to the new file. The journal is
 never truncated or rewritten in place:
 
 - **Naming.** Rotated files sit beside the journal as
@@ -547,6 +609,12 @@ never truncated or rewritten in place:
   one moved it notices, once it holds the lock, that the path now names a
   different file, and opens the path again. No record is written to a file
   after it was moved.
+- **Responses.** The short wait a `koto status` response gives the lock
+  covers the whole write, the fresh file's lock after a rotation included,
+  so turning rotation on doesn't let a held lock stall `koto status`. When
+  the wait runs out the record is skipped, as
+  [Response records](#response-records) describes, whether or not the
+  journal was rotated first.
 - **Failure.** A move that fails prints one warning on standard error, and
   the record goes to the unrotated journal. That command doesn't try to
   rotate again.
