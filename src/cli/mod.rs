@@ -1670,10 +1670,15 @@ pub fn run(app: App) -> Result<()> {
                         plan: plan.as_deref(),
                         migrated_from: migrated_from.as_deref(),
                         source_retired,
-                        marker_retain_days: crate::config::resolve::load_config()?
-                            .session
-                            .cloud
-                            .marker_retain_days(),
+                        // Only marker mode reads the bound, so a config that
+                        // fails to load can't stop a session-mode prune.
+                        marker_retain_days: match migrated_from {
+                            Some(_) => crate::config::resolve::load_config()?
+                                .session
+                                .cloud
+                                .marker_retain_days(),
+                            None => crate::config::DEFAULT_MARKER_RETAIN_DAYS,
+                        },
                     },
                 ),
                 #[cfg(not(unix))]
