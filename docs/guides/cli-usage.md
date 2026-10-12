@@ -478,6 +478,14 @@ If the template read from disk no longer matches the hash recorded in the sessio
 
 For batch parents and sessions bound to a request leg, `koto status` also carries additional fields -- see [Batch workflows](#batch-workflows) below.
 
+**A session koto removed.** koto removes a session at its success terminal (unless the tick passed `--no-cleanup`), and a parent removes its kept terminal children when it is removed or replaced (`koto init --attach-live --replace-terminal`). Before either removal it writes a finished record, so `koto status` on that name still answers, exit 0:
+
+```json
+{"name":"deploy","current_state":"done","is_terminal":true,"result":{"status":"success","summary":"completed at done"},"removed":true,"finished_at":"2026-10-11T23:44:36.123Z","session_id":"<session-id>","execution_dir":"/work/project"}
+```
+
+`current_state`, `is_terminal` and `result` mean what they mean for a kept terminal session, so the same run kept with `--no-cleanup` answers the same three. A child that had been cancelled before its parent removed it answers with its cancel state, a null `result` and `"status": "cancelled"`. A result too large for the record (over 64 KiB) keeps its `status` and `summary`, and the answer carries `"result_truncated": true`. A session removed by a person (`koto session cleanup`, `koto cancel --cleanup`) leaves no record, nor does one whose removal failed (its record is deleted again), so a name that never existed, a name removed that way, and a name whose record was pruned all answer `not found`, exit 2. Creating a session under the name deletes its record.
+
 ### session
 
 The `session` subcommand group provides direct access to session directories. These are useful for skills that need to read or write session-local artifacts, and for manual cleanup during development.
@@ -617,7 +625,7 @@ koto session prune --apply --plan <token>
 koto session prune --apply (--execution-dir <dir> | --older-than <age> | --all)...
 ```
 
-Without `--apply` nothing is removed. The command prints the finished sessions it would remove, every session it keeps with the rule that keeps it, and a plan token, and stores the would-remove list as `.prune-plans/<token>.json` under the sessions directory (a private file in a private directory; a preview removes stored plans older than a day).
+Without `--apply` nothing is removed. The command prints the finished sessions and finished records it would remove, every session it keeps with the rule that keeps it, and a plan token, and stores the would-remove list as `.prune-plans/<token>.json` under the sessions directory (a private file in a private directory; a preview removes stored plans older than a day).
 
 **Optional flags:**
 - `--execution-dir <dir>` -- Only sessions whose execution directory is `<dir>` or lies under it, matched the way [session list](#session-list) matches it.
@@ -640,6 +648,8 @@ The filters choose which sessions are judged, not which sessions count as refere
 
 A session references the session its header's `parent_workflow` names and the one its `chain/parent` context key names. A reference to a name with no session protects nothing, and a request that no longer exists releases a session bound to it. Everything the rules read is on this host (the sessions directory, and the request store for rule e) except rule g. Without a remote `version.json`, rule g compares only the pushed log's length, so a remote log that diverged without growing longer than the local one isn't caught.
 
+**Finished records.** The would-remove list also holds the finished records koto wrote for sessions it removed itself (see [status](#status)), as `"kind": "record"` entries beside the `"kind": "session"` ones. A record carries the removed session's `session_id`, `state`, `status` (`terminal` or `cancelled`), `failure`, `finished_at` and `execution_dir`, and `--execution-dir` and `--older-than` match it by those last two. No rule keeps a record: koto writes one only once the session's parent already had its result, so nothing still needs it. Removing a record makes `koto status` answer `not found` for the name. Applying reads each record again and skips one rewritten since the preview (another session of the name finished and was removed in between).
+
 **Preview output (JSON):**
 
 ```json
@@ -657,7 +667,7 @@ A session references the session its header's `parent_workflow` names and the on
 }
 ```
 
-The token is the first 32 hex digits of a SHA-256 over the would-remove list's names and session ids, so it changes when a session joins or leaves the list, or a removed name is taken by a new session, and not when anything outside the list changes.
+The token is the first 32 hex digits of a SHA-256 over the would-remove list's kinds, names and session ids, so it changes when a session joins or leaves the list, or a removed name is taken by a new session, and not when anything outside the list changes.
 
 **Applying.** `--apply --plan <token>` works the set out again, with the filters the preview ran with (the stored plan records them, and passing a filter alongside `--plan` is an error), and removes it only when its token is still `<token>`. Otherwise it removes nothing, exits 4 with `prune_plan_stale`, and lists under `added` and `dropped` how the set changed. A token with no stored plan (it expired, was applied, or was previewed on another host) also exits 4, with `prune_plan_unknown`. `--apply` without `--plan` removes the set it works out now, in one step with no preview anyone read, and needs `--execution-dir`, `--older-than` or `--all` so that a bare `--apply` can't empty the store by mistake. It is the form for scheduled runs; the rules apply to it all the same, but only `--plan` guarantees that what goes is what someone saw.
 

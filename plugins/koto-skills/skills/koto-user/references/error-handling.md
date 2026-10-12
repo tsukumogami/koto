@@ -219,6 +219,12 @@ refusal exists to stop.
 
 ---
 
+## `not found` from koto status
+
+`koto status <name>` exits 2 with `workflow '<name>' not found` only when no session has the name and koto kept no finished record for it. A session koto removed itself (at its success terminal, or with its parent) answers exit 0 from its record instead, with `removed: true`, `current_state`, `is_terminal: true`, `result`, `finished_at`, `session_id` and `execution_dir`; read `result` there as you would for a kept terminal session. So `not found` means the name never existed, a person removed it (`koto session cleanup`, `koto cancel --cleanup`), or its record was pruned: don't retry it, and don't read it as a failed run.
+
+---
+
 ## Command failure kinds
 
 `failure_kind` is **not** an error code. When a command koto runs fails — a state's

@@ -352,6 +352,12 @@ impl SessionBackend for LocalBackend {
                     &header,
                     &initial_events,
                 );
+                // A finished record left by an earlier session of this name
+                // describes a run that this one replaces; `koto status` must
+                // answer for the new session, so the record goes.
+                if let Err(e) = crate::session::finished::remove(&self.base_dir, id) {
+                    eprintln!("warning: could not remove the finished record for {id}: {e:#}");
+                }
                 Ok(())
             }
             Err(e) => {
