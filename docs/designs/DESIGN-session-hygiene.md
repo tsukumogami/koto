@@ -182,18 +182,29 @@ still protect one inside them. For each session it reads:
 | Rule | Keeps | How the prune knows |
 |------|-------|---------------------|
 | a | a running or unreadable session | the inspection: status `running` or `unreadable` (log, template or header unreadable, or the session directory is a symlink) |
-| b | a session some running session references | the reverse of the reference map below, checked against each referencer's status |
-| c | a finished session that references a running one | the reference map, checked against the referenced session's status; a reference to a name with no session protects nothing |
+| b | a session some running or unreadable session references | the reverse of the reference map below, checked against each referencer's status |
+| c | a finished session that references a running or unreadable one | the reference map, checked against the referenced session's status; a reference to a name with no session protects nothing |
 | d | a session with a malformed `chain/parent` | the context key exists but its content isn't exactly one name passing `validate_session_id` (no surrounding whitespace or newline) |
 | e | a session bound to a waiting or unreadable request leg | `request-leg.toml` in the session directory; the request is read with `request_store::read_view`; kept when the request is open with the leg open, or when the pointer or the request can't be read or parsed; a request that doesn't exist releases it |
 | f | a coordinator's session | the name begins `coordinate-` |
-| g | under the cloud backend, a session whose remote copy is ahead of the local one, diverged from it, or can't be read | the remote `version.json` compared with the local one by the existing `check_sync`; anything but `Safe` keeps it |
+| g | under the cloud backend, a session whose remote copy is ahead of the local one, diverged from it, or can't be read | one listing of the session's remote prefix: a remote state log longer than the local one keeps it, and when a remote `version.json` is listed it is compared with the local one by the existing `check_sync`, where anything but `Safe` keeps it |
 
 Rule g goes beyond the PRD's list for one reason. The cloud backend's
 cleanup deletes the session's remote objects too, and a host whose local copy
 looks finished can be behind a bucket that another host has advanced, for
 example by rewinding the session. The prune judges from the local copy, so it
 removes nothing whose remote it can't show is no newer (D3).
+
+The two signals cover different writes. koto bumps `version.json` only on a
+context write, so it alone misses an advance or rewind that another host
+pushed as state-log events. The remote log's size, from the same listing,
+catches that: a pushed log longer than the local one holds events this host
+never saw. A local log longer than the remote one only means this host's last
+push didn't land, which the removal loses nothing by. A remote `version.json`
+the local copy has none to compare with keeps the session too.
+
+An unreadable session counts as possibly running for rules b and c, so it
+protects what it references and what references it, as rule a keeps it.
 
 The reference map has an edge A to B when A's header `parent_workflow` is B,
 or A's context key `chain/parent` holds exactly B. The context key is read from
@@ -431,9 +442,11 @@ Session mode:
 2. Candidates are sessions that pass the filters and are `Terminal` or
    `Cancelled`, plus finished records (below) that pass the filters. The age
    filter compares `finished_at` with now.
-3. For each candidate session, evaluate rules a to g in order. The first rule
-   that applies puts the session on `kept` with that rule's letter and a
-   detail (the referencing or referenced name, the request id). Records have
+3. For each session that passes the filters, whatever its status, evaluate
+   rules a to g in order, so a running or unreadable session shows on `kept`
+   under rule a. The first rule that applies puts the session on `kept` with
+   that rule's letter and a detail (the referencing or referenced name, the
+   request id); a candidate no rule keeps goes on the would-remove list. Records have
    no rules: koto writes one only when it removes a session itself, and that
    removal already waited until the session's parent had its
    `child_completed` (the terminal tick defers removal when that append
@@ -441,8 +454,8 @@ Session mode:
 4. The plan token is the first 32 hex digits of SHA-256 over the sorted lines
    `<kind>\t<name>\t<session_id>\n`, where `kind` is `session` or `record`.
    Only would-remove entries enter it.
-5. The preview stores its would-remove list at
-   `<sessions base>/.prune-plans/<token>.json` (mode 0600 under a 0700
+5. The preview stores its would-remove list, with the filters it ran with,
+   at `<sessions base>/.prune-plans/<token>.json` (mode 0600 under a 0700
    directory; derived and safe to delete), removing any stored plan older
    than a day, and prints:
 
@@ -453,13 +466,19 @@ Session mode:
  "kept": [{"name": "...", "rule": "b", "detail": "referenced by running session 'x'"}]}
 ```
 
-6. Apply recomputes steps 1 to 4. With `--plan`, a recomputed token that
-   differs exits 4 (`prune_plan_stale`, a code no other koto verb uses),
+6. Apply recomputes steps 1 to 4. With `--plan` it runs with the stored
+   plan's filters, and a filter passed alongside `--plan` is a usage error
+   (exit 2), so a filtered preview's token applies as it stands. A
+   recomputed token that differs exits 4 (`prune_plan_stale`, a code no
+   other koto verb uses),
    removes nothing, and prints `added` and `dropped` by diffing the recomputed
    list against the stored plan. With no stored plan for the token (expired,
    or previewed on another host) it still refuses with exit 4 and says the
    plan is unknown. A token that isn't 32 lowercase hex digits is a usage
-   error (exit 2). A successful apply deletes its stored plan.
+   error (exit 2). Removal then walks only entries the stored plan names,
+   so a session that finished after the preview is never removed by that
+   plan, even if the hash were to collide. A successful apply deletes its
+   stored plan.
 7. For each session to remove, children first (deepest `parent_workflow`
    first): take `lock_state_file` (non-blocking), re-`inspect`, and confirm
    the same session id, still finished, and no rule applies against the
@@ -765,9 +784,10 @@ HOME or `KOTO_SESSIONS_BASE`, with cloud behavior on koto's fake S3 harness
   the remote delete is the same one-removal window. These windows are
   accepted and documented.
 - **Another host's newer copy.** Under the cloud backend a removal deletes
-  remote objects too, so the prune keeps any session whose remote
-  `version.json` is ahead of, diverged from, or unreadable against the local
-  copy (rule g), and re-checks it at apply. A remote delete that fails is
+  remote objects too, so the prune keeps any session whose remote state
+  log is longer than the local one, or whose remote `version.json` is ahead
+  of, diverged from, or unreadable against the local copy (rule g), and
+  re-checks it at apply. A remote delete that fails is
   reported, not swallowed.
 - **Mistyped scope.** An unattended `--apply` needs an explicit filter or
   `--all`, and the token mode refuses a plan it didn't store.
@@ -808,8 +828,9 @@ HOME or `KOTO_SESSIONS_BASE`, with cloud behavior on koto's fake S3 harness
   after the bound could advance its old copy again. The repository owner
   accepts this risk for multi-host use, which koto treats as a migration and
   never as a shared session.
-- Under the cloud backend a preview makes one remote request per candidate
-  session for rule g.
+- Under the cloud backend a preview makes one remote listing per candidate
+  session for rule g, plus a GET when the session has a remote
+  `version.json`.
 
 ### Mitigations
 
