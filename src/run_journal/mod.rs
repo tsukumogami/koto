@@ -99,6 +99,7 @@
 
 mod driver;
 mod fixture;
+#[cfg(unix)]
 pub(crate) mod rotate;
 mod run_id;
 mod sidecar;
@@ -279,9 +280,18 @@ pub(crate) fn warnings_for_test() -> Vec<String> {
 fn write(root: &Path, records: &[Record]) {
     let path = root.join(JOURNAL_FILE);
     let max = max_line_bytes();
+    // One locked append per record, so a record that can't be written is
+    // skipped without losing the others. Each record lands whole in one file;
+    // a rotation can fall between two of them. `rotate::append` takes several
+    // lines when a caller wants them kept together.
     for record in records {
         let line = record.to_line();
-        if let Err(e) = rotate::append(root, &[&line], max) {
+        #[cfg(unix)]
+        let written = rotate::append(root, &[&line], max);
+        #[cfg(not(unix))]
+        let written =
+            crate::engine::jsonl_append::append_bounded_line_no_follow(root, &path, &line, max);
+        if let Err(e) = written {
             warn_once(&format!("{}: {}", path.display(), e.root_cause()));
         }
     }

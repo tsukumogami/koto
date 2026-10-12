@@ -253,9 +253,9 @@ repository. A bound of 0 turns rotation off again.
 With a bound set, the command whose record finds the journal at or over the
 bound first moves the journal to the next rotated name, then writes the
 record to a fresh `_run_journal.jsonl`. The check runs once per write, under
-the journal's lock and before anything is written, so the records one
-command writes together never end up split across two files. The journal is
-never truncated or rewritten in place:
+the journal's lock and before anything is written, so a record always lands
+whole in one file; a rotation can fall between two records of the same
+command. The journal is never truncated or rewritten in place:
 
 - **Naming.** Rotated files sit beside the journal as
   `_run_journal.NNNNNNNNNN.jsonl`: ten decimal digits, zero-padded, starting
@@ -334,7 +334,10 @@ koto reads position files and the journal files' names and metadata, never a
 journal record. A position file that is larger than 4 KiB, a symlink, or
 doesn't parse protects nothing, and neither does one not modified within the
 stale bound (90 days by default); each is named in a warning on standard
-error. Change the stale bound with:
+error. A position whose device and inode match no journal file (its file
+was already removed) protects nothing either, and is reported at each
+rotation until the reader updates or removes it. Change the stale bound
+with:
 
 ```bash
 koto config set run_journal.reader_stale_days 90 --user

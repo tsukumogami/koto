@@ -430,18 +430,31 @@ mod tests {
 
     #[test]
     fn one_byte_under_the_bound_does_not_rotate_and_at_it_does() {
-        let tmp = TempDir::new().unwrap();
         let line = "{\"kind\":\"x\"}"; // 13 bytes with its newline
+
+        // 26 bytes against a bound of 27: one byte under, so the next
+        // append writes to the same file.
+        let under = TempDir::new().unwrap();
         set_settings_for_test(on(27));
-        append(tmp.path(), &[line], MAX).unwrap();
-        append(tmp.path(), &[line], MAX).unwrap(); // 26 bytes: one under
-        append(tmp.path(), &[line], MAX).unwrap();
-        assert!(rotated(tmp.path()).is_empty());
-        assert_eq!(journal(tmp.path()).len(), 39);
-        append(tmp.path(), &[line], MAX).unwrap(); // at 39 >= 27: rotates first
-        assert_eq!(rotated(tmp.path()), vec![rotated_name(1)]);
-        assert_eq!(journal(tmp.path()), format!("{line}\n"));
-        assert!(tmp.path().join(READERS_DIR).is_dir());
+        append(under.path(), &[line], MAX).unwrap();
+        append(under.path(), &[line], MAX).unwrap();
+        append(under.path(), &[line], MAX).unwrap();
+        assert!(rotated(under.path()).is_empty());
+        assert_eq!(journal(under.path()).len(), 39);
+
+        // 26 bytes against a bound of 26: exactly at it, so the next append
+        // rotates first.
+        let at = TempDir::new().unwrap();
+        set_settings_for_test(on(26));
+        append(at.path(), &[line], MAX).unwrap();
+        append(at.path(), &[line], MAX).unwrap();
+        assert!(rotated(at.path()).is_empty());
+        append(at.path(), &[line], MAX).unwrap();
+        assert_eq!(rotated(at.path()), vec![rotated_name(1)]);
+        let first = std::fs::read_to_string(at.path().join(rotated_name(1))).unwrap();
+        assert_eq!(first.len(), 26);
+        assert_eq!(journal(at.path()), format!("{line}\n"));
+        assert!(at.path().join(READERS_DIR).is_dir());
     }
 
     #[test]
