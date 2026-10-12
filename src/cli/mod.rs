@@ -5199,6 +5199,7 @@ fn handle_next(
                         );
                     }
                 }
+                journal_response(journal_root, backend, &name, &resp);
                 // Deliver the result, then clean up unless the session is kept.
                 if let (
                     next_types::NextResponse::Terminal {
@@ -6786,6 +6787,7 @@ fn handle_next(
                     );
                 }
             }
+            journal_response(journal_root, backend, &name, &resp);
             // Deliver the result, then clean up unless the session is kept.
             if let (
                 NextResponse::Terminal {
@@ -6822,6 +6824,30 @@ fn handle_next(
             let json = serde_json::json!({"error": err});
             exit_with_error_code(json, err.code.exit_code());
         }
+    }
+}
+
+/// Journal a `koto next` response that has just been printed: one
+/// `response` record when it carries a directive, nothing for a terminal or
+/// an error. Called after the `instructions_delivered` append, so the
+/// record's `koto.seq` covers it. See `crate::run_journal::response`.
+#[cfg(unix)]
+fn journal_response(
+    journal_root: Option<&Path>,
+    backend: &dyn SessionBackend,
+    name: &str,
+    resp: &next_types::NextResponse,
+) {
+    if let Some((state, directive, details)) = resp.directive_parts() {
+        crate::run_journal::response(
+            journal_root,
+            backend,
+            name,
+            state,
+            crate::run_journal::ResponseSource::Next,
+            directive,
+            details,
+        );
     }
 }
 
@@ -7271,10 +7297,13 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     // additionally absent when the phase declares none. Neither absence
     // is an error.
     //
-    // This retrieval always returns the full instructions regardless of
-    // the delivery rule `koto next` applies (PRD R10), and it appends
-    // nothing: no delivery record, no other event, and no lock is taken
-    // anywhere in this function.
+    // This retrieval always returns the full instructions, whether or not
+    // `koto next` has already delivered them in this visit, and it appends
+    // nothing to the session: no delivery record, no other event, and no
+    // session lock is taken anywhere in this function. The one thing it
+    // writes is the run journal's `response` record at the end, which waits
+    // only briefly for the journal's lock and never touches the session's
+    // files (see `crate::run_journal::response`).
     if let Some(state) = current_template_state {
         if !state.terminal {
             // Re-validates values as defense in depth, mirroring
@@ -7392,6 +7421,21 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     }
 
     println!("{}", serde_json::to_string(&response)?);
+    // A printed directive (present only for a non-terminal state) is
+    // journaled as a `response`, the only write this command makes; a
+    // terminal's status prints none and writes nothing. See
+    // `crate::run_journal::response`.
+    if let Some(directive) = response.get("directive").and_then(|d| d.as_str()) {
+        crate::run_journal::response(
+            backend.journal_root(),
+            backend,
+            name,
+            &machine_state.current_state,
+            crate::run_journal::ResponseSource::Status,
+            directive,
+            response.get("details").and_then(|d| d.as_str()),
+        );
+    }
     Ok(())
 }
 

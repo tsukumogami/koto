@@ -667,7 +667,8 @@ const RELAY_FIELDS: &[&str] = &[
     "koto.visit.seq",
 ];
 
-/// The fields a check kind may carry beyond [`RELAY_FIELDS`].
+/// The fields a check kind, or `response`, may carry beyond
+/// [`RELAY_FIELDS`].
 fn check_kind_fields(kind: &str) -> &'static [&'static str] {
     match kind {
         "check_evaluated" => &[
@@ -699,7 +700,13 @@ fn check_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.poll.evaluations",
             "koto.poll.elapsed_secs",
         ],
-        other => panic!("not a check kind: {other}"),
+        "response" => &[
+            "koto.state",
+            "koto.response.source",
+            "koto.response.directive_bytes",
+            "koto.response.details_bytes",
+        ],
+        other => panic!("not a check or response kind: {other}"),
     }
 }
 
@@ -1445,6 +1452,444 @@ fn check_records_fit_the_line_cap_at_the_longest_names() {
     }
 }
 
+// ----- Response records -----
+
+/// The `response` records in `j`, each checked to carry `v` 1, both
+/// sequence numbers, and exactly its kind's fields.
+fn response_records(j: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    j.iter()
+        .filter(|r| r["kind"] == "response")
+        .map(|r| {
+            let expected: BTreeSet<&str> = RELAY_FIELDS
+                .iter()
+                .chain(check_kind_fields("response"))
+                .copied()
+                .collect();
+            let got: BTreeSet<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();
+            assert_eq!(got, expected, "{r}");
+            assert_eq!(r["v"], 1);
+            r.clone()
+        })
+        .collect()
+}
+
+/// The log of `session` as it stands, read the way `response` reads it.
+fn log_of(f: &Fixture, session: &str) -> String {
+    std::fs::read_to_string(
+        f.backend
+            .session_dir(session)
+            .join(crate::session::state_file_name(session)),
+    )
+    .unwrap()
+}
+
+/// A response record carries the log's highest seq and its visit, the
+/// UTF-8 byte lengths of what was printed (0 for no details), and nothing
+/// of the text. It is written in its own batch without a flush.
+#[test]
+fn a_response_records_the_printed_byte_lengths_and_the_logs_position() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &evidence("a")); // 3
+    reset_for_test();
+    let directive = "Corrija o código — ✓ PLANTED-DIRECTIVE";
+    let details = "Détails PLANTED-DETAILS";
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Next,
+        directive,
+        Some(details),
+    );
+    assert_eq!(batches_for_test(), (1, 0), "one batch, no flush");
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Status,
+        directive,
+        None,
+    );
+    let r = response_records(&f.journal());
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0]["session"], "wf");
+    assert_eq!(r[0]["koto.session.id"], "wf-id");
+    assert_eq!(r[0]["koto.run.id"], "wf-id");
+    assert_eq!(r[0]["koto.state"], "a");
+    assert_eq!(r[0]["koto.response.source"], "next");
+    assert_eq!(r[0]["koto.response.directive_bytes"], directive.len());
+    assert_ne!(directive.len(), directive.chars().count());
+    assert_eq!(r[0]["koto.response.details_bytes"], details.len());
+    assert_eq!(r[1]["koto.response.source"], "status");
+    assert_eq!(r[1]["koto.response.details_bytes"], 0);
+    let log = log_of(&f, "wf");
+    for rec in &r {
+        assert_eq!(rec["koto.seq"], 3);
+        assert_eq!(
+            rec["koto.seq"].as_u64(),
+            crate::engine::persistence::last_seq(&log)
+        );
+        assert_eq!(rec["koto.visit.seq"], 2);
+    }
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("PLANTED"), "{raw}");
+    assert!(warnings_for_test().is_empty());
+}
+
+/// A response and the check records of the same visit carry the same
+/// `koto.visit.seq`, since both come from `persistence::visit_start`: a
+/// self-transition keeps the visit, and an arrival elsewhere or a rewind
+/// opens a new one.
+#[test]
+fn a_response_shares_the_visit_rule_with_the_check_records() {
+    let f = session_in_a();
+    let respond = |f: &Fixture, state: &str| {
+        response(
+            Some(&f.home),
+            &f.backend,
+            "wf",
+            state,
+            ResponseSource::Next,
+            "d",
+            None,
+        )
+    };
+    let check = |f: &Fixture, state: &str| {
+        commit_as(
+            f,
+            None,
+            "wf",
+            &gate_event(
+                state,
+                "g",
+                "passed",
+                command_output(0),
+                stamped(1, 1, None),
+                None,
+            ),
+        )
+    };
+    check(&f, "a"); // 3, visit 2
+    respond(&f, "a");
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "a")); // 4
+    respond(&f, "a");
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 5
+    check(&f, "b"); // 6, visit 5
+    respond(&f, "b");
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::Rewound {
+            from: "b".into(),
+            to: "a".into(),
+            rationale: None,
+        },
+    ); // 7
+    respond(&f, "a");
+    let j = f.journal();
+    let got: Vec<(String, u64, u64)> = j
+        .iter()
+        .filter(|r| r["kind"] == "response" || r["kind"] == "check_evaluated")
+        .map(|r| {
+            (
+                r["kind"].as_str().unwrap().to_string(),
+                r["koto.seq"].as_u64().unwrap(),
+                r["koto.visit.seq"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let pair = |k: &str, seq: u64, visit: u64| (k.to_string(), seq, visit);
+    assert_eq!(
+        got,
+        vec![
+            pair("check_evaluated", 3, 2),
+            pair("response", 3, 2),
+            pair("response", 4, 2),
+            pair("check_evaluated", 6, 5),
+            pair("response", 6, 5),
+            pair("response", 7, 7),
+        ]
+    );
+    assert_eq!(response_records(&j).len(), 4);
+}
+
+/// No journal root writes nothing. A session whose log can't be read
+/// writes nothing and warns once.
+#[test]
+fn a_response_without_a_journal_or_a_log_writes_nothing() {
+    let f = session_in_a();
+    let before = f.journal().len();
+    response(None, &f.backend, "wf", "a", ResponseSource::Next, "d", None);
+    assert_eq!(f.journal().len(), before);
+    assert!(warnings_for_test().is_empty());
+    for _ in 0..2 {
+        response(
+            Some(&f.home),
+            &f.backend,
+            "gone",
+            "a",
+            ResponseSource::Status,
+            "d",
+            None,
+        );
+    }
+    assert_eq!(f.journal().len(), before);
+    assert_eq!(warnings_for_test().len(), 1);
+}
+
+/// With a 255-byte session name, a 128-byte state and the largest counts,
+/// a response record fits the line cap.
+#[test]
+fn a_response_record_fits_the_line_cap_at_the_longest_names() {
+    let session = "s".repeat(255);
+    let id = "i".repeat(128);
+    let relay = Relay {
+        session: &session,
+        session_id: &id,
+        run_id: Some(&id),
+        seq: u64::MAX,
+        visit_seq: Some(u64::MAX),
+    };
+    let state = "t".repeat(128);
+    let long = "x".repeat(1 << 20);
+    let record = response_record(&relay, &state, ResponseSource::Status, &long, Some(&long));
+    let line = record.to_line();
+    assert!(line.len() < MAX_LINE_BYTES, "{} bytes: {line}", line.len());
+    assert!(line.contains(&state));
+    assert!(line.contains(&format!("\"koto.response.directive_bytes\":{}", 1 << 20)));
+}
+
+/// When the log no longer stands in the printed state (another command
+/// advanced the session between the print and the record), no record is
+/// written and nothing warns.
+#[test]
+fn a_response_for_a_state_the_log_has_left_is_skipped() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 3
+    let before = f.journal().len();
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Status,
+        "d",
+        None,
+    );
+    assert_eq!(f.journal().len(), before, "printed a, the log is in b");
+    assert!(warnings_for_test().is_empty());
+    // The state the log is in is still recorded.
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "b",
+        ResponseSource::Status,
+        "d",
+        None,
+    );
+    let r = response_records(&f.journal());
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["koto.state"], "b");
+    assert_eq!(r[0]["koto.seq"], 3);
+    assert_eq!(r[0]["koto.visit.seq"], 3);
+}
+
+/// The hook writes only the journal: a session with no sidecar gets its
+/// run id derived from the header, and still has no sidecar afterwards.
+#[test]
+fn a_response_derives_the_run_id_without_writing_the_sidecar() {
+    let f = session_in_a();
+    let sidecar_path = f.backend.session_dir("wf").join(sidecar::SIDECAR_FILE);
+    std::fs::remove_file(&sidecar_path).unwrap();
+    let files_before: Vec<_> = std::fs::read_dir(f.backend.session_dir("wf"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Status,
+        "d",
+        None,
+    );
+    let r = response_records(&f.journal());
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["koto.run.id"], "wf-id");
+    assert!(!sidecar_path.exists(), "the hook wrote the sidecar");
+    let files_after: Vec<_> = std::fs::read_dir(f.backend.session_dir("wf"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(files_after, files_before);
+}
+
+/// With the journal's lock held by another writer, a `koto status`
+/// response gives up after its short wait: no record, one warning, and no
+/// hang.
+#[test]
+fn a_response_skips_its_record_while_another_writer_holds_the_lock() {
+    use std::os::unix::io::AsRawFd;
+    let f = session_in_a();
+    let journal = f.home.join(JOURNAL_FILE);
+    let before = std::fs::read_to_string(&journal).unwrap();
+    let holder = std::fs::File::open(&journal).unwrap();
+    // SAFETY: flock on a descriptor `holder` owns until it is dropped.
+    assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let started = std::time::Instant::now();
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Status,
+        "d",
+        None,
+    );
+    let took = started.elapsed();
+    assert!(took >= RESPONSE_LOCK_WAIT, "{took:?}");
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
+    let warnings = warnings_for_test();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("held by another writer"),
+        "{warnings:?}"
+    );
+    drop(holder);
+}
+
+/// `koto next`'s response waits for the journal's lock like every other
+/// journal write: held well past the status bound, the lock is waited out,
+/// and the record is written once it's released, with no warning.
+#[test]
+fn a_next_response_waits_for_a_held_lock_and_is_written() {
+    use std::os::unix::io::AsRawFd;
+    use std::time::{Duration, Instant};
+    let f = session_in_a();
+    let journal = f.home.join(JOURNAL_FILE);
+    let holder = std::fs::File::open(&journal).unwrap();
+    // SAFETY: flock on a descriptor `holder` owns until it is dropped.
+    assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let hold = RESPONSE_LOCK_WAIT * 5;
+    let started = Instant::now();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        drop(holder);
+    });
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Next,
+        "d",
+        None,
+    );
+    let took = started.elapsed();
+    release.join().unwrap();
+    assert!(took >= hold, "{took:?}");
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    let r = response_records(&f.journal());
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["koto.response.source"], "next");
+    assert!(warnings_for_test().is_empty(), "{:?}", warnings_for_test());
+}
+
+/// Rotation with a bound every journal is past.
+#[cfg(unix)]
+fn rotate_at_one_byte() {
+    rotate::set_settings_for_test(rotate::Settings {
+        rotate_bytes: 1,
+        retain_days: 30,
+        reader_stale_days: 90,
+    });
+}
+
+/// With rotation on and the journal past its bound, a response rotates the
+/// journal before writing: the rotated file keeps every byte it had, and
+/// the record lands whole, alone, in the fresh journal.
+#[cfg(unix)]
+#[test]
+fn a_response_lands_whole_in_the_fresh_journal_after_a_rotation() {
+    let f = session_in_a();
+    let journal = f.home.join(JOURNAL_FILE);
+    let before = std::fs::read_to_string(&journal).unwrap();
+    assert!(!before.is_empty());
+    rotate_at_one_byte();
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Status,
+        "directive",
+        Some("details"),
+    );
+    let rotated = f.home.join(rotate::rotated_name(1));
+    assert_eq!(std::fs::read_to_string(&rotated).unwrap(), before);
+    let fresh = std::fs::read_to_string(&journal).unwrap();
+    assert!(fresh.ends_with('\n'), "{fresh:?}");
+    let j = f.journal();
+    assert_eq!(j.len(), 1, "{fresh}");
+    let r = response_records(&j);
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0]["session"], "wf");
+    assert_eq!(r[0]["koto.state"], "a");
+    assert_eq!(r[0]["koto.response.source"], "status");
+    assert_eq!(r[0]["koto.response.directive_bytes"], 9);
+    assert_eq!(r[0]["koto.response.details_bytes"], 7);
+    assert!(warnings_for_test().is_empty(), "{:?}", warnings_for_test());
+    assert!(
+        rotate::warnings_for_test().is_empty(),
+        "{:?}",
+        rotate::warnings_for_test()
+    );
+}
+
+/// Rotation doesn't lengthen a response's wait for a held lock, and nothing
+/// is rotated while it's held: the journal past its bound stays where it
+/// is, unchanged, and the record is skipped with the one warning.
+#[cfg(unix)]
+#[test]
+fn a_response_skips_its_record_while_the_lock_is_held_with_rotation_on() {
+    use std::os::unix::io::AsRawFd;
+    let f = session_in_a();
+    let journal = f.home.join(JOURNAL_FILE);
+    let before = std::fs::read_to_string(&journal).unwrap();
+    rotate_at_one_byte();
+    let holder = std::fs::File::open(&journal).unwrap();
+    // SAFETY: flock on a descriptor `holder` owns until it is dropped.
+    assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let started = std::time::Instant::now();
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Status,
+        "d",
+        None,
+    );
+    let took = started.elapsed();
+    drop(holder);
+    assert!(took >= RESPONSE_LOCK_WAIT, "{took:?}");
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), before);
+    assert!(!f.home.join(rotate::rotated_name(1)).exists());
+    let warnings = warnings_for_test();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("held by another writer"),
+        "{warnings:?}"
+    );
+}
+
 // ----- Decider and override records -----
 
 use crate::decider::check::{DeciderCheck, RecordedOutcome, UnansweredReason};
@@ -1865,4 +2310,839 @@ fn decider_and_override_records_fit_the_line_cap_at_the_longest_names() {
         .unwrap()
         .starts_with("sha256:"));
     assert_eq!(parsed[3]["koto.check"], name.as_str());
+}
+
+// ----- Context reads -----
+
+/// The fields a `context_reads` record may carry beyond [`RELAY_FIELDS`].
+const CONTEXT_READS_FIELDS: &[&str] = &[
+    "koto.state",
+    "koto.context.key",
+    "koto.context.reader",
+    "koto.context.access",
+    "koto.context.overflow",
+    "koto.context.read_count",
+    "koto.context.present_count",
+    "koto.context.first_hash",
+    "koto.context.last_hash",
+];
+
+/// The `context_reads` records in `j`, each checked to carry `v` 1, both
+/// sequence numbers, only the kind's fields, and each field exactly when
+/// the reference says: the tuple's names unless it is the overflow record,
+/// the hashes only when a read found the key.
+fn context_records(j: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    j.iter()
+        .filter(|r| r["kind"] == "context_reads")
+        .map(|r| {
+            let allowed: BTreeSet<&str> = RELAY_FIELDS
+                .iter()
+                .chain(CONTEXT_READS_FIELDS)
+                .copied()
+                .collect();
+            for (key, value) in r.as_object().unwrap() {
+                assert!(
+                    allowed.contains(key.as_str()),
+                    "context_reads carries {key}: {r}"
+                );
+                assert!(!value.is_null() && value != "", "{key}: {r}");
+            }
+            assert_eq!(r["v"], 1);
+            assert!(r["koto.seq"].is_u64(), "{r}");
+            assert!(r["koto.visit.seq"].is_u64(), "{r}");
+            assert!(r["koto.state"].is_string(), "{r}");
+            assert!(r["koto.context.read_count"].is_u64(), "{r}");
+            assert!(r["koto.context.present_count"].is_u64(), "{r}");
+            let overflow = r.get("koto.context.overflow").is_some();
+            if overflow {
+                assert_eq!(r["koto.context.overflow"], true, "{r}");
+            }
+            for named in [
+                "koto.context.key",
+                "koto.context.reader",
+                "koto.context.access",
+            ] {
+                assert_eq!(r.get(named).is_some(), !overflow, "{named}: {r}");
+            }
+            let found = r["koto.context.present_count"].as_u64().unwrap() > 0 && !overflow;
+            for hash in ["koto.context.first_hash", "koto.context.last_hash"] {
+                assert_eq!(r.get(hash).is_some(), found, "{hash}: {r}");
+            }
+            r.clone()
+        })
+        .collect()
+}
+
+/// A logged read of `key` by `reader` in `state`: present with `content`'s
+/// hash, or absent.
+fn read_of(
+    state: &str,
+    key: &str,
+    reader: &str,
+    access: &str,
+    content: Option<&str>,
+) -> EventPayload {
+    EventPayload::ContextRead {
+        key: key.into(),
+        reader: reader.into(),
+        state: state.into(),
+        present: content.is_some(),
+        hash: content.map(|c| crate::cache::sha256_hex(c.as_bytes())),
+        access: Some(access.into()),
+        gate: (reader == "gate").then(|| "g".to_string()),
+    }
+}
+
+fn gate_read(state: &str, key: &str, content: Option<&str>) -> EventPayload {
+    read_of(state, key, "gate", "content", content)
+}
+
+fn cli_read(state: &str, key: &str, content: Option<&str>) -> EventPayload {
+    read_of(state, key, "cli", "content", content)
+}
+
+fn hash_of(content: &str) -> String {
+    crate::cache::sha256_hex(content.as_bytes())
+}
+
+fn rewound(from: &str, to: &str) -> EventPayload {
+    EventPayload::Rewound {
+        from: from.into(),
+        to: to.into(),
+        rationale: None,
+    }
+}
+
+fn cancelled(state: &str) -> EventPayload {
+    EventPayload::WorkflowCancelled {
+        state: state.into(),
+        reason: "PLANTED-REASON".into(),
+    }
+}
+
+fn store_result() -> EventPayload {
+    EventPayload::RequestStoreResult {
+        result: crate::engine::types::WorkflowResult::with_string_payload(
+            crate::engine::types::TerminalOutcome::Success,
+            "PLANTED-SUMMARY",
+            [("pr", "PLANTED-RESULT-VALUE")],
+        ),
+        failure_reason: None,
+    }
+}
+
+/// The session's last event's `seq`, read from its log.
+fn last_seq(f: &Fixture, session: &str) -> u64 {
+    f.backend
+        .read_events(session)
+        .unwrap()
+        .1
+        .last()
+        .unwrap()
+        .seq
+}
+
+/// (key, reader, access, read count, present count) of each record.
+fn tuples(c: &[serde_json::Value]) -> Vec<(String, String, String, u64, u64)> {
+    c.iter()
+        .map(|r| {
+            let s = |k: &str| r[k].as_str().unwrap_or("-").to_string();
+            (
+                s("koto.context.key"),
+                s("koto.context.reader"),
+                s("koto.context.access"),
+                r["koto.context.read_count"].as_u64().unwrap(),
+                r["koto.context.present_count"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Within one visit: two keys a gate reads and one `koto context get`
+/// reads give three records, in first-read order; a key read once absent
+/// and twice present counts 3 and 2, with the second and third reads'
+/// hashes. They are written at the arrival that ends the visit, before its
+/// `state_entered`, in the same flushed batch, carrying the arrival's seq
+/// (the highest in the log when they're written) and the closing visit's.
+#[test]
+fn a_visits_reads_fold_into_one_record_per_tuple_before_the_arrival_that_ends_it() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &gate_read("a", "notes", None)); // 3
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &read_of("a", "spec", "gate", "presence", Some("s1")),
+    ); // 4
+    commit_as(&f, None, "wf", &gate_read("a", "notes", Some("n1"))); // 5
+    commit_as(&f, None, "wf", &cli_read("a", "plan", Some("p1"))); // 6
+    commit_as(&f, None, "wf", &gate_read("a", "notes", Some("n2"))); // 7
+    reset_for_test();
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 8
+    assert_eq!(batches_for_test(), (1, 1), "one flushed batch");
+    assert_eq!(last_seq(&f, "wf"), 8);
+
+    let j = f.journal();
+    let tail: Vec<String> = kinds(&j).into_iter().rev().take(4).rev().collect();
+    assert_eq!(
+        tail,
+        vec![
+            "context_reads",
+            "context_reads",
+            "context_reads",
+            "state_entered"
+        ]
+    );
+    let c = context_records(&j);
+    let t = |k: &str, r: &str, a: &str, n, p| (k.into(), r.into(), a.into(), n, p);
+    assert_eq!(
+        tuples(&c),
+        vec![
+            t("notes", "gate", "content", 3, 2),
+            t("spec", "gate", "presence", 1, 1),
+            t("plan", "cli", "content", 1, 1),
+        ]
+    );
+    assert_eq!(c[0]["koto.context.first_hash"], hash_of("n1"));
+    assert_eq!(c[0]["koto.context.last_hash"], hash_of("n2"));
+    assert_eq!(c[1]["koto.context.first_hash"], hash_of("s1"));
+    assert_eq!(c[1]["koto.context.last_hash"], hash_of("s1"));
+    for r in &c {
+        assert_eq!(r["koto.seq"], 8);
+        assert_eq!(r["koto.visit.seq"], 2);
+        assert_eq!(r["koto.state"], "a");
+        assert_eq!(r["koto.run.id"], "wf-id");
+    }
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    for content in ["n1", "n2", "s1", "p1"] {
+        assert!(!raw.contains(&format!("\"{content}\"")), "{raw}");
+    }
+
+    // The next visit's arrival writes that visit's reads only.
+    commit_as(&f, None, "wf", &gate_read("b", "notes", Some("n2"))); // 9
+    commit_as(&f, None, "wf", &transitioned(Some("b"), "c")); // 10
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 4);
+    assert_eq!(tuples(&c[3..]), vec![t("notes", "gate", "content", 1, 1)]);
+    assert_eq!(c[3]["koto.visit.seq"], 8);
+    assert_eq!(c[3]["koto.seq"], 10);
+    assert_eq!(c[3]["koto.state"], "b");
+}
+
+/// A self-transition stays in the visit, so it writes no reads, and the
+/// reads on both sides of it are one visit's.
+#[test]
+fn a_self_transition_writes_no_reads_and_keeps_counting_the_visit() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &gate_read("a", "k", None)); // 3
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "a")); // 4
+    assert!(context_records(&f.journal()).is_empty());
+    commit_as(&f, None, "wf", &gate_read("a", "k", Some("v"))); // 5
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 6
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0]["koto.context.read_count"], 2);
+    assert_eq!(c[0]["koto.visit.seq"], 2);
+}
+
+/// 52 distinct keys read in one visit write 50 records and one overflow
+/// record, which sums the reads of the other two and names none of them.
+/// A tuple already kept goes on counting in its own record.
+#[test]
+fn fifty_two_keys_write_fifty_records_and_one_overflow_record() {
+    let f = session_in_a();
+    for i in 0..52 {
+        commit_as(&f, None, "wf", &gate_read("a", &format!("k{i:02}"), None));
+    }
+    commit_as(&f, None, "wf", &gate_read("a", "k50", Some("x")));
+    commit_as(&f, None, "wf", &gate_read("a", "k51", Some("y")));
+    commit_as(&f, None, "wf", &gate_read("a", "k00", Some("z")));
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b"));
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 51);
+    let keys: Vec<String> = c[..50]
+        .iter()
+        .map(|r| r["koto.context.key"].as_str().unwrap().to_string())
+        .collect();
+    let expected: Vec<String> = (0..50).map(|i| format!("k{i:02}")).collect();
+    assert_eq!(keys, expected);
+    assert_eq!(c[0]["koto.context.read_count"], 2);
+    assert_eq!(c[0]["koto.context.present_count"], 1);
+    let overflow = &c[50];
+    assert_eq!(overflow["koto.context.overflow"], true);
+    assert_eq!(overflow["koto.context.read_count"], 4);
+    assert_eq!(overflow["koto.context.present_count"], 2);
+    assert_eq!(overflow["koto.state"], "a");
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("k50") && !raw.contains("k51"), "{raw}");
+}
+
+/// A key outside the name shape (longer than 128 bytes) is written as its
+/// digest, and one at 128 bytes as itself.
+#[test]
+fn a_key_outside_the_name_shape_is_digested() {
+    let f = session_in_a();
+    let long = format!("k{}", "e".repeat(200));
+    let edge = "q".repeat(128);
+    commit_as(&f, None, "wf", &gate_read("a", &long, None));
+    commit_as(&f, None, "wf", &gate_read("a", &edge, None));
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b"));
+    let c = context_records(&f.journal());
+    assert_eq!(c[0]["koto.context.key"], name_or_digest(&long).as_str());
+    assert!(c[0]["koto.context.key"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert_eq!(c[1]["koto.context.key"], edge.as_str());
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains(&long), "{raw}");
+
+    // A reader or access outside the shape is digested the same way, so
+    // two odd values stay two records.
+    let g = session_in_a();
+    for reader in ["odd reader", "odd  reader"] {
+        commit_as(
+            &g,
+            None,
+            "wf",
+            &read_of("a", "k", reader, "odd access", None),
+        );
+    }
+    commit_as(&g, None, "wf", &transitioned(Some("a"), "b"));
+    let c = context_records(&g.journal());
+    assert_eq!(c.len(), 2);
+    for (r, reader) in c.iter().zip(["odd reader", "odd  reader"]) {
+        assert_eq!(r["koto.context.reader"], name_or_digest(reader).as_str());
+        assert_eq!(
+            r["koto.context.access"],
+            name_or_digest("odd access").as_str()
+        );
+    }
+}
+
+/// The tuple is the key, the reader and the access together: one key read
+/// in one visit by `koto context get` (cli, content), a context-exists
+/// gate (gate, presence) and a context-matches gate (gate, content) gives
+/// three records, in first-read order, each with its own counts.
+#[test]
+fn one_key_read_by_two_readers_and_two_accesses_gives_one_record_per_tuple() {
+    let f = session_in_a();
+    let exists = |content| read_of("a", "notes", "gate", "presence", Some(content));
+    commit_as(&f, None, "wf", &cli_read("a", "notes", Some("n1"))); // 3
+    commit_as(&f, None, "wf", &exists("n1")); // 4
+    commit_as(&f, None, "wf", &gate_read("a", "notes", None)); // 5
+    commit_as(&f, None, "wf", &exists("n2")); // 6
+    commit_as(&f, None, "wf", &gate_read("a", "notes", Some("n2"))); // 7
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 8
+    let c = context_records(&f.journal());
+    let t = |r: &str, a: &str, n, p| ("notes".into(), r.into(), a.into(), n, p);
+    assert_eq!(
+        tuples(&c),
+        vec![
+            t("cli", "content", 1, 1),
+            t("gate", "presence", 2, 2),
+            t("gate", "content", 2, 1),
+        ]
+    );
+    assert_eq!(c[0]["koto.context.last_hash"], hash_of("n1"));
+    assert_eq!(c[1]["koto.context.first_hash"], hash_of("n1"));
+    assert_eq!(c[1]["koto.context.last_hash"], hash_of("n2"));
+    assert_eq!(c[2]["koto.context.first_hash"], hash_of("n2"));
+}
+
+/// A `request_store.result` whose visit has no read left to write writes
+/// nothing at all.
+#[test]
+fn a_result_with_no_reads_to_write_writes_nothing() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "done"));
+    reset_for_test();
+    commit_as(&f, None, "wf", &store_result());
+    assert_eq!(batches_for_test(), (0, 0));
+    assert!(warnings_for_test().is_empty());
+}
+
+/// A rewind ends the visit it leaves: its reads are written before the
+/// rewind's `state_entered`, and the visit it opens counts from zero.
+#[test]
+fn a_rewind_writes_the_visit_it_leaves_once() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 3
+    commit_as(&f, None, "wf", &gate_read("b", "k", Some("v"))); // 4
+    commit_as(&f, None, "wf", &rewound("b", "a")); // 5
+    commit_as(&f, None, "wf", &gate_read("a", "k", None)); // 6
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 7
+    let j = f.journal();
+    let c = context_records(&j);
+    let seqs: Vec<(u64, u64, &str, u64)> = c
+        .iter()
+        .map(|r| {
+            (
+                r["koto.seq"].as_u64().unwrap(),
+                r["koto.visit.seq"].as_u64().unwrap(),
+                r["koto.state"].as_str().unwrap(),
+                r["koto.context.read_count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(seqs, vec![(5, 3, "b", 1), (7, 5, "a", 1)]);
+    // Each before the `state_entered` of the event that ended its visit.
+    let k = kinds(&j);
+    let positions: Vec<usize> = k
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| *k == "context_reads")
+        .map(|(i, _)| i)
+        .collect();
+    for i in positions {
+        assert_eq!(k[i + 1], "state_entered");
+    }
+}
+
+/// A cancel writes the open visit's reads before `cancelled`. Reads after
+/// it aren't journaled: a second cancel and a later rewind write no reads.
+#[test]
+fn a_cancel_writes_the_open_visit_and_a_second_cancel_writes_nothing_more() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &gate_read("a", "k", Some("v"))); // 3
+    commit_as(&f, None, "wf", &gate_read("a", "k", Some("v"))); // 4
+    reset_for_test();
+    commit_as(&f, None, "wf", &cancelled("a")); // 5
+    assert_eq!(batches_for_test(), (1, 1));
+    let tail: Vec<String> = kinds(&f.journal())
+        .into_iter()
+        .rev()
+        .take(2)
+        .rev()
+        .collect();
+    assert_eq!(tail, vec!["context_reads", "cancelled"]);
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0]["koto.context.read_count"], 2);
+    assert_eq!(c[0]["koto.seq"], 5);
+    assert_eq!(c[0]["koto.visit.seq"], 2);
+
+    // A read after the cancel, a second cancel (another process racing the
+    // first, or a respawn fallback), then a rewind out of it.
+    commit_as(&f, None, "wf", &cli_read("a", "k", Some("v"))); // 6
+    commit_as(&f, None, "wf", &cancelled("a")); // 7
+    commit_as(&f, None, "wf", &rewound("a", "a")); // 8
+    let j = f.journal();
+    assert_eq!(context_records(&j).len(), 1, "{j:?}");
+    let tail: Vec<String> = kinds(&j).into_iter().rev().take(2).rev().collect();
+    assert_eq!(tail, vec!["cancelled", "state_entered"]);
+    // The rewind opened a visit of its own, which counts its own reads.
+    commit_as(&f, None, "wf", &gate_read("a", "k", None)); // 9
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 10
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 2);
+    assert_eq!(c[1]["koto.visit.seq"], 8);
+    assert_eq!(c[1]["koto.context.read_count"], 1);
+}
+
+/// The terminal tick's `request_store.result` ends the terminal state's
+/// visit: its batch holds the visit's reads alone, unflushed, and the
+/// `terminal` record's flushed write follows. A read on the kept terminal
+/// afterwards isn't journaled, and a rewind out of it writes no reads.
+#[test]
+fn request_store_result_writes_the_terminal_visit_and_a_rewind_out_of_it_writes_nothing() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &gate_read("a", "k", Some("v"))); // 3
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "done")); // 4
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &read_of("done", "k", "result", "content", Some("v")),
+    ); // 5
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &read_of("done", "gone", "result", "content", None),
+    ); // 6
+    reset_for_test();
+    commit_as(&f, None, "wf", &store_result()); // 7
+    assert_eq!(batches_for_test(), (1, 0), "context reads alone, unflushed");
+    let header = f.backend.read_header("wf").unwrap();
+    terminal(Some(&f.home), &f.backend, "wf", &header, "done");
+    assert_eq!(batches_for_test(), (2, 1), "the terminal is flushed");
+
+    let j = f.journal();
+    let tail: Vec<String> = kinds(&j).into_iter().rev().take(3).rev().collect();
+    assert_eq!(tail, vec!["context_reads", "context_reads", "terminal"]);
+    let c = context_records(&j);
+    let t = |k: &str, n, p| {
+        (
+            k.to_string(),
+            "result".to_string(),
+            "content".to_string(),
+            n,
+            p,
+        )
+    };
+    assert_eq!(tuples(&c[1..]), vec![t("k", 1, 1), t("gone", 1, 0)]);
+    for r in &c[1..] {
+        assert_eq!(r["koto.seq"], 7);
+        assert_eq!(r["koto.visit.seq"], 4);
+        assert_eq!(r["koto.state"], "done");
+    }
+
+    // `koto context get` on the kept terminal, then a rewind out of it.
+    commit_as(&f, None, "wf", &cli_read("done", "k", Some("v"))); // 8
+    commit_as(&f, None, "wf", &rewound("done", "a")); // 9
+    let j = f.journal();
+    assert_eq!(context_records(&j).len(), 3, "nothing more: {j:?}");
+    assert_eq!(kinds(&j).last().unwrap(), "state_entered");
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("PLANTED"), "{raw}");
+}
+
+/// When the terminal tick's `request_store.result` failed to commit, the
+/// terminal visit stays open: its reads stay in the log, a read made after
+/// the `terminal` record joins them (the one exception to reads after a
+/// terminal going unjournaled), and the next arrival writes them once.
+#[test]
+fn a_failed_request_store_result_leaves_the_visit_to_the_next_arrival() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "failed")); // 3
+    let reason = read_of("failed", "failure_reason", "result", "content", Some("r"));
+    commit_as(&f, None, "wf", &reason); // 4
+
+    // No `request_store.result`: its append failed. The terminal is still
+    // recorded.
+    let header = f.backend.read_header("wf").unwrap();
+    terminal(Some(&f.home), &f.backend, "wf", &header, "failed");
+    assert!(context_records(&f.journal()).is_empty());
+    // `koto context get` on the kept failure terminal.
+    let late = cli_read("failed", "failure_reason", Some("r"));
+    commit_as(&f, None, "wf", &late); // 5
+    commit_as(&f, None, "wf", &rewound("failed", "a")); // 6
+    let j = f.journal();
+    let c = context_records(&j);
+    assert_eq!(c.len(), 2);
+    let t = |r: &str, n, p| ("failure_reason".into(), r.into(), "content".into(), n, p);
+    assert_eq!(tuples(&c), vec![t("result", 1, 1), t("cli", 1, 1)]);
+    for r in &c {
+        assert_eq!(r["koto.state"], "failed");
+        assert_eq!(r["koto.seq"], 6);
+        assert_eq!(r["koto.visit.seq"], 3);
+    }
+    let tail: Vec<String> = kinds(&j).into_iter().rev().take(3).rev().collect();
+    assert_eq!(
+        tail,
+        vec!["context_reads", "context_reads", "state_entered"]
+    );
+    // Another arrival writes nothing more for that visit.
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 7
+    assert_eq!(context_records(&f.journal()).len(), 2);
+}
+
+/// An imported session's log carries the source's reads in its open visit,
+/// before its `session_imported`. Only the reads after the import are
+/// written when that visit ends.
+#[test]
+fn an_imported_sessions_visit_counts_only_the_reads_after_the_import() {
+    let f = Fixture::new();
+    let events = vec![
+        event(
+            1,
+            EventPayload::WorkflowInitialized {
+                template_path: String::new(),
+                variables: Default::default(),
+                spawn_entry: None,
+            },
+        ),
+        event(2, transitioned(None, "a")),
+        event(3, gate_read("a", "k", Some("v"))),
+        event(4, gate_read("a", "k", Some("v"))),
+        event(
+            5,
+            EventPayload::SessionImported {
+                from_workspace: "PLANTED-WORKSPACE".into(),
+                from_session: "wf".into(),
+                from_session_id: "src-id".into(),
+                machine_id: "m".into(),
+            },
+        ),
+    ];
+    f.backend
+        .init_state_file("wf", header("wf", "wf-id", None), events)
+        .unwrap();
+    commit_as(&f, None, "wf", &gate_read("a", "k", None)); // 6
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 7
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0]["koto.context.read_count"], 1);
+    assert_eq!(c[0]["koto.context.present_count"], 0);
+    assert_eq!(c[0]["koto.visit.seq"], 2);
+    assert_eq!(c[0]["koto.seq"], 7);
+
+    // An import with no read after it writes nothing.
+    let g = Fixture::new();
+    let mut events = vec![
+        event(
+            1,
+            EventPayload::WorkflowInitialized {
+                template_path: String::new(),
+                variables: Default::default(),
+                spawn_entry: None,
+            },
+        ),
+        event(2, transitioned(None, "a")),
+        event(3, gate_read("a", "k", Some("v"))),
+    ];
+    events.push(event(
+        4,
+        EventPayload::SessionImported {
+            from_workspace: "w".into(),
+            from_session: "wf".into(),
+            from_session_id: "src-id".into(),
+            machine_id: "m".into(),
+        },
+    ));
+    g.backend
+        .init_state_file("wf", header("wf", "wf-id", None), events)
+        .unwrap();
+    commit_as(&g, None, "wf", &transitioned(Some("a"), "b"));
+    assert!(context_records(&g.journal()).is_empty());
+}
+
+/// Under a new driver, an arrival's batch is `driver_seen`, the visit's
+/// reads, then `state_entered`.
+#[test]
+fn a_new_drivers_record_comes_before_the_visits_reads() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &gate_read("a", "k", None));
+    commit_as(&f, Some("driver-z"), "wf", &transitioned(Some("a"), "b"));
+    let tail: Vec<String> = kinds(&f.journal())
+        .into_iter()
+        .rev()
+        .take(3)
+        .rev()
+        .collect();
+    assert_eq!(tail, vec!["driver_seen", "context_reads", "state_entered"]);
+}
+
+/// A visit's `context_reads`, its check records and the responses printed
+/// in it carry the same `koto.visit.seq`, since all of them come from
+/// `persistence::current_visit`'s rule: a self-transition keeps the visit,
+/// and the reads are written, with the visit that ended, at the arrival
+/// elsewhere or the rewind that opens the next one.
+#[test]
+fn context_reads_share_the_visit_rule_with_check_and_response_records() {
+    let f = session_in_a();
+    let respond = |state: &str| {
+        response(
+            Some(&f.home),
+            &f.backend,
+            "wf",
+            state,
+            ResponseSource::Next,
+            "d",
+            None,
+        )
+    };
+    let check = |state: &str| {
+        commit_as(
+            &f,
+            None,
+            "wf",
+            &gate_event(
+                state,
+                "g",
+                "passed",
+                command_output(0),
+                stamped(1, 1, None),
+                None,
+            ),
+        )
+    };
+    check("a"); // 3, visit 2
+    commit_as(&f, None, "wf", &gate_read("a", "k", Some("one"))); // 4
+    respond("a");
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "a")); // 5
+    commit_as(&f, None, "wf", &gate_read("a", "k", Some("two"))); // 6
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 7
+    check("b"); // 8, visit 7
+    commit_as(&f, None, "wf", &gate_read("b", "k", None)); // 9
+    respond("b");
+    commit_as(&f, None, "wf", &rewound("b", "a")); // 10
+    respond("a");
+    let j = f.journal();
+    let got: Vec<(String, u64, u64)> = j
+        .iter()
+        .filter(|r| r["koto.visit.seq"].is_u64())
+        .map(|r| {
+            (
+                r["kind"].as_str().unwrap().to_string(),
+                r["koto.seq"].as_u64().unwrap(),
+                r["koto.visit.seq"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let row = |k: &str, seq: u64, visit: u64| (k.to_string(), seq, visit);
+    assert_eq!(
+        got,
+        vec![
+            row("check_evaluated", 3, 2),
+            row("response", 4, 2),
+            row("context_reads", 7, 2),
+            row("check_evaluated", 8, 7),
+            row("response", 9, 7),
+            row("context_reads", 10, 7),
+            row("response", 10, 10),
+        ]
+    );
+    let c = context_records(&j);
+    assert_eq!(c[0]["koto.context.read_count"], 2, "{}", c[0]);
+    assert_eq!(c[0]["koto.context.last_hash"], hash_of("two"));
+    assert_eq!(c[1]["koto.state"], "b");
+}
+
+/// With rotation on and the journal past its bound, the commit that ends a
+/// visit rotates the journal once, before its batch: the rotated file keeps
+/// every byte it had, and the visit's `context_reads` and the arrival's
+/// `state_entered` land whole, together, in the fresh journal, as one
+/// flushed batch.
+#[cfg(unix)]
+#[test]
+fn a_closing_batch_lands_whole_in_the_fresh_journal_after_a_rotation() {
+    let f = session_in_a();
+    for key in ["k1", "k2", "k3"] {
+        commit_as(&f, None, "wf", &gate_read("a", key, Some(key))); // 3, 4, 5
+    }
+    let journal = f.home.join(JOURNAL_FILE);
+    let before = std::fs::read_to_string(&journal).unwrap();
+    assert!(!before.is_empty());
+    rotate_at_one_byte();
+    reset_for_test();
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 6
+    assert_eq!(batches_for_test(), (1, 1));
+    let rotated = f.home.join(rotate::rotated_name(1));
+    assert_eq!(std::fs::read_to_string(&rotated).unwrap(), before);
+    assert!(!f.home.join(rotate::rotated_name(2)).exists());
+    let j = f.journal();
+    assert_eq!(
+        kinds(&j),
+        vec![
+            "context_reads",
+            "context_reads",
+            "context_reads",
+            "state_entered"
+        ]
+    );
+    let c = context_records(&j);
+    assert_eq!(
+        c.iter()
+            .map(|r| r["koto.context.key"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["k1", "k2", "k3"]
+    );
+    for r in &c {
+        assert_eq!(r["koto.seq"], 6, "{r}");
+        assert_eq!(r["koto.visit.seq"], 2, "{r}");
+    }
+    assert_eq!(j[3]["koto.state"], "b");
+    assert!(warnings_for_test().is_empty(), "{:?}", warnings_for_test());
+    assert!(
+        rotate::warnings_for_test().is_empty(),
+        "{:?}",
+        rotate::warnings_for_test()
+    );
+}
+
+/// A session whose current visit holds 10,000 events (reads of 60 keys,
+/// failed check events with 2 KB of output, evidence): a 4 MB log.
+fn ten_thousand_event_visit() -> Fixture {
+    let f = Fixture::new();
+    let mut events = vec![
+        event(
+            1,
+            EventPayload::WorkflowInitialized {
+                template_path: String::new(),
+                variables: Default::default(),
+                spawn_entry: None,
+            },
+        ),
+        event(2, transitioned(None, "a")),
+    ];
+    let output = serde_json::json!({"exit_code": 1, "error": "", "stdout": "x".repeat(2000)});
+    for i in 0..10_000u64 {
+        let payload = match i % 10 {
+            0 => gate_event(
+                "a",
+                "lint",
+                "failed",
+                output.clone(),
+                stamped(i + 1, i + 1, None),
+                None,
+            ),
+            1 => evidence("a"),
+            n => gate_read("a", &format!("key-{}", (i / 10 * 8 + n) % 60), Some("v")),
+        };
+        events.push(event(3 + i, payload));
+    }
+    f.backend
+        .init_state_file("wf", header("wf", "wf-id", None), events)
+        .unwrap();
+    f
+}
+
+/// The arrival that ends a 10,000-event visit writes 51 lines (50 of the
+/// 60 tuples and the overflow) whose counts add up to the visit's 8,000
+/// reads.
+#[test]
+fn a_ten_thousand_event_visit_writes_fifty_one_lines() {
+    let f = ten_thousand_event_visit();
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b"));
+    let c = context_records(&f.journal());
+    assert_eq!(c.len(), 51);
+    assert_eq!(c[50]["koto.context.overflow"], true);
+    let total: u64 = c
+        .iter()
+        .map(|r| r["koto.context.read_count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 8_000);
+    for r in &c {
+        assert_eq!(r["koto.seq"], 10_003);
+        assert_eq!(r["koto.visit.seq"], 2);
+    }
+}
+
+/// The work the fold adds to the arrival that ends a 10,000-event visit
+/// (finding the visit and folding its reads) stays within the 15 ms the
+/// hot path allows a tick. The budget is for release builds on an idle
+/// machine, so the test is left out of the default run. Run it with
+/// `cargo test --release --lib a_ten_thousand -- --ignored`.
+#[test]
+#[ignore = "wall-clock budget for release builds"]
+fn a_ten_thousand_event_visit_folds_within_budget() {
+    let f = ten_thousand_event_visit();
+    let path = f
+        .backend
+        .session_dir("wf")
+        .join(crate::session::state_file_name("wf"));
+    let log = std::fs::read_to_string(&path).unwrap();
+    let relay = Relay {
+        session: "wf",
+        session_id: "wf-id",
+        run_id: Some("wf-id"),
+        seq: 10_003,
+        visit_seq: Some(2),
+    };
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        let visit = crate::engine::persistence::visit_start(&log).unwrap();
+        let lines = context_reads::records(&log, visit, &relay).len();
+        times.push(started.elapsed());
+        assert_eq!(lines, 51);
+    }
+    times.sort();
+    let median = times[2];
+    assert!(
+        median < std::time::Duration::from_millis(15),
+        "the fold took {median:?}"
+    );
 }

@@ -672,6 +672,45 @@ impl NextResponse {
             NextResponse::Terminal { .. } | NextResponse::Error { .. } => false,
         }
     }
+
+    /// The state, `directive` and `details` this response prints, for a
+    /// variant that carries a directive. `Terminal` and `Error` carry none
+    /// and answer `None`.
+    pub(crate) fn directive_parts(&self) -> Option<(&str, &str, Option<&str>)> {
+        match self {
+            NextResponse::EvidenceRequired {
+                state,
+                directive,
+                details,
+                ..
+            }
+            | NextResponse::GateBlocked {
+                state,
+                directive,
+                details,
+                ..
+            }
+            | NextResponse::Integration {
+                state,
+                directive,
+                details,
+                ..
+            }
+            | NextResponse::IntegrationUnavailable {
+                state,
+                directive,
+                details,
+                ..
+            }
+            | NextResponse::ActionRequiresConfirmation {
+                state,
+                directive,
+                details,
+                ..
+            } => Some((state, directive, details.as_deref())),
+            NextResponse::Terminal { .. } | NextResponse::Error { .. } => None,
+        }
+    }
 }
 
 /// Why koto keeps a session after the tick that lands it in a terminal.
