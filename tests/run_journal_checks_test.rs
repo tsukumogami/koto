@@ -1430,11 +1430,19 @@ fn only_a_printed_directive_writes_a_response() {
     );
 
     // The terminal tick, which removes the session: no response, and none
-    // from `koto status` of the removed session.
+    // from `koto status` of the removed session, which answers from the
+    // finished record koto wrote before removing it and prints no directive.
     let out = env.ok_in(&dir, &["next", "c", "--with-data", r#"{"finish": "yes"}"#]);
     assert_eq!(printed(&out)["action"], "done");
     assert!(!env.session_dir("c").exists());
     let out = env.koto_in(&dir, &["status", "c"]);
+    assert_eq!(out.code, Some(0), "{}", out.stdout);
+    assert_eq!(printed(&out)["removed"], true);
+    assert_eq!(summary(&env), before);
+
+    // An error exit writes none either: a name that never existed and has no
+    // finished record answers `not found`.
+    let out = env.koto_in(&dir, &["status", "never-was"]);
     assert_eq!(out.code, Some(2), "{}", out.stdout);
     assert_eq!(summary(&env), before);
 
