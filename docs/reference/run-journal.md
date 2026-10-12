@@ -269,7 +269,7 @@ committed `decider_consulted` event.
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|
 | `koto.state` | string | always | The state consulted. |
-| `koto.decider.provider` | string | always | The provider's name, such as `jev`. |
+| `koto.decider.provider` | string | always | The provider's name, such as `jev`, koto's built-in decider provider. |
 | `koto.decider.model` | string | always | The model the provider reported, or `unknown`. |
 | `koto.decider.outcome` | string | always | How the consultation ended: `applied`, `not_applied`, `input_unavailable` or `error`. |
 | `koto.decider.error_class` | string | when logged | Why the provider call failed, such as `timeout`, `connect`, `http_status`, `malformed` or `mismatched`. |
@@ -310,8 +310,10 @@ same `koto.rule.id`.
 
 To total decider tokens, sum `koto.decider.input_tokens` and
 `koto.decider.output_tokens` over both decider kinds, by
-`koto.decider.model` and `koto.run.id`. Keep `unknown` as a model of its
-own.
+`koto.decider.model` and `koto.run.id`, and keep `unknown` as a model of
+its own. Sum `koto.decider.unread_usage_attempts` the same way: a nonzero
+count means some billed answers' usage couldn't be read, so that model's
+totals are a lower bound.
 
 ### `check_overridden`
 
@@ -326,12 +328,19 @@ koto writes one per override, not one per criterion of a decider check.
 ### Joining an override
 
 The evaluation an override moved past is the `check_evaluated` with the
-same `koto.session.id`, `koto.state` and `koto.check` and the highest
-`koto.seq` below the override's. It may belong to an earlier visit. Its
+same `koto.session.id`, `koto.state`, `koto.check` and `koto.visit.seq` as
+the override, and the highest `koto.seq` below the override's. Its
 `check_rule` records name the rules the override moved past; for a decider
-check, those are the criteria that failed. When there's no such record, as
-for an override recorded before the gate was ever evaluated, the override
-names no rule.
+check, those are the criteria that failed.
+
+koto ties an override to the gate's evaluations in the current visit only,
+so an evaluation from an earlier visit never counts. When the visit holds
+no such record, as for an override recorded before the gate was evaluated
+in that visit, the override names no rule. One case this join can't see:
+koto also stops counting earlier evaluations at a transition from the
+state to itself, which stays in the visit. An override recorded after such
+a transition, with no evaluation since, names no rule to koto, but the
+join finds the evaluation before the transition.
 
 ### What writes no decider or override record
 
@@ -479,8 +488,8 @@ writes several and a flush takes milliseconds. They reach the operating
 system as soon as they're written, so a koto process that crashes or is
 killed loses none of them, and the next identity record's flush (the
 session's next state entry, terminal or cancel) makes them durable along
-with it. An operating system crash or a power loss can lose check, decider and override records
-written since the journal's last flush.
+with it. An operating system crash or a power loss can lose check,
+decider and override records written since the journal's last flush.
 
 ## Retention
 

@@ -853,51 +853,6 @@ fn a_self_transition_keeps_the_visit_and_a_move_and_a_rewind_open_new_ones() {
 
 // ----- What writes nothing -----
 
-/// An overridden gate isn't evaluated, so it writes no check record, and
-/// the override's rationale stays out of the journal.
-#[test]
-fn an_overridden_gate_writes_no_check_record() {
-    let env = Env::new();
-    let dir = env.check_dir("over", &[1, 1], &[finding("E501")]);
-    let t = env.template(&dir, RETRY);
-    env.ok_in(&dir, &["init", "over", "--template", t.to_str().unwrap()]);
-    env.koto_in(&dir, &["next", "over", "--no-cleanup"]);
-    assert_eq!(
-        env.check_records("over").len(),
-        2,
-        "one evaluation, one rule"
-    );
-    env.ok_in(
-        &dir,
-        &[
-            "overrides",
-            "record",
-            "over",
-            "--gate",
-            "lint",
-            "--rationale",
-            "planted-rationale-5e1f",
-        ],
-    );
-    env.ok_in(&dir, &["next", "over", "--no-cleanup"]);
-    let records = env.records("over");
-    assert_eq!(
-        records.last().unwrap()["kind"],
-        "terminal",
-        "the override let the session move on: {records:?}"
-    );
-    // The override itself is relayed as `check_overridden`; no evaluation
-    // is.
-    let (overridden, evaluations): (Vec<Value>, Vec<Value>) = env
-        .check_records("over")
-        .into_iter()
-        .partition(|r| r["kind"] == "check_overridden");
-    assert_eq!(overridden.len(), 1, "{overridden:?}");
-    assert_eq!(evaluations.len(), 2, "nothing more was evaluated");
-    let runs = std::fs::read_to_string(dir.join("runs.log")).unwrap();
-    assert_eq!(runs.lines().count(), 1, "the check didn't run again");
-}
-
 /// A polling check re-run inside one evaluation writes one record for it,
 /// with the run count, and no pending record for the runs it held through.
 #[test]
@@ -1453,13 +1408,14 @@ fn decider_scenario(env: &Env, name: &str, stub: &DeciderStub) -> PathBuf {
 
 /// The journal's `check_evaluated` an override moved past, and that
 /// evaluation's rule records, found from journal lines alone: the same
-/// session, state and check, and the highest `koto.seq` below the
+/// session, state, check and visit, and the highest `koto.seq` below the
 /// override's.
 fn overridden_evaluation(lines: &[Value], overridden: &Value) -> Option<(Value, Vec<Value>)> {
     let same = |r: &Value| {
         r["koto.session.id"] == overridden["koto.session.id"]
             && r["koto.state"] == overridden["koto.state"]
             && r["koto.check"] == overridden["koto.check"]
+            && r["koto.visit.seq"] == overridden["koto.visit.seq"]
     };
     let below = overridden["koto.seq"].as_u64().unwrap();
     let evaluation = lines
@@ -1660,6 +1616,47 @@ fn a_decider_check_writes_one_decider_checked_per_criterion_before_its_evaluatio
     }
 }
 
+/// A decider check evaluated again in the same visit, on the same slice
+/// and with the lock free, reuses every verdict: koto asks the stub
+/// nothing and appends no `decider_checked`, so the journal gets the gate's
+/// new evaluation and its rule record, and no `decider_checked`.
+#[test]
+fn reused_verdicts_write_no_decider_checked() {
+    let env = Env::new();
+    let stub = DeciderStub::start();
+    let dir = decider_dir(
+        &env,
+        "reuse",
+        &decider_template(false, &[("a", "veto"), ("s", "shadow")]),
+    );
+    env.ok_in(&dir, &["init", "reuse", "--template", "template.md"]);
+    stub.push(criterion_answer("a", "fail", MODEL_A, (100, 3)));
+    stub.push(criterion_answer("s", "fail", MODEL_B, (40, 2)));
+    let next = || {
+        let out = decider_in(&env, &dir, &stub, &["next", "reuse", "--no-cleanup"]);
+        assert_eq!(out.journal_warnings(), 0, "{}", out.stderr);
+        let json: Value = serde_json::from_str(out.stdout.trim()).unwrap();
+        assert_eq!(json["action"], "gate_blocked", "{json}");
+    };
+    next();
+    assert_eq!(stub.request_count(), 2);
+    let first = env.records("reuse").len();
+
+    next();
+    assert_eq!(stub.request_count(), 2, "every verdict was reused");
+    let logged = env
+        .events("reuse")
+        .iter()
+        .filter(|e| e["type"] == "decider_checked")
+        .count();
+    assert_eq!(logged, 2, "koto appended no decider_checked");
+    let after: Vec<Value> = env.records("reuse").into_iter().skip(first).collect();
+    assert_eq!(kinds(&after), vec!["check_evaluated", "check_rule"]);
+    assert_eq!(after[0]["koto.check.outcome"], "failed");
+    assert_eq!(after[1]["koto.rule.id"], "a");
+    assert_eq!(after[1]["koto.rule.visit_count"], 2);
+}
+
 /// From the decider-check scenario's journal lines alone, preceded by a
 /// routing consultation, the tokens per model match the stub's answers and
 /// the session log, summed over both decider kinds.
@@ -1819,7 +1816,8 @@ fn an_odd_criterion_id_is_written_as_its_digest() {
 
 /// `koto overrides record` on the gate that failed four times in one visit
 /// writes a `check_overridden` whose highest earlier same-check
-/// `check_evaluated` is the fourth attempt, with the rule it failed.
+/// `check_evaluated` in its visit is the fourth attempt, with the rule it
+/// failed.
 #[test]
 fn an_override_after_a_loop_joins_to_the_fourth_attempt() {
     let env = Env::new();
@@ -1863,6 +1861,52 @@ fn an_override_after_a_loop_joins_to_the_fourth_attempt() {
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0]["koto.rule.id"], "E501");
     assert_eq!(rules[0]["koto.rule.visit_count"], 4);
+}
+
+/// An overridden gate isn't evaluated again: the override writes one
+/// `check_overridden` and no evaluation record, and its rationale stays out
+/// of the journal.
+#[test]
+fn an_overridden_gate_writes_only_check_overridden() {
+    let env = Env::new();
+    let dir = env.check_dir("over", &[1, 1], &[finding("E501")]);
+    let t = env.template(&dir, RETRY);
+    env.ok_in(&dir, &["init", "over", "--template", t.to_str().unwrap()]);
+    env.koto_in(&dir, &["next", "over", "--no-cleanup"]);
+    assert_eq!(
+        env.check_records("over").len(),
+        2,
+        "one evaluation, one rule"
+    );
+    env.ok_in(
+        &dir,
+        &[
+            "overrides",
+            "record",
+            "over",
+            "--gate",
+            "lint",
+            "--rationale",
+            "planted-rationale-5e1f",
+        ],
+    );
+    env.ok_in(&dir, &["next", "over", "--no-cleanup"]);
+    let records = env.records("over");
+    assert_eq!(
+        records.last().unwrap()["kind"],
+        "terminal",
+        "the override let the session move on: {records:?}"
+    );
+    // The override itself is relayed as `check_overridden`; no evaluation
+    // is.
+    let (overridden, evaluations): (Vec<Value>, Vec<Value>) = env
+        .check_records("over")
+        .into_iter()
+        .partition(|r| r["kind"] == "check_overridden");
+    assert_eq!(overridden.len(), 1, "{overridden:?}");
+    assert_eq!(evaluations.len(), 2, "nothing more was evaluated");
+    let runs = std::fs::read_to_string(dir.join("runs.log")).unwrap();
+    assert_eq!(runs.lines().count(), 1, "the check didn't run again");
 }
 
 /// An override recorded before the gate was ever evaluated writes its
@@ -1934,7 +1978,7 @@ fn a_decider_check_override_is_one_record_and_its_join_names_the_failed_criterio
     );
 }
 
-/// `check` runs `lint`; evidence moves it to `other` and back.
+/// `check` runs `lint` and can move to `other` and back.
 const OVERRIDE_VISITS: &str = r#"---
 name: journal-override-visits
 version: "1.0"
@@ -1985,55 +2029,114 @@ Elsewhere.
 Done.
 "#;
 
-/// An override recorded in a later visit than the evaluation that failed
-/// joins to that evaluation.
+/// An override joins only to an evaluation in its own visit, as koto ties
+/// it. Recorded in the visit where the gate failed, it joins to that
+/// evaluation. Recorded after the session left and came back, with no
+/// evaluation in the new visit, it joins to nothing, and koto's own record
+/// of the override agrees: it found no output to move past.
 #[test]
-fn an_override_in_a_later_visit_joins_to_the_earlier_evaluation() {
+fn an_override_joins_only_to_an_evaluation_in_its_own_visit() {
     let env = Env::new();
     let dir = env.check_dir("later", &[1], &[finding("E501")]);
     let t = env.template(&dir, OVERRIDE_VISITS);
     env.ok_in(&dir, &["init", "later", "--template", t.to_str().unwrap()]);
     env.koto_in(&dir, &["next", "later", "--no-cleanup"]);
+    let record = |env: &Env| {
+        env.ok_in(
+            &dir,
+            &[
+                "overrides",
+                "record",
+                "later",
+                "--gate",
+                "lint",
+                "--rationale",
+                "planted-rationale-5e1f",
+            ],
+        )
+    };
+    record(&env);
     env.ok_in(&dir, &["next", "later", "--to", "other"]);
     env.ok_in(&dir, &["next", "later", "--to", "check"]);
-    env.ok_in(
-        &dir,
-        &[
-            "overrides",
-            "record",
-            "later",
-            "--gate",
-            "lint",
-            "--rationale",
-            "planted-rationale-5e1f",
-        ],
-    );
+    record(&env);
     let runs = std::fs::read_to_string(dir.join("runs.log")).unwrap();
     assert_eq!(
         runs.lines().count(),
         1,
         "the check ran in the first visit only"
     );
+
     let overridden = decider_records(&env, "later");
-    assert_eq!(kinds(&overridden), vec!["check_overridden"]);
-    let o = &overridden[0];
-    let (evaluation, rules) =
-        overridden_evaluation(&journal_lines(&env), o).expect("an evaluation");
-    assert_ne!(
-        evaluation["koto.visit.seq"], o["koto.visit.seq"],
-        "the evaluation is in the earlier visit"
+    assert_eq!(
+        kinds(&overridden),
+        vec!["check_overridden", "check_overridden"]
     );
-    assert!(evaluation["koto.visit.seq"].as_u64() < o["koto.visit.seq"].as_u64());
+    let logged: Vec<Value> = env
+        .events("later")
+        .into_iter()
+        .filter(|e| e["type"] == "gate_override_recorded")
+        .collect();
+    let lines = journal_lines(&env);
+
+    // Same visit: the failed evaluation, and koto saw its output.
+    let same = &overridden[0];
+    let (evaluation, rules) = overridden_evaluation(&lines, same).expect("an evaluation");
+    assert_eq!(evaluation["koto.visit.seq"], same["koto.visit.seq"]);
     assert_eq!(evaluation["koto.check.outcome"], "failed");
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0]["koto.rule.id"], "E501");
+    assert!(
+        logged[0]["payload"]["actual_output"].is_object(),
+        "{}",
+        logged[0]
+    );
+
+    // A later visit with no evaluation: nothing, and koto saw no output.
+    let later = &overridden[1];
+    assert!(
+        later["koto.visit.seq"].as_u64() > same["koto.visit.seq"].as_u64(),
+        "{later}"
+    );
+    assert!(overridden_evaluation(&lines, later).is_none());
+    assert!(
+        logged[1]["payload"]["actual_output"].is_null(),
+        "{}",
+        logged[1]
+    );
 }
 
-/// The decider and override scenario's commands in `env`: each one's exit
-/// code, masked standard output and journal warning count, then the masked
-/// session log. The routing decider answers `go`, the decider check blocks
-/// on `a`, an override moves past it, and the session finishes.
-fn decider_outcome(env: &Env) -> (Vec<Step>, Vec<Value>) {
+/// What the decider and override scenario leaves behind in one home.
+struct DeciderOutcome {
+    /// Each command's exit code, masked standard output and journal
+    /// warning count.
+    steps: Vec<Step>,
+    /// The masked session log.
+    log: Vec<Value>,
+    /// The decider ledger's bytes with the values that vary between runs
+    /// (times, ids, latencies, the temporary directory) masked, or `None`
+    /// when the home holds no ledger.
+    ledger: Option<String>,
+}
+
+/// `text` with every time, id, latency and the temporary directory `tmp`
+/// replaced by a marker, and nothing else changed.
+fn masked_text(text: &str, tmp: &str) -> String {
+    let uuid =
+        regex::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap();
+    let time = regex::Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z").unwrap();
+    let latency = regex::Regex::new(r#""latency_ms":\d+"#).unwrap();
+    let text = text.replace(tmp, "<tmp>");
+    let text = uuid.replace_all(&text, "<id>");
+    let text = time.replace_all(&text, "<time>");
+    latency
+        .replace_all(&text, r#""latency_ms":"<masked>""#)
+        .into_owned()
+}
+
+/// The decider and override scenario's commands in `env`. The routing
+/// decider answers `go`, the decider check blocks on `a`, an override moves
+/// past it, and the session finishes.
+fn decider_outcome(env: &Env) -> DeciderOutcome {
     let stub = DeciderStub::start();
     let dir = decider_dir(env, "same", &decider_template(true, SCENARIO_CRITERIA));
     stub.push(route_answer(
@@ -2068,13 +2171,23 @@ fn decider_outcome(env: &Env) -> (Vec<Step>, Vec<Value>) {
         .lines()
         .map(|l| masked(&serde_json::from_str(l).unwrap(), &tmp))
         .collect();
-    (outs, log)
+    let ledger = std::fs::read_to_string(env.koto_home().join("_decider_ledger.jsonl"))
+        .ok()
+        .map(|text| masked_text(&text, &tmp));
+    DeciderOutcome {
+        steps: outs,
+        log,
+        ledger,
+    }
 }
 
-/// With the journal unwritable (a read-only koto home, or a symlink at its
-/// path), the decider and override scenario gives the same exit codes,
-/// standard output and session log as with a writable journal, and each
-/// command prints exactly one run-journal warning.
+/// With the journal unwritable (a read-only koto home, a read-only journal
+/// file, or a symlink at its path), the decider and override scenario gives
+/// the same exit codes, standard output and session log as with a writable
+/// journal, and each command prints exactly one run-journal warning. Where
+/// the ledger can still be written (everywhere but the read-only home,
+/// which holds it), its bytes match too once times, ids and latencies are
+/// masked.
 #[test]
 fn an_unwritable_journal_changes_nothing_for_decider_and_override_commands() {
     if running_as_root() {
@@ -2082,12 +2195,24 @@ fn an_unwritable_journal_changes_nothing_for_decider_and_override_commands() {
         return;
     }
     let good = Env::new();
-    let (expected, expected_log) = decider_outcome(&good);
-    assert!(expected.iter().all(|(_, _, w)| *w == 0), "{expected:?}");
+    let expected = decider_outcome(&good);
     assert!(
-        expected.iter().all(|(_, json, _)| json.is_object()),
-        "{expected:?}"
+        expected.steps.iter().all(|(_, _, w)| *w == 0),
+        "{:?}",
+        expected.steps
     );
+    assert!(
+        expected.steps.iter().all(|(_, json, _)| json.is_object()),
+        "{:?}",
+        expected.steps
+    );
+    let ledger = expected.ledger.clone().expect("a decider ledger");
+    for kind in ["consulted", "checked", "check_overridden"] {
+        assert!(
+            ledger.contains(&format!(r#""kind":"{kind}""#)),
+            "{kind}: {ledger}"
+        );
+    }
     let written = kinds(&decider_records(&good, "same"))
         .into_iter()
         .map(str::to_string)
@@ -2122,6 +2247,21 @@ fn an_unwritable_journal_changes_nothing_for_decider_and_override_commands() {
     )
     .unwrap();
     assert!(!read_only.journal_path().exists());
+    assert_eq!(got.ledger, None, "the read-only home holds the ledger too");
+
+    let read_only_file = Env::new();
+    std::fs::create_dir_all(read_only_file.koto_home()).unwrap();
+    std::fs::write(read_only_file.journal_path(), "").unwrap();
+    std::fs::set_permissions(
+        read_only_file.journal_path(),
+        std::fs::Permissions::from_mode(0o400),
+    )
+    .unwrap();
+    let got_file = decider_outcome(&read_only_file);
+    assert_eq!(
+        std::fs::read_to_string(read_only_file.journal_path()).unwrap(),
+        ""
+    );
 
     let linked = Env::new();
     std::fs::create_dir_all(linked.koto_home()).unwrap();
@@ -2131,15 +2271,22 @@ fn an_unwritable_journal_changes_nothing_for_decider_and_override_commands() {
     let got_linked = decider_outcome(&linked);
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched\n");
 
-    for (label, (outs, log)) in [("read-only", got), ("symlink", got_linked)] {
-        assert_eq!(outs.len(), expected.len());
+    for (label, got, compare_ledger) in [
+        ("read-only home", got, false),
+        ("read-only file", got_file, true),
+        ("symlink", got_linked, true),
+    ] {
+        assert_eq!(got.steps.len(), expected.steps.len());
         for (i, ((code, stdout, warnings), (e_code, e_stdout, _))) in
-            outs.iter().zip(&expected).enumerate()
+            got.steps.iter().zip(&expected.steps).enumerate()
         {
             assert_eq!(code, e_code, "{label} step {i}");
             assert_eq!(stdout, e_stdout, "{label} step {i}");
             assert_eq!(*warnings, 1, "{label} step {i}");
         }
-        assert_eq!(log, expected_log, "{label}");
+        assert_eq!(got.log, expected.log, "{label}");
+        if compare_ledger {
+            assert_eq!(got.ledger, expected.ledger, "{label}");
+        }
     }
 }

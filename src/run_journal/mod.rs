@@ -77,16 +77,16 @@
 //! reference, rationale, override value or output, and `koto.visit.seq` is
 //! always koto's visit, never the `visit_seq` a decider event carries.
 //!
-//! A field with no value is left out, never written as null or empty. Ids
-//! must match `^[A-Za-z0-9._:-]{1,128}$` and names `^[A-Za-z0-9._:/@-]{1,128}$`
-//! without a leading `/` or `~`. Names cover template and state names,
-//! `koto.check`, the decider's provider and model, and the short vocabulary
-//! values the relayed kinds carry (`koto.check.outcome`, `koto.poll.status`,
-//! `koto.check.error`, and the `koto.decider.` outcome, mode, reason and
-//! error class). A value outside its shape is left out and the record is
-//! still written, with one exception: a rule id outside the name shape, a
-//! decider criterion's id included, is written as its digest
-//! ([`name_or_digest`]), never dropped.
+//! A field with no value is left out, never written as null or empty.
+//! Ids must match `^[A-Za-z0-9._:-]{1,128}$`, and names
+//! `^[A-Za-z0-9._:/@-]{1,128}$` without a leading `/` or `~`. Names cover
+//! template and state names, `koto.check`, the decider's provider and
+//! model, and the short vocabulary values the relayed kinds carry
+//! (`koto.check.outcome`, `koto.poll.status`, `koto.check.error`, and the
+//! `koto.decider.` outcome, mode, reason and error class). A value outside
+//! its shape is left out and the record is still written, with one
+//! exception: a rule id outside the name shape, a decider criterion's id
+//! included, is written as its digest ([`name_or_digest`]), never dropped.
 //!
 //! ## When records are written
 //!
@@ -101,12 +101,12 @@
 //!   `workflow_cancelled`, the check kinds for `gate_evaluated` and
 //!   `default_action_executed`, and the decider and override kinds for
 //!   `decider_consulted`, `decider_checked` and `gate_override_recorded`.
-//!   Before those, on any committed payload, it
-//!   writes `driver_seen` when the process's driver (`CLAUDE_CODE_SESSION_ID`,
-//!   when id-shaped) differs from the one the session's sidecar caches, or
-//!   the sidecar caches none, and then caches the new driver. No driver is
-//!   never a change. Two commands racing under one new driver can each
-//!   write a `driver_seen`; readers take the distinct values.
+//!   Before those, on any committed payload, it writes `driver_seen` when
+//!   the process's driver (`CLAUDE_CODE_SESSION_ID`, when id-shaped)
+//!   differs from the one the session's sidecar caches, or the sidecar
+//!   caches none, and then caches the new driver. No driver is never a
+//!   change. Two commands racing under one new driver can each write a
+//!   `driver_seen`; readers take the distinct values.
 //! - [`terminal`], from the terminal tick, writes `terminal` once per
 //!   arrival.
 //! - [`imported`], from `koto session import`, writes the imported
@@ -511,12 +511,13 @@ impl Relay<'_> {
     }
 }
 
-/// The records a committed event relays. A check event writes
-/// `check_pending` for a pending polling gate; otherwise `check_evaluated`,
-/// then one `check_rule` per key of the event's `rule_counts`, in their
-/// order. A `decider_consulted` or `decider_checked` event writes one record
-/// of its own name, and a `gate_override_recorded` one `check_overridden`.
-/// Every other payload relays nothing.
+/// The records a committed event relays. A check event writes a
+/// `check_pending` for a pending polling gate; otherwise a
+/// `check_evaluated`, then one `check_rule` per key of the event's
+/// `rule_counts`, in their order. A `decider_consulted` or
+/// `decider_checked` event writes one record of its own name, and a
+/// `gate_override_recorded` one `check_overridden`. Every other payload
+/// relays nothing.
 ///
 /// Each field is copied by name from the event, never by stripping it, so
 /// nothing the event carries beyond these (output, streams, findings,
