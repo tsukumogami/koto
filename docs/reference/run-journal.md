@@ -449,9 +449,9 @@ session read:
   confirm it, and a short or guessable value (a branch name, a yes or no, a
   small number) is easy to recover from its hash.
 
-Treat context-read records as host-local data that can reveal what a
-session read and, for guessable content, what it said. Don't forward them
-off the host without that in mind.
+Context-read records hold key names and content hashes, so they stay on
+the host: no carrier or exporter forwards them. A tool that sends journal
+lines elsewhere leaves out every `context_reads` line.
 
 ### When a visit's reads are written
 
@@ -481,7 +481,7 @@ before that rewind's `state_entered`.
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|
 | `koto.state` | string | always | The state of the visit, as its reads name it. |
-| `koto.context.key` | string | except on the overflow record | The key's name, verbatim, when it has the name shape; otherwise (any key longer than 128 bytes) its digest, computed as for [Rule ids](#rule-ids). |
+| `koto.context.key` | string | except on the overflow record | The key's name, verbatim, when it has the name shape; otherwise (any key outside the name shape, such as one longer than 128 bytes or one with a space or a non-ASCII character) its digest, computed as for [Rule ids](#rule-ids). |
 | `koto.context.reader` | string | except on the overflow record | Who read it: `gate`, `cli`, `result` or `decider`. A value outside the name shape is written as its digest. |
 | `koto.context.access` | string | except on the overflow record | `content` for a read that fetched the content, `presence` for one that asked only whether the key exists. A value outside the name shape is written as its digest. |
 | `koto.context.overflow` | boolean | on the overflow record only | `true`: the record sums the reads of every tuple past the visit's first 50. |
@@ -550,9 +550,15 @@ An imported session is a new run: its own id is its run id.
   `check_rule` records, which share its `koto.seq`. A `response` comes
   after the records of the events committed before it printed.
 - A visit's `context_reads` come after any `driver_seen` of the same
-  command and right before the `state_entered`, `cancelled` or `terminal`
-  that ends the visit, and share its `koto.seq`. Records of one visit
-  differ in their key, reader and access.
+  command. A visit that ends in another state, a rewind or a cancel has
+  them right before the `state_entered` or `cancelled` that ends it, in
+  the same write, sharing that event's `koto.seq`. A terminal visit's are
+  written with the commit of the result event the terminal tick appends
+  to the session's log (see [When a visit's reads are
+  written](#when-a-visits-reads-are-written)), and carry that event's
+  `koto.seq`; the `terminal` record, which has no `koto.seq`, follows in
+  a write of its own. Records of one visit differ in their key, reader
+  and access.
 - A copy of the journal that delivered some lines more than once (a
   sender that retries, for example) holds exact duplicates. Treat two
   check, decider, override, response or context-read records as duplicates
