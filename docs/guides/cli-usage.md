@@ -622,7 +622,7 @@ Without `--apply` nothing is removed. The command prints the finished sessions i
 **Optional flags:**
 - `--execution-dir <dir>` -- Only sessions whose execution directory is `<dir>` or lies under it, matched the way [session list](#session-list) matches it.
 - `--older-than <age>` -- Only sessions whose last event is at least `<age>` old: a whole number and a unit, `s`, `m`, `h` or `d`, such as `30d`. A session whose last event's time can't be read is left out.
-- `--all` -- Every session. A preview without filters already covers every session; `--all` is what an `--apply` without `--plan` names when no other filter is given.
+- `--all` -- No filter: every finished session is judged. A preview without filters already covers them all; `--all` is what an `--apply` without `--plan` names when no other filter is given.
 - `--apply` -- Remove instead of previewing.
 - `--plan <token>` -- With `--apply`, remove exactly the sessions the preview that printed `<token>` listed.
 

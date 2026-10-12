@@ -49,7 +49,7 @@ const PLAN_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The exit code for a plan that is stale or unknown. No other koto verb
 /// uses it.
-const EXIT_PLAN_STALE: i32 = 4;
+const EXIT_PLAN_REFUSED: i32 = 4;
 
 /// The exit code when a removal failed.
 const EXIT_REMOVAL_FAILED: i32 = 3;
@@ -516,7 +516,7 @@ fn plan_unknown(token: &str) -> ! {
                  previewed on another host; preview again"
             ),
         }}),
-        EXIT_PLAN_STALE,
+        EXIT_PLAN_REFUSED,
     )
 }
 
@@ -622,7 +622,7 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
                     "added": added,
                     "dropped": dropped,
                 }}),
-                EXIT_PLAN_STALE,
+                EXIT_PLAN_REFUSED,
             );
         }
     }
@@ -691,6 +691,10 @@ fn apply(backend: &Backend, inv: &Inventory, verdict: &Verdict) -> Outcome {
 }
 
 /// How many `parent_workflow` links lie above `name` in the inventory.
+/// Removal goes deepest first so a koto child goes before its parent. A
+/// `chain/parent` link isn't ordered: such a parent is kept by rule b for as
+/// long as the session naming it runs, and both being finished means
+/// neither needs the other.
 fn depth(inv: &Inventory, name: &str) -> usize {
     let mut seen = BTreeSet::new();
     let mut current = name.to_string();
@@ -772,6 +776,10 @@ fn remove_one(
         status: fresh.seen.status,
         chain_parent: &fresh.chain_parent,
         references: fresh.references(name),
+        // Referencers as the judgment found them, each re-inspected now. A
+        // session created since that names this one isn't seen: the design
+        // accepts that window rather than re-reading the whole store per
+        // removal.
         referencers: inv.referencers.get(name).cloned().unwrap_or_default(),
     };
     let mut status_of = |other: &str| -> Option<SessionStatus> {

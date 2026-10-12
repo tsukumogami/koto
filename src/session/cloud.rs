@@ -74,7 +74,9 @@ pub enum RemoteCopy {
     /// The remote copy is ahead of the local one or diverged from it; the
     /// string says which.
     NotSafe(String),
-    /// A version file couldn't be read or parsed; the string says which.
+    /// The check couldn't be made: the listing failed, the local log or a
+    /// version file couldn't be read, or a version file didn't parse. The
+    /// string says which.
     Unreadable(String),
 }
 
