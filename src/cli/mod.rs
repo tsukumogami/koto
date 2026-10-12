@@ -9767,7 +9767,7 @@ Done.
     }
 
     /// Points `$HOME` at a scratch directory for one test and restores it,
-    /// so the terminal tick's writes under `~/.koto` (the terminal index)
+    /// so the terminal tick's writes under `$HOME/.koto` (the terminal index)
     /// land there. Env mutation is process-global; CI runs
     /// `--test-threads=1`, as the workflows surface tests that do the same
     /// rely on.
