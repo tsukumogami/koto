@@ -25,6 +25,17 @@ to `0.9.x`).
   ones written since the session's last state entry; a process crash loses
   none. `docs/reference/run-journal.md` documents the three kinds.
 
+- **The run journal records the size of each printed directive.** When
+  `koto next` or `koto status` prints a non-terminal state's directive, koto
+  now adds a `response` line with the state, the command (`next` or
+  `status`), and the UTF-8 byte lengths of the printed `directive` and
+  `details` (0 when the details were left out), never the text. Like check
+  lines, it carries `koto.seq`, here the highest sequence number in the
+  session's log when it was written, and `koto.visit.seq`, so a reader can
+  sum the instruction bytes an agent received per visit. A chained tick
+  writes one line, for the state it stopped in; terminal ticks, errors and
+  refusals write none. The `instructions_delivered` event is unchanged.
+
 - **A session waiting on a request leg is woken when the leg changes.** Every
   write that records a leg's result (a promoted worker result, `koto request
   resolve`, or a refusal `koto init --koto-leg` records), abandons a leg or a

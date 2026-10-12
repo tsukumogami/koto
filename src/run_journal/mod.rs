@@ -60,6 +60,12 @@
 //! - `check_pending`: one per pending `gate_evaluated` of a polling gate,
 //!   with the poll's run count and elapsed seconds, never an outcome.
 //!
+//! One more relays no event: `response`, written after `koto next` or
+//! `koto status` prints a non-terminal state's directive, with the byte
+//! lengths of the printed `directive` and `details` (never their text).
+//! Its `koto.seq` is the highest sequence number in the session's log when
+//! it is written, and its `koto.visit.seq` the visit the log is in.
+//!
 //! A field with no value is left out, never written as null or empty. Ids
 //! must match `^[A-Za-z0-9._:-]{1,128}$` and names `^[A-Za-z0-9._:/@-]{1,128}$`
 //! without a leading `/` or `~`. Names cover template and state names,
@@ -88,6 +94,9 @@
 //!   write a `driver_seen`; readers take the distinct values.
 //! - [`terminal`], from the terminal tick, writes `terminal` once per
 //!   arrival.
+//! - [`response`], from `koto next`'s two print sites and from
+//!   `koto status`, writes `response` after a directive is printed. It
+//!   describes output rather than a commit, so it follows the print.
 //! - [`imported`], from `koto session import`, writes the imported
 //!   session's `session_started` and a `state_entered` for the state it is
 //!   in, once per imported session.
@@ -109,8 +118,8 @@
 //! partial line is lost. Readers skip lines that don't parse as JSON.
 //!
 //! A batch holding an identity record is flushed to disk; a batch of check
-//! records alone isn't, and is made durable by the next flush (see
-//! [`write`]).
+//! or response records alone isn't, and is made durable by the next flush
+//! (see [`write`]).
 //!
 //! ## Files
 //!
@@ -826,6 +835,118 @@ pub(crate) fn terminal(
             Record::new("terminal", session, &header.session_id, run_id.as_deref())
                 .name("koto.terminal", Some(final_state)),
         ],
+    );
+}
+
+/// The command that printed a response: `koto next` or `koto status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponseSource {
+    Next,
+    Status,
+}
+
+impl ResponseSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            ResponseSource::Next => "next",
+            ResponseSource::Status => "status",
+        }
+    }
+}
+
+/// A `response` record: the state whose directive was printed, the command
+/// that printed it, and the byte lengths of the printed `directive` and
+/// `details` (0 when none was printed). Never the text itself.
+fn response_record(
+    relay: &Relay<'_>,
+    state: &str,
+    source: ResponseSource,
+    directive: &str,
+    details: Option<&str>,
+) -> Record {
+    relay
+        .record("response")
+        .name("koto.state", Some(state))
+        .name("koto.response.source", Some(source.as_str()))
+        .int(
+            "koto.response.directive_bytes",
+            Some(directive.len() as u64),
+        )
+        .int(
+            "koto.response.details_bytes",
+            Some(details.map_or(0, str::len) as u64),
+        )
+}
+
+/// Journal a response that has just been printed: one `response` record for
+/// `state`, the non-terminal state whose `directive` (and `details`, when it
+/// carried them) the command printed. `koto next` calls this at its two
+/// print sites, after the response and its `instructions_delivered` event,
+/// and `koto status` at its end; a terminal, an error or a refusal prints no
+/// directive and calls nothing. A chained `koto next` prints, and records,
+/// only the state it stopped in.
+///
+/// The byte counts are the UTF-8 lengths of the strings the response
+/// serialized, which are the printed JSON's strings after decoding: escapes
+/// don't count, and text koto adds to the directive (the recovery pointer,
+/// a notice) does.
+///
+/// The session's log is read once, straight from the session directory and
+/// never through the backend's own read (which, for the cloud store, can
+/// fetch the log from the remote), for its header, its highest `seq`
+/// (`koto.seq`) and, by [`persistence::visit_start`]'s rule, the visit it
+/// is in (`koto.visit.seq`). The record is written without a flush, like
+/// the check records. `journal_root` is the store's journal home; `None`
+/// writes nothing.
+///
+/// [`persistence::visit_start`]: crate::engine::persistence::visit_start
+pub(crate) fn response(
+    journal_root: Option<&Path>,
+    backend: &dyn SessionBackend,
+    session: &str,
+    state: &str,
+    source: ResponseSource,
+    directive: &str,
+    details: Option<&str>,
+) {
+    use crate::engine::persistence::{last_seq, visit_start};
+    let Some(root) = journal_root else {
+        return;
+    };
+    let session_dir = backend.session_dir(session);
+    let log =
+        match std::fs::read_to_string(session_dir.join(crate::session::state_file_name(session))) {
+            Ok(log) => log,
+            Err(e) => {
+                warn_once(&format!(
+                    "could not read the log of session {}: {}",
+                    session, e
+                ));
+                return;
+            }
+        };
+    let header = log
+        .lines()
+        .next()
+        .and_then(|line| serde_json::from_str::<StateFileHeader>(line.trim()).ok());
+    let (Some(header), Some(seq)) = (header, last_seq(&log)) else {
+        warn_once(&format!(
+            "could not read the header and events of session {}",
+            session
+        ));
+        return;
+    };
+    let run_id = cached_run_id(backend, &session_dir, &header);
+    let relay = Relay {
+        session,
+        session_id: &header.session_id,
+        run_id: run_id.as_deref(),
+        seq,
+        visit_seq: visit_start(&log),
+    };
+    write(
+        root,
+        &[response_record(&relay, state, source, directive, details)],
     );
 }
 

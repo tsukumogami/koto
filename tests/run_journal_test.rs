@@ -496,6 +496,14 @@ fn allowed_fields(kind: &str) -> &'static [&'static str] {
             "koto.poll.evaluations",
             "koto.poll.elapsed_secs",
         ],
+        "response" => &[
+            "koto.seq",
+            "koto.visit.seq",
+            "koto.state",
+            "koto.response.source",
+            "koto.response.directive_bytes",
+            "koto.response.details_bytes",
+        ],
         other => panic!("unknown record kind {other}"),
     }
 }
@@ -659,9 +667,13 @@ fn self_directed_and_rewound_transitions_each_journal_the_state_entered() {
     env.ok(&["rewind", "moves"]);
 
     let records = env.records("moves");
-    let tail = &records[mark..];
-    assert_eq!(kinds(tail), vec!["state_entered"; 3], "{tail:?}");
-    assert_eq!(states(tail), vec!["loop", "one", "loop"]);
+    let tail: Vec<Value> = records[mark..]
+        .iter()
+        .filter(|r| r["kind"] != "response")
+        .cloned()
+        .collect();
+    assert_eq!(kinds(&tail), vec!["state_entered"; 3], "{tail:?}");
+    assert_eq!(states(&tail), vec!["loop", "one", "loop"]);
 }
 
 #[test]
@@ -1263,10 +1275,14 @@ Done.
 
 /// `(kind, the driver or the state it names)` for each of `session`'s
 /// records after `session_started`.
+/// The session's identity records after its `session_started`, as (kind,
+/// state or driver) pairs. `response` records follow what a command
+/// printed, not who drove it, and are left out.
 fn driven_sequence(env: &Env, session: &str) -> Vec<(String, String)> {
     env.records(session)
         .iter()
         .skip(1)
+        .filter(|r| r["kind"] != "response")
         .map(|r| {
             let kind = r["kind"].as_str().unwrap().to_string();
             let what = match kind.as_str() {

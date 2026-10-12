@@ -96,7 +96,8 @@ fn every_kind_the_reference_names_is_one_koto_writes_and_the_reverse() {
             "driver_seen",
             "session_started",
             "state_entered",
-            "terminal"
+            "terminal",
+            "response"
         ]
         .iter()
         .map(|s| s.to_string())

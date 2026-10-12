@@ -3,7 +3,8 @@
 The run journal is a local record of session identity and progress for
 tooling outside koto. koto appends one JSON object per line as sessions
 start, enter states, reach a terminal, are cancelled, or are driven by a new
-Claude Code session, and each time koto evaluates one of their checks. The
+Claude Code session, each time koto evaluates one of their checks, and each
+time `koto next` or `koto status` prints a state's directive. The
 journal is append-only: koto never rewrites or reads back its records, so a
 session's lines outlive the session itself, including sessions koto removes
 at their terminal tick or on `koto session cleanup`.
@@ -57,7 +58,7 @@ A field with no value is left out, never written as `null` or an empty
 string. Ids (every `*.id` field except `koto.rule.id`, and
 `koto.template.hash`) must match `^[A-Za-z0-9._:-]{1,128}$`. Names
 (`koto.template.name`, `koto.state`, `koto.terminal`, `koto.check`, and
-the string values of the check kinds) must match
+the string values of the check and response kinds) must match
 `^[A-Za-z0-9._:/@-]{1,128}$` and not start with `/` or `~`. A value outside
 its shape is left out and the record is still written. `koto.rule.id` is
 never left out: a rule id outside the name shape is written as its digest
@@ -75,9 +76,11 @@ never left out: a rule id outside the name shape is written as its digest
 | `check_evaluated` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.check.outcome`, `koto.attempt`, `koto.visit_attempt`, `koto.check.rule_count`, `koto.check.rule_counts_truncated`, `koto.check.duration_ms`, `koto.poll.status`, `koto.check.unanswered_count`, `koto.check.error` | koto evaluates a gate and the result isn't pending, or runs a state's default action. |
 | `check_rule` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.rule.visit_count`, `koto.rule.session_count` | Once for each error rule of a check evaluation, after its `check_evaluated`. |
 | `check_pending` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.poll.status`, `koto.poll.evaluations`, `koto.poll.elapsed_secs` | A polling gate's evaluation is still pending. |
+| `response` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.response.source`, `koto.response.directive_bytes`, `koto.response.details_bytes` | `koto next` or `koto status` has printed a non-terminal state's directive. |
 
-The first five are the identity kinds. The last three are the check kinds,
-described in [Check records](#check-records).
+The first five are the identity kinds. The next three are the check kinds,
+described in [Check records](#check-records), and `response` is described
+in [Response records](#response-records).
 
 `session_started`'s fields:
 
@@ -236,6 +239,48 @@ literal id of that form can't be told apart from a digest.
 {"kind":"check_pending","v":1,"at":"2026-10-10T03:21:40.502Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":19,"koto.visit.seq":17,"koto.state":"ci","koto.check":"ci","koto.poll.status":"pending","koto.poll.evaluations":2,"koto.poll.elapsed_secs":31}
 ```
 
+## Response records
+
+koto writes one `response` record each time `koto next` or `koto status`
+prints a directive, right after printing it. It records how much
+instruction text koto handed the agent, never the text itself.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.seq` | integer | always | The highest sequence number in the session's log when the record was written. A response relays no event, so this places it among the session's check records: after every event committed before it printed. |
+| `koto.visit.seq` | integer | always | The visit the session is in, as for check records. |
+| `koto.state` | string | always | The state whose directive was printed. |
+| `koto.response.source` | string | always | `next` or `status`: the command that printed it. |
+| `koto.response.directive_bytes` | integer | always | The UTF-8 byte length of the printed `directive` string, after JSON decoding: escapes don't count, multi-byte characters count every byte, and text koto adds to the directive (the pointer to `koto status`, a notice) counts. |
+| `koto.response.details_bytes` | integer | always | The same for the printed `details` string, or 0 when the response printed none, including when koto left the details out because this visit already received them. |
+
+`koto next` writes its record after the response's `instructions_delivered`
+event, when it has one, so `koto.seq` covers that event. A `koto next` that
+chains through several states prints, and records, only the state it
+stopped in. Summing a state's `koto.response.directive_bytes` and
+`koto.response.details_bytes` per `koto.visit.seq` gives the instruction
+bytes the agent received in each visit.
+
+These write no `response` record:
+
+- A `koto next` that lands on a terminal state, or a `koto status` of a
+  session in one, since neither prints a directive.
+- A command that prints an error, such as a `koto next` whose evidence is
+  refused at validation, or a `koto status` of a session that doesn't
+  exist.
+
+Two `response` records of one session written in the same millisecond with
+no event committed between them are equal in every field. A reader that
+removes exact duplicates (see [Write and ordering
+rules](#write-and-ordering-rules)) counts them once; koto takes longer than
+that to answer a command, so this is rare.
+
+### Example
+
+```json
+{"kind":"response","v":1,"at":"2026-10-10T03:15:02.131Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":15,"koto.visit.seq":9,"koto.state":"implement","koto.response.source":"next","koto.response.directive_bytes":1342,"koto.response.details_bytes":0}
+```
+
 ## Run ids
 
 A run is a root session and every session spawned under it, at any depth.
@@ -269,14 +314,15 @@ An imported session is a new run: its own id is its run id.
 - `at` is the time the record was written, not the time of the event it
   describes, and it isn't guaranteed to increase down the file across
   processes. Use file order within a session.
-- Order one session's check records by `koto.seq`, then by file order.
-  A `check_evaluated` comes before its own `check_rule` records, which
-  share its `koto.seq`.
+- Order one session's check and response records by `koto.seq`, then by
+  file order. A `check_evaluated` comes before its own `check_rule`
+  records, which share its `koto.seq`. A `response` comes after the
+  records of the events committed before it printed.
 - A copy of the journal that delivered some lines more than once (a
   sender that retries, for example) holds exact duplicates. Treat two
-  check records as duplicates only when every field, `at` included, is
-  equal. Distinct check records differ in `kind`, `at`, `koto.seq` or
-  `koto.rule.id`.
+  check or response records as duplicates only when every field, `at`
+  included, is equal. Distinct check records differ in `kind`, `at`,
+  `koto.seq` or `koto.rule.id`.
 - `koto session import` writes the imported session's `session_started` and
   one `state_entered` for the state it's in, both timed at the import,
   exactly once per imported session. A retry or a rerun that adopts an
@@ -361,14 +407,14 @@ line is lost.
 
 ## Durability
 
-Identity records are flushed to disk as they're written. Check records
-aren't flushed on their own, since a blocked tick writes several and a
-flush takes milliseconds. They reach the operating system as soon as
-they're written, so a koto process that crashes or is killed loses none of
-them, and the next identity record's flush (the session's next state
-entry, terminal or cancel) makes them durable along with it. An operating
-system crash or a power loss can lose check records written since the
-journal's last flush.
+Identity records are flushed to disk as they're written. Check and
+response records aren't flushed on their own, since a blocked tick writes
+several and a flush takes milliseconds. They reach the operating system as
+soon as they're written, so a koto process that crashes or is killed loses
+none of them, and the next identity record's flush (the session's next
+state entry, terminal or cancel) makes them durable along with it. An operating
+system crash or a power loss can lose check and response records written
+since the journal's last flush.
 
 ## Retention
 
@@ -377,8 +423,9 @@ No session-lifecycle command deletes or rewrites the journal:
 at its terminal tick, a parent's sweep of its children,
 `koto init --replace-terminal` and `koto session import` all leave existing
 lines byte-identical. koto doesn't rotate or prune it yet, so it grows by
-a few hundred bytes per state entered and per check evaluation, and by up
-to 50 more lines for a check that reports many error rules.
+a few hundred bytes per state entered, per check evaluation and per printed
+directive, and by up to 50 more lines for a check that reports many error
+rules.
 
 To remove it by hand, delete the file (or move it aside) while no koto
 command is running. The next record creates a new file. Lines removed this

@@ -667,7 +667,8 @@ const RELAY_FIELDS: &[&str] = &[
     "koto.visit.seq",
 ];
 
-/// The fields a check kind may carry beyond [`RELAY_FIELDS`].
+/// The fields a check kind, or `response`, may carry beyond
+/// [`RELAY_FIELDS`].
 fn check_kind_fields(kind: &str) -> &'static [&'static str] {
     match kind {
         "check_evaluated" => &[
@@ -698,6 +699,12 @@ fn check_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.poll.status",
             "koto.poll.evaluations",
             "koto.poll.elapsed_secs",
+        ],
+        "response" => &[
+            "koto.state",
+            "koto.response.source",
+            "koto.response.directive_bytes",
+            "koto.response.details_bytes",
         ],
         other => panic!("not a check kind: {other}"),
     }
@@ -1443,4 +1450,214 @@ fn check_records_fit_the_line_cap_at_the_longest_names() {
     for id in &ids {
         assert!(lines.iter().any(|l| l.contains(id.as_str())), "{id}");
     }
+}
+
+// ----- Response records -----
+
+/// The `response` records in `j`, each checked to carry `v` 1, both
+/// sequence numbers, and exactly its kind's fields.
+fn response_records(j: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    j.iter()
+        .filter(|r| r["kind"] == "response")
+        .map(|r| {
+            let expected: BTreeSet<&str> = RELAY_FIELDS
+                .iter()
+                .chain(check_kind_fields("response"))
+                .copied()
+                .collect();
+            let got: BTreeSet<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();
+            assert_eq!(got, expected, "{r}");
+            assert_eq!(r["v"], 1);
+            r.clone()
+        })
+        .collect()
+}
+
+/// The log of `wf` as it stands, read the way the hook reads it.
+fn log_of(f: &Fixture, session: &str) -> String {
+    std::fs::read_to_string(
+        f.backend
+            .session_dir(session)
+            .join(crate::session::state_file_name(session)),
+    )
+    .unwrap()
+}
+
+/// A response record carries the log's highest seq and its visit, the
+/// UTF-8 byte lengths of what was printed (0 for no details), and nothing
+/// of the text. It is written in its own batch without a flush.
+#[test]
+fn a_response_records_the_printed_byte_lengths_and_the_logs_position() {
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &evidence("a")); // 3
+    reset_for_test();
+    let directive = "Corrija o código — ✓ PLANTED-DIRECTIVE";
+    let details = "Détails PLANTED-DETAILS";
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Next,
+        directive,
+        Some(details),
+    );
+    assert_eq!(batches_for_test(), (1, 0), "one batch, no flush");
+    response(
+        Some(&f.home),
+        &f.backend,
+        "wf",
+        "a",
+        ResponseSource::Status,
+        directive,
+        None,
+    );
+    let r = response_records(&f.journal());
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0]["session"], "wf");
+    assert_eq!(r[0]["koto.session.id"], "wf-id");
+    assert_eq!(r[0]["koto.run.id"], "wf-id");
+    assert_eq!(r[0]["koto.state"], "a");
+    assert_eq!(r[0]["koto.response.source"], "next");
+    assert_eq!(r[0]["koto.response.directive_bytes"], directive.len());
+    assert_ne!(directive.len(), directive.chars().count());
+    assert_eq!(r[0]["koto.response.details_bytes"], details.len());
+    assert_eq!(r[1]["koto.response.source"], "status");
+    assert_eq!(r[1]["koto.response.details_bytes"], 0);
+    let log = log_of(&f, "wf");
+    for rec in &r {
+        assert_eq!(rec["koto.seq"], 3);
+        assert_eq!(
+            rec["koto.seq"].as_u64(),
+            crate::engine::persistence::last_seq(&log)
+        );
+        assert_eq!(rec["koto.visit.seq"], 2);
+    }
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("PLANTED"), "{raw}");
+    assert!(warnings_for_test().is_empty());
+}
+
+/// A response and the check records of the same visit carry the same
+/// `koto.visit.seq`, since both come from `persistence::visit_start`: a
+/// self-transition keeps the visit, and an arrival elsewhere or a rewind
+/// opens a new one.
+#[test]
+fn a_response_shares_the_visit_rule_with_the_check_records() {
+    let f = session_in_a();
+    let respond = |f: &Fixture, state: &str| {
+        response(
+            Some(&f.home),
+            &f.backend,
+            "wf",
+            state,
+            ResponseSource::Next,
+            "d",
+            None,
+        )
+    };
+    let check = |f: &Fixture, state: &str| {
+        commit_as(
+            f,
+            None,
+            "wf",
+            &gate_event(
+                state,
+                "g",
+                "passed",
+                command_output(0),
+                stamped(1, 1, None),
+                None,
+            ),
+        )
+    };
+    check(&f, "a"); // 3, visit 2
+    respond(&f, "a");
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "a")); // 4
+    respond(&f, "a");
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b")); // 5
+    check(&f, "b"); // 6, visit 5
+    respond(&f, "b");
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::Rewound {
+            from: "b".into(),
+            to: "a".into(),
+            rationale: None,
+        },
+    ); // 7
+    respond(&f, "a");
+    let j = f.journal();
+    let got: Vec<(String, u64, u64)> = j
+        .iter()
+        .filter(|r| r["kind"] == "response" || r["kind"] == "check_evaluated")
+        .map(|r| {
+            (
+                r["kind"].as_str().unwrap().to_string(),
+                r["koto.seq"].as_u64().unwrap(),
+                r["koto.visit.seq"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let pair = |k: &str, seq: u64, visit: u64| (k.to_string(), seq, visit);
+    assert_eq!(
+        got,
+        vec![
+            pair("check_evaluated", 3, 2),
+            pair("response", 3, 2),
+            pair("response", 4, 2),
+            pair("check_evaluated", 6, 5),
+            pair("response", 6, 5),
+            pair("response", 7, 7),
+        ]
+    );
+    assert_eq!(response_records(&j).len(), 4);
+}
+
+/// No journal root writes nothing. A session whose log can't be read
+/// writes nothing and warns once.
+#[test]
+fn a_response_without_a_journal_or_a_log_writes_nothing() {
+    let f = session_in_a();
+    let before = f.journal().len();
+    response(None, &f.backend, "wf", "a", ResponseSource::Next, "d", None);
+    assert_eq!(f.journal().len(), before);
+    assert!(warnings_for_test().is_empty());
+    for _ in 0..2 {
+        response(
+            Some(&f.home),
+            &f.backend,
+            "gone",
+            "a",
+            ResponseSource::Status,
+            "d",
+            None,
+        );
+    }
+    assert_eq!(f.journal().len(), before);
+    assert_eq!(warnings_for_test().len(), 1);
+}
+
+/// With a 255-byte session name, a 128-byte state and the largest counts,
+/// a response record fits the line cap.
+#[test]
+fn a_response_record_fits_the_line_cap_at_the_longest_names() {
+    let session = "s".repeat(255);
+    let id = "i".repeat(128);
+    let relay = Relay {
+        session: &session,
+        session_id: &id,
+        run_id: Some(&id),
+        seq: u64::MAX,
+        visit_seq: Some(u64::MAX),
+    };
+    let state = "t".repeat(128);
+    let long = "x".repeat(1 << 20);
+    let record = response_record(&relay, &state, ResponseSource::Status, &long, Some(&long));
+    let line = record.to_line();
+    assert!(line.len() < MAX_LINE_BYTES, "{} bytes: {line}", line.len());
+    assert!(line.contains(&state));
+    assert!(line.contains(&format!("\"koto.response.directive_bytes\":{}", 1 << 20)));
 }
