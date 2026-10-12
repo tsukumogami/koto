@@ -542,7 +542,7 @@ Every row also carries `execution_dir`, the directory the session's ticks run in
       "parent_workflow": null,
       "template_source_status": null,
       "execution_dir": "/work/repo",
-      "session_id": "b43af83c-5948-4cf2-8424-563d8436f02e",
+      "session_id": "<session-id>",
       "state": "done",
       "status": "terminal",
       "failure": false,

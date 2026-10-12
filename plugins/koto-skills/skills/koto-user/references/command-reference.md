@@ -670,7 +670,7 @@ Lists all sessions as a JSON array, sorted alphabetically by `id`.
     "created_at": "2026-01-15T10:30:00Z",
     "template_hash": "abc123...",
     "execution_dir": "/work/repo",
-    "session_id": "b43af83c-5948-4cf2-8424-563d8436f02e"
+    "session_id": "<session-id>"
   }
 ]
 ```
