@@ -710,15 +710,20 @@ fn status_returns_promptly_while_a_batch_scoped_parents_lock_is_held() {
 
 /// The held-lock and mid-tick races above show `status` doesn't wait on
 /// contention, but neither discriminates a correct implementation from
-/// one that wrongly attempts a non-blocking lock: on a non-batch session
-/// no lock exists to contend over, so both would return immediately
-/// either way. This test is the one that does discriminate -- it traces
-/// the process with `strace` and asserts no `flock` syscall is made at
-/// all. Skips (rather than fails) when `strace` isn't on `PATH`, since
-/// its presence isn't guaranteed on every dev machine; GitHub's
-/// `ubuntu-latest` runner ships it, so CI still gets the real check.
+/// one that wrongly attempts a non-blocking lock on the session: on a
+/// non-batch session no lock exists to contend over, so both would return
+/// immediately either way. This test is the one that does discriminate --
+/// it traces the process with `strace -y`, which names the file behind
+/// each descriptor, and asserts that the only `flock` syscalls `status`
+/// makes are on the run journal, for the `response` record it appends
+/// after printing the directive, and that each is non-blocking
+/// (`LOCK_NB`), so a stopped journal writer can't hang it either. No
+/// `flock` touches the session's files. Skips (rather than fails) when
+/// `strace` isn't on `PATH`, since its presence isn't guaranteed on every
+/// dev machine; GitHub's `ubuntu-latest` runner ships it, so CI still gets
+/// the real check.
 #[test]
-fn status_attempts_no_lock_syscall_on_a_non_batch_session() {
+fn status_attempts_no_session_lock_syscall_on_a_non_batch_session() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     init_workflow_with_vars(root, "wf", PHASES_TEMPLATE, &["ORG=acme"]);
@@ -729,6 +734,7 @@ fn status_attempts_no_lock_syscall_on_a_non_batch_session() {
     let spawn = std::process::Command::new("strace")
         .args([
             "-f",
+            "-y",
             "-e",
             "trace=flock",
             "-o",
@@ -761,9 +767,22 @@ fn status_attempts_no_lock_syscall_on_a_non_batch_session() {
     );
 
     let trace = std::fs::read_to_string(&trace_path).unwrap();
+    let flocks: Vec<&str> = trace.lines().filter(|l| l.contains("flock(")).collect();
+    for call in &flocks {
+        assert!(
+            call.contains("_run_journal.jsonl>"),
+            "status must not flock anything but the run journal; strace output:\n{trace}"
+        );
+        assert!(
+            call.contains("LOCK_NB"),
+            "status must only try the run journal's lock without blocking; strace output:\n{trace}"
+        );
+    }
+    // The directive was printed, so the journal was locked for its record:
+    // the trace saw the calls it is checking.
     assert!(
-        !trace.contains("flock("),
-        "status must not attempt any flock syscall on a non-batch session; strace output:\n{trace}"
+        !flocks.is_empty(),
+        "expected the run journal's lock for the response record; strace output:\n{trace}"
     );
 }
 
