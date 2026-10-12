@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 problem: |
   koto's session store under $HOME/.koto/sessions holds every kind of state its
   users keep, about a thousand session directories on one workstation, and
@@ -23,7 +23,7 @@ absorbed:
 
 ## Status
 
-In Progress
+Done
 
 Absorbed [BRIEF-session-hygiene](docs/briefs/BRIEF-session-hygiene.md); carried in Absorbed Brief.
 
@@ -545,5 +545,5 @@ Documentation and verification:
 
 ## Downstream Artifacts
 
-- `docs/designs/DESIGN-session-hygiene.md` (planned): how each verb, the
+- `docs/designs/current/DESIGN-session-hygiene.md` (planned): how each verb, the
   finished record, the rotation and the marker rule are built.

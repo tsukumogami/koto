@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 problem: |
   koto's session store holds about a thousand sessions on one workstation
   and offers no way to find them by where they ran, no safe way to remove
@@ -42,7 +42,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 
