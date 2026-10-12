@@ -134,7 +134,16 @@ impl Env {
 
     /// A koto command for this home, run from `cwd`.
     fn cmd(&self, cwd: &Path) -> Command {
-        let mut cmd = Command::cargo_bin("koto").unwrap();
+        Command::from_std(self.std_cmd(cwd))
+    }
+
+    /// [`Env::cmd`] as a `std::process::Command`, for a test that spawns
+    /// koto and bounds how long it waits. Every koto command a test runs is
+    /// built here: this home, this cache, and none of the developer's
+    /// variables that would redirect the store, the config, the workflows
+    /// directory, the decider or the driver.
+    fn std_cmd(&self, cwd: &Path) -> std::process::Command {
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("koto"));
         cmd.current_dir(cwd)
             .env("HOME", &self.home)
             .env("XDG_CACHE_HOME", self.tmp.path().join("cache"));
@@ -1599,26 +1608,9 @@ fn status_while_the_journal_lock_is_held(rotate_bytes: Option<u64>) {
     let holder = std::fs::File::open(env.journal_path()).unwrap();
     // SAFETY: flock on a descriptor `holder` owns until it is dropped.
     assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
-    // The same command `Env::cmd` builds, spawned so the test can bound
-    // how long it waits.
-    let mut status = std::process::Command::new(assert_cmd::cargo::cargo_bin("koto"));
-    status
-        .current_dir(&dir)
-        .env("HOME", &env.home)
-        .env("XDG_CACHE_HOME", env.tmp.path().join("cache"));
-    for unset in [
-        "KOTO_SESSIONS_BASE",
-        "KOTO_HOME",
-        "XDG_CONFIG_HOME",
-        "KOTO_WORKFLOWS_DIR",
-        "KOTO_DECIDER",
-        "KOTO_DECIDER_API_KEY",
-        "KOTO_DECIDER_ENDPOINT",
-        "CLAUDE_CODE_SESSION_ID",
-    ] {
-        status.env_remove(unset);
-    }
-    let mut child = status
+    // Spawned so the test can bound how long it waits.
+    let mut child = env
+        .std_cmd(&dir)
         .args(["status", "held"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1672,6 +1664,498 @@ fn status_while_the_journal_lock_is_held(rotate_bytes: Option<u64>) {
     let records = env.responses("held");
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["koto.response.source"], "status");
+}
+
+// ----- Every journal write's lock wait is bounded -----
+
+/// The variable a debug build of koto reads in place of the journal's
+/// five-second lock wait, in milliseconds. Release builds ignore it, so
+/// the tests that use it skip themselves there.
+const LOCK_WAIT_ENV: &str = "KOTO_TEST_JOURNAL_LOCK_WAIT_MS";
+
+/// The variable a debug build reads to hold its first rotation's slow step
+/// (just before the rotated file's flush) until the file it names is
+/// removed.
+const ROTATE_HOLD_ENV: &str = "KOTO_TEST_JOURNAL_ROTATE_HOLD";
+
+/// The lock wait these tests give koto through [`LOCK_WAIT_ENV`].
+const TEST_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The journal's real bound. A command that took this long per write would
+/// mean the test bound wasn't applied.
+const JOURNAL_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the koto binary under test reads the test variables, which only
+/// a debug build does. The test can't ask the binary, so this reads the
+/// test crate's own `debug_assertions` and assumes cargo built the binary
+/// in the same profile, as `cargo test` does unless a profile override
+/// sets the two apart. Under such an override this answer can be wrong.
+fn seams_available() -> bool {
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    eprintln!("skipped: a release build doesn't read the journal test variables");
+    false
+}
+
+/// Take the journal's lock, as a writer that stopped while holding it would,
+/// until the returned file is dropped.
+fn hold_journal_lock(env: &Env) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let holder = std::fs::File::open(env.journal_path()).unwrap();
+    // SAFETY: flock on a descriptor `holder` owns until it is dropped.
+    assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+    holder
+}
+
+/// [`Env::std_cmd`] with the journal's lock wait set to [`TEST_BOUND`].
+fn bounded_cmd(env: &Env, dir: &Path, args: &[&str]) -> std::process::Command {
+    let mut cmd = env.std_cmd(dir);
+    cmd.env(LOCK_WAIT_ENV, TEST_BOUND.as_millis().to_string())
+        .env_remove(ROTATE_HOLD_ENV)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    cmd
+}
+
+/// Wait for `child` to exit, failing the test instead of hanging when it
+/// runs past 20 seconds. Returns its output and how long it ran from
+/// `started`.
+fn finish(
+    mut child: std::process::Child,
+    started: std::time::Instant,
+    what: &str,
+) -> (Out, std::time::Duration) {
+    use std::time::Duration;
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(20) {
+            child.kill().unwrap();
+            panic!("{what} hung behind the journal lock");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let took = started.elapsed();
+    let output = child.wait_with_output().unwrap();
+    let out = Out {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    };
+    (out, took)
+}
+
+/// Run `koto args` from `dir` with the journal's lock wait at
+/// [`TEST_BOUND`], to the end.
+fn run_bounded(env: &Env, dir: &Path, args: &[&str]) -> (Out, std::time::Duration) {
+    let started = std::time::Instant::now();
+    let child = bounded_cmd(env, dir, args).spawn().unwrap();
+    finish(child, started, &format!("koto {args:?}"))
+}
+
+/// Two sessions of [`CHAINED`] in a fresh directory, `free` and `held`,
+/// each at `start`.
+fn twin_sessions(env: &Env, label: &str) -> PathBuf {
+    let dir = env.work.join(label);
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = env.template(&dir, CHAINED);
+    for name in ["free", "held"] {
+        env.ok_in(&dir, &["init", name, "--template", t.to_str().unwrap()]);
+    }
+    dir
+}
+
+/// `koto next` never hangs on the journal: with the journal's lock held by
+/// another process past the bound, a tick that chains through four states
+/// and prints a directive exits with the same code and standard output as
+/// the same tick with the lock free, prints one run-journal warning, and
+/// writes no record. Each of its journal writes gives up after the bound,
+/// not the real five seconds, and none waits indefinitely. The session
+/// itself moves exactly as the free one does, and once the lock is free its
+/// records are written again.
+#[test]
+fn koto_next_exits_normally_while_the_journal_lock_is_held_past_the_bound() {
+    if !seams_available() {
+        return;
+    }
+    let env = Env::new();
+    let dir = twin_sessions(&env, "next-held");
+    let go = ["--with-data", r#"{"go":"yes"}"#];
+    let free = env.ok_in(&dir, &[&["next", "free"][..], &go].concat());
+    let journal_before = std::fs::read_to_string(env.journal_path()).unwrap();
+
+    let holder = hold_journal_lock(&env);
+    let (held, took) = run_bounded(&env, &dir, &[&["next", "held"][..], &go].concat());
+    drop(holder);
+
+    assert_eq!(held.code, free.code, "{}", held.stderr);
+    assert_eq!(held.code, Some(0));
+    assert_eq!(held.stdout, free.stdout);
+    assert_eq!(held.journal_warnings(), 1, "{}", held.stderr);
+    assert!(
+        held.stderr.contains("held by another writer"),
+        "{}",
+        held.stderr
+    );
+    assert!(took >= TEST_BOUND, "took {took:?}");
+    assert!(took < JOURNAL_BOUND, "took {took:?}");
+    assert_eq!(
+        std::fs::read_to_string(env.journal_path()).unwrap(),
+        journal_before
+    );
+    // The session is where the free one is: the skipped records were the
+    // journal's only loss.
+    let state = |name: &str| -> Vec<String> {
+        env.events(name)
+            .iter()
+            .filter(|e| e["type"] == "transitioned")
+            .map(|e| e["payload"]["to"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(state("held"), state("free"));
+
+    env.ok_in(&dir, &["status", "held"]);
+    assert_eq!(env.responses("held").len(), 1);
+}
+
+/// A held lock costs a command one wait, not one per batch: a `koto next`
+/// that chains through four states writes five batches with the lock free,
+/// and with the lock held it gives up on the first after the bound and
+/// skips the other four without waiting. It finishes in about one bound,
+/// with the free run's exit code and standard output and one warning.
+#[test]
+fn a_chained_koto_next_waits_out_a_held_lock_once_not_once_per_batch() {
+    use std::time::Duration;
+    if !seams_available() {
+        return;
+    }
+    // Long enough that one wait per batch can't pass for one wait plus the
+    // command's own run time.
+    let bound = Duration::from_secs(1);
+    let env = Env::new();
+    let dir = twin_sessions(&env, "next-chained-held");
+    let go = ["--with-data", r#"{"go":"yes"}"#];
+    let lines = || {
+        std::fs::read_to_string(env.journal_path())
+            .unwrap()
+            .lines()
+            .count()
+    };
+    let before_free = lines();
+    let free = env.ok_in(&dir, &[&["next", "free"][..], &go].concat());
+    let records = lines() - before_free;
+    assert_eq!(records, 5, "four state entries and one response");
+    let journal_before = std::fs::read_to_string(env.journal_path()).unwrap();
+
+    let holder = hold_journal_lock(&env);
+    let started = std::time::Instant::now();
+    let child = bounded_cmd(&env, &dir, &[&["next", "held"][..], &go].concat())
+        .env(LOCK_WAIT_ENV, bound.as_millis().to_string())
+        .spawn()
+        .unwrap();
+    let (held, took) = finish(child, started, "the chained koto next");
+    drop(holder);
+
+    assert_eq!(held.code, free.code, "{}", held.stderr);
+    assert_eq!(held.code, Some(0));
+    assert_eq!(held.stdout, free.stdout);
+    assert_eq!(held.journal_warnings(), 1, "{}", held.stderr);
+    assert!(took >= bound, "took {took:?}");
+    assert!(
+        took < bound * 2,
+        "took {took:?}: more than one wait for {records} records"
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.journal_path()).unwrap(),
+        journal_before
+    );
+}
+
+/// A terminal tick with the journal's lock held past the bound still does
+/// everything after its `terminal` record: it exits with the free tick's
+/// code and output, appends the terminal index entry, and removes the
+/// session, or keeps it under `--no-cleanup`, exactly as the free tick
+/// does. A removed session leaves its finished record, so `koto status`
+/// still answers for it with `removed: true`, as it does for the free
+/// twin; a kept one has no record and answers as a kept session. Neither
+/// the `state_entered` nor the `terminal` record is written, and one
+/// warning names the journal.
+#[test]
+fn a_terminal_tick_finishes_its_cleanup_while_the_journal_lock_is_held() {
+    if !seams_available() {
+        return;
+    }
+    for no_cleanup in [false, true] {
+        let env = Env::new();
+        let dir = twin_sessions(&env, "terminal-held");
+        for name in ["free", "held"] {
+            env.ok_in(&dir, &["next", name, "--with-data", r#"{"go":"yes"}"#]);
+        }
+        let mut finish_args = vec!["--with-data", r#"{"finish":"yes"}"#];
+        if no_cleanup {
+            finish_args.push("--no-cleanup");
+        }
+        let free = env.ok_in(&dir, &[&["next", "free"][..], &finish_args].concat());
+        let journal_before = std::fs::read_to_string(env.journal_path()).unwrap();
+        assert!(
+            journal_before.contains(r#""kind":"terminal""#),
+            "{journal_before}"
+        );
+        let terminals_before = journal_before.matches(r#""kind":"terminal""#).count();
+
+        let holder = hold_journal_lock(&env);
+        let (held, took) = run_bounded(&env, &dir, &[&["next", "held"][..], &finish_args].concat());
+        drop(holder);
+
+        assert_eq!(held.code, free.code, "{}", held.stderr);
+        assert_eq!(held.code, Some(0));
+        assert_eq!(held.stdout, free.stdout);
+        assert!(held.stdout.contains(r#""state":"done""#), "{}", held.stdout);
+        assert_eq!(held.journal_warnings(), 1, "{}", held.stderr);
+        assert!(took >= TEST_BOUND, "took {took:?}");
+        assert!(took < JOURNAL_BOUND, "took {took:?}");
+        let journal_after = std::fs::read_to_string(env.journal_path()).unwrap();
+        assert_eq!(journal_after, journal_before);
+        assert_eq!(
+            journal_after.matches(r#""kind":"terminal""#).count(),
+            terminals_before
+        );
+
+        // What the tick does after the record happened all the same.
+        assert_eq!(
+            env.session_dir("held").exists(),
+            env.session_dir("free").exists(),
+            "no_cleanup={no_cleanup}"
+        );
+        assert_eq!(env.session_dir("held").exists(), no_cleanup);
+        let index = std::fs::read_to_string(env.koto_home().join("_terminal_index.jsonl")).unwrap();
+        for name in ["free", "held"] {
+            assert!(
+                index.contains(&format!(r#""session_id":"{name}""#)),
+                "{index}"
+            );
+        }
+
+        // The finished record is written just before the removal, after
+        // the skipped `terminal` record, and only when the session is
+        // removed; `koto status` reads it back.
+        let record = |name: &str| {
+            env.koto_home()
+                .join("sessions")
+                .join(".finished")
+                .join(format!("{name}.json"))
+        };
+        let status = |name: &str| -> Value {
+            let out = env.ok_in(&dir, &["status", name]);
+            serde_json::from_str(&out.stdout).unwrap()
+        };
+        let (free_status, held_status) = (status("free"), status("held"));
+        for field in ["current_state", "is_terminal", "result"] {
+            assert_eq!(held_status[field], free_status[field], "{field}");
+        }
+        assert_eq!(held_status["current_state"], "done");
+        assert_eq!(held_status["is_terminal"], true);
+        if no_cleanup {
+            assert!(!record("held").exists());
+            assert!(!record("free").exists());
+            assert!(held_status.get("removed").is_none(), "{held_status}");
+        } else {
+            assert!(record("held").is_file());
+            assert!(record("free").is_file());
+            assert_eq!(held_status["removed"], true, "{held_status}");
+            assert_eq!(free_status["removed"], true, "{free_status}");
+        }
+    }
+}
+
+/// A parent that waits on its children, for
+/// [`a_terminal_tick_still_notifies_its_parent_while_the_journal_lock_is_held`].
+const PARENT: &str = r#"---
+name: journal-parent
+version: "1.0"
+initial_state: wait
+states:
+  wait:
+    accepts:
+      done:
+        type: enum
+        required: true
+        values: ["yes"]
+    transitions:
+      - target: end
+        when:
+          done: "yes"
+  end:
+    terminal: true
+---
+
+## wait
+
+Wait for the children.
+
+## end
+
+Done.
+"#;
+
+/// A child's terminal tick under a held journal lock still notifies its
+/// parent: with one child finishing with the lock free and its twin with
+/// the lock held, the parent's log gets a `child_completed` for each, and
+/// both children are removed. The held tick skips its journal records with
+/// one warning and exits as the free one does.
+#[test]
+fn a_terminal_tick_still_notifies_its_parent_while_the_journal_lock_is_held() {
+    if !seams_available() {
+        return;
+    }
+    let env = Env::new();
+    let dir = env.work.join("parent-held");
+    std::fs::create_dir_all(&dir).unwrap();
+    let parent = dir.join("parent.md");
+    std::fs::write(&parent, PARENT).unwrap();
+    env.ok_in(
+        &dir,
+        &["init", "boss", "--template", parent.to_str().unwrap()],
+    );
+    let child = env.template(&dir, CHAINED);
+    for name in ["kid-free", "kid-held"] {
+        env.ok_in(
+            &dir,
+            &[
+                "init",
+                name,
+                "--template",
+                child.to_str().unwrap(),
+                "--parent",
+                "boss",
+            ],
+        );
+        env.ok_in(&dir, &["next", name, "--with-data", r#"{"go":"yes"}"#]);
+    }
+    let finish_args = ["--with-data", r#"{"finish":"yes"}"#];
+    let free = env.ok_in(&dir, &[&["next", "kid-free"][..], &finish_args].concat());
+
+    let holder = hold_journal_lock(&env);
+    let (held, took) = run_bounded(
+        &env,
+        &dir,
+        &[&["next", "kid-held"][..], &finish_args].concat(),
+    );
+    drop(holder);
+
+    assert_eq!(held.code, free.code, "{}", held.stderr);
+    assert_eq!(held.stdout, free.stdout);
+    assert_eq!(held.journal_warnings(), 1, "{}", held.stderr);
+    assert!(took < JOURNAL_BOUND, "took {took:?}");
+    let notices: Vec<String> = env
+        .events("boss")
+        .iter()
+        .filter(|e| e["type"] == "child_completed")
+        .map(|e| e["payload"]["child_name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(notices, vec!["kid-free", "kid-held"]);
+    for name in ["kid-free", "kid-held"] {
+        assert!(!env.session_dir(name).exists(), "{name} was kept");
+    }
+}
+
+/// With rotation on, a rotation that is slow under the lock (held just
+/// before the rotated file's flush, the slow step) doesn't hold up another
+/// `koto next` past the bound: the waiting command gives up on the lock
+/// after the bound, exits normally with its usual output and one warning,
+/// and writes nothing, while the rotation is still held. The rotating
+/// command's slow step isn't cut short by its own bound: released well
+/// after it, the rotation finishes, the rotated file keeps the journal byte
+/// for byte, and that command's records land whole in the fresh file.
+#[test]
+fn koto_next_gives_up_at_the_bound_behind_a_slow_rotation_that_still_finishes() {
+    use std::time::{Duration, Instant};
+    if !seams_available() {
+        return;
+    }
+    let env = Env::new();
+    let dir = env.work.join("slow-rotation");
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = env.template(&dir, CHAINED);
+    for name in ["slow", "waiting"] {
+        env.ok_in(&dir, &["init", name, "--template", t.to_str().unwrap()]);
+        env.ok_in(&dir, &["next", name, "--with-data", r#"{"go":"yes"}"#]);
+    }
+    // The next write finds the journal at its bound and rotates; the
+    // rotating command's own two records stay well under it.
+    let journal_before = std::fs::read_to_string(env.journal_path()).unwrap();
+    let bound = journal_before.len() as u64;
+    env.ok_in(
+        &dir,
+        &[
+            "config",
+            "set",
+            "run_journal.rotate_bytes",
+            &bound.to_string(),
+            "--user",
+        ],
+    );
+    let back = ["--with-data", r#"{"finish":"no"}"#];
+
+    let marker = env.tmp.path().join("rotation-held");
+    let rotating_started = Instant::now();
+    let rotating = bounded_cmd(&env, &dir, &[&["next", "slow"][..], &back].concat())
+        .env(ROTATE_HOLD_ENV, &marker)
+        .spawn()
+        .unwrap();
+    while !marker.exists() {
+        assert!(
+            rotating_started.elapsed() < Duration::from_secs(20),
+            "the rotation never reached its slow step"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let held_at = Instant::now();
+
+    let (waiting, took) = run_bounded(&env, &dir, &[&["next", "waiting"][..], &back].concat());
+    // The rotation is still in its slow step, holding the lock.
+    assert!(marker.exists());
+    assert!(rotated_journals(&env).is_empty());
+    assert_eq!(waiting.code, Some(0), "{}", waiting.stderr);
+    assert_eq!(waiting.journal_warnings(), 1, "{}", waiting.stderr);
+    assert!(
+        waiting.stderr.contains("held by another writer"),
+        "{}",
+        waiting.stderr
+    );
+    assert!(took >= TEST_BOUND, "took {took:?}");
+    assert!(took < JOURNAL_BOUND, "took {took:?}");
+
+    // Hold the slow step well past the rotating command's own bound, then
+    // let it go.
+    while held_at.elapsed() < TEST_BOUND * 3 {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::remove_file(&marker).unwrap();
+    let (rotated_out, rotated_took) = finish(rotating, rotating_started, "the rotating koto next");
+    assert_eq!(rotated_out.code, Some(0), "{}", rotated_out.stderr);
+    assert_eq!(rotated_out.journal_warnings(), 0, "{}", rotated_out.stderr);
+    assert!(rotated_took >= TEST_BOUND * 3, "took {rotated_took:?}");
+    assert_eq!(waiting.stdout, rotated_out.stdout);
+
+    let rotated = rotated_journals(&env);
+    assert_eq!(rotated.len(), 1, "{rotated:?}");
+    assert!(rotated[0].ends_with("_run_journal.0000000001.jsonl"));
+    assert_eq!(
+        std::fs::read_to_string(&rotated[0]).unwrap(),
+        journal_before
+    );
+    let fresh = env.journal();
+    assert_eq!(
+        kinds(&fresh),
+        vec!["state_entered", "response"],
+        "{fresh:#?}"
+    );
+    assert!(fresh.iter().all(|r| r["session"] == "slow"), "{fresh:#?}");
+    assert!(
+        fresh.iter().all(|r| r["koto.state"] == "start"),
+        "{fresh:#?}"
+    );
 }
 
 // ----- A journal koto can't write -----

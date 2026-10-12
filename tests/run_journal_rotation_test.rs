@@ -137,8 +137,9 @@ impl Env {
     }
 
     /// One `koto next` round of the loop. Every journal write it makes,
-    /// its `response` record included, waits for the lock, so it never
-    /// prints a journal warning, however many writers contend.
+    /// its `response` record included, waits up to five seconds for the
+    /// lock, far longer than these writers ever hold it, so it never prints
+    /// a journal warning, however many writers contend.
     fn tick(&self, name: &str) {
         let out = self.run(&[
             "next",
