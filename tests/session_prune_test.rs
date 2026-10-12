@@ -313,11 +313,9 @@ fn error_code(out: &std::process::Output) -> String {
 /// One protected session per local rule, each named after the rule, and four
 /// sessions nothing protects. Returns the protected names with their rule.
 fn build_store(env: &Env) -> BTreeMap<&'static str, &'static str> {
-    // a: running, and unreadable.
+    // a: running. (An unreadable session has a test of its own: one whose
+    // header can't be read keeps every finished session.)
     env.init("a-running");
-    let broken = env.sessions().join("a-broken");
-    std::fs::create_dir_all(&broken).unwrap();
-    std::fs::write(broken.join("koto-a-broken.state.jsonl"), "not json\n").unwrap();
 
     // b: a finished parent with a running child by header.
     env.init("b-parent");
@@ -373,7 +371,6 @@ fn build_store(env: &Env) -> BTreeMap<&'static str, &'static str> {
 
     BTreeMap::from([
         ("a-running", "a"),
-        ("a-broken", "a"),
         ("b-parent", "b"),
         ("b-child-running", "a"),
         ("b-chain-parent", "b"),
@@ -478,6 +475,49 @@ fn assert_only_free_removed(env: &Env, protected: &BTreeMap<&str, &str>) {
     for name in FREE {
         assert!(!env.sessions().join(name).exists(), "{name} is still there");
     }
+}
+
+/// Write a session directory whose state file has no readable header.
+fn header_less(env: &Env, name: &str) {
+    let dir = env.sessions().join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("koto-{name}.state.jsonl")), "not json\n").unwrap();
+}
+
+#[test]
+fn a_header_less_session_keeps_every_finished_session_until_it_is_dealt_with() {
+    let env = Env::new();
+    env.done("parent");
+    env.done("other");
+    // A child whose header was half-written: nothing can say which session
+    // it names as its parent.
+    header_less(&env, "kid");
+
+    let preview = env.prune_ok(&[]);
+    assert!(
+        preview["remove"].as_array().unwrap().is_empty(),
+        "{preview:#}"
+    );
+    let kept = rules(&preview);
+    assert_eq!(kept["kid"].0, "a");
+    for name in ["parent", "other"] {
+        assert_eq!(kept[name].0, "b", "{name}: {}", kept[name].1);
+        assert!(kept[name].1.contains("'kid'"), "{}", kept[name].1);
+    }
+    let token = preview["plan"].as_str().unwrap().to_string();
+
+    // Neither apply removes the parent.
+    let out = env.prune_ok(&["--apply", "--all"]);
+    assert!(out["removed"].as_array().unwrap().is_empty());
+    let out = env.prune_ok(&["--apply", "--plan", &token]);
+    assert!(out["removed"].as_array().unwrap().is_empty());
+    assert!(env.sessions().join("parent").is_dir());
+    assert!(env.sessions().join("other").is_dir());
+
+    // Once a person removes the unreadable session, the prune goes on.
+    env.ok(&["session", "cleanup", "kid"]);
+    let out = env.prune_ok(&["--apply", "--all"]);
+    assert_eq!(names(&out["removed"]), vec!["other", "parent"]);
 }
 
 #[test]

@@ -631,14 +631,14 @@ The filters choose which sessions are judged, not which sessions count as refere
 | Rule | Keeps a session that |
 |------|----------------------|
 | `a` | is running, or can't be read (its header, log or template is unreadable, or its directory is a symlink) |
-| `b` | a running or unreadable session references |
+| `b` | a running or unreadable session references, or any finished session while some session's header can't be read (it could name any session as its parent; the reason names it, so you can inspect or remove it) |
 | `c` | references a running or unreadable session |
 | `d` | has a `chain/parent` context key that isn't exactly one session name |
 | `e` | is bound to a request leg that is still waiting, or whose leg pointer or request can't be read |
 | `f` | is a coordinator's session (its name starts with `coordinate-`) |
 | `g` | under the cloud backend, has a remote copy that may be newer: a pushed log longer than the local one, a `version.json` ahead of or diverged from the local one, or a remote copy that can't be checked |
 
-A session references the session its header's `parent_workflow` names and the one its `chain/parent` context key names. A reference to a name with no session protects nothing, and a request that no longer exists releases a session bound to it. Everything the rules read is local except rule g.
+A session references the session its header's `parent_workflow` names and the one its `chain/parent` context key names. A reference to a name with no session protects nothing, and a request that no longer exists releases a session bound to it. Everything the rules read is on this host (the sessions directory, and the request store for rule e) except rule g. Without a remote `version.json`, rule g compares only the pushed log's length, so a remote log that diverged without growing longer than the local one isn't caught.
 
 **Preview output (JSON):**
 
@@ -659,9 +659,9 @@ A session references the session its header's `parent_workflow` names and the on
 
 The token is the first 32 hex digits of a SHA-256 over the would-remove list's names and session ids, so it changes when a session joins or leaves the list, or a removed name is taken by a new session, and not when anything outside the list changes.
 
-**Applying.** `--apply --plan <token>` works the set out again, with the filters the preview ran with (the stored plan records them, and passing a filter alongside `--plan` is an error), and removes it only when its token is still `<token>`. Otherwise it removes nothing, exits 4 with `prune_plan_stale`, and lists under `added` and `dropped` how the set changed. A token with no stored plan (it expired, was applied, or was previewed on another host) also exits 4, with `prune_plan_unknown`. `--apply` without `--plan` removes the set it works out now, and needs `--execution-dir`, `--older-than` or `--all` so that a bare `--apply` can't empty the store by mistake.
+**Applying.** `--apply --plan <token>` works the set out again, with the filters the preview ran with (the stored plan records them, and passing a filter alongside `--plan` is an error), and removes it only when its token is still `<token>`. Otherwise it removes nothing, exits 4 with `prune_plan_stale`, and lists under `added` and `dropped` how the set changed. A token with no stored plan (it expired, was applied, or was previewed on another host) also exits 4, with `prune_plan_unknown`. `--apply` without `--plan` removes the set it works out now, in one step with no preview anyone read, and needs `--execution-dir`, `--older-than` or `--all` so that a bare `--apply` can't empty the store by mistake. It is the form for scheduled runs; the rules apply to it all the same, but only `--plan` guarantees that what goes is what someone saw.
 
-Sessions are removed children first. Each is locked, read again, and judged again against the sessions it references and is referenced by; one that another koto process holds, one that is no longer finished (rewound, say), one replaced by a new session under the same name, and one a rule now keeps go to `skipped` with the reason. Under the cloud backend a session's remote copy is deleted before its local directory, apart from a migration marker, so a failure leaves the local copy for a later prune to retry. The prune never touches the run journal.
+Sessions are removed children first. Each is locked, read again, and judged again against the sessions it references and the referencing sessions the judgment found (a session created after the judgment that names it isn't seen); one that another koto process holds, one that is no longer finished (rewound, say), one replaced by a new session under the same name, and one a rule now keeps go to `skipped` with the reason. Under the cloud backend a session's remote copy is deleted before its local directory, apart from a migration marker, so a failure leaves the local copy for a later prune to retry. The remote delete isn't conditional: a push from another host that lands between rule g's check and the delete is lost with it; that window can't close without conditional deletes. The prune never touches the run journal.
 
 **Apply output (JSON):** `{"mode": "apply", "plan": ..., "removed": [...], "skipped": [{"name", "reason"}], "kept": [...], "failed": [{"name", "error"}]}`.
 

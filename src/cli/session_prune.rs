@@ -11,7 +11,8 @@
 //! and the first that applies keeps it:
 //!
 //! - a: the session is running or unreadable.
-//! - b: a running or unreadable session references it.
+//! - b: a running or unreadable session references it, or some session's
+//!   header can't be read (it may reference any session).
 //! - c: it references a running or unreadable session.
 //! - d: its `chain/parent` context key is malformed.
 //! - e: it is bound to a request leg that is still waiting, or whose
@@ -175,6 +176,9 @@ struct Inventory {
     sessions: BTreeMap<String, Session>,
     /// For each name, the sessions that reference it.
     referencers: HashMap<String, BTreeSet<String>>,
+    /// Sessions whose header couldn't be read, so what they reference is
+    /// unknown (see [`Facts::headerless`]).
+    headerless: BTreeSet<String>,
 }
 
 impl Inventory {
@@ -199,10 +203,16 @@ impl Inventory {
                 referencers.entry(target).or_default().insert(name.clone());
             }
         }
+        let headerless = sessions
+            .iter()
+            .filter(|(_, s)| s.header.is_none())
+            .map(|(name, _)| name.clone())
+            .collect();
         Ok(Inventory {
             base: base.to_path_buf(),
             sessions,
             referencers,
+            headerless,
         })
     }
 }
@@ -285,6 +295,11 @@ struct Facts<'a> {
     chain_parent: &'a ChainParent,
     references: BTreeSet<String>,
     referencers: BTreeSet<String>,
+    /// Other sessions whose header couldn't be read. Any of them may name
+    /// this one as its `parent_workflow`, and nothing else can say which
+    /// (the execution directory is in the header too), so each counts as an
+    /// unreadable referencer of every session.
+    headerless: BTreeSet<String>,
 }
 
 /// The first rule that keeps a session, with its detail. `status_of`
@@ -304,6 +319,15 @@ fn first_rule(
         if let Some(how) = may_run(status_of(referencer)) {
             return Some(('b', format!("referenced by {how} session '{referencer}'")));
         }
+    }
+    if let Some(other) = facts.headerless.iter().next() {
+        return Some((
+            'b',
+            format!(
+                "session '{other}' has a header that can't be read, so it may reference this \
+                 one; inspect or remove it to let the prune go on"
+            ),
+        ));
     }
     for target in &facts.references {
         if let Some(how) = may_run(status_of(target)) {
@@ -438,6 +462,12 @@ fn judge(inv: &Inventory, filters: &Filters, backend: &Backend) -> Verdict {
             chain_parent: &session.chain_parent,
             references: session.references(name),
             referencers: inv.referencers.get(name).unwrap_or(&empty).clone(),
+            headerless: inv
+                .headerless
+                .iter()
+                .filter(|h| *h != name)
+                .cloned()
+                .collect(),
         };
         let mut status_of = |other: &str| inv.sessions.get(other).map(|s| s.seen.status);
         match first_rule(&facts, &inv.base, backend, &mut status_of) {
@@ -781,6 +811,15 @@ fn remove_one(
         // accepts that window rather than re-reading the whole store per
         // removal.
         referencers: inv.referencers.get(name).cloned().unwrap_or_default(),
+        // The judgment's header-less sessions that are still there and still
+        // header-less now.
+        headerless: inv
+            .headerless
+            .iter()
+            .filter(|h| h.as_str() != name && session_exists(base, h))
+            .filter(|h| inspect_full(base, h, cache).1.is_none())
+            .cloned()
+            .collect(),
     };
     let mut status_of = |other: &str| -> Option<SessionStatus> {
         if !session_exists(base, other) {

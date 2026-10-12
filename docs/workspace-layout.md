@@ -405,7 +405,8 @@ session, and `koto session prune` for finished sessions as a set:
 koto session prune --older-than 30d
 koto session prune --apply --plan <token>
 
-# Unattended: remove what is finished and unprotected at run time
+# Unattended: remove what is finished and unprotected at run time, in one
+# step with no preview (the rules still apply)
 0 3 * * 0 /usr/local/bin/koto session prune --apply --older-than 30d >/dev/null 2>&1
 ```
 
