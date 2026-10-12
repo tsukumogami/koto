@@ -64,6 +64,7 @@ pub fn load_config() -> Result<KotoConfig> {
             record_file_secrets(&mut config.secret_sources, &user_config.config);
             merge_config(&mut config, &user_config);
             merge_run_journal(&mut config, &user_config);
+            merge_marker_retention(&mut config, &user_config);
             merge_decider(
                 &mut config.decider,
                 &user_config.config.decider,
@@ -383,9 +384,6 @@ fn merge_config(target: &mut KotoConfig, source: &LoadedConfig) {
     if source.config.session.cloud.path_style.is_some() {
         target.session.cloud.path_style = source.config.session.cloud.path_style;
     }
-    if source.config.session.cloud.marker_retain_days.is_some() {
-        target.session.cloud.marker_retain_days = source.config.session.cloud.marker_retain_days;
-    }
 
     for key in &source.request_store_keys {
         match key.as_str() {
@@ -436,6 +434,16 @@ fn merge_config(target: &mut KotoConfig, source: &LoadedConfig) {
     }
     if source.workflows_native_present {
         target.workflows.native = source.config.workflows.native;
+    }
+}
+
+/// Apply `session.cloud.marker_retain_days` from a config file. Called for
+/// the user layer only: the bound guards a deletion from the bucket, so a
+/// project file in a cloned repository must not shorten it (`koto config
+/// set` refuses the key without `--user`).
+fn merge_marker_retention(target: &mut KotoConfig, source: &LoadedConfig) {
+    if source.config.session.cloud.marker_retain_days.is_some() {
+        target.session.cloud.marker_retain_days = source.config.session.cloud.marker_retain_days;
     }
 }
 

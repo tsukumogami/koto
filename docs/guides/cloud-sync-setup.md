@@ -229,7 +229,7 @@ koto session resolve <name> --keep remote  # download the bucket's version
 | `session.cloud.bucket` | Bucket name | `koto-sessions` (used when the key is unset; `koto config get` shows it as unset) | Yes |
 | `session.cloud.region` | Region | (none) | Yes |
 | `session.cloud.path_style` | Address the bucket in the path (`true`) rather than as a subdomain; needed for an IP-address endpoint | `false` | Yes |
-| `session.cloud.marker_retain_days` | Days a migration marker whose target is present is kept before `koto session prune --migrated-from` may remove it without `--source-retired` | `30` | Yes |
+| `session.cloud.marker_retain_days` | Days a migration marker whose target is present is kept before `koto session prune --migrated-from` may remove it without `--source-retired` | `30` | No (user only: it guards a deletion, so a cloned repository's config can't shorten it) |
 | `session.cloud.access_key` | Access key ID | (none) | No (user/env only) |
 | `session.cloud.secret_key` | Secret access key | (none) | No (user/env only) |
 

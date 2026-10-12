@@ -311,10 +311,40 @@ fn the_age_bound_and_source_retired_decide_a_present_target() {
         assert_eq!(e["reason"], "source_retired");
     }
 
-    // The bound is a config key: at 0 days every present target's marker is
-    // past it.
+    // The bound is a user config key. A project can't shorten it: setting it
+    // there is refused, and a project file that holds it is ignored.
     let run =
         h.b.koto(&["config", "set", "session.cloud.marker_retain_days", "0"]);
+    assert!(
+        !run.ok(),
+        "a project value was accepted: {}",
+        run.describe()
+    );
+    let project = h.b.ws.join(".koto/config.toml");
+    let text = std::fs::read_to_string(&project).unwrap();
+    assert!(text.contains("[session.cloud]\n"), "{text}");
+    std::fs::write(
+        &project,
+        text.replacen(
+            "[session.cloud]\n",
+            "[session.cloud]\nmarker_retain_days = 0\n",
+            1,
+        ),
+    )
+    .unwrap();
+    let out = h.prune_ok(&[]);
+    assert_eq!(out["marker_retain_days"], 30);
+    assert!(names(&out["remove"]).is_empty());
+    std::fs::write(&project, &text).unwrap();
+
+    // Set for the user, at 0 days every present target's marker is past it.
+    let run = h.b.koto(&[
+        "config",
+        "set",
+        "--user",
+        "session.cloud.marker_retain_days",
+        "0",
+    ]);
     assert!(run.ok(), "config set: {}", run.describe());
     let run =
         h.b.koto(&["config", "get", "session.cloud.marker_retain_days"]);
@@ -328,8 +358,12 @@ fn the_age_bound_and_source_retired_decide_a_present_target() {
 
     // Back to the default, with `foo`'s marker dated long ago: past the
     // bound, while `foo-2` stays inside it.
-    let run =
-        h.b.koto(&["config", "unset", "session.cloud.marker_retain_days"]);
+    let run = h.b.koto(&[
+        "config",
+        "unset",
+        "--user",
+        "session.cloud.marker_retain_days",
+    ]);
     assert!(run.ok(), "config unset: {}", run.describe());
     let key = h.marker_key("foo");
     let mut marker: Value = serde_json::from_slice(&h.s3.object(&key).unwrap()).unwrap();
@@ -346,6 +380,7 @@ fn the_age_bound_and_source_retired_decide_a_present_target() {
     let run = h.b.koto(&[
         "config",
         "set",
+        "--user",
         "session.cloud.marker_retain_days",
         "100000",
     ]);
