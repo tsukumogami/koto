@@ -29,6 +29,11 @@ pub fn validate_project_key(key: &str) -> Result<(), String> {
             "key '{}' contains credentials and cannot be stored in project config (use user config or env vars instead)",
             key
         ))
+    } else if key == "session.cloud.marker_retain_days" {
+        Err(format!(
+            "key '{}' guards a deletion from the bucket and can only be set in user config (--user)",
+            key
+        ))
     } else if key == "decider.endpoint" {
         Err(format!(
             "key '{}' can only be set in user config (--user) or KOTO_DECIDER_ENDPOINT",

@@ -24,6 +24,12 @@
 //! context key, read from the local session directory. A name with no
 //! session behind it protects nothing. Everything here reads the local
 //! store, except rule g and the removal of a session's remote copy.
+//!
+//! `--migrated-from <workspace>` switches to marker mode (see [`markers`]),
+//! which removes migration markers and the old copies beside them from the
+//! bucket instead, with the same preview, token and stored-plan contract.
+
+mod markers;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -70,6 +76,13 @@ pub struct PruneArgs<'a> {
     pub all: bool,
     pub apply: bool,
     pub plan: Option<&'a str>,
+    /// Marker mode: the source workspace whose migration markers to judge.
+    pub migrated_from: Option<&'a str>,
+    /// Marker mode: the source host is gone, so a present target's marker is
+    /// removable inside the retention bound too.
+    pub source_retired: bool,
+    /// Marker mode: `session.cloud.marker_retain_days`.
+    pub marker_retain_days: u64,
 }
 
 /// One session the prune would remove, as the preview prints it and the
@@ -124,9 +137,21 @@ pub struct KeptEntry {
     pub detail: String,
 }
 
+/// The `mode` a session-mode stored plan records. Marker plans record
+/// [`markers::MODE`] and live under another file name.
+const SESSIONS_MODE: &str = "sessions";
+
+fn sessions_mode() -> String {
+    SESSIONS_MODE.to_string()
+}
+
 /// A stored plan: the would-remove list a preview printed.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredPlan {
+    /// Always [`SESSIONS_MODE`]; plans stored before marker mode existed
+    /// have none and read as session plans.
+    #[serde(default = "sessions_mode")]
+    mode: String,
     plan: String,
     created_at: String,
     /// The filters the preview ran with; `--apply --plan` runs with them.
@@ -551,8 +576,12 @@ fn judge(inv: &Inventory, filters: &Filters, backend: &Backend) -> Verdict {
 
 /// The first 32 hex digits of SHA-256 over the sorted token lines.
 fn plan_token(remove: &[RemoveEntry]) -> String {
+    token_over(remove.iter().map(RemoveEntry::token_line).collect())
+}
+
+/// The first 32 hex digits of SHA-256 over `lines`, sorted.
+fn token_over(mut lines: Vec<String>) -> String {
     use sha2::{Digest, Sha256};
-    let mut lines: Vec<String> = remove.iter().map(RemoveEntry::token_line).collect();
     lines.sort();
     let mut hasher = Sha256::new();
     for line in &lines {
@@ -609,6 +638,12 @@ fn usage(message: impl Into<String>) -> ! {
 
 /// Handle `koto session prune`.
 pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
+    if args.migrated_from.is_some() {
+        return markers::handle(backend, &args);
+    }
+    if args.source_retired {
+        usage("--source-retired applies to migration markers; pass it with --migrated-from");
+    }
     let filtered = args.execution_dir.is_some() || args.older_than.is_some() || args.all;
     if args.plan.is_some() && !args.apply {
         usage("--plan applies a previewed plan; pass it with --apply");
@@ -933,10 +968,27 @@ fn plans_dir(base: &Path) -> PathBuf {
     base.join(PLANS_DIR)
 }
 
-/// Store the preview's would-remove list, creating the plans directory 0700,
-/// and remove stored plans older than a day. A plans path that is a symlink
-/// or not a directory is refused.
+/// Store the preview's would-remove list (see [`write_plan_file`]).
 fn store_plan(base: &Path, verdict: &Verdict, filters: &PlanFilters) -> Result<()> {
+    let plan = StoredPlan {
+        mode: sessions_mode(),
+        plan: verdict.token.clone(),
+        created_at: crate::engine::types::now_iso8601(),
+        filters: filters.clone(),
+        remove: verdict.remove.clone(),
+    };
+    write_plan_file(
+        base,
+        &format!("{}.json", verdict.token),
+        &serde_json::to_vec(&plan)?,
+    )
+}
+
+/// Write `bytes` as stored plan `file_name`, creating the plans directory
+/// 0700 and the file 0600, and remove stored plans older than a day. A plans
+/// path that is a symlink or not a directory is refused, and so is a plan
+/// file that is a symlink.
+fn write_plan_file(base: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
@@ -960,13 +1012,7 @@ fn store_plan(base: &Path, verdict: &Verdict, filters: &PlanFilters) -> Result<(
     }
     expire_plans(&dir);
 
-    let plan = StoredPlan {
-        plan: verdict.token.clone(),
-        created_at: crate::engine::types::now_iso8601(),
-        filters: filters.clone(),
-        remove: verdict.remove.clone(),
-    };
-    let path = dir.join(format!("{}.json", verdict.token));
+    let path = dir.join(file_name);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -975,7 +1021,7 @@ fn store_plan(base: &Path, verdict: &Verdict, filters: &PlanFilters) -> Result<(
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .with_context(|| format!("failed to write {}", path.display()))?;
-    file.write_all(serde_json::to_string(&plan)?.as_bytes())
+    file.write_all(bytes)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
@@ -1004,29 +1050,43 @@ fn expire_plans(dir: &Path) {
     }
 }
 
-/// Read stored plan `token`; `None` when there is none.
+/// Read stored plan `token`; `None` when there is none, or when the file
+/// holds another mode's plan.
 fn read_plan(base: &Path, token: &str) -> Result<Option<StoredPlan>> {
-    let path = plans_dir(base).join(format!("{token}.json"));
+    let Some(bytes) = read_plan_file(base, &format!("{token}.json"))? else {
+        return Ok(None);
+    };
+    let plan: StoredPlan = match serde_json::from_slice(&bytes) {
+        Ok(plan) => plan,
+        Err(_) => return Ok(None),
+    };
+    if plan.plan != token || plan.mode != SESSIONS_MODE {
+        return Ok(None);
+    }
+    Ok(Some(plan))
+}
+
+/// The bytes of stored plan file `file_name`; `None` when there is no
+/// regular file by that name.
+fn read_plan_file(base: &Path, file_name: &str) -> Result<Option<Vec<u8>>> {
+    let path = plans_dir(base).join(file_name);
     match std::fs::symlink_metadata(&path) {
         Ok(meta) if meta.file_type().is_file() => {}
         Ok(_) => return Ok(None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
     }
-    let bytes =
-        std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let plan: StoredPlan = match serde_json::from_slice(&bytes) {
-        Ok(plan) => plan,
-        Err(_) => return Ok(None),
-    };
-    if plan.plan != token {
-        return Ok(None);
-    }
-    Ok(Some(plan))
+    std::fs::read(&path)
+        .map(Some)
+        .with_context(|| format!("failed to read {}", path.display()))
 }
 
 fn remove_plan(base: &Path, token: &str) {
-    let _ = std::fs::remove_file(plans_dir(base).join(format!("{token}.json")));
+    remove_plan_file(base, &format!("{token}.json"));
+}
+
+fn remove_plan_file(base: &Path, file_name: &str) {
+    let _ = std::fs::remove_file(plans_dir(base).join(file_name));
 }
 
 #[cfg(test)]
