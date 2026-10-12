@@ -701,6 +701,7 @@ Removes the entire session directory for the named workflow. Idempotent — succ
 koto session prune [--execution-dir <dir>] [--older-than <age>] [--all]
 koto session prune --apply --plan <token>
 koto session prune --apply (--execution-dir <dir> | --older-than <age> | --all)
+koto session prune --migrated-from <workspace> [--source-retired] [--apply [--plan <token>]]
 ```
 
 Previews, then removes, finished sessions as a set. Without `--apply` it removes nothing and prints `{"mode": "preview", "plan": "<token>", "remove": [...], "kept": [...]}`: the finished sessions it would remove (the `session list --state` fields plus `kind`), and every session it keeps with a `rule` letter and a `detail`. `--older-than` takes a whole number and `s`, `m`, `h` or `d`.
@@ -713,6 +714,8 @@ A session is kept when it is running or unreadable (`a`), a running or unreadabl
 - A malformed token or age, `--plan` without `--apply` or with a filter, or a bare `--apply` exits 2 with `invalid_arguments`.
 
 Clean up after your own work with `koto session prune --execution-dir <your directory>`, read the preview, then apply its token.
+
+`--migrated-from <workspace>` (cloud backend only; exit 2 otherwise, and with any of `--execution-dir`, `--older-than` or `--all`) works on the migration markers `koto session import` left under that old workspace's bucket prefix instead. Each marker is listed with its `target`, `age_days`, `target_status` (`present`, `replaced`, `migrated`, `absent`, `unknown`), `removable` and `reason`. Only a `present` target's marker is removable, once it is `session.cloud.marker_retain_days` old (default 30) or with `--source-retired`; removal deletes the old copy and the marker last, and a failed delete exits 3 with the marker still refusing. Apply a preview with `--migrated-from <same workspace> --apply --plan <token>` (no `--source-retired`; the plan recorded it).
 
 ---
 
@@ -1052,7 +1055,7 @@ koto config list                 # Print merged config as TOML
 koto config list --json          # Print merged config as JSON
 ```
 
-Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `session.cloud.path_style`, `workflows.native`, `decider.mode`, `decider.api_key`, `decider.endpoint`, `decider.timeout_ms`.
+Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `session.cloud.path_style`, `session.cloud.marker_retain_days`, `workflows.native`, `decider.mode`, `decider.api_key`, `decider.endpoint`, `decider.timeout_ms`.
 
 `session.cloud.path_style` takes `true` or `false` (unset means `false`). `true` puts the bucket in the URL path instead of a subdomain, which an endpoint given as an IP address needs.
 

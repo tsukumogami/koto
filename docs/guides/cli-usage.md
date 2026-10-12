@@ -615,6 +615,7 @@ Removes finished sessions as a set, after showing the set first.
 koto session prune [--execution-dir <dir>] [--older-than <age>] [--all]
 koto session prune --apply --plan <token>
 koto session prune --apply (--execution-dir <dir> | --older-than <age> | --all)...
+koto session prune --migrated-from <workspace> [--source-retired] [--apply [--plan <token>]]
 ```
 
 Without `--apply` nothing is removed. The command prints the finished sessions it would remove, every session it keeps with the rule that keeps it, and a plan token, and stores the would-remove list as `.prune-plans/<token>.json` under the sessions directory (a private file in a private directory; a preview removes stored plans older than a day).
@@ -671,6 +672,8 @@ Sessions are removed children first. Each is locked, read again, and judged agai
 | 2 | `invalid_arguments`: a malformed token or age, `--plan` without `--apply` or with a filter, or `--apply` with nothing naming the set |
 | 3 | A session couldn't be removed; it is listed under `failed` |
 | 4 | `prune_plan_stale` or `prune_plan_unknown`; nothing was removed |
+
+**Migration markers.** `--migrated-from <workspace>` judges the migration markers `koto session import` left under that workspace's bucket prefix instead of local sessions; it needs the cloud backend (under the local backend it exits 2) and takes none of `--execution-dir`, `--older-than` or `--all`. `<workspace>` is the old workspace's absolute path as it was on its own host. Each marker is listed with `name`, `target` (`session`, `session_id`, `workspace`, `prefix`), `migrated_at`, `age_days`, `target_status` (`present`, `replaced`, `migrated`, `absent` or `unknown`), `removable`, `reason` and `detail`, under `remove` or `kept`. A marker is removable only when its target is `present` and it is at least `session.cloud.marker_retain_days` days old (default 30), or `--source-retired` was given; anything else is kept, and a marker that can't be read is kept as `unreadable`. The token covers each removable marker's name and `migrated_at`, and the stored plan (`.prune-plans/markers-<prefix>-<token>.json`) records the workspace and `--source-retired`, so `--apply --plan <token>` takes `--migrated-from` with the same workspace and no `--source-retired`. Apply reads each marker again, then deletes everything under the old session's prefix, the marker last; a delete that fails leaves the marker, lists the entry under `failed` and exits 3, and a re-run finishes it. Nothing local is removed. The [cloud sync guide](cloud-sync-setup.md#removing-the-old-copy-and-its-marker) has the full rule.
 
 ### context
 

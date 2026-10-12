@@ -28,7 +28,8 @@ of authority for this document).
 │   ├── .migration-conflicts/                  # AUTHORITATIVE state (see below)
 │   │   └── <repo-id>/<session-id>/
 │   └── .prune-plans/                          # derived (koto session prune previews)
-│       └── <token>.json
+│       ├── <token>.json                       # a finished-sessions plan
+│       └── markers-<prefix>-<token>.json      # a migration-marker plan (--migrated-from)
 ├── requests/                                  # AUTHORITATIVE state
 │   └── <request_id>/
 │       ├── request.jsonl                      # header + event log
@@ -418,6 +419,17 @@ koto session prune --apply --plan <token>
 # step with no preview (the rules still apply)
 0 3 * * 0 /usr/local/bin/koto session prune --apply --older-than 30d >/dev/null 2>&1
 ```
+
+Under the cloud backend, `koto session import` leaves a `migrated.json`
+marker in the bucket beside the session it moved, and the prune above
+leaves those markers alone. They can now be removed too, with
+`koto session prune --migrated-from <old workspace>`: a marker goes,
+together with the old copy beside it, only when the session it points
+at is present at its target and the marker is older than
+`session.cloud.marker_retain_days` (or `--source-retired` says the old
+host is gone). That mode works on the bucket only and never touches
+`~/.koto/sessions/` beyond its stored plan; see
+`docs/guides/cloud-sync-setup.md` for the rule.
 
 ### Sizing your prune cadence
 

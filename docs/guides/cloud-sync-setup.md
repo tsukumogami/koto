@@ -160,9 +160,34 @@ From then on the source refuses. `koto next`, `koto status`, and the `koto conte
 session_migrated: session 'review' was migrated to 'review' in /srv/ws-b; continue it there
 ```
 
-Nothing else under the source's prefix is written, and nothing is deleted. The source's state file and context keys stay in the bucket until someone runs `koto session cleanup review` in the source workspace, which removes them and the local copy but keeps `migrated.json`. koto never deletes a `migrated.json`, so any copy of the session still left in that workspace keeps refusing.
+Nothing else under the source's prefix is written, and nothing is deleted. The source's state file and context keys stay in the bucket until someone runs `koto session cleanup review` in the source workspace, which removes them and the local copy but keeps `migrated.json`. Cleanup, a terminal tick and `koto session prune` without `--migrated-from` never delete a `migrated.json`, so any copy of the session still left in that workspace keeps refusing.
 
 An imported session is an ordinary session in its new workspace, so it can be imported again from there to a third one.
+
+### Removing the old copy and its marker
+
+Markers pile up under the old workspace's prefix, each beside whatever of the old copy is still there. Once the old host can't come back and advance its copy, remove them with `koto session prune --migrated-from`, run from any workspace on the same bucket:
+
+```bash
+koto session prune --migrated-from /srv/ws-a                  # preview
+koto session prune --migrated-from /srv/ws-a --apply --plan <token>
+```
+
+Pass the old workspace's absolute path as it was on its own host, the same path `koto session import --from` took. The preview lists every marker under that workspace's prefix with the session it names, where the session went, the marker's age (from its `migrated_at`), what the target holds now, and whether it would be removed and why. The target status comes from one listing of the target's prefix:
+
+| `target_status` | What the bucket holds for the target |
+|-----------------|--------------------------------------|
+| `present` | A state file whose header carries the session id the marker names |
+| `replaced` | A state file for another session under the same name |
+| `migrated` | A marker of its own: the session moved on again |
+| `absent` | No state file |
+| `unknown` | The listing or the read failed |
+
+A marker is removable only when its target is `present`, and then only once it is at least `session.cloud.marker_retain_days` days old (default 30), or when you pass `--source-retired` to say the old host is gone for good. Any other status keeps the marker at any age, with or without the flag, because the old copy beside it may be the only one left. A marker whose body doesn't parse, or has no `migrated_at`, is kept as `unreadable`. Every entry carries `removable`, a `reason` (the target status, `unreadable`, `age`, or `source_retired`) and a `detail` sentence, so the preview shows which markers `--source-retired` adds.
+
+Removing a marker deletes everything under `<prefix>/<name>/` in the old workspace's prefix, the marker last. The marker isn't removed on its own: without it, the old copy would read as a live session again. Apply reads each marker again and judges it again, so a marker rewritten since the preview, or whose target changed, is skipped with the reason. If a delete fails, that entry stops before its marker goes, so the old copy still refuses; it is listed under `failed`, the run exits 3, and running it again finishes the job.
+
+The plan token and stored plan work as they do for finished sessions (see the [CLI usage guide](cli-usage.md#session-prune)): an unchanged token applies, one whose set changed exits 4 with `prune_plan_stale`, and the stored plan records whether `--source-retired` was given. `--apply` without `--plan` removes what is removable now. Marker removal never touches the local session store: a local copy of the old session on the host you run it from stays, and the only local write is the stored plan.
 
 ### Import errors
 
@@ -204,6 +229,7 @@ koto session resolve <name> --keep remote  # download the bucket's version
 | `session.cloud.bucket` | Bucket name | `koto-sessions` (used when the key is unset; `koto config get` shows it as unset) | Yes |
 | `session.cloud.region` | Region | (none) | Yes |
 | `session.cloud.path_style` | Address the bucket in the path (`true`) rather than as a subdomain; needed for an IP-address endpoint | `false` | Yes |
+| `session.cloud.marker_retain_days` | Days a migration marker whose target is present is kept before `koto session prune --migrated-from` may remove it without `--source-retired` | `30` | Yes |
 | `session.cloud.access_key` | Access key ID | (none) | No (user/env only) |
 | `session.cloud.secret_key` | Secret access key | (none) | No (user/env only) |
 
