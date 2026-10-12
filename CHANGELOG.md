@@ -10,6 +10,21 @@ to `0.9.x`).
 
 ### Added
 
+- **The run journal records check evaluations.** Each gate evaluation and
+  default-action run a session commits now adds a `check_evaluated` line to
+  `~/.koto/_run_journal.jsonl`, with the check's outcome, attempt numbers,
+  rule count and run time, followed by one `check_rule` line per error rule
+  with the rule's visit and session counts. A polling gate that is still
+  pending adds a `check_pending` line instead. Every check line carries
+  `koto.seq`, the relayed event's sequence number in the session's log, and
+  `koto.visit.seq`, the sequence number of the entry that opened its visit.
+  A rule id outside the journal's name shape is written as `sha256:` and 32
+  hex characters of its digest. The lines carry no check output, finding
+  text, path or command. Unlike the identity records, check lines aren't
+  flushed to disk on their own, so an operating-system crash can lose the
+  ones written since the session's last state entry; a process crash loses
+  none. `docs/reference/run-journal.md` documents the three kinds.
+
 - **A session waiting on a request leg is woken when the leg changes.** Every
   write that records a leg's result (a promoted worker result, `koto request
   resolve`, or a refusal `koto init --koto-leg` records), abandons a leg or a

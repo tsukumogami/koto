@@ -238,10 +238,11 @@ impl SessionBackend for LocalBackend {
         timestamp: &str,
     ) -> anyhow::Result<()> {
         let path = self.base_dir.join(id).join(state_file_name(id));
-        persistence::append_event(&path, payload, timestamp)?;
+        let commit = persistence::append_event_tracked(&path, payload, timestamp)?;
         // Journal the committed payload (best-effort, after the commit, so a
-        // failed append above never writes a record). See `crate::run_journal`.
-        crate::run_journal::after_commit(self.journal_root(), self, id, payload);
+        // failed append above never writes a record), with the seq it took
+        // and the log it was appended to. See `crate::run_journal`.
+        crate::run_journal::after_commit(self.journal_root(), self, id, payload, &commit);
         // Materialize the native Claude Code `/workflows` artifact off the one
         // commit funnel (opt-in, best-effort: never fails the commit). `self`
         // is both the SessionBackend (header chain) and the ContextStore
