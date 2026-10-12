@@ -146,8 +146,18 @@
 //! gate decisions changes.
 //!
 //! Writers take an advisory lock on the journal for each commit's records,
-//! written as one batch, so a record is never interleaved with another. A
-//! write cut short (a crash, a full disk) can still leave a partial last
+//! written as one batch, so a record is never interleaved with another.
+//! Every writer waits for that lock at most [`JOURNAL_LOCK_WAIT`] (five
+//! seconds; a `koto status` response, 30 milliseconds), then skips its
+//! batch with the same one warning, so a process that stopped while holding
+//! the lock can't hang a command. Once one write has given up, the
+//! process's later writes try the lock once without waiting until one takes
+//! it again, so a held lock costs a command one wait however many batches
+//! it writes. The wait covers taking the lock only: nothing done while
+//! holding it is cut short, and a writer that rotated the journal gets a
+//! full wait of its own for the fresh file's lock.
+//!
+//! A write cut short (a crash, a full disk) can still leave a partial last
 //! line: the next writer sees, under the lock, that the file doesn't end in
 //! a newline and starts its record on a line of its own, so only the
 //! partial line is lost. Readers skip lines that don't parse as JSON.
@@ -342,18 +352,50 @@ fn warn_once(message: &str) {
     }
 }
 
-// In unit tests the cap and the warn-once flag are per thread, so a test
-// sees exactly the warnings its own commands caused. Unit tests reach a
-// journal only through a store built with
+/// Set when a journal write in this process has given up waiting for the
+/// lock, and cleared by the next write that takes it. A lock still held
+/// after a full wait most likely belongs to a writer that stopped, so while
+/// this is set every write tries the lock once, without waiting, and skips
+/// its batch (with the warning already printed) if it is still held: a held
+/// lock costs a command one wait, not one per batch. A write that takes the
+/// lock clears it, so a long-running process (a `koto next` polling a gate)
+/// waits normally again after a stall has passed. A rotating writer that
+/// can't lock the fresh file after its own move doesn't set it: that wait
+/// says nothing about a stopped writer (see [`write_within`]).
+#[cfg(not(test))]
+static GAVE_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(not(test))]
+fn gave_up() -> bool {
+    GAVE_UP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+fn set_gave_up(value: bool) {
+    GAVE_UP.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+// In unit tests the cap, the warn-once flag and the gave-up flag are per
+// thread, so a test sees exactly the warnings and waits its own commands
+// caused. Unit tests reach a journal only through a store built with
 // `LocalBackend::with_base_dir_and_journal` on a temporary directory.
 #[cfg(test)]
 thread_local! {
     static TEST_MAX_LINE: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_LINE_BYTES) };
     static TEST_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_GAVE_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_WARNINGS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// (batches written, batches flushed to disk) on this thread.
     static TEST_BATCHES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    static TEST_LOCK_WAIT: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(JOURNAL_LOCK_WAIT) };
+}
+
+/// Shorten (or restore) this thread's [`journal_lock_wait`].
+#[cfg(test)]
+pub(crate) fn set_lock_wait_for_test(wait: std::time::Duration) {
+    TEST_LOCK_WAIT.with(|c| c.set(wait));
 }
 
 /// Count one written batch, and whether the append reported a flush.
@@ -390,13 +432,25 @@ fn warn_once(message: &str) {
     }
 }
 
-/// Reset this thread's line cap and warnings.
+#[cfg(test)]
+fn gave_up() -> bool {
+    TEST_GAVE_UP.with(|g| g.get())
+}
+
+#[cfg(test)]
+fn set_gave_up(value: bool) {
+    TEST_GAVE_UP.with(|g| g.set(value));
+}
+
+/// Reset this thread's line cap, warnings and lock-wait state.
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
     TEST_MAX_LINE.with(|c| c.set(MAX_LINE_BYTES));
     TEST_WARNED.with(|w| w.set(false));
+    TEST_GAVE_UP.with(|g| g.set(false));
     TEST_WARNINGS.with(|w| w.borrow_mut().clear());
     TEST_BATCHES.with(|c| c.set((0, 0)));
+    TEST_LOCK_WAIT.with(|c| c.set(JOURNAL_LOCK_WAIT));
 }
 
 /// Lower (or restore) this thread's line cap.
@@ -415,6 +469,14 @@ pub(crate) fn warnings_for_test() -> Vec<String> {
 /// lock, one write per line. A record over the line cap is skipped with a
 /// warning and the rest are still written.
 ///
+/// The lock is waited for at most [`journal_lock_wait`] ([`JOURNAL_LOCK_WAIT`]
+/// outside tests). A lock still held after that is a failed write like any
+/// other: the batch is skipped with the one warning and this returns
+/// normally, so a writer that stopped while holding the lock can't hang the
+/// command. That includes the terminal tick, whose cleanup runs after its
+/// `terminal` record. After one write has given up, later writes in the
+/// process don't wait until one takes the lock again (see [`GAVE_UP`]).
+///
 /// The batch is flushed to disk only when it holds an identity record
 /// ([`IDENTITY_KINDS`]). Records relayed from check, decider and override
 /// events, and `response` records, are never flushed on their own: a flush
@@ -424,17 +486,59 @@ pub(crate) fn warnings_for_test() -> Vec<String> {
 /// durable with it, since a flush covers the whole file. Only an OS crash
 /// or power loss before then can lose them.
 fn write(root: &Path, records: &[Record]) {
-    write_within(root, records, None)
+    write_within(root, records, journal_lock_wait())
 }
+
+/// How long a journal write waits for the journal's lock before its batch
+/// is skipped, unless the caller passes a tighter bound. Generous enough
+/// that ordinary contention between koto commands never skips a record;
+/// short enough that a writer stopped while holding the lock can't hang a
+/// command for long. A process waits it out once per stall: after a write
+/// gives up, later writes don't wait until one takes the lock again (see
+/// [`GAVE_UP`]). Not configurable.
+///
+/// The bound covers acquiring the lock only. Once a writer holds the lock,
+/// what it does under it (the size check, a rotation's flush and rename,
+/// retention, the batch's own writes and flush) runs to the end however
+/// long it takes: a slow step there is never cut short, and it is the
+/// writers waiting behind it whose bound runs out.
+pub(crate) const JOURNAL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long a `koto status` `response` record waits for the journal's lock
 /// before it is skipped (see [`response`]).
 const RESPONSE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(30);
 
-/// [`write`], waiting at most `lock_wait` for the journal's lock when it is
-/// set. A lock still held after that is a failed write: one warning, and
-/// the batch is skipped.
-fn write_within(root: &Path, records: &[Record], lock_wait: Option<std::time::Duration>) {
+/// The lock wait a debug build reads from the environment in place of
+/// [`JOURNAL_LOCK_WAIT`], in milliseconds, so the binary's tests can hold
+/// the lock past the bound without sleeping for seconds. Release builds
+/// don't read it, so it is not a setting.
+#[cfg(all(not(test), debug_assertions))]
+const LOCK_WAIT_TEST_ENV: &str = "KOTO_TEST_JOURNAL_LOCK_WAIT_MS";
+
+/// The bound every journal write waits for the lock within, when its
+/// caller passes no tighter one: [`JOURNAL_LOCK_WAIT`].
+#[cfg(not(test))]
+fn journal_lock_wait() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var(LOCK_WAIT_TEST_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    JOURNAL_LOCK_WAIT
+}
+
+#[cfg(test)]
+fn journal_lock_wait() -> std::time::Duration {
+    TEST_LOCK_WAIT.with(|c| c.get())
+}
+
+/// [`write`], waiting at most `lock_wait` for the journal's lock, or not at
+/// all once an earlier write in this process has given up on it. A lock
+/// still held after that is a failed write: one warning, and the batch is
+/// skipped.
+fn write_within(root: &Path, records: &[Record], lock_wait: std::time::Duration) {
     if records.is_empty() {
         return;
     }
@@ -461,22 +565,48 @@ fn write_within(root: &Path, records: &[Record], lock_wait: Option<std::time::Du
         lines.push(line);
     }
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    // A zero wait still tries the lock once, so a lock that was freed in
+    // the meantime is taken and the batch written. Only the waiting is
+    // dropped: a writer that takes the lock does everything it would have
+    // under it, a rotation included.
+    let lock_wait = if gave_up() {
+        std::time::Duration::ZERO
+    } else {
+        lock_wait
+    };
     // The batch goes to one file whole: a rotation happens before it or
-    // after it, never between two of its lines. A bounded lock wait covers
-    // the whole append, the fresh file's lock after a rotation included.
+    // after it, never between two of its lines. The lock wait covers the
+    // whole append, the fresh file's lock after a rotation included, but
+    // only the waiting: work done while holding the lock isn't timed.
     #[cfg(unix)]
     let written = rotate::append(root, &refs, max, flush, lock_wait);
     #[cfg(not(unix))]
     let written = crate::engine::jsonl_append::append_bounded_lines_no_follow_within(
-        root, &path, &refs, max, flush, lock_wait,
+        root,
+        &path,
+        &refs,
+        max,
+        flush,
+        Some(lock_wait),
     );
     match written {
         Ok(flushed) => {
+            // No lines opens nothing; any other success took the lock.
             if !refs.is_empty() {
                 count_batch(flushed);
+                set_gave_up(false);
             }
         }
-        Err(e) => warn_once(&format!("{}: {}", path.display(), e.root_cause())),
+        Err(e) => {
+            // Only a wait that ran out on another writer's lock means a
+            // writer may have stopped. A rotating writer whose own move
+            // left it short of the fresh file's lock had its full wait
+            // there and simply lost a race.
+            if crate::engine::jsonl_append::lock_timeout(&e).is_some_and(|t| !t.after_own_move()) {
+                set_gave_up(true);
+            }
+            warn_once(&format!("{}: {}", path.display(), e.root_cause()))
+        }
     }
 }
 
@@ -982,6 +1112,11 @@ pub(crate) fn after_commit(
 /// tick calls this once per arrival, after the state's `state_entered`
 /// and before any cleanup, with the root of the command's backend
 /// (`Backend::journal_root`); `None` writes nothing.
+///
+/// Like every journal write it always returns: a record it can't write,
+/// one whose lock stays held past [`JOURNAL_LOCK_WAIT`] included, is
+/// skipped with the one warning, and the tick goes on to its index entry,
+/// parent notice and cleanup as it would have.
 pub(crate) fn terminal(
     journal_root: Option<&Path>,
     backend: &dyn SessionBackend,
@@ -1069,10 +1204,11 @@ fn response_record(
 /// session's sidecar, or is derived from the header without caching it. For
 /// `koto status` the journal's lock is waited for at most
 /// [`RESPONSE_LOCK_WAIT`], so a writer that stopped while holding it can't
-/// hang the command an agent uses to recover; past that, the record is
-/// skipped with the one warning. `koto next` waits for the lock like every
-/// other journal write, so its records aren't lost to a busy journal. The
-/// record is written without a flush, like the check records.
+/// hold up the command an agent uses to recover; past that, the record is
+/// skipped with the one warning. `koto next` waits as long as every other
+/// journal write ([`JOURNAL_LOCK_WAIT`]), so its records aren't lost to a
+/// busy journal but a stuck one can't hang it either. The record is written
+/// without a flush, like the check records.
 /// `journal_root` is the store's journal home; `None` writes nothing.
 ///
 /// [`persistence::visit_start`]: crate::engine::persistence::visit_start
@@ -1129,8 +1265,8 @@ pub(crate) fn response(
         visit_seq: Some(visit_seq),
     };
     let lock_wait = match source {
-        ResponseSource::Status => Some(RESPONSE_LOCK_WAIT),
-        ResponseSource::Next => None,
+        ResponseSource::Status => RESPONSE_LOCK_WAIT.min(journal_lock_wait()),
+        ResponseSource::Next => journal_lock_wait(),
     };
     write_within(
         root,

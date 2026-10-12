@@ -101,7 +101,62 @@ thread_local! {
     static TEST_WARNINGS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
     static TEST_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_SLOW_STEP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
+
+/// Run `hold` inside this thread's next rotation, with the journal's lock
+/// held, just before the rotated file's `sync_data`: a test's stand-in for
+/// a slow flush.
+#[cfg(test)]
+pub(crate) fn hold_next_rotation_for_test(hold: impl FnOnce() + 'static) {
+    TEST_SLOW_STEP.with(|s| *s.borrow_mut() = Some(Box::new(hold)));
+}
+
+#[cfg(test)]
+fn hold_slow_step() {
+    if let Some(hold) = TEST_SLOW_STEP.with(|s| s.borrow_mut().take()) {
+        hold();
+    }
+}
+
+/// The marker path a debug build reads from the environment to hold its
+/// first rotation's slow step, so the binary's tests can show another
+/// writer giving up on the lock while a rotation holds it. Release builds
+/// don't read it.
+#[cfg(all(not(test), debug_assertions))]
+const ROTATE_HOLD_TEST_ENV: &str = "KOTO_TEST_JOURNAL_ROTATE_HOLD";
+
+/// In a debug build with [`ROTATE_HOLD_TEST_ENV`] set, the process's first
+/// rotation creates the file it names and then waits, with the journal's
+/// lock held, until the test removes it (at most a minute). Otherwise
+/// nothing.
+#[cfg(all(not(test), debug_assertions))]
+fn hold_slow_step() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static HELD: AtomicBool = AtomicBool::new(false);
+    let Some(marker) = std::env::var_os(ROTATE_HOLD_TEST_ENV) else {
+        return;
+    };
+    if HELD.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker);
+    if created.is_err() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    while std::fs::symlink_metadata(&marker).is_ok() && started.elapsed() < Duration::from_secs(60)
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(all(not(test), not(debug_assertions)))]
+fn hold_slow_step() {}
 
 #[cfg(test)]
 fn settings() -> Settings {
@@ -149,13 +204,18 @@ pub(crate) fn warnings_for_test() -> Vec<String> {
 /// as in [`append_bounded_lines_current`]: a writer that gives up before
 /// taking the lock has written and rotated nothing, and one that rotated but
 /// then can't take the fresh file's lock in time has written nothing.
-/// Returns whether it flushed.
+///
+/// The bound covers waiting for the lock and nothing else. A rotation and
+/// its retention pass run under the lock, and a slow one (a `sync_data` on
+/// a busy disk, a long readers directory) runs to the end: the writers
+/// waiting behind it are the ones whose bound runs out. Returns whether it
+/// flushed.
 pub(crate) fn append(
     root: &Path,
     lines: &[&str],
     max: usize,
     flush: bool,
-    lock_wait: Option<Duration>,
+    lock_wait: Duration,
 ) -> anyhow::Result<bool> {
     let path = root.join(JOURNAL_FILE);
     let s = settings();
@@ -165,7 +225,7 @@ pub(crate) fn append(
         lines,
         max,
         flush,
-        lock_wait,
+        Some(lock_wait),
         &mut |file, size| {
             if s.rotate_bytes == 0 || rotation_disabled() {
                 return UnderLock::Write;
@@ -217,7 +277,10 @@ fn rotate_locked(root: &Path, path: &Path, file: &std::fs::File, size: u64) -> a
     file.set_modified(SystemTime::now())?;
     // Records written without a flush (check records) count on the next
     // flush of the journal to make them durable. That flush goes to the new
-    // file, so flush this one before it stops being written.
+    // file, so flush this one before it stops being written. This is the
+    // slow step of a rotation, and it runs under the lock to the end: the
+    // lock wait bounds the writers waiting behind it, not this one.
+    hold_slow_step();
     file.sync_data()?;
 
     // A crash between an earlier rotation's link and its unlink left the
@@ -436,6 +499,9 @@ mod tests {
 
     const MAX: usize = 4096;
 
+    /// The lock wait every journal write gets.
+    const WAIT: Duration = super::super::JOURNAL_LOCK_WAIT;
+
     fn on(bytes: u64) -> Settings {
         Settings {
             rotate_bytes: bytes,
@@ -475,7 +541,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         set_settings_for_test(on(0));
         for _ in 0..50 {
-            append(tmp.path(), &["{\"kind\":\"x\"}"], MAX, true, None).unwrap();
+            append(tmp.path(), &["{\"kind\":\"x\"}"], MAX, true, WAIT).unwrap();
         }
         assert!(rotated(tmp.path()).is_empty());
         assert_eq!(journal(tmp.path()).lines().count(), 50);
@@ -489,9 +555,9 @@ mod tests {
         // append writes to the same file.
         let under = TempDir::new().unwrap();
         set_settings_for_test(on(27));
-        append(under.path(), &[line], MAX, true, None).unwrap();
-        append(under.path(), &[line], MAX, true, None).unwrap();
-        append(under.path(), &[line], MAX, true, None).unwrap();
+        append(under.path(), &[line], MAX, true, WAIT).unwrap();
+        append(under.path(), &[line], MAX, true, WAIT).unwrap();
+        append(under.path(), &[line], MAX, true, WAIT).unwrap();
         assert!(rotated(under.path()).is_empty());
         assert_eq!(journal(under.path()).len(), 39);
 
@@ -499,10 +565,10 @@ mod tests {
         // rotates first.
         let at = TempDir::new().unwrap();
         set_settings_for_test(on(26));
-        append(at.path(), &[line], MAX, true, None).unwrap();
-        append(at.path(), &[line], MAX, true, None).unwrap();
+        append(at.path(), &[line], MAX, true, WAIT).unwrap();
+        append(at.path(), &[line], MAX, true, WAIT).unwrap();
         assert!(rotated(at.path()).is_empty());
-        append(at.path(), &[line], MAX, true, None).unwrap();
+        append(at.path(), &[line], MAX, true, WAIT).unwrap();
         assert_eq!(rotated(at.path()), vec![rotated_name(1)]);
         let first = std::fs::read_to_string(at.path().join(rotated_name(1))).unwrap();
         assert_eq!(first.len(), 26);
@@ -514,7 +580,7 @@ mod tests {
     fn a_batch_is_never_split_across_files() {
         let tmp = TempDir::new().unwrap();
         set_settings_for_test(on(5));
-        append(tmp.path(), &["{\"n\":1}"], MAX, true, None).unwrap();
+        append(tmp.path(), &["{\"n\":1}"], MAX, true, WAIT).unwrap();
         // The journal is already over the bound: the batch goes, whole, to
         // the fresh file.
         append(
@@ -522,7 +588,7 @@ mod tests {
             &["{\"n\":2}", "{\"n\":3}", "{\"n\":4}"],
             MAX,
             true,
-            None,
+            WAIT,
         )
         .unwrap();
         let first = std::fs::read_to_string(tmp.path().join(rotated_name(1))).unwrap();
@@ -539,7 +605,7 @@ mod tests {
         std::fs::write(root.join(JOURNAL_FILE), "{\"n\":1}\n").unwrap();
         std::fs::hard_link(root.join(JOURNAL_FILE), root.join(rotated_name(1))).unwrap();
         set_settings_for_test(on(1_000_000));
-        append(root, &["{\"n\":2}"], MAX, true, None).unwrap();
+        append(root, &["{\"n\":2}"], MAX, true, WAIT).unwrap();
         assert_eq!(rotated(root), vec![rotated_name(1)]);
         let first = std::fs::read_to_string(root.join(rotated_name(1))).unwrap();
         assert_eq!(first, "{\"n\":1}\n");
@@ -550,15 +616,15 @@ mod tests {
     fn an_unflushed_batch_rotates_like_a_flushed_one_and_no_lines_opens_nothing() {
         let tmp = TempDir::new().unwrap();
         set_settings_for_test(on(5));
-        assert!(!append(tmp.path(), &["{\"n\":1}", "{\"n\":2}"], MAX, false, None).unwrap());
-        assert!(append(tmp.path(), &["{\"n\":3}"], MAX, true, None).unwrap());
+        assert!(!append(tmp.path(), &["{\"n\":1}", "{\"n\":2}"], MAX, false, WAIT).unwrap());
+        assert!(append(tmp.path(), &["{\"n\":3}"], MAX, true, WAIT).unwrap());
         let first = std::fs::read_to_string(tmp.path().join(rotated_name(1))).unwrap();
         assert_eq!(first, "{\"n\":1}\n{\"n\":2}\n");
         assert_eq!(journal(tmp.path()), "{\"n\":3}\n");
 
         let empty = TempDir::new().unwrap();
         let root = empty.path().join("never-made");
-        assert!(!append(&root, &[], MAX, true, None).unwrap());
+        assert!(!append(&root, &[], MAX, true, WAIT).unwrap());
         assert!(!root.exists());
     }
 
@@ -567,7 +633,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(JOURNAL_FILE), "{\"n\":1}\n{\"tor").unwrap();
         set_settings_for_test(on(5));
-        append(tmp.path(), &["{\"n\":2}"], MAX, true, None).unwrap();
+        append(tmp.path(), &["{\"n\":2}"], MAX, true, WAIT).unwrap();
         let first = std::fs::read_to_string(tmp.path().join(rotated_name(1))).unwrap();
         assert!(first.ends_with('\n'), "{first:?}");
         assert_eq!(journal(tmp.path()), "{\"n\":2}\n");
@@ -578,7 +644,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(JOURNAL_FILE), "not json at all\n").unwrap();
         set_settings_for_test(on(5));
-        append(tmp.path(), &["also not json"], MAX, true, None).unwrap();
+        append(tmp.path(), &["also not json"], MAX, true, WAIT).unwrap();
         assert_eq!(rotated(tmp.path()), vec![rotated_name(1)]);
     }
 
@@ -594,8 +660,8 @@ mod tests {
         std::fs::write(root.join(JOURNAL_FILE), "{\"n\":1}\n").unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
         set_settings_for_test(on(5));
-        let first = append(&root, &["{\"n\":2}"], MAX, true, None);
-        let second = append(&root, &["{\"n\":3}"], MAX, true, None);
+        let first = append(&root, &["{\"n\":2}"], MAX, true, WAIT);
+        let second = append(&root, &["{\"n\":3}"], MAX, true, WAIT);
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         first.unwrap();
         second.unwrap();
@@ -610,13 +676,13 @@ mod tests {
         let root = tmp.path();
         set_settings_for_test(on(5));
         for n in 0..3 {
-            append(root, &[&format!("{{\"n\":{n}}}")], MAX, true, None).unwrap();
+            append(root, &[&format!("{{\"n\":{n}}}")], MAX, true, WAIT).unwrap();
         }
         // Two rotations so far; age the oldest past the bound.
         assert_eq!(rotated(root), vec![rotated_name(1), rotated_name(2)]);
         set_mtime_days_ago(&root.join(rotated_name(1)), 31);
         set_mtime_days_ago(&root.join(rotated_name(2)), 29);
-        append(root, &["{\"n\":3}"], MAX, true, None).unwrap();
+        append(root, &["{\"n\":3}"], MAX, true, WAIT).unwrap();
         // File 1 is gone; file 2 is inside the bound; file 3 is new.
         assert_eq!(rotated(root), vec![rotated_name(2), rotated_name(3)]);
     }
@@ -631,7 +697,7 @@ mod tests {
             reader_stale_days: 90,
         });
         for n in 0..6 {
-            append(root, &[&format!("{{\"n\":{n}}}")], MAX, true, None).unwrap();
+            append(root, &[&format!("{{\"n\":{n}}}")], MAX, true, WAIT).unwrap();
             if n > 0 {
                 // With a zero-day bound only the newest survives each pass.
                 assert_eq!(rotated(root), vec![rotated_name(n)]);
@@ -644,12 +710,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         set_settings_for_test(on(5));
-        append(root, &["{\"n\":0}"], MAX, true, None).unwrap();
-        append(root, &["{\"n\":1}"], MAX, true, None).unwrap();
+        append(root, &["{\"n\":0}"], MAX, true, WAIT).unwrap();
+        append(root, &["{\"n\":1}"], MAX, true, WAIT).unwrap();
         // File 1 exists; the active journal then sits idle for 40 days.
         set_mtime_days_ago(&root.join(JOURNAL_FILE), 40);
         set_mtime_days_ago(&root.join(rotated_name(1)), 41);
-        append(root, &["{\"n\":2}"], MAX, true, None).unwrap();
+        append(root, &["{\"n\":2}"], MAX, true, WAIT).unwrap();
         // File 1 is old and goes; file 2 was rotated just now, so it counts
         // as new whatever its last append's age.
         assert_eq!(rotated(root), vec![rotated_name(2)]);
@@ -685,7 +751,7 @@ mod tests {
         let root = tmp.path();
         set_settings_for_test(on(5));
         for n in 0..4 {
-            append(root, &[&format!("{{\"n\":{n}}}")], MAX, true, None).unwrap();
+            append(root, &[&format!("{{\"n\":{n}}}")], MAX, true, WAIT).unwrap();
         }
         // Rotated 1, 2, 3; a lagging reader mid-way through file 2, a
         // reader at the end of file 2 (which needs only 3 on).
@@ -694,7 +760,7 @@ mod tests {
         for n in 1..=3 {
             set_mtime_days_ago(&root.join(rotated_name(n)), 40);
         }
-        append(root, &["{\"n\":4}"], MAX, true, None).unwrap();
+        append(root, &["{\"n\":4}"], MAX, true, WAIT).unwrap();
         assert_eq!(
             rotated(root),
             vec![rotated_name(2), rotated_name(3), rotated_name(4)]
@@ -704,7 +770,7 @@ mod tests {
         let len = std::fs::metadata(root.join(rotated_name(2))).unwrap().len();
         write_position(root, "lagging", &root.join(rotated_name(2)), len);
         set_mtime_days_ago(&root.join(rotated_name(4)), 40);
-        append(root, &["{\"n\":5}"], MAX, true, None).unwrap();
+        append(root, &["{\"n\":5}"], MAX, true, WAIT).unwrap();
         // File 2 goes; 3 and everything newer stay, 4 included despite its
         // age, because the readers still need file 3 onward.
         assert_eq!(
@@ -719,16 +785,115 @@ mod tests {
         let root = tmp.path();
         set_settings_for_test(on(5));
         for n in 0..2 {
-            append(root, &[&format!("{{\"n\":{n}}}")], MAX, true, None).unwrap();
+            append(root, &[&format!("{{\"n\":{n}}}")], MAX, true, WAIT).unwrap();
         }
         write_position(root, "stale", &root.join(rotated_name(1)), 0);
         set_mtime_days_ago(&root.join(READERS_DIR).join("stale.json"), 91);
         std::fs::write(root.join(READERS_DIR).join("broken.json"), "{not json").unwrap();
         set_mtime_days_ago(&root.join(rotated_name(1)), 40);
-        append(root, &["{\"n\":2}"], MAX, true, None).unwrap();
+        append(root, &["{\"n\":2}"], MAX, true, WAIT).unwrap();
         assert!(!root.join(rotated_name(1)).exists());
         let warnings = warnings_for_test().join("\n");
         assert!(warnings.contains("stale.json"), "{warnings}");
         assert!(warnings.contains("broken.json"), "{warnings}");
+    }
+
+    /// A rotation that is slow under the lock (held here just before the
+    /// rotated file's `sync_data`, well past the bound) runs to the end,
+    /// while a writer waiting behind it gives up at its own bound, having
+    /// written and rotated nothing. The bound covers taking the lock, not
+    /// the work done while holding it.
+    #[test]
+    fn a_slow_rotation_finishes_while_a_writer_behind_it_gives_up_at_its_bound() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join(JOURNAL_FILE), "{\"n\":1}\n").unwrap();
+        let bound = Duration::from_millis(50);
+        let (inside_tx, inside_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let rotating = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                set_settings_for_test(on(5));
+                hold_next_rotation_for_test(move || {
+                    inside_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+                let started = Instant::now();
+                let result = append(&root, &["{\"n\":2}"], MAX, true, bound);
+                (result.map_err(|e| format!("{e:#}")), started.elapsed())
+            })
+        };
+        inside_rx.recv().unwrap();
+
+        // The rotating writer holds the lock inside its slow step.
+        set_settings_for_test(on(5));
+        let started = Instant::now();
+        let err = append(&root, &["{\"n\":3}"], MAX, true, bound).unwrap_err();
+        let waited = started.elapsed();
+        assert!(
+            format!("{err:#}").contains("held by another writer"),
+            "{err:#}"
+        );
+        assert!(waited >= bound, "{waited:?}");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        assert!(rotated(&root).is_empty());
+        assert_eq!(journal(&root), "{\"n\":1}\n");
+
+        // Keep the slow step going past twice the bound, then let it finish.
+        std::thread::sleep(bound * 2);
+        release_tx.send(()).unwrap();
+        let (result, took) = rotating.join().unwrap();
+        assert_eq!(result, Ok(true));
+        assert!(took >= bound * 3, "{took:?}");
+        assert_eq!(rotated(&root), vec![rotated_name(1)]);
+        let first = std::fs::read_to_string(root.join(rotated_name(1))).unwrap();
+        assert_eq!(first, "{\"n\":1}\n");
+        assert_eq!(journal(&root), "{\"n\":2}\n");
+    }
+
+    /// A rotation slower than its writer's whole bound still delivers the
+    /// batch it rotated for. The rotator holds its slow step past its bound
+    /// while a second writer waits behind it with a longer one; once the
+    /// rotation lets go, the second writer follows the move to the fresh
+    /// file and writes there too, so the two contend for the fresh file's
+    /// lock. The rotator's wait for that lock is a fresh one, not what its
+    /// slow step left, so both batches land in the fresh file.
+    #[test]
+    fn a_rotation_slower_than_its_bound_still_writes_its_batch() {
+        use std::sync::mpsc;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        // Past a 30-byte bound, so the first write rotates; the fresh file
+        // stays under it with both batches in.
+        let old = "{\"n\":1,\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxx\"}\n";
+        std::fs::write(root.join(JOURNAL_FILE), old).unwrap();
+        let bound = Duration::from_millis(100);
+        let (inside_tx, inside_rx) = mpsc::channel::<()>();
+        let rotating = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                set_settings_for_test(on(30));
+                hold_next_rotation_for_test(move || {
+                    inside_tx.send(()).unwrap();
+                    std::thread::sleep(bound * 3);
+                });
+                append(&root, &["{\"n\":2}"], MAX, true, bound).map_err(|e| format!("{e:#}"))
+            })
+        };
+        inside_rx.recv().unwrap();
+        // The second writer, rotation on too, waits out the slow step.
+        set_settings_for_test(on(30));
+        append(&root, &["{\"n\":3}"], MAX, true, WAIT).unwrap();
+        assert_eq!(rotating.join().unwrap(), Ok(true));
+
+        assert_eq!(rotated(&root), vec![rotated_name(1)]);
+        let first = std::fs::read_to_string(root.join(rotated_name(1))).unwrap();
+        assert_eq!(first, old);
+        let mut fresh: Vec<String> = journal(&root).lines().map(str::to_string).collect();
+        fresh.sort();
+        assert_eq!(fresh, vec!["{\"n\":2}", "{\"n\":3}"]);
     }
 }
