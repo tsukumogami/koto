@@ -722,12 +722,56 @@ pub fn handle_dir(backend: &dyn SessionBackend, name: &str) -> Result<()> {
 /// `LocalBackend`. Takes `&Backend` (the concrete enum) rather than `&dyn
 /// SessionBackend` so it can call that inherent accessor, mirroring
 /// `handle_resolve`'s existing `&Backend` parameter.
-pub fn handle_list(backend: &Backend) -> Result<()> {
-    let sessions = backend.list()?;
+///
+/// `execution_dir` keeps only sessions whose recorded execution directory is
+/// that directory or lies under it (see
+/// [`crate::cli::session_inventory::under_dir`]); it implies `with_state` and
+/// wraps the rows as `{"sessions": [...], "excluded_remote_only": N}`, where N
+/// counts the cloud backend's remote-only rows, which have no header to
+/// match. `with_state` adds each row's `state`, `status`, `failure` and
+/// `finished_at` from one inspection per session; the filter runs on the
+/// header first, so only matching rows are inspected.
+pub fn handle_list(backend: &Backend, execution_dir: Option<&str>, with_state: bool) -> Result<()> {
+    use crate::cli::session_inventory::{inspect, normalize_filter, under_dir, TemplateCache};
+
+    let mut sessions = backend.list()?;
+    let base = backend.local_base_dir().to_path_buf();
+    let remote_only = |id: &str| backend.is_cloud() && !base.join(id).is_dir();
+
+    let mut excluded_remote_only = 0usize;
+    if let Some(arg) = execution_dir {
+        let filter = normalize_filter(arg);
+        sessions.retain(|s| {
+            if remote_only(&s.id) {
+                excluded_remote_only += 1;
+                return false;
+            }
+            s.execution_dir
+                .as_deref()
+                .is_some_and(|dir| under_dir(dir, &filter))
+        });
+    }
+    let with_state = with_state || execution_dir.is_some();
+
     let mut rows = serde_json::to_value(&sessions)?;
     if let serde_json::Value::Array(rows) = &mut rows {
         let is_cloud = backend.is_cloud();
+        let mut cache = TemplateCache::new();
         for row in rows.iter_mut() {
+            if with_state {
+                let id = row["id"].as_str().unwrap_or_default().to_string();
+                if remote_only(&id) {
+                    for key in ["state", "status", "failure", "finished_at"] {
+                        row[key] = serde_json::Value::Null;
+                    }
+                } else {
+                    let seen = inspect(&base, &id, &mut cache);
+                    row["state"] = serde_json::json!(seen.state);
+                    row["status"] = serde_json::json!(seen.status);
+                    row["failure"] = serde_json::json!(seen.failure);
+                    row["finished_at"] = serde_json::json!(seen.finished_at);
+                }
+            }
             let exists_false = row
                 .get("template_source_status")
                 .and_then(|s| s.get("exists"))
@@ -742,6 +786,12 @@ pub fn handle_list(backend: &Backend) -> Result<()> {
                 }
             }
         }
+    }
+    if execution_dir.is_some() {
+        rows = serde_json::json!({
+            "sessions": rows,
+            "excluded_remote_only": excluded_remote_only,
+        });
     }
     println!("{}", serde_json::to_string_pretty(&rows)?);
     Ok(())
