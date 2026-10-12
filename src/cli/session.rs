@@ -928,6 +928,11 @@ pub fn handle_recover(backend: &Backend, apply: bool, sessions: &[String]) -> Re
 /// Remove a session directory. Idempotent: succeeds even if the session doesn't exist.
 pub fn handle_cleanup(backend: &dyn SessionBackend, name: &str) -> Result<()> {
     backend.cleanup(name)?;
+    // A person's removal leaves no finished record: one a crash left behind
+    // (written just before a removal that never happened) must not answer
+    // for this session as removed by koto.
+    #[cfg(unix)]
+    super::forget_finished_record(backend, name);
     Ok(())
 }
 

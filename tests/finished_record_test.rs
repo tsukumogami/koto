@@ -228,6 +228,40 @@ fn an_unknown_name_and_a_pruned_record_answer_not_found() {
     assert_not_found(&env.status("gone"));
 }
 
+/// Leave a finished record beside a kept session, as a crash between the
+/// record's write and the session's removal would.
+fn crash_leaves_a_record(env: &Env, name: &str) {
+    env.init(name);
+    env.finish(name, "yes", true);
+    let template = env.record_path("template");
+    // Any finished record will do; the session's own fields aren't checked.
+    env.init("template");
+    env.finish("template", "yes", false);
+    let mut record = env.record("template");
+    record["name"] = Value::from(name);
+    std::fs::write(env.record_path(name), serde_json::to_vec(&record).unwrap()).unwrap();
+    let _ = std::fs::remove_file(template);
+    assert!(env.sessions().join(name).is_dir());
+}
+
+#[test]
+fn a_persons_removal_deletes_a_record_a_crash_left_behind() {
+    let env = Env::new();
+    crash_leaves_a_record(&env, "cleaned");
+    env.ok(&["session", "cleanup", "cleaned"]);
+    assert!(!env.record_path("cleaned").exists());
+    assert_not_found(&env.status("cleaned"));
+
+    // A session at its terminal can't be cancelled, so this one is rewound
+    // back to work first, the way a record beside a kept session meets
+    // `cancel --cleanup`.
+    crash_leaves_a_record(&env, "cancelled");
+    env.ok(&["rewind", "cancelled"]);
+    env.ok(&["cancel", "cancelled", "--cleanup"]);
+    assert!(!env.record_path("cancelled").exists());
+    assert_not_found(&env.status("cancelled"));
+}
+
 #[test]
 fn only_a_removal_koto_makes_itself_writes_a_record() {
     let env = Env::new();

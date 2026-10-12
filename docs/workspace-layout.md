@@ -92,7 +92,9 @@ at its success terminal, or with its parent. Each `<name>.json` keeps
 what `koto status` needs to answer for the removed session (its final
 state, result, finish time, session id and execution directory), and is
 written just before the removal. The directory is created mode 0700 and
-each record 0600. It is derived and safe to delete: a missing record
+each record 0600. A record keeps the session's whole result, including
+any payload its result map carries, until the name is reused or the
+prune removes it. It is derived and safe to delete: a missing record
 only makes `koto status` answer `not found` for a name koto removed.
 Creating a session deletes its name's record, `koto session prune`
 lists and removes records, and nothing that lists sessions shows them.

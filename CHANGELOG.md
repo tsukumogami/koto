@@ -258,6 +258,20 @@ to `0.9.x`).
 
 ### Changed
 
+- **`koto status` answers for a session koto removed.** koto removes a
+  session at its success terminal (unless the tick passed `--no-cleanup`),
+  and a parent removes its kept terminal children. Before either removal
+  koto now writes a finished record to `.finished/<name>.json` under the
+  sessions directory, and `koto status` on that name exits 0 with
+  `removed: true`, `current_state`, `is_terminal: true`, `result`,
+  `finished_at`, `session_id` and `execution_dir`, where it used to exit 2
+  with `not found`. A caller that read exit 2 as "the run is gone" should
+  read `removed: true` instead. `not found` now means no session and no
+  record: the name never existed, a person removed it with
+  `koto session cleanup` or `koto cancel --cleanup`, or `koto session
+  prune` removed its record. Creating a session under the name deletes the
+  record.
+
 - **Gates and default actions run in an environment fixed when the session
   is created (koto#261).** Until now every command gate and default action
   ran as `sh -c` with the whole environment of whatever process called `koto

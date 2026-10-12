@@ -7986,7 +7986,13 @@ fn handle_cancel(backend: &dyn SessionBackend, name: &str, cleanup: bool) -> Res
     // them so the caller has the same visibility regardless of --cleanup.
     let cleaned = if cleanup {
         match backend.cleanup(name) {
-            Ok(()) => true,
+            Ok(()) => {
+                // As for `koto session cleanup`: a person's removal leaves no
+                // finished record, including one a crash left behind.
+                #[cfg(unix)]
+                forget_finished_record(backend, name);
+                true
+            }
             Err(e) => {
                 // The cancel event is already persisted; surface the
                 // cleanup failure without rolling back.
