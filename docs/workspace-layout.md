@@ -30,7 +30,7 @@ of authority for this document).
 │   ├── .prune-plans/                          # derived (koto session prune previews)
 │   │   └── <token>.json
 │   └── .finished/                             # derived (finished records, see below)
-│       └── <session-id>.json
+│       └── <name>.json
 ├── requests/                                  # AUTHORITATIVE state
 │   └── <request_id>/
 │       ├── request.jsonl                      # header + event log

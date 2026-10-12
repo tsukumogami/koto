@@ -478,13 +478,13 @@ If the template read from disk no longer matches the hash recorded in the sessio
 
 For batch parents and sessions bound to a request leg, `koto status` also carries additional fields -- see [Batch workflows](#batch-workflows) below.
 
-**A session koto removed.** koto removes a session at its success terminal (unless the tick passed `--no-cleanup`), and a parent removes its kept terminal children when it is removed. Before either removal it writes a finished record, so `koto status` on that name still answers, exit 0:
+**A session koto removed.** koto removes a session at its success terminal (unless the tick passed `--no-cleanup`), and a parent removes its kept terminal children when it is removed or replaced (`koto init --attach-live --replace-terminal`). Before either removal it writes a finished record, so `koto status` on that name still answers, exit 0:
 
 ```json
 {"name":"deploy","current_state":"done","is_terminal":true,"result":{"status":"success","summary":"completed at done"},"removed":true,"finished_at":"2026-10-11T23:44:36.123Z","session_id":"<session-id>","execution_dir":"/work/project"}
 ```
 
-`current_state`, `is_terminal` and `result` mean what they mean for a kept terminal session, so the same run kept with `--no-cleanup` answers the same three. A child that had been cancelled before its parent removed it answers with its cancel state, a null `result` and `"status": "cancelled"`. A result too large for the record (over 64 KiB) keeps its `status` and `summary`, and the answer carries `"result_truncated": true`. A session removed by a person (`koto session cleanup`, `koto cancel --cleanup`) leaves no record, so a name that never existed, a name removed that way, and a name whose record was pruned all answer `not found`, exit 2. Creating a session under the name deletes its record.
+`current_state`, `is_terminal` and `result` mean what they mean for a kept terminal session, so the same run kept with `--no-cleanup` answers the same three. A child that had been cancelled before its parent removed it answers with its cancel state, a null `result` and `"status": "cancelled"`. A result too large for the record (over 64 KiB) keeps its `status` and `summary`, and the answer carries `"result_truncated": true`. A session removed by a person (`koto session cleanup`, `koto cancel --cleanup`) leaves no record, nor does one whose removal failed (its record is deleted again), so a name that never existed, a name removed that way, and a name whose record was pruned all answer `not found`, exit 2. Creating a session under the name deletes its record.
 
 ### session
 

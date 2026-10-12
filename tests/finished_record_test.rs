@@ -268,6 +268,19 @@ fn creating_a_session_deletes_its_names_record_and_nothing_lists_records() {
 }
 
 #[test]
+fn a_cut_result_is_flagged_in_the_status_answer() {
+    let env = Env::new();
+    env.init("big");
+    env.finish("big", "yes", false);
+    let mut record = env.record("big");
+    record["truncated"] = Value::Bool(true);
+    std::fs::write(env.record_path("big"), serde_json::to_vec(&record).unwrap()).unwrap();
+    let status = json(&env.status("big"));
+    assert_eq!(status["result_truncated"], true);
+    assert_eq!(status["result"], record["result"]);
+}
+
+#[test]
 fn a_record_that_cannot_be_written_warns_and_the_session_is_still_removed() {
     let env = Env::new();
     env.init("unrecorded");
@@ -360,9 +373,12 @@ fn prune_lists_records_under_its_filters_and_in_its_token() {
         "/no/such/dir/for/koto",
     ]);
     assert!(elsewhere["remove"].as_array().unwrap().is_empty());
-    // The age filter reads the record's finish time.
+    // The age filter reads the record's finish time: nothing is a day old,
+    // and everything is at least zero seconds old.
     let old = env.ok(&["session", "prune", "--older-than", "1d"]);
     assert!(old["remove"].as_array().unwrap().is_empty());
+    let any = env.ok(&["session", "prune", "--older-than", "0s"]);
+    assert_eq!(any["remove"].as_array().unwrap().len(), 2);
 
     // A record that changes after the preview changes the token.
     env.init("rec-b");

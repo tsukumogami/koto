@@ -3351,6 +3351,8 @@ fn finish_terminal_tick(
         workspace::sweep_if_parent(backend, context_store, name, compiled);
         if let Err(e) = backend.cleanup(name) {
             eprintln!("warning: session cleanup failed: {}", e);
+            // The session stays, so its record must not answer for it later.
+            forget_finished_record(backend, name);
         }
     }
 }
@@ -3375,11 +3377,24 @@ pub(crate) fn write_finished_record(
     }
 }
 
+/// Delete the finished record written for a session whose removal then
+/// failed, so the session that stays isn't later answered for as removed.
+#[cfg(unix)]
+pub(crate) fn forget_finished_record(backend: &dyn SessionBackend, name: &str) {
+    let session_dir = backend.session_dir(name);
+    if let Some(base) = crate::session::finished::base_of(&session_dir) {
+        if let Err(e) = crate::session::finished::remove(base, name) {
+            eprintln!("warning: could not remove the finished record for {name}: {e:#}");
+        }
+    }
+}
+
 /// The finished record of a kept child a parent is about to remove: the
 /// result its log records for this arrival, else the one `koto status`
 /// resolves read-only. A cancelled child has no result and stands in the
-/// state it was cancelled in. `None` when the child can't be read, in which
-/// case the sweep doesn't remove it either.
+/// state it was cancelled in. `None` when the child can't be read now (the
+/// sweep checked it was terminal just before), in which case the sweep
+/// removes it without a record and `koto status` answers `not found`.
 #[cfg(unix)]
 pub(crate) fn finished_record_for_child(
     backend: &dyn SessionBackend,

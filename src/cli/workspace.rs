@@ -446,6 +446,8 @@ fn sweep_children(
             Ok(()) => {}
             Err(e) => {
                 eprintln!("warning: could not remove kept session {child}: {e}");
+                #[cfg(unix)]
+                super::forget_finished_record(backend, child);
                 all_removed = false;
             }
         }
