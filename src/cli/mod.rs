@@ -17,6 +17,9 @@ pub mod overrides;
 pub mod request;
 pub mod retry;
 pub mod session;
+pub(crate) mod session_inventory;
+#[cfg(unix)]
+pub(crate) mod session_prune;
 pub mod task_spawn_error;
 pub mod validate_feed;
 pub mod vars;
@@ -513,11 +516,90 @@ pub enum SessionCommand {
         name: String,
     },
     /// List all sessions as JSON
-    List,
+    ///
+    /// Each row carries the session's execution directory and session id.
+    /// `--state` adds where each session stands (`state`, `status`,
+    /// `failure`, `finished_at`), which reads every session's log.
+    List {
+        /// Only sessions whose execution directory is this directory or lies
+        /// under it, compared by whole path components. Implies `--state`,
+        /// and prints `{"sessions": [...], "excluded_remote_only": N}`.
+        #[arg(long = "execution-dir", value_name = "DIR")]
+        execution_dir: Option<String>,
+
+        /// Add each session's state, status (`running`, `terminal`,
+        /// `cancelled` or `unreadable`), failure flag and the time of its last
+        /// event.
+        #[arg(long)]
+        state: bool,
+    },
     /// Remove a session directory (idempotent)
     Cleanup {
         /// Session name
         name: String,
+    },
+    /// Preview, then remove, finished sessions as a set.
+    ///
+    /// Without `--apply`, prints the sessions it would remove, the sessions
+    /// it keeps with the rule that keeps each, and a plan token, and changes
+    /// nothing but its stored plan. `--apply --plan <token>` removes exactly
+    /// that preview's sessions, or nothing (exit 4) when the set has changed
+    /// since. `--apply` without `--plan` removes the set it computes now, and
+    /// needs `--execution-dir`, `--older-than` or `--all`.
+    ///
+    /// A session is kept when it is running or unreadable (rule a), a running
+    /// session references it (b), it references a running session (c), its
+    /// `chain/parent` context key is malformed (d), it is bound to a request
+    /// leg still waiting (e), it is a coordinator's session (f), or, under the
+    /// cloud backend, its remote copy may be newer (g). A failed removal
+    /// exits 3.
+    ///
+    /// `--migrated-from <workspace-path>` (cloud backend only) previews and
+    /// removes instead the migration markers `koto session import` left
+    /// under that workspace's bucket prefix. A marker is removable only when
+    /// its target is present, with a log that reads cleanly and begins with
+    /// every event of the old copy's log, and then once at least
+    /// `session.cloud.marker_retain_days` old or with `--source-retired`;
+    /// removal deletes everything under the old session's prefix, the
+    /// marker last.
+    Prune {
+        /// Only sessions whose execution directory is this directory or lies
+        /// under it. A session outside the filter still protects the sessions
+        /// it references.
+        #[arg(long = "execution-dir", value_name = "DIR")]
+        execution_dir: Option<String>,
+
+        /// Only sessions whose last event is at least this old: a whole
+        /// number and a unit, `s`, `m`, `h` or `d` (for example `30d`).
+        #[arg(long = "older-than", value_name = "AGE")]
+        older_than: Option<String>,
+
+        /// Every finished session. Required for `--apply` without `--plan`
+        /// when no other filter is given.
+        #[arg(long)]
+        all: bool,
+
+        /// Remove the sessions instead of previewing them.
+        #[arg(long)]
+        apply: bool,
+
+        /// The token a preview printed; with `--apply`, remove exactly that
+        /// preview's sessions.
+        #[arg(long, value_name = "TOKEN")]
+        plan: Option<String>,
+
+        /// Remove migration markers, and the old copies beside them, under
+        /// this source workspace's bucket prefix instead of finished local
+        /// sessions. Cloud backend only. Takes none of `--execution-dir`,
+        /// `--older-than` or `--all`.
+        #[arg(long = "migrated-from", value_name = "WORKSPACE")]
+        migrated_from: Option<String>,
+
+        /// With `--migrated-from`: the source host is gone for good, so a
+        /// marker whose target is present is removable inside
+        /// `session.cloud.marker_retain_days` too.
+        #[arg(long = "source-retired")]
+        source_retired: bool,
     },
     /// Resolve a session version conflict
     Resolve {
@@ -1553,7 +1635,10 @@ pub fn run(app: App) -> Result<()> {
                     coordinator_of_record.as_deref(),
                 ),
                 SessionCommand::Dir { name } => session::handle_dir(&backend, &name),
-                SessionCommand::List => session::handle_list(&backend),
+                SessionCommand::List {
+                    execution_dir,
+                    state,
+                } => session::handle_list(&backend, execution_dir.as_deref(), state),
                 SessionCommand::Cleanup { name } => {
                     // Query children before cleanup so the parent is still visible.
                     let children = query_children(&backend, &name);
@@ -1567,6 +1652,40 @@ pub fn run(app: App) -> Result<()> {
                         }))?
                     );
                     Ok(())
+                }
+                #[cfg(unix)]
+                SessionCommand::Prune {
+                    execution_dir,
+                    older_than,
+                    all,
+                    apply,
+                    plan,
+                    migrated_from,
+                    source_retired,
+                } => session_prune::handle_prune(
+                    &backend,
+                    session_prune::PruneArgs {
+                        execution_dir: execution_dir.as_deref(),
+                        older_than: older_than.as_deref(),
+                        all,
+                        apply,
+                        plan: plan.as_deref(),
+                        migrated_from: migrated_from.as_deref(),
+                        source_retired,
+                        // Only marker mode reads the bound, so a config that
+                        // fails to load can't stop a session-mode prune.
+                        marker_retain_days: match migrated_from {
+                            Some(_) => crate::config::resolve::load_config()?
+                                .session
+                                .cloud
+                                .marker_retain_days(),
+                            None => crate::config::DEFAULT_MARKER_RETAIN_DAYS,
+                        },
+                    },
+                ),
+                #[cfg(not(unix))]
+                SessionCommand::Prune { .. } => {
+                    anyhow::bail!("koto session prune is only supported on Unix platforms")
                 }
                 SessionCommand::Resolve {
                     name,
@@ -3174,6 +3293,7 @@ fn append_terminal_index_for_session(
 #[allow(clippy::too_many_arguments)]
 fn finish_terminal_tick(
     backend: &dyn SessionBackend,
+    context_store: &dyn ContextStore,
     journal_root: Option<&Path>,
     name: &str,
     header: &crate::engine::types::StateFileHeader,
@@ -3240,11 +3360,155 @@ fn finish_terminal_tick(
         return;
     }
     if !defer_for_parent && !defer_for_promotion {
+        // The finished record goes after the journal's terminal record above
+        // and before anything is removed, so `koto status` can answer for the
+        // session once it is gone. A record that can't be written warns and
+        // the removal goes on.
+        write_finished_record(
+            backend,
+            &crate::session::finished::FinishedRecord {
+                v: crate::session::finished::RECORD_VERSION,
+                name: name.to_string(),
+                session_id: Some(header.session_id.clone()).filter(|id| !id.is_empty()),
+                execution_dir: header.execution_dir.clone(),
+                state: final_state.to_string(),
+                status: crate::session::finished::STATUS_TERMINAL.to_string(),
+                failure: compiled.states.get(final_state).is_some_and(|s| s.failure),
+                result: serde_json::to_value(result).ok(),
+                truncated: false,
+                finished_at: crate::engine::types::now_iso8601(),
+                removed_by: crate::session::finished::REMOVED_BY_TERMINAL.to_string(),
+            },
+        );
+        #[cfg(test)]
+        finished_record_hooks::before_removal(name);
         // A parent koto removes takes its kept terminal descendants with it.
-        workspace::sweep_if_parent(backend, name, compiled);
+        workspace::sweep_if_parent(backend, context_store, name, compiled);
         if let Err(e) = backend.cleanup(name) {
             eprintln!("warning: session cleanup failed: {}", e);
+            // The session stays, so its record must not answer for it later.
+            forget_finished_record(backend, name);
         }
+    }
+}
+
+/// Write the finished record of a session koto is about to remove, beside
+/// the store's sessions. A failure warns and is otherwise ignored: the record
+/// is a convenience for `koto status`, never a reason to keep a session.
+#[cfg(unix)]
+pub(crate) fn write_finished_record(
+    backend: &dyn SessionBackend,
+    record: &crate::session::finished::FinishedRecord,
+) {
+    let session_dir = backend.session_dir(&record.name);
+    let Some(base) = crate::session::finished::base_of(&session_dir) else {
+        return;
+    };
+    if let Err(e) = crate::session::finished::write(base, record) {
+        eprintln!(
+            "warning: could not write the finished record for {}: {:#}",
+            record.name, e
+        );
+    }
+}
+
+/// Delete the finished record under `name`, so it doesn't answer for the
+/// name as removed by koto: after a removal that failed (the session stays),
+/// or after a person's removal of a session a crash left a record beside.
+#[cfg(unix)]
+pub(crate) fn forget_finished_record(backend: &dyn SessionBackend, name: &str) {
+    let session_dir = backend.session_dir(name);
+    if let Some(base) = crate::session::finished::base_of(&session_dir) {
+        if let Err(e) = crate::session::finished::remove(base, name) {
+            eprintln!("warning: could not remove the finished record for {name}: {e:#}");
+        }
+    }
+}
+
+/// The finished record of a kept child a parent is about to remove: the
+/// result its log records for this arrival, else the one `koto status`
+/// resolves read-only. A cancelled child has no result and stands in the
+/// state it was cancelled in. `None` when the child can't be read now (the
+/// sweep checked it was terminal just before), in which case the sweep
+/// removes it without a record and `koto status` answers `not found`.
+#[cfg(unix)]
+pub(crate) fn finished_record_for_child(
+    backend: &dyn SessionBackend,
+    context_store: &dyn ContextStore,
+    name: &str,
+) -> Option<crate::session::finished::FinishedRecord> {
+    use crate::session::finished::{
+        FinishedRecord, RECORD_VERSION, REMOVED_BY_PARENT, STATUS_CANCELLED, STATUS_TERMINAL,
+    };
+
+    let (header, events) = backend.read_events(name).ok()?;
+    let base = |state: String, status: &str, failure: bool, result| FinishedRecord {
+        v: RECORD_VERSION,
+        name: name.to_string(),
+        session_id: Some(header.session_id.clone()).filter(|id| !id.is_empty()),
+        execution_dir: header.execution_dir.clone(),
+        state,
+        status: status.to_string(),
+        failure,
+        result,
+        truncated: false,
+        finished_at: crate::engine::types::now_iso8601(),
+        removed_by: REMOVED_BY_PARENT.to_string(),
+    };
+    // The sweep treats any cancel as terminal, so the record does too.
+    let cancelled_in = events.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::WorkflowCancelled { state, .. } => Some(state.clone()),
+        _ => None,
+    });
+    if let Some(state) = cancelled_in {
+        return Some(base(state, STATUS_CANCELLED, false, None));
+    }
+    let machine = derive_machine_state(&header, &events, &backend.session_dir(name))?;
+    let compiled: CompiledTemplate =
+        serde_json::from_slice(&std::fs::read(&machine.template_path).ok()?).ok()?;
+    let final_state = machine.current_state;
+    let failure = compiled.states.get(&final_state).is_some_and(|s| s.failure);
+    let result = crate::engine::terminal_result::recorded_result_for_current_arrival(&events)
+        .unwrap_or_else(|| {
+            resolve_terminal_result(
+                backend,
+                context_store,
+                name,
+                &compiled,
+                &final_state,
+                &events,
+            )
+        });
+    Some(base(
+        final_state,
+        STATUS_TERMINAL,
+        failure,
+        serde_json::to_value(&result).ok(),
+    ))
+}
+
+/// A hook a test sets to look at the store between the finished record's
+/// write and the session's removal.
+#[cfg(test)]
+pub(crate) mod finished_record_hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn Fn(&str)>;
+
+    thread_local! {
+        static BEFORE_REMOVAL: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set_before_removal(hook: Option<Hook>) {
+        BEFORE_REMOVAL.with(|h| *h.borrow_mut() = hook);
+    }
+
+    pub(crate) fn before_removal(name: &str) {
+        BEFORE_REMOVAL.with(|h| {
+            if let Some(hook) = h.borrow().as_ref() {
+                hook(name);
+            }
+        });
     }
 }
 
@@ -5082,6 +5346,7 @@ fn handle_next(
                         );
                     }
                 }
+                journal_response(journal_root, backend, &name, &resp);
                 // Deliver the result, then clean up unless the session is kept.
                 if let (
                     next_types::NextResponse::Terminal {
@@ -5092,6 +5357,7 @@ fn handle_next(
                 {
                     finish_terminal_tick(
                         backend,
+                        context_store,
                         journal_root,
                         &name,
                         &header,
@@ -6669,6 +6935,7 @@ fn handle_next(
                     );
                 }
             }
+            journal_response(journal_root, backend, &name, &resp);
             // Deliver the result, then clean up unless the session is kept.
             if let (
                 NextResponse::Terminal {
@@ -6679,6 +6946,7 @@ fn handle_next(
             {
                 finish_terminal_tick(
                     backend,
+                    context_store,
                     journal_root,
                     &name,
                     &header,
@@ -6705,6 +6973,30 @@ fn handle_next(
             let json = serde_json::json!({"error": err});
             exit_with_error_code(json, err.code.exit_code());
         }
+    }
+}
+
+/// Journal a `koto next` response that has just been printed: one
+/// `response` record when it carries a directive, nothing for a terminal or
+/// an error. Called after the `instructions_delivered` append, so the
+/// record's `koto.seq` covers it. See `crate::run_journal::response`.
+#[cfg(unix)]
+fn journal_response(
+    journal_root: Option<&Path>,
+    backend: &dyn SessionBackend,
+    name: &str,
+    resp: &next_types::NextResponse,
+) {
+    if let Some((state, directive, details)) = resp.directive_parts() {
+        crate::run_journal::response(
+            journal_root,
+            backend,
+            name,
+            state,
+            crate::run_journal::ResponseSource::Next,
+            directive,
+            details,
+        );
     }
 }
 
@@ -7047,6 +7339,41 @@ fn handle_decisions_list(backend: &dyn SessionBackend, name: String) -> Result<(
 /// existing `&Backend` parameter for the same reason.
 fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     if !backend.exists(name) {
+        // A session koto removed itself left a finished record: answer from
+        // it, with the fields a kept terminal session's answer uses meaning
+        // the same, and `removed: true`.
+        let session_dir = backend.session_dir(name);
+        let record = crate::session::finished::base_of(&session_dir)
+            .map(|base| crate::session::finished::read(base, name));
+        match record {
+            Some(Ok(Some(record))) => {
+                let mut response = serde_json::json!({
+                    "name": name,
+                    "current_state": record.state,
+                    "is_terminal": true,
+                    "result": record.result,
+                    "removed": true,
+                    "finished_at": record.finished_at,
+                    "session_id": record.session_id,
+                    "execution_dir": record.execution_dir,
+                });
+                // A kept cancelled session's answer reads its state from the
+                // log; a record has no log, so it says it was cancelled.
+                // `result.status` is the result's own outcome.
+                if record.status == crate::session::finished::STATUS_CANCELLED {
+                    response["status"] = serde_json::json!(record.status);
+                }
+                if record.truncated {
+                    response["result_truncated"] = serde_json::json!(true);
+                }
+                println!("{}", serde_json::to_string(&response)?);
+                return Ok(());
+            }
+            Some(Err(e)) => {
+                eprintln!("warning: the finished record for '{name}' can't be read: {e:#}");
+            }
+            _ => {}
+        }
         exit_with_error_code(
             serde_json::json!({
                 "error": format!("workflow '{}' not found", name),
@@ -7154,10 +7481,13 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     // additionally absent when the phase declares none. Neither absence
     // is an error.
     //
-    // This retrieval always returns the full instructions regardless of
-    // the delivery rule `koto next` applies (PRD R10), and it appends
-    // nothing: no delivery record, no other event, and no lock is taken
-    // anywhere in this function.
+    // This retrieval always returns the full instructions, whether or not
+    // `koto next` has already delivered them in this visit, and it appends
+    // nothing to the session: no delivery record, no other event, and no
+    // session lock is taken anywhere in this function. The one thing it
+    // writes is the run journal's `response` record at the end, which waits
+    // only briefly for the journal's lock and never touches the session's
+    // files (see `crate::run_journal::response`).
     if let Some(state) = current_template_state {
         if !state.terminal {
             // Re-validates values as defense in depth, mirroring
@@ -7275,6 +7605,21 @@ fn handle_status(backend: &Backend, name: &str) -> Result<()> {
     }
 
     println!("{}", serde_json::to_string(&response)?);
+    // A printed directive (present only for a non-terminal state) is
+    // journaled as a `response`, the only write this command makes; a
+    // terminal's status prints none and writes nothing. See
+    // `crate::run_journal::response`.
+    if let Some(directive) = response.get("directive").and_then(|d| d.as_str()) {
+        crate::run_journal::response(
+            backend.journal_root(),
+            backend,
+            name,
+            &machine_state.current_state,
+            crate::run_journal::ResponseSource::Status,
+            directive,
+            response.get("details").and_then(|d| d.as_str()),
+        );
+    }
     Ok(())
 }
 
@@ -7677,7 +8022,13 @@ fn handle_cancel(backend: &dyn SessionBackend, name: &str, cleanup: bool) -> Res
     // them so the caller has the same visibility regardless of --cleanup.
     let cleaned = if cleanup {
         match backend.cleanup(name) {
-            Ok(()) => true,
+            Ok(()) => {
+                // As for `koto session cleanup`: a person's removal leaves no
+                // finished record, including one a crash left behind.
+                #[cfg(unix)]
+                forget_finished_record(backend, name);
+                true
+            }
             Err(e) => {
                 // The cancel event is already persisted; surface the
                 // cleanup failure without rolling back.
@@ -9502,5 +9853,139 @@ Done.
             check_execution_anchor(header.execution_dir.as_deref(), checkout.path()),
             ExecutionAnchorCheck::Satisfied { anchor }
         );
+    }
+
+    /// Points `$HOME` at a scratch directory for one test and restores it,
+    /// so the terminal tick's writes under `$HOME/.koto` (the terminal index)
+    /// land there. Env mutation is process-global; CI runs
+    /// `--test-threads=1` (a parallel local run can race another test that
+    /// reads `$HOME`), as the workflows surface tests that do the same
+    /// rely on.
+    #[cfg(unix)]
+    struct ScratchHome {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl ScratchHome {
+        fn set(path: &Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", path);
+            ScratchHome { prev }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ScratchHome {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_finished_record_is_written_after_the_journal_and_before_the_removal() {
+        use crate::session::local::LocalBackend;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = ScratchHome::set(&tmp.path().join("home"));
+        let md = tmp.path().join("t.md");
+        std::fs::write(
+            &md,
+            "---\nname: order\nversion: \"1.0\"\ninitial_state: start\nstates:\n  start:\n    \
+             transitions:\n      - target: done\n  done:\n    terminal: true\n---\n\n## start\n\n\
+             Start.\n\n## done\n\nDone.\n",
+        )
+        .unwrap();
+        let compiled = crate::template::compile::compile(&md, false).unwrap();
+        let compiled_path = tmp.path().join("t.json");
+        std::fs::write(&compiled_path, serde_json::to_vec(&compiled).unwrap()).unwrap();
+
+        let base = tmp.path().join("sessions");
+        let journal = tmp.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let backend = LocalBackend::with_base_dir_and_journal(base.clone(), journal.clone());
+        let header: crate::engine::types::StateFileHeader =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "workflow": "order",
+                "template_hash": "h",
+                "created_at": "2026-10-12T00:00:00.000Z",
+                "session_id": "id-order",
+                "execution_dir": "/work/project",
+            }))
+            .unwrap();
+        let events: Vec<Event> = serde_json::from_value(serde_json::json!([
+            {"seq": 1, "timestamp": "2026-10-12T00:00:00.000Z", "type": "workflow_initialized",
+             "payload": {"template_path": compiled_path, "variables": {}}},
+            {"seq": 2, "timestamp": "2026-10-12T00:00:00.000Z", "type": "transitioned",
+             "payload": {"from": null, "to": "start", "condition_type": "auto"}},
+            {"seq": 3, "timestamp": "2026-10-12T00:00:01.000Z", "type": "transitioned",
+             "payload": {"from": "start", "to": "done", "condition_type": "auto"}},
+        ]))
+        .unwrap();
+        backend
+            .init_state_file("order", header.clone(), events)
+            .unwrap();
+
+        // What the store held at the hook, between the record and the removal.
+        let seen: Rc<RefCell<Option<(bool, bool, bool)>>> = Rc::new(RefCell::new(None));
+        let probe = Rc::clone(&seen);
+        let base_at_hook = base.clone();
+        let journal_at_hook = journal.clone();
+        finished_record_hooks::set_before_removal(Some(Box::new(move |name| {
+            let record = base_at_hook
+                .join(".finished")
+                .join(format!("{name}.json"))
+                .is_file();
+            let session = base_at_hook.join(name).is_dir();
+            let terminal_journaled =
+                std::fs::read_to_string(journal_at_hook.join("_run_journal.jsonl"))
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|l| l.contains("\"terminal\"") && l.contains("\"order\""));
+            *probe.borrow_mut() = Some((record, session, terminal_journaled));
+        })));
+
+        let record = TerminalRecord {
+            result: crate::engine::types::WorkflowResult {
+                status: crate::engine::types::TerminalOutcome::Success,
+                summary: "completed at done".to_string(),
+                payload: None,
+            },
+            failure_reason: None,
+            already_recorded: false,
+        };
+        finish_terminal_tick(
+            &backend,
+            &backend,
+            Some(&journal),
+            "order",
+            &header,
+            &compiled,
+            "done",
+            None,
+            &record,
+        );
+        finished_record_hooks::set_before_removal(None);
+
+        assert_eq!(
+            *seen.borrow(),
+            Some((true, true, true)),
+            "at the hook: (record written, session still there, terminal journaled)"
+        );
+        assert!(!base.join("order").exists(), "the session was removed");
+        let written = crate::session::finished::read(&base, "order")
+            .unwrap()
+            .unwrap();
+        assert_eq!(written.state, "done");
+        assert_eq!(written.removed_by, "terminal");
+        assert_eq!(written.session_id.as_deref(), Some("id-order"));
+        assert_eq!(written.result.unwrap()["summary"], "completed at done");
     }
 }

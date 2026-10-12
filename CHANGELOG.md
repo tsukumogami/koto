@@ -10,6 +10,62 @@ to `0.9.x`).
 
 ### Added
 
+- **The run journal records check evaluations.** Each gate evaluation and
+  default-action run a session commits now adds a `check_evaluated` line to
+  `~/.koto/_run_journal.jsonl`, with the check's outcome, attempt numbers,
+  rule count and run time, followed by one `check_rule` line per error rule
+  with the rule's visit and session counts. A polling gate that is still
+  pending adds a `check_pending` line instead. Every check line carries
+  `koto.seq`, the relayed event's sequence number in the session's log, and
+  `koto.visit.seq`, the sequence number of the entry that opened its visit.
+  A rule id outside the journal's name shape is written as `sha256:` and 32
+  hex characters of its digest. The lines carry no check output, finding
+  text, path or command. Unlike the identity records, check lines aren't
+  flushed to disk on their own, so an operating-system crash can lose the
+  ones written since the session's last state entry; a process crash loses
+  none. `docs/reference/run-journal.md` documents the three kinds.
+
+- **The run journal records decider calls and overrides.** Each decider
+  consultation a session commits adds a `decider_consulted` line (provider,
+  model, outcome, token counts, latency), each graded decider-check
+  criterion a `decider_checked` line (the gate, the criterion's id, mode,
+  outcome, reason, whether it blocked, tokens, attempts, latency), and each
+  `koto overrides record` a `check_overridden` line naming the state and
+  gate. They carry `koto.seq` and `koto.visit.seq` like check lines, so an
+  override can be joined to the evaluation it moved past and decider tokens
+  summed per model from the journal alone. A verdict koto reuses writes
+  nothing. No line holds a probability, hash, threshold, endpoint, rule
+  reference, rationale or override value.
+
+- **The run journal records the context keys each state visit read.** When
+  a visit ends (an arrival elsewhere, a rewind, a cancel, or a terminal's
+  result), the journal gets one `context_reads` line per distinct key,
+  reader and access the visit read, in first-read order, with the read
+  count, how many reads found the key, and the first and last content
+  hashes. A visit writes at most 51 such lines: past 50 tuples, one
+  overflow line sums the rest. The lines come right before the
+  `state_entered`, `cancelled` or `terminal` that ends the visit, carry
+  `koto.seq` and `koto.visit.seq`, and never hold a context value, though
+  the key's name and the content's unsalted SHA-256 can reveal what a
+  session read, so the lines are host-local data to forward with care. A
+  key, reader or access outside the journal's name shape is written as its
+  digest. Reads made after a visit's terminal or cancel, and reads carried
+  in by `koto session import`, aren't journaled.
+
+- **The run journal records the size of each printed directive.** When
+  `koto next` or `koto status` prints a non-terminal state's directive, koto
+  now adds a `response` line with the state, the command (`next` or
+  `status`), and the UTF-8 byte lengths of the printed `directive` and
+  `details` (0 when the details were left out), never the text. Like check
+  lines, it carries `koto.seq`, here the highest sequence number in the
+  session's log when it was written, and `koto.visit.seq`, so a reader can
+  sum the instruction bytes an agent received per visit. A chained tick
+  writes one line, for the state it stopped in; terminal ticks, errors and
+  refusals write none. The `instructions_delivered` event is unchanged.
+  Writing the line never holds up `koto status`: it waits at most a few
+  tens of milliseconds for the journal's lock and otherwise skips the line
+  with the usual one warning, and it writes nothing else.
+
 - **A session waiting on a request leg is woken when the leg changes.** Every
   write that records a leg's result (a promoted worker result, `koto request
   resolve`, or a refusal `koto init --koto-leg` records), abandons a leg or a
@@ -202,6 +258,20 @@ to `0.9.x`).
 
 ### Changed
 
+- **`koto status` answers for a session koto removed.** koto removes a
+  session at its success terminal (unless the tick passed `--no-cleanup`),
+  and a parent removes its kept terminal children. Before either removal
+  koto now writes a finished record to `.finished/<name>.json` under the
+  sessions directory, and `koto status` on that name exits 0 with
+  `removed: true`, `current_state`, `is_terminal: true`, `result`,
+  `finished_at`, `session_id` and `execution_dir`, where it used to exit 2
+  with `not found`. A caller that read exit 2 as "the run is gone" should
+  read `removed: true` instead. `not found` now means no session and no
+  record: the name never existed, a person removed it with
+  `koto session cleanup` or `koto cancel --cleanup`, or `koto session
+  prune` removed its record. Creating a session under the name, or a rewind
+  moving a child session to it, deletes the record.
+
 - **Gates and default actions run in an environment fixed when the session
   is created (koto#261).** Until now every command gate and default action
   ran as `sh -c` with the whole environment of whatever process called `koto
@@ -284,6 +354,23 @@ to `0.9.x`).
   `LoggingWaker` is removed.
 
 ### Fixed
+
+- **A held run-journal lock can no longer hang a koto command (koto#354).**
+  Run-journal writes waited for the journal's lock with no limit, so a
+  process that stopped while holding it left every later `koto next`
+  stuck after printing its directive, never reaching its exit. Every
+  journal write now waits at most five seconds for the lock (`koto status`
+  keeps its 30 milliseconds), then skips that write's records with the
+  usual one warning and carries on: the command's output, exit code and
+  everything it does afterwards, a terminal tick's cleanup included, are
+  unchanged. Once one write has given up, later writes try the lock once
+  without waiting until one takes it again, so a held lock costs a
+  command one wait, not one per write, and a long-running command
+  recovers once the holder lets go. The wait isn't configurable and
+  covers only taking the lock: a rotation that is slow while holding it
+  still finishes, the writers behind it are the ones that give up, and the
+  rotating writer gets a full wait of its own for the fresh file. A
+  write's records still go to one file whole. `docs/reference/run-journal.md` describes the wait.
 
 - **A failed batch offers its retry after the parent leaves the batching
   state (koto#277).** `reserved_actions` was built only from the batch

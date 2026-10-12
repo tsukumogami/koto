@@ -21,6 +21,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session dir` | Runner — primary |
 | `koto session list` | Runner — primary |
 | `koto session cleanup` | Runner — primary |
+| `koto session prune` | Runner and operator — removing finished sessions in bulk |
 | `koto session recover` | Operator — one-time migration recovery |
 | `koto session rebind` | Runner — after a checkout moves |
 | `koto session import` | Runner — cloud backend only, after a session moves to another host or workspace |
@@ -317,6 +318,8 @@ Returns read-only state metadata for a workflow. No gates are evaluated, no acti
   "is_terminal": false
 }
 ```
+
+A session koto removed itself (at its success terminal, or with its parent) still answers, exit 0, from the finished record koto wrote before removing it: `current_state`, `is_terminal: true` and `result` mean what they do for a kept terminal session, plus `removed: true`, `finished_at`, `session_id` and `execution_dir`. It has no `template_path`, `template_hash`, `batch` or `leg`, since no session is left to read them from. A child cancelled before its parent removed it also carries `status: "cancelled"` and a null `result`, and a result too large for the record carries `result_truncated: true` with only its `status` and `summary`. `not found` (exit 2) means no session and no record; see `error-handling.md`.
 
 ### Retrieving the current phase's instructions
 
@@ -657,7 +660,7 @@ The path always ends with the session name as the last component. This is the sa
 ## koto session list
 
 ```
-koto session list
+koto session list [--state] [--execution-dir <dir>]
 ```
 
 Lists all sessions as a JSON array, sorted alphabetically by `id`.
@@ -668,12 +671,17 @@ Lists all sessions as a JSON array, sorted alphabetically by `id`.
   {
     "id": "my-workflow",
     "created_at": "2026-01-15T10:30:00Z",
-    "template_hash": "abc123..."
+    "template_hash": "abc123...",
+    "execution_dir": "/work/repo",
+    "session_id": "<session-id>"
   }
 ]
 ```
 
 Note: this command uses `id` where `koto workflows` uses `name`. Both refer to the same session identifier. Returns `[]` when no sessions exist.
+
+- `--state` adds `state`, `status` (`running`, `terminal`, `cancelled` or `unreadable`), `failure` and `finished_at` to each row.
+- `--execution-dir <dir>` keeps only sessions whose `execution_dir` is `<dir>` or lies under it (whole path components, so `/work/a` doesn't match `/work/ab`), implies `--state`, and prints `{"sessions": [...], "excluded_remote_only": N}`. Use it to find the sessions a piece of work left in a directory and which of them are finished.
 
 ---
 
@@ -685,7 +693,31 @@ koto session cleanup <name>
 
 Removes the entire session directory for the named workflow. Idempotent — succeeds even if the session does not exist. Produces no stdout output.
 
-`koto next` removes a session at its terminal state unless the terminal is declared `failure: true` or the tick passed `--no-cleanup` (the response's `retention` field says which). Use this command to remove a kept session once its record is no longer needed, or after an abandoned workflow. It removes only the named session: a kept parent's kept children are left, listed by `koto workflows --orphaned`. A parent koto removes at its own terminal, or replaces with `koto init --attach-live --replace-terminal`, takes its terminal descendants with it, and `koto workspace prune --root` removes a finished tree.
+`koto next` removes a session at its terminal state unless the terminal is declared `failure: true` or the tick passed `--no-cleanup` (the response's `retention` field says which). Use this command to remove a kept session once its record is no longer needed, or after an abandoned workflow. It removes only the named session: a kept parent's kept children are left, listed by `koto workflows --orphaned`. A parent koto removes at its own terminal, or replaces with `koto init --attach-live --replace-terminal`, takes its terminal descendants with it, and `koto workspace prune --root` removes a finished tree. To remove many finished sessions at once, use `koto session prune`.
+
+---
+
+## koto session prune
+
+```
+koto session prune [--execution-dir <dir>] [--older-than <age>] [--all]
+koto session prune --apply --plan <token>
+koto session prune --apply (--execution-dir <dir> | --older-than <age> | --all)
+koto session prune --migrated-from <workspace> [--source-retired] [--apply [--plan <token>]]
+```
+
+Previews, then removes, finished sessions as a set. Without `--apply` it removes nothing and prints `{"mode": "preview", "plan": "<token>", "remove": [...], "kept": [...]}`: the finished sessions it would remove (the `session list --state` fields plus `kind`), and every session it keeps with a `rule` letter and a `detail`. `--older-than` takes a whole number and `s`, `m`, `h` or `d`.
+
+A session is kept when it is running or unreadable (`a`), a running or unreadable session references it by `parent_workflow` or the `chain/parent` context key, or any session's header can't be read, since that session could name any other as its parent (`b`), it references one (`c`), its `chain/parent` isn't exactly one session name (`d`), it is bound to a request leg still waiting or unreadable (`e`), its name starts with `coordinate-` (`f`), or, under the cloud backend, its remote copy may be newer (`g`). A session outside the filters still protects what it references.
+
+- `--apply --plan <token>` removes exactly what that preview listed, using the filters the preview ran with (don't pass them again). If the set changed, it removes nothing and exits 4 with `prune_plan_stale` and `added`/`dropped` lists; a token with no stored plan exits 4 with `prune_plan_unknown`.
+- `--apply` without `--plan` removes the set as it stands now, and needs `--execution-dir`, `--older-than` or `--all`.
+- Apply prints `{"mode": "apply", "removed": [...], "skipped": [...], "kept": [...], "failed": [...]}`. A session another koto process holds, or one that changed since it was judged, is `skipped` (exit 0). A removal that failed is listed under `failed` and the command exits 3.
+- A malformed token or age, `--plan` without `--apply` or with a filter, or a bare `--apply` exits 2 with `invalid_arguments`.
+
+Clean up after your own work with `koto session prune --execution-dir <your directory>`, read the preview, then apply its token.
+
+`--migrated-from <workspace>` (cloud backend only; exit 2 otherwise, and with any of `--execution-dir`, `--older-than` or `--all`) works on the migration markers `koto session import` left under that old workspace's bucket prefix instead. Each marker is listed with its `target`, `age_days`, `target_status` (`present`, `replaced`, `migrated`, `absent`, `unverified`, `unknown`), `removable`, `reason` and `objects` (what its removal deletes). `present` needs the target's whole log to read cleanly and begin with every event of the old copy's log; a truncated, shorter or differing one is `unverified`. Only a `present` target's marker is removable, once it is `session.cloud.marker_retain_days` old (default 30) or with `--source-retired`; removal deletes the old copy and the marker last, and a failed delete exits 3 with the marker still refusing. Apply a preview with `--migrated-from <same workspace> --apply --plan <token>` (no `--source-retired`; the plan recorded it). Remove the old host's local copy first (`koto session cleanup <name>` there): once the marker is gone, nothing refuses it, and its next sync pushes it back.
 
 ---
 
@@ -1025,7 +1057,7 @@ koto config list                 # Print merged config as TOML
 koto config list --json          # Print merged config as JSON
 ```
 
-Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `session.cloud.path_style`, `workflows.native`, `decider.mode`, `decider.api_key`, `decider.endpoint`, `decider.timeout_ms`.
+Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `session.cloud.path_style`, `session.cloud.marker_retain_days`, `workflows.native`, `decider.mode`, `decider.api_key`, `decider.endpoint`, `decider.timeout_ms`.
 
 `session.cloud.path_style` takes `true` or `false` (unset means `false`). `true` puts the bucket in the URL path instead of a subdomain, which an endpoint given as an IP address needs.
 

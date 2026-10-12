@@ -161,12 +161,15 @@ impl SessionBackend for LocalBackend {
                 Ok(header) => {
                     // Compute from the header already in memory -- no new I/O.
                     let template_source_status = check_template_source_dir(&header);
+                    let session_id = (!header.session_id.is_empty()).then_some(header.session_id);
                     results.push(SessionInfo {
                         id: dir_name,
                         created_at: header.created_at,
                         template_hash: header.template_hash,
                         parent_workflow: header.parent_workflow,
                         template_source_status,
+                        execution_dir: header.execution_dir,
+                        session_id,
                     });
                 }
                 Err(_) => {
@@ -235,10 +238,11 @@ impl SessionBackend for LocalBackend {
         timestamp: &str,
     ) -> anyhow::Result<()> {
         let path = self.base_dir.join(id).join(state_file_name(id));
-        persistence::append_event(&path, payload, timestamp)?;
+        let commit = persistence::append_event_tracked(&path, payload, timestamp)?;
         // Journal the committed payload (best-effort, after the commit, so a
-        // failed append above never writes a record). See `crate::run_journal`.
-        crate::run_journal::after_commit(self.journal_root(), self, id, payload);
+        // failed append above never writes a record), with the seq it took
+        // and the log it was appended to. See `crate::run_journal`.
+        crate::run_journal::after_commit(self.journal_root(), self, id, payload, &commit);
         // Materialize the native Claude Code `/workflows` artifact off the one
         // commit funnel (opt-in, best-effort: never fails the commit). `self`
         // is both the SessionBackend (header chain) and the ContextStore
@@ -348,6 +352,12 @@ impl SessionBackend for LocalBackend {
                     &header,
                     &initial_events,
                 );
+                // A finished record left by an earlier session of this name
+                // describes a run that this one replaces; `koto status` must
+                // answer for the new session, so the record goes.
+                if let Err(e) = crate::session::finished::remove(&self.base_dir, id) {
+                    eprintln!("warning: could not remove the finished record for {id}: {e:#}");
+                }
                 Ok(())
             }
             Err(e) => {
@@ -392,6 +402,14 @@ impl SessionBackend for LocalBackend {
         // directory and rewrite the header's identity fields.
         rename_state_file(&to_dir, from, to)?;
         rewrite_header_identity(&to_dir, to)?;
+
+        // A live session now holds `to`, so a finished record left under that
+        // name must not answer for it once it is removed later; `init_state_file`
+        // makes the same removal for a new session. The session moved here is
+        // live, so it has no record of its own to carry along.
+        if let Err(e) = crate::session::finished::remove(&self.base_dir, to) {
+            eprintln!("warning: could not remove the finished record for {to}: {e:#}");
+        }
 
         Ok(())
     }
@@ -2400,6 +2418,37 @@ mod tests {
             respawn_generation: None,
         };
         persistence::append_header(&state_path, &header).unwrap();
+    }
+
+    #[test]
+    fn relocate_clears_a_finished_record_under_the_target_name() {
+        let tmp = TempDir::new().unwrap();
+        let backend = test_backend(tmp.path());
+        write_state_file_with_parent(tmp.path(), "parent.task-a", Some("parent"));
+        let stale = crate::session::finished::FinishedRecord {
+            v: crate::session::finished::RECORD_VERSION,
+            name: "parent~1.task-a".to_string(),
+            session_id: Some("id-old".to_string()),
+            execution_dir: None,
+            state: "done".to_string(),
+            status: crate::session::finished::STATUS_TERMINAL.to_string(),
+            failure: false,
+            result: None,
+            truncated: false,
+            finished_at: "2026-10-12T00:00:00.000Z".to_string(),
+            removed_by: crate::session::finished::REMOVED_BY_TERMINAL.to_string(),
+        };
+        crate::session::finished::write(tmp.path(), &stale).unwrap();
+
+        backend
+            .relocate("parent.task-a", "parent~1.task-a")
+            .unwrap();
+
+        assert!(
+            crate::session::finished::read(tmp.path(), "parent~1.task-a")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

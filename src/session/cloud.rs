@@ -28,7 +28,10 @@ use crate::session::{
 };
 
 /// File name of the marker `koto session import` leaves beside a source
-/// session's remote objects. koto never deletes one.
+/// session's remote objects. Only `koto session prune --migrated-from`
+/// deletes one, together with everything else under the source session's
+/// prefix and only after the rest is gone (see
+/// [`CloudBackend::delete_migrated_source`]).
 pub(crate) const MIGRATED_MARKER: &str = "migrated.json";
 
 /// File name of the compiled template a cloud session's init pushes beside
@@ -63,6 +66,80 @@ pub enum ChildResolution {
         /// reconciled.
         message: String,
     },
+}
+
+/// What [`CloudBackend::remote_copy_check`] found in the bucket's copy of a
+/// session, set against the local one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteCopy {
+    /// No remote copy, or one that is no newer than the local copy.
+    Safe,
+    /// The remote copy is ahead of the local one or diverged from it; the
+    /// string says which.
+    NotSafe(String),
+    /// The check couldn't be made: the listing failed, the local log or a
+    /// version file couldn't be read, or a version file didn't parse. The
+    /// string says which.
+    Unreadable(String),
+}
+
+/// A migrated source copy, as [`CloudBackend::migrated_source_copy`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCopy {
+    /// The objects under the copy's prefix, the marker included.
+    pub objects: usize,
+    /// Its log's event lines, verbatim; none when it has no state file.
+    pub events: Vec<String>,
+}
+
+/// What a migration marker's target holds, as
+/// [`CloudBackend::marker_target_status`] finds it in the bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetStatus {
+    /// The target carries a marker of its own: it moved on again.
+    Migrated,
+    /// The target's state file header names the marker's session id, and
+    /// its whole log reads with no error and begins with every event of the
+    /// source's log, unchanged.
+    Present,
+    /// A state file is there, but its header names another session id (a
+    /// later session under the same name).
+    Replaced(String),
+    /// No state file under the target's prefix.
+    Absent,
+    /// The header names the marker's session id, but the copy can't be shown
+    /// complete: the target's log doesn't read to the end, ends before the
+    /// source's, holds a different event at some seq the source's reaches,
+    /// or the source copy can't be listed or its log can't be read. The
+    /// string says which.
+    Unverified(String),
+    /// The listing or the read failed, or the header couldn't be read; the
+    /// string says which.
+    Unknown(String),
+}
+
+impl TargetStatus {
+    /// The word the prune prints for this status.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TargetStatus::Migrated => "migrated",
+            TargetStatus::Present => "present",
+            TargetStatus::Replaced(_) => "replaced",
+            TargetStatus::Absent => "absent",
+            TargetStatus::Unverified(_) => "unverified",
+            TargetStatus::Unknown(_) => "unknown",
+        }
+    }
+}
+
+/// Whether `prefix` has the shape of a workspace prefix koto derives: 16
+/// lowercase hex digits. A marker's `target.prefix` comes from the bucket,
+/// so it is checked before any key is built from it.
+pub(crate) fn is_workspace_prefix(prefix: &str) -> bool {
+    prefix.len() == 16
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// S3-backed session storage that delegates to `LocalBackend` for all
@@ -373,6 +450,382 @@ impl CloudBackend {
                 );
             }
         }
+    }
+
+    /// [`CloudBackend::sync_delete_session`] for a caller that must know
+    /// whether the remote copy is gone: every object under the session's
+    /// prefix except its migration marker is deleted, and the first failure
+    /// (the listing, or any delete) is returned after the rest were tried.
+    /// `koto session prune` removes the local copy only after this succeeds,
+    /// so a failure leaves something a later prune can retry.
+    pub fn delete_remote_session_checked(&self, id: &str) -> anyhow::Result<()> {
+        let prefix = self.session_prefix(id);
+        let results = self.bucket.list(prefix.clone(), None).map_err(|e| {
+            anyhow::anyhow!(
+                "listing {} failed: {}",
+                prefix,
+                without_url_userinfo(&e.to_string())
+            )
+        })?;
+        let mut first: Option<anyhow::Error> = None;
+        for list in &results {
+            for obj in &list.contents {
+                if is_migration_marker(&prefix, &obj.key) {
+                    continue;
+                }
+                if let Err(e) = self.bucket.delete_object(&obj.key) {
+                    first.get_or_insert_with(|| {
+                        anyhow::anyhow!(
+                            "deleting {} failed: {}",
+                            obj.key,
+                            without_url_userinfo(&e.to_string())
+                        )
+                    });
+                }
+            }
+        }
+        match first {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the bucket's copy of session `id` may hold anything its local
+    /// copy doesn't. One listing of the session's prefix answers two
+    /// questions. A remote state log longer than the local one has events
+    /// this host never saw (another host advanced or rewound the session).
+    /// And the two `version.json` files, compared with
+    /// [`crate::session::version::check_sync`], show a context write this
+    /// host never saw. A remote copy with neither is no newer than the local
+    /// one. Anything that can't be read, or a remote version the local copy
+    /// has nothing to compare with, can't be shown to be no newer, so it
+    /// isn't `Safe`.
+    pub fn remote_copy_check(&self, id: &str) -> RemoteCopy {
+        use crate::session::version::{check_sync, SessionVersion, SyncCheck};
+
+        let prefix = self.session_prefix(id);
+        let listing = match self.bucket.list(prefix.clone(), None) {
+            Ok(listing) => listing,
+            Err(e) => {
+                return RemoteCopy::Unreadable(format!(
+                    "listing {} failed: {}",
+                    prefix,
+                    without_url_userinfo(&e.to_string())
+                ))
+            }
+        };
+        let size_of = |key: &str| {
+            listing
+                .iter()
+                .flat_map(|page| page.contents.iter())
+                .find(|obj| obj.key == key)
+                .map(|obj| obj.size)
+        };
+
+        if let Some(remote_len) = size_of(&self.state_key(id)) {
+            let local_path = self.local.session_dir(id).join(state_file_name(id));
+            let local_len = match std::fs::metadata(&local_path) {
+                Ok(meta) => meta.len(),
+                Err(e) => {
+                    return RemoteCopy::Unreadable(format!("the local log can't be read: {e}"))
+                }
+            };
+            if remote_len > local_len {
+                return RemoteCopy::NotSafe(format!(
+                    "the remote log is ahead ({remote_len} bytes against {local_len} here)"
+                ));
+            }
+        }
+
+        let version_key = self.version_key(id);
+        if size_of(&version_key).is_none() {
+            return RemoteCopy::Safe;
+        }
+        let remote = match self.fetch_object(&version_key) {
+            // Removed between the listing and the GET.
+            Ok(None) => return RemoteCopy::Safe,
+            Ok(Some(bytes)) => match serde_json::from_slice::<SessionVersion>(&bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    return RemoteCopy::Unreadable(format!(
+                        "the remote version.json doesn't parse: {e}"
+                    ))
+                }
+            },
+            Err(e) => {
+                return RemoteCopy::Unreadable(without_url_userinfo(&format!("{e:#}")));
+            }
+        };
+        let local = match SessionVersion::load(&self.local_version_path(id)) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return RemoteCopy::NotSafe(
+                    "the remote copy has a version and the local copy has none".to_string(),
+                )
+            }
+            Err(e) => {
+                return RemoteCopy::Unreadable(format!(
+                    "the local version.json can't be read: {e:#}"
+                ))
+            }
+        };
+        match check_sync(&local, Some(&remote)) {
+            SyncCheck::Safe => RemoteCopy::Safe,
+            SyncCheck::RemoteNewer => RemoteCopy::NotSafe(format!(
+                "the remote copy is ahead (version {} against local {})",
+                remote.version, local.version
+            )),
+            SyncCheck::Conflict {
+                local_version,
+                remote_version,
+                ..
+            } => RemoteCopy::NotSafe(format!(
+                "the remote copy diverged (version {remote_version} against local {local_version})"
+            )),
+        }
+    }
+
+    /// The names of the sessions under workspace prefix `source_prefix` that
+    /// carry a migration marker. One paginated listing of `<prefix>/`
+    /// collects exactly the keys `<prefix>/<name>/migrated.json` whose
+    /// `<name>` is a valid session id; a context key named `migrated.json`
+    /// sits deeper and is not one. Sorted.
+    pub(crate) fn migration_marker_names(
+        &self,
+        source_prefix: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let listing_prefix = format!("{}/", source_prefix);
+        let suffix = format!("/{}", MIGRATED_MARKER);
+        let results = self
+            .bucket
+            .list(listing_prefix.clone(), None)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "listing {} failed: {}",
+                    listing_prefix,
+                    without_url_userinfo(&e.to_string())
+                )
+            })?;
+        let mut names = std::collections::BTreeSet::new();
+        for page in &results {
+            for obj in &page.contents {
+                let Some(name) = obj
+                    .key
+                    .strip_prefix(&listing_prefix)
+                    .and_then(|rest| rest.strip_suffix(&suffix))
+                else {
+                    continue;
+                };
+                if crate::session::validate::validate_session_id(name).is_ok() {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    /// GET the migration marker of session `name` under `source_prefix`:
+    /// `Ok(None)` when it is gone.
+    pub(crate) fn read_migration_marker(
+        &self,
+        source_prefix: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        crate::session::validate::validate_session_id(name)?;
+        self.fetch_object(&format!("{}/{}/{}", source_prefix, name, MIGRATED_MARKER))
+            .map_err(|e| anyhow::anyhow!("{}", without_url_userinfo(&format!("{e:#}"))))
+    }
+
+    /// What the bucket holds of the migrated source copy `<source_prefix>/<name>/`:
+    /// how many objects a removal would delete, the marker included, and the
+    /// event lines of its log. The log is read to the end under the import's
+    /// own rule (no unparseable line, a final one included, and no seq gap).
+    /// A copy with no state file left has no events to lose: only a removal
+    /// that stopped part way leaves it so, because the import never deletes
+    /// the source's log and a removal deletes the marker last, and a retry
+    /// must be able to finish. `Err` says why the copy can't be read.
+    pub(crate) fn migrated_source_copy(
+        &self,
+        source_prefix: &str,
+        name: &str,
+    ) -> Result<SourceCopy, String> {
+        crate::session::validate::validate_session_id(name).map_err(|e| format!("{e:#}"))?;
+        let session = format!("{}/{}/", source_prefix, name);
+        let listing = self.bucket.list(session.clone(), None).map_err(|e| {
+            format!(
+                "listing {} failed: {}",
+                session,
+                without_url_userinfo(&e.to_string())
+            )
+        })?;
+        let keys: Vec<&str> = listing
+            .iter()
+            .flat_map(|page| page.contents.iter())
+            .map(|obj| obj.key.as_str())
+            .filter(|key| key.starts_with(&session))
+            .collect();
+        let state_key = format!("{}{}", session, state_file_name(name));
+        let events = if keys.contains(&state_key.as_str()) {
+            match self.fetch_object(&state_key) {
+                Ok(Some(bytes)) => {
+                    parse_source_log(&bytes)
+                        .map_err(|e| format!("the source's log doesn't read to the end: {e}"))?
+                        .event_lines
+                }
+                // Removed between the listing and the GET.
+                Ok(None) => Vec::new(),
+                Err(e) => return Err(without_url_userinfo(&format!("{e:#}"))),
+            }
+        } else {
+            Vec::new()
+        };
+        Ok(SourceCopy {
+            objects: keys.len(),
+            events,
+        })
+    }
+
+    /// What the bucket holds for a marker's target: one listing of
+    /// `<target_prefix>/<target_session>/` (the trailing slash keeps `foo`
+    /// from matching `foo-2`), and a GET of the state file when there is one.
+    /// Its header's `session_id` tells the session apart from a later one
+    /// under the name, and its whole log must then read with no error and
+    /// begin with every event line of `source`, the migrated source copy,
+    /// unchanged (the import carries them verbatim, and the target only
+    /// appends after them) before the target counts as present. A truncated
+    /// or corrupt copy, one behind the source, or one that differs from it
+    /// at any seq is `Unverified`, and so is any target when the source's
+    /// log can't be read (`Err`, saying why).
+    pub(crate) fn marker_target_status(
+        &self,
+        target_prefix: &str,
+        target_session: &str,
+        target_session_id: &str,
+        source: Result<&SourceCopy, &str>,
+    ) -> TargetStatus {
+        if !is_workspace_prefix(target_prefix)
+            || crate::session::validate::validate_session_id(target_session).is_err()
+        {
+            return TargetStatus::Unknown(
+                "the marker's target isn't a workspace prefix and a session name".to_string(),
+            );
+        }
+        let session = format!("{}/{}/", target_prefix, target_session);
+        let listing = match self.bucket.list(session.clone(), None) {
+            Ok(listing) => listing,
+            Err(e) => {
+                return TargetStatus::Unknown(format!(
+                    "listing {} failed: {}",
+                    session,
+                    without_url_userinfo(&e.to_string())
+                ))
+            }
+        };
+        let keys: Vec<&str> = listing
+            .iter()
+            .flat_map(|page| page.contents.iter())
+            .map(|obj| obj.key.as_str())
+            .collect();
+        if keys.iter().any(|k| is_migration_marker(&session, k)) {
+            return TargetStatus::Migrated;
+        }
+        let state_key = format!("{}{}", session, state_file_name(target_session));
+        if !keys.contains(&state_key.as_str()) {
+            return TargetStatus::Absent;
+        }
+        let bytes = match self.fetch_object(&state_key) {
+            Ok(Some(bytes)) => bytes,
+            // Removed between the listing and the GET.
+            Ok(None) => return TargetStatus::Absent,
+            Err(e) => {
+                return TargetStatus::Unknown(without_url_userinfo(&format!("{e:#}")));
+            }
+        };
+        match header_session_id(&bytes) {
+            Some(id) if id == target_session_id => {}
+            Some(id) => return TargetStatus::Replaced(id),
+            None => {
+                return TargetStatus::Unknown(
+                    "the target's state file header doesn't parse or has no session_id".to_string(),
+                )
+            }
+        }
+        let source = match source {
+            Ok(source) => source,
+            Err(why) => {
+                return TargetStatus::Unverified(format!("the source copy can't be read: {why}"))
+            }
+        };
+        let target = match parse_source_log(&bytes) {
+            Ok(log) => log,
+            Err(e) => {
+                return TargetStatus::Unverified(format!(
+                    "the target's log doesn't read to the end: {e}"
+                ))
+            }
+        };
+        // Both logs start at seq 1 with no gap, so index i holds seq i + 1.
+        if target.event_lines.len() < source.events.len() {
+            return TargetStatus::Unverified(format!(
+                "the target's log ends at seq {} and the source's runs to seq {}",
+                target.event_lines.len(),
+                source.events.len()
+            ));
+        }
+        match target
+            .event_lines
+            .iter()
+            .zip(&source.events)
+            .position(|(target, source)| target != source)
+        {
+            Some(i) => TargetStatus::Unverified(format!(
+                "the target's event at seq {} differs from the source's",
+                i + 1
+            )),
+            None => TargetStatus::Present,
+        }
+    }
+
+    /// Delete every object under `<source_prefix>/<name>/`, the migration
+    /// marker last. The first delete that fails stops the removal and is
+    /// returned, so the marker is still there and the old copy still
+    /// refuses; running it again finishes the job.
+    pub(crate) fn delete_migrated_source(
+        &self,
+        source_prefix: &str,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        crate::session::validate::validate_session_id(name)?;
+        let session = format!("{}/{}/", source_prefix, name);
+        let marker = format!("{}{}", session, MIGRATED_MARKER);
+        let results = self.bucket.list(session.clone(), None).map_err(|e| {
+            anyhow::anyhow!(
+                "listing {} failed: {}",
+                session,
+                without_url_userinfo(&e.to_string())
+            )
+        })?;
+        let delete = |key: &str| {
+            self.bucket.delete_object(key).map(|_| ()).map_err(|e| {
+                anyhow::anyhow!(
+                    "deleting {} failed: {}",
+                    key,
+                    without_url_userinfo(&e.to_string())
+                )
+            })
+        };
+        for page in &results {
+            for obj in &page.contents {
+                // The listing's prefix already holds every key under
+                // `session`; the check keeps a key some endpoint returned
+                // anyway from ever reaching a delete.
+                if obj.key == marker || !obj.key.starts_with(&session) {
+                    continue;
+                }
+                delete(&obj.key)?;
+            }
+        }
+        delete(&marker)
     }
 
     /// List session IDs present in S3 under this backend's prefix.
@@ -859,6 +1312,8 @@ fn placeholder_session_info(id: String) -> SessionInfo {
         template_hash: String::new(),
         parent_workflow: None,
         template_source_status: None,
+        execution_dir: None,
+        session_id: None,
     }
 }
 
@@ -1467,6 +1922,10 @@ struct SourceLog {
 /// doesn't parse, or a gap in the sequence numbers. Blank lines are
 /// dropped. The `template_hash` is checked by the caller, after it has
 /// refused a child session, whose hash may legitimately be empty.
+///
+/// The marker prune reads both a migrated source's log and its target's
+/// with it too, so "reads to the end" means the same there as here; the
+/// name and [`SourceLog`] say "source" because the import came first.
 fn parse_source_log(bytes: &[u8]) -> Result<SourceLog, String> {
     use crate::engine::types::{Event, StateFileHeader};
 
@@ -1477,7 +1936,7 @@ fn parse_source_log(bytes: &[u8]) -> Result<SourceLog, String> {
         .map_err(|e| format!("the state file's header doesn't parse: {}", e))?;
     if header.schema_version != 1 {
         return Err(format!(
-            "the state file has schema_version {}; this koto imports version 1",
+            "the state file has schema_version {}; this koto reads version 1",
             header.schema_version
         ));
     }
@@ -2450,6 +2909,21 @@ fn is_not_found(e: &S3Error) -> bool {
 /// not one.
 fn is_migration_marker(session_prefix: &str, key: &str) -> bool {
     key.strip_prefix(session_prefix) == Some(MIGRATED_MARKER)
+}
+
+/// The `session_id` in a state file's header line (its first non-empty
+/// line), or `None` when the header doesn't parse or has none.
+///
+/// Deliberately looser than [`parse_source_log`]: the marker judge reads
+/// the header with this first, to tell a target that is another session
+/// (`Replaced`) or has no usable header (`Unknown`) from the right session
+/// with a damaged log (`Unverified`). Reading it with the strict parser
+/// would fold the first two into the third.
+fn header_session_id(state: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(state);
+    let line = text.lines().find(|l| !l.trim().is_empty())?;
+    let header: serde_json::Value = serde_json::from_str(line).ok()?;
+    header.get("session_id")?.as_str().map(str::to_string)
 }
 
 /// Build the refusal a marker's bytes describe for session `id`.
@@ -3645,6 +4119,7 @@ mod tests {
             access_key: Some("k".to_string()),
             secret_key: Some("s".to_string()),
             path_style: Some(true),
+            marker_retain_days: None,
         };
         let bucket = create_bucket(&config).unwrap();
         assert!(bucket.is_path_style());
@@ -3842,6 +4317,32 @@ mod tests {
         // deletes it like any other.
         assert!(!is_migration_marker("p/wf/", "p/wf/ctx/migrated.json"));
         assert!(!is_migration_marker("p/wf/", "p/other/migrated.json"));
+    }
+
+    #[test]
+    fn a_marker_target_prefix_must_be_sixteen_lowercase_hex() {
+        assert!(is_workspace_prefix("0123456789abcdef"));
+        for bad in [
+            "",
+            "0123456789ABCDEF",
+            "0123456789abcde",
+            "0123456789abcdef0",
+            "../../0123456789",
+            "0123456789abcde/",
+        ] {
+            assert!(!is_workspace_prefix(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_target_session_id_is_read_from_the_header_line() {
+        assert_eq!(
+            header_session_id(b"\n{\"workflow\":\"foo\",\"session_id\":\"id-1\"}\n{\"seq\":1}\n"),
+            Some("id-1".to_string())
+        );
+        assert_eq!(header_session_id(b"{\"workflow\":\"foo\"}\n"), None);
+        assert_eq!(header_session_id(b"not json\n"), None);
+        assert_eq!(header_session_id(b""), None);
     }
 
     // -- the import's source checks --

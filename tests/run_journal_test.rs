@@ -461,6 +461,49 @@ fn allowed_fields(kind: &str) -> &'static [&'static str] {
         "terminal" => &["koto.terminal"],
         "cancelled" => &[],
         "driver_seen" => &["koto.driver.session.id"],
+        "check_evaluated" => &[
+            "koto.seq",
+            "koto.visit.seq",
+            "koto.state",
+            "koto.check",
+            "koto.check.outcome",
+            "koto.attempt",
+            "koto.visit_attempt",
+            "koto.check.rule_count",
+            "koto.check.rule_counts_truncated",
+            "koto.check.duration_ms",
+            "koto.poll.status",
+            "koto.check.unanswered_count",
+            "koto.check.error",
+        ],
+        "check_rule" => &[
+            "koto.seq",
+            "koto.visit.seq",
+            "koto.state",
+            "koto.check",
+            "koto.attempt",
+            "koto.visit_attempt",
+            "koto.rule.id",
+            "koto.rule.visit_count",
+            "koto.rule.session_count",
+        ],
+        "check_pending" => &[
+            "koto.seq",
+            "koto.visit.seq",
+            "koto.state",
+            "koto.check",
+            "koto.poll.status",
+            "koto.poll.evaluations",
+            "koto.poll.elapsed_secs",
+        ],
+        "response" => &[
+            "koto.seq",
+            "koto.visit.seq",
+            "koto.state",
+            "koto.response.source",
+            "koto.response.directive_bytes",
+            "koto.response.details_bytes",
+        ],
         other => panic!("unknown record kind {other}"),
     }
 }
@@ -624,9 +667,13 @@ fn self_directed_and_rewound_transitions_each_journal_the_state_entered() {
     env.ok(&["rewind", "moves"]);
 
     let records = env.records("moves");
-    let tail = &records[mark..];
-    assert_eq!(kinds(tail), vec!["state_entered"; 3], "{tail:?}");
-    assert_eq!(states(tail), vec!["loop", "one", "loop"]);
+    let tail: Vec<Value> = records[mark..]
+        .iter()
+        .filter(|r| r["kind"] != "response")
+        .cloned()
+        .collect();
+    assert_eq!(kinds(&tail), vec!["state_entered"; 3], "{tail:?}");
+    assert_eq!(states(&tail), vec!["loop", "one", "loop"]);
 }
 
 #[test]
@@ -1227,11 +1274,13 @@ Done.
 "#;
 
 /// `(kind, the driver or the state it names)` for each of `session`'s
-/// records after `session_started`.
+/// records after `session_started`. `response` records follow what a
+/// command printed, not who drove it, and are left out.
 fn driven_sequence(env: &Env, session: &str) -> Vec<(String, String)> {
     env.records(session)
         .iter()
         .skip(1)
+        .filter(|r| r["kind"] != "response")
         .map(|r| {
             let kind = r["kind"].as_str().unwrap().to_string();
             let what = match kind.as_str() {
@@ -1930,9 +1979,11 @@ fn a_full_journal_file_system_costs_one_warning_and_nothing_else() {
             r#"{"go": "yes"}"#.into(),
         ],
     ];
-    // A step warns only when it has a record to write: the bare `next`
-    // waits on evidence in `start`, changes nothing, and journals nothing.
-    let records = [true, false, true];
+    // A step warns only when it has a record to write, and every step here
+    // has one: `init` its session start, the bare `next` the `response`
+    // for the `start` directive it prints (it changes no state), and the
+    // last `next` its state entries and terminal.
+    let records = [true, true, true];
     let mut outs = Vec::new();
     for (i, step) in steps.into_iter().enumerate() {
         // 64 blocks of 512 bytes: room for the session's own files, none

@@ -154,6 +154,61 @@ pub fn append_event_in<H: LogHeader>(
     payload: &EventPayload,
     timestamp: &str,
 ) -> anyhow::Result<u64> {
+    append_event_reading::<H>(path, payload, timestamp).map(|(seq, _)| seq)
+}
+
+/// What one committed append to a session's log tells the code that runs
+/// after it, all taken from the bytes the append read under its lock.
+///
+/// Holds no journal types: the run journal is its one reader today, but
+/// nothing here knows about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitInfo {
+    /// The committed event's `seq`.
+    pub seq: u64,
+    /// The log as it stood before this event: the bytes the append read to
+    /// find the next `seq`, moved rather than copied.
+    pub prior_log: String,
+}
+
+impl CommitInfo {
+    /// The `seq` of the event that opened the visit the log was in before
+    /// this event, by [`visit_start`]'s rule; `None` for a log with no state
+    /// entry. Computed from [`prior_log`](Self::prior_log) on each call, so
+    /// a commit nobody asks about pays nothing for it.
+    pub(crate) fn prior_visit_seq(&self) -> Option<u64> {
+        visit_start(&self.prior_log)
+    }
+
+    /// The visit `payload` (the committed event) belongs to: its own `seq`
+    /// when it opens a visit itself, otherwise the visit the log was in.
+    pub(crate) fn visit_seq_for(&self, payload: &EventPayload) -> Option<u64> {
+        if opens_visit(payload) {
+            Some(self.seq)
+        } else {
+            self.prior_visit_seq()
+        }
+    }
+}
+
+/// [`append_event`], returning what the append read as well as the `seq` it
+/// took (see [`CommitInfo`]). Writes exactly what [`append_event`] writes.
+pub(crate) fn append_event_tracked(
+    path: &Path,
+    payload: &EventPayload,
+    timestamp: &str,
+) -> anyhow::Result<CommitInfo> {
+    let (seq, prior_log) = append_event_reading::<StateFileHeader>(path, payload, timestamp)?;
+    Ok(CommitInfo { seq, prior_log })
+}
+
+/// The one append: returns the `seq` taken and the log's bytes as read
+/// under the lock, before the new line.
+fn append_event_reading<H: LogHeader>(
+    path: &Path,
+    payload: &EventPayload,
+    timestamp: &str,
+) -> anyhow::Result<(u64, String)> {
     debug_assert!(
         !matches!(payload, EventPayload::Unknown { .. }),
         "Unknown events must not be passed to append_event"
@@ -161,7 +216,7 @@ pub fn append_event_in<H: LogHeader>(
     // Held from reading the last seq until the line is synced, so two
     // processes appending at once can't both take the same seq.
     let _append_lock = AppendLock::acquire(path);
-    let next_seq = next_seq_after_header::<H>(path)?;
+    let (next_seq, prior_log) = read_for_append::<H>(path)?;
 
     let event = Event {
         seq: next_seq,
@@ -187,7 +242,7 @@ pub fn append_event_in<H: LogHeader>(
     file.sync_data()
         .map_err(|e| anyhow::anyhow!("failed to sync state file {}: {}", path.display(), e))?;
 
-    Ok(next_seq)
+    Ok((next_seq, prior_log))
 }
 
 /// Outcome of an idempotent append.
@@ -657,6 +712,11 @@ fn fsync_log_file(path: &Path) -> std::io::Result<()> {
 /// equals line index. This avoids silently masking corruption where events
 /// appear out of order.
 fn next_seq_after_header<H: LogHeader>(path: &Path) -> anyhow::Result<u64> {
+    read_for_append::<H>(path).map(|(seq, _)| seq)
+}
+
+/// [`next_seq_after_header`], also handing back the bytes it read.
+fn read_for_append<H: LogHeader>(path: &Path) -> anyhow::Result<(u64, String)> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -690,14 +750,15 @@ fn next_seq_after_header<H: LogHeader>(path: &Path) -> anyhow::Result<u64> {
     }
     parse_header::<H>(first_line)?;
 
-    match lines.rev().find(|l| !l.trim().is_empty()) {
-        None => Ok(1),
+    let next = match lines.rev().find(|l| !l.trim().is_empty()) {
+        None => 1,
         Some(line) => {
             let val: serde_json::Value = serde_json::from_str(line.trim())
                 .map_err(|e| anyhow::anyhow!("failed to parse last event line: {}", e))?;
-            Ok(val.get("seq").and_then(|s| s.as_u64()).unwrap_or(0) + 1)
+            val.get("seq").and_then(|s| s.as_u64()).unwrap_or(0) + 1
         }
-    }
+    };
+    Ok((next, content))
 }
 
 /// Read the header line from a state file.
@@ -1308,23 +1369,132 @@ fn entry_slice<'a>(events: &'a [Event], current_state: &str, boundary: Boundary)
 /// and [`any_entry_index`] read, so the two can't disagree.
 fn entry_index(events: &[Event], current_state: &str, boundary: Boundary) -> Option<usize> {
     events.iter().enumerate().rev().find_map(|(idx, e)| {
-        let opens = match &e.payload {
-            EventPayload::Transitioned { from, to, .. } => {
-                to == current_state
-                    && (boundary.opens_on_self_entry() || from.as_deref() != Some(current_state))
-            }
-            EventPayload::DirectedTransition { from, to, .. } => {
-                to == current_state && (boundary.opens_on_self_entry() || from != current_state)
-            }
-            EventPayload::Rewound { to, .. } => to == current_state,
-            _ => false,
-        };
-        if opens {
+        if opens_window(&e.payload, current_state, boundary) {
             Some(idx)
         } else {
             None
         }
     })
+}
+
+/// Whether `payload` is an entry into `current_state` that opens a window
+/// under `boundary`: the one predicate [`entry_index`] and [`visit_start`]
+/// both apply.
+fn opens_window(payload: &EventPayload, current_state: &str, boundary: Boundary) -> bool {
+    match payload {
+        EventPayload::Transitioned { from, to, .. } => {
+            to == current_state
+                && (boundary.opens_on_self_entry() || from.as_deref() != Some(current_state))
+        }
+        EventPayload::DirectedTransition { from, to, .. } => {
+            to == current_state && (boundary.opens_on_self_entry() || from != current_state)
+        }
+        EventPayload::Rewound { to, .. } => to == current_state,
+        _ => false,
+    }
+}
+
+/// The state a state-entry event enters, or `None` for any other event.
+fn entered_state(payload: &EventPayload) -> Option<&str> {
+    match payload {
+        EventPayload::Transitioned { to, .. }
+        | EventPayload::DirectedTransition { to, .. }
+        | EventPayload::Rewound { to, .. } => Some(to.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether `payload` opens a visit: a state entry that is an arrival (a
+/// first entry, a transition or directed transition from a different state,
+/// or any rewind). A transition from a state to itself stays in its visit.
+pub(crate) fn opens_visit(payload: &EventPayload) -> bool {
+    entered_state(payload)
+        .is_some_and(|to| opens_window(payload, to, Boundary::ArrivalFromElsewhere))
+}
+
+/// Whether a raw log line can be a state entry, without parsing it.
+///
+/// [`Event`] serializes `seq`, `timestamp`, then `type`, so the type word
+/// sits a few dozen bytes in, and reading it there keeps a long visit's
+/// lines (a failed check's logged streams run to kilobytes) from being
+/// searched end to end. A line laid out any other way falls back to
+/// searching all of it for an entry's type word. Either way a `true` is only
+/// a candidate: the caller parses the line.
+fn may_be_entry(line: &str) -> bool {
+    const ENTRY_TYPES: [&[u8]; 3] = [b"transitioned\"", b"directed_transition\"", b"rewound\""];
+    const TYPE_KEY: &[u8] = b"\"type\":\"";
+    let bytes = line.as_bytes();
+    // Fast path: relies on `impl Serialize for Event` writing `seq`, then
+    // `timestamp`, then `type`, so the first `"type":"` within the head is
+    // the event's own. Reorder that serializer and this must change with it.
+    let head = &bytes[..bytes.len().min(96)];
+    if let Some(at) = head.windows(TYPE_KEY.len()).position(|w| w == TYPE_KEY) {
+        let word = &bytes[at + TYPE_KEY.len()..];
+        return ENTRY_TYPES.iter().any(|t| word.starts_with(t));
+    }
+    line.contains("\"transitioned\"")
+        || line.contains("\"directed_transition\"")
+        || line.contains("\"rewound\"")
+}
+
+/// The `seq` of the event that opened the visit a session's log ends in,
+/// read from the log's raw bytes (header line included).
+///
+/// A visit runs from an arrival in a state -- its first entry, an arrival
+/// from a different state, or any rewind -- until the session next arrives
+/// somewhere. A transition from a state to itself stays in the visit. This
+/// is [`arrival_index`]'s boundary, the one `visit_attempt` and the
+/// delivery window cut at, applied to the state the log's last entry names,
+/// so the two can't drift.
+///
+/// Scans backwards from the end and parses only lines that can be a state
+/// entry, so the work is bounded by the length of the current visit, not
+/// the log. `None` when the log holds no state entry. A line that doesn't
+/// parse is skipped, as [`read_events`] skips it.
+pub(crate) fn visit_start(log: &str) -> Option<u64> {
+    current_visit(log).map(|(_, seq)| seq)
+}
+
+/// [`visit_start`], together with the state the log ends in (the state its
+/// last state entry names, as [`derive_state_from_log`] reads it), both
+/// from one scan of the same bytes.
+pub(crate) fn current_visit(log: &str) -> Option<(String, u64)> {
+    let mut current: Option<String> = None;
+    for line in log.lines().rev() {
+        if !may_be_entry(line) {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Event>(line.trim()) else {
+            continue;
+        };
+        let Some(to) = entered_state(&event.payload) else {
+            continue;
+        };
+        let state = current.get_or_insert_with(|| to.to_string());
+        if opens_window(&event.payload, state, Boundary::ArrivalFromElsewhere) {
+            return current.map(|state| (state, event.seq));
+        }
+    }
+    None
+}
+
+/// The highest `seq` in a session's log, read from its raw bytes (header
+/// line included): the `seq` of the last non-empty line that parses as a
+/// JSON object with an unsigned `seq`. Appends take strictly increasing
+/// seqs, so the last event holds the highest. Lines that don't parse that
+/// way, such as a partial last write, are passed over. This is a cheaper
+/// reading than [`read_events`] and doesn't promise to agree with it on a
+/// damaged log. `None` when no line carries a `seq`.
+pub(crate) fn last_seq(log: &str) -> Option<u64> {
+    #[derive(serde::Deserialize)]
+    struct Seq {
+        seq: u64,
+    }
+    log.lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .find_map(|line| serde_json::from_str::<Seq>(line.trim()).ok())
+        .map(|s| s.seq)
 }
 
 /// Index of the event that began `current_state`'s current epoch: the last
@@ -2060,6 +2230,180 @@ mod tests {
         assert_eq!(events[0].seq, 1);
         assert_eq!(events[1].seq, 2);
         assert_eq!(events[2].seq, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // append_event_tracked and the visit rule
+    // -----------------------------------------------------------------------
+
+    fn moved(from: Option<&str>, to: &str) -> EventPayload {
+        EventPayload::Transitioned {
+            from: from.map(str::to_string),
+            to: to.to_string(),
+            condition_type: "auto".to_string(),
+            skip_if_matched: None,
+            context_assignments: None,
+            vars_matched: None,
+        }
+    }
+
+    fn noted(state: &str) -> EventPayload {
+        EventPayload::EvidenceSubmitted {
+            state: state.to_string(),
+            fields: HashMap::new(),
+            submitter_cwd: None,
+            source: None,
+        }
+    }
+
+    /// Each append returns its own seq, the log as it was before it, and
+    /// the visit that log was in. A self-transition stays in the visit; an
+    /// arrival from elsewhere, a directed transition from a different
+    /// state and a rewind each open one.
+    #[test]
+    fn tracked_appends_report_the_seq_the_prior_log_and_the_visit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("koto-tracked.state.jsonl");
+        append_header(&path, &make_header()).unwrap();
+        let ts = "2026-01-01T00:00:00Z";
+        let steps: Vec<(EventPayload, Option<u64>, Option<u64>)> = vec![
+            // (payload, prior visit, the event's own visit)
+            (
+                EventPayload::WorkflowInitialized {
+                    template_path: "t".to_string(),
+                    variables: HashMap::new(),
+                    spawn_entry: None,
+                },
+                None,
+                None,
+            ),
+            (moved(None, "a"), None, Some(2)),
+            (noted("a"), Some(2), Some(2)),
+            (moved(Some("a"), "a"), Some(2), Some(2)),
+            (noted("a"), Some(2), Some(2)),
+            (moved(Some("a"), "b"), Some(2), Some(6)),
+            (noted("b"), Some(6), Some(6)),
+            (
+                EventPayload::DirectedTransition {
+                    from: "b".to_string(),
+                    to: "b".to_string(),
+                    rationale: None,
+                },
+                Some(6),
+                Some(6),
+            ),
+            (
+                EventPayload::Rewound {
+                    from: "b".to_string(),
+                    to: "a".to_string(),
+                    rationale: None,
+                },
+                Some(6),
+                Some(9),
+            ),
+            (noted("a"), Some(9), Some(9)),
+            (
+                EventPayload::DirectedTransition {
+                    from: "a".to_string(),
+                    to: "c".to_string(),
+                    rationale: None,
+                },
+                Some(9),
+                Some(11),
+            ),
+            (
+                EventPayload::Rewound {
+                    from: "c".to_string(),
+                    to: "c".to_string(),
+                    rationale: None,
+                },
+                Some(11),
+                Some(12),
+            ),
+        ];
+        for (i, (payload, prior, own)) in steps.iter().enumerate() {
+            let before = std::fs::read_to_string(&path).unwrap();
+            let commit = append_event_tracked(&path, payload, ts).unwrap();
+            assert_eq!(commit.seq, i as u64 + 1, "step {i}");
+            assert_eq!(commit.prior_log, before, "step {i}");
+            assert_eq!(commit.prior_visit_seq(), *prior, "step {i}");
+            assert_eq!(commit.visit_seq_for(payload), *own, "step {i}");
+        }
+        // The tracked append writes exactly what a plain append writes.
+        let (_, events) = read_events(&path).unwrap();
+        assert_eq!(events.len(), steps.len());
+        assert_eq!(
+            visit_start(&std::fs::read_to_string(&path).unwrap()),
+            Some(12)
+        );
+    }
+
+    /// `visit_start` on a whole log agrees with `arrival_index` on the same
+    /// events, and isn't fooled by a type word inside another event.
+    #[test]
+    fn visit_start_matches_arrival_index_and_skips_lookalike_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("koto-look.state.jsonl");
+        append_header(&path, &make_header()).unwrap();
+        let ts = "2026-01-01T00:00:00Z";
+        append_event(&path, &moved(None, "a"), ts).unwrap();
+        append_event(&path, &moved(Some("a"), "b"), ts).unwrap();
+        let mut fields = HashMap::new();
+        fields.insert("type".to_string(), serde_json::json!("rewound"));
+        fields.insert("to".to_string(), serde_json::json!("a"));
+        append_event(
+            &path,
+            &EventPayload::EvidenceSubmitted {
+                state: "b".to_string(),
+                fields,
+                submitter_cwd: None,
+                source: None,
+            },
+            ts,
+        )
+        .unwrap();
+        append_event(&path, &moved(Some("b"), "b"), ts).unwrap();
+        let log = std::fs::read_to_string(&path).unwrap();
+        let (_, events) = read_events(&path).unwrap();
+        let idx = arrival_index(&events, "b").unwrap();
+        assert_eq!(visit_start(&log), Some(events[idx].seq));
+        assert_eq!(visit_start(&log), Some(2));
+        // The state comes from the same scan, and agrees with the log's.
+        assert_eq!(current_visit(&log), Some(("b".to_string(), 2)));
+        assert_eq!(derive_state_from_log(&events).as_deref(), Some("b"));
+        // A log with no state entry has no visit.
+        assert_eq!(visit_start(log.lines().next().unwrap()), None);
+
+        // The prefilter reads the type word where koto writes it, and falls
+        // back to the whole line for any other layout.
+        let lines: Vec<&str> = log.lines().collect();
+        assert!(!may_be_entry(lines[3]), "evidence naming a rewind");
+        assert!(may_be_entry(lines[2]));
+        let reordered = format!(
+            r#"{{"payload":{{"from":"{}","to":"a"}},"type":"rewound","seq":9,"timestamp":"t"}}"#,
+            "b".repeat(200)
+        );
+        assert!(may_be_entry(&reordered));
+        let log = format!("{log}{reordered}\n");
+        assert_eq!(visit_start(&log), Some(9));
+    }
+
+    /// `last_seq` is the last event's seq, skips a partial last line, and
+    /// is `None` for a log holding only its header.
+    #[test]
+    fn last_seq_reads_the_last_event_and_skips_a_partial_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("koto-last.state.jsonl");
+        append_header(&path, &make_header()).unwrap();
+        let header_only = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(last_seq(&header_only), None);
+        let ts = "2026-01-01T00:00:00Z";
+        append_event(&path, &moved(None, "a"), ts).unwrap();
+        append_event(&path, &moved(Some("a"), "b"), ts).unwrap();
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(last_seq(&log), Some(2));
+        let torn = format!("{log}{{\"seq\":3,\"timest");
+        assert_eq!(last_seq(&torn), Some(2));
     }
 
     // -----------------------------------------------------------------------
