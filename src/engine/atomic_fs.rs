@@ -210,6 +210,118 @@ pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Swap two existing directories (or files) in one call: afterwards `a`
+/// holds what `b` held and `b` what `a` held, and at no instant is either
+/// name empty. Linux uses `renameat2(RENAME_EXCHANGE)`, macOS
+/// `renamex_np(RENAME_SWAP)`; elsewhere it reports `Unsupported`.
+///
+/// The same-host import takeover hands a session name from the source's
+/// copy to the imported session with it (DESIGN-session-migration's
+/// cloud-session-config amendment): with two renames the name would be
+/// empty between them, and a concurrent command could re-create it.
+#[cfg(target_os = "linux")]
+pub fn exchange_dirs(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| {
+        CString::new(p.as_os_str().as_bytes()).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("path contains NUL: {}", e),
+            )
+        })
+    };
+    let (a_c, b_c) = (c(a)?, c(b)?);
+    // SAFETY: valid C strings, AT_FDCWD on both ends; -1 sets errno.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            a_c.as_ptr(),
+            libc::AT_FDCWD,
+            b_c.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// macOS: `renamex_np(RENAME_SWAP)`, the call [`atomic_rename_dir`] makes
+/// with `RENAME_EXCL`.
+#[cfg(target_vendor = "apple")]
+pub fn exchange_dirs(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| {
+        CString::new(p.as_os_str().as_bytes()).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("path contains NUL: {}", e),
+            )
+        })
+    };
+    let (a_c, b_c) = (c(a)?, c(b)?);
+    // SAFETY: both are valid C strings; -1 sets errno.
+    let ret = unsafe { libc::renamex_np(a_c.as_ptr(), b_c.as_ptr(), libc::RENAME_SWAP) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Elsewhere there is no atomic exchange.
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+pub fn exchange_dirs(_a: &Path, _b: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no atomic directory exchange on this platform",
+    ))
+}
+
+/// Whether [`exchange_dirs`] works inside `dir`, checked without touching
+/// anything but two empty scratch directories it creates and removes.
+///
+/// `false` when `dir` isn't a directory owned by the invoking user (on
+/// Unix), when the scratch directories can't be made, or when the
+/// filesystem refuses the exchange (CIFS/SMB, FAT and hfsplus accept a
+/// no-replace rename but not an exchange; NFS refuses both).
+pub fn exchange_supported(dir: &Path) -> bool {
+    let md = match std::fs::symlink_metadata(dir) {
+        Ok(md) if md.is_dir() => md,
+        _ => return false,
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and can't fail.
+        if md.uid() != unsafe { libc::geteuid() } {
+            return false;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = md;
+    let tag = format!(
+        ".exchange-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let a = dir.join(format!("{}-a", tag));
+    let b = dir.join(format!("{}-b", tag));
+    let made = std::fs::create_dir(&a).is_ok() && std::fs::create_dir(&b).is_ok();
+    let swapped = made && exchange_dirs(&a, &b).is_ok();
+    let _ = std::fs::remove_dir(&a);
+    let _ = std::fs::remove_dir(&b);
+    swapped
+}
+
 /// Route `EEXIST` to [`AtomicCreateError::Collision`] and everything
 /// else to the I/O bucket.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
@@ -277,5 +389,57 @@ mod tests {
         // caller to clean up.
         assert_eq!(fs::read(&dst).expect("read dst"), b"old");
         assert!(src.exists(), "source must survive a refused rename");
+    }
+
+    #[test]
+    fn exchange_swaps_two_populated_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        fs::write(a.join("from-a"), b"a").unwrap();
+        fs::write(b.join("from-b"), b"b").unwrap();
+        exchange_dirs(&a, &b).expect("exchange");
+        assert!(a.join("from-b").exists() && !a.join("from-a").exists());
+        assert!(b.join("from-a").exists() && !b.join("from-b").exists());
+    }
+
+    #[test]
+    fn exchange_with_a_missing_side_fails_and_moves_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a");
+        fs::create_dir(&a).unwrap();
+        fs::write(a.join("f"), b"x").unwrap();
+        assert!(exchange_dirs(&a, &dir.path().join("missing")).is_err());
+        assert!(a.join("f").exists());
+        assert!(!dir.path().join("missing").exists());
+    }
+
+    #[test]
+    fn the_probe_answers_true_in_a_private_temp_dir_and_leaves_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(exchange_supported(dir.path()));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_probe_refuses_what_is_not_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("f");
+        fs::write(&f, b"x").unwrap();
+        assert!(!exchange_supported(&f));
+        assert!(!exchange_supported(&dir.path().join("missing")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_refuses_a_directory_another_user_owns() {
+        // `/` belongs to root; a test suite doesn't run as root.
+        // SAFETY: geteuid can't fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        assert!(!exchange_supported(Path::new("/")));
     }
 }
