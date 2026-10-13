@@ -801,7 +801,7 @@ Creates a new local session from the copy another workspace pushed to the bucket
 |---|---|---|
 | `<name>` | Yes | The session's name in the source workspace. |
 | `--from <workspace-path>` | Yes | Absolute path of the source workspace as it was on the host that created the session, symlinks resolved. A relative path is refused. |
-| `--as <new-name>` | No | Name to give the session here when its own name is taken. |
+| `--as <new-name>` | No | Name to give the session here when another session holds its name. Not needed on the same host: see "On the same host" below. |
 | `--trust-template` | No | Take the compiled template the source pushed to the bucket (after checking its hash) instead of this machine's cache. Only when everyone who can write the bucket is trusted: the template holds every command the session runs. |
 
 **The source must be stopped.** No process may still be advancing the session, and its last write must have reached the bucket. Stop the agent on the source host first; if a push from it failed, or you aren't sure, run `koto session resolve <name> --keep local` there, which uploads the whole local session. koto can't detect a source that is still moving.
@@ -824,6 +824,8 @@ Creates a new local session from the copy another workspace pushed to the bucket
 
 The new session holds the source's events plus a `session_imported` event, every context key and the compiled template, and is pushed under this workspace's prefix before the marker is written. From then on the old copy refuses with `session_migrated` (see `error-handling.md#session_migrated`). The import writes nothing else under the source's prefix and deletes nothing; the source's objects stay in the bucket until a `koto session cleanup` in the source workspace, which keeps `migrated.json`. A child session is refused on its own, and importing a parent doesn't bring its children.
 
+**On the same host.** Workspaces on one host share the local store, so the source's own copy already holds the name there. Without `--as` the import takes the name over and the output's `name` is the original name: it builds the new session in `~/.koto/sessions/.takeover-<name>/`, pushes it, writes the marker, then swaps the two directories in one atomic call. Before writing anything it refuses, leaving the source untouched, if another process holds the session's lock, the local copy is ahead of the bucket, or a local child names it as parent (the `import_source_*` codes below). A stop at any step is finished by running the same command again; while `.takeover-<name>/` exists, commands on the name refuse and say so. Where the filesystem can't swap directories atomically, the import refuses before writing and names `--as`. Run from the source workspace itself, or with `--as`, the import behaves as above.
+
 **Errors** print `{"error":{"code":"...","message":"..."}}` and exit 2 for a refusal you act on, 1 for a failure:
 
 | `error.code` | Exit | Meaning | What to do |
@@ -836,6 +838,9 @@ The new session holds the source's events plus a `session_imported` event, every
 | `import_template_unavailable` | 2 | No usable compiled template with the session's hash (in the cache, or under `--trust-template` in the bucket). | Run `koto template compile` on the session's template here, then import again without `--trust-template`. |
 | `import_source_unreadable` | 1 | A source object couldn't be fetched or failed validation. | Retry if the bucket was unreachable; otherwise report the message. |
 | `import_push_failed` | 1 | Building, pushing or moving the session into place failed; what this run pushed was taken back. | Fix what the message names and run the same import again. |
+| `import_source_running` | 2 | Same host: another process holds the source session's lock. | Stop what is advancing it, then import again. |
+| `import_source_unpushed` | 2 | Same host: the source's local copy holds events or context the bucket lacks. | Run `koto session resolve <name> --keep local` in the source workspace, then import again. |
+| `import_source_has_children` | 2 | Same host: a local session names the source as its parent. | Finish or clean up the child the message names, or import with `--as`. |
 | `import_unmarked` | 1 | Imported and pushed, but the source's marker couldn't be written, so the old copy won't refuse yet. | Run the same import again; it writes only the marker. Keep the source stopped meanwhile. |
 
 ---

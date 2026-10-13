@@ -61,6 +61,21 @@ lists instead of GETting, to avoid rust-s3's retry sleep on the expected
 404, and an import re-run that finds its own marker on the source reports
 `template: unchanged` instead of refusing.
 
+**Note (2026-10-14), same-host import.** The cloud-session-config design
+changes what an import does on the host that created the session. There the
+source's own local copy holds the name, so an import without `--as` used to
+refuse `import_name_taken`. It now takes the name over: with the source's
+locks held and its local copy checked against the bucket, it stages the new
+session in `<sessions>/.takeover-<name>`, pushes it, writes the marker on the
+source, and swaps the two directories with one atomic exchange
+(`exchange_dirs`), so the marker always lands before the local name changes
+hands. Three new refusals, `import_source_running`, `import_source_unpushed`
+and `import_source_has_children`, guard the old copy, and every step is
+finished by running the same command again. The old workspace's commands also
+refuse locally, from the imported log's `session_imported` event, so they
+don't depend on reading the marker. An import with `--as`, from another host,
+or from the source workspace itself is unchanged.
+
 ## Context and Problem Statement
 
 The requirements are in `docs/prds/PRD-session-migration.md`; this design

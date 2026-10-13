@@ -422,21 +422,34 @@ fn an_import_refuses_a_source_still_ahead_running_or_with_children() {
         assert_source_untouched(&h, &s3, &before, what);
     }
 
-    // Running: another process holds the state-file lock.
-    let s3 = FakeS3::start(BUCKET);
-    let h = source(&s3);
-    let before = snapshot(&h, &s3);
-    let lock = std::fs::File::open(h.state_path(NAME)).unwrap();
-    {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: the fd belongs to `lock`, held for the import below.
-        let ret = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(ret, 0);
+    // Running: another process holds the state-file lock, or the context
+    // manifest's.
+    for which in ["state", "manifest"] {
+        let s3 = FakeS3::start(BUCKET);
+        let h = source(&s3);
+        let before = snapshot(&h, &s3);
+        let path = match which {
+            "state" => h.state_path(NAME),
+            _ => h.sessions().join(NAME).join("ctx").join("manifest.lock"),
+        };
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: the fd belongs to `lock`, held for the import below.
+            let ret = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(ret, 0);
+        }
+        let out = h.import_from_a(&[]);
+        assert_refused(&out, "import_source_running");
+        drop(lock);
+        assert_source_untouched(&h, &s3, &before, which);
     }
-    let out = h.import_from_a(&[]);
-    assert_refused(&out, "import_source_running");
-    drop(lock);
-    assert_source_untouched(&h, &s3, &before, "running");
 
     // Children: a session naming the source as its parent.
     let s3 = FakeS3::start(BUCKET);
@@ -664,4 +677,79 @@ fn the_source_workspace_can_t_touch_the_imported_copy_even_without_the_marker() 
     for (p, v) in before {
         assert_eq!(std::fs::read(&p).unwrap(), v, "{}", p.display());
     }
+}
+
+/// `log` with one more `intent_updated` event after its last.
+fn with_one_more_event(log: &str, intent: &str) -> String {
+    let next = log.lines().filter(|l| !l.trim().is_empty()).count();
+    format!(
+        "{log}{}\n",
+        serde_json::json!({
+            "seq": next,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "intent_updated",
+            "payload": {"intent": intent},
+        })
+    )
+}
+
+#[test]
+fn a_re_run_after_the_marker_never_overwrites_a_copy_that_moved_on() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = source(&s3);
+    let out = h.import_from_a(&[("KOTO_TEST_IMPORT_FAULT", "after-mark")]);
+    assert!(!out.ok(), "{}", out.describe());
+    assert!(s3.object(&marker_key(&h)).is_some());
+
+    // B's copy in the bucket gains an event after its session_imported.
+    let key = format!("{}/{}/koto-{}.state.jsonl", prefix_of(&h.b), NAME, NAME);
+    let log = with_one_more_event(
+        &String::from_utf8(s3.object(&key).unwrap()).unwrap(),
+        "moved on",
+    );
+    s3.put(&key, log.as_bytes());
+    let local_before = std::fs::read(h.state_path(NAME)).unwrap();
+
+    let out = h.import_from_a(&[]);
+    assert_refused(&out, "import_source_migrated");
+    assert!(out.stdout.contains("moved on"), "{}", out.describe());
+    assert_eq!(s3.object(&key).unwrap(), log.as_bytes());
+    assert_eq!(std::fs::read(h.state_path(NAME)).unwrap(), local_before);
+}
+
+#[test]
+fn an_old_copy_that_changed_or_is_a_symlink_is_kept() {
+    // Changed: an event appended to the old copy after the exchange.
+    let s3 = FakeS3::start(BUCKET);
+    let h = source(&s3);
+    let out = h.import_from_a(&[("KOTO_TEST_IMPORT_FAULT", "after-exchange")]);
+    assert!(!out.ok(), "{}", out.describe());
+    let old = h.pending().join(format!("koto-{}.state.jsonl", NAME));
+    let log = with_one_more_event(&std::fs::read_to_string(&old).unwrap(), "late");
+    std::fs::write(&old, &log).unwrap();
+    let out = h.import_from_a(&[]);
+    assert!(out.ok(), "{}", out.describe());
+    assert!(
+        out.stderr.contains(h.pending().to_str().unwrap()),
+        "the warning names the kept copy: {}",
+        out.describe()
+    );
+    assert_eq!(std::fs::read_to_string(&old).unwrap(), log);
+
+    // A symlink at .takeover-<name> is never followed or removed.
+    let s3 = FakeS3::start(BUCKET);
+    let h = source(&s3);
+    let out = h.import_from_a(&[("KOTO_TEST_IMPORT_FAULT", "after-exchange")]);
+    assert!(!out.ok(), "{}", out.describe());
+    let real = h.sessions().join("elsewhere");
+    std::fs::rename(h.pending(), &real).unwrap();
+    std::os::unix::fs::symlink(&real, h.pending()).unwrap();
+    let out = h.import_from_a(&[]);
+    assert!(out.ok(), "{}", out.describe());
+    assert!(out.stderr.contains("not a directory"), "{}", out.describe());
+    assert!(std::fs::symlink_metadata(h.pending())
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(real.join(format!("koto-{}.state.jsonl", NAME)).exists());
 }
