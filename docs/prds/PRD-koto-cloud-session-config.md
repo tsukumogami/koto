@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   koto takes its session backend and cloud location only from the user file,
   which every running session re-reads, or a project file in the exact working
@@ -22,7 +22,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-koto-cloud-session-config](docs/briefs/BRIEF-koto-cloud-session-config.md); carried in Absorbed Brief.
 
