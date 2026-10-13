@@ -1914,6 +1914,14 @@ pub enum ImportErrorCode {
     /// The imported session is in place and pushed, but the marker on the
     /// source couldn't be written.
     Unmarked,
+    /// A same-host import found another process holding the source's lock.
+    SourceRunning,
+    /// A same-host import found the source's local copy ahead of the
+    /// bucket: events or context the bucket lacks.
+    SourceUnpushed,
+    /// A same-host import found a local session naming the source as its
+    /// parent.
+    SourceHasChildren,
 }
 
 impl ImportErrorCode {
@@ -1929,6 +1937,9 @@ impl ImportErrorCode {
             ImportErrorCode::SourceUnreadable => "import_source_unreadable",
             ImportErrorCode::PushFailed => "import_push_failed",
             ImportErrorCode::Unmarked => "import_unmarked",
+            ImportErrorCode::SourceRunning => "import_source_running",
+            ImportErrorCode::SourceUnpushed => "import_source_unpushed",
+            ImportErrorCode::SourceHasChildren => "import_source_has_children",
         }
     }
 
@@ -1941,7 +1952,10 @@ impl ImportErrorCode {
             | ImportErrorCode::SourceMigrated
             | ImportErrorCode::SourceIsChild
             | ImportErrorCode::NameTaken
-            | ImportErrorCode::TemplateUnavailable => 2,
+            | ImportErrorCode::TemplateUnavailable
+            | ImportErrorCode::SourceRunning
+            | ImportErrorCode::SourceUnpushed
+            | ImportErrorCode::SourceHasChildren => 2,
             ImportErrorCode::SourceUnreadable
             | ImportErrorCode::PushFailed
             | ImportErrorCode::Unmarked => 1,
@@ -2009,6 +2023,9 @@ pub struct ImportRequest<'a> {
     pub anchor: &'a Path,
     /// `--trust-template`: take the compiled template from the bucket.
     pub trust_template: bool,
+    /// `--as` was given. A same-host takeover of the source's own copy runs
+    /// only without it; with it the import behaves as it always has.
+    pub explicit_as: bool,
 }
 
 /// What a completed import did.
@@ -2110,6 +2127,8 @@ struct ImportSource {
     workspace: String,
     /// `<source prefix>/<name>/`, the source session's key prefix.
     session: String,
+    /// The source workspace's prefix alone.
+    prefix: String,
     log: SourceLog,
     /// The source's marker, when it names this workspace's prefix and the
     /// import's target: an earlier run of this import may have written it
@@ -2258,6 +2277,9 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     builder.create(path)
 }
 
+#[path = "cloud_takeover.rs"]
+mod takeover;
+
 impl CloudBackend {
     /// Import session `req.name` from the workspace at `req.from` into this
     /// workspace as `req.target`, anchored at `req.anchor`.
@@ -2296,10 +2318,27 @@ impl CloudBackend {
         // marker PUT landed though it reported a failure. With that run's
         // target here, the import is already complete; nothing is written.
         if let Some(marker) = &source.own_marker {
+            // A same-host takeover that marked the source but stopped before
+            // the exchange: the source's own copy still holds the name.
+            // Finish it with the session id the marker recorded.
+            if self.is_takeover(req, &source) {
+                let session_id = marker_target_field(marker, "session_id");
+                return self.takeover(req, &source, Some(&session_id));
+            }
             return match self.local_import_of(req.target, &source) {
-                Some(session_id) if session_id == marker_target_field(marker, "session_id") => Ok(
-                    outcome(self.local_key_count(req.target)?, TemplateOrigin::Unchanged),
-                ),
+                Some(session_id) if session_id == marker_target_field(marker, "session_id") => {
+                    // A takeover that stopped after the exchange leaves its
+                    // `.takeover-<name>` to journal and delete.
+                    if std::fs::symlink_metadata(takeover_dir(self.local.base_dir(), req.target))
+                        .is_ok()
+                    {
+                        self.finish_takeover(req.target, &source, None);
+                    }
+                    Ok(outcome(
+                        self.local_key_count(req.target)?,
+                        TemplateOrigin::Unchanged,
+                    ))
+                }
                 _ => {
                     let local = self.local.session_dir(req.target);
                     let (what, hint) = if local.exists() {
@@ -2333,6 +2372,10 @@ impl CloudBackend {
             };
         }
 
+        if self.is_takeover(req, &source) {
+            return self.takeover(req, &source, None);
+        }
+
         let (session_id, machine_id, keys, template_origin) =
             match self.existing_target(req, &source)? {
                 ExistingTarget::Local { session_id } => (
@@ -2352,6 +2395,7 @@ impl CloudBackend {
                         &manifest,
                         manifest_bytes.as_deref(),
                         &machine_id,
+                        None,
                     )?;
                     let pushed = self.push_staged(req.target, &staging.dir, &source, &manifest)?;
                     self.move_into_place(req.target, &mut staging, &pushed)?;
@@ -2485,6 +2529,7 @@ impl CloudBackend {
             name: name.to_string(),
             workspace,
             session,
+            prefix: source_prefix,
             log,
             own_marker,
         })
@@ -2526,6 +2571,31 @@ impl CloudBackend {
             };
         }
 
+        self.remote_name_free(req, source)?;
+        Ok(ExistingTarget::Free)
+    }
+
+    /// Whether this workspace's prefix in the bucket leaves the target name
+    /// free: nothing there, or only an earlier run of this same import.
+    /// Anything else refuses `import_name_taken`.
+    fn remote_name_free(
+        &self,
+        req: &ImportRequest<'_>,
+        source: &ImportSource,
+    ) -> Result<(), ImportError> {
+        use ImportErrorCode::*;
+
+        let target = req.target;
+        let taken = |place: &str| {
+            ImportError::new(
+                NameTaken,
+                format!(
+                    "{} already has a session named '{}', and it is not an import of session \
+                     '{}' from {}; pass --as <new-name> to import it under another name",
+                    place, target, source.name, source.workspace
+                ),
+            )
+        };
         let key = self.state_key(target);
         let could_not_check = |e: &dyn std::fmt::Display| {
             ImportError::new(
@@ -2537,10 +2607,10 @@ impl CloudBackend {
             )
         };
         match self.object_listed(&key) {
-            Ok(false) => Ok(ExistingTarget::Free),
+            Ok(false) => Ok(()),
             Ok(true) => match self.fetch_object(&key) {
                 Ok(bytes) => match bytes.as_deref().and_then(ImportedAs::read) {
-                    Some(imported) if imported.is_of(source) => Ok(ExistingTarget::Free),
+                    Some(imported) if imported.is_of(source) => Ok(()),
                     _ => Err(taken("this workspace's prefix in the bucket")),
                 },
                 Err(e) => Err(could_not_check(&e)),
@@ -2651,6 +2721,7 @@ impl CloudBackend {
     ///
     /// A source with no manifest gets an empty one, so every imported
     /// session has a `ctx/` manifest.
+    #[allow(clippy::too_many_arguments)]
     fn stage_import(
         &self,
         req: &ImportRequest<'_>,
@@ -2659,6 +2730,7 @@ impl CloudBackend {
         manifest: &crate::session::context::Manifest,
         manifest_bytes: Option<&[u8]>,
         machine_id: &str,
+        into: Option<(&Path, Option<&str>)>,
     ) -> Result<(Staging, String), ImportError> {
         use crate::engine::types::{
             generate_session_id, now_iso8601, Event, EventPayload, SessionOrigin,
@@ -2677,7 +2749,13 @@ impl CloudBackend {
         crate::session::local::ensure_koto_root(base)
             .and_then(|()| std::fs::create_dir_all(base).map_err(anyhow::Error::from))
             .map_err(|e| write_failed(base, &e))?;
-        let dir = base.join(format!(".import-{}-{}", target, generate_session_id()));
+        // A same-host takeover stages in its fixed `.takeover-<name>` and may
+        // reuse the session id its marker already names; every other import
+        // stages in a fresh `.import-<target>-<random>` with a new id.
+        let dir = match into {
+            Some((dir, _)) => dir.to_path_buf(),
+            None => base.join(format!(".import-{}-{}", target, generate_session_id())),
+        };
         create_private_dir(&dir).map_err(|e| write_failed(&dir, &e))?;
         let staging = Staging { dir, moved: false };
         let dir = staging.dir.as_path();
@@ -2728,7 +2806,10 @@ impl CloudBackend {
 
         // The header is the source's, renamed, re-identified and
         // re-anchored here, with a command environment taken on this host.
-        let session_id = generate_session_id();
+        let session_id = into
+            .and_then(|(_, id)| id)
+            .map(str::to_string)
+            .unwrap_or_else(generate_session_id);
         let mut header = source.log.header.clone();
         header.workflow = target.to_string();
         header.session_id = session_id.clone();
