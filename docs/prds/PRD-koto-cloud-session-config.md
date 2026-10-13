@@ -14,7 +14,8 @@ goals: |
   came from, keeps the bucket key under koto's own names, and moves a stopped
   session into a fresh workspace on the same host under its own name. A host
   that sets none of the new variables keeps today's behavior.
-upstream: docs/briefs/BRIEF-koto-cloud-session-config.md
+absorbed:
+  - docs/briefs/BRIEF-koto-cloud-session-config.md
 ---
 
 # PRD: Cloud session config and same-host import
@@ -22,6 +23,33 @@ upstream: docs/briefs/BRIEF-koto-cloud-session-config.md
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-koto-cloud-session-config](docs/briefs/BRIEF-koto-cloud-session-config.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+The feature was framed around an operator who wants one workspace's koto
+sessions in a bucket without disturbing the rest of the host. Three things
+stood in the way: the cloud backend could only be turned on by editing a
+config file that every running session re-reads (or a project file in each
+command's exact directory), the bucket key could only travel under the AWS
+names every AWS tool reads, and a stopped session couldn't be imported into a
+fresh workspace on the same host without a new name, which loses it for every
+caller that finds it by name. The trigger was a coordinator handoff that
+starts from an imported session on a host whose other sessions must stay
+local.
+
+The outcome it set is that the operator turns the backend on through one
+workspace's environment, sees where each session setting came from, keeps the
+bucket key under koto's own names, and moves a stopped session to a fresh
+workspace on the same host under its own name, while a host that sets none of
+it sees no change. Its journeys were the operator enabling one workspace, the
+replacement coordinator taking over on the same host, the upgrade that
+changes nothing, and the operator debugging a session on the wrong backend;
+they are User Stories 1 to 6 below. Its boundary kept out a move between
+hosts, writing anyone's environment or secrets, a variable for
+`marker_retain_days`, per-workspace stores and changes to shirabe's import
+step, all carried in Out of Scope.
 
 ## Problem Statement
 
