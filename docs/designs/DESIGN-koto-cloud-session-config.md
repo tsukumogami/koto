@@ -721,7 +721,21 @@ from the bucket, so a bucket writer could also trigger that refusal; this
 grants nothing a marker doesn't. On the shared bucket, an importer can mark
 another workspace's prefix as migrated, exactly as a cross-host import can.
 
-**Residual risk.** A process already running in the source workspace when the
+**Implementation notes from the review.** Every place koto spawns a
+subprocess, not only `build_command_env`, is checked for the pair. A
+variable whose value isn't valid Unicode counts as set and invalid, so it
+can't fall through to another credential source. The raw path-style value
+`config get` prints goes through the same cap and escape as the error text.
+A re-run tells what `.takeover-<name>` holds by its header's session id
+alone. Session names already pass `ValidatedSessionId`, which refuses path
+separators and a leading dot, so no session name can be `.takeover-*`. A
+session refused by a stale or forged `session_imported` event is recovered
+the way any migrated session is: by importing it, or by removing the local
+copy and its marker by hand.
+
+**Residual risk.** Removing the pair from command environments stops
+accidental inheritance, not a same-user process that reads its parent's
+environment through the operating system. A process already running in the source workspace when the
 import starts, and not holding the state-file lock, is excluded only by the
 stopped-source rule, as for a cross-host import. Runtime files of the old
 copy that the checks don't compare (its run-journal sidecar, version record
