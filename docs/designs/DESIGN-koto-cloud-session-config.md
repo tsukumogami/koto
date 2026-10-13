@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Proposed
 upstream: docs/prds/PRD-koto-cloud-session-config.md
 problem: |
@@ -32,6 +33,7 @@ rationale: |
   same host because the import never deletes anything under the source's
   prefix and the marker names the new session id. An exchange leaves the
   name held at every instant, which two renames can't.
+decision_provenance: inline-resolved
 ---
 
 # DESIGN: Cloud session config and same-host import
@@ -229,7 +231,29 @@ missing one. With neither set, the AWS block runs exactly as today.
 `ENV_SECRET_NAMES` lists the two koto names before the AWS pair, so
 `known_credentials` finds and labels them even when the load fails;
 `SecretSources` replaces its two booleans with the name of the variable that
-supplied each credential, and `redaction_keys` labels with it.
+supplied each credential, and `redaction_keys` labels with it. Both the
+value as set and its trimmed form are searched for.
+
+Three guards keep the pair from leaking:
+
+- **No project-file destination for the pair.** When the koto pair supplies
+  the credentials, `build_backend` refuses if `session.cloud.endpoint` or
+  `session.cloud.bucket` resolved from the project file, naming the setting
+  and the variable that would replace it. A committed project file in a
+  cloned repository can then never send requests signed with the pair, or
+  session content, to a host or bucket the operator didn't choose. This is the
+  rule `merge_decider` already applies to `decider.endpoint`. It touches only
+  hosts that set the new pair; the same exposure with the AWS pair predates
+  this feature and is proposed as its own issue.
+- **Not in any command's environment.** The two credential variables are
+  removed from every environment koto builds for a template command, the
+  legacy one (which otherwise inherits the whole process environment)
+  included, and `pass_env` refuses them as it refuses other names that can
+  never be passed. A gate script can't read them, so it can't write them into
+  evidence that reaches the bucket.
+- **Bounded echoes.** An error or origin line that repeats a raw value (the
+  backend, the path style) shows at most 64 characters, escaped with Rust's
+  debug formatting. Credential values are never echoed.
 
 #### Alternatives Considered
 
@@ -305,7 +329,8 @@ scratch directories in the store succeeds. A failed probe refuses
 `import_push_failed` with an `--as` hint, with nothing written.
 
 Writes: stage the new session (new id S') in `<sessions>/.takeover-<name>`
-(hidden from `list`, created exclusively, mode 0700); push under B's prefix
+(hidden from `list`, created with `create_dir` so a planted entry fails,
+mode 0700); push under B's prefix
 with the strict push (failure: take back, remove the directory, A
 unchanged); re-verify the holder under the held locks; write the marker (a
 definite failure takes back the push and leaves A unchanged; an unknown
@@ -313,7 +338,9 @@ outcome keeps everything and exits `import_unmarked`); exchange
 `.takeover-<name>` and `<name>` in one call; release the locks; remove the
 name's `.finished` record; journal the import; delete `.takeover-<name>`
 (now A's old copy) only if its header still holds A's id and its last seq
-hasn't grown, otherwise keep it and warn naming the path.
+hasn't grown and its context manifest is byte-identical to the one checked
+under the lock, otherwise keep it and warn naming the path. The removal
+refuses a symlink at the path and doesn't follow links inside it.
 
 Three guards on the cloud backend, each a local read:
 
@@ -473,12 +500,19 @@ setup), not for its code.
 **`src/cli/mod.rs`**
 
 - `build_backend`: `config::check_session_env(&config)?` first; for
-  `"cloud"`, a half pair refuses naming the missing variable before
-  `CloudBackend::new`. The unknown-backend error from a file keeps today's
+  `"cloud"`, a half pair refuses naming the missing variable, and with the
+  koto pair an endpoint or bucket whose origin is `project` refuses naming
+  the setting, both before `CloudBackend::new`. The unknown-backend error from a file keeps today's
   text.
 - `handle_config` `List`: JSON is `serde_json::to_value(&redacted)` with an
   `origins` object inserted; TOML is today's string followed by one `# origin:`
   line per setting.
+
+**`src/engine/command_env.rs`**
+
+- The two credential variables join the names `pass_env` refuses, and
+  `build_command_env` removes them from the legacy (inherited) environment
+  too, through a removal list on `CommandEnv::inherited`.
 
 **`src/engine/atomic_fs.rs`**
 
@@ -580,6 +614,9 @@ Errors from `build_backend`:
 - `KOTO_SESSION_CLOUD_PATH_STYLE is "yes"; set it to true or false, or unset it`
 - `KOTO_SESSION_CLOUD_ACCESS_KEY is set but KOTO_SESSION_CLOUD_SECRET_KEY is
   not; set both or neither`
+- `session.cloud.endpoint comes from the project file, which can't choose
+  where KOTO_SESSION_CLOUD_* credentials are sent; set
+  KOTO_SESSION_CLOUD_ENDPOINT or the user file instead`
 
 Import codes: `import_source_running`, `import_source_unpushed`,
 `import_source_has_children` (exit 2), and the existing codes unchanged.
@@ -611,7 +648,8 @@ alone: a host can enable the cloud backend through its environment once this
 lands.
 
 Deliverables:
-- `src/config/resolve.rs`, `src/config/mod.rs`, `src/cli/mod.rs` changes
+- `src/config/resolve.rs`, `src/config/mod.rs`, `src/cli/mod.rs`,
+  `src/engine/command_env.rs` changes
 - unit tests and `tests/` coverage for every config and credential criterion
 - `tests/decider_config.rs` and `tests/redaction_test.rs` updates
 - `docs/guides/cloud-sync-setup.md`: variables, precedence, credential pair,
@@ -639,6 +677,55 @@ build, reported with the last pull request. No product code.
 Deliverables:
 - an ignored test that serves the fake endpoint until told to stop
 - the measured run's exit codes and timings in the pull request body
+
+## Security Considerations
+
+**Credentials from the environment.** The koto pair is read only by
+`load_config` and handed to the S3 client as an explicit pair; a half pair
+refuses before any request, so the client never falls back to its own AWS
+lookup. The values are redacted on every surface that redacts credentials
+today, searched for under their own names in both their set and trimmed
+forms, including when a config file fails to load. They are removed from
+every command environment koto builds and can't be named in `pass_env`, so
+template commands and gate scripts never see them. `koto config list` prints
+`<set>` for them and the origin report names variables, never values.
+
+**Where the pair is sent.** A project file is committed to a repository and
+read from whatever directory a command runs in, so it can come from someone
+else. When the koto pair supplies the credentials, an endpoint or bucket from
+the project file refuses; the operator names them in the environment or the
+user file. Without the pair, resolution is unchanged, and a project file can
+still set the endpoint used with AWS-pair or user-file credentials, as it can
+today; that pre-existing exposure is proposed as a separate change because
+fixing it alters resolution for existing hosts.
+
+**Values echoed back.** The only raw values repeated in errors or the origin
+report are the backend and path style, capped and escaped. Endpoints printed
+by `config list` are unchanged; cloud error text already strips URL userinfo.
+
+**The takeover's file operations.** Everything happens inside the user's own
+`$HOME/.koto/sessions`, so the takeover can't reach another Unix user's
+sessions. `.takeover-<name>` is created exclusively with mode 0700; the
+directory at `<name>` must be a real directory on the store's device, not a
+symlink; the removal of the old copy refuses a symlink and deletes only after
+the identity, no-growth and manifest checks under which it was taken. The
+exchange is one system call, so no state exists in which the name points at a
+half-built session.
+
+**What a bucket writer can do.** Anyone who can write the bucket could already
+lock a session out by writing a marker, or replace its state; the import's
+existing trust model (`--trust-template` only when everyone who can write the
+bucket is trusted) is unchanged. The local migrated check reads a
+`session_imported` event from the local log, which for a pulled session came
+from the bucket, so a bucket writer could also trigger that refusal; this
+grants nothing a marker doesn't. On the shared bucket, an importer can mark
+another workspace's prefix as migrated, exactly as a cross-host import can.
+
+**Residual risk.** A process already running in the source workspace when the
+import starts, and not holding the state-file lock, is excluded only by the
+stopped-source rule, as for a cross-host import. Runtime files of the old
+copy that the checks don't compare (its run-journal sidecar, version record
+and lock files) are deleted with it; none of them holds session content.
 
 ## Consequences
 

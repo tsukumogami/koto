@@ -27,7 +27,8 @@ In Progress
 Amended 2026-10-13 by the design (`DESIGN-koto-cloud-session-config.md`,
 Decision 2), before implementation: "ahead of the bucket" also covers a
 forked log and unpushed context, and R14 records that the same-host import
-needs atomic directory exchange on the session store.
+needs atomic directory exchange on the session store. The design's
+security review added R7a and R10a.
 
 Absorbed [BRIEF-koto-cloud-session-config](docs/briefs/BRIEF-koto-cloud-session-config.md); carried in Absorbed Brief.
 
@@ -196,6 +197,10 @@ sessions live or which key they use.
   cloud backend exits non-zero with an error naming the missing variable,
   before any request reaches the endpoint. A command that builds the local
   backend is unaffected.
+- **R7a.** When the koto pair supplies the credentials, every command that
+  builds the cloud backend refuses if `session.cloud.endpoint` or
+  `session.cloud.bucket` came from the project file, naming the setting. A
+  committed project file never chooses where the koto pair is sent.
 - **R8.** With neither set, credentials resolve exactly as today:
   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` over the user file, with
   today's handling of each, an exported empty AWS variable included.
@@ -206,6 +211,9 @@ sessions live or which key they use.
   load. Where the koto and AWS values are equal, the koto variable's name is
   the label.
 - **R10.** Credentials stay barred from the project file, as today.
+- **R10a.** The two koto credential variables never reach a template
+  command: koto removes them from every command environment it builds, the
+  legacy one included, and a template's `pass_env` naming either is refused.
 
 **Origins in `koto config list`**
 
@@ -347,11 +355,18 @@ sessions live or which key they use.
       credentials, and `AWS_ACCESS_KEY_ID=""` overrides a user-file key as it
       does today (R8).
 - [ ] `koto config list` prints `<set>` for credentials from the koto pair;
-      a legacy-environment session's command that prints both koto values
-      shows `[REDACTED:KOTO_SESSION_CLOUD_ACCESS_KEY]` and
+      a command that prints both koto values read from a file shows
+      `[REDACTED:KOTO_SESSION_CLOUD_ACCESS_KEY]` and
       `[REDACTED:KOTO_SESSION_CLOUD_SECRET_KEY]`, including with a user file
       that fails to parse; with the koto and AWS values equal, the label is
       the koto variable's name (R9).
+- [ ] With the koto pair set and the project file setting
+      `session.cloud.endpoint`, a cloud command exits non-zero naming the
+      setting and the fake endpoint receives no request; with
+      `KOTO_SESSION_CLOUD_ENDPOINT` set as well, it succeeds (R7a).
+- [ ] In both a legacy-environment session and a default one, a command
+      printing `$KOTO_SESSION_CLOUD_SECRET_KEY` prints nothing, and a
+      template whose `pass_env` names it is refused (R10a).
 - [ ] `koto config set session.cloud.access_key x` without `--user` is
       refused as today (R10).
 
@@ -441,8 +456,9 @@ state, given three context keys, and then left alone (stopped).
   as written.
 - Re-pointing `workflows/publish-location` on import; the key is carried as
   today (koto#361).
-- Passing the new variables through to template commands. Non-legacy ticks
-  keep their minimal environment.
+- Removing the AWS pair from command environments, or refusing a
+  project-file endpoint used with the AWS pair. Both would change hosts that
+  set none of the new variables; they are proposed separately.
 - Two imports of the same source started at once from different
   workspaces. The stopped-source rule already excludes it, as it does for a
   cross-host import.
