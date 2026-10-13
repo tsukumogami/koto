@@ -2549,6 +2549,19 @@ mod session_env_tests {
     }
 
     #[test]
+    fn an_empty_backend_in_a_file_leaves_the_lower_layer_its_origin() {
+        // The merge ignores an empty backend, so the user file's value and
+        // origin stand.
+        let c = resolve(
+            "[session]\nbackend = \"cloud\"\n",
+            "[session]\nbackend = \"\"\n",
+            &[],
+        );
+        assert_eq!(c.session.backend, "cloud");
+        assert_eq!(c.session_env.origin("session.backend"), Origin::User);
+    }
+
+    #[test]
     fn command_vars_carry_only_what_the_environment_supplied() {
         let c = resolve(
             "[session.cloud]\nregion = \"user-region\"\n",

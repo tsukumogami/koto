@@ -1093,16 +1093,21 @@ mod tests {
 
     #[test]
     fn the_koto_credential_pair_is_searched_without_config_keys_and_named_first() {
-        // No config keys, as when a config file failed to load. The koto
-        // pair is found in the environment and labeled with its own names,
-        // also where the AWS pair holds the same values.
+        // When the user config file fails to parse, `koto next` loads the
+        // default configuration (`load_config().unwrap_or_default()`), whose
+        // redaction keys are empty: exactly the config keys passed here. The
+        // koto pair is still found in the environment through
+        // ENV_SECRET_NAMES and labeled with its own names, also where the AWS
+        // pair holds the same values.
         let rec = record(Some("/usr/bin"), &[]);
+        let config_keys = crate::config::redaction_keys(&crate::config::KotoConfig::default());
+        assert!(config_keys.is_empty());
         let lookup = env(&[
             ("KOTO_SESSION_CLOUD_ACCESS_KEY", "koto-access-key-id"),
             ("KOTO_SESSION_CLOUD_SECRET_KEY", "koto-secret-key-value"),
             ("AWS_ACCESS_KEY_ID", "koto-access-key-id"),
         ]);
-        let (built, _) = for_tick(Some(&rec), &[], "wf", None, &[], &[], lookup).unwrap();
+        let (built, _) = for_tick(Some(&rec), &[], "wf", None, &config_keys, &[], lookup).unwrap();
         assert_eq!(
             redacted(built.redactor(), "koto-access-key-id koto-secret-key-value"),
             "[REDACTED:KOTO_SESSION_CLOUD_ACCESS_KEY] [REDACTED:KOTO_SESSION_CLOUD_SECRET_KEY]"
