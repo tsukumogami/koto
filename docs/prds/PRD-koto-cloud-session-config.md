@@ -24,6 +24,11 @@ absorbed:
 
 In Progress
 
+Amended 2026-10-13 by the design (`DESIGN-koto-cloud-session-config.md`,
+Decision 2), before implementation: "ahead of the bucket" also covers a
+forked log and unpushed context, and R14 records that the same-host import
+needs atomic directory exchange on the session store.
+
 Absorbed [BRIEF-koto-cloud-session-config](docs/briefs/BRIEF-koto-cloud-session-config.md); carried in Absorbed Brief.
 
 ## Absorbed Brief
@@ -127,8 +132,10 @@ sessions live or which key they use.
   `$HOME/.koto/sessions` whose state-file header carries the same, non-empty
   `session_id` as the source's state file in the bucket under the `--from`
   workspace's prefix.
-- **Ahead of the bucket.** The local state log's last event `seq` is greater
-  than the last `seq` in the bucket's copy.
+- **Ahead of the bucket.** The local state log's event lines are not a
+  prefix of the bucket copy's (the local log is longer, or differs at a
+  `seq` both hold), or the local context manifest holds a key the bucket's
+  manifest lacks, or one whose hash differs and whose `created_at` is later.
 - **Legacy-environment session.** A session whose recorded command
   environment is marked legacy, so its template commands inherit the calling
   process's whole environment rather than koto's minimal one.
@@ -228,7 +235,11 @@ sessions live or which key they use.
 - **R14.** `koto session import <name> --from <workspace>` with no `--as`,
   run from a different workspace on the same host, succeeds and keeps
   `<name>` when the local session holding `<name>` is the source's own local
-  copy and is not ahead of the bucket.
+  copy and is not ahead of the bucket. It needs a session store that supports
+  atomic directory exchange (ext4, xfs, btrfs, tmpfs, APFS and the like); on
+  one that doesn't, or when `<name>` is not a plain directory on the store's
+  device, the import refuses before writing anything, with an error naming
+  `--as`, and `--as` works as today.
 - **R15.** After it, every command run from the source workspace against
   `<name>` that reads the session's state or context exits 2 with
   `session_migrated` naming the new session's workspace, as after a move
@@ -377,6 +388,12 @@ state, given three context keys, and then left alone (stopped).
 - [ ] With an event appended to A's local log and not pushed, the import
       exits 2 with `import_source_unpushed` and the `koto session resolve`
       hint (R16).
+- [ ] With A's local log differing from the bucket's at a `seq` both hold,
+      and separately with a context key added in A and not pushed, the
+      import exits 2 with `import_source_unpushed` (R16).
+- [ ] With atomic directory exchange reported unsupported, the import exits
+      non-zero naming `--as` before any request writes, and A is unchanged
+      (R14).
 - [ ] With the session's lock held by another process, the import exits 2
       with `import_source_running` (R16).
 - [ ] With a child session naming `<name>` as parent, the import exits 2
