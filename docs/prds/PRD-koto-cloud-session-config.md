@@ -101,6 +101,9 @@ sessions live or which key they use.
   workspace's prefix.
 - **Ahead of the bucket.** The local state log's last event `seq` is greater
   than the last `seq` in the bucket's copy.
+- **Legacy-environment session.** A session whose recorded command
+  environment is marked legacy, so its template commands inherit the calling
+  process's whole environment rather than koto's minimal one.
 - **Live session.** A session that accepts `koto next` without refusing with
   `session_migrated`.
 - **Builds the backend.** A command that opens any session's state or context
@@ -205,22 +208,28 @@ sessions live or which key they use.
   `session_imported` event; nothing from the source's local files is written
   into it after the import reads the bucket.
 - **R16.** A same-host import refuses with exit 2, and leaves the source's
-  local files, its prefix in the bucket and its marker unchanged, when:
-  - the source's own local copy is ahead of the bucket; the error says to run
-    `koto session resolve <name> --keep local` from the source workspace
-    first;
+  local files, its prefix in the bucket and its marker unchanged, when (checked
+  in this order, the first that applies wins):
   - another process holds the session's state-file lock (a non-blocking
-    attempt to take it fails); the error says the source is still running;
-  - a session in the local store names `<name>` as its parent; the error
-    names the child.
-  Each refusal has its own error code.
+    attempt to take it fails): code `import_source_running`, and the error
+    says the source is still running;
+  - the source's own local copy is ahead of the bucket: code
+    `import_source_unpushed`, and the error says to run `koto session resolve
+    <name> --keep local` from the source workspace first;
+  - a session in the local store names `<name>` as its parent: code
+    `import_source_has_children`, and the error names the child.
+  A local copy behind the bucket is not a refusal: the bucket's copy is what
+  the import reads. A local copy whose `session_id` is empty is not the
+  source's own local copy (R17).
 - **R17.** A local session holding `<name>` that is not the source's own
   local copy keeps refusing as `import_name_taken`, naming `--as`, and
   nothing local or remote changes. `--as` keeps today's behavior in every
   case.
-- **R18.** The failures in scope are a refused or failed remote request, a
-  failed local rename, and the process exiting between any two of the
-  import's writes. After any of them, either the source's local files,
+- **R18.** The import's writes are: the new session's objects under the
+  importing workspace's prefix, the marker on the source's prefix, and the
+  local directory that holds `<name>`. The failures in scope are a refused or
+  failed remote request, a failed local rename, and the process exiting
+  between any two of those writes. After any of them, either the source's local files,
   prefix and marker are unchanged, or running the same command again
   completes the import. At every point the name in the local store is held by
   at most one session directory, and the local store never holds the new
@@ -274,7 +283,12 @@ sessions live or which key they use.
       naming the variable and the value, no session directory is created, and
       `koto config list` exits 0 showing `s3` with origin `env
       KOTO_SESSION_BACKEND`. `KOTO_SESSION_CLOUD_PATH_STYLE=yes` and
-      `KOTO_SESSION_BACKEND=Cloud` behave the same (R4).
+      `KOTO_SESSION_BACKEND=Cloud` behave the same, and `koto config get
+      session.backend` exits 0 printing `s3`. `KOTO_SESSION_BACKEND=" cloud "`
+      selects the cloud backend (R1, R4).
+- [ ] Two processes sharing one `HOME`, one with `KOTO_SESSION_BACKEND=cloud`
+      and one without, each build their own backend from their own
+      environment (R2).
 - [ ] `KOTO_SESSION_CLOUD_MARKER_RETAIN_DAYS=1` leaves
       `marker_retain_days` at its user-file or default value and origin (R5).
 
@@ -297,7 +311,8 @@ sessions live or which key they use.
       a legacy-environment session's command that prints both koto values
       shows `[REDACTED:KOTO_SESSION_CLOUD_ACCESS_KEY]` and
       `[REDACTED:KOTO_SESSION_CLOUD_SECRET_KEY]`, including with a user file
-      that fails to parse (R9).
+      that fails to parse; with the koto and AWS values equal, the label is
+      the koto variable's name (R9).
 - [ ] `koto config set session.cloud.access_key x` without `--user` is
       refused as today (R10).
 
@@ -332,11 +347,14 @@ state, given three context keys, and then left alone (stopped).
 - [ ] B's state log equals the bucket's source events plus one
       `session_imported` event (R15).
 - [ ] With an event appended to A's local log and not pushed, the import
-      exits 2 with its code and the `koto session resolve` hint (R16).
+      exits 2 with `import_source_unpushed` and the `koto session resolve`
+      hint (R16).
 - [ ] With the session's lock held by another process, the import exits 2
-      with its code (R16).
+      with `import_source_running` (R16).
 - [ ] With a child session naming `<name>` as parent, the import exits 2
-      with its code, naming the child (R16).
+      with `import_source_has_children`, naming the child (R16).
+- [ ] With the bucket's copy one event ahead of A's local copy, the import
+      succeeds and B's log holds the bucket's events (R16).
 - [ ] In each of the three refusals, A's local files, A's prefix and the
       absence of a marker are unchanged (R16).
 - [ ] A different session named `<name>` in the local store makes the import
