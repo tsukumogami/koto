@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Draft
+status: Accepted
 problem: |
   Turning on koto's cloud backend means editing a file every live session
   on the host re-reads, the bucket key reaches every AWS tool, and a stopped
@@ -24,7 +24,7 @@ motivating_context: |
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
@@ -149,12 +149,3 @@ the environment, not the file.
 - Changes to shirabe's import step, unless the design finds koto alone
   can't keep the name.
 - Moving the live sessions on any existing host to the cloud backend.
-
-## Open Questions
-
-- What are the variables called, and where do they sit among the
-  existing layers (above the project file, or below it)?
-- When only half of the koto-prefixed credential pair is set, does koto
-  fall back to the `AWS_*` pair, mix them, or refuse?
-- What happens to the source workspace's local copy of a session after a
-  same-host import keeps its name?
