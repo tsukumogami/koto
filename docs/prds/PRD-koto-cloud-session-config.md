@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 problem: |
   koto takes its session backend and cloud location only from the user file,
   which every running session re-reads, or a project file in the exact working
@@ -21,7 +21,7 @@ upstream: docs/briefs/BRIEF-koto-cloud-session-config.md
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
