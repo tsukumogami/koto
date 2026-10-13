@@ -34,6 +34,7 @@ rationale: |
   prefix and the marker names the new session id. An exchange leaves the
   name held at every instant, which two renames can't.
 decision_provenance: inline-resolved
+user_visible_surface: true
 ---
 
 # DESIGN: Cloud session config and same-host import
@@ -252,8 +253,9 @@ Three guards keep the pair from leaking:
   never be passed. A gate script can't read them, so it can't write them into
   evidence that reaches the bucket.
 - **Bounded echoes.** An error or origin line that repeats a raw value (the
-  backend, the path style) shows at most 64 characters, escaped with Rust's
-  debug formatting. Credential values are never echoed.
+  backend, the path style) passes it through the redactor, then shows at most
+  32 characters, escaped with Rust's debug formatting. Credential values are
+  never echoed.
 
 #### Alternatives Considered
 
@@ -433,6 +435,14 @@ working directory, which is what the two directories are.
 
 ## Decision Outcome
 
+In short: seven `KOTO_SESSION_*` variables, one per setting, win over both
+config files; the two credential variables replace the AWS pair as a whole
+and refuse when half set or when the project file would choose their
+destination; `koto config list` gains an origin for every session setting;
+and a same-host import keeps the session's name by marking the source first,
+then exchanging directories in one call, with three local guards that keep
+the source workspace's commands off the new copy.
+
 The three decisions meet at `build_backend` and at the cloud backend's read
 path. Decision 1 makes the environment a full layer for the five settings and
 the credential pair, records where every value came from, and moves every
@@ -482,9 +492,8 @@ setup), not for its code.
 
 **`src/config/mod.rs`**
 
-- `KotoConfig` gains `#[serde(skip)] session_origins: SessionOrigins` and
-  `#[serde(skip)] session_env: SessionEnvFindings` (the `invalid_env` list and
-  `credential_pair_missing`).
+- `KotoConfig` gains one skip-serialized field, `session_env: SessionEnv`,
+  holding the origins, the `invalid_env` list and `credential_pair_missing`.
 - `SessionOrigins` holds one `Origin` per setting for the eight settings, in a
   fixed order, with `Origin` = `Env(&'static str) | Project | User | Default |
   Unset`. The initial value is `Default` for `backend`, `path_style` and
@@ -508,19 +517,28 @@ setup), not for its code.
   `origins` object inserted; TOML is today's string followed by one `# origin:`
   line per setting.
 
-**`src/engine/command_env.rs`**
+**`src/engine/command_env.rs`, `src/action.rs`, `src/session/version.rs`**
 
 - The two credential variables join the names `pass_env` refuses, and
   `build_command_env` removes them from the legacy (inherited) environment
-  too, through a removal list on `CommandEnv::inherited`.
+  too, through a removal list on `CommandEnv::inherited`. koto spawns
+  subprocesses in two places outside tests: `src/action.rs` (every template
+  command, gate and default action runs through it with a `CommandEnv`) and
+  the `hostname` call in `src/session/version.rs`, which gets an explicit
+  `env_remove` of the pair. A test asserts the pair is absent in both.
+- A koto run nested inside a gate script sees `KOTO_SESSION_BACKEND` and the
+  location but not the pair, so it either uses AWS-pair or user-file
+  credentials as any process would, or fails closed with no credentials; it
+  never receives the parent's pair.
 
 **`src/engine/atomic_fs.rs`**
 
 - `exchange_dirs(a: &Path, b: &Path) -> Result<(), AtomicCreateError>`:
   `renameat2(AT_FDCWD, a, AT_FDCWD, b, RENAME_EXCHANGE)` on Linux,
   `renamex_np(a, b, RENAME_SWAP)` on Apple, `Unsupported` elsewhere.
-- `exchange_supported(dir: &Path) -> bool`: creates two empty scratch
-  directories in `dir`, exchanges them, removes them.
+- `exchange_supported(dir: &Path) -> bool`: checks that `dir` is owned by
+  the invoking user, creates two empty scratch directories in it, exchanges
+  them, removes them.
 
 **`src/session/cloud.rs`**
 
@@ -533,6 +551,19 @@ setup), not for its code.
   (`import_source_has_children`), all exit 2.
 - `takeover_session(req, &source)`: the checks and writes of Decision 2,
   holding the two lock guards from the check through the exchange.
+- `local_ahead_of(local, &source, &source_manifest) -> bool`: the "ahead"
+  test (event lines not a prefix of the bucket's, or a manifest key missing
+  from or newer than the bucket's), one helper used by the first check, the
+  re-verification under the lock and the post-marker re-run.
+- On a post-marker re-run, S' is read from the marker's
+  `target.session_id`; the marker is the only record of it.
+- The local migrated check keeps its own per-process cache and runs before
+  the remote marker check, which it neither reads nor populates.
+- Test seam: `KOTO_TEST_IMPORT_FAULT`, in the pattern of
+  `KOTO_TEST_JOURNAL_LOCK_WAIT_MS`, names one point (`after-push`,
+  `after-mark`, `exchange-unsupported`, `exchange-error`, `after-exchange`,
+  `after-journal`) at which the takeover fails or exits as if killed. Unset,
+  it does nothing.
 - `stage_import` takes an optional session id (reused on a post-marker re-run)
   and a target staging directory.
 - The own-marker branch gains the two takeover states (A's copy still at the
@@ -655,21 +686,33 @@ Deliverables:
 - `docs/guides/cloud-sync-setup.md`: variables, precedence, credential pair,
   origin report; dated note in `DESIGN-config-and-cloud-sync.md`
 
-### Phase 2: Same-host import
+### Phase 2: Exchange primitive and the import guards
 
-The exchange primitive, the takeover branch and its re-run states, the three
-guards, and their tests, including fault injection. Its tests set the backend
-through the environment, so they build on Phase 1.
+The `atomic_fs` exchange and probe, and the three cloud-backend guards (local
+migrated check, takeover pending, identity-checked pull), with unit and
+integration tests. Low risk and testable on their own; nothing calls the
+exchange yet, and the guards only fire for import pairs, which a cross-host
+import already produces. Its code doesn't depend on Phase 1; its integration
+tests set the backend through the environment, so it lands after Phase 1.
 
 Deliverables:
 - `src/engine/atomic_fs.rs`: `exchange_dirs`, `exchange_supported`
-- `src/session/cloud.rs`: takeover branch, new codes, guards
+- `src/session/cloud.rs`: the three guards
+- tests for each guard, including the fail-open listing case
+
+### Phase 3: Same-host takeover
+
+The takeover branch, its re-run states, the new codes, the fault seam, and
+the same-host test file, plus the guide's same-host section.
+
+Deliverables:
+- `src/session/cloud.rs`: takeover branch, `local_ahead_of`, new codes
 - `src/cli/session.rs`: `explicit_as`
 - `tests/same_host_import_test.rs`
 - `docs/guides/cloud-sync-setup.md`: same-host import; dated note in
   `DESIGN-session-migration.md`
 
-### Phase 3: Measured acceptance
+### Phase 4: Measured acceptance
 
 The ignored endpoint-serving test and the measured run against a release
 build, reported with the last pull request. No product code.
@@ -703,9 +746,10 @@ fixing it alters resolution for existing hosts.
 report are the backend and path style, capped and escaped. Endpoints printed
 by `config list` are unchanged; cloud error text already strips URL userinfo.
 
-**The takeover's file operations.** Everything happens inside the user's own
-`$HOME/.koto/sessions`, so the takeover can't reach another Unix user's
-sessions. `.takeover-<name>` is created exclusively with mode 0700; the
+**The takeover's file operations.** Everything happens inside
+`$HOME/.koto/sessions`, and the exchange probe refuses unless that directory
+belongs to the invoking user, so the takeover can't reach another Unix user's
+sessions even under a shared `HOME`. `.takeover-<name>` is created exclusively with mode 0700; the
 directory at `<name>` must be a real directory on the store's device, not a
 symlink; the removal of the old copy refuses a symlink and deletes only after
 the identity, no-growth and manifest checks under which it was taken. The
@@ -731,9 +775,16 @@ alone. Session names already pass `ValidatedSessionId`, which refuses path
 separators and a leading dot, so no session name can be `.takeover-*`. A
 session refused by a stale or forged `session_imported` event is recovered
 the way any migrated session is: by importing it, or by removing the local
-copy and its marker by hand.
+copy and its marker by hand. Removing the local copy discards anything not
+pushed, which costs more than clearing a marker; it is recorded as a residual
+risk below.
 
-**Residual risk.** Removing the pair from command environments stops
+**Residual risk.** A project file can still choose the endpoint and bucket
+used with AWS-pair or user-file credentials, as it can today; more hosts will
+run the cloud backend after this feature, so the proposed separate change
+matters more than before. A forged `session_imported` event in a bucket copy
+locks that session out locally until someone removes the local copy by hand.
+Removing the pair from command environments stops
 accidental inheritance, not a same-user process that reads its parent's
 environment through the operating system. A process already running in the source workspace when the
 import starts, and not holding the state-file lock, is excluded only by the
@@ -770,7 +821,7 @@ and lock files) are deleted with it; none of them holds session content.
 - After a crash mid-takeover, `<name>` refuses commands from both workspaces
   until the import runs again.
 - The macOS exchange arm isn't exercised by CI, which runs on Linux only.
-- `KotoConfig` carries two more skip-serialized side channels.
+- `KotoConfig` carries one more skip-serialized side channel.
 - A file with a `[session]` table and no `backend` still resets an earlier
   layer's backend to `local`, as today; the origin report now shows it as
   `default`, which may surprise.
@@ -787,3 +838,9 @@ and lock files) are deleted with it; none of them holds session content.
 - The exchange primitive is a thin wrapper next to `atomic_rename_dir`, whose
   macOS arm uses the same `renamex_np` call with a different flag.
 - The `[session]`-table reset is proposed as its own issue.
+- The macOS arm is the same `renamex_np` call `atomic_rename_dir` already
+  makes, with `RENAME_SWAP` for `RENAME_EXCL`, and the measured acceptance run
+  is done on macOS, so it is exercised once by hand.
+- The side channel is never serialized and is read only by `config list`,
+  `config get`, `build_backend` and redaction, the same shape as
+  `secret_sources`.
