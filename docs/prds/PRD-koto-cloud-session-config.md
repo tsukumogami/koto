@@ -28,7 +28,9 @@ Amended 2026-10-13 by the design (`DESIGN-koto-cloud-session-config.md`,
 Decision 2), before implementation: "ahead of the bucket" also covers a
 forked log and unpushed context, and R14 records that the same-host import
 needs atomic directory exchange on the session store. The design's
-security review added R7a and R10a.
+security review added R7a and R10a; R10a was revised before
+implementation so that koto's own gates and actions, which call koto, keep
+reaching the cloud backend.
 
 Absorbed [BRIEF-koto-cloud-session-config](docs/briefs/BRIEF-koto-cloud-session-config.md); carried in Absorbed Brief.
 
@@ -211,9 +213,13 @@ sessions live or which key they use.
   load. Where the koto and AWS values are equal, the koto variable's name is
   the label.
 - **R10.** Credentials stay barred from the project file, as today.
-- **R10a.** The two koto credential variables never reach a template
-  command: koto removes them from every command environment it builds, the
-  legacy one included, and a template's `pass_env` naming either is refused.
+- **R10a.** A koto command run by a gate or action reaches the same
+  backend, location and credentials as the tick that ran it. In every command
+  environment koto builds, legacy or not, it sets each `KOTO_SESSION_*`
+  variable that supplied a resolved session setting to the value it resolved,
+  the credential pair included when the pair is in use. Values that came from
+  a config file are not exported: a nested koto reads the same files. Output
+  that repeats a credential is still redacted (R9).
 
 **Origins in `koto config list`**
 
@@ -364,9 +370,12 @@ sessions live or which key they use.
       `session.cloud.endpoint`, a cloud command exits non-zero naming the
       setting and the fake endpoint receives no request; with
       `KOTO_SESSION_CLOUD_ENDPOINT` set as well, it succeeds (R7a).
-- [ ] In both a legacy-environment session and a default one, a command
-      printing `$KOTO_SESSION_CLOUD_SECRET_KEY` prints nothing, and a
-      template whose `pass_env` names it is refused (R10a).
+- [ ] With the cloud backend and credentials enabled only through the
+      variables, in both a legacy-environment session and a default one, a
+      gate that runs `koto context get` on its own session against the fake
+      endpoint passes and reads the key's value; a command that prints the
+      secret-key variable shows `[REDACTED:KOTO_SESSION_CLOUD_SECRET_KEY]`
+      (R9, R10a).
 - [ ] `koto config set session.cloud.access_key x` without `--user` is
       refused as today (R10).
 

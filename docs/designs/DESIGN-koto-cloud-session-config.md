@@ -235,7 +235,7 @@ missing one. With neither set, the AWS block runs exactly as today.
 supplied each credential, and `redaction_keys` labels with it. Both the
 value as set and its trimmed form are searched for.
 
-Three guards keep the pair from leaking:
+Three rules govern where the pair goes:
 
 - **No project-file destination for the pair.** When the koto pair supplies
   the credentials, `build_backend` refuses if `session.cloud.endpoint` or
@@ -246,12 +246,19 @@ Three guards keep the pair from leaking:
   rule `merge_decider` already applies to `decider.endpoint`. It touches only
   hosts that set the new pair; the same exposure with the AWS pair predates
   this feature and is proposed as its own issue.
-- **Not in any command's environment.** The two credential variables are
-  removed from every environment koto builds for a template command, the
-  legacy one (which otherwise inherits the whole process environment)
-  included, and `pass_env` refuses them as it refuses other names that can
-  never be passed. A gate script can't read them, so it can't write them into
-  evidence that reaches the bucket.
+- **The same settings for koto's own commands.** Gates and actions often
+  call koto themselves (`koto context get` and the like), and a default
+  session's commands get only a minimal environment, so a koto run by a gate
+  would otherwise see none of the variables and fall back to the local
+  backend. In every environment koto builds for a template command, legacy or
+  not, it sets each `KOTO_SESSION_*` variable that supplied a resolved
+  session setting to the value it resolved, the credential pair included when
+  the pair is in use; values from config files aren't exported, since a
+  nested koto reads the same files. This trades away the stronger rule the
+  security review first proposed, removing the pair from every command
+  environment: a gate script can read the pair, as it can read a user file it
+  has access to. Anything it prints that matches a credential is still
+  redacted.
 - **Bounded echoes.** An error or origin line that repeats a raw value (the
   backend, the path style) passes it through the redactor, then shows at most
   32 characters, escaped with Rust's debug formatting. Credential values are
@@ -519,17 +526,18 @@ setup), not for its code.
 
 **`src/engine/command_env.rs`, `src/action.rs`, `src/session/version.rs`**
 
-- The two credential variables join the names `pass_env` refuses, and
-  `build_command_env` removes them from the legacy (inherited) environment
-  too, through a removal list on `CommandEnv::inherited`. koto spawns
-  subprocesses in two places outside tests: `src/action.rs` (every template
-  command, gate and default action runs through it with a `CommandEnv`) and
-  the `hostname` call in `src/session/version.rs`, which gets an explicit
-  `env_remove` of the pair. A test asserts the pair is absent in both.
-- A koto run nested inside a gate script sees `KOTO_SESSION_BACKEND` and the
-  location but not the pair, so it either uses AWS-pair or user-file
-  credentials as any process would, or fails closed with no credentials; it
-  never receives the parent's pair.
+- `build_command_env` takes the resolved `SessionEnv` and adds, to both
+  the cleared and the inherited (legacy) environment, every `KOTO_SESSION_*`
+  variable whose origin is `env`, with the value koto resolved (trimmed). A
+  default session's commands then carry exactly what a nested koto needs to
+  resolve the same backend; a legacy session's carry what they already
+  inherited. Commands run through `src/action.rs` with that `CommandEnv`;
+  the `hostname` call in `src/session/version.rs` inherits the process
+  environment as today.
+- A test pins the case the coordinate workflow relies on: with the backend
+  and the pair set only through the variables, a gate that runs `koto context
+  get` on its own session reaches the fake endpoint and passes, in a legacy
+  and in a default session.
 
 **`src/engine/atomic_fs.rs`**
 
@@ -728,10 +736,12 @@ Deliverables:
 refuses before any request, so the client never falls back to its own AWS
 lookup. The values are redacted on every surface that redacts credentials
 today, searched for under their own names in both their set and trimmed
-forms, including when a config file fails to load. They are removed from
-every command environment koto builds and can't be named in `pass_env`, so
-template commands and gate scripts never see them. `koto config list` prints
-`<set>` for them and the origin report names variables, never values.
+forms, including when a config file fails to load. koto sets them in the
+environment of the commands it runs, so a koto that a gate or action calls
+reaches the same backend; a gate script can therefore read them, which is
+the accepted cost of koto's own commands working, and anything it prints that
+matches them is redacted. `koto config list` prints `<set>` for them and the
+origin report names variables, never values.
 
 **Where the pair is sent.** A project file is committed to a repository and
 read from whatever directory a command runs in, so it can come from someone
@@ -765,8 +775,7 @@ from the bucket, so a bucket writer could also trigger that refusal; this
 grants nothing a marker doesn't. On the shared bucket, an importer can mark
 another workspace's prefix as migrated, exactly as a cross-host import can.
 
-**Implementation notes from the review.** Every place koto spawns a
-subprocess, not only `build_command_env`, is checked for the pair. A
+**Implementation notes from the review.** A
 variable whose value isn't valid Unicode counts as set and invalid, so it
 can't fall through to another credential source. The raw path-style value
 `config get` prints goes through the same cap and escape as the error text.
@@ -784,9 +793,10 @@ used with AWS-pair or user-file credentials, as it can today; more hosts will
 run the cloud backend after this feature, so the proposed separate change
 matters more than before. A forged `session_imported` event in a bucket copy
 locks that session out locally until someone removes the local copy by hand.
-Removing the pair from command environments stops
-accidental inheritance, not a same-user process that reads its parent's
-environment through the operating system. A process already running in the source workspace when the
+The pair reaches template commands, so a template
+that writes its environment into evidence can put the pair in the bucket in
+a form the redactor doesn't recognize (encoded, split); a template is
+trusted code, as it already is for user-file credentials. A process already running in the source workspace when the
 import starts, and not holding the state-file lock, is excluded only by the
 stopped-source rule, as for a cross-host import. Runtime files of the old
 copy that the checks don't compare (its run-journal sidecar, version record
