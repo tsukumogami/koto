@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-koto-cloud-session-config.md
 problem: |
   koto resolves its session backend, cloud location and bucket credentials in
@@ -41,7 +41,7 @@ user_visible_surface: true
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
@@ -561,9 +561,9 @@ setup), not for its code.
   the remote marker check, which it neither reads nor populates.
 - Test seam: `KOTO_TEST_IMPORT_FAULT`, in the pattern of
   `KOTO_TEST_JOURNAL_LOCK_WAIT_MS`, names one point (`after-push`,
-  `after-mark`, `exchange-unsupported`, `exchange-error`, `after-exchange`,
-  `after-journal`) at which the takeover fails or exits as if killed. Unset,
-  it does nothing.
+  `after-mark`, `exchange-unsupported`, `name-other-device`,
+  `exchange-error`, `after-exchange`, `after-journal`) at which the takeover
+  fails or exits as if killed. Unset, it does nothing.
 - `stage_import` takes an optional session id (reused on a post-marker re-run)
   and a target staging directory.
 - The own-marker branch gains the two takeover states (A's copy still at the
