@@ -158,7 +158,11 @@ fn mark_file_origins(
         if setting == "session.cloud.marker_retain_days" && !user_layer {
             continue;
         }
-        if loaded.session_keys.iter().any(|k| k == setting) {
+        let named = loaded.session_keys.iter().any(|k| k == setting);
+        // An empty backend is the one value a file can name that the merge
+        // ignores; the layer below keeps the setting, and its origin.
+        let ignored = setting == "session.backend" && loaded.config.session.backend.is_empty();
+        if named && !ignored {
             config.session_env.set_origin(setting, origin);
         } else if setting == "session.backend" && !loaded.config.session.backend.is_empty() {
             config.session_env.set_origin(setting, Origin::Default);

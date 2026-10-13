@@ -493,6 +493,23 @@ fn the_pair_is_never_sent_to_a_project_file_destination() {
     let env = cloud_env(&s3);
     let out = b.koto(&["init", "demo", "--template", "demo.md"], &as_refs(&env));
     assert!(out.status.success(), "{}", describe(&out));
+
+    // The bucket the same way.
+    let b = Box_::new();
+    b.project_file("[session.cloud]\nbucket = \"elsewhere\"\n");
+    s3.clear_requests();
+    let env: Vec<(&'static str, String)> = cloud_env(&s3)
+        .into_iter()
+        .filter(|(k, _)| *k != "KOTO_SESSION_CLOUD_BUCKET")
+        .collect();
+    let out = b.koto(&["init", "demo", "--template", "demo.md"], &as_refs(&env));
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert!(
+        stderr(&out).contains("session.cloud.bucket"),
+        "{}",
+        describe(&out)
+    );
+    assert!(s3.requests().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -573,7 +590,10 @@ fn empty_koto_credentials_fall_through_to_the_aws_pair() {
 /// The case the coordinate workflow relies on: a gate that calls koto
 /// reaches the same cloud backend as the tick that runs it, in a default
 /// session (whose commands get only a minimal environment) and in a legacy
-/// one. The gate checks that the nested koto resolved the cloud backend and
+/// one. The default session is the discriminating half: its commands see
+/// none of the caller's variables unless koto passes them. A legacy
+/// session's commands inherit the caller's environment, so that half pins
+/// that passing the settings again doesn't break it. The gate checks that the nested koto resolved the cloud backend and
 /// read the key through it; without the settings in its environment it
 /// would see the local backend, and without the pair it couldn't
 /// authenticate.
@@ -647,7 +667,7 @@ states:
     gates:
       leak:
         type: command
-        command: "cat secrets.txt; exit 1"
+        command: "cat secrets.txt; echo \"env=$KOTO_SESSION_CLOUD_SECRET_KEY\"; exit 1"
     transitions:
       - target: done
   done:
@@ -663,14 +683,16 @@ Run.
 Done.
 "#;
     std::fs::write(b.ws.join("leaky.md"), template).unwrap();
+    // The file holds the values as set (padded) and as koto uses them
+    // (trimmed); the gate also echoes the variable koto passes it.
     std::fs::write(
         b.ws.join("secrets.txt"),
-        "id=koto-access-key-id key=koto-secret-key-value\n",
+        "padded=[ koto-secret-key-value ] trimmed=koto-secret-key-value id=koto-access-key-id\n",
     )
     .unwrap();
     let env = [
         ("KOTO_SESSION_CLOUD_ACCESS_KEY", "koto-access-key-id"),
-        ("KOTO_SESSION_CLOUD_SECRET_KEY", "koto-secret-key-value"),
+        ("KOTO_SESSION_CLOUD_SECRET_KEY", " koto-secret-key-value "),
     ];
     let out = b.koto(&["init", "leaky", "--template", "leaky.md"], &env);
     assert!(out.status.success(), "{}", describe(&out));
@@ -678,6 +700,18 @@ Done.
     let all = stdout(&out) + &stderr(&out);
     assert!(!all.contains("koto-secret-key-value"), "{all}");
     assert!(!all.contains("koto-access-key-id"), "{all}");
+    assert!(
+        all.contains("[REDACTED:KOTO_SESSION_CLOUD_SECRET_KEY]"),
+        "the secret is labeled with its variable: {all}"
+    );
+    assert!(
+        all.contains("[REDACTED:KOTO_SESSION_CLOUD_ACCESS_KEY]"),
+        "the access key is labeled with its variable: {all}"
+    );
+    assert!(
+        all.contains("env=[REDACTED:KOTO_SESSION_CLOUD_SECRET_KEY]"),
+        "the gate received the secret from koto and its echo is redacted: {all}"
+    );
 }
 
 #[test]
