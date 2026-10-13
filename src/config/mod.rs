@@ -1,4 +1,5 @@
 pub mod resolve;
+pub mod session_env;
 pub mod validate;
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,11 @@ pub struct KotoConfig {
     /// never serialized; read by [`redaction_keys`].
     #[serde(skip)]
     pub secret_sources: SecretSources,
+    /// Where each session setting came from, and what the environment
+    /// layer couldn't use. Filled by `resolve::load_config`, never
+    /// serialized; `koto config list` prints it beside the tables.
+    #[serde(skip)]
+    pub session_env: session_env::SessionEnv,
 }
 
 /// Provenance of koto's secret settings, for redaction.
@@ -37,10 +43,13 @@ pub struct KotoConfig {
 /// Never serialized, and its `Debug` prints setting names only.
 #[derive(Clone, Default)]
 pub struct SecretSources {
-    /// `AWS_ACCESS_KEY_ID` supplied `session.cloud.access_key`.
-    pub access_key_from_env: bool,
-    /// `AWS_SECRET_ACCESS_KEY` supplied `session.cloud.secret_key`.
-    pub secret_key_from_env: bool,
+    /// The environment variable that supplied `session.cloud.access_key`
+    /// (`KOTO_SESSION_CLOUD_ACCESS_KEY` or `AWS_ACCESS_KEY_ID`), if one did.
+    pub access_key_env: Option<&'static str>,
+    /// The environment variable that supplied `session.cloud.secret_key`
+    /// (`KOTO_SESSION_CLOUD_SECRET_KEY` or `AWS_SECRET_ACCESS_KEY`), if one
+    /// did.
+    pub secret_key_env: Option<&'static str>,
     /// `(setting name, config-file value)` for each secret a config file
     /// set, in load order, without repeats.
     pub file_values: Vec<(&'static str, String)>,
@@ -49,8 +58,8 @@ pub struct SecretSources {
 impl std::fmt::Debug for SecretSources {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecretSources")
-            .field("access_key_from_env", &self.access_key_from_env)
-            .field("secret_key_from_env", &self.secret_key_from_env)
+            .field("access_key_env", &self.access_key_env)
+            .field("secret_key_env", &self.secret_key_env)
             .field(
                 "file_values",
                 &self.file_values.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
@@ -78,23 +87,26 @@ pub fn redaction_keys(config: &KotoConfig) -> Vec<(String, String)> {
         keys.push((source.to_string(), v.clone()));
     }
     let src = &config.secret_sources;
-    for (value, from_env, env_name, setting) in [
+    for (value, env_name, setting) in [
         (
             &config.session.cloud.access_key,
-            src.access_key_from_env,
-            resolve::ENV_AWS_ACCESS_KEY_ID,
+            src.access_key_env,
             "session.cloud.access_key",
         ),
         (
             &config.session.cloud.secret_key,
-            src.secret_key_from_env,
-            resolve::ENV_AWS_SECRET_ACCESS_KEY,
+            src.secret_key_env,
             "session.cloud.secret_key",
         ),
     ] {
         if let Some(v) = value {
-            let source = if from_env { env_name } else { setting };
+            let source = env_name.unwrap_or(setting);
             keys.push((source.to_string(), v.clone()));
+            // A trimmed environment value is what koto uses; the value as
+            // set is what a command that echoes the variable prints.
+            if env_name.is_some() && v.trim() != v {
+                keys.push((source.to_string(), v.trim().to_string()));
+            }
         }
     }
     for (setting, v) in &src.file_values {
@@ -470,7 +482,10 @@ pub fn get_value(config: &KotoConfig, key: &str) -> Option<String> {
         "session.cloud.region" => config.session.cloud.region.clone(),
         "session.cloud.access_key" => config.session.cloud.access_key.clone(),
         "session.cloud.secret_key" => config.session.cloud.secret_key.clone(),
-        "session.cloud.path_style" => config.session.cloud.path_style.map(|b| b.to_string()),
+        "session.cloud.path_style" => match config.session_env.invalid_for(key) {
+            Some(bad) => Some(session_env::echo(bad.raw.as_deref(), config)),
+            None => config.session.cloud.path_style.map(|b| b.to_string()),
+        },
         "session.cloud.marker_retain_days" => {
             Some(config.session.cloud.marker_retain_days().to_string())
         }

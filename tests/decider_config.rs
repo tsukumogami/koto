@@ -95,7 +95,13 @@ fn list_without_decider_has_no_decider_key() {
     assert!(v.get("decider").is_none(), "{}", out.stdout);
     assert_eq!(
         v.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
-        vec!["request_store", "run_journal", "session", "workflows"]
+        vec![
+            "origins",
+            "request_store",
+            "run_journal",
+            "session",
+            "workflows"
+        ]
     );
 }
 

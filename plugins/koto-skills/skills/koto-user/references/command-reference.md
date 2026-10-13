@@ -1061,6 +1061,10 @@ Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.buc
 
 `session.cloud.path_style` takes `true` or `false` (unset means `false`). `true` puts the bucket in the URL path instead of a subdomain, which an endpoint given as an IP address needs.
 
+Every `session.*` key except `marker_retain_days` also reads an environment variable, `KOTO_` plus the dotted name upper-cased with dots as underscores (`KOTO_SESSION_BACKEND`, `KOTO_SESSION_CLOUD_ENDPOINT`, `KOTO_SESSION_CLOUD_BUCKET`, `KOTO_SESSION_CLOUD_REGION`, `KOTO_SESSION_CLOUD_PATH_STYLE`, `KOTO_SESSION_CLOUD_ACCESS_KEY`, `KOTO_SESSION_CLOUD_SECRET_KEY`), which wins over project and user config; empty means unset. The two credential variables replace `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` as a pair. These refuse on any command that opens a session, naming the variable: a backend other than `local`/`cloud` or a path style other than `true`/`false` from the environment, one credential variable set without the other, and the endpoint or bucket coming from project config while the koto pair is in use. `koto config list` still runs and shows them.
+
+`koto config list` ends with one `# origin: <key> = <source>` comment line per session key (`env <VARIABLE>`, `project`, `user`, `default`, `unset`); `--json` has the same under a top-level `origins` object.
+
 The `[decider]` keys opt the user in to consulting a decider on declared template fields. It's off by default, and it's the user's choice, not the agent's: don't set these keys unless the user asks you to.
 
 | Key | Values | Default | Project config |
