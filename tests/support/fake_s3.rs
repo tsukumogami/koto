@@ -43,6 +43,10 @@ pub struct Request {
     pub key: String,
     /// For a listing, its `prefix` parameter.
     pub list_prefix: Option<String>,
+    /// The access key id the request was signed with, read from the
+    /// `Credential=` part of its `Authorization` header; `None` when the
+    /// request carried no signature.
+    pub access_key: Option<String>,
     /// When the request had been read in full.
     pub at: Instant,
 }
@@ -217,6 +221,7 @@ struct Incoming {
     path: String,
     query: Vec<(String, String)>,
     body: Vec<u8>,
+    access_key: Option<String>,
 }
 
 fn read_request(stream: &TcpStream) -> Option<Incoming> {
@@ -228,6 +233,7 @@ fn read_request(stream: &TcpStream) -> Option<Incoming> {
     let target = parts.next()?.to_string();
 
     let mut content_length = 0usize;
+    let mut access_key = None;
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).ok()? == 0 {
@@ -240,6 +246,13 @@ fn read_request(stream: &TcpStream) -> Option<Incoming> {
         if let Some((name, value)) = h.split_once(':') {
             if name.trim().eq_ignore_ascii_case("content-length") {
                 content_length = value.trim().parse().unwrap_or(0);
+            }
+            if name.trim().eq_ignore_ascii_case("authorization") {
+                access_key = value
+                    .split("Credential=")
+                    .nth(1)
+                    .and_then(|rest| rest.split('/').next())
+                    .map(str::to_string);
             }
         }
     }
@@ -258,6 +271,7 @@ fn read_request(stream: &TcpStream) -> Option<Incoming> {
         path: percent_decode(&path),
         query,
         body,
+        access_key,
     })
 }
 
@@ -352,6 +366,7 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
         } else {
             None
         },
+        access_key: req.access_key.clone(),
         at: Instant::now(),
     });
 

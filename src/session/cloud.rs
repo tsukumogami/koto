@@ -158,6 +158,15 @@ pub struct CloudBackend {
     /// A command reads a session's state many times; the marker costs one
     /// request per session per process.
     migration_checks: Mutex<HashMap<String, Option<SessionMigrated>>>,
+    /// Per-process answers of the local half of the migration check
+    /// ([`CloudBackend::local_guard`]): `Some` when the local copy at the
+    /// name is a session imported from this very workspace's copy, which a
+    /// same-host import leaves behind. Each answer is kept with the
+    /// identity of the state file it was read from, so a takeover that
+    /// swaps the directory under a running process is noticed. Kept apart
+    /// from `migration_checks`, which only the bucket's marker fills.
+    /// Boxed so the backend stays small beside `LocalBackend` in `Backend`.
+    local_migration_checks: Box<Mutex<HashMap<String, LocalCheck>>>,
 }
 
 impl CloudBackend {
@@ -188,6 +197,7 @@ impl CloudBackend {
             prefix,
             manifest_cache: ManifestCache::new(),
             migration_checks: Mutex::new(HashMap::new()),
+            local_migration_checks: Box::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -240,6 +250,7 @@ impl CloudBackend {
     /// presence is the signal, and a marker written by a newer koto must
     /// not fork the session on an older one.
     pub fn check_not_migrated(&self, id: &str) -> anyhow::Result<()> {
+        self.local_guard(id)?;
         let mut checks = self
             .migration_checks
             .lock()
@@ -272,6 +283,75 @@ impl CloudBackend {
             Some(migrated) => Err(anyhow::Error::new(migrated)),
             None => Ok(()),
         }
+    }
+
+    /// The local half of the migration check, which never makes a request.
+    ///
+    /// On one host every workspace shares the local store, so a same-host
+    /// import leaves the imported session at the name the source's copy
+    /// used. Two things refuse here, before any pull could write over the
+    /// other side's copy:
+    ///
+    /// - a `.takeover-<id>` directory in the store: an import of `id` is
+    ///   between its push and its last step (or stopped there), and neither
+    ///   workspace may read or write the name until it is run again;
+    /// - a local copy whose latest `session_imported` event names this
+    ///   backend's own workspace and this name as its source: the copy is
+    ///   the session this workspace's copy was imported into, so this
+    ///   workspace refuses with `session_migrated` even when the bucket's
+    ///   marker can't be listed.
+    ///
+    /// The second answer is cached per process, like the marker's.
+    pub fn local_guard(&self, id: &str) -> anyhow::Result<()> {
+        let pending = takeover_dir(self.local.base_dir(), id);
+        if std::fs::symlink_metadata(&pending).is_ok() {
+            anyhow::bail!(
+                "session '{}' is being imported on this host and the import hasn't finished \
+                 ({} exists); run the same `koto session import {}` again from the importing \
+                 workspace to finish it",
+                id,
+                pending.display(),
+                id
+            );
+        }
+        let file = file_identity(&self.local.session_dir(id).join(state_file_name(id)));
+        let mut checks = self
+            .local_migration_checks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let answer = match checks.get(id) {
+            Some((seen, answer)) if *seen == file => answer.clone(),
+            _ => {
+                let answer = self.local_import_from_here(id);
+                checks.insert(id.to_string(), (file, answer.clone()));
+                answer
+            }
+        };
+        match answer {
+            Some(migrated) => Err(anyhow::Error::new(migrated)),
+            None => Ok(()),
+        }
+    }
+
+    /// `Some` when the local copy at `id` is an import of this workspace's
+    /// own copy of `id`.
+    fn local_import_from_here(&self, id: &str) -> Option<SessionMigrated> {
+        let bytes = std::fs::read(self.local.session_dir(id).join(state_file_name(id))).ok()?;
+        let imported = ImportedAs::read(&bytes)?;
+        if imported.from_session != id {
+            return None;
+        }
+        let from = crate::session::local::prefix_for_workspace(Path::new(&imported.from_workspace))
+            .ok()?;
+        if from != self.prefix {
+            return None;
+        }
+        let workspace = header_anchor(&bytes).unwrap_or_else(|| "another workspace".to_string());
+        Some(SessionMigrated {
+            name: id.to_string(),
+            target: id.to_string(),
+            workspace,
+        })
     }
 
     /// S3 key of a session's migration marker under this backend's prefix.
@@ -363,6 +443,7 @@ impl CloudBackend {
     /// best-effort `sync_push_state` is retained for the single-writer
     /// happy path.
     fn strict_push_state(&self, id: &str) -> anyhow::Result<()> {
+        self.local_guard(id)?;
         let state_path = self.local.session_dir(id).join(state_file_name(id));
         if !state_path.exists() {
             // Nothing to push; mirrors the old no-op behavior. Callers
@@ -403,13 +484,43 @@ impl CloudBackend {
         }
     }
 
+    /// Before a context key is downloaded over the local copy: the bucket's
+    /// state file for `session` must not be the other side of an import of
+    /// the local one ([`refuse_cross_import_pull`]). A state file the bucket
+    /// can't serve lets the pull go on, as the state pull does.
+    ///
+    /// Unlike the local guards ([`CloudBackend::local_guard`]), which make no
+    /// request, this check reads the bucket's state file: the identity it
+    /// compares lives there. It is asked only when a download is already due,
+    /// after the manifests' hashes differ, so a read whose hashes match makes
+    /// no extra request, and the cross-host carrier's recorded requests are
+    /// unchanged.
+    fn check_context_pull(&self, session: &str) -> anyhow::Result<()> {
+        let state_path = self
+            .local
+            .session_dir(session)
+            .join(state_file_name(session));
+        match self.bucket.get_object(self.state_key(session)) {
+            Ok(response) if response.status_code() == 200 => {
+                refuse_cross_import_pull(session, &state_path, response.bytes())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Download the state file from S3 to the local session directory.
     /// Non-fatal on failure: if S3 is unreachable, local state is used as-is.
-    fn sync_pull_state(&self, id: &str) {
+    ///
+    /// The one error is [`refuse_cross_import_pull`]'s: the bucket's copy
+    /// and the local one are the two sides of an import, which only a
+    /// same-host import can bring together, and writing one over the other
+    /// would destroy a session.
+    fn sync_pull_state(&self, id: &str) -> anyhow::Result<()> {
         let key = self.state_key(id);
         match self.bucket.get_object(&key) {
             Ok(response) if response.status_code() == 200 => {
                 let state_path = self.local.session_dir(id).join(state_file_name(id));
+                refuse_cross_import_pull(id, &state_path, response.bytes())?;
                 if let Err(e) = std::fs::write(&state_path, response.bytes()) {
                     eprintln!("warning: cloud sync: failed to write pulled state: {}", e);
                 }
@@ -419,6 +530,7 @@ impl CloudBackend {
                 eprintln!("warning: cloud sync pull failed: {}", e);
             }
         }
+        Ok(())
     }
 
     /// Delete all objects under a session's S3 prefix except its migration
@@ -983,6 +1095,11 @@ impl CloudBackend {
     pub fn resolve_conflict(&self, id: &str, keep: &str) -> anyhow::Result<()> {
         use crate::session::version::{get_or_create_machine_id, resolved_version, SessionVersion};
 
+        // Not the bucket's marker: `--keep local` is how a source pushes its
+        // last writes before an import, and must work while one is marked.
+        // Only the local guard, which a same-host import's other side trips.
+        self.local_guard(id)?;
+
         let local_path = self.local_version_path(id);
         let local = self.load_or_create_local_version(id)?;
         let remote = self
@@ -1266,6 +1383,7 @@ impl CloudBackend {
         if let Ok(response) = self.bucket.get_object(&state_key) {
             if response.status_code() == 200 {
                 let state_path = session_dir.join(state_file_name(id));
+                refuse_cross_import_pull(id, &state_path, response.bytes())?;
                 std::fs::write(&state_path, response.bytes())?;
             }
         }
@@ -1344,6 +1462,9 @@ impl SessionBackend for CloudBackend {
     }
 
     fn cleanup(&self, id: &str) -> anyhow::Result<()> {
+        // A workspace whose copy was imported on this host must not delete
+        // the imported session that now holds the name.
+        self.local_guard(id)?;
         self.local.cleanup(id)?;
         self.sync_delete_session(id);
         Ok(())
@@ -1373,6 +1494,7 @@ impl SessionBackend for CloudBackend {
         id: &str,
         header: &crate::engine::types::StateFileHeader,
     ) -> anyhow::Result<()> {
+        self.local_guard(id)?;
         self.local.append_header(id, header)?;
         self.sync_push_state(id);
         Ok(())
@@ -1384,6 +1506,7 @@ impl SessionBackend for CloudBackend {
         payload: &crate::engine::types::EventPayload,
         timestamp: &str,
     ) -> anyhow::Result<()> {
+        self.local_guard(id)?;
         self.local.append_event(id, payload, timestamp)?;
         self.sync_push_state(id);
         Ok(())
@@ -1399,7 +1522,7 @@ impl SessionBackend for CloudBackend {
         // Before the pull, so a migrated session's local file is left
         // exactly as it was.
         self.check_not_migrated(id)?;
-        self.sync_pull_state(id);
+        self.sync_pull_state(id)?;
         self.local.read_events(id)
     }
 
@@ -1413,12 +1536,13 @@ impl SessionBackend for CloudBackend {
         crate::engine::types::StateFileHeader,
         Vec<crate::engine::types::Event>,
     )> {
+        self.local_guard(id)?;
         self.local.read_events(id)
     }
 
     fn read_header(&self, id: &str) -> anyhow::Result<crate::engine::types::StateFileHeader> {
         self.check_not_migrated(id)?;
-        self.sync_pull_state(id);
+        self.sync_pull_state(id)?;
         self.local.read_header(id)
     }
 
@@ -1442,6 +1566,7 @@ impl SessionBackend for CloudBackend {
         id: &str,
         f: &dyn Fn(crate::engine::types::StateFileHeader) -> crate::engine::types::StateFileHeader,
     ) -> anyhow::Result<()> {
+        self.local_guard(id)?;
         self.local.rewrite_header(id, f)?;
         self.sync_push_state(id);
         Ok(())
@@ -1482,6 +1607,8 @@ impl SessionBackend for CloudBackend {
     }
 
     fn relocate(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.local_guard(from)?;
+        self.local_guard(to)?;
         // Local rename is authoritative; S3 propagation is best-effort.
         self.local.relocate(from, to)?;
 
@@ -1673,7 +1800,8 @@ impl ContextStore for CloudBackend {
             session,
             key,
             &self.manifest_cache,
-        );
+            &|| self.check_context_pull(session),
+        )?;
         if pulled {
             if let Some(meta) = self.local.meta(session, key) {
                 crate::session::context_log::append_to_session_best_effort(
@@ -1793,6 +1921,14 @@ pub enum ImportErrorCode {
     /// The imported session is in place and pushed, but the marker on the
     /// source couldn't be written.
     Unmarked,
+    /// A same-host import found another process holding the source's lock.
+    SourceRunning,
+    /// A same-host import found the source's local copy ahead of the
+    /// bucket: events or context the bucket lacks.
+    SourceUnpushed,
+    /// A same-host import found a local session naming the source as its
+    /// parent.
+    SourceHasChildren,
 }
 
 impl ImportErrorCode {
@@ -1808,6 +1944,9 @@ impl ImportErrorCode {
             ImportErrorCode::SourceUnreadable => "import_source_unreadable",
             ImportErrorCode::PushFailed => "import_push_failed",
             ImportErrorCode::Unmarked => "import_unmarked",
+            ImportErrorCode::SourceRunning => "import_source_running",
+            ImportErrorCode::SourceUnpushed => "import_source_unpushed",
+            ImportErrorCode::SourceHasChildren => "import_source_has_children",
         }
     }
 
@@ -1820,7 +1959,10 @@ impl ImportErrorCode {
             | ImportErrorCode::SourceMigrated
             | ImportErrorCode::SourceIsChild
             | ImportErrorCode::NameTaken
-            | ImportErrorCode::TemplateUnavailable => 2,
+            | ImportErrorCode::TemplateUnavailable
+            | ImportErrorCode::SourceRunning
+            | ImportErrorCode::SourceUnpushed
+            | ImportErrorCode::SourceHasChildren => 2,
             ImportErrorCode::SourceUnreadable
             | ImportErrorCode::PushFailed
             | ImportErrorCode::Unmarked => 1,
@@ -1888,6 +2030,9 @@ pub struct ImportRequest<'a> {
     pub anchor: &'a Path,
     /// `--trust-template`: take the compiled template from the bucket.
     pub trust_template: bool,
+    /// `--as` was given. A same-host takeover of the source's own copy runs
+    /// only without it; with it the import behaves as it always has.
+    pub explicit_as: bool,
 }
 
 /// What a completed import did.
@@ -1989,6 +2134,8 @@ struct ImportSource {
     workspace: String,
     /// `<source prefix>/<name>/`, the source session's key prefix.
     session: String,
+    /// The source workspace's prefix alone.
+    prefix: String,
     log: SourceLog,
     /// The source's marker, when it names this workspace's prefix and the
     /// import's target: an earlier run of this import may have written it
@@ -2117,6 +2264,25 @@ struct Staging {
     moved: bool,
 }
 
+/// What [`CloudBackend::local_guard`] last answered for a name, and the
+/// state file it read.
+type LocalCheck = (Option<(u64, u64)>, Option<SessionMigrated>);
+
+/// The device and inode of `path`, or `None` when it can't be read or the
+/// platform has none.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 impl Drop for Staging {
     fn drop(&mut self) {
         if !self.moved {
@@ -2136,6 +2302,9 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     }
     builder.create(path)
 }
+
+#[path = "cloud_takeover.rs"]
+mod takeover;
 
 impl CloudBackend {
     /// Import session `req.name` from the workspace at `req.from` into this
@@ -2175,10 +2344,27 @@ impl CloudBackend {
         // marker PUT landed though it reported a failure. With that run's
         // target here, the import is already complete; nothing is written.
         if let Some(marker) = &source.own_marker {
+            // A same-host takeover that marked the source but stopped before
+            // the exchange: the source's own copy still holds the name.
+            // Finish it with the session id the marker recorded.
+            if self.is_takeover(req, &source) {
+                let session_id = marker_target_field(marker, "session_id");
+                return self.takeover(req, &source, Some(&session_id));
+            }
             return match self.local_import_of(req.target, &source) {
-                Some(session_id) if session_id == marker_target_field(marker, "session_id") => Ok(
-                    outcome(self.local_key_count(req.target)?, TemplateOrigin::Unchanged),
-                ),
+                Some(session_id) if session_id == marker_target_field(marker, "session_id") => {
+                    // A takeover that stopped after the exchange leaves its
+                    // `.takeover-<name>` to journal and delete.
+                    if std::fs::symlink_metadata(takeover_dir(self.local.base_dir(), req.target))
+                        .is_ok()
+                    {
+                        self.finish_takeover(req.target, &source, None);
+                    }
+                    Ok(outcome(
+                        self.local_key_count(req.target)?,
+                        TemplateOrigin::Unchanged,
+                    ))
+                }
                 _ => {
                     let local = self.local.session_dir(req.target);
                     let (what, hint) = if local.exists() {
@@ -2212,6 +2398,10 @@ impl CloudBackend {
             };
         }
 
+        if self.is_takeover(req, &source) {
+            return self.takeover(req, &source, None);
+        }
+
         let (session_id, machine_id, keys, template_origin) =
             match self.existing_target(req, &source)? {
                 ExistingTarget::Local { session_id } => (
@@ -2231,6 +2421,7 @@ impl CloudBackend {
                         &manifest,
                         manifest_bytes.as_deref(),
                         &machine_id,
+                        None,
                     )?;
                     let pushed = self.push_staged(req.target, &staging.dir, &source, &manifest)?;
                     self.move_into_place(req.target, &mut staging, &pushed)?;
@@ -2364,6 +2555,7 @@ impl CloudBackend {
             name: name.to_string(),
             workspace,
             session,
+            prefix: source_prefix,
             log,
             own_marker,
         })
@@ -2405,6 +2597,31 @@ impl CloudBackend {
             };
         }
 
+        self.remote_name_free(req, source)?;
+        Ok(ExistingTarget::Free)
+    }
+
+    /// Whether this workspace's prefix in the bucket leaves the target name
+    /// free: nothing there, or only an earlier run of this same import.
+    /// Anything else refuses `import_name_taken`.
+    fn remote_name_free(
+        &self,
+        req: &ImportRequest<'_>,
+        source: &ImportSource,
+    ) -> Result<(), ImportError> {
+        use ImportErrorCode::*;
+
+        let target = req.target;
+        let taken = |place: &str| {
+            ImportError::new(
+                NameTaken,
+                format!(
+                    "{} already has a session named '{}', and it is not an import of session \
+                     '{}' from {}; pass --as <new-name> to import it under another name",
+                    place, target, source.name, source.workspace
+                ),
+            )
+        };
         let key = self.state_key(target);
         let could_not_check = |e: &dyn std::fmt::Display| {
             ImportError::new(
@@ -2416,10 +2633,10 @@ impl CloudBackend {
             )
         };
         match self.object_listed(&key) {
-            Ok(false) => Ok(ExistingTarget::Free),
+            Ok(false) => Ok(()),
             Ok(true) => match self.fetch_object(&key) {
                 Ok(bytes) => match bytes.as_deref().and_then(ImportedAs::read) {
-                    Some(imported) if imported.is_of(source) => Ok(ExistingTarget::Free),
+                    Some(imported) if imported.is_of(source) => Ok(()),
                     _ => Err(taken("this workspace's prefix in the bucket")),
                 },
                 Err(e) => Err(could_not_check(&e)),
@@ -2530,6 +2747,7 @@ impl CloudBackend {
     ///
     /// A source with no manifest gets an empty one, so every imported
     /// session has a `ctx/` manifest.
+    #[allow(clippy::too_many_arguments)]
     fn stage_import(
         &self,
         req: &ImportRequest<'_>,
@@ -2538,6 +2756,7 @@ impl CloudBackend {
         manifest: &crate::session::context::Manifest,
         manifest_bytes: Option<&[u8]>,
         machine_id: &str,
+        into: Option<(&Path, Option<&str>)>,
     ) -> Result<(Staging, String), ImportError> {
         use crate::engine::types::{
             generate_session_id, now_iso8601, Event, EventPayload, SessionOrigin,
@@ -2556,7 +2775,14 @@ impl CloudBackend {
         crate::session::local::ensure_koto_root(base)
             .and_then(|()| std::fs::create_dir_all(base).map_err(anyhow::Error::from))
             .map_err(|e| write_failed(base, &e))?;
-        let dir = base.join(format!(".import-{}-{}", target, generate_session_id()));
+        // A same-host takeover passes its own staging directory, which it
+        // renames to `.takeover-<name>` once complete, and may reuse the
+        // session id its marker already names; every other import stages in
+        // a fresh `.import-<target>-<random>` with a new id.
+        let dir = match into {
+            Some((dir, _)) => dir.to_path_buf(),
+            None => base.join(format!(".import-{}-{}", target, generate_session_id())),
+        };
         create_private_dir(&dir).map_err(|e| write_failed(&dir, &e))?;
         let staging = Staging { dir, moved: false };
         let dir = staging.dir.as_path();
@@ -2607,7 +2833,10 @@ impl CloudBackend {
 
         // The header is the source's, renamed, re-identified and
         // re-anchored here, with a command environment taken on this host.
-        let session_id = generate_session_id();
+        let session_id = into
+            .and_then(|(_, id)| id)
+            .map(str::to_string)
+            .unwrap_or_else(generate_session_id);
         let mut header = source.log.header.clone();
         header.workflow = target.to_string();
         header.session_id = session_id.clone();
@@ -2909,6 +3138,58 @@ fn is_not_found(e: &S3Error) -> bool {
 /// not one.
 fn is_migration_marker(session_prefix: &str, key: &str) -> bool {
     key.strip_prefix(session_prefix) == Some(MIGRATED_MARKER)
+}
+
+/// `<sessions>/.takeover-<id>`: where a same-host import of `id` stages the
+/// new session, and where the source's old copy sits after the exchange
+/// until the import deletes it. Its presence means the import of `id` has
+/// not finished. Hidden from listings, and no session can be named like it
+/// (a session name starts with a letter).
+pub(crate) fn takeover_dir(sessions_base: &Path, id: &str) -> PathBuf {
+    sessions_base.join(format!(".takeover-{}", id))
+}
+
+/// Refuse to write `remote` over the local state file at `state_path` when
+/// the two are the two sides of an import: different session ids, and one
+/// log's latest `session_imported` names the other's id as its source.
+fn refuse_cross_import_pull(id: &str, state_path: &Path, remote: &[u8]) -> anyhow::Result<()> {
+    let Ok(local) = std::fs::read(state_path) else {
+        return Ok(());
+    };
+    let (Some(local_id), Some(remote_id)) = (header_session_id(&local), header_session_id(remote))
+    else {
+        return Ok(());
+    };
+    if local_id == remote_id || local_id.is_empty() || remote_id.is_empty() {
+        return Ok(());
+    }
+    let imports =
+        |log: &[u8], other: &str| ImportedAs::read(log).is_some_and(|i| i.from_session_id == other);
+    if imports(remote, &local_id) || imports(&local, &remote_id) {
+        anyhow::bail!(
+            "refusing to pull session '{}' from the bucket over the local copy at {}: one is \
+             the session the other was imported into (local session id {}, bucket session id \
+             {}); run koto from the workspace the import went to",
+            id,
+            state_path.display(),
+            local_id,
+            remote_id
+        );
+    }
+    Ok(())
+}
+
+/// The workspace a state log's header anchors it in: its origin anchor,
+/// else its execution directory.
+fn header_anchor(state: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(state);
+    let line = text.lines().find(|l| !l.trim().is_empty())?;
+    let header: serde_json::Value = serde_json::from_str(line).ok()?;
+    header
+        .pointer("/origin/anchor")
+        .or_else(|| header.get("execution_dir"))?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// The `session_id` in a state file's header line (its first non-empty
@@ -3708,14 +3989,17 @@ mod tests {
 
         backend.add("sess", "scope.md", b"local").unwrap();
         // pull attempt fails silently, local data is unaffected.
-        sync::pull_context_if_newer(
+        let pulled = sync::pull_context_if_newer(
             &backend.local,
             &backend.bucket,
             &backend.prefix,
             "sess",
             "scope.md",
             &backend.manifest_cache,
-        );
+            &|| Ok(()),
+        )
+        .unwrap();
+        assert!(!pulled);
         let data = backend.local.get("sess", "scope.md").unwrap();
         assert_eq!(data, b"local");
     }
@@ -4529,5 +4813,276 @@ mod tests {
             assert_eq!(code.as_str(), text);
             assert_eq!(code.exit_code(), exit, "{text}");
         }
+    }
+
+    // -- The local guards a same-host import relies on --------------------
+
+    /// A log for session `id` with header session id `sid`, whose last
+    /// event is a `session_imported` from `from_workspace`'s `from_session`
+    /// (session id `from_sid`); `None` writes a plain log.
+    fn guard_log(id: &str, sid: &str, imported: Option<(&str, &str, &str)>) -> Vec<u8> {
+        let header = serde_json::json!({
+            "schema_version": 1,
+            "workflow": id,
+            "template_hash": "a".repeat(64),
+            "created_at": "2026-01-01T00:00:00Z",
+            "session_id": sid,
+            "origin": {"anchor": "/srv/ws-b", "store": {"kind": "cloud", "base": "/x"}},
+        });
+        let mut lines = vec![header.to_string(), event_json(1).to_string()];
+        if let Some((ws, from, from_sid)) = imported {
+            lines.push(
+                serde_json::json!({
+                    "seq": 2,
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "type": "session_imported",
+                    "payload": {
+                        "from_workspace": ws,
+                        "from_session": from,
+                        "from_session_id": from_sid,
+                        "machine_id": "m",
+                    },
+                })
+                .to_string(),
+            );
+        }
+        let mut out = lines.join("\n");
+        out.push('\n');
+        out.into_bytes()
+    }
+
+    fn write_log(base: &Path, id: &str, bytes: &[u8]) -> PathBuf {
+        let dir = base.join(id);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(state_file_name(id));
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// A backend whose prefix is the one koto derives for `ws`, against an
+    /// unreachable endpoint: the local guards must answer before any
+    /// request is tried.
+    fn backend_for_workspace(base: &Path, ws: &Path) -> CloudBackend {
+        let prefix = crate::session::local::prefix_for_workspace(ws).unwrap();
+        let region = Region::Custom {
+            region: "us-east-1".to_string(),
+            endpoint: "http://192.0.2.1:19000".to_string(),
+        };
+        let credentials =
+            Credentials::new(Some("test-key"), Some("test-secret"), None, None, None).unwrap();
+        let bucket = Bucket::new("test-bucket", region, credentials).unwrap();
+        CloudBackend::with_parts(
+            LocalBackend::with_base_dir(base.to_path_buf()),
+            bucket,
+            prefix,
+        )
+    }
+
+    #[test]
+    fn the_source_workspace_refuses_the_session_imported_from_it() {
+        let tmp = TempDir::new().unwrap();
+        let ws_a = tmp.path().join("ws-a");
+        fs::create_dir_all(&ws_a).unwrap();
+        let ws_a = fs::canonicalize(&ws_a).unwrap();
+        let base = tmp.path().join("sessions");
+        let log = guard_log("wf", "id-b", Some((ws_a.to_str().unwrap(), "wf", "id-a")));
+        let state = write_log(&base, "wf", &log);
+        let a = backend_for_workspace(&base, &ws_a);
+
+        for err in [
+            a.read_events("wf").unwrap_err(),
+            a.read_header("wf").map(|_| ()).unwrap_err(),
+            a.check_not_migrated("wf").unwrap_err(),
+            SessionBackend::cleanup(&a, "wf").unwrap_err(),
+            a.resolve_conflict("wf", "local").unwrap_err(),
+            a.append_event(
+                "wf",
+                &crate::engine::types::EventPayload::IntentUpdated {
+                    intent: "x".to_string(),
+                },
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap_err(),
+            a.add("wf", "k", b"v").unwrap_err(),
+        ] {
+            let migrated = err
+                .downcast_ref::<SessionMigrated>()
+                .unwrap_or_else(|| panic!("a typed SessionMigrated, got {err}"));
+            assert_eq!(migrated.workspace, "/srv/ws-b");
+        }
+        // Nothing touched the imported session's files.
+        assert_eq!(fs::read(&state).unwrap(), log);
+        assert!(!base.join("wf").join("ctx").exists());
+    }
+
+    #[test]
+    fn another_workspace_passes_the_local_guard() {
+        let tmp = TempDir::new().unwrap();
+        let ws_a = tmp.path().join("ws-a");
+        let ws_b = tmp.path().join("ws-b");
+        fs::create_dir_all(&ws_a).unwrap();
+        fs::create_dir_all(&ws_b).unwrap();
+        let ws_a = fs::canonicalize(&ws_a).unwrap();
+        let ws_b = fs::canonicalize(&ws_b).unwrap();
+        let base = tmp.path().join("sessions");
+        // The importing workspace itself, and a log imported under another
+        // name, and a plain log: none of them is refused locally.
+        write_log(
+            &base,
+            "wf",
+            &guard_log("wf", "id-b", Some((ws_a.to_str().unwrap(), "wf", "id-a"))),
+        );
+        backend_for_workspace(&base, &ws_b)
+            .local_guard("wf")
+            .unwrap();
+        write_log(
+            &base,
+            "renamed",
+            &guard_log(
+                "renamed",
+                "id-c",
+                Some((ws_a.to_str().unwrap(), "wf", "id-a")),
+            ),
+        );
+        backend_for_workspace(&base, &ws_a)
+            .local_guard("renamed")
+            .unwrap();
+        write_log(&base, "plain", &guard_log("plain", "id-p", None));
+        backend_for_workspace(&base, &ws_a)
+            .local_guard("plain")
+            .unwrap();
+    }
+
+    #[test]
+    fn a_pending_takeover_refuses_reads_and_writes_of_the_name() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let ws = fs::canonicalize(&ws).unwrap();
+        let base = tmp.path().join("sessions");
+        let state = write_log(&base, "wf", &guard_log("wf", "id-a", None));
+        fs::create_dir_all(takeover_dir(&base, "wf")).unwrap();
+        let backend = backend_for_workspace(&base, &ws);
+        for err in [
+            backend.read_header("wf").map(|_| ()).unwrap_err(),
+            backend.add("wf", "k", b"v").unwrap_err(),
+            backend.remove("wf", "k").unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("being imported"), "{err}");
+            assert!(err.to_string().contains("koto session import wf"), "{err}");
+        }
+        assert_eq!(fs::read(&state).unwrap(), guard_log("wf", "id-a", None));
+        assert!(!base.join("wf").join("ctx").exists());
+        // Another name is untouched by it.
+        write_log(&base, "other", &guard_log("other", "id-o", None));
+        backend.local_guard("other").unwrap();
+    }
+
+    #[test]
+    fn a_pull_never_writes_one_side_of_an_import_over_the_other() {
+        // The bucket holds the source (id-a); the local copy is the
+        // session imported from it (id-b), from a workspace other than
+        // this backend's, so only the pull's own check stands in the way.
+        let remote = guard_log("wf", "id-a", None);
+        let local = guard_log("wf", "id-b", Some(("/srv/elsewhere", "wf", "id-a")));
+        for direction in ["local-is-import", "remote-is-import"] {
+            let (remote_bytes, local_bytes) = if direction == "local-is-import" {
+                (remote.clone(), local.clone())
+            } else {
+                (local.clone(), remote.clone())
+            };
+            let endpoint = serve(vec![
+                ("/wf/koto-wf.state.jsonl".to_string(), remote_bytes),
+                ("/wf/version.json".to_string(), b"{}".to_vec()),
+            ])
+            .url;
+            let tmp = TempDir::new().unwrap();
+            let state = write_log(tmp.path(), "wf", &local_bytes);
+            let backend = cloud_backend_at(tmp.path(), endpoint);
+            for err in [
+                backend.read_events("wf").map(|_| ()).unwrap_err(),
+                backend.read_header("wf").map(|_| ()).unwrap_err(),
+                backend.force_pull_session("wf").unwrap_err(),
+            ] {
+                assert!(
+                    err.to_string().contains("refusing to pull"),
+                    "{direction}: {err}"
+                );
+            }
+            assert_eq!(fs::read(&state).unwrap(), local_bytes, "{direction}");
+        }
+    }
+
+    #[test]
+    fn a_context_pull_never_writes_one_side_of_an_import_over_the_other() {
+        // The bucket's state is the source (id-a) and holds a key the local
+        // copy, the session imported from it (id-b), lacks.
+        let remote = guard_log("wf", "id-a", None);
+        let local = guard_log("wf", "id-b", Some(("/srv/elsewhere", "wf", "id-a")));
+        let content = b"bucket bytes".to_vec();
+        let hash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let manifest = serde_json::json!({
+            "keys": {"k": {"created_at": "2026-01-01T00:00:00Z", "size": content.len(), "hash": hash}}
+        });
+        let endpoint = serve(vec![
+            ("/wf/koto-wf.state.jsonl".to_string(), remote),
+            (
+                "/wf/ctx/manifest.json".to_string(),
+                manifest.to_string().into_bytes(),
+            ),
+            ("/wf/ctx/k".to_string(), content),
+        ])
+        .url;
+        let tmp = TempDir::new().unwrap();
+        let state = write_log(tmp.path(), "wf", &local);
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+        let err = ContextStore::get(&backend, "wf", "k").unwrap_err();
+        assert!(err.to_string().contains("refusing to pull"), "{err}");
+        assert_eq!(fs::read(&state).unwrap(), local);
+        assert!(!tmp.path().join("wf").join("ctx").join("k").exists());
+    }
+
+    #[test]
+    fn a_context_pull_of_the_same_session_still_downloads() {
+        let log = guard_log("wf", "id-a", None);
+        let content = b"bucket bytes".to_vec();
+        let hash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let manifest = serde_json::json!({
+            "keys": {"k": {"created_at": "2026-01-01T00:00:00Z", "size": content.len(), "hash": hash}}
+        });
+        let endpoint = serve(vec![
+            ("/wf/koto-wf.state.jsonl".to_string(), log.clone()),
+            (
+                "/wf/ctx/manifest.json".to_string(),
+                manifest.to_string().into_bytes(),
+            ),
+            ("/wf/ctx/k".to_string(), content.clone()),
+        ])
+        .url;
+        let tmp = TempDir::new().unwrap();
+        write_log(tmp.path(), "wf", &log);
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+        assert_eq!(ContextStore::get(&backend, "wf", "k").unwrap(), content);
+    }
+
+    #[test]
+    fn a_pull_of_the_same_session_still_overwrites() {
+        let remote = guard_log("wf", "id-a", Some(("/srv/x", "old", "id-0")));
+        let endpoint = serve(vec![(
+            "/wf/koto-wf.state.jsonl".to_string(),
+            remote.clone(),
+        )])
+        .url;
+        let tmp = TempDir::new().unwrap();
+        let state = write_log(tmp.path(), "wf", &guard_log("wf", "id-a", None));
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+        backend.read_header("wf").unwrap();
+        assert_eq!(fs::read(&state).unwrap(), remote);
     }
 }

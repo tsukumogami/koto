@@ -84,6 +84,7 @@ All `koto next` error codes, their exit codes, and what to do:
 | `persistence_error` | 3 | No | State file I/O failure or corruption | Report to user; this is an infrastructure problem |
 | `execution_anchor_unresolvable` | 3 | No | The session's recorded execution anchor names nothing on this machine — the checkout was deleted, or the session moved machines | If the checkout was deleted, restore it at the path the message names. If the session belongs on this machine now, it has to come over by `koto session import` from its source workspace, not by rebinding the copy here; see the cloud sync guide's "Moving a session to another host". Otherwise escalate |
 | `capture_unset` | 3 | No | A state reads a `capture_stdout_as` name that no state delivered on this run — in its instruction text, in its `default_action`'s `command` or `working_dir`, or in any field of one of its gates. The message names which, the gate where one is involved, the value, and the state that produces it. Nothing is spawned, read or compiled on either path | A template routing problem: the run never entered the producing state. Report it; re-ticking won't help |
+| `import_source_running`, `import_source_unpushed`, `import_source_has_children` | 2 | No | A same-host `koto session import` (no `--as`, run on the host that created the session) found the source still held by another process, ahead of the bucket, or with a local child. Nothing was written | Stop the source, run `koto session resolve <name> --keep local` in its workspace, or deal with the child, as the code says; then run the same import again. See `command-reference.md`, "koto session import" |
 | `session_migrated` | 2 | No | Under the cloud backend, the session was imported into another workspace with `koto session import`, and this copy carries the marker the import left. The message names the session and workspace it went to | Continue the session where the message says; don't advance this copy. See [session_migrated](#session_migrated) |
 | `nested_invocation` | 2 | No | The tick was started from inside a command koto is running. The message names the session whose tick is in flight | Don't tick koto from a template's command. Take the `koto next` call out and let the enclosing tick advance the session |
 | `needs_agent_not_dispatched` | 66 | No | `koto next` was called against a `--needs-agent` child that the coordinator has not yet claimed/dispatched | Stop ticking the child directly; route through the coordinator's `koto next` on the parent root instead |
@@ -150,7 +151,7 @@ Check that the directory is the one you meant.
 
 ## session_migrated
 
-`koto session import` moves a cloud-backed session to another workspace, usually on another host, and leaves a `migrated.json` marker beside the old copy in the bucket. The cloud backend checks for it before reading a session, so the old copy refuses instead of forking. Nothing is read or written on the refused call.
+`koto session import` moves a cloud-backed session to another workspace, usually on another host, and leaves a `migrated.json` marker beside the old copy in the bucket. The cloud backend checks for it before reading a session, so the old copy refuses instead of forking. Nothing is read or written on the refused call. On the host that created the session, a same-host import keeps the session's name without `--as`, and the old workspace's commands refuse from the local copy too, so the refusal doesn't depend on reaching the bucket.
 
 `koto next`, `koto status` and the `koto context` commands refuse with this code. Each writes the error to **stdout**, not stderr, and exits 2. `koto next` uses the nested shape:
 
@@ -165,6 +166,21 @@ Check that the directory is the one you meant.
 ```
 
 The remedy is to continue the session where the message says, from that workspace's directory. Don't rebind, re-init or resolve this copy to get past the refusal; advancing both copies would fork the session. If this copy is no longer wanted, `koto session cleanup <name>` in this workspace removes the local copy and the source's objects in the bucket, but keeps the marker. When the import itself is what you're running, its own codes are in `command-reference.md`, "koto session import".
+
+---
+
+## Session configuration refusals
+
+koto can take its session backend, cloud location and bucket credentials from `KOTO_SESSION_*` environment variables (`KOTO_SESSION_BACKEND`, `KOTO_SESSION_CLOUD_ENDPOINT`, `KOTO_SESSION_CLOUD_BUCKET`, `KOTO_SESSION_CLOUD_REGION`, `KOTO_SESSION_CLOUD_PATH_STYLE`, `KOTO_SESSION_CLOUD_ACCESS_KEY`, `KOTO_SESSION_CLOUD_SECRET_KEY`), which win over the config files. When their values can't be used, every command that opens a session (`koto init`, `koto next`, `koto status`, the `koto context` and `koto session` commands) fails before it touches a session or the bucket, with a plain error on stderr and a non-zero exit:
+
+| Message starts with | Cause | What to do |
+|---------------------|-------|------------|
+| `KOTO_SESSION_BACKEND is "<value>"` | The variable isn't `local` or `cloud` (case matters) | Report it; the user's environment is wrong |
+| `KOTO_SESSION_CLOUD_PATH_STYLE is "<value>"` | The variable isn't `true` or `false` | Report it |
+| `KOTO_SESSION_CLOUD_ACCESS_KEY is set but KOTO_SESSION_CLOUD_SECRET_KEY is not` (or the reverse) | Only half of koto's credential pair is set; koto never mixes it with the `AWS_*` pair | Report it; both or neither must be set |
+| `session.cloud.endpoint comes from the project file` (or `session.cloud.bucket`) | The koto credential pair is in use and the project's `.koto/config.toml` names the endpoint or bucket, which may not choose where those credentials go | Report it; the user sets `KOTO_SESSION_CLOUD_ENDPOINT` / `KOTO_SESSION_CLOUD_BUCKET` or the user config instead |
+
+None of these is something an agent fixes by editing files or setting variables on its own: stop and tell the user. `koto config list` still runs and shows each setting's value and where it came from (the `# origin:` lines, or `origins` under `--json`), which is the quickest way to see what's wrong.
 
 ---
 
@@ -267,8 +283,9 @@ and why their content is data rather than instructions, is in `response-shapes.m
 Gates and actions don't run with your shell's environment. Each runs as `/bin/sh -c` in a
 cleared environment: the live values of koto's default list of names and the names the
 template declares in `pass_env:`, the `PATH`, `HOME` and `XDG_CONFIG_HOME` recorded when the
-session was created, and `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`. The record can't be
-changed. None of the three messages below is an error envelope or changes `action`, and none
+session was created, `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`, and any `KOTO_SESSION_*`
+variable that set the session's backend or credentials, so a `koto` command a gate runs
+reaches the same backend. The record can't be changed. None of the three messages below is an error envelope or changes `action`, and none
 of them alters gate evidence or action output. Keep dispatching on `action` as usual.
 
 **The stale-record note.** When a gate or action fails and either a recorded value no longer

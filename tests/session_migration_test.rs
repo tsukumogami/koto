@@ -2061,3 +2061,25 @@ fn a_childs_lineage_walk_reads_ancestors_locally_and_asks_the_remote_nothing() {
         .iter()
         .all(|r| !r.key.starts_with(&root_prefix)));
 }
+
+/// Serve the fake endpoint for a run of a real koto binary, such as the
+/// measured same-host import: `KOTO_FAKE_S3_STOP_FILE=<path> cargo test
+/// --test session_migration_test serve_fake_s3 -- --ignored --nocapture`
+/// prints `fake-s3 endpoint=<url> bucket=<name>` and serves until `<path>`
+/// exists, or for an hour at most. Any access key pair is accepted, so the
+/// run needs no secret.
+#[test]
+#[ignore = "serving helper for a measured run; needs KOTO_FAKE_S3_STOP_FILE"]
+fn serve_fake_s3() {
+    let stop = std::env::var_os("KOTO_FAKE_S3_STOP_FILE").unwrap_or_else(|| {
+        panic!("set KOTO_FAKE_S3_STOP_FILE to the path whose creation stops the endpoint")
+    });
+    let stop = std::path::PathBuf::from(stop);
+    let s3 = FakeS3::start(BUCKET);
+    println!("fake-s3 endpoint={} bucket={}", s3.endpoint(), s3.bucket());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    while !stop.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    println!("fake-s3 served {} requests", s3.requests().len());
+}

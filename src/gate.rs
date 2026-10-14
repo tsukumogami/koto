@@ -1058,6 +1058,7 @@ mod tests {
             "wf",
             None,
             &[],
+            &[],
             lookup,
         )
         .unwrap();

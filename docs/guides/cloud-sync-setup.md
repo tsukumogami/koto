@@ -36,6 +36,24 @@ koto config set --user session.cloud.endpoint https://<account-id>.r2.cloudflare
 
 Project config wins over user config where both set a key.
 
+### From the environment
+
+Every session setting except `marker_retain_days` can also come from an environment variable, named `KOTO_` plus the setting's dotted name, upper-cased, with dots turned into underscores. A variable wins over both files, setting by setting, so you can put one workspace's sessions in the bucket by setting its processes' environment and leave every config file alone:
+
+```bash
+export KOTO_SESSION_BACKEND=cloud
+export KOTO_SESSION_CLOUD_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+export KOTO_SESSION_CLOUD_BUCKET=my-koto-sessions
+export KOTO_SESSION_CLOUD_REGION=auto
+export KOTO_SESSION_CLOUD_PATH_STYLE=false   # optional
+```
+
+This is the safe way to switch one workspace on a host that runs other sessions: koto re-reads `$HOME/.koto/config.toml` on every command, so changing that file moves every running session on the host to the new backend at once.
+
+Values are trimmed, and an empty or whitespace-only variable counts as unset, so the setting falls through to the files. `KOTO_SESSION_BACKEND` must be `local` or `cloud` and `KOTO_SESSION_CLOUD_PATH_STYLE` `true` or `false`, in lower case. Any other value never falls back to a file or to the local backend: every command that opens a session refuses with an error naming the variable, while `koto config list` and `koto config get` still show it so you can see what's wrong.
+
+The commands a session runs (gates, actions) get the `KOTO_SESSION_*` variables that set its configuration, so a `koto` command a gate runs reaches the same backend.
+
 ### Endpoints given as an IP address, and self-hosted stores
 
 By default koto addresses the bucket as a virtual host, `<bucket>.<endpoint-host>`. That can't work when the endpoint's host is an IP address, and a self-hosted store behind a hostname often doesn't serve bucket subdomains either. Set `session.cloud.path_style` to `true` and koto puts the bucket in the path instead, `<endpoint>/<bucket>/<key>`:
@@ -53,12 +71,23 @@ A plain `http://` endpoint needs nothing extra; koto uses the scheme you give it
 
 Credentials go in environment variables (recommended for CI) or user config (for developer machines). They're never allowed in project config.
 
-**Environment variables (CI/CD):**
+**koto's own variables:**
+
+```bash
+export KOTO_SESSION_CLOUD_ACCESS_KEY=<your-access-key>
+export KOTO_SESSION_CLOUD_SECRET_KEY=<your-secret-key>
+```
+
+Under these names the bucket key isn't picked up by every AWS tool the session runs. They're a pair: when either is set, both credentials come from them and nothing else is consulted, not the `AWS_*` pair and not the user file. If only one is set, every command that uses the cloud backend refuses, naming the missing one, before it sends anything. And while they're in use, the endpoint and the bucket can't come from the project file: a committed `.koto/config.toml` doesn't get to choose where your key is sent. Set those in the environment (`KOTO_SESSION_CLOUD_ENDPOINT`, `KOTO_SESSION_CLOUD_BUCKET`) or the user file.
+
+**AWS variables (CI/CD):**
 
 ```bash
 export AWS_ACCESS_KEY_ID=<your-access-key>
 export AWS_SECRET_ACCESS_KEY=<your-secret-key>
 ```
+
+These work as they always have when the koto pair isn't set.
 
 **User config (persistent on your machine):**
 
@@ -67,7 +96,7 @@ koto config set --user session.cloud.access_key <your-access-key>
 koto config set --user session.cloud.secret_key <your-secret-key>
 ```
 
-The `--user` flag is required for credentials. They're blocked from project config to prevent accidental commits to git. Env vars take precedence over user config. `koto config list` redacts credential values in output.
+The `--user` flag is required for credentials. They're blocked from project config to prevent accidental commits to git. Env vars take precedence over user config. `koto config list` redacts credential values in output, and koto replaces any credential it knows of with `[REDACTED:<source>]` in the output of the commands a session runs.
 
 ## 4. Use koto normally
 
@@ -128,7 +157,7 @@ koto session import review --from /srv/ws-a
 
 `--from` is the absolute path of the source workspace as it was on the host that created the session, symlinks resolved. A relative path is refused. To find it, run `pwd -P` in the source workspace; `koto session list` there shows the session's name. The current directory becomes the new session's execution anchor and its workspace, so run the session's later commands from there.
 
-If a session called `review` already exists on this host or under this workspace's prefix, give the import a new name:
+If a different session called `review` already exists on this host or under this workspace's prefix, give the import a new name. The source's own local copy doesn't count: on the host that created the session, the import takes the name over (see "Importing on the same host" below).
 
 ```bash
 koto session import review --from /srv/ws-a --as review-b
@@ -163,6 +192,29 @@ session_migrated: session 'review' was migrated to 'review' in /srv/ws-b; contin
 Nothing else under the source's prefix is written, and nothing is deleted. The source's state file and context keys stay in the bucket until someone runs `koto session cleanup review` in the source workspace, which removes them and the local copy but keeps `migrated.json`. Cleanup, a terminal tick and `koto session prune` without `--migrated-from` never delete a `migrated.json`, so any copy of the session still left in that workspace keeps refusing.
 
 An imported session is an ordinary session in its new workspace, so it can be imported again from there to a third one.
+
+### Importing on the same host
+
+Workspaces on one host share one local session store, so on the host that created the session its old copy already holds the name. Run the import without `--as` and it takes the name over, so every caller that looks the session up by name finds the new copy:
+
+```bash
+cd /srv/ws-b
+koto session import review --from /srv/ws-a
+```
+
+It prints the same JSON as an import from another host, with `name` set to `review`. Before it writes anything, it checks the old copy and refuses, leaving it untouched, when:
+
+- another process holds the session's lock (`import_source_running`): stop it first;
+- the local copy holds events or context the bucket lacks (`import_source_unpushed`): run `koto session resolve review --keep local` in the source workspace, then import again;
+- a local session names it as its parent (`import_source_has_children`).
+
+A local copy behind the bucket is fine: the import takes the bucket's events, as it does from another host.
+
+The import builds the new session in `~/.koto/sessions/.takeover-review/`, pushes it under this workspace's prefix, writes the marker on the source, and only then swaps the two directories in one atomic call. After the swap `.takeover-review/` holds the old copy, which is deleted once the import has checked it's still the copy it read. A copy that changed in between is moved aside to `~/.koto/sessions/.kept-takeover-review-<time>/`, with a warning naming it, so nothing it holds is lost and the name stays usable. While `.takeover-review/` exists, commands on `review` refuse and name the import to run.
+
+If the import stops at any step, run the same command again: a stop before the marker starts over, and a stop after it finishes the swap with the session id the marker recorded. A re-run never overwrites a copy under this workspace's prefix that has moved past its `session_imported` event; it refuses with `import_source_migrated` instead.
+
+The swap needs a filesystem that can exchange two directories atomically (`renameat2` on Linux, `renamex_np` on macOS) with the store on one device. Where that isn't available, the import refuses before writing anything and names `--as`; an import under a new name works everywhere. Running the import from the source workspace itself, or with `--as`, behaves as it always has.
 
 ### Removing the old copy and its marker
 
@@ -205,7 +257,10 @@ A refusal or failure prints `{"error": {"code": "...", "message": "..."}}`. Exit
 | `import_name_taken` | 2 | A different session already has the name here or under this workspace's prefix | Pass `--as <new-name>`, or remove the session holding the name if it isn't wanted |
 | `import_template_unavailable` | 2 | No usable compiled template with the session's hash: none in this host's cache, or under `--trust-template` none in the bucket or one that doesn't match | Run `koto template compile` here on the session's template from a matching checkout, then import again without `--trust-template` |
 | `import_source_unreadable` | 1 | A source object couldn't be fetched, or failed validation (for example, a state log this koto can't carry intact) | If the bucket was unreachable, run it again; if the message names a validation failure, the source needs repair on its host |
-| `import_push_failed` | 1 | Building the session here, pushing it, or moving it into place failed; what the run pushed was taken back | Fix what the message names (usually connectivity or local disk) and run the same import again |
+| `import_push_failed` | 1 | Building the session here, pushing it, or moving it into place failed. Before the source is marked, what the run pushed was taken back; once it's marked (a same-host import whose swap failed), everything is kept and the message says so | Fix what the message names (usually connectivity or local disk) and run the same import again; after the marker, that finishes it. When the message names `--as` (a same-host import this host's store can't swap), import under another name instead |
+| `import_source_running` | 2 | Same host only: another process holds the source session's lock | Stop whatever is advancing the session, then import again |
+| `import_source_unpushed` | 2 | Same host only: the source's local copy holds events or context keys the bucket lacks | Run `koto session resolve <name> --keep local` in the source workspace, then import again |
+| `import_source_has_children` | 2 | Same host only: a local session names the source as its parent | Finish or clean up the child it names, or import under `--as` |
 | `import_unmarked` | 1 | The session was imported and pushed, but the marker on the source couldn't be written, so the old copy won't refuse yet | Run the same import again; it writes only the marker. Keep the source stopped until it succeeds |
 
 ## 6. Handle conflicts (rare)
@@ -225,16 +280,18 @@ koto session resolve <name> --keep remote  # download the bucket's version
 
 ## Config reference
 
-| Key | Description | Default | Project config |
-|-----|-------------|---------|---------------|
-| `session.backend` | Storage backend | `local` | Yes |
-| `session.cloud.endpoint` | S3-compatible endpoint URL | (none) | Yes |
-| `session.cloud.bucket` | Bucket name | `koto-sessions` (used when the key is unset; `koto config get` shows it as unset) | Yes |
-| `session.cloud.region` | Region | (none) | Yes |
-| `session.cloud.path_style` | Address the bucket in the path (`true`) rather than as a subdomain; needed for an IP-address endpoint | `false` | Yes |
-| `session.cloud.marker_retain_days` | Days a migration marker whose target is present is kept before `koto session prune --migrated-from` may remove it without `--source-retired` | `30` | No (user only: it guards a deletion, so a cloned repository's config can't shorten it) |
-| `session.cloud.access_key` | Access key ID | (none) | No (user/env only) |
-| `session.cloud.secret_key` | Secret access key | (none) | No (user/env only) |
+| Key | Variable | Description | Default | Project config |
+|-----|----------|-------------|---------|---------------|
+| `session.backend` | `KOTO_SESSION_BACKEND` | Storage backend | `local` | Yes |
+| `session.cloud.endpoint` | `KOTO_SESSION_CLOUD_ENDPOINT` | S3-compatible endpoint URL | (none) | Yes |
+| `session.cloud.bucket` | `KOTO_SESSION_CLOUD_BUCKET` | Bucket name | `koto-sessions` (used when the key is unset; `koto config get` shows it as unset) | Yes |
+| `session.cloud.region` | `KOTO_SESSION_CLOUD_REGION` | Region | (none) | Yes |
+| `session.cloud.path_style` | `KOTO_SESSION_CLOUD_PATH_STYLE` | Address the bucket in the path (`true`) rather than as a subdomain; needed for an IP-address endpoint | `false` | Yes |
+| `session.cloud.marker_retain_days` | (none) | Days a migration marker whose target is present is kept before `koto session prune --migrated-from` may remove it without `--source-retired` | `30` | No (user only: it guards a deletion, so a cloned repository's config can't shorten it) |
+| `session.cloud.access_key` | `KOTO_SESSION_CLOUD_ACCESS_KEY`, else `AWS_ACCESS_KEY_ID` | Access key ID | (none) | No (user/env only) |
+| `session.cloud.secret_key` | `KOTO_SESSION_CLOUD_SECRET_KEY`, else `AWS_SECRET_ACCESS_KEY` | Secret access key | (none) | No (user/env only) |
+
+Precedence for each setting: its variable, then project config, then user config, then the default. For the credentials: the koto pair as a whole, else the `AWS_*` pair, else user config.
 
 ## Supported providers
 
@@ -257,6 +314,21 @@ Check your resolved config:
 ```bash
 koto config list
 ```
+
+After the tables it lists where each session setting came from, as comment lines, so the output is still valid TOML:
+
+```toml
+# origin: session.backend = env KOTO_SESSION_BACKEND
+# origin: session.cloud.endpoint = user
+# origin: session.cloud.bucket = project
+# origin: session.cloud.region = unset
+# origin: session.cloud.path_style = default
+# origin: session.cloud.access_key = env KOTO_SESSION_CLOUD_ACCESS_KEY
+# origin: session.cloud.secret_key = env KOTO_SESSION_CLOUD_SECRET_KEY
+# origin: session.cloud.marker_retain_days = default
+```
+
+`env` names the variable, `project` and `user` the config file, `default` means koto's built-in value applies, and `unset` means nothing set it and there's no default. `koto config list --json` has the same under a top-level `origins` object: `{"session.backend": {"source": "env", "variable": "KOTO_SESSION_BACKEND"}, ...}`. A file counts as an origin only when it names the key.
 
 This shows all settings with credential values redacted. If `session.backend` shows `cloud` and the endpoint and bucket are set, sync is active.
 
