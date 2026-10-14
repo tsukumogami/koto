@@ -21,7 +21,7 @@
 //! 5. exchange `.takeover-<name>` and `<name>` in one call;
 //! 6. journal the import, then delete the old copy now in `.takeover-<name>`,
 //!    or, if it changed since it was checked, move it aside to
-//!    `.takeover-kept-<name>-<time>` so the name is usable.
+//!    `.kept-takeover-<name>-<time>` so the name is usable.
 //!
 //! A failure before the marker takes back what was pushed and leaves the
 //! source as it was. A failure or a crash after it is completed by running
@@ -179,7 +179,7 @@ impl CloudBackend {
         staging.moved = true;
         if reuse_session_id.is_none() {
             if let Err(e) = self.mark_source(req, source, &session_id, &machine_id) {
-                if let Some(stop) = self.after_failed_mark(e, source, &pushed) {
+                if let Some(stop) = self.after_failed_mark(e, source, &session_id, &pushed) {
                     return Err(stop);
                 }
             }
@@ -313,7 +313,7 @@ impl CloudBackend {
     }
 
     /// Move a `.takeover-<name>` that can't be deleted safely aside to
-    /// `.takeover-kept-<name>-<time>`, where it no longer holds the name
+    /// `.kept-takeover-<name>-<time>`, where it no longer holds the name
     /// refusing, and say where it went.
     fn keep_old_copy(&self, name: &str, pending: &Path, why: &str) {
         let stamp = std::time::SystemTime::now()
@@ -323,7 +323,7 @@ impl CloudBackend {
         let kept = self
             .local
             .base_dir()
-            .join(format!(".takeover-kept-{}-{}", name, stamp));
+            .join(format!(".kept-takeover-{}-{}", name, stamp));
         match crate::engine::atomic_fs::atomic_rename_dir(pending, &kept) {
             Ok(()) => eprintln!(
                 "warning: the old copy of '{}' {}, so it was kept at {}; look at it, then \
@@ -562,6 +562,7 @@ impl CloudBackend {
         &self,
         err: ImportError,
         source: &ImportSource,
+        session_id: &str,
         pushed: &[String],
     ) -> Option<ImportError> {
         let pending = takeover_dir(self.local.base_dir(), &source.name);
@@ -571,14 +572,30 @@ impl CloudBackend {
             let _ = std::fs::remove_dir_all(&pending);
             return Some(err);
         }
-        let listed = if fault("marker-unknown") {
+        // A marker that is there must also be this import's: one that names
+        // another session id means another import marked the source in
+        // between, and this one takes everything back.
+        let landed = if fault("marker-unknown") {
             Err(anyhow::anyhow!("injected unknown marker outcome"))
         } else {
-            self.object_listed(&source.key(MIGRATED_MARKER))
+            self.get_object_if_present(&source.key(MIGRATED_MARKER))
         };
-        match listed {
-            Ok(true) => None,
-            Ok(false) => {
+        match landed {
+            Ok(Some(marker)) if marker_target_field(&marker, "session_id") == session_id => None,
+            Ok(Some(marker)) => {
+                self.take_back(pushed);
+                let _ = std::fs::remove_dir_all(&pending);
+                Some(ImportError::new(
+                    ImportErrorCode::SourceMigrated,
+                    format!(
+                        "session '{}' was marked migrated to '{}' by another import while this \
+                         one ran; nothing here was kept. Continue it where that import put it",
+                        source.name,
+                        marker_target_field(&marker, "workspace")
+                    ),
+                ))
+            }
+            Ok(None) => {
                 self.take_back(pushed);
                 let _ = std::fs::remove_dir_all(&pending);
                 Some(ImportError::new(

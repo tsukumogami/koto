@@ -79,7 +79,7 @@ or from the source workspace itself is unchanged. The design is
 session is built in a private `.import-<name>-<random>` and renamed to
 `.takeover-<name>` only once complete, so a stop while staging never leaves
 the name refusing; and an old copy that changed after it was checked is
-moved aside to `.takeover-kept-<name>-<time>` rather than left at
+moved aside to `.kept-takeover-<name>-<time>` rather than left at
 `.takeover-<name>`, so the name stays usable while nothing is deleted.
 
 ## Context and Problem Statement

@@ -726,9 +726,9 @@ fn a_re_run_after_the_marker_never_overwrites_a_copy_that_moved_on() {
     assert_eq!(std::fs::read(h.state_path(NAME)).unwrap(), local_before);
 }
 
-/// The `.takeover-kept-<name>-*` directories in the store.
+/// The `.kept-takeover-<name>-*` directories in the store.
 fn kept_copies(h: &Host) -> Vec<PathBuf> {
-    let prefix = format!(".takeover-kept-{}-", NAME);
+    let prefix = format!(".kept-takeover-{}-", NAME);
     std::fs::read_dir(h.sessions())
         .unwrap()
         .flatten()
@@ -944,4 +944,64 @@ fn a_re_run_after_a_stop_past_the_exchange_removes_the_finished_record() {
     assert!(out.ok(), "{}", out.describe());
     assert!(!record.exists(), "the re-run removed the finished record");
     assert_moved(&h);
+}
+
+#[test]
+fn a_prune_in_the_source_workspace_never_removes_the_imported_session() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = source(&s3);
+    let out = h.import_from_a(&[]);
+    assert!(out.ok(), "{}", out.describe());
+    // Finish the imported session in B, so a prune would pick it up.
+    for data in [r#"{"choice":"go"}"#, r#"{"verdict":"approve"}"#] {
+        let out = h.koto(
+            &h.b,
+            &["next", NAME, "--with-data", data, "--no-cleanup"],
+            &[],
+        );
+        assert!(out.ok(), "{}", out.describe());
+    }
+    let state = std::fs::read(h.state_path(NAME)).unwrap();
+    for args in [
+        vec!["session", "prune", "--apply", "--all"],
+        vec![
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--execution-dir",
+            h.b.to_str().unwrap(),
+        ],
+    ] {
+        let _ = h.koto(&h.a, &args, &[]);
+        assert_eq!(
+            std::fs::read(h.state_path(NAME)).unwrap(),
+            state,
+            "{args:?} from A removed or changed the imported session"
+        );
+    }
+}
+
+#[test]
+fn a_marker_from_another_import_is_never_taken_for_this_one() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = source(&s3);
+    // Our marker PUT fails, but another import's marker is there when the
+    // run looks.
+    let other = serde_json::json!({
+        "target": {"workspace": "/srv/elsewhere", "session": NAME, "session_id": "someone-else"},
+    });
+    s3.fail("PUT", &marker_key(&h), 500);
+    s3.put_after(
+        "PUT",
+        &marker_key(&h),
+        &marker_key(&h),
+        other.to_string().as_bytes(),
+    );
+    let out = h.import_from_a(&[]);
+    assert_refused(&out, "import_source_migrated");
+    assert!(out.stdout.contains("another import"), "{}", out.describe());
+    // Everything this run pushed or staged was taken back.
+    assert!(b_objects(&h, &s3).is_empty());
+    assert!(!h.pending().exists());
 }
