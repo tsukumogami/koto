@@ -901,3 +901,26 @@ fn a_pending_takeover_refuses_commands_on_the_name() {
     assert_eq!(snapshot(&h, &s3), before);
     assert!(std::fs::read_dir(h.pending()).unwrap().next().is_none());
 }
+
+#[test]
+fn a_takeover_removes_the_name_s_finished_record() {
+    use std::os::unix::fs::DirBuilderExt;
+    let s3 = FakeS3::start(BUCKET);
+    let h = source(&s3);
+    // A stale record of an earlier session that finished under the name.
+    let finished = h.sessions().join(".finished");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&finished)
+        .unwrap();
+    let record = finished.join(format!("{}.json", NAME));
+    std::fs::write(&record, br#"{"name":"coord","status":"done"}"#).unwrap();
+
+    let out = h.import_from_a(&[]);
+    assert!(out.ok(), "{}", out.describe());
+    assert!(
+        !record.exists(),
+        "the finished record of the name was removed"
+    );
+    assert_moved(&h);
+}
