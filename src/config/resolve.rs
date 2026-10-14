@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use url::Url;
 
+use super::session_env::{self, Origin};
 use super::validate::{check_decider_endpoint, DECIDER_TIMEOUT_DEFAULT_MS, DECIDER_TIMEOUT_MAX_MS};
 use super::{DeciderConfig, KotoConfig, RequestStoreConfig};
 use crate::decider::{ApiKey, GlobalMode, SettingOrigin};
@@ -41,11 +42,18 @@ pub struct RequestStoreOverrides {
 /// nothing.
 ///
 /// Precedence (highest to lowest):
-/// 1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+/// 1. Environment variables (`KOTO_SESSION_*` for the session backend,
+///    location and credentials, `AWS_ACCESS_KEY_ID` and
+///    `AWS_SECRET_ACCESS_KEY` when the koto credential pair is unset,
 ///    `KOTO_REQUEST_STORE_*` for request-store dimensions)
 /// 2. Project config (.koto/config.toml in current directory)
 /// 3. User config (~/.koto/config.toml)
 /// 4. Built-in defaults
+///
+/// The session layer records where each session setting came from in
+/// `config.session_env`, and never fails the load on a value it can't use:
+/// [`session_env::check`] refuses those where a backend is built, so
+/// `koto config list` can still show them.
 ///
 /// The CLI-flag layer (the highest tier of the 5-level cascade) is
 /// applied per-tick in `request_store_config()`, not here --
@@ -63,6 +71,7 @@ pub fn load_config() -> Result<KotoConfig> {
             let user_config = load_config_file(&user_path, "user config")?;
             record_file_secrets(&mut config.secret_sources, &user_config.config);
             merge_config(&mut config, &user_config);
+            mark_file_origins(&mut config, &user_config, Origin::User, true);
             merge_run_journal(&mut config, &user_config);
             merge_marker_retention(&mut config, &user_config);
             merge_decider(
@@ -79,6 +88,7 @@ pub fn load_config() -> Result<KotoConfig> {
         let project_config = load_config_file(&project_path, "project config")?;
         record_file_secrets(&mut config.secret_sources, &project_config.config);
         merge_config(&mut config, &project_config);
+        mark_file_origins(&mut config, &project_config, Origin::Project, false);
         merge_decider(
             &mut config.decider,
             &project_config.config.decider,
@@ -86,16 +96,12 @@ pub fn load_config() -> Result<KotoConfig> {
         );
     }
 
-    // Layer 3: env var overrides for credentials. The config-file values
-    // they replace were recorded above, so redaction still searches for them.
-    if let Ok(val) = env::var(ENV_AWS_ACCESS_KEY_ID) {
-        config.session.cloud.access_key = Some(val);
-        config.secret_sources.access_key_from_env = true;
-    }
-    if let Ok(val) = env::var(ENV_AWS_SECRET_ACCESS_KEY) {
-        config.session.cloud.secret_key = Some(val);
-        config.secret_sources.secret_key_from_env = true;
-    }
+    // Layer 3: the KOTO_SESSION_* location variables, then the
+    // credentials: the koto pair as a whole, else the AWS pair as before.
+    // The config-file values they replace were recorded above, so
+    // redaction still searches for them.
+    apply_session_env(&mut config, env_lookup);
+    apply_credential_env(&mut config, env_lookup);
 
     // Layer 3b: KOTO_REQUEST_STORE_* env-var overrides for the
     // request_store block.
@@ -105,6 +111,191 @@ pub fn load_config() -> Result<KotoConfig> {
     apply_decider_env(&mut config.decider, |k| env::var(k).ok());
 
     Ok(config)
+}
+
+/// One environment variable as the session layer sees it: `None` when it is
+/// unset, `Some(Err(()))` when its value isn't valid Unicode.
+type EnvValue = Option<Result<String, ()>>;
+
+/// [`load_config`]'s lookup: the process environment.
+fn env_lookup(name: &str) -> EnvValue {
+    match env::var(name) {
+        Ok(v) => Some(Ok(v)),
+        Err(env::VarError::NotUnicode(_)) => Some(Err(())),
+        Err(env::VarError::NotPresent) => None,
+    }
+}
+
+/// A `KOTO_SESSION_*` value as the session layer uses it: trimmed, and
+/// `None` when unset, empty or whitespace only. A value that isn't Unicode
+/// is set: `Some(Err(()))`.
+fn session_var<F>(lookup: &F, name: &str) -> EnvValue
+where
+    F: Fn(&str) -> EnvValue,
+{
+    match lookup(name)? {
+        Ok(v) if v.trim().is_empty() => None,
+        Ok(v) => Some(Ok(v.trim().to_string())),
+        Err(()) => Some(Err(())),
+    }
+}
+
+/// Mark the session settings a config file names with that file's origin.
+///
+/// A file names a setting only when its raw TOML has the key, whatever its
+/// value. A file with a `[session]` table but no `backend` key still sets
+/// the backend to `local` through serde's default (and still replaces an
+/// earlier layer's value, as it always has); that value is koto's default,
+/// so the origin reads `default`. `marker_retain_days` merges from the user
+/// file only, so only that layer can be its origin.
+fn mark_file_origins(
+    config: &mut KotoConfig,
+    loaded: &LoadedConfig,
+    origin: Origin,
+    user_layer: bool,
+) {
+    for setting in session_env::SETTINGS {
+        if setting == "session.cloud.marker_retain_days" && !user_layer {
+            continue;
+        }
+        let named = loaded.session_keys.iter().any(|k| k == setting);
+        // An empty backend is the one value a file can name that the merge
+        // ignores; the layer below keeps the setting, and its origin.
+        let ignored = setting == "session.backend" && loaded.config.session.backend.is_empty();
+        if named && !ignored {
+            config.session_env.set_origin(setting, origin);
+        } else if setting == "session.backend" && !loaded.config.session.backend.is_empty() {
+            config.session_env.set_origin(setting, Origin::Default);
+        }
+    }
+}
+
+/// Apply the five `KOTO_SESSION_*` location variables through `lookup`.
+///
+/// A set value replaces the file layers' value for its setting and marks
+/// its origin. A backend is kept as given, valid or not: `session_env::check`
+/// refuses one other than `local` or `cloud`. A path style other than `true`
+/// or `false`, and any value that isn't Unicode, is recorded in
+/// `session_env.invalid` and leaves its setting with no value, so neither a
+/// lower layer nor a default stands in for it.
+pub fn apply_session_env<F>(config: &mut KotoConfig, lookup: F)
+where
+    F: Fn(&str) -> EnvValue,
+{
+    use session_env::{
+        InvalidEnv, ENV_BACKEND, ENV_BUCKET, ENV_ENDPOINT, ENV_PATH_STYLE, ENV_REGION,
+    };
+    for (setting, var) in [
+        ("session.backend", ENV_BACKEND),
+        ("session.cloud.endpoint", ENV_ENDPOINT),
+        ("session.cloud.bucket", ENV_BUCKET),
+        ("session.cloud.region", ENV_REGION),
+        ("session.cloud.path_style", ENV_PATH_STYLE),
+    ] {
+        let Some(value) = session_var(&lookup, var) else {
+            continue;
+        };
+        config.session_env.set_origin(setting, Origin::Env(var));
+        let invalid = |raw: Option<String>| InvalidEnv {
+            setting,
+            variable: var,
+            raw,
+        };
+        let cloud = &mut config.session.cloud;
+        match (setting, value) {
+            ("session.cloud.path_style", Ok(v)) if v == "true" || v == "false" => {
+                cloud.path_style = Some(v == "true");
+            }
+            ("session.cloud.path_style", Ok(v)) => {
+                cloud.path_style = None;
+                config.session_env.invalid.push(invalid(Some(v)));
+            }
+            (_, Err(())) => {
+                match setting {
+                    "session.backend" => config.session.backend = String::new(),
+                    "session.cloud.endpoint" => cloud.endpoint = None,
+                    "session.cloud.bucket" => cloud.bucket = None,
+                    "session.cloud.region" => cloud.region = None,
+                    _ => cloud.path_style = None,
+                }
+                config.session_env.invalid.push(invalid(None));
+            }
+            ("session.backend", Ok(v)) => config.session.backend = v,
+            ("session.cloud.endpoint", Ok(v)) => cloud.endpoint = Some(v),
+            ("session.cloud.bucket", Ok(v)) => cloud.bucket = Some(v),
+            (_, Ok(v)) => cloud.region = Some(v),
+        }
+    }
+}
+
+/// Resolve the cloud credentials from the environment through `lookup`.
+///
+/// When either `KOTO_SESSION_CLOUD_ACCESS_KEY` or
+/// `KOTO_SESSION_CLOUD_SECRET_KEY` is set (non-empty after trimming), both
+/// credentials come from that pair and nothing else: a missing half becomes
+/// no value, named in `session_env.pair_missing`, and is never filled from
+/// the AWS pair or a file. With neither set, `AWS_ACCESS_KEY_ID` and
+/// `AWS_SECRET_ACCESS_KEY` replace the file values exactly as they always
+/// have, an empty value included.
+pub fn apply_credential_env<F>(config: &mut KotoConfig, lookup: F)
+where
+    F: Fn(&str) -> EnvValue,
+{
+    use session_env::{InvalidEnv, ENV_ACCESS_KEY, ENV_SECRET_KEY};
+    let access = session_var(&lookup, ENV_ACCESS_KEY);
+    let secret = session_var(&lookup, ENV_SECRET_KEY);
+    if access.is_some() || secret.is_some() {
+        for (setting, var, value) in [
+            ("session.cloud.access_key", ENV_ACCESS_KEY, access),
+            ("session.cloud.secret_key", ENV_SECRET_KEY, secret),
+        ] {
+            let resolved = match value {
+                Some(Ok(v)) => {
+                    config.session_env.set_origin(setting, Origin::Env(var));
+                    Some(v)
+                }
+                Some(Err(())) => {
+                    config.session_env.set_origin(setting, Origin::Env(var));
+                    config.session_env.invalid.push(InvalidEnv {
+                        setting,
+                        variable: var,
+                        raw: None,
+                    });
+                    None
+                }
+                None => {
+                    config.session_env.set_origin(setting, Origin::Unset);
+                    config.session_env.pair_missing = Some(var);
+                    None
+                }
+            };
+            let sources = &mut config.secret_sources;
+            if setting == "session.cloud.access_key" {
+                config.session.cloud.access_key = resolved;
+                sources.access_key_env = Some(var);
+            } else {
+                config.session.cloud.secret_key = resolved;
+                sources.secret_key_env = Some(var);
+            }
+        }
+        return;
+    }
+    if let Some(Ok(val)) = lookup(ENV_AWS_ACCESS_KEY_ID) {
+        config.session.cloud.access_key = Some(val);
+        config.secret_sources.access_key_env = Some(ENV_AWS_ACCESS_KEY_ID);
+        config.session_env.set_origin(
+            "session.cloud.access_key",
+            Origin::Env(ENV_AWS_ACCESS_KEY_ID),
+        );
+    }
+    if let Some(Ok(val)) = lookup(ENV_AWS_SECRET_ACCESS_KEY) {
+        config.session.cloud.secret_key = Some(val);
+        config.secret_sources.secret_key_env = Some(ENV_AWS_SECRET_ACCESS_KEY);
+        config.session_env.set_origin(
+            "session.cloud.secret_key",
+            Origin::Env(ENV_AWS_SECRET_ACCESS_KEY),
+        );
+    }
 }
 
 /// Record every secret value one config file sets, before the merge can
@@ -260,13 +451,37 @@ fn load_config_file(path: &Path, label: &'static str) -> Result<LoadedConfig> {
         .and_then(|v| v.as_table())
         .map(|t| t.contains_key("native"))
         .unwrap_or(false);
+    let session_keys = session_keys_named(&raw);
     Ok(LoadedConfig {
         config,
         request_store_keys,
         request_store_has_recursion,
         run_journal_keys,
         workflows_native_present,
+        session_keys,
     })
+}
+
+/// The session settings a file's raw TOML names, as dotted names. Both TOML
+/// spellings (`[session]` with `backend = ...`, or a top-level
+/// `session.backend = ...`) parse to the same table.
+fn session_keys_named(raw: &toml::Value) -> Vec<String> {
+    let session = raw
+        .as_table()
+        .and_then(|t| t.get("session"))
+        .and_then(|v| v.as_table());
+    let Some(session) = session else {
+        return Vec::new();
+    };
+    let cloud = session.get("cloud").and_then(|v| v.as_table());
+    session_env::SETTINGS
+        .iter()
+        .filter(|setting| match setting.strip_prefix("session.cloud.") {
+            Some(field) => cloud.is_some_and(|c| c.contains_key(field)),
+            None => session.contains_key(setting.trim_start_matches("session.")),
+        })
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// What kind of parse failure a [`ConfigParseError`] reports.
@@ -356,6 +571,9 @@ struct LoadedConfig {
     request_store_has_recursion: bool,
     run_journal_keys: Vec<String>,
     workflows_native_present: bool,
+    /// The session settings (dotted names from `session_env::SETTINGS`)
+    /// the file's raw TOML names, whatever their values.
+    session_keys: Vec<String>,
 }
 
 /// Merge source config into target. Non-default/non-empty values in
@@ -489,8 +707,13 @@ pub const ENV_DECIDER_API_KEY: &str = "KOTO_DECIDER_API_KEY";
 /// access and secret keys. Redaction reads them from the environment
 /// directly as well as through the loaded configuration, so they're
 /// searched for even when a config file fails to load.
-pub const ENV_SECRET_NAMES: [&str; 3] = [
+///
+/// The koto credential pair comes before the AWS pair: a value both hold is
+/// labeled with the koto name, the one koto used.
+pub const ENV_SECRET_NAMES: [&str; 5] = [
     ENV_DECIDER_API_KEY,
+    session_env::ENV_ACCESS_KEY,
+    session_env::ENV_SECRET_KEY,
     ENV_AWS_ACCESS_KEY_ID,
     ENV_AWS_SECRET_ACCESS_KEY,
 ];
@@ -1019,11 +1242,13 @@ mod tests {
                 run_journal: Default::default(),
                 decider: Default::default(),
                 secret_sources: Default::default(),
+                session_env: Default::default(),
             },
             request_store_keys: vec![],
             request_store_has_recursion: false,
             run_journal_keys: vec![],
             workflows_native_present: false,
+            session_keys: vec![],
         };
 
         merge_config(&mut base, &overlay);
@@ -1043,6 +1268,7 @@ mod tests {
             request_store_has_recursion: false,
             run_journal_keys: vec![],
             workflows_native_present: false,
+            session_keys: vec![],
         };
         merge_config(&mut base, &overlay);
 
@@ -1065,6 +1291,7 @@ mod tests {
             request_store_has_recursion: false,
             run_journal_keys: vec![],
             workflows_native_present: false,
+            session_keys: vec![],
         };
         merge_config(&mut base, &unset);
         assert_eq!(base.session.cloud.path_style, Some(true));
@@ -1078,6 +1305,7 @@ mod tests {
             request_store_has_recursion: false,
             run_journal_keys: vec![],
             workflows_native_present: false,
+            session_keys: vec![],
         };
         merge_config(&mut base, &overlay);
         assert_eq!(base.session.cloud.path_style, Some(false));
@@ -1168,6 +1396,7 @@ mod tests {
             request_store_has_recursion: false,
             run_journal_keys: vec![],
             workflows_native_present: true,
+            session_keys: vec![],
         };
         merge_config(&mut base, &optout);
         assert!(
@@ -1184,6 +1413,7 @@ mod tests {
             request_store_has_recursion: false,
             run_journal_keys: vec![],
             workflows_native_present: false,
+            session_keys: vec![],
         };
         merge_config(&mut base_off, &absent);
         assert!(!base_off.workflows.native, "absent key must not clobber");
@@ -1469,6 +1699,7 @@ mod tests {
                 request_store_has_recursion: false,
                 run_journal_keys: vec![],
                 workflows_native_present: false,
+                session_keys: vec![],
             };
             merge_config(&mut base, &loaded);
             assert!(base.decider.is_empty());
@@ -1973,5 +2204,406 @@ mod tests {
         fn drop(&mut self) {
             let _ = env::set_current_dir(&self.prev);
         }
+    }
+}
+
+/// The `KOTO_SESSION_*` layer, exercised through its lookup closure so no
+/// test touches the process environment.
+#[cfg(test)]
+mod session_env_tests {
+    use super::*;
+    use crate::config::session_env::{
+        Origin, ENV_ACCESS_KEY, ENV_BACKEND, ENV_BUCKET, ENV_ENDPOINT, ENV_PATH_STYLE, ENV_REGION,
+        ENV_SECRET_KEY,
+    };
+    use std::collections::HashMap;
+
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> EnvValue {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned().map(Ok)
+    }
+
+    /// A config as the two file layers leave it, from TOML bodies.
+    fn from_files(user: &str, project: &str) -> KotoConfig {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = KotoConfig::default();
+        config.session.backend = "local".to_string();
+        for (body, origin, user_layer) in [
+            (user, Origin::User, true),
+            (project, Origin::Project, false),
+        ] {
+            if body.is_empty() {
+                continue;
+            }
+            let path = tmp.path().join(if user_layer {
+                "user.toml"
+            } else {
+                "project.toml"
+            });
+            fs::write(&path, body).unwrap();
+            let loaded = load_config_file(&path, "test config").unwrap();
+            merge_config(&mut config, &loaded);
+            if user_layer {
+                merge_marker_retention(&mut config, &loaded);
+            }
+            mark_file_origins(&mut config, &loaded, origin, user_layer);
+        }
+        config
+    }
+
+    fn resolve(user: &str, project: &str, env: &[(&str, &str)]) -> KotoConfig {
+        let mut config = from_files(user, project);
+        apply_session_env(&mut config, lookup(env));
+        apply_credential_env(&mut config, lookup(env));
+        config
+    }
+
+    const BOTH_FILES_USER: &str = "[session]\nbackend = \"local\"\n[session.cloud]\nendpoint = \"https://user.example\"\nbucket = \"user-bucket\"\nregion = \"user-region\"\npath_style = false\n";
+    const BOTH_FILES_PROJECT: &str = "[session]\nbackend = \"local\"\n[session.cloud]\nendpoint = \"https://project.example\"\nbucket = \"project-bucket\"\nregion = \"project-region\"\npath_style = false\n";
+
+    #[test]
+    fn each_variable_wins_over_both_files() {
+        let c = resolve(
+            BOTH_FILES_USER,
+            BOTH_FILES_PROJECT,
+            &[
+                (ENV_BACKEND, "cloud"),
+                (ENV_ENDPOINT, "https://env.example"),
+                (ENV_BUCKET, "env-bucket"),
+                (ENV_REGION, "env-region"),
+                (ENV_PATH_STYLE, "true"),
+            ],
+        );
+        assert_eq!(c.session.backend, "cloud");
+        assert_eq!(
+            c.session.cloud.endpoint.as_deref(),
+            Some("https://env.example")
+        );
+        assert_eq!(c.session.cloud.bucket.as_deref(), Some("env-bucket"));
+        assert_eq!(c.session.cloud.region.as_deref(), Some("env-region"));
+        assert_eq!(c.session.cloud.path_style, Some(true));
+        for (setting, var) in [
+            ("session.backend", ENV_BACKEND),
+            ("session.cloud.endpoint", ENV_ENDPOINT),
+            ("session.cloud.bucket", ENV_BUCKET),
+            ("session.cloud.region", ENV_REGION),
+            ("session.cloud.path_style", ENV_PATH_STYLE),
+        ] {
+            assert_eq!(c.session_env.origin(setting), Origin::Env(var), "{setting}");
+        }
+    }
+
+    #[test]
+    fn project_beats_user_and_user_beats_default_without_variables() {
+        let c = resolve(BOTH_FILES_USER, BOTH_FILES_PROJECT, &[]);
+        assert_eq!(c.session.cloud.bucket.as_deref(), Some("project-bucket"));
+        assert_eq!(
+            c.session_env.origin("session.cloud.bucket"),
+            Origin::Project
+        );
+        let c = resolve(BOTH_FILES_USER, "", &[]);
+        assert_eq!(c.session.cloud.bucket.as_deref(), Some("user-bucket"));
+        assert_eq!(c.session_env.origin("session.cloud.bucket"), Origin::User);
+        let c = resolve("", "", &[]);
+        assert_eq!(c.session.backend, "local");
+        assert!(c.session.cloud.bucket.is_none());
+        assert_eq!(c.session_env.origin("session.backend"), Origin::Default);
+        assert_eq!(c.session_env.origin("session.cloud.bucket"), Origin::Unset);
+    }
+
+    #[test]
+    fn empty_and_whitespace_values_fall_through() {
+        for value in ["", "  ", "\t"] {
+            let c = resolve(
+                "",
+                "[session]\nbackend = \"local\"\n",
+                &[(ENV_BACKEND, value), (ENV_BUCKET, value)],
+            );
+            assert_eq!(c.session.backend, "local", "{value:?}");
+            assert_eq!(c.session_env.origin("session.backend"), Origin::Project);
+            assert!(c.session.cloud.bucket.is_none());
+            assert!(c.session_env.invalid.is_empty());
+        }
+    }
+
+    #[test]
+    fn values_are_trimmed_and_case_sensitive() {
+        let c = resolve("", "", &[(ENV_BACKEND, " cloud ")]);
+        assert_eq!(c.session.backend, "cloud");
+        assert!(crate::config::session_env::check(&c).is_ok());
+        let c = resolve("", "", &[(ENV_BACKEND, "Cloud")]);
+        let err = crate::config::session_env::check(&c)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(ENV_BACKEND) && err.contains("Cloud"), "{err}");
+    }
+
+    #[test]
+    fn a_mixed_run_reports_three_origins() {
+        let c = resolve(
+            "[session.cloud]\nregion = \"user-region\"\n",
+            "[session.cloud]\nbucket = \"project-bucket\"\n",
+            &[(ENV_BACKEND, "cloud")],
+        );
+        assert_eq!(
+            c.session_env.origin("session.backend"),
+            Origin::Env(ENV_BACKEND)
+        );
+        assert_eq!(
+            c.session_env.origin("session.cloud.bucket"),
+            Origin::Project
+        );
+        assert_eq!(c.session_env.origin("session.cloud.region"), Origin::User);
+    }
+
+    #[test]
+    fn an_invalid_value_refuses_and_never_falls_back() {
+        let c = resolve(BOTH_FILES_USER, "", &[(ENV_PATH_STYLE, "yes")]);
+        assert_eq!(
+            c.session.cloud.path_style, None,
+            "the user file's value must not show through"
+        );
+        assert_eq!(
+            c.session_env.origin("session.cloud.path_style"),
+            Origin::Env(ENV_PATH_STYLE)
+        );
+        let err = crate::config::session_env::check(&c)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(ENV_PATH_STYLE) && err.contains("\"yes\""),
+            "{err}"
+        );
+
+        let c = resolve("", "", &[(ENV_BACKEND, "s3")]);
+        assert_eq!(c.session.backend, "s3");
+        let err = crate::config::session_env::check(&c)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(ENV_BACKEND) && err.contains("s3"), "{err}");
+    }
+
+    #[test]
+    fn a_non_unicode_value_counts_as_set_and_invalid() {
+        let mut c = from_files(BOTH_FILES_USER, "");
+        apply_session_env(&mut c, |k: &str| (k == ENV_BUCKET).then_some(Err(())));
+        assert!(c.session.cloud.bucket.is_none());
+        assert_eq!(
+            c.session_env.origin("session.cloud.bucket"),
+            Origin::Env(ENV_BUCKET)
+        );
+        assert!(crate::config::session_env::check(&c).is_err());
+
+        let mut c = from_files("", "");
+        apply_credential_env(&mut c, |k: &str| match k {
+            ENV_ACCESS_KEY => Some(Err(())),
+            "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" => Some(Ok("aws".to_string())),
+            _ => None,
+        });
+        assert!(c.session.cloud.access_key.is_none(), "never the AWS key");
+        assert!(crate::config::session_env::check(&c).is_err());
+    }
+
+    #[test]
+    fn marker_retain_days_has_no_variable() {
+        let c = resolve(
+            "[session.cloud]\nmarker_retain_days = 7\n",
+            "",
+            &[("KOTO_SESSION_CLOUD_MARKER_RETAIN_DAYS", "1")],
+        );
+        assert_eq!(c.session.cloud.marker_retain_days(), 7);
+        assert_eq!(
+            c.session_env.origin("session.cloud.marker_retain_days"),
+            Origin::User
+        );
+    }
+
+    const AWS: [(&str, &str); 2] = [
+        ("AWS_ACCESS_KEY_ID", "aws-access"),
+        ("AWS_SECRET_ACCESS_KEY", "aws-secret"),
+    ];
+
+    #[test]
+    fn the_koto_pair_replaces_the_aws_pair_and_the_file_as_a_whole() {
+        let user = "[session.cloud]\naccess_key = \"file-access\"\nsecret_key = \"file-secret\"\n";
+        let mut env = AWS.to_vec();
+        env.extend([
+            (ENV_ACCESS_KEY, "koto-access"),
+            (ENV_SECRET_KEY, "koto-secret"),
+        ]);
+        let c = resolve(user, "", &env);
+        assert_eq!(c.session.cloud.access_key.as_deref(), Some("koto-access"));
+        assert_eq!(c.session.cloud.secret_key.as_deref(), Some("koto-secret"));
+        assert_eq!(
+            c.session_env.origin("session.cloud.access_key"),
+            Origin::Env(ENV_ACCESS_KEY)
+        );
+        assert_eq!(c.secret_sources.access_key_env, Some(ENV_ACCESS_KEY));
+        assert!(c.session_env.pair_missing.is_none());
+    }
+
+    #[test]
+    fn a_half_pair_refuses_on_cloud_naming_the_missing_half() {
+        for (set, missing) in [
+            (ENV_ACCESS_KEY, ENV_SECRET_KEY),
+            (ENV_SECRET_KEY, ENV_ACCESS_KEY),
+        ] {
+            let user =
+                "[session.cloud]\naccess_key = \"file-access\"\nsecret_key = \"file-secret\"\n";
+            let mut env = AWS.to_vec();
+            env.push((set, "koto-half"));
+            env.push((ENV_BACKEND, "cloud"));
+            let c = resolve(user, "", &env);
+            assert_eq!(c.session_env.pair_missing, Some(missing));
+            let neither_aws_nor_file = |v: &Option<String>| {
+                !matches!(
+                    v.as_deref(),
+                    Some("aws-access" | "aws-secret" | "file-access" | "file-secret")
+                )
+            };
+            assert!(neither_aws_nor_file(&c.session.cloud.access_key));
+            assert!(neither_aws_nor_file(&c.session.cloud.secret_key));
+            let err = crate::config::session_env::check(&c)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(missing), "{err}");
+
+            let mut env = env.clone();
+            env.retain(|(k, _)| *k != ENV_BACKEND);
+            let c = resolve(user, "", &env);
+            assert!(
+                crate::config::session_env::check(&c).is_ok(),
+                "local backend is unaffected"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_koto_credentials_fall_through_to_the_aws_pair() {
+        let mut env = AWS.to_vec();
+        env.extend([(ENV_ACCESS_KEY, ""), (ENV_SECRET_KEY, "  ")]);
+        let c = resolve("", "", &env);
+        assert_eq!(c.session.cloud.access_key.as_deref(), Some("aws-access"));
+        assert_eq!(
+            c.session_env.origin("session.cloud.access_key"),
+            Origin::Env("AWS_ACCESS_KEY_ID")
+        );
+        assert!(c.session_env.pair_missing.is_none());
+    }
+
+    #[test]
+    fn the_aws_pair_keeps_its_empty_value_handling() {
+        let user = "[session.cloud]\naccess_key = \"file-access\"\n";
+        let c = resolve(user, "", &[("AWS_ACCESS_KEY_ID", "")]);
+        assert_eq!(c.session.cloud.access_key.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn the_pair_never_goes_to_a_project_file_destination() {
+        let env = [
+            (ENV_BACKEND, "cloud"),
+            (ENV_ACCESS_KEY, "koto-access"),
+            (ENV_SECRET_KEY, "koto-secret"),
+        ];
+        for project in [
+            "[session.cloud]\nendpoint = \"https://evil.example\"\n",
+            "[session.cloud]\nbucket = \"evil\"\n",
+        ] {
+            let c = resolve("", project, &env);
+            let err = crate::config::session_env::check(&c)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("project file"), "{err}");
+        }
+        let mut with_endpoint = env.to_vec();
+        with_endpoint.push((ENV_ENDPOINT, "https://mine.example"));
+        let c = resolve(
+            "",
+            "[session.cloud]\nendpoint = \"https://evil.example\"\n",
+            &with_endpoint,
+        );
+        assert!(crate::config::session_env::check(&c).is_ok());
+        // Without the koto pair the project file keeps today's reach.
+        let c = resolve(
+            "",
+            "[session.cloud]\nendpoint = \"https://elsewhere.example\"\n",
+            &[(ENV_BACKEND, "cloud"), AWS[0], AWS[1]],
+        );
+        assert!(crate::config::session_env::check(&c).is_ok());
+    }
+
+    #[test]
+    fn a_session_table_without_backend_reports_default() {
+        for (user, project) in [
+            ("[session.cloud]\nbucket = \"b\"\n[session]\n", ""),
+            ("", "[session]\n"),
+        ] {
+            let c = resolve(user, project, &[]);
+            assert_eq!(c.session_env.origin("session.backend"), Origin::Default);
+        }
+        let c = resolve("", "session.backend = \"local\"\n", &[]);
+        assert_eq!(c.session_env.origin("session.backend"), Origin::Project);
+    }
+
+    #[test]
+    fn an_empty_backend_in_a_file_leaves_the_lower_layer_its_origin() {
+        // The merge ignores an empty backend, so the user file's value and
+        // origin stand.
+        let c = resolve(
+            "[session]\nbackend = \"cloud\"\n",
+            "[session]\nbackend = \"\"\n",
+            &[],
+        );
+        assert_eq!(c.session.backend, "cloud");
+        assert_eq!(c.session_env.origin("session.backend"), Origin::User);
+    }
+
+    #[test]
+    fn command_vars_carry_only_what_the_environment_supplied() {
+        let c = resolve(
+            "[session.cloud]\nregion = \"user-region\"\n",
+            "",
+            &[
+                (ENV_BACKEND, "cloud"),
+                (ENV_BUCKET, " env-bucket "),
+                (ENV_ACCESS_KEY, "koto-access"),
+                (ENV_SECRET_KEY, "koto-secret"),
+            ],
+        );
+        let vars = crate::config::session_env::command_vars(&c);
+        assert_eq!(
+            vars,
+            vec![
+                (ENV_BACKEND.to_string(), "cloud".to_string()),
+                (ENV_BUCKET.to_string(), "env-bucket".to_string()),
+                (ENV_ACCESS_KEY.to_string(), "koto-access".to_string()),
+                (ENV_SECRET_KEY.to_string(), "koto-secret".to_string()),
+            ]
+        );
+        // AWS-pair credentials stay where they were: not added.
+        let c = resolve("", "", &[(ENV_BACKEND, "cloud"), AWS[0], AWS[1]]);
+        assert_eq!(
+            crate::config::session_env::command_vars(&c),
+            vec![(ENV_BACKEND.to_string(), "cloud".to_string())]
+        );
+    }
+
+    #[test]
+    fn redaction_labels_the_koto_variable() {
+        let c = resolve(
+            "",
+            "",
+            &[
+                (ENV_ACCESS_KEY, "koto-access-value"),
+                (ENV_SECRET_KEY, "koto-secret-value"),
+            ],
+        );
+        let keys = crate::config::redaction_keys(&c);
+        assert!(keys.contains(&(ENV_ACCESS_KEY.to_string(), "koto-access-value".to_string())));
+        assert!(keys.contains(&(ENV_SECRET_KEY.to_string(), "koto-secret-value".to_string())));
+        assert_eq!(&ENV_SECRET_NAMES[1..3], &[ENV_ACCESS_KEY, ENV_SECRET_KEY]);
     }
 }

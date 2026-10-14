@@ -336,6 +336,12 @@ impl std::fmt::Display for MissingRecord {
 /// [`known_credentials`] and stored on the returned environment, so every
 /// command's output is redacted against it.
 ///
+/// `session_vars` are the `KOTO_SESSION_*` variables that supplied a
+/// session setting, with the values koto resolved
+/// (`crate::config::session_env::command_vars`). Every command gets them,
+/// legacy or not, so a koto that a gate or action runs resolves the same
+/// backend, location and credentials as the tick.
+///
 /// This is the only public way to build a tick's environment, so a tick's
 /// commands can't run without the known set.
 pub fn for_tick<F>(
@@ -344,6 +350,7 @@ pub fn for_tick<F>(
     session: &str,
     sessions_base: Option<&Path>,
     config_keys: &[(String, String)],
+    session_vars: &[(String, String)],
     lookup: F,
 ) -> Result<(CommandEnv, StaleValues), MissingRecord>
 where
@@ -357,6 +364,7 @@ where
             session,
             sessions_base,
             config_keys,
+            session_vars,
             &lookup,
         ),
         stale(record),
@@ -541,6 +549,7 @@ fn build_command_env<F>(
     session: &str,
     sessions_base: Option<&Path>,
     config_keys: &[(String, String)],
+    session_vars: &[(String, String)],
     lookup: F,
 ) -> CommandEnv
 where
@@ -552,7 +561,9 @@ where
         session.to_string(),
     );
     if record.legacy {
-        return CommandEnv::inherited(vec![tick], redactor);
+        let mut vars = vec![tick];
+        vars.extend(session_vars.iter().cloned());
+        return CommandEnv::inherited(vars, redactor);
     }
 
     let mut vars: Vec<(String, String)> = Vec::new();
@@ -576,6 +587,7 @@ where
         vars.push(("XDG_CONFIG_HOME".to_string(), xdg.clone()));
     }
     vars.push(tick);
+    vars.extend(session_vars.iter().cloned());
     if let Some(base) = sessions_base {
         vars.push((
             "KOTO_SESSIONS_BASE".to_string(),
@@ -669,7 +681,15 @@ mod tests {
             "BASH_FUNC_probe%%".to_string(),
             "GIT_CONFIG_COUNT".to_string(),
         ];
-        let built = build_command_env(&rec, &pass_env, "wf", Some(Path::new("/s")), &[], lookup);
+        let built = build_command_env(
+            &rec,
+            &pass_env,
+            "wf",
+            Some(Path::new("/s")),
+            &[],
+            &[],
+            lookup,
+        );
         assert!(!built.inherits());
         assert_eq!(built.get("LANG"), Some("C.UTF-8"));
         assert_eq!(built.get("GH_DB"), Some("live"));
@@ -686,7 +706,7 @@ mod tests {
 
     #[test]
     fn an_unset_path_becomes_the_system_directories() {
-        let built = build_command_env(&record(None, &[]), &[], "wf", None, &[], env(&[]));
+        let built = build_command_env(&record(None, &[]), &[], "wf", None, &[], &[], env(&[]));
         assert_eq!(built.get("PATH"), Some(UNSET_PATH));
         assert_eq!(built.get("KOTO_SESSIONS_BASE"), None);
     }
@@ -695,7 +715,7 @@ mod tests {
     fn a_legacy_record_inherits_and_adds_the_tick_session() {
         let mut rec = record(Some("/usr/bin"), &[]);
         rec.legacy = true;
-        let built = build_command_env(&rec, &[], "wf", Some(Path::new("/s")), &[], env(&[]));
+        let built = build_command_env(&rec, &[], "wf", Some(Path::new("/s")), &[], &[], env(&[]));
         assert!(built.inherits());
         assert_eq!(built.get("KOTO_TICK_SESSION"), Some("wf"));
         assert_eq!(built.get("PATH"), None);
@@ -722,10 +742,18 @@ mod tests {
 
     #[test]
     fn a_tick_without_a_record_is_refused_not_given_the_callers_environment() {
-        let refused = for_tick(None, &[], "wf", None, &[], env(&[("PATH", "/usr/bin")]));
+        let refused = for_tick(
+            None,
+            &[],
+            "wf",
+            None,
+            &[],
+            &[],
+            env(&[("PATH", "/usr/bin")]),
+        );
         assert_eq!(refused.err(), Some(MissingRecord));
         let rec = record(Some("/usr/bin"), &[]);
-        let (built, _) = for_tick(Some(&rec), &[], "wf", None, &[], env(&[])).unwrap();
+        let (built, _) = for_tick(Some(&rec), &[], "wf", None, &[], &[], env(&[])).unwrap();
         assert!(!built.inherits());
     }
 
@@ -967,8 +995,16 @@ mod tests {
             ("GITHUB_TOKEN", "ghp_legacyvalue1"),
             ("GH_DB", "legacy-db-value"),
         ]);
-        let (built, _) =
-            for_tick(Some(&rec), &["GH_DB".to_string()], "wf", None, &[], lookup).unwrap();
+        let (built, _) = for_tick(
+            Some(&rec),
+            &["GH_DB".to_string()],
+            "wf",
+            None,
+            &[],
+            &[],
+            lookup,
+        )
+        .unwrap();
         assert!(built.inherits());
         assert_eq!(
             redacted(built.redactor(), "ghp_legacyvalue1 legacy-db-value"),
@@ -994,11 +1030,12 @@ mod tests {
         let want = "[REDACTED:GH_TOKEN] [REDACTED:GH_DB] [REDACTED:decider.api_key] \
                     [REDACTED:KOTO_DECIDER_API_KEY]";
 
-        let (ticked, _) = for_tick(Some(&rec), &pass_env, "wf", None, &config, &lookup).unwrap();
+        let (ticked, _) =
+            for_tick(Some(&rec), &pass_env, "wf", None, &config, &[], &lookup).unwrap();
         assert!(!ticked.inherits());
         assert_eq!(redacted(ticked.redactor(), text), want);
 
-        let built = build_command_env(&rec, &pass_env, "wf", None, &config, &lookup);
+        let built = build_command_env(&rec, &pass_env, "wf", None, &config, &[], &lookup);
         assert_eq!(redacted(built.redactor(), text), want);
     }
 
@@ -1043,7 +1080,7 @@ mod tests {
             ("AWS_ACCESS_KEY_ID", "AKIAENVACCESSKEY01"),
             ("AWS_SECRET_ACCESS_KEY", "env-secret-access-value"),
         ]);
-        let (built, _) = for_tick(Some(&rec), &[], "wf", None, &[], lookup).unwrap();
+        let (built, _) = for_tick(Some(&rec), &[], "wf", None, &[], &[], lookup).unwrap();
         assert_eq!(
             redacted(
                 built.redactor(),
@@ -1052,5 +1089,46 @@ mod tests {
             "[REDACTED:KOTO_DECIDER_API_KEY] [REDACTED:AWS_ACCESS_KEY_ID] \
              [REDACTED:AWS_SECRET_ACCESS_KEY]"
         );
+    }
+
+    #[test]
+    fn the_koto_credential_pair_is_searched_without_config_keys_and_named_first() {
+        // When the user config file fails to parse, `koto next` loads the
+        // default configuration (`load_config().unwrap_or_default()`), whose
+        // redaction keys are empty: exactly the config keys passed here. The
+        // koto pair is still found in the environment through
+        // ENV_SECRET_NAMES and labeled with its own names, also where the AWS
+        // pair holds the same values.
+        let rec = record(Some("/usr/bin"), &[]);
+        let config_keys = crate::config::redaction_keys(&crate::config::KotoConfig::default());
+        assert!(config_keys.is_empty());
+        let lookup = env(&[
+            ("KOTO_SESSION_CLOUD_ACCESS_KEY", "koto-access-key-id"),
+            ("KOTO_SESSION_CLOUD_SECRET_KEY", "koto-secret-key-value"),
+            ("AWS_ACCESS_KEY_ID", "koto-access-key-id"),
+        ]);
+        let (built, _) = for_tick(Some(&rec), &[], "wf", None, &config_keys, &[], lookup).unwrap();
+        assert_eq!(
+            redacted(built.redactor(), "koto-access-key-id koto-secret-key-value"),
+            "[REDACTED:KOTO_SESSION_CLOUD_ACCESS_KEY] [REDACTED:KOTO_SESSION_CLOUD_SECRET_KEY]"
+        );
+    }
+
+    #[test]
+    fn session_vars_reach_both_kinds_of_environment() {
+        let vars = vec![
+            ("KOTO_SESSION_BACKEND".to_string(), "cloud".to_string()),
+            ("KOTO_SESSION_CLOUD_SECRET_KEY".to_string(), "s".to_string()),
+        ];
+        let rec = record(Some("/usr/bin"), &[]);
+        let (built, _) = for_tick(Some(&rec), &[], "wf", None, &[], &vars, env(&[])).unwrap();
+        assert!(!built.inherits());
+        assert_eq!(built.get("KOTO_SESSION_BACKEND"), Some("cloud"));
+        assert_eq!(built.get("KOTO_SESSION_CLOUD_SECRET_KEY"), Some("s"));
+        let mut legacy = record(Some("/usr/bin"), &[]);
+        legacy.legacy = true;
+        let (built, _) = for_tick(Some(&legacy), &[], "wf", None, &[], &vars, env(&[])).unwrap();
+        assert!(built.inherits());
+        assert_eq!(built.get("KOTO_SESSION_BACKEND"), Some("cloud"));
     }
 }

@@ -168,6 +168,21 @@ The remedy is to continue the session where the message says, from that workspac
 
 ---
 
+## Session configuration refusals
+
+koto can take its session backend, cloud location and bucket credentials from `KOTO_SESSION_*` environment variables (`KOTO_SESSION_BACKEND`, `KOTO_SESSION_CLOUD_ENDPOINT`, `KOTO_SESSION_CLOUD_BUCKET`, `KOTO_SESSION_CLOUD_REGION`, `KOTO_SESSION_CLOUD_PATH_STYLE`, `KOTO_SESSION_CLOUD_ACCESS_KEY`, `KOTO_SESSION_CLOUD_SECRET_KEY`), which win over the config files. When their values can't be used, every command that opens a session (`koto init`, `koto next`, `koto status`, the `koto context` and `koto session` commands) fails before it touches a session or the bucket, with a plain error on stderr and a non-zero exit:
+
+| Message starts with | Cause | What to do |
+|---------------------|-------|------------|
+| `KOTO_SESSION_BACKEND is "<value>"` | The variable isn't `local` or `cloud` (case matters) | Report it; the user's environment is wrong |
+| `KOTO_SESSION_CLOUD_PATH_STYLE is "<value>"` | The variable isn't `true` or `false` | Report it |
+| `KOTO_SESSION_CLOUD_ACCESS_KEY is set but KOTO_SESSION_CLOUD_SECRET_KEY is not` (or the reverse) | Only half of koto's credential pair is set; koto never mixes it with the `AWS_*` pair | Report it; both or neither must be set |
+| `session.cloud.endpoint comes from the project file` (or `session.cloud.bucket`) | The koto credential pair is in use and the project's `.koto/config.toml` names the endpoint or bucket, which may not choose where those credentials go | Report it; the user sets `KOTO_SESSION_CLOUD_ENDPOINT` / `KOTO_SESSION_CLOUD_BUCKET` or the user config instead |
+
+None of these is something an agent fixes by editing files or setting variables on its own: stop and tell the user. `koto config list` still runs and shows each setting's value and where it came from (the `# origin:` lines, or `origins` under `--json`), which is the quickest way to see what's wrong.
+
+---
+
 ## Nested tick refusals
 
 `koto next` runs a state's `default_action` and its command gates as child processes, and
@@ -267,8 +282,9 @@ and why their content is data rather than instructions, is in `response-shapes.m
 Gates and actions don't run with your shell's environment. Each runs as `/bin/sh -c` in a
 cleared environment: the live values of koto's default list of names and the names the
 template declares in `pass_env:`, the `PATH`, `HOME` and `XDG_CONFIG_HOME` recorded when the
-session was created, and `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`. The record can't be
-changed. None of the three messages below is an error envelope or changes `action`, and none
+session was created, `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`, and any `KOTO_SESSION_*`
+variable that set the session's backend or credentials, so a `koto` command a gate runs
+reaches the same backend. The record can't be changed. None of the three messages below is an error envelope or changes `action`, and none
 of them alters gate evidence or action output. Keep dispatching on `action` as usual.
 
 **The stale-record note.** When a gate or action fails and either a recorded value no longer

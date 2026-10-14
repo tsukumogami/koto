@@ -47,6 +47,20 @@ session-migration design (`DESIGN-session-migration.md`) has the details; the
 setup guide,
 `docs/guides/cloud-sync-setup.md`, lists the commands that reach the bucket.
 
+**Note (2026-10-14).** The cloud-session-config design changes Decisions 1
+and 3. The session settings now have an environment layer above both files:
+`KOTO_SESSION_BACKEND` and `KOTO_SESSION_CLOUD_ENDPOINT`, `_BUCKET`,
+`_REGION` and `_PATH_STYLE` win over project and user config, per setting,
+so the precedence is environment, project, user, default. A value koto can't
+use refuses where a backend is built instead of falling back, and `koto
+config list` reports where each session setting came from. Credentials gain a
+koto-prefixed pair, `KOTO_SESSION_CLOUD_ACCESS_KEY` and
+`KOTO_SESSION_CLOUD_SECRET_KEY`, which replaces the `AWS_*` pair as a whole
+when either is set; a half pair refuses, and while the pair is in use the
+endpoint and bucket can't come from project config. Without the new
+variables, resolution is as described here. The setup guide documents the
+variables.
+
 ## Context and Problem Statement
 koto's `LocalBackend` is the only storage backend. It's hardcoded in `build_backend()`
 with no way to select an alternative. Sessions live at `~/.koto/sessions/<repo-id>/<name>/`

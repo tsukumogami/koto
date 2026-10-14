@@ -36,6 +36,24 @@ koto config set --user session.cloud.endpoint https://<account-id>.r2.cloudflare
 
 Project config wins over user config where both set a key.
 
+### From the environment
+
+Every session setting except `marker_retain_days` can also come from an environment variable, named `KOTO_` plus the setting's dotted name, upper-cased, with dots turned into underscores. A variable wins over both files, setting by setting, so you can put one workspace's sessions in the bucket by setting its processes' environment and leave every config file alone:
+
+```bash
+export KOTO_SESSION_BACKEND=cloud
+export KOTO_SESSION_CLOUD_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+export KOTO_SESSION_CLOUD_BUCKET=my-koto-sessions
+export KOTO_SESSION_CLOUD_REGION=auto
+export KOTO_SESSION_CLOUD_PATH_STYLE=false   # optional
+```
+
+This is the safe way to switch one workspace on a host that runs other sessions: koto re-reads `$HOME/.koto/config.toml` on every command, so changing that file moves every running session on the host to the new backend at once.
+
+Values are trimmed, and an empty or whitespace-only variable counts as unset, so the setting falls through to the files. `KOTO_SESSION_BACKEND` must be `local` or `cloud` and `KOTO_SESSION_CLOUD_PATH_STYLE` `true` or `false`, in lower case. Any other value never falls back to a file or to the local backend: every command that opens a session refuses with an error naming the variable, while `koto config list` and `koto config get` still show it so you can see what's wrong.
+
+The commands a session runs (gates, actions) get the `KOTO_SESSION_*` variables that set its configuration, so a `koto` command a gate runs reaches the same backend.
+
 ### Endpoints given as an IP address, and self-hosted stores
 
 By default koto addresses the bucket as a virtual host, `<bucket>.<endpoint-host>`. That can't work when the endpoint's host is an IP address, and a self-hosted store behind a hostname often doesn't serve bucket subdomains either. Set `session.cloud.path_style` to `true` and koto puts the bucket in the path instead, `<endpoint>/<bucket>/<key>`:
@@ -53,12 +71,23 @@ A plain `http://` endpoint needs nothing extra; koto uses the scheme you give it
 
 Credentials go in environment variables (recommended for CI) or user config (for developer machines). They're never allowed in project config.
 
-**Environment variables (CI/CD):**
+**koto's own variables:**
+
+```bash
+export KOTO_SESSION_CLOUD_ACCESS_KEY=<your-access-key>
+export KOTO_SESSION_CLOUD_SECRET_KEY=<your-secret-key>
+```
+
+Under these names the bucket key isn't picked up by every AWS tool the session runs. They're a pair: when either is set, both credentials come from them and nothing else is consulted, not the `AWS_*` pair and not the user file. If only one is set, every command that uses the cloud backend refuses, naming the missing one, before it sends anything. And while they're in use, the endpoint and the bucket can't come from the project file: a committed `.koto/config.toml` doesn't get to choose where your key is sent. Set those in the environment (`KOTO_SESSION_CLOUD_ENDPOINT`, `KOTO_SESSION_CLOUD_BUCKET`) or the user file.
+
+**AWS variables (CI/CD):**
 
 ```bash
 export AWS_ACCESS_KEY_ID=<your-access-key>
 export AWS_SECRET_ACCESS_KEY=<your-secret-key>
 ```
+
+These work as they always have when the koto pair isn't set.
 
 **User config (persistent on your machine):**
 
@@ -67,7 +96,7 @@ koto config set --user session.cloud.access_key <your-access-key>
 koto config set --user session.cloud.secret_key <your-secret-key>
 ```
 
-The `--user` flag is required for credentials. They're blocked from project config to prevent accidental commits to git. Env vars take precedence over user config. `koto config list` redacts credential values in output.
+The `--user` flag is required for credentials. They're blocked from project config to prevent accidental commits to git. Env vars take precedence over user config. `koto config list` redacts credential values in output, and koto replaces any credential it knows of with `[REDACTED:<source>]` in the output of the commands a session runs.
 
 ## 4. Use koto normally
 
@@ -225,16 +254,18 @@ koto session resolve <name> --keep remote  # download the bucket's version
 
 ## Config reference
 
-| Key | Description | Default | Project config |
-|-----|-------------|---------|---------------|
-| `session.backend` | Storage backend | `local` | Yes |
-| `session.cloud.endpoint` | S3-compatible endpoint URL | (none) | Yes |
-| `session.cloud.bucket` | Bucket name | `koto-sessions` (used when the key is unset; `koto config get` shows it as unset) | Yes |
-| `session.cloud.region` | Region | (none) | Yes |
-| `session.cloud.path_style` | Address the bucket in the path (`true`) rather than as a subdomain; needed for an IP-address endpoint | `false` | Yes |
-| `session.cloud.marker_retain_days` | Days a migration marker whose target is present is kept before `koto session prune --migrated-from` may remove it without `--source-retired` | `30` | No (user only: it guards a deletion, so a cloned repository's config can't shorten it) |
-| `session.cloud.access_key` | Access key ID | (none) | No (user/env only) |
-| `session.cloud.secret_key` | Secret access key | (none) | No (user/env only) |
+| Key | Variable | Description | Default | Project config |
+|-----|----------|-------------|---------|---------------|
+| `session.backend` | `KOTO_SESSION_BACKEND` | Storage backend | `local` | Yes |
+| `session.cloud.endpoint` | `KOTO_SESSION_CLOUD_ENDPOINT` | S3-compatible endpoint URL | (none) | Yes |
+| `session.cloud.bucket` | `KOTO_SESSION_CLOUD_BUCKET` | Bucket name | `koto-sessions` (used when the key is unset; `koto config get` shows it as unset) | Yes |
+| `session.cloud.region` | `KOTO_SESSION_CLOUD_REGION` | Region | (none) | Yes |
+| `session.cloud.path_style` | `KOTO_SESSION_CLOUD_PATH_STYLE` | Address the bucket in the path (`true`) rather than as a subdomain; needed for an IP-address endpoint | `false` | Yes |
+| `session.cloud.marker_retain_days` | (none) | Days a migration marker whose target is present is kept before `koto session prune --migrated-from` may remove it without `--source-retired` | `30` | No (user only: it guards a deletion, so a cloned repository's config can't shorten it) |
+| `session.cloud.access_key` | `KOTO_SESSION_CLOUD_ACCESS_KEY`, else `AWS_ACCESS_KEY_ID` | Access key ID | (none) | No (user/env only) |
+| `session.cloud.secret_key` | `KOTO_SESSION_CLOUD_SECRET_KEY`, else `AWS_SECRET_ACCESS_KEY` | Secret access key | (none) | No (user/env only) |
+
+Precedence for each setting: its variable, then project config, then user config, then the default. For the credentials: the koto pair as a whole, else the `AWS_*` pair, else user config.
 
 ## Supported providers
 
@@ -257,6 +288,21 @@ Check your resolved config:
 ```bash
 koto config list
 ```
+
+After the tables it lists where each session setting came from, as comment lines, so the output is still valid TOML:
+
+```toml
+# origin: session.backend = env KOTO_SESSION_BACKEND
+# origin: session.cloud.endpoint = user
+# origin: session.cloud.bucket = project
+# origin: session.cloud.region = unset
+# origin: session.cloud.path_style = default
+# origin: session.cloud.access_key = env KOTO_SESSION_CLOUD_ACCESS_KEY
+# origin: session.cloud.secret_key = env KOTO_SESSION_CLOUD_SECRET_KEY
+# origin: session.cloud.marker_retain_days = default
+```
+
+`env` names the variable, `project` and `user` the config file, `default` means koto's built-in value applies, and `unset` means nothing set it and there's no default. `koto config list --json` has the same under a top-level `origins` object: `{"session.backend": {"source": "env", "variable": "KOTO_SESSION_BACKEND"}, ...}`. A file counts as an origin only when it names the key.
 
 This shows all settings with credential values redacted. If `session.backend` shows `cloud` and the endpoint and bucket are set, sync is active.
 

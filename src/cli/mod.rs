@@ -970,6 +970,10 @@ pub(super) fn exit_code_for_engine_error(err: &anyhow::Error) -> i32 {
 /// integration tests that need to control the storage location.
 fn build_backend() -> Result<Backend> {
     let config = crate::config::resolve::load_config()?;
+    // An unusable KOTO_SESSION_* value, a half-set koto credential pair, or a
+    // project file choosing where that pair is sent: refused here, before any
+    // session is opened or any request made (DESIGN-koto-cloud-session-config).
+    crate::config::session_env::check(&config)?;
 
     match config.session.backend.as_str() {
         "local" => Ok(Backend::Local(build_local_backend()?)),
@@ -2086,10 +2090,21 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
         ConfigCommand::List { json } => {
             let resolved = config::resolve::load_config()?;
             let redacted = config::redact(&resolved);
+            // Where each session setting came from, beside the tables and
+            // never inside them: one `origins` field in JSON, comment lines
+            // in TOML, so the tables read exactly as before.
             if json {
-                println!("{}", serde_json::to_string_pretty(&redacted)?);
+                let mut value = serde_json::to_value(&redacted)?;
+                if let Some(map) = value.as_object_mut() {
+                    map.insert(
+                        "origins".to_string(),
+                        config::session_env::origins_json(&resolved),
+                    );
+                }
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 println!("{}", toml::to_string_pretty(&redacted)?);
+                print!("{}", config::session_env::origins_toml(&resolved));
             }
             Ok(())
         }
@@ -4264,7 +4279,10 @@ fn handle_next(
     //
     // The same load names koto's own configured secrets, which join the
     // tick's known credentials so no command's output carries them.
-    let (request_store_cfg, decider_settings, config_keys) = {
+    //
+    // And the session settings that came from KOTO_SESSION_* variables, which
+    // the tick's commands get so a koto they call reaches the same backend.
+    let (request_store_cfg, decider_settings, config_keys, session_vars) = {
         let base = crate::config::resolve::load_config().unwrap_or_default();
         crate::config::warn_if_request_store_recursion_reserved(&base);
         let cli_overrides = crate::config::resolve::RequestStoreOverrides {
@@ -4280,6 +4298,7 @@ fn handle_next(
             crate::config::resolve::request_store_config(&base.request_store, &cli_overrides),
             decider_settings,
             crate::config::redaction_keys(&base),
+            crate::config::session_env::command_vars(&base),
         )
     };
 
@@ -4858,6 +4877,7 @@ fn handle_next(
         &name,
         backend.session_dir(&name).parent(),
         &config_keys,
+        &session_vars,
         |n| std::env::var(n).ok(),
     ) {
         Ok(built) => built,
