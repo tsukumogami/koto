@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 problem: |
   koto takes its session backend and cloud location only from the user file,
   which every running session re-reads, or a project file in the exact working
@@ -22,7 +22,7 @@ absorbed:
 
 ## Status
 
-In Progress
+Done
 
 Amended 2026-10-13 by the design (`DESIGN-koto-cloud-session-config.md`,
 Decision 2), before implementation: "ahead of the bucket" also covers a

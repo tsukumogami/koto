@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 upstream: docs/prds/PRD-koto-cloud-session-config.md
 problem: |
   koto resolves its session backend, cloud location and bucket credentials in
@@ -41,7 +41,7 @@ user_visible_surface: true
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 
