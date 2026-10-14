@@ -480,6 +480,25 @@ impl CloudBackend {
         }
     }
 
+    /// Before a context key is downloaded over the local copy: the bucket's
+    /// state file for `session` must not be the other side of an import of
+    /// the local one ([`refuse_cross_import_pull`]). Asked only when a
+    /// download is due, so a read whose hashes match makes no extra request;
+    /// a state file the bucket can't serve lets the pull go on, as the state
+    /// pull does.
+    fn check_context_pull(&self, session: &str) -> anyhow::Result<()> {
+        let state_path = self
+            .local
+            .session_dir(session)
+            .join(state_file_name(session));
+        match self.bucket.get_object(self.state_key(session)) {
+            Ok(response) if response.status_code() == 200 => {
+                refuse_cross_import_pull(session, &state_path, response.bytes())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Download the state file from S3 to the local session directory.
     /// Non-fatal on failure: if S3 is unreachable, local state is used as-is.
     ///
@@ -1769,7 +1788,8 @@ impl ContextStore for CloudBackend {
             session,
             key,
             &self.manifest_cache,
-        );
+            &|| self.check_context_pull(session),
+        )?;
         if pulled {
             if let Some(meta) = self.local.meta(session, key) {
                 crate::session::context_log::append_to_session_best_effort(
@@ -3856,14 +3876,17 @@ mod tests {
 
         backend.add("sess", "scope.md", b"local").unwrap();
         // pull attempt fails silently, local data is unaffected.
-        sync::pull_context_if_newer(
+        let pulled = sync::pull_context_if_newer(
             &backend.local,
             &backend.bucket,
             &backend.prefix,
             "sess",
             "scope.md",
             &backend.manifest_cache,
-        );
+            &|| Ok(()),
+        )
+        .unwrap();
+        assert!(!pulled);
         let data = backend.local.get("sess", "scope.md").unwrap();
         assert_eq!(data, b"local");
     }
@@ -4875,6 +4898,64 @@ mod tests {
             }
             assert_eq!(fs::read(&state).unwrap(), local_bytes, "{direction}");
         }
+    }
+
+    #[test]
+    fn a_context_pull_never_writes_one_side_of_an_import_over_the_other() {
+        // The bucket's state is the source (id-a) and holds a key the local
+        // copy, the session imported from it (id-b), lacks.
+        let remote = guard_log("wf", "id-a", None);
+        let local = guard_log("wf", "id-b", Some(("/srv/elsewhere", "wf", "id-a")));
+        let content = b"bucket bytes".to_vec();
+        let hash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let manifest = serde_json::json!({
+            "keys": {"k": {"created_at": "2026-01-01T00:00:00Z", "size": content.len(), "hash": hash}}
+        });
+        let endpoint = serve(vec![
+            ("/wf/koto-wf.state.jsonl".to_string(), remote),
+            (
+                "/wf/ctx/manifest.json".to_string(),
+                manifest.to_string().into_bytes(),
+            ),
+            ("/wf/ctx/k".to_string(), content),
+        ])
+        .url;
+        let tmp = TempDir::new().unwrap();
+        let state = write_log(tmp.path(), "wf", &local);
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+        let err = ContextStore::get(&backend, "wf", "k").unwrap_err();
+        assert!(err.to_string().contains("refusing to pull"), "{err}");
+        assert_eq!(fs::read(&state).unwrap(), local);
+        assert!(!tmp.path().join("wf").join("ctx").join("k").exists());
+    }
+
+    #[test]
+    fn a_context_pull_of_the_same_session_still_downloads() {
+        let log = guard_log("wf", "id-a", None);
+        let content = b"bucket bytes".to_vec();
+        let hash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let manifest = serde_json::json!({
+            "keys": {"k": {"created_at": "2026-01-01T00:00:00Z", "size": content.len(), "hash": hash}}
+        });
+        let endpoint = serve(vec![
+            ("/wf/koto-wf.state.jsonl".to_string(), log.clone()),
+            (
+                "/wf/ctx/manifest.json".to_string(),
+                manifest.to_string().into_bytes(),
+            ),
+            ("/wf/ctx/k".to_string(), content.clone()),
+        ])
+        .url;
+        let tmp = TempDir::new().unwrap();
+        write_log(tmp.path(), "wf", &log);
+        let backend = cloud_backend_at(tmp.path(), endpoint);
+        assert_eq!(ContextStore::get(&backend, "wf", "k").unwrap(), content);
     }
 
     #[test]

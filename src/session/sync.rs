@@ -179,6 +179,10 @@ pub fn push_context_key(
 ///
 /// Returns whether it wrote the local store, so the caller can log the
 /// write (a `context_added` with `writer: "sync"`).
+///
+/// `before_download` runs once a download is due and before it starts; its
+/// error is the only one returned, and nothing is written after it. Every
+/// other failure is a warning and `Ok(false)`, as before.
 pub fn pull_context_if_newer(
     local: &LocalBackend,
     bucket: &Bucket,
@@ -186,25 +190,27 @@ pub fn pull_context_if_newer(
     session: &str,
     key: &str,
     cache: &ManifestCache,
-) -> bool {
+    before_download: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
     let manifest_key = format!("{}/{}/ctx/manifest.json", prefix, session);
     let remote_manifest = match fetch_remote_manifest(bucket, &manifest_key, session, cache) {
         Some(m) => m,
-        None => return false,
+        None => return Ok(false),
     };
 
     let remote_meta = match remote_manifest.keys.get(key) {
         Some(m) => m,
-        None => return false, // Key doesn't exist remotely.
+        None => return Ok(false), // Key doesn't exist remotely.
     };
 
     // Check if local hash matches remote hash.
     let local_manifest = local.read_manifest(session).unwrap_or_default();
     if let Some(local_meta) = local_manifest.keys.get(key) {
         if local_meta.hash == remote_meta.hash {
-            return false; // Hashes match, no download needed.
+            return Ok(false); // Hashes match, no download needed.
         }
     }
+    before_download()?;
 
     // Download the content from S3.
     let s3_key = format!("{}/{}/ctx/{}", prefix, session, key);
@@ -215,7 +221,7 @@ pub fn pull_context_if_newer(
                 "warning: cloud sync: failed to download context key '{}': {}",
                 key, e
             );
-            return false;
+            return Ok(false);
         }
     };
     if response.status_code() != 200 {
@@ -224,7 +230,7 @@ pub fn pull_context_if_newer(
             response.status_code(),
             key
         );
-        return false;
+        return Ok(false);
     }
 
     // Write locally, naming the pull as the writer.
@@ -234,13 +240,13 @@ pub fn pull_context_if_newer(
         response.bytes(),
         crate::session::context_log::WRITER_SYNC,
     ) {
-        Ok(()) => true,
+        Ok(()) => Ok(true),
         Err(e) => {
             eprintln!(
                 "warning: cloud sync: failed to write downloaded key '{}': {}",
                 key, e
             );
-            false
+            Ok(false)
         }
     }
 }
