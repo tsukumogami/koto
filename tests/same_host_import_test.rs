@@ -542,7 +542,7 @@ fn the_probe_refuses_before_anything_is_written() {
     let real = h.sessions().join("real-coord");
     std::fs::rename(h.sessions().join(NAME), &real).unwrap();
     std::os::unix::fs::symlink(&real, h.sessions().join(NAME)).unwrap();
-    let marker_before = s3.object(&marker_key(&h));
+    let before = snapshot(&h, &s3);
     let out = h.import_from_a(&[]);
     assert!(!out.ok(), "{}", out.describe());
     assert!(
@@ -550,9 +550,7 @@ fn the_probe_refuses_before_anything_is_written() {
         "{}",
         out.describe()
     );
-    assert_eq!(s3.object(&marker_key(&h)), marker_before);
-    assert!(b_objects(&h, &s3).is_empty());
-    assert!(!h.pending().exists());
+    assert_source_untouched(&h, &s3, &before, "symlink");
     assert!(std::fs::symlink_metadata(h.sessions().join(NAME))
         .unwrap()
         .file_type()
@@ -562,6 +560,7 @@ fn the_probe_refuses_before_anything_is_written() {
 #[test]
 fn a_stop_at_any_step_is_finished_by_running_the_same_command_again() {
     for fault in [
+        "after-staging",
         "after-push",
         "after-mark",
         "exchange-error",
@@ -670,9 +669,19 @@ fn the_source_workspace_can_t_touch_the_imported_copy_even_without_the_marker() 
         vec!["session", "resolve", NAME, "--keep", "local"],
     ] {
         let out = h.koto(&h.a, &args, &[]);
-        assert!(!out.ok(), "{args:?}: {}", out.describe());
+        // `next` refuses with exit 2, as documented; cleanup and resolve
+        // keep their own failure exit.
+        if args[0] == "next" {
+            assert_eq!(out.code, Some(2), "{args:?}: {}", out.describe());
+        } else {
+            assert!(!out.ok(), "{args:?}: {}", out.describe());
+        }
         let all = format!("{}{}", out.stdout, out.stderr);
         assert!(all.contains("session_migrated"), "{args:?}: {all}");
+        assert!(
+            all.contains(h.b.to_str().unwrap()),
+            "{args:?} names B: {all}"
+        );
     }
     for (p, v) in before {
         assert_eq!(std::fs::read(&p).unwrap(), v, "{}", p.display());
@@ -717,39 +726,178 @@ fn a_re_run_after_the_marker_never_overwrites_a_copy_that_moved_on() {
     assert_eq!(std::fs::read(h.state_path(NAME)).unwrap(), local_before);
 }
 
-#[test]
-fn an_old_copy_that_changed_or_is_a_symlink_is_kept() {
-    // Changed: an event appended to the old copy after the exchange.
-    let s3 = FakeS3::start(BUCKET);
-    let h = source(&s3);
+/// The `.takeover-kept-<name>-*` directories in the store.
+fn kept_copies(h: &Host) -> Vec<PathBuf> {
+    let prefix = format!(".takeover-kept-{}-", NAME);
+    std::fs::read_dir(h.sessions())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|e| e.path())
+        .collect()
+}
+
+/// After a stop past the exchange, change the old copy with `change`, run
+/// the import again, and return the one place it was kept.
+fn kept_after(h: &Host, change: impl Fn(&Path)) -> PathBuf {
     let out = h.import_from_a(&[("KOTO_TEST_IMPORT_FAULT", "after-exchange")]);
     assert!(!out.ok(), "{}", out.describe());
-    let old = h.pending().join(format!("koto-{}.state.jsonl", NAME));
-    let log = with_one_more_event(&std::fs::read_to_string(&old).unwrap(), "late");
-    std::fs::write(&old, &log).unwrap();
+    change(&h.pending());
     let out = h.import_from_a(&[]);
     assert!(out.ok(), "{}", out.describe());
+    let kept = kept_copies(h);
+    assert_eq!(kept.len(), 1, "{:?}: {}", kept, out.describe());
     assert!(
-        out.stderr.contains(h.pending().to_str().unwrap()),
+        out.stderr.contains(kept[0].to_str().unwrap()),
         "the warning names the kept copy: {}",
         out.describe()
     );
-    assert_eq!(std::fs::read_to_string(&old).unwrap(), log);
+    // Moved aside, it no longer holds the name: the new session goes on.
+    assert!(std::fs::symlink_metadata(h.pending()).is_err());
+    assert_moved(h);
+    kept[0].clone()
+}
 
-    // A symlink at .takeover-<name> is never followed or removed.
+#[test]
+fn an_old_copy_that_changed_is_moved_aside_and_the_name_stays_usable() {
+    // An event appended to the old copy after the exchange.
     let s3 = FakeS3::start(BUCKET);
     let h = source(&s3);
-    let out = h.import_from_a(&[("KOTO_TEST_IMPORT_FAULT", "after-exchange")]);
-    assert!(!out.ok(), "{}", out.describe());
+    let state = format!("koto-{}.state.jsonl", NAME);
+    let log = std::cell::RefCell::new(String::new());
+    let kept = kept_after(&h, |old| {
+        let grown =
+            with_one_more_event(&std::fs::read_to_string(old.join(&state)).unwrap(), "late");
+        std::fs::write(old.join(&state), &grown).unwrap();
+        *log.borrow_mut() = grown;
+    });
+    assert_eq!(
+        std::fs::read_to_string(kept.join(&state)).unwrap(),
+        *log.borrow()
+    );
+
+    // A context key added to the old copy and never pushed: the re-run
+    // compares the old copy's manifest with the bucket's.
+    let s3 = FakeS3::start(BUCKET);
+    let h = source(&s3);
+    let kept = kept_after(&h, |old| {
+        let ctx = old.join("ctx");
+        std::fs::write(ctx.join("late.md"), b"x").unwrap();
+        let mpath = ctx.join("manifest.json");
+        let mut m: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&mpath).unwrap()).unwrap();
+        m["keys"]["late.md"] = serde_json::json!({
+            "created_at": "2099-01-01T00:00:00Z",
+            "size": 1,
+            "hash": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+        });
+        std::fs::write(&mpath, serde_json::to_vec(&m).unwrap()).unwrap();
+    });
+    assert_eq!(
+        std::fs::read(kept.join("ctx").join("late.md")).unwrap(),
+        b"x"
+    );
+
+    // A symlink at .takeover-<name> is moved aside, never followed.
+    let s3 = FakeS3::start(BUCKET);
+    let h = source(&s3);
     let real = h.sessions().join("elsewhere");
-    std::fs::rename(h.pending(), &real).unwrap();
-    std::os::unix::fs::symlink(&real, h.pending()).unwrap();
-    let out = h.import_from_a(&[]);
-    assert!(out.ok(), "{}", out.describe());
-    assert!(out.stderr.contains("not a directory"), "{}", out.describe());
-    assert!(std::fs::symlink_metadata(h.pending())
+    let kept = kept_after(&h, |old| {
+        std::fs::rename(old, &real).unwrap();
+        std::os::unix::fs::symlink(&real, old).unwrap();
+    });
+    assert!(std::fs::symlink_metadata(&kept)
         .unwrap()
         .file_type()
         .is_symlink());
-    assert!(real.join(format!("koto-{}.state.jsonl", NAME)).exists());
+    assert!(real.join(&state).exists());
+}
+
+#[test]
+fn a_stop_while_staging_or_deleting_leaves_nothing_a_re_run_trips_on() {
+    // Stopped with the session staged but not yet in .takeover-<name>.
+    let s3 = FakeS3::start(BUCKET);
+    let h = source(&s3);
+    let out = h.import_from_a(&[("KOTO_TEST_IMPORT_FAULT", "after-staging")]);
+    assert!(!out.ok(), "{}", out.describe());
+    assert!(
+        !h.pending().exists(),
+        "only a complete session is renamed in"
+    );
+    let out = h.koto(&h.a, &["status", NAME], &[]);
+    assert!(
+        out.ok(),
+        "the source isn't held by a staging: {}",
+        out.describe()
+    );
+    let out = h.import_from_a(&[]);
+    assert!(out.ok(), "{}", out.describe());
+    assert_moved(&h);
+
+    // A .takeover-<name> with no state file: a deletion that stopped.
+    let s3 = FakeS3::start(BUCKET);
+    let h = source(&s3);
+    std::fs::create_dir_all(h.pending().join("ctx")).unwrap();
+    std::fs::write(h.pending().join("ctx").join("leftover"), b"x").unwrap();
+    let out = h.import_from_a(&[]);
+    assert!(out.ok(), "{}", out.describe());
+    assert!(!h.pending().exists());
+    assert_moved(&h);
+}
+
+#[test]
+fn an_unknown_marker_outcome_keeps_the_source_refusing_until_a_re_run() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = source(&s3);
+    s3.fail("PUT", &marker_key(&h), 500);
+    let out = h.import_from_a(&[("KOTO_TEST_IMPORT_FAULT", "marker-unknown")]);
+    assert_eq!(out.code, Some(1), "{}", out.describe());
+    assert_eq!(
+        out.json()["error"]["code"],
+        "import_unmarked",
+        "{}",
+        out.describe()
+    );
+    // The staged session stays, and with it the source's refusal.
+    assert!(h
+        .pending()
+        .join(format!("koto-{}.state.jsonl", NAME))
+        .exists());
+    let out = h.koto(&h.a, &["next", NAME], &[]);
+    assert!(!out.ok(), "{}", out.describe());
+    assert!(
+        format!("{}{}", out.stdout, out.stderr).contains("being imported"),
+        "{}",
+        out.describe()
+    );
+
+    s3.clear_faults();
+    let out = h.import_from_a(&[]);
+    assert!(out.ok(), "{}", out.describe());
+    assert!(!h.pending().exists());
+    assert_moved(&h);
+}
+
+#[test]
+fn a_pending_takeover_refuses_commands_on_the_name() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = source(&s3);
+    std::fs::create_dir_all(h.pending()).unwrap();
+    let before = snapshot(&h, &s3);
+    for args in [
+        vec!["status", NAME],
+        vec!["next", NAME],
+        vec!["context", "add", NAME, "late.md"],
+    ] {
+        let out = h.koto(&h.a, &args, &[]);
+        assert!(!out.ok(), "{args:?}: {}", out.describe());
+        let all = format!("{}{}", out.stdout, out.stderr);
+        assert!(all.contains("being imported"), "{args:?}: {all}");
+        assert!(
+            all.contains(&format!("koto session import {}", NAME)),
+            "{args:?} names the import to run: {all}"
+        );
+    }
+    assert_eq!(snapshot(&h, &s3), before);
+    assert!(std::fs::read_dir(h.pending()).unwrap().next().is_none());
 }

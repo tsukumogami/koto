@@ -161,10 +161,12 @@ pub struct CloudBackend {
     /// Per-process answers of the local half of the migration check
     /// ([`CloudBackend::local_guard`]): `Some` when the local copy at the
     /// name is a session imported from this very workspace's copy, which a
-    /// same-host import leaves behind. Kept apart from `migration_checks`,
-    /// which only the bucket's marker fills.
+    /// same-host import leaves behind. Each answer is kept with the
+    /// identity of the state file it was read from, so a takeover that
+    /// swaps the directory under a running process is noticed. Kept apart
+    /// from `migration_checks`, which only the bucket's marker fills.
     /// Boxed so the backend stays small beside `LocalBackend` in `Backend`.
-    local_migration_checks: Box<Mutex<HashMap<String, Option<SessionMigrated>>>>,
+    local_migration_checks: Box<Mutex<HashMap<String, LocalCheck>>>,
 }
 
 impl CloudBackend {
@@ -312,15 +314,16 @@ impl CloudBackend {
                 id
             );
         }
+        let file = file_identity(&self.local.session_dir(id).join(state_file_name(id)));
         let mut checks = self
             .local_migration_checks
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let answer = match checks.get(id) {
-            Some(answer) => answer.clone(),
-            None => {
+            Some((seen, answer)) if *seen == file => answer.clone(),
+            _ => {
                 let answer = self.local_import_from_here(id);
-                checks.insert(id.to_string(), answer.clone());
+                checks.insert(id.to_string(), (file, answer.clone()));
                 answer
             }
         };
@@ -440,6 +443,7 @@ impl CloudBackend {
     /// best-effort `sync_push_state` is retained for the single-writer
     /// happy path.
     fn strict_push_state(&self, id: &str) -> anyhow::Result<()> {
+        self.local_guard(id)?;
         let state_path = self.local.session_dir(id).join(state_file_name(id));
         if !state_path.exists() {
             // Nothing to push; mirrors the old no-op behavior. Callers
@@ -1532,6 +1536,7 @@ impl SessionBackend for CloudBackend {
         crate::engine::types::StateFileHeader,
         Vec<crate::engine::types::Event>,
     )> {
+        self.local_guard(id)?;
         self.local.read_events(id)
     }
 
@@ -1602,6 +1607,8 @@ impl SessionBackend for CloudBackend {
     }
 
     fn relocate(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.local_guard(from)?;
+        self.local_guard(to)?;
         // Local rename is authoritative; S3 propagation is best-effort.
         self.local.relocate(from, to)?;
 
@@ -2255,6 +2262,25 @@ impl ImportedAs {
 struct Staging {
     dir: PathBuf,
     moved: bool,
+}
+
+/// What [`CloudBackend::local_guard`] last answered for a name, and the
+/// state file it read.
+type LocalCheck = (Option<(u64, u64)>, Option<SessionMigrated>);
+
+/// The device and inode of `path`, or `None` when it can't be read or the
+/// platform has none.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 impl Drop for Staging {

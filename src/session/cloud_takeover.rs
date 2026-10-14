@@ -11,11 +11,15 @@
 //!
 //! 1. check, writing nothing: the source's locks, whether its copy is ahead
 //!    of the bucket, its children, this workspace's prefix, the exchange;
-//! 2. stage the new session in `<sessions>/.takeover-<name>`;
+//! 2. stage the new session in a private `.import-<name>-<random>` and,
+//!    once it is complete, rename it to `<sessions>/.takeover-<name>`, so
+//!    that name only ever holds a whole session;
 //! 3. push it under this workspace's prefix;
 //! 4. re-check under the held locks, then write the marker on the source;
 //! 5. exchange `.takeover-<name>` and `<name>` in one call;
-//! 6. journal the import, then delete the old copy now in `.takeover-<name>`.
+//! 6. journal the import, then delete the old copy now in `.takeover-<name>`,
+//!    or, if it changed since it was checked, move it aside to
+//!    `.takeover-kept-<name>-<time>` so the name is usable.
 //!
 //! A failure before the marker takes back what was pushed and leaves the
 //! source as it was. A failure or a crash after it is completed by running
@@ -26,12 +30,13 @@ use std::path::Path;
 
 use super::*;
 
-/// The fault-injection seam for tests, in the pattern of the run journal's
-/// `KOTO_TEST_*` hooks. Unset, nothing changes.
+/// The fault-injection seam for the binary's tests, in the pattern of the
+/// run journal's `KOTO_TEST_*` hooks: a debug build reads it, a release
+/// build never does, so it is not a setting. Unset, nothing changes.
 const FAULT_ENV: &str = "KOTO_TEST_IMPORT_FAULT";
 
 fn fault(point: &str) -> bool {
-    std::env::var(FAULT_ENV).as_deref() == Ok(point)
+    cfg!(debug_assertions) && std::env::var(FAULT_ENV).as_deref() == Ok(point)
 }
 
 /// Stop as a killed process would: no destructor runs, so nothing is
@@ -109,6 +114,11 @@ impl CloudBackend {
         let template = self.import_template(req, source)?;
         let machine_id = import_machine_id()?;
         self.clear_leftover_takeover(&pending, source)?;
+        let scratch = base.join(format!(
+            ".import-{}-{}",
+            name,
+            crate::engine::types::generate_session_id()
+        ));
         let (mut staging, session_id) = self.stage_import(
             req,
             source,
@@ -116,8 +126,20 @@ impl CloudBackend {
             &manifest,
             manifest_bytes.as_deref(),
             &machine_id,
-            Some((&pending, reuse_session_id)),
+            Some((&scratch, reuse_session_id)),
         )?;
+        crash_at("after-staging");
+        crate::engine::atomic_fs::atomic_rename_dir(&staging.dir, &pending).map_err(|e| {
+            ImportError::new(
+                PushFailed,
+                format!(
+                    "could not move the staged session to {}: {:?}",
+                    pending.display(),
+                    e
+                ),
+            )
+        })?;
+        staging.dir = pending.clone();
 
         // 3. Push.
         let pushed = self.push_staged(name, &staging.dir, source, &manifest)?;
@@ -127,7 +149,10 @@ impl CloudBackend {
         // still takes everything back; past this point nothing does.
         let again = self.verify_source_copy(name, source, &manifest);
         if let Err(e) = again.and_then(|v| {
-            if v.session_id == verified.session_id && v.last_seq == verified.last_seq {
+            if v.session_id == verified.session_id
+                && v.last_seq == verified.last_seq
+                && v.manifest == verified.manifest
+            {
                 Ok(())
             } else {
                 Err(ImportError::new(
@@ -136,9 +161,18 @@ impl CloudBackend {
                 ))
             }
         }) {
-            self.take_back(&pushed);
+            // Before the marker, everything is taken back. On a re-run the
+            // marker already names this copy, so what was pushed stays for
+            // the next run to finish.
+            if reuse_session_id.is_none() {
+                self.take_back(&pushed);
+            }
             return Err(e);
         }
+        // From here an outcome that isn't known keeps the staged session:
+        // the marker may have landed, and `.takeover-<name>` is what keeps
+        // the source's copy refusing until a re-run settles it.
+        staging.moved = true;
         if reuse_session_id.is_none() {
             if let Err(e) = self.mark_source(req, source, &session_id, &machine_id) {
                 if let Some(stop) = self.after_failed_mark(e, source, &pushed) {
@@ -146,7 +180,6 @@ impl CloudBackend {
                 }
             }
         }
-        staging.moved = true;
         crash_at("after-mark");
 
         // 5. Exchange.
@@ -216,31 +249,24 @@ impl CloudBackend {
         crash_at("after-journal");
 
         let pending = takeover_dir(self.local.base_dir(), name);
-        match std::fs::symlink_metadata(&pending) {
-            Ok(md) if md.file_type().is_symlink() || !md.is_dir() => {
-                eprintln!(
-                    "warning: {} is not a directory; left in place",
-                    pending.display()
-                );
-                return;
-            }
-            Ok(_) => {}
+        let md = match std::fs::symlink_metadata(&pending) {
+            Ok(md) => md,
             Err(_) => return,
+        };
+        if md.file_type().is_symlink() || !md.is_dir() {
+            self.keep_old_copy(name, &pending, "is not a directory");
+            return;
         }
-        let state = std::fs::read(pending.join(state_file_name(name))).ok();
-        let manifest = std::fs::read(pending.join("ctx").join("manifest.json")).ok();
-        let expected_sid = source.log.header.session_id.as_str();
-        let unchanged = match (&state, verified) {
-            (Some(bytes), Some(v)) => {
-                header_session_id(bytes).as_deref() == Some(v.session_id.as_str())
-                    && last_seq_of(bytes) == Some(v.last_seq)
-                    && manifest == v.manifest
+        let unchanged = match verified {
+            Some(v) => {
+                let state = std::fs::read(pending.join(state_file_name(name))).ok();
+                let manifest = std::fs::read(pending.join("ctx").join("manifest.json")).ok();
+                state.as_deref().is_some_and(|bytes| {
+                    header_session_id(bytes).as_deref() == Some(v.session_id.as_str())
+                        && last_seq_of(bytes) == Some(v.last_seq)
+                }) && manifest == v.manifest
             }
-            (Some(bytes), None) => {
-                header_session_id(bytes).as_deref() == Some(expected_sid)
-                    && last_seq_of(bytes).is_some_and(|s| s <= source.log.last_seq)
-            }
-            (None, _) => false,
+            None => self.old_copy_in_bucket(name, &pending, source),
         };
         if unchanged {
             if let Err(e) = std::fs::remove_dir_all(&pending) {
@@ -251,12 +277,63 @@ impl CloudBackend {
                 );
             }
         } else {
-            eprintln!(
-                "warning: the old copy of '{}' at {} changed after the import checked it, so it \
-                 was kept; look at it, then remove it by hand",
+            self.keep_old_copy(name, &pending, "changed after the import checked it");
+        }
+    }
+
+    /// On a re-run, with nothing recorded from the first check: whether the
+    /// old copy in `pending` is still the source and holds nothing the
+    /// bucket lacks, events or context. A state file already gone means an
+    /// earlier run was deleting it.
+    fn old_copy_in_bucket(&self, name: &str, pending: &Path, source: &ImportSource) -> bool {
+        let Ok(bytes) = std::fs::read(pending.join(state_file_name(name))) else {
+            return true;
+        };
+        let Ok(old) = parse_source_log(&bytes) else {
+            return false;
+        };
+        if old.header.session_id != source.log.header.session_id {
+            return false;
+        }
+        let Ok((remote_manifest, _)) = self.read_source_manifest(source) else {
+            return false;
+        };
+        let old_manifest: crate::session::context::Manifest =
+            std::fs::read(pending.join("ctx").join("manifest.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+        local_ahead_of(&old, &source.log, &old_manifest, &remote_manifest).is_none()
+    }
+
+    /// Move a `.takeover-<name>` that can't be deleted safely aside to
+    /// `.takeover-kept-<name>-<time>`, where it no longer holds the name
+    /// refusing, and say where it went.
+    fn keep_old_copy(&self, name: &str, pending: &Path, why: &str) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let kept = self
+            .local
+            .base_dir()
+            .join(format!(".takeover-kept-{}-{}", name, stamp));
+        match crate::engine::atomic_fs::atomic_rename_dir(pending, &kept) {
+            Ok(()) => eprintln!(
+                "warning: the old copy of '{}' {}, so it was kept at {}; look at it, then \
+                 remove it by hand",
                 name,
-                pending.display()
-            );
+                why,
+                kept.display()
+            ),
+            Err(e) => eprintln!(
+                "warning: the old copy of '{}' {}, and it could not be moved aside from {} \
+                 ({:?}); move or remove it by hand",
+                name,
+                why,
+                pending.display(),
+                e
+            ),
         }
     }
 
@@ -441,10 +518,14 @@ impl CloudBackend {
             return Ok(());
         }
         let name = &source.name;
-        let ours = std::fs::read(pending.join(state_file_name(name)))
-            .ok()
-            .and_then(|b| ImportedAs::read(&b))
-            .is_some_and(|i| i.is_of(source));
+        // A plain directory with no state file is one an earlier run was
+        // deleting: staging only ever renames a complete session here.
+        let plain_dir = std::fs::symlink_metadata(pending)
+            .is_ok_and(|md| md.is_dir() && !md.file_type().is_symlink());
+        let ours = match std::fs::read(pending.join(state_file_name(name))) {
+            Ok(b) => ImportedAs::read(&b).is_some_and(|i| i.is_of(source)),
+            Err(e) => plain_dir && e.kind() == std::io::ErrorKind::NotFound,
+        };
         if !ours {
             return Err(ImportError::new(
                 ImportErrorCode::PushFailed,
@@ -481,7 +562,12 @@ impl CloudBackend {
             let _ = std::fs::remove_dir_all(&pending);
             return Some(err);
         }
-        match self.object_listed(&source.key(MIGRATED_MARKER)) {
+        let listed = if fault("marker-unknown") {
+            Err(anyhow::anyhow!("injected unknown marker outcome"))
+        } else {
+            self.object_listed(&source.key(MIGRATED_MARKER))
+        };
+        match listed {
             Ok(true) => None,
             Ok(false) => {
                 self.take_back(pushed);
@@ -620,10 +706,17 @@ enum TryLock {
     Io(std::io::Error),
 }
 
-/// Take an exclusive flock on `path` without waiting. A missing file means
-/// no one holds it: `Ok(None)`.
+/// Take an exclusive flock on `path` without waiting, creating the file
+/// so a writer that arrives later waits on it too. A missing directory
+/// means no one holds it: `Ok(None)`.
 fn try_flock(path: &Path) -> Result<Option<std::fs::File>, TryLock> {
-    let file = match std::fs::OpenOptions::new().read(true).open(path) {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+    {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(TryLock::Io(e)),

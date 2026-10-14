@@ -637,6 +637,20 @@ impl LocalBackend {
                 std::io::Error::last_os_error()
             ));
         }
+        // A same-host import can swap the session's directory while this
+        // waits. The lock is then on the old copy's file, and writing by
+        // path would land in the new session, so refuse instead.
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = file.metadata().ok().map(|m| (m.dev(), m.ino()));
+            let now = fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+            if held.is_none() || held != now {
+                return Err(anyhow::anyhow!(
+                    "{} was replaced while waiting for its lock; run the command again",
+                    path.display()
+                ));
+            }
+        }
         Ok(file)
     }
 

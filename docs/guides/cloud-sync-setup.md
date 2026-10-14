@@ -210,7 +210,7 @@ It prints the same JSON as an import from another host, with `name` set to `revi
 
 A local copy behind the bucket is fine: the import takes the bucket's events, as it does from another host.
 
-The import builds the new session in `~/.koto/sessions/.takeover-review/`, pushes it under this workspace's prefix, writes the marker on the source, and only then swaps the two directories in one atomic call. After the swap `.takeover-review/` holds the old copy, which is deleted once the import has checked it's still the copy it read; a copy that changed in between is kept, with a warning naming its path. While `.takeover-review/` exists, commands on `review` refuse and name the import to run.
+The import builds the new session in `~/.koto/sessions/.takeover-review/`, pushes it under this workspace's prefix, writes the marker on the source, and only then swaps the two directories in one atomic call. After the swap `.takeover-review/` holds the old copy, which is deleted once the import has checked it's still the copy it read. A copy that changed in between is moved aside to `~/.koto/sessions/.takeover-kept-review-<time>/`, with a warning naming it, so nothing it holds is lost and the name stays usable. While `.takeover-review/` exists, commands on `review` refuse and name the import to run.
 
 If the import stops at any step, run the same command again: a stop before the marker starts over, and a stop after it finishes the swap with the session id the marker recorded. A re-run never overwrites a copy under this workspace's prefix that has moved past its `session_imported` event; it refuses with `import_source_migrated` instead.
 
