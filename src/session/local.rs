@@ -2121,6 +2121,33 @@ mod tests {
     /// first-wins / second-contends semantics immediately, with no
     /// blocking. The second call must return `SessionError::Locked`
     /// rather than waiting for the first guard to drop.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_waited_on_across_a_swap_of_its_file_refuses() {
+        use std::os::unix::io::AsRawFd;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("manifest.lock");
+        fs::write(&path, b"").unwrap();
+        let held = fs::File::open(&path).unwrap();
+        // SAFETY: the fd belongs to `held`, which outlives the call.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let waiter_path = path.clone();
+        let waiter = std::thread::spawn(move || LocalBackend::acquire_flock(&waiter_path));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // The directory swap a same-host import makes: another file now
+        // sits at the path while the waiter holds the old one open.
+        fs::rename(&path, tmp.path().join("old.lock")).unwrap();
+        fs::write(&path, b"").unwrap();
+        drop(held);
+
+        let err = waiter.join().unwrap().unwrap_err();
+        assert!(err.to_string().contains("replaced while waiting"), "{err}");
+
+        // A lock on a file left in place is taken as before.
+        LocalBackend::acquire_flock(&path).unwrap();
+    }
+
     #[test]
     fn lock_state_file_second_acquire_returns_locked() {
         let tmp = TempDir::new().unwrap();

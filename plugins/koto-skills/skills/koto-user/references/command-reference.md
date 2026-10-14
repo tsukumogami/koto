@@ -837,7 +837,7 @@ The new session holds the source's events plus a `session_imported` event, every
 | `import_name_taken` | 2 | A different session holds the name here or under this workspace's prefix. | Re-run with `--as <new-name>`. |
 | `import_template_unavailable` | 2 | No usable compiled template with the session's hash (in the cache, or under `--trust-template` in the bucket). | Run `koto template compile` on the session's template here, then import again without `--trust-template`. |
 | `import_source_unreadable` | 1 | A source object couldn't be fetched or failed validation. | Retry if the bucket was unreachable; otherwise report the message. |
-| `import_push_failed` | 1 | Building, pushing or moving the session into place failed; what this run pushed was taken back. | Fix what the message names and run the same import again. |
+| `import_push_failed` | 1 | Building, pushing or moving the session into place failed. Before the source is marked, what this run pushed was taken back; after it (a same-host swap that failed), everything is kept and the message says so. | Fix what the message names and run the same import again; after the marker, that finishes it. |
 | `import_source_running` | 2 | Same host: another process holds the source session's lock. | Stop what is advancing it, then import again. |
 | `import_source_unpushed` | 2 | Same host: the source's local copy holds events or context the bucket lacks. | Run `koto session resolve <name> --keep local` in the source workspace, then import again. |
 | `import_source_has_children` | 2 | Same host: a local session names the source as its parent. | Finish or clean up the child the message names, or import with `--as`. |

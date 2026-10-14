@@ -74,7 +74,13 @@ and `import_source_has_children`, guard the old copy, and every step is
 finished by running the same command again. The old workspace's commands also
 refuse locally, from the imported log's `session_imported` event, so they
 don't depend on reading the marker. An import with `--as`, from another host,
-or from the source workspace itself is unchanged.
+or from the source workspace itself is unchanged. The design is
+`DESIGN-koto-cloud-session-config.md`. Two details differ from it: the new
+session is built in a private `.import-<name>-<random>` and renamed to
+`.takeover-<name>` only once complete, so a stop while staging never leaves
+the name refusing; and an old copy that changed after it was checked is
+moved aside to `.takeover-kept-<name>-<time>` rather than left at
+`.takeover-<name>`, so the name stays usable while nothing is deleted.
 
 ## Context and Problem Statement
 

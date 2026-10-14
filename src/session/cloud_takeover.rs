@@ -203,11 +203,6 @@ impl CloudBackend {
             ));
         }
         drop(locks);
-        // The state file was named after the target already; only a
-        // finished record of the name would now be stale.
-        if let Err(e) = crate::session::finished::remove(&base, name) {
-            eprintln!("warning: could not remove the finished record for {name}: {e:#}");
-        }
         crash_at("after-exchange");
 
         // 6. Journal, then delete the old copy.
@@ -237,6 +232,13 @@ impl CloudBackend {
         source: &ImportSource,
         verified: Option<&Verified>,
     ) {
+        // The state file was named after the target already; only a
+        // finished record of the name would now be stale. Removed here, not
+        // in `takeover`, so a re-run after a stop past the exchange removes
+        // it too.
+        if let Err(e) = crate::session::finished::remove(self.local.base_dir(), name) {
+            eprintln!("warning: could not remove the finished record for {name}: {e:#}");
+        }
         if let Ok((header, events)) = self.local.read_events(name) {
             let current = crate::engine::persistence::derive_state_from_log(&events);
             crate::run_journal::imported(
@@ -499,11 +501,14 @@ impl CloudBackend {
                 holder.display()
             )));
         }
+        // `exchange_supported` also refuses a store another user owns, so a
+        // takeover never exchanges directories in someone else's store.
         let supported =
             !fault("exchange-unsupported") && crate::engine::atomic_fs::exchange_supported(base);
         if !supported {
             return Err(refuse(
-                "the session store's filesystem doesn't support an atomic directory exchange",
+                "the session store isn't owned by this user, or its filesystem doesn't support \
+                 an atomic directory exchange",
             ));
         }
         Ok(())
