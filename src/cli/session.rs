@@ -683,6 +683,7 @@ pub fn handle_import(
         from: std::path::Path::new(from),
         anchor: &anchor,
         trust_template,
+        explicit_as: as_name.is_some(),
     };
     let outcome = match cloud.import_session(&request) {
         Ok(outcome) => outcome,

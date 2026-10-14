@@ -157,7 +157,7 @@ koto session import review --from /srv/ws-a
 
 `--from` is the absolute path of the source workspace as it was on the host that created the session, symlinks resolved. A relative path is refused. To find it, run `pwd -P` in the source workspace; `koto session list` there shows the session's name. The current directory becomes the new session's execution anchor and its workspace, so run the session's later commands from there.
 
-If a session called `review` already exists on this host or under this workspace's prefix, give the import a new name:
+If a different session called `review` already exists on this host or under this workspace's prefix, give the import a new name. The source's own local copy doesn't count: on the host that created the session, the import takes the name over (see "Importing on the same host" below).
 
 ```bash
 koto session import review --from /srv/ws-a --as review-b
@@ -192,6 +192,29 @@ session_migrated: session 'review' was migrated to 'review' in /srv/ws-b; contin
 Nothing else under the source's prefix is written, and nothing is deleted. The source's state file and context keys stay in the bucket until someone runs `koto session cleanup review` in the source workspace, which removes them and the local copy but keeps `migrated.json`. Cleanup, a terminal tick and `koto session prune` without `--migrated-from` never delete a `migrated.json`, so any copy of the session still left in that workspace keeps refusing.
 
 An imported session is an ordinary session in its new workspace, so it can be imported again from there to a third one.
+
+### Importing on the same host
+
+Workspaces on one host share one local session store, so on the host that created the session its old copy already holds the name. Run the import without `--as` and it takes the name over, so every caller that looks the session up by name finds the new copy:
+
+```bash
+cd /srv/ws-b
+koto session import review --from /srv/ws-a
+```
+
+It prints the same JSON as an import from another host, with `name` set to `review`. Before it writes anything, it checks the old copy and refuses, leaving it untouched, when:
+
+- another process holds the session's lock (`import_source_running`): stop it first;
+- the local copy holds events or context the bucket lacks (`import_source_unpushed`): run `koto session resolve review --keep local` in the source workspace, then import again;
+- a local session names it as its parent (`import_source_has_children`).
+
+A local copy behind the bucket is fine: the import takes the bucket's events, as it does from another host.
+
+The import builds the new session in `~/.koto/sessions/.takeover-review/`, pushes it under this workspace's prefix, writes the marker on the source, and only then swaps the two directories in one atomic call. After the swap `.takeover-review/` holds the old copy, which is deleted once the import has checked it's still the copy it read. A copy that changed in between is moved aside to `~/.koto/sessions/.kept-takeover-review-<time>/`, with a warning naming it, so nothing it holds is lost and the name stays usable. While `.takeover-review/` exists, commands on `review` refuse and name the import to run.
+
+If the import stops at any step, run the same command again: a stop before the marker starts over, and a stop after it finishes the swap with the session id the marker recorded. A re-run never overwrites a copy under this workspace's prefix that has moved past its `session_imported` event; it refuses with `import_source_migrated` instead.
+
+The swap needs a filesystem that can exchange two directories atomically (`renameat2` on Linux, `renamex_np` on macOS) with the store on one device. Where that isn't available, the import refuses before writing anything and names `--as`; an import under a new name works everywhere. Running the import from the source workspace itself, or with `--as`, behaves as it always has.
 
 ### Removing the old copy and its marker
 
@@ -234,7 +257,10 @@ A refusal or failure prints `{"error": {"code": "...", "message": "..."}}`. Exit
 | `import_name_taken` | 2 | A different session already has the name here or under this workspace's prefix | Pass `--as <new-name>`, or remove the session holding the name if it isn't wanted |
 | `import_template_unavailable` | 2 | No usable compiled template with the session's hash: none in this host's cache, or under `--trust-template` none in the bucket or one that doesn't match | Run `koto template compile` here on the session's template from a matching checkout, then import again without `--trust-template` |
 | `import_source_unreadable` | 1 | A source object couldn't be fetched, or failed validation (for example, a state log this koto can't carry intact) | If the bucket was unreachable, run it again; if the message names a validation failure, the source needs repair on its host |
-| `import_push_failed` | 1 | Building the session here, pushing it, or moving it into place failed; what the run pushed was taken back | Fix what the message names (usually connectivity or local disk) and run the same import again |
+| `import_push_failed` | 1 | Building the session here, pushing it, or moving it into place failed. Before the source is marked, what the run pushed was taken back; once it's marked (a same-host import whose swap failed), everything is kept and the message says so | Fix what the message names (usually connectivity or local disk) and run the same import again; after the marker, that finishes it. When the message names `--as` (a same-host import this host's store can't swap), import under another name instead |
+| `import_source_running` | 2 | Same host only: another process holds the source session's lock | Stop whatever is advancing the session, then import again |
+| `import_source_unpushed` | 2 | Same host only: the source's local copy holds events or context keys the bucket lacks | Run `koto session resolve <name> --keep local` in the source workspace, then import again |
+| `import_source_has_children` | 2 | Same host only: a local session names the source as its parent | Finish or clean up the child it names, or import under `--as` |
 | `import_unmarked` | 1 | The session was imported and pushed, but the marker on the source couldn't be written, so the old copy won't refuse yet | Run the same import again; it writes only the marker. Keep the source stopped until it succeeds |
 
 ## 6. Handle conflicts (rare)
