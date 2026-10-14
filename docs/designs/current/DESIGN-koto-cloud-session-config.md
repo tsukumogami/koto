@@ -43,6 +43,29 @@ user_visible_surface: true
 
 Current
 
+**Note (2026-10-14), departures in the implementation.** Review of the
+same-host takeover changed a few details, and the sections below describe the
+design as accepted:
+
+- The new session is built in a private `.import-<name>-<random>` and renamed
+  to `.takeover-<name>` only once complete, so a stop while staging never
+  leaves the name refusing.
+- An old copy that changed after it was checked is moved aside to
+  `.kept-takeover-<name>-<time>` instead of staying at `.takeover-<name>`, so
+  the name stays usable and nothing is deleted. The prefix is one no session's
+  pending directory can have.
+- The exchange probe runs before the source's locks are taken, so nothing is
+  ever opened through a symlink at the name.
+- After a marker write whose outcome is unknown, a marker found on the source
+  counts as this import's only when its target session id is this one.
+- The finished record of the name is removed when the takeover is finished,
+  so a re-run after a stop past the exchange removes it too.
+- The context pull's identity check reads the bucket's state file, the only
+  place that identity lives, but only once a download is due. The local
+  guards make no request.
+- A context write that waited on its lock across the directory swap refuses
+  instead of writing into the session that replaced it.
+
 ## Context and Problem Statement
 
 The requirements are in `docs/prds/PRD-koto-cloud-session-config.md`. This
