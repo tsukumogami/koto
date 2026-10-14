@@ -100,6 +100,9 @@ impl CloudBackend {
         let pending = takeover_dir(&base, name);
 
         // 1. Checks. Nothing is written until they all pass.
+        // The probe comes first: taking the locks creates `ctx/manifest.lock`,
+        // which must never happen through a symlink at the name.
+        self.probe_exchange(&base, &holder)?;
         let (manifest, manifest_bytes) = self.read_source_manifest(source)?;
         let locks = self.lock_source_copy(name)?;
         let verified = self.verify_source_copy(name, source, &manifest)?;
@@ -108,7 +111,6 @@ impl CloudBackend {
         } else {
             self.remote_copy_unmoved(req, source)?;
         }
-        self.probe_exchange(&base, &holder)?;
 
         // 2. Stage.
         let template = self.import_template(req, source)?;
