@@ -2775,9 +2775,10 @@ impl CloudBackend {
         crate::session::local::ensure_koto_root(base)
             .and_then(|()| std::fs::create_dir_all(base).map_err(anyhow::Error::from))
             .map_err(|e| write_failed(base, &e))?;
-        // A same-host takeover stages in its fixed `.takeover-<name>` and may
-        // reuse the session id its marker already names; every other import
-        // stages in a fresh `.import-<target>-<random>` with a new id.
+        // A same-host takeover passes its own staging directory, which it
+        // renames to `.takeover-<name>` once complete, and may reuse the
+        // session id its marker already names; every other import stages in
+        // a fresh `.import-<target>-<random>` with a new id.
         let dir = match into {
             Some((dir, _)) => dir.to_path_buf(),
             None => base.join(format!(".import-{}-{}", target, generate_session_id())),

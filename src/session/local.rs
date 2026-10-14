@@ -2117,10 +2117,6 @@ mod tests {
 
     // ===== lock_state_file tests =====
 
-    /// scenario-4: two back-to-back acquisitions observe
-    /// first-wins / second-contends semantics immediately, with no
-    /// blocking. The second call must return `SessionError::Locked`
-    /// rather than waiting for the first guard to drop.
     #[cfg(unix)]
     #[test]
     fn a_lock_waited_on_across_a_swap_of_its_file_refuses() {
@@ -2148,6 +2144,10 @@ mod tests {
         LocalBackend::acquire_flock(&path).unwrap();
     }
 
+    /// scenario-4: two back-to-back acquisitions observe
+    /// first-wins / second-contends semantics immediately, with no
+    /// blocking. The second call must return `SessionError::Locked`
+    /// rather than waiting for the first guard to drop.
     #[test]
     fn lock_state_file_second_acquire_returns_locked() {
         let tmp = TempDir::new().unwrap();

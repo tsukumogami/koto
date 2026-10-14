@@ -9,8 +9,10 @@
 //! design's, chosen so the local store never holds the new session while
 //! the source's prefix lacks its marker:
 //!
-//! 1. check, writing nothing: the source's locks, whether its copy is ahead
-//!    of the bucket, its children, this workspace's prefix, the exchange;
+//! 1. check, writing nothing: that the name can take an exchange (the
+//!    probe, first, so nothing is ever opened through a symlink at the
+//!    name), then the source's locks, whether its copy is ahead of the
+//!    bucket, its children, and this workspace's prefix;
 //! 2. stage the new session in a private `.import-<name>-<random>` and,
 //!    once it is complete, rename it to `<sessions>/.takeover-<name>`, so
 //!    that name only ever holds a whole session;
@@ -232,10 +234,10 @@ impl CloudBackend {
         source: &ImportSource,
         verified: Option<&Verified>,
     ) {
-        // The state file was named after the target already; only a
-        // finished record of the name would now be stale. Removed here, not
-        // in `takeover`, so a re-run after a stop past the exchange removes
-        // it too.
+        // The new session's files already carry the name, so the one thing
+        // left stale by the exchange is a finished record of an earlier
+        // session under the name. Removed here, not in `takeover`, so a
+        // re-run after a stop past the exchange removes it too.
         if let Err(e) = crate::session::finished::remove(self.local.base_dir(), name) {
             eprintln!("warning: could not remove the finished record for {name}: {e:#}");
         }
