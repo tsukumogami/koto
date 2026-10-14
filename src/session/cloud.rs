@@ -482,10 +482,15 @@ impl CloudBackend {
 
     /// Before a context key is downloaded over the local copy: the bucket's
     /// state file for `session` must not be the other side of an import of
-    /// the local one ([`refuse_cross_import_pull`]). Asked only when a
-    /// download is due, so a read whose hashes match makes no extra request;
-    /// a state file the bucket can't serve lets the pull go on, as the state
-    /// pull does.
+    /// the local one ([`refuse_cross_import_pull`]). A state file the bucket
+    /// can't serve lets the pull go on, as the state pull does.
+    ///
+    /// Unlike the local guards ([`CloudBackend::local_guard`]), which make no
+    /// request, this check reads the bucket's state file: the identity it
+    /// compares lives there. It is asked only when a download is already due,
+    /// after the manifests' hashes differ, so a read whose hashes match makes
+    /// no extra request, and the cross-host carrier's recorded requests are
+    /// unchanged.
     fn check_context_pull(&self, session: &str) -> anyhow::Result<()> {
         let state_path = self
             .local
@@ -3027,14 +3032,6 @@ fn is_migration_marker(session_prefix: &str, key: &str) -> bool {
     key.strip_prefix(session_prefix) == Some(MIGRATED_MARKER)
 }
 
-/// The `session_id` in a state file's header line (its first non-empty
-/// line), or `None` when the header doesn't parse or has none.
-///
-/// Deliberately looser than [`parse_source_log`]: the marker judge reads
-/// the header with this first, to tell a target that is another session
-/// (`Replaced`) or has no usable header (`Unknown`) from the right session
-/// with a damaged log (`Unverified`). Reading it with the strict parser
-/// would fold the first two into the third.
 /// `<sessions>/.takeover-<id>`: where a same-host import of `id` stages the
 /// new session, and where the source's old copy sits after the exchange
 /// until the import deletes it. Its presence means the import of `id` has
@@ -3087,6 +3084,14 @@ fn header_anchor(state: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The `session_id` in a state file's header line (its first non-empty
+/// line), or `None` when the header doesn't parse or has none.
+///
+/// Deliberately looser than [`parse_source_log`]: the marker judge reads
+/// the header with this first, to tell a target that is another session
+/// (`Replaced`) or has no usable header (`Unknown`) from the right session
+/// with a damaged log (`Unverified`). Reading it with the strict parser
+/// would fold the first two into the third.
 fn header_session_id(state: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(state);
     let line = text.lines().find(|l| !l.trim().is_empty())?;
