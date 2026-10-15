@@ -160,24 +160,54 @@ Key assumptions:
 
 Each criterion resolves in this order:
 
-1. Empty slice: `NotGraded`, as today.
+1. Empty slice: `NotGraded`, as today. (The early outcome is computed as
+   today: a failed extraction first, then an empty slice, then over
+   budget.)
 2. A reusable decider verdict for the same slice: that verdict, as today.
+   An early `OverBudget` or `ExtractionFailed` skips this step, as today.
 3. An applicable agent answer: the latest `decider_check_answered` in the
    visit with the same state, gate, rule id, declaration hash and
    `input_sha256` (two absent hashes match). Its answer is the outcome and
    nothing is appended for the criterion.
-4. Otherwise the existing path: an early `OverBudget` or `ExtractionFailed`,
-   `Busy` without the lock, `CapSpent` without budget, or a consultation.
+4. Otherwise the existing path: the early `OverBudget` or
+   `ExtractionFailed`, `Busy` without the lock, `CapSpent` without budget,
+   or a consultation.
+
+This restructures the evaluator's per-criterion `match`: today the early
+outcome is its first arm, so steps 2 and 3 have to move ahead of it for
+every early outcome except `NotGraded`.
 
 Any criterion that ends step 4 `Unanswered` is a fallback. Because step 3
 precedes every unanswered branch, a reason added to `UnansweredReason`
 falls back with no further code.
+
+A criterion that waits is evaluated again on every `koto next` until the
+agent answers: an unanswered outcome is never reused, so the provider is
+asked again, and a fresh missing verdict is a fresh fallback with its own
+`decider_fallback` event. The journal's record count is therefore the
+number of times the agent was asked. The number of distinct fallbacks is
+the number of distinct `koto.session.id`, `koto.visit.seq`, `koto.check`
+and `koto.rule.id` groups, and the first record of a group is the first
+time the agent was asked.
+
+An answer binds to the slice of the latest fallback, so an agent that
+changes its work after the fallback and then answers has answered about
+the old slice: the next evaluation of the new slice asks the decider, and
+falls back again if it still can't answer. An answer about old work
+never applies to new work.
 
 #### Alternatives Considered
 
 - **Binding an answer to one fallback event.** Each evaluation of a slice
   the provider still can't grade would make a new fallback and ask again
   for something already answered. Rejected.
+- **Consulting the decider before reading the answer.** A provider that
+  recovers within the visit could then grade the slice the agent already
+  answered for, and veto it. But during an outage every tick would pay up
+  to two provider timeouts per criterion and spend the shared cap, and
+  for `over_budget` and `extraction_failed` nothing is sent anyway. The
+  PRD (R6) makes the agent's answer the outcome for its slice. Rejected;
+  a changed slice still goes back to the decider.
 - **Looking up answers in the engine.** The engine would need to read
   decider records it never sees today. Rejected on the small-engine driver.
 
@@ -217,7 +247,12 @@ Findings: a decider veto fail keeps its `error` finding with
 `message_source: decider`. An agent `fail` gets an `error` finding with
 `message_source: koto`, so it counts as a rule like any violation. A
 waiting criterion gets a `warning` finding with `message_source: koto`, so
-it never counts as one.
+it never counts as one: `error_rule_ids` in `src/engine/advance.rs` counts
+only `error` findings, so a warning never reaches `rule_counts` or a
+`check_rule` record. The other readers of a decider check's result take
+it as it is: `blocking_conditions_from_gates` renders any non-passed gate
+with its output and findings, and the journal's `with_rules` writes rules
+from `rule_counts` alone.
 
 The engine's decider-check blocking rule becomes "`failed` or `awaiting` is
 non-empty", still ignoring the evidence fallback. `override_records` writes
@@ -421,6 +456,10 @@ criterion <id> is waiting on your answer: the decider gave no verdict
 <fail>. Answer unclear if: <escape>.
 ```
 
+Each substituted session, gate and criterion value is written as-is when
+it matches `^[A-Za-z0-9._:/@-]+$` and single-quoted otherwise (see
+Security Considerations).
+
 A finding's message is capped at 1,000 bytes (`MESSAGE_MAX_BYTES`), and a
 criterion's question and descriptions have no length limit of their own, so
 the command comes before the template's text: a cut loses the end of the
@@ -465,6 +504,10 @@ Deliverables:
 - `src/cli/validate_feed.rs` test list
 
 ### Phase 2: The fallback in the evaluator and engine
+
+Phase 2's tests build `decider_check_answered` events directly, since the
+subcommand lands in Phase 3; both phases land in the same pull request, so
+no released build stops a state without a way to answer.
 
 Answer lookup, the new output and findings, the unreadable-log shape,
 `decider_fallbacks` on the result, the engine's blocking rule and append
@@ -512,13 +555,15 @@ Deliverables:
 
 ## Security Considerations
 
-The design doesn't download or execute anything new, adds no dependency,
-and asks for no permission beyond writing the session log the agent's own
-koto commands already write. What it does change is who can move a gate,
-what text reaches the agent, and what the journal says.
+koto downloads nothing new and runs no new command itself, adds no
+dependency, and asks for no permission beyond writing the session log the
+agent's own koto commands already write. The finding does ask the agent to
+run one koto command. What the design changes is who can move a gate, what
+text reaches the agent, and what the journal says.
 
 - **Self-grading.** The agent answers for its own work, and could answer
-  `pass` to move on. The 2026-10-14 ruling accepts this: it's what the
+  `pass` to move on. The maintainers' 2026-10-14 ruling, recorded in the
+  PRD's motivating context, accepts this: it's what the
   agent did before a decider existed, and the answer is a recorded event a
   reviewer can read beside the gate. It never reaches the routing decider
   or the ledger's accuracy counts. An answer leaves a thinner trail than an
@@ -534,10 +579,27 @@ what text reaches the agent, and what the journal says.
   the journal; a test feeds marker strings through the slice and asserts
   none appears in any new event, finding or record.
 - **Answer command input.** Arguments reach koto through clap as literal
-  strings and are never evaluated by a shell. The gate and criterion must
-  match the template's declarations, the answer must be one of three
-  words, and nothing else the agent types is recorded, so an event can't
-  carry free text.
+  strings. The gate and criterion must match the template's declarations,
+  the answer must be one of three words, and nothing else the agent types
+  is recorded, so an event can't carry free text. The agent copies the
+  command line from the finding into a shell, so koto writes each
+  substituted value (session, gate, criterion) as-is only when it matches
+  `^[A-Za-z0-9._:/@-]+$`, and otherwise single-quoted with any `'` written
+  as `'\''`. A rule id with a space or a shell metacharacter can't turn
+  the line into a different command; a test covers one.
+- **An agent can cause its own fallback.** The agent controls its work,
+  so it can push the slice over budget or break the extraction, then
+  answer `pass`. That's not a regression, since those cases passed with
+  no answer at all before, but it means a veto check can be reduced to a
+  self-grade on purpose. The `decider_fallback` records make it visible:
+  a session whose fallbacks are all `over_budget` or `extraction_failed`
+  is a signal to alert on. Whether the ruling covers this deliberate case
+  is raised with the maintainers rather than decided here.
+- **Unreadable log.** With no readable log, nothing is appended, so
+  `koto decider answer` finds no fallback and refuses with `no_fallback`,
+  and `koto overrides record` can't read the log either. The state stays
+  stopped until the log is repaired. That's the safe direction for a
+  session koto can't read.
 - **Integrity of the binding.** An answer applies only to the slice hash
   and declaration hash it was recorded against, in the visit it was
   recorded in, so an answer can't be replayed onto changed work or a
@@ -553,7 +615,11 @@ what text reaches the agent, and what the journal says.
 - **Concurrency.** The subcommand appends without the decider lock. An
   evaluation in progress doesn't see the answer, and the next one does;
   both writers append whole events to the same log as `koto overrides
-  record` already does. Two concurrent ticks can each record a fallback for
+  record` already does. An answer that lands between the engine's
+  `decider_fallback` and `gate_evaluated` appends is harmless: lookups key
+  on state, visit and hashes, never on adjacency. A slice that changes and
+  changes back finds the answer recorded for it, by design: the same slice
+  gets the same answer. Two concurrent ticks can each record a fallback for
   the same slice when the lock wait runs out (`busy`); each is a real
   fallback the agent was shown, so the journal counts both, and one answer
   covers both since it binds to the slice.
