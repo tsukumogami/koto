@@ -2347,7 +2347,7 @@ fn decider_records(env: &Env, session: &str) -> Vec<Value> {
         .filter(|r| {
             matches!(
                 r["kind"].as_str().unwrap(),
-                "decider_consulted" | "decider_checked" | "check_overridden"
+                "decider_consulted" | "decider_checked" | "decider_fallback" | "check_overridden"
             )
         })
         .collect()
@@ -2607,12 +2607,13 @@ fn a_decider_check_writes_one_decider_checked_per_criterion_before_its_evaluatio
             "decider_checked",
             "decider_checked",
             "decider_checked",
+            "decider_fallback",
             "check_evaluated",
             "check_rule",
             "response"
         ]
     );
-    assert_eq!(records[5]["koto.state"], "review");
+    assert_eq!(records[6]["koto.state"], "review");
     for (record, event) in records[..3].iter().zip(&checked_events) {
         let p = &event["payload"];
         assert_eq!(record["koto.seq"], event["seq"], "{record}");
@@ -2667,13 +2668,24 @@ fn a_decider_check_writes_one_decider_checked_per_criterion_before_its_evaluatio
     assert_eq!(records[2]["koto.decider.reason"], "provider_error");
     assert!(records[2].get("koto.decider.input_tokens").is_none());
 
-    let e = &records[3];
+    // b got no verdict, so it was handed to the agent: its fallback comes
+    // after the decider_checked records and before the evaluation.
+    let fb = &records[3];
+    assert_eq!(fb["koto.rule.id"], "b");
+    assert_eq!(fb["koto.decider.mode"], "veto");
+    assert_eq!(fb["koto.decider.reason"], "provider_error");
+    assert!(fb["koto.decider.input_bytes"].as_u64().is_some(), "{fb}");
+    assert!(fb["koto.seq"].as_u64() < evaluated_event["seq"].as_u64());
+    assert_eq!(fb["koto.visit.seq"], arrival);
+    let e = &records[4];
     assert_eq!(e["koto.seq"], evaluated_event["seq"]);
     assert_eq!(e["koto.check.outcome"], "failed");
     assert_eq!(e["koto.check.unanswered_count"], 1);
     assert_eq!(e["koto.check.rule_count"], 1);
-    assert_eq!(records[4]["koto.rule.id"], "a");
-    assert_eq!(records[4]["koto.rule.visit_count"], 1);
+    assert_eq!(e["koto.decider.awaiting_count"], 1);
+    assert_eq!(e["koto.decider.agent_answered_count"], 0);
+    assert_eq!(records[5]["koto.rule.id"], "a");
+    assert_eq!(records[5]["koto.rule.visit_count"], 1);
 
     // The same visit again, with another command holding the decider lock:
     // `a` and `s` are reused and write nothing, and `b` is `busy`.
@@ -2688,11 +2700,12 @@ fn a_decider_check_writes_one_decider_checked_per_criterion_before_its_evaluatio
     drop(lock);
     assert_eq!(out.journal_warnings(), 0, "{}", out.stderr);
     assert_eq!(stub.request_count(), 3, "nothing more was asked");
-    let after: Vec<Value> = env.records("dc").into_iter().skip(2 + 6).collect();
+    let after: Vec<Value> = env.records("dc").into_iter().skip(2 + 7).collect();
     assert_eq!(
         kinds(&after),
         vec![
             "decider_checked",
+            "decider_fallback",
             "check_evaluated",
             "check_rule",
             "response"
@@ -2704,10 +2717,11 @@ fn a_decider_check_writes_one_decider_checked_per_criterion_before_its_evaluatio
     assert_eq!(after[0]["koto.decider.reason"], "busy");
     assert_eq!(after[0]["koto.decider.attempts"], 0);
     assert_eq!(after[0]["koto.visit.seq"], arrival);
-    assert_eq!(after[1]["koto.check.outcome"], "failed");
-    assert_eq!(after[1]["koto.check.unanswered_count"], 1);
-    assert_eq!(after[2]["koto.rule.id"], "a");
-    assert_eq!(after[2]["koto.rule.visit_count"], 2);
+    assert_eq!(after[1]["koto.decider.reason"], "busy");
+    assert_eq!(after[2]["koto.check.outcome"], "failed");
+    assert_eq!(after[2]["koto.check.unanswered_count"], 1);
+    assert_eq!(after[3]["koto.rule.id"], "a");
+    assert_eq!(after[3]["koto.rule.visit_count"], 2);
     let logged = env
         .events("dc")
         .iter()
@@ -3341,6 +3355,7 @@ fn an_unwritable_journal_changes_nothing_for_decider_and_override_commands() {
             "decider_checked",
             "decider_checked",
             "decider_checked",
+            "decider_fallback",
             "check_overridden"
         ]
     );

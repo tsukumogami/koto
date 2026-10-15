@@ -97,6 +97,7 @@ fn every_kind_the_reference_names_is_one_koto_writes_and_the_reverse() {
             "context_reads",
             "decider_checked",
             "decider_consulted",
+            "decider_fallback",
             "driver_seen",
             "response",
             "session_started",
@@ -195,6 +196,7 @@ fn every_check_kind_lists_its_fields_and_describes_each() {
         "context_reads",
         "decider_consulted",
         "decider_checked",
+        "decider_fallback",
         "check_overridden",
         "response",
     ] {
@@ -414,5 +416,36 @@ fn the_session_feed_contract_declares_the_lineage_header_fields() {
             spec.contains(&format!("| `{field}` | string | No |")),
             "session-feed.md's header table doesn't describe {field}"
         );
+    }
+}
+
+/// The attributes the decider fallback added (DESIGN-decider-fallback.md,
+/// "The exact names") collide with nothing the journal writes: none equals
+/// another attribute, none starts with another followed by `.`, and none is
+/// such a prefix of another, so a backend that nests dotted names never
+/// sees one as both a value and an object.
+#[test]
+fn the_decider_fallback_attributes_collide_with_no_other_attribute() {
+    let field = Regex::new(r"^koto\.[a-z_]+(\.[a-z_]+)*$").unwrap();
+    let written: BTreeSet<String> = source_literals()
+        .into_iter()
+        .filter(|s| field.is_match(s))
+        .collect();
+    for new in [
+        "koto.decider.input_bytes",
+        "koto.decider.awaiting_count",
+        "koto.decider.agent_answered_count",
+    ] {
+        assert!(written.contains(new), "{SOURCE_DIR} never writes {new}");
+        for other in written.iter().filter(|o| o.as_str() != new) {
+            assert!(
+                !other.starts_with(&format!("{new}.")),
+                "{other} nests under {new}"
+            );
+            assert!(
+                !new.starts_with(&format!("{other}.")),
+                "{new} nests under {other}"
+            );
+        }
     }
 }

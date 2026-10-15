@@ -60,7 +60,7 @@
 //! - `check_pending`: one per pending `gate_evaluated` of a polling gate,
 //!   with the poll's run count and elapsed seconds, never an outcome.
 //!
-//! Three more are relayed the same way, with the same two sequence
+//! Four more are relayed the same way, with the same two sequence
 //! numbers, from decider and override events:
 //!
 //! - `decider_consulted`: one per `decider_consulted` event, with the
@@ -70,6 +70,9 @@
 //!   `koto.rule.id` (digested like a rule id), the mode, outcome, reason,
 //!   whether it blocked, tokens and timings. A verdict koto reuses appends
 //!   no event, so it writes no record.
+//! - `decider_fallback`: one per `decider_fallback` event (a criterion
+//!   handed to the agent), with the gate as `koto.check`, the criterion's id
+//!   as `koto.rule.id`, the mode, the reason and the slice's size.
 //! - `check_overridden`: one per `gate_override_recorded`, with the state
 //!   and gate only.
 //!
@@ -117,7 +120,8 @@
 //!   `directed_transition` and `rewound` event, `cancelled` for
 //!   `workflow_cancelled`, the check kinds for `gate_evaluated` and
 //!   `default_action_executed`, and the decider and override kinds for
-//!   `decider_consulted`, `decider_checked` and `gate_override_recorded`.
+//!   `decider_consulted`, `decider_checked`, `decider_fallback` and
+//!   `gate_override_recorded`.
 //!   A commit that ends a visit (an arrival, a rewind, a cancel, or the
 //!   terminal tick's `request_store.result`) writes the visit's
 //!   `context_reads` just before its own record. Before those, on any
@@ -659,6 +663,7 @@ fn relays(payload: &EventPayload) -> bool {
             | EventPayload::DefaultActionExecuted { .. }
             | EventPayload::DeciderConsulted(_)
             | EventPayload::DeciderChecked(_)
+            | EventPayload::DeciderFallback(_)
             | EventPayload::GateOverrideRecorded { .. }
     )
 }
@@ -713,12 +718,27 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
             poll,
             ..
         } => {
+            // Only a decider check's output carries an `unanswered` list. A
+            // decider check also counts the criteria waiting on the agent
+            // and the ones an agent's answer decided, 0 included, on its
+            // pending and its evaluated records alike.
+            let unanswered = output.get("unanswered").and_then(Value::as_array);
+            let decider_count = |key: &str| {
+                unanswered.map(|_| {
+                    output
+                        .get(key)
+                        .and_then(Value::as_array)
+                        .map_or(0, |ids| ids.len() as u64)
+                })
+            };
             if outcome == "pending" {
+                // A polling gate's wait, or a decider check waiting on the
+                // agent. Only the first has a poll to describe.
                 return vec![relay
                     .record("check_pending")
                     .name("koto.state", Some(state.as_str()))
                     .name("koto.check", Some(gate.as_str()))
-                    .name("koto.poll.status", Some("pending"))
+                    .name("koto.poll.status", poll.as_ref().map(|_| "pending"))
                     .int(
                         "koto.poll.evaluations",
                         poll.as_ref().map(|p| p.evaluations),
@@ -726,10 +746,13 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
                     .int(
                         "koto.poll.elapsed_secs",
                         poll.as_ref().map(|p| p.elapsed_secs),
+                    )
+                    .int("koto.decider.awaiting_count", decider_count("awaiting"))
+                    .int(
+                        "koto.decider.agent_answered_count",
+                        decider_count("agent_answered"),
                     )];
             }
-            // Only a decider check's output carries an `unanswered` list.
-            let unanswered = output.get("unanswered").and_then(Value::as_array);
             let error = unanswered
                 .and(output.get("error"))
                 .and_then(Value::as_str)
@@ -740,7 +763,12 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
                     "koto.check.unanswered_count",
                     unanswered.map(|u| u.len() as u64),
                 )
-                .name("koto.check.error", error);
+                .name("koto.check.error", error)
+                .int("koto.decider.awaiting_count", decider_count("awaiting"))
+                .int(
+                    "koto.decider.agent_answered_count",
+                    decider_count("agent_answered"),
+                );
             with_rules(evaluated, relay, state, gate, check)
         }
         EventPayload::DefaultActionExecuted {
@@ -757,6 +785,7 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
         }
         EventPayload::DeciderConsulted(c) => vec![decider_consulted(relay, c)],
         EventPayload::DeciderChecked(c) => vec![decider_checked(relay, c)],
+        EventPayload::DeciderFallback(f) => vec![decider_fallback(relay, f)],
         // The override event doesn't say which rules it moved past; a reader
         // joins it to the evaluation it overrode (the reference's "Joining
         // an override"). Its rationale and values stay in the log.
@@ -821,6 +850,24 @@ fn decider_checked(relay: &Relay<'_>, c: &crate::decider::check::DeciderCheck) -
         )
         .int("koto.decider.attempts", Some(u64::from(c.attempts)))
         .int("koto.decider.latency_ms", Some(c.latency_ms))
+        .int("koto.decider.input_bytes", c.input_bytes)
+}
+
+/// A `decider_fallback` record: one decider-check criterion handed to the
+/// agent (DESIGN-decider-fallback.md, Decision 4), under its gate as
+/// `koto.check` and its id (or the id's digest) as `koto.rule.id`, with its
+/// mode, the reason it got no verdict and the slice's size. Like
+/// [`decider_checked`], the event's own `visit_seq` isn't copied, and no
+/// hash, question or slice is.
+fn decider_fallback(relay: &Relay<'_>, f: &crate::decider::check::DeciderFallback) -> Record {
+    relay
+        .record("decider_fallback")
+        .name("koto.state", Some(f.state.as_str()))
+        .name("koto.check", Some(f.gate.as_str()))
+        .name("koto.rule.id", Some(name_or_digest(&f.rule_id).as_str()))
+        .name("koto.decider.mode", Some(f.mode.as_str()))
+        .name("koto.decider.reason", Some(f.reason.as_str()))
+        .int("koto.decider.input_bytes", f.input_bytes)
 }
 
 /// A `check_evaluated` record's fields common to gates and default actions.
