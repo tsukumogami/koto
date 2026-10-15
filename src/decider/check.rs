@@ -414,7 +414,7 @@ pub struct DeciderFallback {
 }
 
 /// The agent's answer to one fallback: the payload of the
-/// `decider_check_answered` event `koto decider answer` appends. It binds
+/// `decider_check_answered` event the agent appends to answer. It binds
 /// to the slice and declaration of the fallback it answers, so it applies
 /// only to an evaluation of the same slice of the same criterion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -424,6 +424,9 @@ pub struct DeciderCheckAnswered {
     pub gate: String,
     pub rule_id: String,
     pub declaration_hash: String,
+    /// The answered fallback's slice hash; absent when that fallback had no
+    /// slice (a failed extraction), and then it matches only another
+    /// evaluation with no slice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_sha256: Option<String>,
     pub answer: AgentAnswer,

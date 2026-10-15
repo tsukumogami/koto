@@ -1975,7 +1975,7 @@ another.
 #### `decider_check_answered`
 
 Records the agent's answer to a criterion that fell back to it, appended by
-`koto decider answer`. The answer binds to the slice and declaration of the
+the agent's answer command. The answer binds to the slice and declaration of the
 latest `decider_fallback` for that check and criterion in the visit, and
 decides the criterion on a later evaluation of the same slice in the same
 visit; the latest answer for a slice wins.
