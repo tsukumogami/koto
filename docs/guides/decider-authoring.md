@@ -601,7 +601,10 @@ descriptions, so write those for an agent to read as well as for the
 decider. The command comes first because a finding's message is capped at
 1,000 bytes and a long description is cut at its end.
 
-The agent answers with:
+The check's output lists the criterion under `awaiting`, which holds every
+criterion waiting on the agent, veto or shadow; a veto criterion is also
+listed under `unanswered` until an answer is recorded. The agent answers
+with:
 
 ```bash
 koto decider answer <session> --gate <check> --criterion <rule_id> --answer <pass|fail|unclear>

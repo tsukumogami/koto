@@ -20,8 +20,8 @@
 # waits. The script answers pass with `koto decider answer`, which appends a
 # decider_check_answered event, and the next tick passes review on that
 # answer and moves on to work, where the routing consultation fails to
-# connect and bills nothing. The logs must
-# hold every event in EVENT_CHECKS and NV_EVENT_CHECKS, and the new build's
+# connect and bills nothing. The logs must hold every event in EVENT_CHECKS
+# and NV_EVENT_CHECKS, and the new build's
 # `koto template validate-feed` must accept them against
 # docs/reference/session-feed.md. The ledger must hold a `checked` and a
 # `check_overridden` line, which the new build's `koto decider report`
@@ -66,8 +66,11 @@ EVENT_CHECKS=(
   'decider_consulted with the billed tokens and model|.type? == "decider_consulted" and .payload.state == "work" and .payload.input_tokens == 50 and .payload.output_tokens == 2 and .payload.unread_usage_attempts == 0 and .payload.provider == "jev" and .payload.model == "compat-stub-1.0.0"'
 )
 
-# Events the no-verdict session must leave in its log: a pass that keeps
-# the criterion listed as unanswered, never read as compliance.
+# Events the no-verdict session must leave in its log: the criterion falls
+# back to the agent, the gate is pending on it, the agent's pass is recorded,
+# and only then does the gate pass, on that answer. The pending gate lists the
+# criterion under both unanswered (veto criteria with no verdict and no
+# answer) and awaiting (any criterion waiting on the agent, shadow included).
 NV_EVENT_CHECKS=(
   'decider_checked for the unanswered criterion|.type? == "decider_checked" and .payload.rule_id == "comment_reason" and .payload.outcome == "unanswered" and .payload.reason == "provider_error" and .payload.mode == "veto" and .payload.blocked == false'
   'decider_fallback handing the criterion to the agent|.type? == "decider_fallback" and .payload.gate == "comments" and .payload.rule_id == "comment_reason" and .payload.reason == "provider_error" and .payload.mode == "veto" and (.payload.visit_seq | type) == "number" and (.payload.declaration_hash | type) == "string" and (.payload.input_sha256 | type) == "string" and (.payload.input_bytes | type) == "number"'
