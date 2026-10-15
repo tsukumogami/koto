@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 problem: |
   A decider-check criterion that gets no verdict passes its gate. Six reasons
   lead there today (over budget, extraction failed, provider error, unreadable
@@ -26,7 +26,7 @@ motivating_context: |
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
@@ -195,8 +195,9 @@ lists of criterion ids in declaration order: `awaiting`, the waiting
 criteria, and `agent_answered`, the criteria whose outcome this evaluation
 took from an agent answer. `failed` lists every criterion that blocks on a
 fail, from the decider in veto or from the agent in either mode.
-`unanswered` keeps its exact current meaning: veto criteria that got no
-verdict this evaluation. The gate is `failed` when `failed` or `awaiting` is
+`unanswered` keeps its current meaning: every veto criterion that got no
+decider verdict this evaluation, so a veto criterion under `awaiting` or
+`agent_answered` is listed there too. The gate is `failed` when `failed` or `awaiting` is
 non-empty, and `passed` otherwise. A template's existing `override_default`
 for a decider check stays valid without the two new lists, and an override
 value without them doesn't block.
@@ -227,12 +228,14 @@ answer event is not relayed.
 `koto.`-prefixed. An attribute this feature reuses keeps its name, its JSON
 type and its documented meaning in the run-journal reference. For every new
 attribute N and every other attribute M the run journal writes in any record
-kind, N differs from M and neither is M or N followed by `.` and more text.
+kind, N differs from M, N doesn't start with M followed by `.`, and M
+doesn't start with N followed by `.`.
 
 **R13. An unreadable log never passes.** A decider check with an unreadable
 log is `failed`, lists every criterion under `awaiting`, keeps
-`output.error: log_unreadable`, and appends nothing; its finding says the
-session log couldn't be read. With no readable log the agent can't answer
+`output.error: log_unreadable`, and appends nothing; its one finding, at
+level `warning` and named for the check, says the session log couldn't be
+read. With no readable log the agent can't answer
 either, so the state stays stopped until the log is repaired or an override
 is recorded.
 
@@ -303,6 +306,11 @@ rule.
 - [ ] An answer recorded for one slice doesn't apply to an evaluation of
       another slice, and an answer from an earlier visit doesn't apply after
       the state is left and re-entered.
+- [ ] An answer stops applying once the criterion's declaration hash changes,
+      and a reusable decider verdict for a slice is used ahead of an agent
+      answer recorded for the same slice.
+- [ ] An answer recorded while another `koto next` holds the decider lock is
+      appended at once and applies to the next evaluation.
 - [ ] With `extraction_failed`, an answer applies to later evaluations in the
       visit while extraction keeps failing.
 - [ ] A check with three criteria, one failed by the decider in veto, one
@@ -361,11 +369,14 @@ rule.
 - [ ] A `decider_fallback` record built from 128-byte state, check and
       criterion names is at most 4,096 bytes.
 - [ ] Each document R19 lists names `koto decider answer` and
-      `decider_fallback`, a search of those documents for the sentences
-      saying a missing verdict passes or doesn't block finds none, and
+      `decider_fallback`; every line in them matching `missing verdict` or
+      `unanswered` is read, and none says such a criterion passes or doesn't
+      block; and
       `tests/doc_names.rs` and `tests/run_journal_doc_test.rs` pass.
-- [ ] The koto-user eval about a missing verdict passes only when the
-      response runs `koto decider answer` for the waiting criterion.
+- [ ] The koto-user eval about a missing verdict asserts that the response
+      runs `koto decider answer` for the waiting criterion, and the repo's
+      eval shape check passes. The full eval run belongs to the release's
+      eval precondition, not to this change.
 - [ ] The pull request lists every existing test it edits and the old rule
       each one pinned.
 
