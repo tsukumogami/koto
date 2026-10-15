@@ -37,7 +37,7 @@ user_visible_surface: true
 
 Current
 
-Superseded in part by [DESIGN-decider-fallback](../DESIGN-decider-fallback.md):
+Superseded in part by [DESIGN-decider-fallback](./DESIGN-decider-fallback.md):
 where this design says a criterion with no verdict passes its gate, a
 current koto hands the criterion to the agent instead. The check is
 `pending`, the agent records its answer with `koto decider answer`, and a

@@ -1504,7 +1504,7 @@ gate types, including `children-complete` and `request-leg`, log none, so a
 failure of one of them carries no `findings` and no `rule_counts`.
 
 **A `decider-check` gate** (docs/designs/current/DESIGN-koto-decider-checks.md,
-docs/designs/DESIGN-decider-fallback.md) logs `output` as
+docs/designs/current/DESIGN-decider-fallback.md) logs `output` as
 `{"failed": [...], "unanswered": [...], "awaiting": [...], "agent_answered": [...], "error": ""}`,
 each list holding criterion `rule_id`s in declaration order:
 
@@ -1955,7 +1955,7 @@ failed criterion; see `docs/workspace-layout.md`.
 Records one criterion of a `decider-check` gate handed to the agent: it got
 no verdict this evaluation, for any `reason` an `unanswered`
 `decider_checked` can carry, and no answer the agent recorded applies to
-it (docs/designs/DESIGN-decider-fallback.md). It appears after the
+it (docs/designs/current/DESIGN-decider-fallback.md). It appears after the
 evaluation's `decider_checked` events and before the gate's
 `gate_evaluated`, in criterion declaration order, in veto and in shadow
 mode. An evaluation whose criterion takes a recorded agent answer appends

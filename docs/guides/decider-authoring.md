@@ -592,7 +592,7 @@ slice, or a new visit, is asked afresh.
 
 A criterion that gets no verdict, for any of the reasons in the table,
 isn't passed and doesn't block as a fail: it falls back to the agent doing
-the work (docs/designs/DESIGN-decider-fallback.md). The check's gate is
+the work (docs/designs/current/DESIGN-decider-fallback.md). The check's gate is
 `pending`, which stops the state without counting a judgment, and the
 response carries one `warning` finding per waiting criterion. The finding
 names the criterion, the reason, the command that records the answer, and
