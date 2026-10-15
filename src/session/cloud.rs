@@ -27,7 +27,7 @@ use s3::{Bucket, Region};
 use crate::config::CloudConfig;
 use crate::engine::reentrancy;
 use crate::session::batch::{self, BatchLock, Journal, Pending};
-use crate::session::context::ContextStore;
+use crate::session::context::{is_host_local_key, ContextStore};
 use crate::session::local::{repo_id, LocalBackend};
 use crate::session::sync::{self, ManifestCache};
 use crate::session::{
@@ -1330,6 +1330,7 @@ impl CloudBackend {
         let (present, gone): (Vec<&String>, Vec<&String>) = pending
             .keys
             .iter()
+            .filter(|key| !is_host_local_key(key))
             .partition(|key| manifest.keys.contains_key(key.as_str()));
         let ctx_dir = self.local.session_dir(id).join("ctx");
         let ctx_key = |key: &str| format!("{}/{}/ctx/{}", self.prefix, id, key);
@@ -1340,10 +1341,7 @@ impl CloudBackend {
             self.put_object(&ctx_key(key), &data)
         })?;
         if !pending.keys.is_empty() {
-            let manifest_path = ctx_dir.join("manifest.json");
-            if manifest_path.exists() {
-                let data = std::fs::read(&manifest_path)
-                    .with_context(|| format!("reading {}", manifest_path.display()))?;
+            if let Some(data) = sync::bucket_manifest_bytes(&ctx_dir.join("manifest.json"))? {
                 self.put_object(&ctx_key("manifest.json"), &data)?;
             }
         }
@@ -1704,20 +1702,30 @@ impl CloudBackend {
         // Upload version.json.
         self.push_version(id)?;
 
-        // Upload all context files.
+        // Upload every context key the manifest names, then the manifest,
+        // so the bucket never lists a key it was not sent. Host-local keys
+        // stay on this host.
         let ctx_dir = session_dir.join("ctx");
-        if ctx_dir.exists() {
-            for entry in std::fs::read_dir(&ctx_dir)? {
-                let entry = entry?;
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                let data = std::fs::read(entry.path())?;
-                let s3_key = format!("{}/{}/ctx/{}", self.prefix, id, file_name);
-                if let Err(e) = self.put_object(&s3_key, &data) {
-                    eprintln!(
-                        "warning: cloud sync: failed to upload ctx/{}: {}",
-                        file_name, e
-                    );
+        let manifest = self.local.read_manifest(id)?;
+        let mut uploads: Vec<(String, PathBuf)> = manifest
+            .keys
+            .keys()
+            .filter(|key| !is_host_local_key(key))
+            .map(|key| (key.clone(), ctx_dir.join(key)))
+            .collect();
+        uploads.push(("manifest.json".to_string(), ctx_dir.join("manifest.json")));
+        for (name, path) in uploads {
+            let data = if name == "manifest.json" {
+                match sync::bucket_manifest_bytes(&path)? {
+                    Some(data) => data,
+                    None => continue,
                 }
+            } else {
+                std::fs::read(&path).with_context(|| format!("reading context key '{}'", name))?
+            };
+            let s3_key = format!("{}/{}/ctx/{}", self.prefix, id, name);
+            if let Err(e) = self.put_object(&s3_key, &data) {
+                eprintln!("warning: cloud sync: failed to upload ctx/{}: {}", name, e);
             }
         }
 
@@ -1739,7 +1747,19 @@ impl CloudBackend {
             }
         }
 
-        // Download all context files by listing the ctx/ prefix.
+        // Download all context files by listing the ctx/ prefix. Host-local
+        // keys aren't the bucket's to replace: this host keeps its own, and
+        // keeps them in the manifest it takes from the bucket.
+        let kept: Vec<(String, crate::session::context::KeyMeta)> = self
+            .local
+            .read_manifest(id)
+            .map(|m| {
+                m.keys
+                    .into_iter()
+                    .filter(|(key, _)| is_host_local_key(key))
+                    .collect()
+            })
+            .unwrap_or_default();
         let ctx_prefix = format!("{}/{}/ctx/", self.prefix, id);
         if let Ok(results) = self.bucket.list(ctx_prefix.clone(), None) {
             let ctx_dir = session_dir.join("ctx");
@@ -1747,7 +1767,7 @@ impl CloudBackend {
             for list in &results {
                 for obj in &list.contents {
                     if let Some(file_name) = obj.key.strip_prefix(&ctx_prefix) {
-                        if file_name.is_empty() {
+                        if file_name.is_empty() || is_host_local_key(file_name) {
                             continue;
                         }
                         if let Ok(response) = self.bucket.get_object(&obj.key) {
@@ -1756,7 +1776,11 @@ impl CloudBackend {
                                 if let Some(parent) = local_path.parent() {
                                     std::fs::create_dir_all(parent)?;
                                 }
-                                std::fs::write(&local_path, response.bytes())?;
+                                let mut data = response.bytes().to_vec();
+                                if file_name == "manifest.json" {
+                                    data = with_host_local_keys(data, &kept);
+                                }
+                                std::fs::write(&local_path, data)?;
                             }
                         }
                     }
@@ -1766,6 +1790,24 @@ impl CloudBackend {
 
         Ok(())
     }
+}
+
+/// A manifest pulled from the bucket, as this host keeps it: whatever
+/// host-local keys it lists dropped, and this host's own (`kept`) put back.
+/// Bytes that don't parse as a manifest are kept as they are.
+fn with_host_local_keys(
+    pulled: Vec<u8>,
+    kept: &[(String, crate::session::context::KeyMeta)],
+) -> Vec<u8> {
+    let Ok(mut manifest) = serde_json::from_slice::<crate::session::context::Manifest>(&pulled)
+    else {
+        return pulled;
+    };
+    if !manifest.drop_host_local() && kept.is_empty() {
+        return pulled;
+    }
+    manifest.keys.extend(kept.iter().cloned());
+    serde_json::to_vec_pretty(&manifest).expect("Manifest serialize is infallible")
 }
 
 /// Build a placeholder `SessionInfo` for a session that exists only in S3
@@ -2066,7 +2108,9 @@ impl SessionBackend for CloudBackend {
 }
 
 impl CloudBackend {
-    /// Write locally (recording `writer` when given), then push the key.
+    /// Write locally (recording `writer` when given), then push the key. A
+    /// host-local key is written locally only: it has nothing to push and
+    /// joins no batch.
     fn add_as(
         &self,
         session: &str,
@@ -2079,6 +2123,9 @@ impl CloudBackend {
             Some(w) => self.local.add_with_writer(session, key, content, w),
             None => self.local.add(session, key, content),
         };
+        if is_host_local_key(key) {
+            return write();
+        }
 
         // Inside a tick on this session: record the key, then write it, and
         // leave the push to the tick. Recorded first, so a write that stops
@@ -2149,7 +2196,7 @@ impl ContextStore for CloudBackend {
         if let Some(meta) = self.local.meta(session, key) {
             return Some(meta);
         }
-        if !crate::session::context_log::loggable_key(key) {
+        if !crate::session::context_log::loggable_key(key) || is_host_local_key(key) {
             return None;
         }
         if self
@@ -2169,10 +2216,12 @@ impl ContextStore for CloudBackend {
 
     fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
         self.check_not_migrated(session)?;
-        // A key an open batch wrote is read as the batch left it.
-        if self
-            .pending_keys(session)
-            .is_some_and(|pending| pending.touches(key))
+        // A key an open batch wrote is read as the batch left it, and a
+        // host-local key only ever lives here.
+        if is_host_local_key(key)
+            || self
+                .pending_keys(session)
+                .is_some_and(|pending| pending.touches(key))
         {
             return self.local.get(session, key);
         }
@@ -2213,9 +2262,10 @@ impl ContextStore for CloudBackend {
         if self.local.ctx_exists(session, key) {
             return true;
         }
-        if self
-            .pending_keys(session)
-            .is_some_and(|pending| pending.touches(key))
+        if is_host_local_key(key)
+            || self
+                .pending_keys(session)
+                .is_some_and(|pending| pending.touches(key))
         {
             return false;
         }
@@ -2232,6 +2282,9 @@ impl ContextStore for CloudBackend {
 
     fn remove(&self, session: &str, key: &str) -> anyhow::Result<()> {
         self.check_not_migrated(session)?;
+        if is_host_local_key(key) {
+            return self.local.remove(session, key);
+        }
         if self.defers(session) {
             if let Some((journal, lock)) = self.open_batch(session)? {
                 journal.record(
@@ -3156,8 +3209,9 @@ impl CloudBackend {
             })
     }
 
-    /// The source's context manifest, with every key name checked before
-    /// any key is fetched, and its bytes when the source has one.
+    /// The source's context manifest without its host-local keys, with
+    /// every key name checked before any key is fetched, and its bytes when
+    /// the source has one (re-serialized when a host-local key was dropped).
     fn read_source_manifest(
         &self,
         source: &ImportSource,
@@ -3168,10 +3222,18 @@ impl CloudBackend {
         let bytes = self
             .get_object_if_present(&source.key("ctx/manifest.json"))
             .map_err(|e| source.unreadable("the context manifest", &e))?;
-        let manifest: Manifest = match &bytes {
+        let mut manifest: Manifest = match &bytes {
             Some(bytes) => serde_json::from_slice(bytes)
                 .map_err(|e| source.unreadable("the context manifest", &e))?,
             None => Manifest::default(),
+        };
+        // An older koto listed host-local keys, often without their
+        // objects. They describe the source's host, so the import leaves
+        // them behind and the new session resolves its own.
+        let bytes = if manifest.drop_host_local() {
+            Some(serde_json::to_vec_pretty(&manifest).expect("Manifest serialize is infallible"))
+        } else {
+            bytes
         };
         for key in manifest.keys.keys() {
             validate_context_key(key)

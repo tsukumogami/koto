@@ -189,6 +189,8 @@ On success it prints one JSON object:
 
 The new session holds the source's events plus a `session_imported` event, every context key, and the compiled template. It's pushed under this workspace's prefix, and only then does the import leave a `migrated.json` marker beside the source.
 
+One key is the exception. `workflows/publish-location`, the Claude Code `/workflows` folder koto renders the session into, names a folder on the host that wrote it, so it never goes to the bucket and the import doesn't carry it. A manifest pushed by koto 0.19.0 or earlier can list it without its object; the import skips that entry too. On its first commit on the new host, the session publishes its own location from `KOTO_WORKFLOWS_DIR` or the Claude Code session there.
+
 A child session isn't imported on its own, and importing a parent doesn't bring its children: the import copies only the named session's own objects.
 
 ### What happens to the old copy

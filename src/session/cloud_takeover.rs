@@ -672,7 +672,8 @@ impl CloudBackend {
 /// Ahead means the local event lines aren't a prefix of the bucket's (the
 /// local log is longer, or differs at a `seq` both hold), or the local
 /// manifest holds a key the bucket's lacks, or one whose hash differs and
-/// whose `created_at` is later.
+/// whose `created_at` is later. Host-local keys never reach the bucket, so
+/// they never count.
 fn local_ahead_of(
     local: &SourceLog,
     remote: &SourceLog,
@@ -694,6 +695,9 @@ fn local_ahead_of(
         return Some(format!("a different event at seq {}", i + 1));
     }
     for (key, meta) in &local_manifest.keys {
+        if crate::session::context::is_host_local_key(key) {
+            continue;
+        }
         match remote_manifest.keys.get(key) {
             None => return Some(format!("context key {:?}", key)),
             Some(r) if r.hash != meta.hash && meta.created_at > r.created_at => {

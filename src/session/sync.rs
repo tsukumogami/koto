@@ -106,9 +106,36 @@ pub fn fetch_remote_manifest(
     if response.status_code() != 200 {
         return None;
     }
-    let manifest: Manifest = serde_json::from_slice(response.bytes()).ok()?;
+    let mut manifest: Manifest = serde_json::from_slice(response.bytes()).ok()?;
+    // A manifest an older koto pushed can list a host-local key, often
+    // without its object; this host answers those keys from its own store.
+    manifest.drop_host_local();
     cache.set(session, manifest.clone());
     Some(manifest)
+}
+
+/// The manifest at `path` as the bucket gets it: the file's bytes, or,
+/// when it lists a host-local key
+/// ([`is_host_local_key`](crate::session::context::is_host_local_key)),
+/// the manifest re-serialized without them. `None` when there is no file.
+///
+/// Every manifest koto uploads from a local store goes through this, so the
+/// bucket never lists a key whose object it was never sent.
+pub fn bucket_manifest_bytes(path: &std::path::Path) -> anyhow::Result<Option<Vec<u8>>> {
+    use anyhow::Context;
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut manifest: Manifest = serde_json::from_slice(&data)
+        .with_context(|| format!("failed to parse manifest: {}", path.display()))?;
+    if !manifest.drop_host_local() {
+        return Ok(Some(data));
+    }
+    Ok(Some(
+        serde_json::to_vec_pretty(&manifest).context("failed to serialize manifest")?,
+    ))
 }
 
 /// Push a single context key and the manifest to S3.
@@ -123,6 +150,9 @@ pub fn push_context_key(
     key: &str,
     cache: &ManifestCache,
 ) {
+    if crate::session::context::is_host_local_key(key) {
+        return;
+    }
     let ctx_dir = local.session_dir(session).join("ctx");
 
     // Upload the content file.
@@ -150,14 +180,11 @@ pub fn push_context_key(
     }
 
     // Upload the manifest.
-    let manifest_path = ctx_dir.join("manifest.json");
-    if !manifest_path.exists() {
-        return;
-    }
-    let manifest_data = match std::fs::read(&manifest_path) {
-        Ok(d) => d,
+    let manifest_data = match bucket_manifest_bytes(&ctx_dir.join("manifest.json")) {
+        Ok(Some(d)) => d,
+        Ok(None) => return,
         Err(e) => {
-            eprintln!("warning: cloud sync: failed to read manifest: {}", e);
+            eprintln!("warning: cloud sync: failed to read manifest: {:#}", e);
             return;
         }
     };
@@ -285,12 +312,10 @@ pub fn delete_context_key(
 
     // Upload the updated manifest (the local remove already happened).
     let manifest_path = local.session_dir(session).join("ctx").join("manifest.json");
-    if manifest_path.exists() {
-        if let Ok(data) = std::fs::read(&manifest_path) {
-            let manifest_s3_key = format!("{}/{}/ctx/manifest.json", prefix, session);
-            if let Err(e) = bucket.put_object(&manifest_s3_key, &data) {
-                eprintln!("warning: cloud sync failed for manifest upload: {}", e);
-            }
+    if let Ok(Some(data)) = bucket_manifest_bytes(&manifest_path) {
+        let manifest_s3_key = format!("{}/{}/ctx/manifest.json", prefix, session);
+        if let Err(e) = bucket.put_object(&manifest_s3_key, &data) {
+            eprintln!("warning: cloud sync failed for manifest upload: {}", e);
         }
     }
 
@@ -335,6 +360,30 @@ pub fn remote_list_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A manifest with no host-local key goes up byte for byte; one with
+    /// such a key goes up without it; no file is `None`.
+    #[test]
+    fn bucket_manifest_bytes_drops_only_host_local_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        assert!(bucket_manifest_bytes(&path).unwrap().is_none());
+
+        let entry = r#"{"created_at":"t","size":1,"hash":"h"}"#;
+        let plain = format!(r#"{{"keys":{{"notes.md":{entry}}}}}"#);
+        std::fs::write(&path, &plain).unwrap();
+        assert_eq!(
+            bucket_manifest_bytes(&path).unwrap().unwrap(),
+            plain.as_bytes()
+        );
+
+        let with_location =
+            format!(r#"{{"keys":{{"notes.md":{entry},"workflows/publish-location":{entry}}}}}"#);
+        std::fs::write(&path, &with_location).unwrap();
+        let pushed: Manifest =
+            serde_json::from_slice(&bucket_manifest_bytes(&path).unwrap().unwrap()).unwrap();
+        assert_eq!(pushed.keys.keys().collect::<Vec<_>>(), ["notes.md"]);
+    }
 
     #[test]
     fn manifest_cache_returns_none_when_empty() {

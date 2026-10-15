@@ -22,6 +22,29 @@ pub struct Manifest {
     pub keys: BTreeMap<String, KeyMeta>,
 }
 
+impl Manifest {
+    /// Drop the [host-local](is_host_local_key) keys, leaving the copy a
+    /// bucket holds. Returns whether any were there.
+    pub fn drop_host_local(&mut self) -> bool {
+        let before = self.keys.len();
+        self.keys.retain(|key, _| !is_host_local_key(key));
+        self.keys.len() != before
+    }
+}
+
+/// Whether `key` describes the host a session runs on rather than the
+/// session, so the cloud backend keeps it out of the bucket.
+///
+/// A host-local key is written to the local store only, no manifest pushed
+/// to the bucket names it, and an import skips it, even when a manifest an
+/// older koto pushed lists it. The destination resolves its own value on its
+/// first commit. The one such key is `workflows/publish-location`, which
+/// names a Claude Code `/workflows` folder on this host and is meaningless
+/// on any other.
+pub fn is_host_local_key(key: &str) -> bool {
+    key == crate::workflows_surface::PUBLISH_LOCATION_KEY
+}
+
 /// Content store for workflow context artifacts.
 ///
 /// Agents submit and retrieve context through this trait instead of
@@ -150,6 +173,30 @@ mod tests {
         fn list_keys(&self, _session: &str, _prefix: Option<&str>) -> anyhow::Result<Vec<String>> {
             Ok(Vec::new())
         }
+    }
+
+    #[test]
+    fn drop_host_local_keeps_every_other_key() {
+        let meta = KeyMeta {
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            size: 1,
+            hash: "ab".to_string(),
+            writer: None,
+        };
+        let mut manifest = Manifest::default();
+        for key in [
+            "workflows/publish-location",
+            "workflows/other",
+            "batch_final_view",
+        ] {
+            manifest.keys.insert(key.to_string(), meta.clone());
+        }
+        assert!(manifest.drop_host_local());
+        assert_eq!(
+            manifest.keys.keys().collect::<Vec<_>>(),
+            ["batch_final_view", "workflows/other"]
+        );
+        assert!(!manifest.drop_host_local());
     }
 
     #[test]
