@@ -1234,7 +1234,11 @@ pub fn blocking_conditions_from_gates(
                 .map(|g| g.gate_type.clone())
                 .unwrap_or_else(|| "command".to_string());
             // A pending polling gate is a wait, whatever its type's default.
-            let pending = result.outcome == GateOutcome::Pending;
+            // A pending decider check isn't: a criterion is waiting on the
+            // agent's own answer, so the agent has to act
+            // (DESIGN-decider-fallback.md, Decision 3).
+            let pending = result.outcome == GateOutcome::Pending
+                && condition_type != crate::template::types::GATE_TYPE_DECIDER_CHECK;
             let category = if pending {
                 "temporal".to_string()
             } else {

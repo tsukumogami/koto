@@ -13,6 +13,12 @@
 //! returns a [`StructuredGateResult`] carrying the blocking findings and the
 //! records the advance loop appends as `decider_checked` events.
 //!
+//! A criterion that gets no verdict falls back to the agent
+//! (DESIGN-decider-fallback.md): unless an answer the agent recorded for the
+//! same slice applies, it is listed under `output.awaiting`, the gate is
+//! `pending` with a warning finding that hands the agent the question, and a
+//! `decider_fallback` record goes beside the `decider_checked` ones.
+//!
 //! The pure rules (the verdict, blocking, retry, the record) live in
 //! `crate::decider::check`; this module is the I/O around them.
 
@@ -26,7 +32,8 @@ use crate::action::{run_shell_command, CommandEnv};
 use crate::cli::decider_port::{input_sha256, try_decider_lock, LockHold};
 use crate::decider::check::{
     blocks, build_check_request, effective_check_mode, is_retryable, reason_for_error,
-    recorded_probabilities, verdict, CheckOutcome, DeciderCheck, UnansweredReason,
+    recorded_probabilities, verdict, AgentAnswer, CheckOutcome, DeciderCheck, DeciderFallback,
+    UnansweredReason,
 };
 use crate::decider::ledger::{append_or_warn, LedgerRecord};
 use crate::decider::types::{
@@ -125,10 +132,12 @@ pub fn without_checks(
 
 /// The ledger's `check_overridden` records for an override of the decider
 /// check `gate` in `state`: one `candidate_false_fail` per criterion the
-/// check's last output (`actual_output`) lists as failed, the only kind of
-/// criterion that blocks. An unanswered criterion never blocked, so the
-/// override didn't move past it and it gets none; `overridden_unanswered`
-/// survives only in ledgers written before that rule. Each record takes its
+/// check's last output (`actual_output`) lists as failed by the decider. A
+/// criterion the agent answered `fail` is listed under `agent_answered` too
+/// and gets none: an override of the agent's own judgment says nothing
+/// about the decider. A criterion waiting on the agent is never under
+/// `failed`, so it gets none either; `overridden_unanswered` survives only
+/// in ledgers written before that rule. Each record takes its
 /// visit and declaration hash from the latest `decider_checked` for that
 /// criterion in the current visit to `state`, the visit the override applies
 /// to; a reused verdict appended none, but the consultation it reused is in
@@ -153,7 +162,17 @@ pub fn override_records(
         .as_array()
         .cloned()
         .unwrap_or_default();
-    for rule_id in ids.iter().filter_map(|v| v.as_str()) {
+    // A criterion the agent failed is the agent's own judgment, not a
+    // decider verdict an override could prove wrong.
+    let agent_answered: Vec<&str> = actual_output["agent_answered"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    for rule_id in ids
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|id| !agent_answered.contains(id))
+    {
         let latest = visit.iter().rev().find_map(|e| match &e.payload {
             EventPayload::DeciderChecked(c)
                 if c.state == state && c.gate == gate && c.rule_id == rule_id =>
@@ -233,16 +252,39 @@ impl Consulted {
     }
 }
 
-/// One criterion's outcome this evaluation, and its record when it wasn't a
-/// reuse.
-struct Graded {
-    rule_id: String,
-    rule_ref: String,
-    fail_description: String,
+/// One criterion's outcome this evaluation, and its records when it wasn't
+/// a reuse.
+struct Graded<'s> {
+    criterion: &'s crate::template::decider_check::CheckCriterion,
     mode: CheckMode,
     outcome: CheckOutcome,
+    /// The agent's answer, when the outcome came from one.
+    agent: Option<AgentAnswer>,
     blocked: bool,
     record: Option<DeciderCheck>,
+    /// Set when the criterion fell back to the agent this evaluation.
+    fallback: Option<DeciderFallback>,
+}
+
+impl Graded<'_> {
+    /// No verdict and no applicable answer: the criterion waits on the
+    /// agent (DESIGN-decider-fallback.md, Decision 2).
+    fn waiting(&self) -> Option<UnansweredReason> {
+        match (self.outcome, self.agent) {
+            (CheckOutcome::Unanswered(r), None) => Some(r),
+            _ => None,
+        }
+    }
+}
+
+/// The outcome an agent's answer stands for: its `unclear` is the
+/// criterion's escape.
+fn agent_outcome(answer: AgentAnswer) -> CheckOutcome {
+    match answer {
+        AgentAnswer::Pass => CheckOutcome::Pass,
+        AgentAnswer::Fail => CheckOutcome::Fail,
+        AgentAnswer::Unclear => CheckOutcome::Escape,
+    }
 }
 
 /// Evaluates `decider-check` gates for one `koto next`.
@@ -328,7 +370,7 @@ impl<'a> CliCheckEvaluator<'a> {
         // in memory reaches this. With nothing to grade against, the check
         // passes and says why; it never blocks.
         let Some(spec) = gate.decider_check.as_ref() else {
-            return pass_result(&[], MISSING_SPEC, Vec::new(), None);
+            return pass_result(MISSING_SPEC, None);
         };
         let output = run_shell_command(&gate.command, self.working_dir, gate.timeout, self.env);
         self.env.record(&format!("gate '{}'", name), &output);
@@ -391,13 +433,7 @@ impl<'a> CliCheckEvaluator<'a> {
             ))
         }) else {
             drop(lock);
-            let veto: Vec<&str> = spec
-                .criteria
-                .iter()
-                .filter(|c| effective_check_mode(c.mode, self.global) == CheckMode::Veto)
-                .map(|c| c.rule_id.as_str())
-                .collect();
-            return pass_result(&veto, LOG_UNREADABLE, Vec::new(), duration_ms);
+            return unreadable_log_result(name, spec, self.global, duration_ms);
         };
         let visit_index = arrival_index(events, &state);
         let visit_seq = visit_index.map(|i| events[i].seq).unwrap_or(0);
@@ -407,17 +443,36 @@ impl<'a> CliCheckEvaluator<'a> {
         for (i, (criterion, request)) in spec.criteria.iter().zip(&requests).enumerate() {
             let hash = hashes.get(i).cloned().unwrap_or_default();
             let mode = effective_check_mode(criterion.mode, self.global);
-            let reused = input.as_ref().and_then(|(sha, _)| {
-                reusable(visit_events, &state, name, &criterion.rule_id, &hash, sha)
-            });
-            let (outcome, record_from) = match (early, reused, &lock) {
-                (Some(o), _, _) => (o, Some(Consulted::unsent(o))),
-                (None, Some(o), _) => (o, None),
-                (None, None, None) => {
+            let sha = input.as_ref().map(|(sha, _)| sha.as_str());
+            // Order matters (DESIGN-decider-fallback.md, Decision 2): an
+            // empty slice is never graded; a reusable decider verdict comes
+            // first; then an answer the agent recorded for this slice; only
+            // then the early outcome, the lock and the cap. Every path that
+            // ends unanswered is therefore checked for an answer first, so
+            // any reason, present or future, falls back the same way.
+            let reused = match early {
+                None => sha.and_then(|s| {
+                    reusable(visit_events, &state, name, &criterion.rule_id, &hash, s)
+                }),
+                Some(_) => None,
+            };
+            let answered = match (early, reused) {
+                (Some(CheckOutcome::NotGraded), _) | (_, Some(_)) => None,
+                _ => applicable_answer(visit_events, &state, name, &criterion.rule_id, &hash, sha),
+            };
+            let (outcome, record_from) = match (early, reused, answered, &lock) {
+                (Some(CheckOutcome::NotGraded), ..) => (
+                    CheckOutcome::NotGraded,
+                    Some(Consulted::unsent(CheckOutcome::NotGraded)),
+                ),
+                (_, Some(o), ..) => (o, None),
+                (_, None, Some(a), _) => (agent_outcome(a), None),
+                (Some(o), None, None, _) => (o, Some(Consulted::unsent(o))),
+                (None, None, None, None) => {
                     let o = CheckOutcome::Unanswered(UnansweredReason::Busy);
                     (o, Some(Consulted::unsent(o)))
                 }
-                (None, None, Some(_)) => {
+                (None, None, None, Some(_)) => {
                     let c = if self.budget.try_take() {
                         self.consult(criterion, request)
                     } else {
@@ -426,7 +481,27 @@ impl<'a> CliCheckEvaluator<'a> {
                     (c.outcome, Some(c))
                 }
             };
-            let blocked = blocks(outcome, mode);
+            // The decider's own record keeps its rule: only a veto fail
+            // from the decider blocks there. An agent fail blocks the same
+            // way, only in veto.
+            let blocked = match answered {
+                Some(a) => mode == CheckMode::Veto && a == AgentAnswer::Fail,
+                None => blocks(outcome, mode),
+            };
+            let fallback = match (outcome, answered) {
+                (CheckOutcome::Unanswered(reason), None) => Some(DeciderFallback {
+                    state: state.clone(),
+                    visit_seq,
+                    gate: name.to_string(),
+                    rule_id: criterion.rule_id.clone(),
+                    declaration_hash: hash.clone(),
+                    mode,
+                    reason,
+                    input_sha256: input.as_ref().map(|(sha, _)| sha.clone()),
+                    input_bytes: input.as_ref().map(|(_, n)| *n),
+                }),
+                _ => None,
+            };
             let record = record_from.map(|c| {
                 let (recorded, reason) = c.outcome.recorded();
                 DeciderCheck {
@@ -456,13 +531,13 @@ impl<'a> CliCheckEvaluator<'a> {
                 }
             });
             graded.push(Graded {
-                rule_id: criterion.rule_id.clone(),
-                rule_ref: criterion.rule_ref.clone(),
-                fail_description: criterion.fail.clone(),
+                criterion,
                 mode,
                 outcome,
+                agent: answered,
                 blocked,
                 record,
+                fallback,
             });
         }
         drop(lock);
@@ -472,7 +547,7 @@ impl<'a> CliCheckEvaluator<'a> {
             let line = LedgerRecord::checked(self.session, session_id, record.clone());
             append_or_warn(self.ledger_root.as_deref(), &line);
         }
-        result_for(spec, &graded, records, duration_ms)
+        result_for(self.session, name, spec, &graded, records, duration_ms)
     }
 
     /// Ask the provider about one criterion, retrying once on a transient
@@ -553,82 +628,246 @@ fn reusable(
     })
 }
 
-/// The check's output: the failed and unanswered veto criteria, and why no
-/// criterion could be graded at all (empty when they could).
-fn check_output(failed: &[&str], unanswered: &[&str], error: &str) -> serde_json::Value {
+/// The latest answer the agent recorded in this visit for the same gate,
+/// criterion, declaration and slice (DESIGN-decider-fallback.md, Decision
+/// 2). Two absent slice hashes match: a failed extraction has no slice,
+/// and its answer stands while extraction keeps failing.
+fn applicable_answer(
+    visit_events: &[Event],
+    state: &str,
+    gate: &str,
+    rule_id: &str,
+    hash: &str,
+    sha: Option<&str>,
+) -> Option<AgentAnswer> {
+    visit_events.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::DeciderCheckAnswered(a)
+            if a.state == state
+                && a.gate == gate
+                && a.rule_id == rule_id
+                && a.declaration_hash == hash
+                && a.input_sha256.as_deref() == sha =>
+        {
+            Some(a.answer)
+        }
+        _ => None,
+    })
+}
+
+/// The check's output (DESIGN-decider-fallback.md, Decision 3): the
+/// criteria that block on a fail, the veto criteria with no verdict, the
+/// criteria waiting on the agent, the criteria the agent's answer decided,
+/// and why no criterion could be graded at all (empty when they could).
+/// `awaiting` and `agent_answered` stay out of the gate type's schema, so an
+/// `override_default` without them is still valid.
+fn check_output(
+    failed: &[&str],
+    unanswered: &[&str],
+    awaiting: &[&str],
+    agent_answered: &[&str],
+    error: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "failed": failed,
         "unanswered": unanswered,
+        "awaiting": awaiting,
+        "agent_answered": agent_answered,
         "error": error,
     })
 }
 
-/// A passing result: nothing blocked. `unanswered` names the veto criteria
-/// that got no verdict, so a pass that checked nothing never reads as one
-/// that was checked and met.
-fn pass_result(
-    unanswered: &[&str],
-    error: &str,
-    records: Vec<DeciderCheck>,
-    duration_ms: Option<u64>,
-) -> StructuredGateResult {
+/// A passing result with nothing to grade: no spec.
+fn pass_result(error: &str, duration_ms: Option<u64>) -> StructuredGateResult {
     StructuredGateResult {
         outcome: GateOutcome::Passed,
-        output: check_output(&[], unanswered, error),
+        output: check_output(&[], &[], &[], &[], error),
         duration_ms,
-        decider_checks: records,
         ..Default::default()
     }
 }
 
-/// The gate's result from its criteria's outcomes (Decision 5): `failed`
-/// with one finding per failing veto criterion when any failed on a
-/// verdict, otherwise `passed`. Either way the output lists the veto
-/// criteria that went unanswered. A missing verdict is a checker fault,
-/// not a violation: it never blocks and no finding names it.
+/// A check whose session log can't be read: no state or visit to record
+/// under, no verdict to reuse and no answer to read, so nothing is asked or
+/// recorded and every criterion waits. The gate is `pending`, so the state
+/// stops without counting a judgment; with no readable log the agent can't
+/// record an answer either, so the state stays stopped until the log is
+/// repaired or an override is recorded.
+fn unreadable_log_result(
+    gate: &str,
+    spec: &DeciderCheckSpec,
+    global: GlobalMode,
+    duration_ms: Option<u64>,
+) -> StructuredGateResult {
+    let all: Vec<&str> = spec.criteria.iter().map(|c| c.rule_id.as_str()).collect();
+    let veto: Vec<&str> = spec
+        .criteria
+        .iter()
+        .filter(|c| effective_check_mode(c.mode, global) == CheckMode::Veto)
+        .map(|c| c.rule_id.as_str())
+        .collect();
+    let finding = Finding {
+        rule_id: gate.to_string(),
+        level: FindingLevel::Warning,
+        message: format!(
+            "decider check {} can't be graded: the session log couldn't be read, \
+             so koto can't ask the decider or record your answer; repair the session \
+             or record an override",
+            gate
+        ),
+        path: None,
+        line: None,
+        column: None,
+        rule_ref: None,
+        effect_landed: None,
+        message_source: MessageSource::Koto,
+    };
+    StructuredGateResult {
+        outcome: GateOutcome::Pending,
+        output: check_output(&[], &veto, &all, &[], LOG_UNREADABLE),
+        failure: Some(GateFailure {
+            fallback: None,
+            captured: None,
+        }),
+        findings: vec![finding],
+        duration_ms,
+        ..Default::default()
+    }
+}
+
+/// `s` as one shell word an agent can paste: as-is in the name shape,
+/// otherwise single-quoted with each `'` written as `'\''`.
+fn shell_word(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:/@-".contains(&b));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// The finding that hands a waiting criterion to the agent. The command
+/// comes before the template's text: a finding's message is capped at
+/// `MESSAGE_MAX_BYTES`, and a cut must lose the end of the descriptions,
+/// never the command.
+fn waiting_finding(
+    session: &str,
+    gate: &str,
+    criterion: &crate::template::decider_check::CheckCriterion,
+    reason: UnansweredReason,
+) -> Finding {
+    Finding {
+        rule_id: criterion.rule_id.clone(),
+        level: FindingLevel::Warning,
+        message: format!(
+            "criterion {} is waiting on your answer: the decider gave no verdict ({}). \
+             Record it with `koto decider answer {} --gate {} --criterion {} --answer \
+             <pass|fail|unclear>`, then run `koto next {}` again. {} Answer pass if: {} \
+             Answer fail if: {} Answer unclear if: {}",
+            criterion.rule_id,
+            reason.as_str(),
+            shell_word(session),
+            shell_word(gate),
+            shell_word(&criterion.rule_id),
+            shell_word(session),
+            criterion.question,
+            criterion.pass,
+            criterion.fail,
+            criterion.escape,
+        ),
+        path: None,
+        line: None,
+        column: None,
+        rule_ref: Some(criterion.rule_ref.clone()),
+        effect_landed: None,
+        message_source: MessageSource::Koto,
+    }
+}
+
+/// The gate's result from its criteria's outcomes (Decision 3 of
+/// DESIGN-decider-fallback.md): `failed` with one finding per blocking
+/// criterion when a veto criterion failed, by the decider's verdict or the
+/// agent's answer; otherwise `pending`, with one warning finding per
+/// criterion waiting on the agent, when any waits; otherwise `passed`. A
+/// `pending` evaluation judged nothing, so it stamps no attempt and counts
+/// no rule. A shadow criterion never blocks, whoever answered.
 fn result_for(
+    session: &str,
+    gate: &str,
     spec: &DeciderCheckSpec,
     graded: &[Graded],
     records: Vec<DeciderCheck>,
     duration_ms: Option<u64>,
 ) -> StructuredGateResult {
-    let failed: Vec<&Graded> = graded.iter().filter(|g| g.blocked).collect();
-    let unanswered: Vec<&str> = graded
-        .iter()
-        .filter(|g| g.mode == CheckMode::Veto && matches!(g.outcome, CheckOutcome::Unanswered(_)))
-        .map(|g| g.rule_id.as_str())
-        .collect();
-    if failed.is_empty() {
-        return pass_result(&unanswered, "", records, duration_ms);
+    let ids = |keep: &dyn Fn(&Graded) -> bool| -> Vec<&str> {
+        graded
+            .iter()
+            .filter(|g| keep(g))
+            .map(|g| g.criterion.rule_id.as_str())
+            .collect()
+    };
+    let failed = ids(&|g| g.blocked);
+    let unanswered = ids(&|g| g.mode == CheckMode::Veto && g.waiting().is_some());
+    let awaiting = ids(&|g| g.waiting().is_some());
+    let agent_answered = ids(&|g| g.agent.is_some());
+
+    let mut findings = Vec::new();
+    for g in graded {
+        if g.blocked {
+            let c = g.criterion;
+            let (message, source) = if g.agent.is_some() {
+                (
+                    format!(
+                        "criterion {} failed: you answered fail for the {}: {}",
+                        c.rule_id, spec.label, c.fail
+                    ),
+                    MessageSource::Koto,
+                )
+            } else {
+                (
+                    format!(
+                        "criterion {} failed: the decider judged the {} to fail it: {}",
+                        c.rule_id, spec.label, c.fail
+                    ),
+                    MessageSource::Decider,
+                )
+            };
+            findings.push(Finding {
+                rule_id: c.rule_id.clone(),
+                level: FindingLevel::Error,
+                message,
+                path: None,
+                line: None,
+                column: None,
+                rule_ref: Some(c.rule_ref.clone()),
+                effect_landed: None,
+                message_source: source,
+            });
+        } else if let Some(reason) = g.waiting() {
+            findings.push(waiting_finding(session, gate, g.criterion, reason));
+        }
     }
-    let failed_ids: Vec<&str> = failed.iter().map(|g| g.rule_id.as_str()).collect();
-    let findings = failed
-        .iter()
-        .map(|g| Finding {
-            rule_id: g.rule_id.clone(),
-            level: FindingLevel::Error,
-            message: format!(
-                "criterion {} failed: the decider judged the {} to fail it: {}",
-                g.rule_id, spec.label, g.fail_description
-            ),
-            path: None,
-            line: None,
-            column: None,
-            rule_ref: Some(g.rule_ref.clone()),
-            effect_landed: None,
-            message_source: MessageSource::Decider,
-        })
-        .collect();
+
+    let outcome = if !failed.is_empty() {
+        GateOutcome::Failed
+    } else if !awaiting.is_empty() {
+        GateOutcome::Pending
+    } else {
+        GateOutcome::Passed
+    };
+    let failure = (!findings.is_empty()).then_some(GateFailure {
+        fallback: None,
+        captured: None,
+    });
     StructuredGateResult {
-        outcome: GateOutcome::Failed,
-        output: check_output(&failed_ids, &unanswered, ""),
-        failure: Some(GateFailure {
-            fallback: None,
-            captured: None,
-        }),
+        outcome,
+        output: check_output(&failed, &unanswered, &awaiting, &agent_answered, ""),
+        failure,
         findings,
         duration_ms,
         decider_checks: records,
+        decider_fallbacks: graded.iter().filter_map(|g| g.fallback.clone()).collect(),
         ..Default::default()
     }
 }
@@ -783,7 +1022,8 @@ mod tests {
         assert_eq!(r.outcome, GateOutcome::Passed);
         assert_eq!(
             r.output,
-            serde_json::json!({"failed": [], "unanswered": [], "error": "missing_spec"})
+            serde_json::json!({"failed": [], "unanswered": [], "awaiting": [],
+                "agent_answered": [], "error": "missing_spec"})
         );
         assert!(r.decider_checks.is_empty());
         assert!(r.failure.is_none() && r.findings.is_empty());
@@ -791,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_log_passes_lists_veto_criteria_and_records_nothing() {
+    fn an_unreadable_log_waits_on_every_criterion_and_records_nothing() {
         for (mode, listed) in [
             (CheckMode::Veto, serde_json::json!(["a", "b"])),
             (CheckMode::Shadow, serde_json::json!([])),
@@ -801,18 +1041,34 @@ mod tests {
             let gate = check_gate(&[("a", mode), ("b", mode)]);
             let decider = Arc::new(ScriptedDecider::new());
             let r = evaluate(&backend, tmp.path(), &gate, &decider);
-            assert_eq!(r.outcome, GateOutcome::Passed, "{:?}", mode);
+            assert_eq!(r.outcome, GateOutcome::Pending, "{:?}", mode);
             assert_eq!(
                 r.output,
-                serde_json::json!({"failed": [], "unanswered": listed, "error": "log_unreadable"}),
+                serde_json::json!({"failed": [], "unanswered": listed,
+                    "awaiting": ["a", "b"], "agent_answered": [], "error": "log_unreadable"}),
                 "{:?}",
                 mode
             );
             // Nothing is recorded, so nothing lands under an empty state.
             assert!(r.decider_checks.is_empty(), "{:?}", mode);
-            assert!(r.failure.is_none() && r.findings.is_empty());
+            assert!(r.decider_fallbacks.is_empty(), "{:?}", mode);
+            assert_eq!(r.findings.len(), 1);
+            assert_eq!(r.findings[0].level, FindingLevel::Warning);
+            assert_eq!(r.findings[0].rule_id, "comments");
+            assert!(r.failure.is_some());
             assert_eq!(decider.calls(), 0, "nothing is asked without a visit");
         }
+    }
+
+    #[test]
+    fn a_value_outside_the_name_shape_is_quoted_for_the_shell() {
+        assert_eq!(shell_word("comment_reason"), "comment_reason");
+        assert_eq!(shell_word("parent.task-a"), "parent.task-a");
+        assert_eq!(shell_word("a b"), "'a b'");
+        assert_eq!(shell_word("x;rm -rf ~"), "'x;rm -rf ~'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word("$(id)"), "'$(id)'");
+        assert_eq!(shell_word(""), "''");
     }
 
     /// Log events from JSON lines, numbered from 1.
@@ -906,12 +1162,149 @@ mod tests {
         let decider = Arc::new(ScriptedDecider::new());
         // No reply queued: the provider fails twice, so no verdict.
         let r = evaluate(&backend, tmp.path(), &gate, &decider);
-        assert_eq!(r.outcome, GateOutcome::Passed);
+        assert_eq!(r.outcome, GateOutcome::Pending);
         assert_eq!(r.output["unanswered"], serde_json::json!(["r"]));
+        assert_eq!(r.output["awaiting"], serde_json::json!(["r"]));
         let c = &r.decider_checks[0];
         assert_eq!(c.state, "review");
         assert_eq!(c.visit_seq, 2);
         assert!(!c.blocked);
         assert_eq!(c.reason, Some(UnansweredReason::ProviderError));
+        let f = &r.decider_fallbacks[0];
+        assert_eq!((f.state.as_str(), f.visit_seq), ("review", 2));
+        assert_eq!(f.reason, UnansweredReason::ProviderError);
+        assert_eq!(f.declaration_hash, c.declaration_hash);
+        assert_eq!(f.input_sha256, c.input_sha256);
+        assert_eq!(f.input_bytes, c.input_bytes);
+    }
+
+    /// Append `answer` for criterion `r` of `comments`, bound to the slice
+    /// and declaration of the last fallback the backend's log holds.
+    fn answer(backend: &LocalBackend, fallback: &DeciderFallback, answer: AgentAnswer) {
+        let p = EventPayload::DeciderCheckAnswered(crate::decider::check::DeciderCheckAnswered {
+            state: fallback.state.clone(),
+            visit_seq: fallback.visit_seq,
+            gate: fallback.gate.clone(),
+            rule_id: fallback.rule_id.clone(),
+            declaration_hash: fallback.declaration_hash.clone(),
+            input_sha256: fallback.input_sha256.clone(),
+            answer,
+            fallback_seq: 3,
+        });
+        backend
+            .append_event("wf", &p, &crate::engine::types::now_iso8601())
+            .unwrap();
+    }
+
+    #[test]
+    fn an_answer_decides_the_criterion_by_mode_without_asking() {
+        use AgentAnswer::*;
+        for (mode, ans, outcome, failed) in [
+            (CheckMode::Veto, Pass, GateOutcome::Passed, false),
+            (CheckMode::Veto, Unclear, GateOutcome::Passed, false),
+            (CheckMode::Veto, Fail, GateOutcome::Failed, true),
+            (CheckMode::Shadow, Fail, GateOutcome::Passed, false),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let backend = backend(tmp.path(), true);
+            let gate = check_gate(&[("r", mode)]);
+            let decider = Arc::new(ScriptedDecider::new());
+            let first = evaluate(&backend, tmp.path(), &gate, &decider);
+            assert_eq!(first.outcome, GateOutcome::Pending, "{:?}", mode);
+            answer(&backend, &first.decider_fallbacks[0], ans);
+            let calls = decider.calls();
+            let r = evaluate(&backend, tmp.path(), &gate, &decider);
+            assert_eq!(r.outcome, outcome, "{:?} {:?}", mode, ans);
+            assert_eq!(decider.calls(), calls, "an answer is never re-asked");
+            assert!(r.decider_checks.is_empty() && r.decider_fallbacks.is_empty());
+            assert_eq!(r.output["agent_answered"], serde_json::json!(["r"]));
+            assert_eq!(r.output["unanswered"], serde_json::json!([]));
+            assert_eq!(r.output["awaiting"], serde_json::json!([]));
+            let expected = if failed {
+                serde_json::json!(["r"])
+            } else {
+                serde_json::json!([])
+            };
+            assert_eq!(r.output["failed"], expected, "{:?} {:?}", mode, ans);
+            if failed {
+                assert_eq!(r.findings.len(), 1);
+                assert_eq!(r.findings[0].level, FindingLevel::Error);
+                assert_eq!(r.findings[0].message_source, MessageSource::Koto);
+                assert!(r.findings[0].message.contains("you answered fail"));
+            } else {
+                assert!(r.findings.is_empty(), "{:?}", r.findings);
+            }
+        }
+    }
+
+    #[test]
+    fn an_answer_for_another_slice_or_declaration_does_not_apply() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = backend(tmp.path(), true);
+        let gate = check_gate(&[("r", CheckMode::Veto)]);
+        let decider = Arc::new(ScriptedDecider::new());
+        let first = evaluate(&backend, tmp.path(), &gate, &decider);
+        let mut other_slice = first.decider_fallbacks[0].clone();
+        other_slice.input_sha256 = Some("0".repeat(64));
+        answer(&backend, &other_slice, AgentAnswer::Pass);
+        let mut other_decl = first.decider_fallbacks[0].clone();
+        other_decl.declaration_hash = "changed".into();
+        answer(&backend, &other_decl, AgentAnswer::Pass);
+        let r = evaluate(&backend, tmp.path(), &gate, &decider);
+        assert_eq!(r.outcome, GateOutcome::Pending);
+        assert_eq!(r.output["agent_answered"], serde_json::json!([]));
+        assert_eq!(r.decider_fallbacks.len(), 1, "asked again");
+    }
+
+    #[test]
+    fn the_latest_answer_for_a_slice_wins() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = backend(tmp.path(), true);
+        let gate = check_gate(&[("r", CheckMode::Veto)]);
+        let decider = Arc::new(ScriptedDecider::new());
+        let first = evaluate(&backend, tmp.path(), &gate, &decider);
+        answer(&backend, &first.decider_fallbacks[0], AgentAnswer::Fail);
+        assert_eq!(
+            evaluate(&backend, tmp.path(), &gate, &decider).outcome,
+            GateOutcome::Failed
+        );
+        answer(&backend, &first.decider_fallbacks[0], AgentAnswer::Pass);
+        assert_eq!(
+            evaluate(&backend, tmp.path(), &gate, &decider).outcome,
+            GateOutcome::Passed
+        );
+    }
+
+    #[test]
+    fn a_waiting_finding_puts_the_command_first_and_quotes_odd_names() {
+        let mut gate = check_gate(&[("r", CheckMode::Veto)]);
+        let c = &mut gate.decider_check.as_mut().unwrap().criteria[0];
+        c.rule_id = "odd id".into();
+        c.question = "Q?".into();
+        let f = waiting_finding("wf", "comments", c, UnansweredReason::OverBudget);
+        assert_eq!(f.level, FindingLevel::Warning);
+        assert_eq!(f.message_source, MessageSource::Koto);
+        let cmd = "`koto decider answer wf --gate comments --criterion 'odd id' --answer";
+        let at = f.message.find(cmd).expect(&f.message);
+        assert!(at < f.message.find("Q?").unwrap(), "{}", f.message);
+        assert!(f.message.contains("(over_budget)"));
+        assert!(f.message.contains("Answer unclear if: can't tell"));
+    }
+
+    #[test]
+    fn an_override_skips_criteria_the_agent_answered() {
+        let init = serde_json::json!({"type": "workflow_initialized",
+            "payload": {"template_path": "t.json", "variables": {}}});
+        let events = log(&[init, arrive(None, "review"), checked(2, "h")]);
+        let records = override_records(
+            &events,
+            "review",
+            "comments",
+            &serde_json::json!({"failed": ["r"], "unanswered": [], "awaiting": [],
+                "agent_answered": ["r"], "error": ""}),
+            "wf",
+            None,
+        );
+        assert!(records.is_empty());
     }
 }

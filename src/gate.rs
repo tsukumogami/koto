@@ -141,6 +141,12 @@ pub struct StructuredGateResult {
     /// `gate_evaluated`.
     #[serde(skip)]
     pub decider_checks: Vec<crate::decider::check::DeciderCheck>,
+    /// For a decider check: one record per criterion handed to the agent
+    /// this evaluation (DESIGN-decider-fallback.md). The advance loop
+    /// appends them as `decider_fallback` events after the
+    /// `decider_checked` events and before the `gate_evaluated`.
+    #[serde(skip)]
+    pub decider_fallbacks: Vec<crate::decider::check::DeciderFallback>,
 }
 
 impl StructuredGateResult {
@@ -191,6 +197,7 @@ impl Default for StructuredGateResult {
             context_reads: Vec::new(),
             poll: None,
             decider_checks: Vec::new(),
+            decider_fallbacks: Vec::new(),
         }
     }
 }
@@ -845,6 +852,7 @@ fn command_gate_result(
             context_reads: Vec::new(),
             poll: None,
             decider_checks: Vec::new(),
+            decider_fallbacks: Vec::new(),
         };
     };
     let (outcome, evidence) = match kind {
@@ -880,6 +888,7 @@ fn command_gate_result(
         context_reads: Vec::new(),
         poll: None,
         decider_checks: Vec::new(),
+        decider_fallbacks: Vec::new(),
     }
 }
 

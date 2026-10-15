@@ -273,6 +273,7 @@ fn action_condition(
         context_reads: Vec::new(),
         poll: None,
         decider_checks: Vec::new(),
+        decider_fallbacks: Vec::new(),
     };
     fill_effect_landed(result.all_findings_mut(), false);
 
@@ -1669,6 +1670,13 @@ where
                         append_event(&EventPayload::DeciderChecked(check.clone()))
                             .map_err(AdvanceError::PersistenceError)?;
                     }
+                    // Then the criteria handed to the agent, which the
+                    // answer command cites and the journal counts, so a
+                    // failed append fails the tick too.
+                    for fallback in &result.decider_fallbacks {
+                        append_event(&EventPayload::DeciderFallback(fallback.clone()))
+                            .map_err(AdvanceError::PersistenceError)?;
+                    }
                     append_event(&gate_evaluated_payload)
                         .map_err(AdvanceError::PersistenceError)?;
                     gate_results.insert(gate_name.clone(), result.clone());
@@ -1680,10 +1688,11 @@ where
             // when clauses referencing gates.* can route based on gate output.
             // (gate_evidence_map is already populated above)
 
-            // A decider check blocks only on a criterion recorded as
-            // blocking, a veto fail listed in its output, never on its
-            // outcome alone: a missing verdict and every shadow check pass
-            // (DESIGN-koto-decider-checks.md, Decision 5).
+            // A decider check blocks on what its output lists, never on its
+            // outcome alone: a veto fail (`failed`) or a criterion waiting on
+            // the agent's answer (`awaiting`). An override value without
+            // `awaiting` doesn't block (DESIGN-koto-decider-checks.md,
+            // Decision 5; DESIGN-decider-fallback.md, Decision 3).
             let is_decider_check = |name: &str| {
                 template_state
                     .gates
@@ -1692,9 +1701,9 @@ where
             };
             let blocks = |name: &str, r: &StructuredGateResult| {
                 if is_decider_check(name) {
-                    r.output["failed"]
-                        .as_array()
-                        .is_some_and(|failed| !failed.is_empty())
+                    let listed =
+                        |key: &str| r.output[key].as_array().is_some_and(|ids| !ids.is_empty());
+                    listed("failed") || listed("awaiting")
                 } else {
                     !matches!(r.outcome, GateOutcome::Passed)
                 }
@@ -7826,6 +7835,7 @@ mod tests {
             context_reads: Vec::new(),
             poll: None,
             decider_checks: Vec::new(),
+            decider_fallbacks: Vec::new(),
         }
     }
 

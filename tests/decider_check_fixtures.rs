@@ -117,8 +117,9 @@ fn outcome_rows(name: &str, rule_id: &str, path: &str, before: &str, after: &str
         (choice(rule_id, 0.02, 0.95, 0.03), "fail", true),
         (choice(rule_id, 0.95, 0.02, 0.03), "pass", false),
         (choice(rule_id, 0.1, 0.1, 0.8), "escape", false),
-        // A missing verdict never blocks.
-        (Reply::status(401), "unanswered", false),
+        // A missing verdict stops the state for the agent's answer
+        // (DESIGN-decider-fallback.md).
+        (Reply::status(401), "unanswered", true),
     ];
     for (reply, outcome, blocks) in rows {
         let h = repo_harness(&veto, path, before, after);
