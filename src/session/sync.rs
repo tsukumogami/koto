@@ -118,9 +118,11 @@ pub fn fetch_remote_manifest(
 /// when it lists a host-local key
 /// ([`is_host_local_key`](crate::session::context::is_host_local_key)),
 /// the manifest re-serialized without them. `None` when there is no file.
+/// Bytes that don't parse go up as they are, as every manifest did before:
+/// they name no key this could drop, and refusing would leave a batch open.
 ///
-/// Every manifest koto uploads from a local store goes through this, so the
-/// bucket never lists a key whose object it was never sent.
+/// Every manifest koto uploads from a local store goes through this, so no
+/// manifest koto pushes names a host-local key.
 pub fn bucket_manifest_bytes(path: &std::path::Path) -> anyhow::Result<Option<Vec<u8>>> {
     use anyhow::Context;
     let data = match std::fs::read(path) {
@@ -128,8 +130,9 @@ pub fn bucket_manifest_bytes(path: &std::path::Path) -> anyhow::Result<Option<Ve
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let mut manifest: Manifest = serde_json::from_slice(&data)
-        .with_context(|| format!("failed to parse manifest: {}", path.display()))?;
+    let Ok(mut manifest) = serde_json::from_slice::<Manifest>(&data) else {
+        return Ok(Some(data));
+    };
     if !manifest.drop_host_local() {
         return Ok(Some(data));
     }

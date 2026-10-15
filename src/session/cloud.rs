@@ -1703,8 +1703,11 @@ impl CloudBackend {
         self.push_version(id)?;
 
         // Upload every context key the manifest names, then the manifest,
-        // so the bucket never lists a key it was not sent. Host-local keys
-        // stay on this host.
+        // in the order the batch flush uses. Host-local keys stay on this
+        // host, and files in `ctx/` the manifest doesn't name (its lock) are
+        // not context. A key the manifest names with no content file here
+        // refuses the push rather than send a manifest naming it; a failed
+        // upload is a warning, as every push here always was.
         let ctx_dir = session_dir.join("ctx");
         let manifest = self.local.read_manifest(id)?;
         let mut uploads: Vec<(String, PathBuf)> = manifest
@@ -2935,13 +2938,17 @@ impl CloudBackend {
         imported.is_of(source).then_some(imported.session_id)
     }
 
-    /// How many keys the local session `target`'s manifest lists. A
-    /// manifest that can't be read fails the import rather than reporting
-    /// none.
+    /// How many keys the local session `target`'s manifest lists, leaving
+    /// out the host-local ones the import never carries, so a re-run reports
+    /// what the first run did. A manifest that can't be read fails the
+    /// import rather than reporting none.
     fn local_key_count(&self, target: &str) -> Result<usize, ImportError> {
         self.local
             .read_manifest(target)
-            .map(|m| m.keys.len())
+            .map(|mut m| {
+                m.drop_host_local();
+                m.keys.len()
+            })
             .map_err(|e| {
                 ImportError::new(
                     ImportErrorCode::PushFailed,

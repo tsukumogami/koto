@@ -371,9 +371,17 @@ fn every_manifest_entry_has_its_object_and_the_location_stays_on_its_host() {
 
     // The push the import guide asks for before a move uploads the whole
     // local copy, a nested key included, and still leaves the location out.
+    // The nested key's object is deleted first, so only the push can put it
+    // back; the flat listing it replaced failed on any nested key.
+    let out = h.add(&ws, "notes/plan.md", b"plan");
+    assert!(out.ok(), "context add: {}", out.describe());
+    s3.remove(&key(&ws, "ctx/notes/plan.md"));
     let out = h.koto(&ws, &["session", "resolve", NAME, "--keep", "local"], &[]);
     assert!(out.ok(), "resolve --keep local: {}", out.describe());
-    assert_eq!(assert_bucket_manifest_whole(&s3, &ws), ["one.md"]);
+    assert_eq!(
+        assert_bucket_manifest_whole(&s3, &ws),
+        ["notes/plan.md", "one.md"]
+    );
 
     // Taking the bucket's copy keeps this host's location.
     let out = h.koto(&ws, &["session", "resolve", NAME, "--keep", "remote"], &[]);
