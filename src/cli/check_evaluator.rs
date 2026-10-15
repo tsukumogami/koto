@@ -690,8 +690,8 @@ fn pass_result(error: &str, duration_ms: Option<u64>) -> StructuredGateResult {
 /// under, no verdict to reuse and no answer to read, so nothing is asked or
 /// recorded and every criterion waits. The gate is `pending`, so the state
 /// stops without counting a judgment; with no readable log the agent can't
-/// record an answer either, so the state stays stopped until the log is
-/// repaired or an override is recorded.
+/// record an answer either (nor an override, which reads the log too), so
+/// the state stays stopped until the log can be read again.
 fn unreadable_log_result(
     gate: &str,
     spec: &DeciderCheckSpec,
@@ -710,8 +710,8 @@ fn unreadable_log_result(
         level: FindingLevel::Warning,
         message: format!(
             "decider check {} can't be graded: the session log couldn't be read, \
-             so koto can't ask the decider or record your answer; repair the session \
-             or record an override",
+             so koto can't ask the decider or record your answer; repair the session's \
+             log, then run koto next again",
             gate
         ),
         path: None,
@@ -1057,6 +1057,78 @@ mod tests {
             assert_eq!(r.findings[0].rule_id, "comments");
             assert!(r.failure.is_some());
             assert_eq!(decider.calls(), 0, "nothing is asked without a visit");
+        }
+    }
+
+    /// Every `UnansweredReason`. The match has no wildcard, so a reason
+    /// added to the enum fails to compile here until it is listed, and the
+    /// test below then proves it falls back like the others.
+    fn every_reason() -> Vec<UnansweredReason> {
+        use UnansweredReason::*;
+        let all = vec![
+            ProviderError,
+            UnreadableResponse,
+            OverBudget,
+            ExtractionFailed,
+            CapSpent,
+            Busy,
+        ];
+        for r in &all {
+            match r {
+                ProviderError | UnreadableResponse | OverBudget | ExtractionFailed | CapSpent
+                | Busy => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn every_unanswered_reason_falls_back_in_veto_and_in_shadow() {
+        let gate = check_gate(&[("r", CheckMode::Veto)]);
+        let spec = gate.decider_check.as_ref().unwrap();
+        for reason in every_reason() {
+            for mode in [CheckMode::Veto, CheckMode::Shadow] {
+                let fallback = DeciderFallback {
+                    state: "review".into(),
+                    visit_seq: 2,
+                    gate: "comments".into(),
+                    rule_id: "r".into(),
+                    declaration_hash: "h".into(),
+                    mode,
+                    reason,
+                    input_sha256: None,
+                    input_bytes: None,
+                };
+                let graded = vec![Graded {
+                    criterion: &spec.criteria[0],
+                    mode,
+                    outcome: CheckOutcome::Unanswered(reason),
+                    agent: None,
+                    blocked: false,
+                    record: None,
+                    fallback: Some(fallback),
+                }];
+                let r = result_for("wf", "comments", spec, &graded, Vec::new(), None);
+                let label = format!("{:?} {:?}", reason, mode);
+                assert_eq!(r.outcome, GateOutcome::Pending, "{}", label);
+                assert_eq!(r.output["awaiting"], serde_json::json!(["r"]), "{}", label);
+                let unanswered = if mode == CheckMode::Veto {
+                    serde_json::json!(["r"])
+                } else {
+                    serde_json::json!([])
+                };
+                assert_eq!(r.output["unanswered"], unanswered, "{}", label);
+                assert_eq!(r.decider_fallbacks.len(), 1, "{}", label);
+                assert_eq!(r.findings.len(), 1, "{}", label);
+                assert_eq!(r.findings[0].level, FindingLevel::Warning, "{}", label);
+                assert!(
+                    r.findings[0]
+                        .message
+                        .contains(&format!("({})", reason.as_str())),
+                    "{}",
+                    label
+                );
+            }
         }
     }
 

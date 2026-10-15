@@ -867,6 +867,73 @@ fn a_fallback_never_carries_the_slice_or_the_template_text() {
 }
 
 #[test]
+fn an_override_default_without_the_new_lists_still_compiles_and_moves_past_a_wait() {
+    // A template written before the fallback: its override value names only
+    // failed, unanswered and error.
+    let tpl = check_template(&criterion("r", "veto")).replace(
+        "        label: comments\n",
+        "        label: comments\n        override_default:\n          failed: []\n          unanswered: []\n          error: \"\"\n",
+    );
+    let h = harness(&tpl, SLICE);
+    h.stub.push(Reply::status(401));
+    let out = run(&h, "auto");
+    assert_waits_on_the_agent(&h, &out, "provider_error", "veto");
+    let mut cmd = h.koto();
+    cmd.args([
+        "overrides",
+        "record",
+        WF,
+        "--gate",
+        "comments",
+        "--rationale",
+        "graded by hand",
+    ]);
+    let rec = cmd.output().unwrap();
+    assert!(rec.status.success(), "{}", describe(&rec));
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+}
+
+#[test]
+fn a_reusable_decider_verdict_comes_before_an_answer_for_the_same_slice() {
+    // A slice the decider passed in this visit, then an answer recorded
+    // for that same slice: the verdict decides it, not the answer.
+    let h = harness(&looping_template(&criterion("r", "veto")), SLICE);
+    run(&h, "auto");
+    h.stub.push(pass("r"));
+    run_with(&h, "auto", r#"{"go": true}"#);
+    assert_eq!(checks(&h)[0]["outcome"], "pass");
+    // Hand-craft the answer from the verdict's own slice and declaration.
+    let c = checks(&h)[0].clone();
+    let events = h.events();
+    let seq = events
+        .iter()
+        .filter_map(|e| e["seq"].as_u64())
+        .max()
+        .unwrap()
+        + 1;
+    let line = json!({"seq": seq, "timestamp": "2026-10-15T00:00:00.000Z",
+        "type": "decider_check_answered", "payload": {
+            "state": "review", "visit_seq": c["visit_seq"], "gate": "comments",
+            "rule_id": "r", "declaration_hash": c["declaration_hash"],
+            "input_sha256": c["input_sha256"], "answer": "fail", "fallback_seq": seq}});
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(h.state_path())
+            .unwrap();
+        writeln!(f, "{}", line).unwrap();
+    }
+    let out = run_with(&h, "auto", r#"{"again": true}"#);
+    assert!(condition(&out).is_none(), "{}", out);
+    let last = gate_evals(&h).last().unwrap().clone();
+    assert_eq!(last["outcome"], "passed");
+    assert_eq!(last["output"]["agent_answered"], json!([]));
+    assert_eq!(h.stub.request_count(), 1);
+}
+
+#[test]
 fn an_answer_from_an_earlier_visit_does_not_apply() {
     let h = harness(&looping_template(&criterion("r", "veto")), SLICE);
     run(&h, "auto");
