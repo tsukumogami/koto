@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   A decider-check criterion that gets no verdict passes its gate. Six reasons
   lead there today (over budget, extraction failed, provider error, unreadable
@@ -27,7 +27,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-decider-fallback](docs/briefs/BRIEF-decider-fallback.md); carried in Absorbed Brief.
 
