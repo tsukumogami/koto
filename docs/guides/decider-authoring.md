@@ -611,7 +611,9 @@ The answer binds to the slice the check was judging and decides that
 criterion on the next evaluation of the same slice in the same visit: `pass`
 and `unclear` let it through, and `fail` blocks in veto (in shadow it's
 recorded and doesn't block). The decider isn't asked again about a slice
-the agent answered for. When the work changes, the next evaluation asks the
+the agent answered for, but a verdict the decider already gave for that same
+slice still comes first: an answer only decides a criterion the decider
+couldn't. When the work changes, the next evaluation asks the
 decider about the new slice, and falls back again if it still can't
 answer. With `extraction_failed` there's no slice to bind to, so the answer
 stands for the rest of the visit while the extraction keeps failing; the
@@ -627,7 +629,8 @@ criterion, by reason, and a criterion whose fallbacks are mostly
 `over_budget` or `extraction_failed` needs its slice or budget looked at.
 
 `koto overrides record` still moves past a waiting check, as it moves past a
-failing one.
+failing one, but it isn't how a waiting criterion is meant to be resolved:
+an override skips the judgment, while an answer records it.
 
 ### What's recorded for a check
 
