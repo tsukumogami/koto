@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-decider-fallback.md
 problem: |
   koto's check evaluator turns every decider-check criterion that gets no
@@ -33,7 +33,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
