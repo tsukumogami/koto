@@ -599,7 +599,7 @@ You can also publish a location explicitly (e.g. for a specific session id):
 koto workflows publish --dir <workflows-dir> --session <session-id>
 ```
 
-`workflows publish` records the directory in the session's context store under the reserved key `workflows/publish-location`; it writes no event. koto resolves the directory on each commit by walking from the session up its parent chain to the nearest published location, so a child session renders into an ancestor's published directory automatically.
+`workflows publish` records the directory in the session's context store under the reserved key `workflows/publish-location`; it writes no event. koto resolves the directory on each commit by walking from the session up its parent chain to the nearest published location, so a child session renders into an ancestor's published directory automatically. Under the cloud backend the key stays on the host that wrote it: it isn't uploaded, and `koto session import` doesn't carry it, so an imported session publishes its own location on its first commit on the new host.
 
 To verify the path end-to-end without a live Claude Code TUI, run `scripts/verify-native-workflows.sh`; the manual TUI procedure is in `docs/guides/native-workflows-verification.md`.
 
