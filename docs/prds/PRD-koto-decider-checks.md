@@ -34,6 +34,11 @@ Done
 
 Absorbed [BRIEF-koto-decider-checks](docs/briefs/BRIEF-koto-decider-checks.md); carried in Absorbed Brief.
 
+Superseded in part by [PRD-decider-fallback](PRD-decider-fallback.md): the
+rule here that a criterion with no verdict passes its gate no longer holds.
+Such a criterion now falls back to the agent, whose answer decides it; a
+missing verdict still never blocks as a fail.
+
 ## Absorbed Brief
 
 The feature was framed around prose rules a workflow tells the agent to

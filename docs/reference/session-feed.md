@@ -585,6 +585,67 @@ events:
         type: string
         required: false
 
+  decider_fallback:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      visit_seq:
+        type: integer
+        required: true
+      gate:
+        type: string
+        required: true
+      rule_id:
+        type: string
+        required: true
+      declaration_hash:
+        type: string
+        required: true
+      mode:
+        type: string
+        required: true
+        enum: ["shadow", "veto"]
+      reason:
+        type: string
+        required: true
+      input_sha256:
+        type: string
+        required: false
+      input_bytes:
+        type: integer
+        required: false
+
+  decider_check_answered:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      visit_seq:
+        type: integer
+        required: true
+      gate:
+        type: string
+        required: true
+      rule_id:
+        type: string
+        required: true
+      declaration_hash:
+        type: string
+        required: true
+      input_sha256:
+        type: string
+        required: false
+      answer:
+        type: string
+        required: true
+        enum: ["pass", "fail", "unclear"]
+      fallback_seq:
+        type: integer
+        required: true
+
   scheduler_ran:
     tier: 3
     fields:
@@ -959,7 +1020,7 @@ Records when an agent bypassed a failing gate via `koto overrides record`.
 | `gate` | string | Yes | Gate identifier string. |
 | `rationale` | string | Yes | Human-readable reason for the override. |
 | `override_applied` | object | Yes | The value substituted as if the gate had produced it. Schema is gate-type-specific. |
-| `actual_output` | object | Yes | The gate's actual output at override time. Schema is gate-type-specific. For a `decider-check` gate it lists the criteria that failed, the only ones that block, under `failed`, and those that got no verdict under `unanswered`. |
+| `actual_output` | object | Yes | The gate's actual output at override time. Schema is gate-type-specific. For a `decider-check` gate it lists the criteria that failed under `failed`, those that got no verdict under `unanswered`, and those waiting on the agent's answer under `awaiting`. |
 | `timestamp` | string | Yes | RFC 3339 UTC timestamp. Matches the outer envelope `timestamp`. |
 
 ---
@@ -1442,43 +1503,63 @@ Command, context-exists and context-matches gates produce findings. Other
 gate types, including `children-complete` and `request-leg`, log none, so a
 failure of one of them carries no `findings` and no `rule_counts`.
 
-**A `decider-check` gate** (docs/designs/current/DESIGN-koto-decider-checks.md) logs
-`output` as `{"failed": [<rule_id>...], "unanswered": [<rule_id>...], "error": ""}`:
-`failed` lists the veto criteria that failed on a verdict, the only ones
-that block, and `unanswered` the veto criteria that got no verdict. It never
-logs `stdout` or `stderr`, since its output is the agent's own text. Its
-`outcome` is:
+**A `decider-check` gate** (docs/designs/current/DESIGN-koto-decider-checks.md,
+docs/designs/current/DESIGN-decider-fallback.md) logs `output` as
+`{"failed": [...], "unanswered": [...], "awaiting": [...], "agent_answered": [...], "error": ""}`,
+each list holding criterion `rule_id`s in declaration order:
 
-- `failed` when a veto criterion failed on a verdict. `findings` holds one per
-  failing criterion, with its `rule_id`, `rule_ref` and `message_source`
-  `decider`; unanswered criteria appear in `output.unanswered` only.
-- `passed` otherwise. A missing or malformed verdict never blocks, but it is
-  never read as a pass either: every veto criterion that got no verdict stays
-  listed in `output.unanswered` on the passing event, with no finding, and its
-  `decider_checked` keeps outcome `unanswered` with the reason and `blocked:
-  false`. A reader can therefore tell a pass that was checked and met from one
-  where nothing could be checked. A shadow check's event is always `passed`,
-  with empty lists and no findings, whatever the decider said; its verdicts
-  are only in `decider_checked`.
+- `failed`: the veto criteria that block on a fail, the decider's verdict or
+  the agent's answer.
+- `unanswered`: the veto criteria that got no verdict, neither from the
+  decider nor from an answer the agent recorded. An agent-answered criterion
+  is never listed here.
+- `awaiting`: the criteria, veto or shadow, handed to the agent this
+  evaluation and still waiting on its answer.
+- `agent_answered`: the criteria whose outcome this evaluation took from an
+  answer the agent recorded (`decider_check_answered`).
 
-`output.error` is `""` unless the check couldn't grade anything, and then the
-event is `passed` and no `decider_checked` precedes it: `log_unreadable`
-when the session log couldn't be read (every veto criterion is listed under
-`unanswered`). The evaluator keeps a `missing_spec` value (the lists empty)
-for a gate with no decider-check spec as a defence in depth, but loading a
-compiled template refuses such a gate (`E-DECIDER-CHECK-SPEC`), so a session
-never reaches it. Consumers MUST tolerate other values.
+`awaiting` and `agent_answered` are absent from logs written before the
+fallback, and from an override value that leaves them out; a reader treats
+an absent list as empty. The event never logs `stdout` or `stderr`, since
+its output is the agent's own text. Its `outcome` is:
 
-Logs from koto before this rule may hold a decider check's event with outcome
-`error` (no criterion failed, a veto criterion got no verdict) and koto's own
-finding, `rule_id` the gate's name, `message_source` `koto`, message beginning
-`no verdict was read`. koto no longer writes it. No reader handles it
-specially: such logs still parse, and still validate against this contract,
-because an `error` outcome and a koto finding are ordinary values of fields
-it already declares.
+- `failed` when `failed` is non-empty. `findings` holds one `error` finding
+  per failing criterion, with its `rule_id` and `rule_ref`: `message_source`
+  `decider` for a decider verdict, `koto` for an agent's `fail` answer.
+- `pending` otherwise, when `awaiting` is non-empty. The check judged
+  nothing yet: like a polling gate's pending evaluation, it carries no
+  attempt stamp and no `rule_counts`. `findings` holds one `warning` finding
+  per waiting criterion, `message_source` `koto`, naming the reason and the
+  command that records the agent's answer. The state doesn't advance.
+- `passed` otherwise. A shadow check is never `failed`: a shadow fail, from
+  the decider or the agent, is recorded and not acted on.
 
-Each consultation's `decider_checked` event comes immediately before this
-event.
+A criterion that got no verdict is never read as a pass: it waits on the
+agent, its `decider_checked` keeps outcome `unanswered` with the reason and
+`blocked: false`, and a `decider_fallback` event names it.
+
+`output.error` is `""` unless the check couldn't grade anything.
+`log_unreadable`: the session log couldn't be read, so nothing is asked or
+recorded; the event is `pending`, every criterion is listed under
+`awaiting` (and every veto criterion under `unanswered`), and one `warning`
+finding named for the gate says so. The evaluator keeps a `missing_spec`
+value (the event `passed`, the lists empty) for a gate with no
+decider-check spec as a defence in depth, but loading a compiled template
+refuses such a gate (`E-DECIDER-CHECK-SPEC`), so a session never reaches
+it. Consumers MUST tolerate other values.
+
+Logs from koto between the decider-check release and the fallback hold
+decider checks that passed with a veto criterion under `output.unanswered`;
+they keep that meaning. Logs from before that may hold an event with outcome
+`error` (no criterion failed, a veto criterion got no verdict) and koto's
+own finding, `rule_id` the gate's name, `message_source` `koto`, message
+beginning `no verdict was read`. koto no longer writes either. No reader
+handles them specially: such logs still parse, and still validate against
+this contract, because they hold ordinary values of fields it already
+declares.
+
+Each consultation's `decider_checked` event, then each `decider_fallback`
+event, comes immediately before this event.
 
 A failed append of this event fails the command, as it always has.
 
@@ -1860,7 +1941,7 @@ appends none.
 the slice was empty or only whitespace, so nothing was asked and nothing sent; `escape` means the
 decider read the slice and answered that it can't be judged, or no value won
 at its threshold. **`unanswered`** is a checker fault, never a judgment about
-the agent's work, and it never blocks.
+the agent's work: it never blocks as a fail, and it is never read as a pass; the criterion falls back to the agent (see `decider_fallback`).
 
 The event carries no slice content and no credentials: the slice appears only
 as `input_sha256` and `input_bytes`, and the API key, the response body and
@@ -1868,6 +1949,87 @@ error text are never recorded. koto also appends each consultation to
 `~/.koto/_decider_ledger.jsonl` as a `checked` line with the same fields, and
 an override of a blocking decider check as one `check_overridden` line per
 failed criterion; see `docs/workspace-layout.md`.
+
+#### `decider_fallback`
+
+Records one criterion of a `decider-check` gate handed to the agent: it got
+no verdict this evaluation, for any `reason` an `unanswered`
+`decider_checked` can carry, and no answer the agent recorded applies to
+it (docs/designs/current/DESIGN-decider-fallback.md). It appears after the
+evaluation's `decider_checked` events and before the gate's
+`gate_evaluated`, in criterion declaration order, in veto and in shadow
+mode. An evaluation whose criterion takes a recorded agent answer appends
+none for that criterion. A criterion still waiting is evaluated again on
+every `koto next`, so each evaluation that hands it over again appends
+another.
+
+```json
+{
+  "type": "decider_fallback",
+  "payload": {
+    "state": "review",
+    "visit_seq": 2,
+    "gate": "comments",
+    "rule_id": "comment_reason",
+    "declaration_hash": "e0f8...0c2b",
+    "mode": "veto",
+    "reason": "over_budget",
+    "input_sha256": "202c...db4d",
+    "input_bytes": 4096
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `state` | string | Yes | The state evaluated. |
+| `visit_seq` | integer | Yes | As for `decider_checked`. |
+| `gate` | string | Yes | The decider check's name. |
+| `rule_id` | string | Yes | The criterion's id, as the template declares it. |
+| `declaration_hash` | string | Yes | As for `decider_checked`. An answer binds to it. |
+| `mode` | string | Yes | The criterion's effective mode, `veto` or `shadow`. |
+| `reason` | string | Yes | Why no verdict: `provider_error`, `unreadable_response`, `over_budget`, `extraction_failed`, `cap_spent` or `busy`. Consumers MUST tolerate other values; every value is a fixed identifier, never a message, path or instruction text. |
+| `input_sha256` | string | No | The slice's hash, as for `decider_checked`. Absent with `extraction_failed`, which has no slice. An answer binds to it. |
+| `input_bytes` | integer | No | Byte length of the redacted slice as captured. Present with `input_sha256`. Capture stops at 64 KiB, so 65,536 means at least that many. |
+
+#### `decider_check_answered`
+
+Records the agent's answer to a criterion that fell back to it, appended by
+`koto decider answer`. The answer binds to the slice and declaration of the
+latest `decider_fallback` for that check and criterion in the visit, and
+decides the criterion on a later evaluation of the same slice in the same
+visit; the latest answer for a slice wins.
+
+```json
+{
+  "type": "decider_check_answered",
+  "payload": {
+    "state": "review",
+    "visit_seq": 2,
+    "gate": "comments",
+    "rule_id": "comment_reason",
+    "declaration_hash": "e0f8...0c2b",
+    "input_sha256": "202c...db4d",
+    "answer": "fail",
+    "fallback_seq": 7
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `state` | string | Yes | The state the answer was recorded in. |
+| `visit_seq` | integer | Yes | The visit, as for `decider_checked`. |
+| `gate` | string | Yes | The decider check's name. |
+| `rule_id` | string | Yes | The criterion's id. |
+| `declaration_hash` | string | Yes | Copied from the fallback answered. |
+| `input_sha256` | string | No | Copied from the fallback answered; absent when it had none. |
+| `answer` | string | Yes | `pass`, `fail` or `unclear` (the criterion's escape). |
+| `fallback_seq` | integer | Yes | The `seq` of the `decider_fallback` event answered. |
+
+Neither event carries the slice, a question, a description, or anything the
+agent wrote beyond its one-word answer. An agent answer is never a decider
+verdict: it appends no `decider_checked` and no ledger line.
 
 ---
 

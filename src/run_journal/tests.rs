@@ -683,6 +683,8 @@ fn check_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.poll.status",
             "koto.check.unanswered_count",
             "koto.check.error",
+            "koto.decider.awaiting_count",
+            "koto.decider.agent_answered_count",
         ],
         "check_rule" => &[
             "koto.state",
@@ -699,6 +701,8 @@ fn check_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.poll.status",
             "koto.poll.evaluations",
             "koto.poll.elapsed_secs",
+            "koto.decider.awaiting_count",
+            "koto.decider.agent_answered_count",
         ],
         "response" => &[
             "koto.state",
@@ -1070,9 +1074,19 @@ fn each_when_field_is_present_exactly_under_its_condition() {
     assert_eq!(by("d0")["koto.check.unanswered_count"], 0);
     assert_eq!(by("d1")["koto.check.unanswered_count"], 1);
     assert_eq!(by("d2")["koto.check.unanswered_count"], 2);
+    // An output from before the fallback lists no awaiting or answered
+    // criteria: both counts are 0, not absent.
+    for d in ["d0", "d1", "d2"] {
+        assert_eq!(by(d)["koto.decider.awaiting_count"], 0, "{d}");
+        assert_eq!(by(d)["koto.decider.agent_answered_count"], 0, "{d}");
+    }
     for plain in ["cmd", "ctx", "ci", "old"] {
         assert!(
             by(plain).get("koto.check.unanswered_count").is_none(),
+            "{plain}"
+        );
+        assert!(
+            by(plain).get("koto.decider.awaiting_count").is_none(),
             "{plain}"
         );
         assert!(by(plain).get("koto.check.error").is_none(), "{plain}");
@@ -2236,6 +2250,15 @@ fn decider_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.decider.unread_usage_attempts",
             "koto.decider.attempts",
             "koto.decider.latency_ms",
+            "koto.decider.input_bytes",
+        ],
+        "decider_fallback" => &[
+            "koto.state",
+            "koto.check",
+            "koto.rule.id",
+            "koto.decider.mode",
+            "koto.decider.reason",
+            "koto.decider.input_bytes",
         ],
         "check_overridden" => &["koto.state", "koto.check"],
         other => panic!("not a decider or override kind: {other}"),
@@ -2249,7 +2272,7 @@ fn decider_records(j: &[serde_json::Value]) -> Vec<serde_json::Value> {
         .filter(|r| {
             matches!(
                 r["kind"].as_str().unwrap(),
-                "decider_consulted" | "decider_checked" | "check_overridden"
+                "decider_consulted" | "decider_checked" | "decider_fallback" | "check_overridden"
             )
         })
         .map(|r| {
@@ -3453,4 +3476,122 @@ fn a_ten_thousand_event_visit_folds_within_budget() {
         median < std::time::Duration::from_millis(15),
         "the fold took {median:?}"
     );
+}
+
+// ----- Decider fallback records -----
+
+fn fallback(rule_id: &str) -> crate::decider::check::DeciderFallback {
+    crate::decider::check::DeciderFallback {
+        state: "a".into(),
+        visit_seq: 99,
+        gate: "comments".into(),
+        rule_id: rule_id.into(),
+        declaration_hash: "PLANTED-DECLARATION-HASH".into(),
+        mode: CheckMode::Veto,
+        reason: UnansweredReason::OverBudget,
+        input_sha256: Some("PLANTED-INPUT-HASH".into()),
+        input_bytes: Some(2561),
+    }
+}
+
+#[test]
+fn a_fallback_relays_decider_fallback_with_the_events_values() {
+    let f = session_in_a();
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::DeciderFallback(fallback("r")),
+    );
+    let no_slice = crate::decider::check::DeciderFallback {
+        mode: CheckMode::Shadow,
+        reason: UnansweredReason::ExtractionFailed,
+        input_sha256: None,
+        input_bytes: None,
+        ..fallback("no reason [x]")
+    };
+    commit_as(&f, None, "wf", &EventPayload::DeciderFallback(no_slice));
+
+    let d = decider_records(&f.journal());
+    assert_eq!(kinds(&d), vec!["decider_fallback", "decider_fallback"]);
+    let r = &d[0];
+    assert_eq!(r["koto.state"], "a");
+    assert_eq!(r["koto.check"], "comments");
+    assert_eq!(r["koto.rule.id"], "r");
+    assert_eq!(r["koto.decider.mode"], "veto");
+    assert_eq!(r["koto.decider.reason"], "over_budget");
+    assert_eq!(r["koto.decider.input_bytes"], 2561);
+    let r = &d[1];
+    assert_eq!(r["koto.decider.mode"], "shadow");
+    assert_eq!(r["koto.decider.reason"], "extraction_failed");
+    assert!(r.get("koto.decider.input_bytes").is_none(), "{r}");
+    // A rule id outside the name shape is digested, as on decider_checked.
+    assert!(
+        r["koto.rule.id"].as_str().unwrap().starts_with("sha256:"),
+        "{r}"
+    );
+    let text = serde_json::to_string(&f.journal()).unwrap();
+    for planted in ["PLANTED-DECLARATION-HASH", "PLANTED-INPUT-HASH"] {
+        assert!(!text.contains(planted), "{planted} reached the journal");
+    }
+}
+
+#[test]
+fn a_fallback_record_with_the_longest_names_fits_a_line() {
+    let session = "s".repeat(255);
+    let id = "i".repeat(128);
+    let relay = Relay {
+        session: &session,
+        session_id: &id,
+        run_id: Some(&id),
+        seq: u64::MAX,
+        visit_seq: Some(u64::MAX),
+    };
+    let p = crate::decider::check::DeciderFallback {
+        state: "t".repeat(128),
+        gate: "g".repeat(128),
+        input_bytes: Some(u64::MAX),
+        ..fallback(&"r".repeat(128))
+    };
+    let lines: Vec<String> = relayed(&EventPayload::DeciderFallback(p), &relay)
+        .iter()
+        .map(Record::to_line)
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].len() < MAX_LINE_BYTES, "{} bytes", lines[0].len());
+    let r: serde_json::Value = serde_json::from_str(lines[0].trim_end()).unwrap();
+    assert_eq!(r["koto.check"], "g".repeat(128));
+    assert_eq!(r["koto.rule.id"], "r".repeat(128));
+}
+
+#[test]
+fn a_waiting_decider_check_writes_check_pending_with_its_counts_and_no_poll() {
+    let f = session_in_a();
+    let output = serde_json::json!({"failed": [], "unanswered": ["r"],
+        "awaiting": ["r", "s"], "agent_answered": ["t"], "error": ""});
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event(
+            "a",
+            "comments",
+            "pending",
+            output,
+            CheckEventFields::default(),
+            None,
+        ),
+    );
+    let c = check_records(&f.journal());
+    assert_eq!(kinds(&c), vec!["check_pending"]);
+    let r = &c[0];
+    assert_eq!(r["koto.decider.awaiting_count"], 2);
+    assert_eq!(r["koto.decider.agent_answered_count"], 1);
+    for absent in [
+        "koto.poll.status",
+        "koto.poll.evaluations",
+        "koto.poll.elapsed_secs",
+    ] {
+        assert!(r.get(absent).is_none(), "{absent}: {r}");
+    }
 }

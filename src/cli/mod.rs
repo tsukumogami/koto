@@ -8,6 +8,7 @@ pub mod dashboard_data;
 pub mod dashboard_render;
 pub mod dashboard_state;
 pub mod decider;
+pub mod decider_answer;
 pub mod decider_port;
 pub mod init_child;
 pub mod init_entry;
@@ -2040,7 +2041,16 @@ pub fn run(app: App) -> Result<()> {
             }
         }
         Command::Config { subcommand } => handle_config(subcommand),
-        Command::Decider { subcommand } => decider::handle(subcommand),
+        Command::Decider { subcommand } => match subcommand {
+            // The one decider verb that writes to a session. A future verb
+            // that writes to one is wired here, with a backend, as well as in
+            // decider::handle's match.
+            decider::DeciderCommand::Answer(args) => {
+                let backend = build_backend()?;
+                decider_answer::handle_answer(&backend, args)
+            }
+            other => decider::handle(other),
+        },
         Command::Workspace { subcommand } => {
             let backend = build_backend()?;
             match subcommand {

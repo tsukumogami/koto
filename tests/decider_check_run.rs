@@ -364,31 +364,86 @@ fn an_escape_never_blocks() {
 // unanswered
 // ---------------------------------------------------------------------------
 
-/// A veto criterion `r` that got no verdict for `reason`: the gate passed
-/// and the workflow moved on, with no finding, while the log still says
-/// nothing was checked. The criterion stays under `output.unanswered`, and
-/// its `decider_checked` keeps outcome `unanswered` with the reason and
-/// `blocked: false`.
-fn assert_unanswered_passes(h: &Harness, out: &Value, reason: &str) {
-    assert_eq!(state_of(out), "done", "{}", out);
-    assert!(condition(out).is_none(), "{}", out);
+fn fallbacks(h: &Harness) -> Vec<Value> {
+    h.events_of("decider_fallback")
+        .into_iter()
+        .map(|e| e["payload"].clone())
+        .collect()
+}
+
+/// A criterion `r` in `mode` that got no verdict for `reason`: it fell back
+/// to the agent (DESIGN-decider-fallback.md). The state stopped at `review`
+/// with the gate `pending`, one warning finding hands the criterion and the
+/// answer command to the agent, the criterion is under `output.awaiting`
+/// (and, in veto, `output.unanswered`), its `decider_checked` keeps outcome
+/// `unanswered` with the reason and `blocked: false`, and one
+/// `decider_fallback` names it with the reason.
+fn assert_waits_on_the_agent(h: &Harness, out: &Value, reason: &str, mode: &str) {
+    assert_eq!(state_of(out), "review", "{}", out);
+    let cond = condition(out).expect("a blocking condition");
+    assert_eq!(cond["status"], "pending", "{}", cond);
+    assert_eq!(cond["category"], "corrective", "{}", cond);
+    let f = findings(out);
+    assert_eq!(f.len(), 1, "{}", out);
+    assert_eq!(f[0]["level"], "warning");
+    assert_eq!(f[0]["rule_id"], "r");
+    assert_eq!(f[0]["message_source"], "koto");
+    let msg = f[0]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("`koto decider answer wf --gate comments --criterion r --answer"),
+        "{}",
+        msg
+    );
+    assert!(msg.contains(&format!("({})", reason)), "{}", msg);
     let g = gate_evals(h);
     let last = g.last().unwrap();
-    assert_eq!(last["outcome"], "passed", "{}", last);
-    assert_eq!(last["output"]["unanswered"], json!(["r"]));
+    assert_eq!(last["outcome"], "pending", "{}", last);
+    assert_eq!(last["output"]["awaiting"], json!(["r"]));
+    let unanswered = if mode == "veto" {
+        json!(["r"])
+    } else {
+        json!([])
+    };
+    assert_eq!(last["output"]["unanswered"], unanswered);
     assert_eq!(last["output"]["failed"], json!([]));
+    assert_eq!(last["output"]["agent_answered"], json!([]));
     assert_eq!(last["output"]["error"], "");
-    assert!(last.get("findings").is_none(), "{}", last);
+    assert!(last.get("rule_counts").is_none(), "{}", last);
+    assert!(last.get("attempt").is_none(), "{}", last);
     let c = checks(h);
     let c = c.last().unwrap();
     assert_eq!(c["outcome"], "unanswered");
     assert_eq!(c["reason"], reason);
-    assert_eq!(c["mode"], "veto");
+    assert_eq!(c["mode"], mode);
     assert_eq!(c["blocked"], false);
+    let fb = fallbacks(h);
+    let fb = fb.last().unwrap();
+    assert_eq!(fb["rule_id"], "r");
+    assert_eq!(fb["reason"], reason);
+    assert_eq!(fb["mode"], mode);
+    assert_eq!(fb["declaration_hash"], c["declaration_hash"]);
+}
+
+/// Record the agent's `answer` for criterion `rule` of `comments` with
+/// `koto decider answer`, as the waiting finding tells the agent to.
+fn answer(h: &Harness, rule: &str, answer: &str) {
+    let out = answer_cmd(
+        h,
+        &[
+            WF,
+            "--gate",
+            "comments",
+            "--criterion",
+            rule,
+            "--answer",
+            answer,
+        ],
+    );
+    assert!(out.status.success(), "{}", describe(&out));
 }
 
 #[test]
-fn provider_failures_are_retried_once_then_pass_unanswered() {
+fn provider_failures_are_retried_once_then_fall_back_to_the_agent() {
     let malformed = Reply::json(&json!({"model": "m", "answers": {"r": {"type": "choice"}}}));
     let mismatched = Reply::json(&json!({"model": "m", "answers": {"other": {}}}));
     for (reply, reason) in [
@@ -401,7 +456,7 @@ fn provider_failures_are_retried_once_then_pass_unanswered() {
         h.stub.push(reply);
         let out = run(&h, "auto");
         assert_eq!(h.stub.request_count(), 2, "{}", reason);
-        assert_unanswered_passes(&h, &out, reason);
+        assert_waits_on_the_agent(&h, &out, reason, "veto");
         assert_eq!(checks(&h)[0]["attempts"], 2);
     }
 }
@@ -415,7 +470,7 @@ fn a_timeout_is_retried_once() {
     h.stub.push(slow);
     let out = run(&h, "auto");
     assert_eq!(h.stub.request_count(), 2);
-    assert_unanswered_passes(&h, &out, "provider_error");
+    assert_waits_on_the_agent(&h, &out, "provider_error", "veto");
     assert_eq!(checks(&h)[0]["error_class"], "timeout");
 }
 
@@ -426,7 +481,7 @@ fn a_4xx_is_not_retried() {
         h.stub.push(Reply::status(status));
         let out = run(&h, "auto");
         assert_eq!(h.stub.request_count(), 1, "{}", status);
-        assert_unanswered_passes(&h, &out, "provider_error");
+        assert_waits_on_the_agent(&h, &out, "provider_error", "veto");
     }
 }
 
@@ -469,7 +524,7 @@ fn a_failed_attempt_reports_no_tokens() {
 }
 
 #[test]
-fn a_fail_and_an_unanswered_criterion_fail_the_check_with_the_fail_finding_only() {
+fn a_fail_and_a_waiting_criterion_fail_the_check_with_both_findings() {
     let h = harness(&check_template(&criteria(&["a", "b"], "veto")), SLICE);
     h.stub.push(fail("a"));
     h.stub.push(Reply::status(401));
@@ -479,33 +534,57 @@ fn a_fail_and_an_unanswered_criterion_fail_the_check_with_the_fail_finding_only(
     assert_eq!(g["outcome"], "failed");
     assert_eq!(g["output"]["failed"], json!(["a"]));
     assert_eq!(g["output"]["unanswered"], json!(["b"]));
+    assert_eq!(g["output"]["awaiting"], json!(["b"]));
     let f = findings(&out);
-    assert_eq!(f.len(), 1, "{}", out);
-    assert_eq!(f[0]["rule_id"], "a");
+    assert_eq!(f.len(), 2, "{}", out);
+    assert_eq!(
+        (&f[0]["rule_id"], &f[0]["level"]),
+        (&json!("a"), &json!("error"))
+    );
+    assert_eq!(
+        (&f[1]["rule_id"], &f[1]["level"]),
+        (&json!("b"), &json!("warning"))
+    );
     let c = checks(&h);
     assert_eq!(c[0]["blocked"], true);
     assert_eq!(c[1]["rule_id"], "b");
     assert_eq!(c[1]["outcome"], "unanswered");
     assert_eq!(c[1]["reason"], "provider_error");
     assert_eq!(c[1]["blocked"], false, "only the fail blocks");
+    // The waiting criterion is the failed gate's only non-rule: the rule
+    // counts name the fail alone.
+    assert_eq!(g["rule_counts"].as_object().unwrap().len(), 1, "{}", g);
 }
 
 #[test]
-fn a_passing_gate_keeps_an_unanswered_criterion_listed_beside_a_pass() {
+fn a_pass_beside_a_waiting_criterion_leaves_the_check_pending() {
     let h = harness(&check_template(&criteria(&["a", "b"], "veto")), SLICE);
     h.stub.push(pass("a"));
     h.stub.push(Reply::status(401));
     let out = run(&h, "auto");
-    assert_eq!(state_of(&out), "done", "{}", out);
+    assert_eq!(state_of(&out), "review", "{}", out);
     let g = &gate_evals(&h)[0];
-    assert_eq!(g["outcome"], "passed");
+    assert_eq!(g["outcome"], "pending");
     assert_eq!(g["output"]["failed"], json!([]));
     assert_eq!(g["output"]["unanswered"], json!(["b"]));
+    assert_eq!(g["output"]["awaiting"], json!(["b"]));
     let c = checks(&h);
     assert_eq!(c[0]["outcome"], "pass");
     assert_eq!(c[1]["outcome"], "unanswered");
-    assert_eq!(c[1]["reason"], "provider_error");
     assert_eq!(c[1]["blocked"], false);
+
+    // Answering b passes the gate without asking the decider about b again;
+    // a's verdict is reused.
+    answer(&h, "b", "pass");
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+    assert_eq!(h.stub.request_count(), 2, "nothing more was asked");
+    let g = gate_evals(&h);
+    let last = g.last().unwrap();
+    assert_eq!(last["outcome"], "passed");
+    assert_eq!(last["output"]["agent_answered"], json!(["b"]));
+    assert_eq!(last["output"]["unanswered"], json!([]));
+    assert_eq!(last["output"]["awaiting"], json!([]));
 }
 
 #[test]
@@ -532,7 +611,7 @@ fn over_budget_empty_and_failed_extractions_send_nothing() {
     let h = harness(&check_template(&criterion("r", "veto")), &"x".repeat(2561));
     let out = run(&h, "auto");
     assert_eq!(h.stub.request_count(), 0);
-    assert_unanswered_passes(&h, &out, "over_budget");
+    assert_waits_on_the_agent(&h, &out, "over_budget", "veto");
     assert_eq!(checks(&h)[0]["input_bytes"], 2561);
 
     let h = harness(
@@ -540,8 +619,8 @@ fn over_budget_empty_and_failed_extractions_send_nothing() {
         &"x".repeat(2561),
     );
     let out = run(&h, "auto");
-    assert_eq!(state_of(&out), "done");
-    assert_eq!(checks(&h)[0]["reason"], "over_budget");
+    assert_waits_on_the_agent(&h, &out, "over_budget", "shadow");
+    assert_eq!(fallbacks(&h)[0]["input_bytes"], 2561);
 
     for mode in ["veto", "shadow"] {
         let h = harness(&check_template(&criterion("r", mode)), " \n\t\n");
@@ -555,7 +634,15 @@ fn over_budget_empty_and_failed_extractions_send_nothing() {
     let h = harness(&tpl, SLICE);
     let out = run(&h, "auto");
     assert_eq!(h.stub.request_count(), 0);
-    assert_unanswered_passes(&h, &out, "extraction_failed");
+    assert_waits_on_the_agent(&h, &out, "extraction_failed", "veto");
+    let fb = &fallbacks(&h)[0];
+    assert!(fb.get("input_sha256").is_none() && fb.get("input_bytes").is_none());
+
+    // With no slice, the answer stands while extraction keeps failing.
+    answer(&h, "r", "pass");
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+    assert_eq!(fallbacks(&h).len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -563,8 +650,8 @@ fn over_budget_empty_and_failed_extractions_send_nothing() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn shadow_never_blocks_and_logs_the_check_as_passed() {
-    for reply in [fail("r"), escape("r"), Reply::status(401)] {
+fn shadow_never_blocks_on_a_verdict_and_logs_the_check_as_passed() {
+    for reply in [fail("r"), escape("r")] {
         let h = harness(&check_template(&criterion("r", "shadow")), SLICE);
         h.stub.push(reply);
         let out = run(&h, "auto");
@@ -682,6 +769,187 @@ fn the_agents_evidence_cannot_route_past_a_blocking_check() {
 }
 
 #[test]
+fn the_agents_evidence_cannot_route_past_a_waiting_check() {
+    for mode in ["veto", "shadow"] {
+        let h = harness(&looping_template(&criterion("r", mode)), SLICE);
+        run(&h, "auto");
+        h.stub.push(Reply::status(401));
+        run_with(&h, "auto", r#"{"go": true}"#);
+        h.stub.push(Reply::status(401));
+        let out = run_with(&h, "auto", r#"{"again": false}"#);
+        assert_eq!(state_of(&out), "review", "{} {}", mode, out);
+        assert_eq!(out["action"], "gate_blocked", "{}", mode);
+        assert_eq!(condition(&out).unwrap()["status"], "pending");
+    }
+}
+
+#[test]
+fn an_answer_decides_the_gate_by_mode_and_the_latest_one_wins() {
+    // Veto: a fail answer blocks with an error finding, a later pass for
+    // the same slice releases the state.
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    h.stub.push(Reply::status(401));
+    let out = run(&h, "auto");
+    assert_waits_on_the_agent(&h, &out, "provider_error", "veto");
+    answer(&h, "r", "fail");
+    let out = run(&h, "auto");
+    assert_eq!(out["action"], "gate_blocked", "{}", out);
+    let f = findings(&out);
+    assert_eq!(f.len(), 1, "{}", out);
+    assert_eq!(f[0]["level"], "error");
+    assert_eq!(f[0]["message_source"], "koto");
+    assert!(f[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("you answered fail"));
+    let g = gate_evals(&h);
+    let last = g.last().unwrap();
+    assert_eq!(last["outcome"], "failed");
+    assert_eq!(last["output"]["failed"], json!(["r"]));
+    assert_eq!(last["output"]["agent_answered"], json!(["r"]));
+    assert_eq!(last["output"]["unanswered"], json!([]));
+    assert_eq!(h.stub.request_count(), 1, "an answer is never re-asked");
+    assert_eq!(fallbacks(&h).len(), 1);
+    answer(&h, "r", "pass");
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+
+    // Shadow: a fail answer is recorded and doesn't block.
+    let h = harness(&check_template(&criterion("r", "shadow")), SLICE);
+    h.stub.push(Reply::status(401));
+    let out = run(&h, "auto");
+    assert_waits_on_the_agent(&h, &out, "provider_error", "shadow");
+    answer(&h, "r", "fail");
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+    let last = gate_evals(&h).last().unwrap().clone();
+    assert_eq!(last["outcome"], "passed");
+    assert_eq!(last["output"]["failed"], json!([]));
+    assert_eq!(last["output"]["agent_answered"], json!(["r"]));
+
+    // Unclear is the escape: it doesn't block.
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    h.stub.push(Reply::status(401));
+    run(&h, "auto");
+    answer(&h, "r", "unclear");
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+}
+
+#[test]
+fn a_fallback_never_carries_the_slice_or_the_template_text() {
+    let marker = "SLICE-MARKER-9f2c";
+    let slice = format!("// {}\n{}", marker, "x".repeat(2600));
+    let h = harness(&check_template(&criterion("r", "veto")), &slice);
+    let out = run(&h, "auto");
+    assert_waits_on_the_agent(&h, &out, "over_budget", "veto");
+    assert!(!out.to_string().contains(marker), "{}", out);
+    assert!(!h.raw_log().contains(marker));
+    let fb = fallbacks(&h)[0].to_string();
+    assert!(!fb.contains("Does each comment"), "{}", fb);
+}
+
+#[test]
+fn an_override_default_without_the_new_lists_still_compiles_and_moves_past_a_wait() {
+    // A template written before the fallback: its override value names only
+    // failed, unanswered and error.
+    let tpl = check_template(&criterion("r", "veto")).replace(
+        "        label: comments\n",
+        "        label: comments\n        override_default:\n          failed: []\n          unanswered: []\n          error: \"\"\n",
+    );
+    let h = harness(&tpl, SLICE);
+    h.stub.push(Reply::status(401));
+    let out = run(&h, "auto");
+    assert_waits_on_the_agent(&h, &out, "provider_error", "veto");
+    let mut cmd = h.koto();
+    cmd.args([
+        "overrides",
+        "record",
+        WF,
+        "--gate",
+        "comments",
+        "--rationale",
+        "graded by hand",
+    ]);
+    let rec = cmd.output().unwrap();
+    assert!(rec.status.success(), "{}", describe(&rec));
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+}
+
+#[test]
+fn a_reusable_decider_verdict_comes_before_an_answer_for_the_same_slice() {
+    // A slice the decider passed in this visit, then an answer recorded
+    // for that same slice: the verdict decides it, not the answer.
+    let h = harness(&looping_template(&criterion("r", "veto")), SLICE);
+    run(&h, "auto");
+    h.stub.push(pass("r"));
+    run_with(&h, "auto", r#"{"go": true}"#);
+    assert_eq!(checks(&h)[0]["outcome"], "pass");
+    // Hand-craft the answer from the verdict's own slice and declaration.
+    let c = checks(&h)[0].clone();
+    let events = h.events();
+    let seq = events
+        .iter()
+        .filter_map(|e| e["seq"].as_u64())
+        .max()
+        .unwrap()
+        + 1;
+    let line = json!({"seq": seq, "timestamp": "2026-10-15T00:00:00.000Z",
+        "type": "decider_check_answered", "payload": {
+            "state": "review", "visit_seq": c["visit_seq"], "gate": "comments",
+            "rule_id": "r", "declaration_hash": c["declaration_hash"],
+            "input_sha256": c["input_sha256"], "answer": "fail", "fallback_seq": seq}});
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(h.state_path())
+            .unwrap();
+        writeln!(f, "{}", line).unwrap();
+    }
+    let out = run_with(&h, "auto", r#"{"again": true}"#);
+    assert!(condition(&out).is_none(), "{}", out);
+    let last = gate_evals(&h).last().unwrap().clone();
+    assert_eq!(last["outcome"], "passed");
+    assert_eq!(last["output"]["agent_answered"], json!([]));
+    assert_eq!(h.stub.request_count(), 1);
+}
+
+#[test]
+fn an_answer_from_an_earlier_visit_does_not_apply() {
+    let h = harness(&looping_template(&criterion("r", "veto")), SLICE);
+    run(&h, "auto");
+    h.stub.push(Reply::status(401));
+    run_with(&h, "auto", r#"{"go": true}"#);
+    answer(&h, "r", "pass");
+    let out = run_with(&h, "auto", r#"{"again": false}"#);
+    assert_eq!(state_of(&out), "work", "{}", out);
+    h.stub.push(Reply::status(401));
+    let out = run_with(&h, "auto", r#"{"go": true}"#);
+    assert_waits_on_the_agent(&h, &out, "provider_error", "veto");
+    assert_eq!(fallbacks(&h).len(), 2);
+}
+
+#[test]
+fn a_changed_slice_goes_back_to_the_decider_after_an_answer() {
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    h.stub.push(Reply::status(401));
+    run(&h, "auto");
+    answer(&h, "r", "fail");
+    run(&h, "auto");
+    write_slice(&h, "let total = a + b; // totals feed the invoice\n");
+    h.stub.push(Reply::status(401));
+    let out = run(&h, "auto");
+    assert_waits_on_the_agent(&h, &out, "provider_error", "veto");
+    assert_eq!(fallbacks(&h).len(), 2, "a new fallback for the new slice");
+    write_slice(&h, "let total = a + b; // the invoice needs the total\n");
+    h.stub.push(pass("r"));
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+}
+
+#[test]
 fn a_self_transition_keeps_the_visit_and_an_arrival_opens_a_new_one() {
     // Shadow, so evidence can move the workflow while verdicts are kept.
     let h = harness(&looping_template(&criterion("r", "shadow")), SLICE);
@@ -779,10 +1047,19 @@ fn checks_share_the_per_call_cap_with_the_routing_decider() {
     assert_eq!(c[3]["blocked"], false);
     let g = gate_evals(&h);
     assert_eq!(g[0]["output"]["unanswered"], json!(["d"]));
+    assert_eq!(g[0]["output"]["awaiting"], json!(["d"]));
+    assert_eq!(fallbacks(&h)[0]["reason"], "cap_spent");
+    let f = findings(&out);
+    let levels: Vec<&Value> = f.iter().map(|f| &f["level"]).collect();
     assert_eq!(
-        findings(&out).len(),
-        3,
-        "the fails block, the spent cap doesn't"
+        levels,
+        vec![
+            &json!("error"),
+            &json!("error"),
+            &json!("error"),
+            &json!("warning")
+        ],
+        "three fails, and d handed to the agent"
     );
 
     // The next call consults d; a, b and c are reused.
@@ -823,7 +1100,7 @@ fn a_lock_held_past_the_wait_makes_criteria_busy() {
     let waited = started.elapsed();
     assert!(waited >= Duration::from_millis(1400), "{:?}", waited);
     assert_eq!(h.stub.request_count(), 0);
-    assert_unanswered_passes(&h, &out, "busy");
+    assert_waits_on_the_agent(&h, &out, "busy", "veto");
     drop(f);
 }
 
@@ -1426,4 +1703,148 @@ fn a_session_whose_cached_check_lost_its_spec_is_refused_on_resume() {
     // Nothing was asked and nothing appended: the session did not resume.
     assert_eq!(h.stub.request_count(), 0);
     assert_eq!(h.raw_log(), log);
+}
+
+// ---------------------------------------------------------------------------
+// koto decider answer
+// ---------------------------------------------------------------------------
+
+/// `koto decider answer` with these arguments, as the agent runs it.
+fn answer_cmd(h: &Harness, args: &[&str]) -> std::process::Output {
+    let mut cmd = h.koto();
+    cmd.args(["decider", "answer"]).args(args);
+    cmd.output().unwrap()
+}
+
+/// Assert `out` is the typed refusal `code` with exit 2, and that the log
+/// gained no event.
+fn assert_refused(h: &Harness, before: usize, out: &std::process::Output, code: &str) {
+    assert_eq!(out.status.code(), Some(2), "{}", describe(out));
+    let body = json_out(out);
+    assert_eq!(body["error"]["code"], code, "{}", body);
+    assert_eq!(body["command"], "decider answer");
+    assert_eq!(h.events().len(), before, "nothing appended");
+}
+
+#[test]
+fn the_command_the_waiting_finding_prints_records_the_answer() {
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    h.stub.push(Reply::status(401));
+    let out = run(&h, "auto");
+    let msg = findings(&out)[0]["message"].as_str().unwrap().to_string();
+    // The command between the first pair of backticks, with a word chosen.
+    let line = msg
+        .split('`')
+        .nth(1)
+        .unwrap()
+        .replace("<pass|fail|unclear>", "pass");
+    let words: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(&words[..3], &["koto", "decider", "answer"], "{}", line);
+    let rec = answer_cmd(&h, &words[3..]);
+    assert!(rec.status.success(), "{}", describe(&rec));
+    let body = json_out(&rec);
+    assert_eq!(body["status"], "recorded");
+    assert_eq!(body["answer"], "pass");
+
+    // The event names everything the next evaluation binds on.
+    let fb = h.events_of("decider_fallback").last().unwrap().clone();
+    let ans = h.events_of("decider_check_answered");
+    assert_eq!(ans.len(), 1);
+    let p = &ans[0]["payload"];
+    assert_eq!(p["state"], "review");
+    assert_eq!(p["gate"], "comments");
+    assert_eq!(p["rule_id"], "r");
+    assert_eq!(p["answer"], "pass");
+    assert_eq!(p["visit_seq"], fb["payload"]["visit_seq"]);
+    assert_eq!(p["declaration_hash"], fb["payload"]["declaration_hash"]);
+    assert_eq!(p["input_sha256"], fb["payload"]["input_sha256"]);
+    assert_eq!(p["fallback_seq"], fb["seq"]);
+
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+}
+
+#[test]
+fn the_answer_command_refuses_what_it_cannot_record() {
+    let h = harness(&check_template(&criteria(&["r", "s"], "veto")), SLICE);
+    h.stub.push(Reply::status(401));
+    h.stub.push(pass("s"));
+    run(&h, "auto");
+    let before = h.events().len();
+
+    let out = answer_cmd(
+        &h,
+        &[
+            WF,
+            "--gate",
+            "comments",
+            "--criterion",
+            "r",
+            "--answer",
+            "yes",
+        ],
+    );
+    assert_refused(&h, before, &out, "invalid_answer");
+    let out = answer_cmd(
+        &h,
+        &[WF, "--gate", "nope", "--criterion", "r", "--answer", "pass"],
+    );
+    assert_refused(&h, before, &out, "unknown_criterion");
+    let out = answer_cmd(
+        &h,
+        &[
+            WF,
+            "--gate",
+            "comments",
+            "--criterion",
+            "zz",
+            "--answer",
+            "pass",
+        ],
+    );
+    assert_refused(&h, before, &out, "unknown_criterion");
+    // s got a verdict: nothing fell back, so there is nothing to answer.
+    let out = answer_cmd(
+        &h,
+        &[
+            WF,
+            "--gate",
+            "comments",
+            "--criterion",
+            "s",
+            "--answer",
+            "pass",
+        ],
+    );
+    assert_refused(&h, before, &out, "no_fallback");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_answer_is_recorded_while_another_tick_holds_the_lock() {
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    h.stub.push(Reply::status(401));
+    run(&h, "auto");
+    let lock = hold_lock(&h);
+    let started = Instant::now();
+    let out = answer_cmd(
+        &h,
+        &[
+            WF,
+            "--gate",
+            "comments",
+            "--criterion",
+            "r",
+            "--answer",
+            "pass",
+        ],
+    );
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the answer doesn't wait"
+    );
+    drop(lock);
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
 }

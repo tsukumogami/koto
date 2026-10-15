@@ -1133,6 +1133,23 @@ koto dashboard --once my-workflow
 koto dashboard --interval 200
 ```
 
+### decider answer
+
+Records your answer to a decider-check criterion the decider couldn't grade. When a decider check gets no verdict for a criterion (its slice was over budget, the extraction failed, the provider errored or answered something unreadable, the per-call cap was spent, or another `koto next` held the lock), `koto next` stops the state with the check `pending` and a warning finding that names the criterion, its question, what pass, fail and `unclear` mean, and this command. See [decider-authoring.md](decider-authoring.md) for how the fallback works.
+
+```bash
+koto decider answer <name> --gate <check> --criterion <criterion id> --answer <pass|fail|unclear>
+```
+
+**Required flags:**
+- `--gate <check>` -- The decider check (gate) the finding names.
+- `--criterion <criterion id>` -- The criterion's id.
+- `--answer <pass|fail|unclear>` -- Your judgment of your own work. `unclear` is the criterion's escape.
+
+The answer binds to the slice the check was judging when the criterion fell back, and decides that criterion on the next `koto next` of the same slice in the same visit: `pass` and `unclear` let it through, `fail` blocks in veto mode until the work changes or you answer again. If you change the work instead, the next `koto next` asks the decider about the new slice. The latest answer for a slice wins. The command never consults the decider and doesn't wait for the decider lock.
+
+Prints `{"status":"recorded","gate":...,"criterion":...,"answer":...}` and exits 0. Refusals (`invalid_answer`, `unknown_criterion`, `no_fallback`) exit 2 with a typed code; see [error-codes.md](../reference/error-codes.md#decider-answer).
+
 ### decider report
 
 Reads the decider ledger and reports, per question and per value, how often the decider agreed with agents. With `--fixtures` it also runs a golden fixture set against the configured decider and marks each value promotion-eligible or not. The command only reads: it never changes a mode, never writes the ledger or a session log, and compiles the template in memory without touching the compile cache. The promotion workflow it supports is described in [decider-authoring.md](decider-authoring.md#promoting-a-value-to-auto).

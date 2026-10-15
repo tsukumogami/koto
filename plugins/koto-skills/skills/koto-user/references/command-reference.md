@@ -37,6 +37,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto context remove` | Runner — primary |
 | `koto context list` | Runner — primary |
 | `koto config get/set/unset/list` | Runner — setup only |
+| `koto decider answer` | Runner — primary, when a decider-check criterion waits on your answer |
 | `koto decider report` | Maintainer — decider promotion |
 | `koto template compile` | Author (brief mention) |
 | `koto template validate` | Author only |
@@ -1080,6 +1081,16 @@ The `[decider]` keys opt the user in to consulting a decider on declared templat
 | `decider.timeout_ms` | 1 to 10000 | `2000` | no, user config only |
 
 `decider.api_key` is user-config-only, and `koto config get decider.api_key` and `koto config list` show it as `<set>`, never the key itself. `KOTO_DECIDER` overrides the user mode. A key alone opts nobody in: the effective mode must also be `shadow` or `auto`, and the key is sent only to an endpoint from the same place (both env or both user config) or to the default. koto ignores `api_key`, `endpoint`, and `timeout_ms` in a project `.koto/config.toml` and warns.
+
+---
+
+## koto decider answer
+
+```bash
+koto decider answer <name> --gate <check> --criterion <criterion id> --answer <pass|fail|unclear>
+```
+
+Records your answer to a decider-check criterion the decider couldn't grade. Run it when a `koto next` response has a decider check with status `pending`, the criterion under its output's `awaiting` list, and a `warning` finding that gives this exact command; then run `koto next` again. The answer applies to the work as the check last saw it: `pass` and `unclear` let the criterion through, `fail` blocks in veto mode until the work changes or you answer again. It prints `{"status":"recorded",...}`. It refuses, with exit 2 and a JSON `error.code`, an answer other than the three words (`invalid_answer`), a check or criterion the current state doesn't declare (`unknown_criterion`), and a criterion that isn't waiting on you in this visit (`no_fallback`).
 
 ---
 

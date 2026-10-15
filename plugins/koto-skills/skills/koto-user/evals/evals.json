@@ -209,15 +209,16 @@
     },
     {
       "id": 17,
-      "name": "decider-check-no-verdict-is-not-overridden",
-      "prompt": "I'm running the koto workflow 'fix-771', opted in to the decider at `auto`. The `review` state has a veto `decider-check` gate `comment_reasons`. My last `koto next` returned `evidence_required` for `review` with no blocking conditions, but the session log shows the check's `gate_evaluated` with outcome `passed` and output `{\"failed\": [], \"unanswered\": [\"comment_reason\"], \"error\": \"\"}`, and a `decider_checked` with outcome `unanswered`, reason `provider_error`, `blocked: false`. Before I submit the review evidence, should I record `koto overrides record fix-771 --gate comment_reasons --rationale \"decider was down\"` so the missing verdict is on record, and should I rewrite the comments I added in case they fail?",
-      "expected_output": "Agent says neither is needed. A missing verdict never blocks: the check passed with `comment_reason` listed as unanswered and the reason already recorded on `decider_checked`, so there is nothing to override and an override of a check that blocks nothing records nothing useful. Nothing was judged, so the comments weren't found wanting and don't need rewriting on the check's account. It also doesn't mean the comments were checked and met the criterion. The agent should carry on and submit the evidence the `review` directive asks for.",
+      "name": "decider-check-no-verdict-is-answered-not-overridden",
+      "prompt": "I'm running the koto workflow 'fix-771', opted in to the decider at `auto`. My last `koto next` stopped in `review` with a blocking condition for the veto `decider-check` gate `comment_reasons`: status `pending`, category `corrective`, output `{\"failed\": [], \"unanswered\": [\"comment_reason\"], \"awaiting\": [\"comment_reason\"], \"agent_answered\": [], \"error\": \"\"}`, and one warning finding: \"criterion comment_reason is waiting on your answer: the decider gave no verdict (provider_error). Record it with `koto decider answer fix-771 --gate comment_reasons --criterion comment_reason --answer <pass|fail|unclear>`, then run `koto next fix-771` again. Does every comment this change adds record why the code is shaped this way? Answer pass if: Each added comment gives a reason the code can't show. Answer fail if: At least one added comment restates what the code does. Answer unclear if: The change adds no comment, or it can't be judged.\" The two comments I added both explain why the retry waits. Should I record `koto overrides record fix-771 --gate comment_reasons --rationale \"decider was down\"` to get past this?",
+      "expected_output": "Agent says not to override. The decider gave no verdict, so the criterion fell back to the agent, which should judge its own comments against the question and record its answer with the command the finding gives: here `koto decider answer fix-771 --gate comment_reasons --criterion comment_reason --answer pass`, since both comments give a reason, then run `koto next fix-771` again. An answer of fail would block until the comments are fixed.",
       "files": [],
       "assertions": [
-        "Response says no override is needed because a missing verdict does not block the state",
-        "Response says the comments don't need rewriting on the check's account because nothing was judged",
-        "Response tells the agent to continue with the state, for example by submitting the review evidence with `koto next`",
-        "Response does NOT claim the unanswered criterion means the comments passed or were checked and met"
+        "Response says not to record an override for the waiting criterion",
+        "Response tells the agent to run `koto decider answer` for criterion `comment_reason` of gate `comment_reasons`",
+        "Response chooses `pass` for these comments, or tells the agent to choose the word that matches its honest judgment of the question",
+        "Response tells the agent to run `koto next` again after answering",
+        "Response does NOT claim the missing verdict means the comments passed or were checked by the decider"
       ]
     }
   ]

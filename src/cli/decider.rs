@@ -1,4 +1,6 @@
 //! `koto decider report`: the ledger report and the fixture runner.
+//! (`koto decider answer`, the one decider verb that writes to a session,
+//! lives in `decider_answer.rs`.)
 //!
 //! The command only reads. It reads the ledger, and with `--fixtures` it
 //! reads the config files, compiles the named template in memory (no
@@ -36,6 +38,9 @@ pub enum DeciderCommand {
     /// Report decider agreement from the ledger and, with --fixtures,
     /// judge promotion eligibility against a golden fixture set
     Report(ReportArgs),
+    /// Record your answer to a decider-check criterion the decider gave no
+    /// verdict on: pass, fail, or unclear
+    Answer(super::decider_answer::AnswerArgs),
 }
 
 /// Flags of `koto decider report`.
@@ -84,6 +89,8 @@ fn fail(code: i32, msg: impl std::fmt::Display) -> ! {
 pub fn handle(cmd: DeciderCommand) -> anyhow::Result<()> {
     match cmd {
         DeciderCommand::Report(args) => handle_report(args),
+        // Dispatched with a session backend in `cli::run`, never here.
+        DeciderCommand::Answer(_) => unreachable!("decider answer is dispatched in cli::run"),
     }
 }
 

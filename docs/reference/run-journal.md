@@ -79,17 +79,18 @@ their digest (see
 | `terminal` | `koto.terminal` | The session arrives at a terminal state. |
 | `cancelled` | none | The session is cancelled. |
 | `driver_seen` | `koto.driver.session.id` | A command runs under a driving session other than the last one recorded for it. |
-| `check_evaluated` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.check.outcome`, `koto.attempt`, `koto.visit_attempt`, `koto.check.rule_count`, `koto.check.rule_counts_truncated`, `koto.check.duration_ms`, `koto.poll.status`, `koto.check.unanswered_count`, `koto.check.error` | koto evaluates a gate and the result isn't pending, or runs a state's default action. |
+| `check_evaluated` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.check.outcome`, `koto.attempt`, `koto.visit_attempt`, `koto.check.rule_count`, `koto.check.rule_counts_truncated`, `koto.check.duration_ms`, `koto.poll.status`, `koto.check.unanswered_count`, `koto.check.error`, `koto.decider.awaiting_count`, `koto.decider.agent_answered_count` | koto evaluates a gate and the result isn't pending, or runs a state's default action. |
 | `check_rule` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.rule.visit_count`, `koto.rule.session_count` | Once for each error rule of a check evaluation, after its `check_evaluated`. |
-| `check_pending` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.poll.status`, `koto.poll.evaluations`, `koto.poll.elapsed_secs` | A polling gate's evaluation is still pending. |
+| `check_pending` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.poll.status`, `koto.poll.evaluations`, `koto.poll.elapsed_secs`, `koto.decider.awaiting_count`, `koto.decider.agent_answered_count` | A polling gate's evaluation is still pending, or a decider check is waiting on the agent. |
 | `decider_consulted` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.outcome`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.latency_ms`, `koto.decider.directive_bytes` | koto consults the decider about a state's evidence. |
-| `decider_checked` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.mode`, `koto.decider.outcome`, `koto.decider.reason`, `koto.decider.blocked`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.attempts`, `koto.decider.latency_ms` | koto grades one criterion of a decider check. |
+| `decider_checked` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.mode`, `koto.decider.outcome`, `koto.decider.reason`, `koto.decider.blocked`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.attempts`, `koto.decider.latency_ms`, `koto.decider.input_bytes` | koto grades one criterion of a decider check. |
+| `decider_fallback` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.mode`, `koto.decider.reason`, `koto.decider.input_bytes` | A decider-check criterion that got no verdict is handed to the agent. |
 | `check_overridden` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check` | An override is recorded for a gate. |
 | `response` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.response.source`, `koto.response.directive_bytes`, `koto.response.details_bytes` | `koto next` or `koto status` has printed a non-terminal state's directive. |
 | `context_reads` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.context.key`, `koto.context.reader`, `koto.context.access`, `koto.context.overflow`, `koto.context.read_count`, `koto.context.present_count`, `koto.context.first_hash`, `koto.context.last_hash` | A state visit that read context keys ends. |
 
 The first five are the identity kinds. The next three are the check kinds,
-described in [Check records](#check-records), the three after them are the
+described in [Check records](#check-records), the four after them are the
 decider and override kinds, described in
 [Decider and override records](#decider-and-override-records), `response`
 is described in [Response records](#response-records), and `context_reads`
@@ -179,6 +180,8 @@ One record per check evaluation: a `gate_evaluated` whose outcome isn't
 | `koto.poll.status` | string | polling gates | Where the poll settled: `done`, `failed` or `timed_out`. |
 | `koto.check.unanswered_count` | integer | decider checks | How many veto criteria got no verdict. |
 | `koto.check.error` | string | decider checks, when set | Why no criterion could be graded, such as `log_unreadable` or `missing_spec`. |
+| `koto.decider.awaiting_count` | integer | decider checks | How many criteria are waiting on the agent's answer (the length of the check's `awaiting` output list), 0 included. Non-zero here only beside a failed criterion; a check that only waits writes `check_pending`. |
+| `koto.decider.agent_answered_count` | integer | decider checks | How many criteria this evaluation took from an answer the agent recorded (its `agent_answered` output list), 0 included. |
 
 ### `check_rule`
 
@@ -205,18 +208,22 @@ check the agent isn't converging on; one that stops before a passing
 
 ### `check_pending`
 
-One record per evaluation of a polling gate that is still pending. A
+One record per evaluation of a polling gate that is still pending, or of
+a decider check waiting on the agent's answer (see
+[`decider_fallback`](#decider_fallback)). A
 pending evaluation judged nothing, so it carries no outcome, attempt or rule
-field and never a `check_evaluated`. The evaluation where the poll settles
-is a check evaluation.
+field and never a `check_evaluated`. The evaluation where the poll settles,
+or where the decider check stops waiting, is a check evaluation.
 
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|
 | `koto.state` | string | always | The state the gate belongs to. |
 | `koto.check` | string | always | The gate's name. |
-| `koto.poll.status` | string | always | `pending`. |
-| `koto.poll.evaluations` | integer | always | The gate's runs since its polling window opened, at least 1. |
-| `koto.poll.elapsed_secs` | integer | always | Seconds since the polling window opened. |
+| `koto.poll.status` | string | polling gates | `pending`. |
+| `koto.poll.evaluations` | integer | polling gates | The gate's runs since its polling window opened, at least 1. |
+| `koto.poll.elapsed_secs` | integer | polling gates | Seconds since the polling window opened. |
+| `koto.decider.awaiting_count` | integer | decider checks | How many criteria are waiting on the agent's answer, at least 1. |
+| `koto.decider.agent_answered_count` | integer | decider checks | How many criteria this evaluation took from an answer the agent recorded, 0 included. |
 
 A polling gate re-run several times inside one evaluation (a `hold_secs`
 wait) writes one record for that evaluation, and `koto.poll.evaluations`
@@ -305,7 +312,7 @@ within a visit appends no event, so it writes no record.
 | `koto.decider.model` | string | always | The model the provider reported, or `unknown`. |
 | `koto.decider.mode` | string | always | The criterion's effective mode: `veto` or `shadow`. |
 | `koto.decider.outcome` | string | always | `pass`, `fail`, `escape`, `unanswered` or `not_graded`. |
-| `koto.decider.reason` | string | when logged | Why a criterion got no verdict: `provider_error`, `unreadable_response`, `over_budget`, `extraction_failed`, `cap_spent` or `busy`. |
+| `koto.decider.reason` | string | when logged | Why a criterion got no verdict: `provider_error`, `unreadable_response`, `over_budget`, `extraction_failed`, `cap_spent` or `busy`. Later koto versions may add values; every value is a fixed identifier koto defines, never a message, a path or instruction text. |
 | `koto.decider.blocked` | boolean | always | Whether this verdict blocked the state. |
 | `koto.decider.error_class` | string | when logged | Why the last provider call failed. |
 | `koto.decider.input_tokens` | integer | when logged | Input tokens, summed over the attempts that reported usage. |
@@ -313,6 +320,7 @@ within a visit appends no event, so it writes no record.
 | `koto.decider.unread_usage_attempts` | integer | always | Billed attempts whose token usage couldn't be read. |
 | `koto.decider.attempts` | integer | always | Provider calls made for this criterion, 0 when none was sent. |
 | `koto.decider.latency_ms` | integer | always | Wall time of those calls, in milliseconds. |
+| `koto.decider.input_bytes` | integer | when the extraction produced output | The slice's size in bytes, after redaction, as captured. Capture stops at 64 KiB, so 65,536 means at least that many. |
 
 A failing veto criterion is also one of its gate's error rules, so the
 gate's `check_evaluated` that follows has a `check_rule` for it under the
@@ -324,6 +332,40 @@ To total decider tokens, sum `koto.decider.input_tokens` and
 its own. Sum `koto.decider.unread_usage_attempts` the same way: a nonzero
 count means some billed answers' usage couldn't be read, so that model's
 totals are a lower bound.
+
+### `decider_fallback`
+
+One record per decider-check criterion handed to the agent: a committed
+`decider_fallback` event. A criterion falls back when it got no verdict
+(the slice was over budget, the extraction failed, the provider failed or
+answered something unreadable, the per-call cap was spent, or the decider
+lock stayed held) and no answer the agent recorded for that slice applies.
+The check then waits on the agent's answer, recorded with `koto decider
+answer`, and its gate writes `check_pending` until the answer or the
+decider decides it. A fallback's record comes after its evaluation's
+`decider_checked` records and before the gate's `check_evaluated` or
+`check_pending`.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.state` | string | always | The state the check belongs to. |
+| `koto.check` | string | always | The decider check's gate name. |
+| `koto.rule.id` | string | always | The criterion's id, or its digest (see [Rule ids](#rule-ids)). |
+| `koto.decider.mode` | string | always | The criterion's effective mode: `veto` or `shadow`. |
+| `koto.decider.reason` | string | always | Why it got no verdict, as on `decider_checked`. A fixed identifier, never a message, a path or instruction text. |
+| `koto.decider.input_bytes` | integer | except with `extraction_failed` | The slice's size in bytes, after redaction, as captured. Capture stops at 64 KiB, so 65,536 means at least that many. Absent when the extraction failed and there is no slice. |
+
+A criterion still waiting is evaluated again on every `koto next`, and each
+evaluation that hands it over again writes another record. So the number of
+records is the number of times the agent was asked; the number of distinct
+fallbacks is the number of distinct `koto.session.id`, `koto.visit.seq`,
+`koto.check` and `koto.rule.id` groups. The agent's answer is not relayed:
+a gate it decided has `koto.decider.agent_answered_count` above 0, and an
+answered `fail` in veto mode is one of its gate's error rules, with a
+`check_rule` under the criterion's `koto.rule.id`.
+
+The record never holds the slice, its hash, the criterion's question or
+descriptions, or anything the agent wrote.
 
 ### `check_overridden`
 

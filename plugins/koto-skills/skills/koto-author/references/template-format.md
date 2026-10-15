@@ -809,9 +809,12 @@ gates:
 
 A check only ever vetoes. A criterion in `veto`, for a user whose effective
 decider mode is `auto`, blocks the state on a `fail` verdict only. A
-missing or malformed verdict never blocks: the criterion is listed under the
-check's `output.unanswered` and recorded with its reason, and it is never
-read as a pass. A pass, an escape and an empty or whitespace-only slice (not
+missing or malformed verdict is never read as a pass: the criterion falls
+back to the agent, in veto and in shadow. The check is `pending` and the
+agent is shown the criterion's `question` and its `pass`, `fail` and
+`escape` descriptions, so write them for the agent as well as the decider;
+the agent answers with `koto decider answer`, and its `fail` blocks in veto
+(see `docs/guides/decider-authoring.md`). A pass, an escape and an empty or whitespace-only slice (not
 graded, nothing asked) never block, and a pass
 never advances anything. In `shadow` nothing blocks and every verdict
 is recorded. For users who aren't opted in, the state behaves as if the check

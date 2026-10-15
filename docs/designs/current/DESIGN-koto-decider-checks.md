@@ -37,6 +37,12 @@ user_visible_surface: true
 
 Current
 
+Superseded in part by [DESIGN-decider-fallback](./DESIGN-decider-fallback.md):
+where this design says a criterion with no verdict passes its gate, a
+current koto hands the criterion to the agent instead. The check is
+`pending`, the agent records its answer with `koto decider answer`, and a
+`decider_fallback` event records each hand-off. Everything else here holds.
+
 ## Context and Problem Statement
 
 The requirements are in `docs/prds/PRD-koto-decider-checks.md` (R1 to R34).
