@@ -16,6 +16,8 @@
 //! makes every matching request answer with a given status instead, and
 //! [`FakeS3::put_after`] stores an object as soon as a given request has
 //! been handled, the way another writer racing the command would.
+//! [`FakeS3::set_latency`] holds every reply for a fixed time, so a test can
+//! see what a command's round trips cost against a distant bucket.
 //!
 //! Authentication is ignored. A missing object or bucket answers 404 with an
 //! S3 XML error body, as a real endpoint does. Each connection is read and
@@ -75,6 +77,7 @@ struct State {
     requests: Vec<Request>,
     faults: Vec<Fault>,
     triggers: Vec<Trigger>,
+    latency: Duration,
     shutdown: bool,
 }
 
@@ -201,6 +204,12 @@ impl FakeS3 {
             bytes: bytes.to_vec(),
         });
     }
+
+    /// Hold every reply for `latency` before sending it, as a bucket across
+    /// a network would. Zero, the default, answers at once.
+    pub fn set_latency(&self, latency: Duration) {
+        lock(&self.state).latency = latency;
+    }
 }
 
 impl Drop for FakeS3 {
@@ -323,6 +332,10 @@ fn serve(stream: TcpStream, bucket: &str, state: &Mutex<State>) {
     // Before the reply goes out, so the client's next request already
     // sees what the trigger stored.
     fire_triggers(&req, bucket, state);
+    let latency = lock(state).latency;
+    if !latency.is_zero() {
+        thread::sleep(latency);
+    }
     write_reply(stream, &req.method, &reply);
 }
 

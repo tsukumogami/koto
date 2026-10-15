@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod cloud;
 pub mod context;
 pub mod context_log;
@@ -572,6 +573,16 @@ impl Backend {
     /// `crate::engine::template_source_status`.
     pub fn is_cloud(&self) -> bool {
         matches!(self, Backend::Cloud(_))
+    }
+
+    /// Push the writes the commands of a tick on `id` deferred
+    /// ([`batch`]); `koto next` calls it before it exits. The local backend
+    /// has no remote half and nothing to push.
+    pub fn flush_pending(&self, id: &str) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(_) => Ok(()),
+            Backend::Cloud(b) => b.flush_pending(id),
+        }
     }
 
     /// The local directory sessions are stored under.

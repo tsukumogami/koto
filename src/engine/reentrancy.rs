@@ -45,6 +45,27 @@ pub fn enclosing_tick() -> Option<String> {
 /// runs one session and then exits.
 pub fn mark_tick(session: &str) {
     std::env::set_var(TICK_SESSION_ENV, session);
+    TICK_OWNER.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Set by [`mark_tick`]: this process is the tick, not a command it runs.
+/// The marker alone can't say which, since the tick stamps its own
+/// environment as well as its commands'.
+static TICK_OWNER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process is a `koto next` tick (it called [`mark_tick`]).
+pub fn is_tick_process() -> bool {
+    TICK_OWNER.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether this process is a command an enclosing tick on `session` is
+/// running: the marker names `session` and this process isn't the tick.
+///
+/// The cloud backend defers such a command's writes to `session` and leaves
+/// the bucket to the tick, which flushes them once before it returns
+/// (koto#376). A command writing to any other session pushes at once.
+pub fn runs_inside_tick_of(session: &str) -> bool {
+    !is_tick_process() && enclosing_tick().as_deref() == Some(session)
 }
 
 /// The message a nested `koto next` refuses with.

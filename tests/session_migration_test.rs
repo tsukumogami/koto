@@ -1321,10 +1321,10 @@ fn the_marker_check_adds_one_request_to_next_and_none_on_the_local_backend() {
     let state = format!("{}koto-plain.state.jsonl", session);
     let get = format!("GET {}", state);
     let put = format!("PUT {}", state);
-    // The requests `koto next` made before the marker check existed
-    // (measured with the check switched off): the pulls of the state file
-    // and the pushes of the events the tick appends.
-    let before_the_check = vec![get.clone(), get.clone(), put.clone(), put.clone(), put, get];
+    // The requests `koto next` makes without the marker check: one pull of
+    // the state file (a tick pulls its own session once, koto#376) and the
+    // pushes of the events the tick appends.
+    let before_the_check = vec![get, put.clone(), put.clone(), put];
     // The marker check: the one added request, answered once for the
     // whole tick though the gate reads a context key.
     let mut expected = vec![format!("LIST {}migrated.json", session)];
