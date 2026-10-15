@@ -1041,9 +1041,14 @@ pub fn gate_type_schema(gate_type: &str) -> Option<&'static [(&'static str, Gate
             ("payload", Object),
             ("error", Str),
         ]),
-        // Must stay in step with the output the check evaluator builds in
-        // `src/cli/check_evaluator.rs`. No `when` clause may read it; the
-        // schema exists for override values and the override record.
+        // The keys every decider-check output has carried since the gate
+        // type shipped; the evaluator in `src/cli/check_evaluator.rs` builds
+        // them. Its later lists, `awaiting` and `agent_answered`, are left
+        // out on purpose: the schema is enforced on `override_default`, so
+        // adding them would break every template that declares one, and an
+        // override value without `awaiting` correctly doesn't block. No
+        // `when` clause may read it; the schema exists for override values
+        // and the override record.
         GATE_TYPE_DECIDER_CHECK => {
             Some(&[("failed", Array), ("unanswered", Array), ("error", Str)])
         }
@@ -1090,7 +1095,9 @@ pub fn gate_type_builtin_default(gate_type: &str) -> Option<serde_json::Value> {
 
 /// The built-in default for a `decider-check` gate: no failing and no
 /// unanswered criteria. Shared by both default functions and the gate
-/// evaluator's pass when no check evaluator is supplied.
+/// evaluator's pass when no check evaluator is supplied. It matches the
+/// schema's three keys; a reader treats the absent `awaiting` and
+/// `agent_answered` lists as empty.
 pub fn decider_check_default_output() -> serde_json::Value {
     serde_json::json!({"failed": [], "unanswered": [], "error": ""})
 }

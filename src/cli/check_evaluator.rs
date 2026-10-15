@@ -415,9 +415,9 @@ impl<'a> CliCheckEvaluator<'a> {
         } else {
             None
         };
-        // Without the log there is no state or visit to record under, and
-        // no verdict to reuse, so nothing is asked or recorded: every veto
-        // criterion is listed as unanswered and the check passes. That
+        // Without the log there is no state or visit to record under, no
+        // verdict to reuse and no answer to read, so nothing is asked or
+        // recorded: every criterion waits and the check is pending. That
         // holds whatever the slice decided (empty, over budget, a failed
         // extraction), since none of it can be recorded either. A log that
         // names no state is treated the same way. The lock wait above may

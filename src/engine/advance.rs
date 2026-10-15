@@ -1623,10 +1623,11 @@ where
                     // Every resolved gate of this entry carries the same
                     // stamp. Rule counts are per check, so one gate's event
                     // never feeds another's counts within the attempt. A
-                    // pending polling gate judged nothing: it carries no
-                    // stamp and no rule counts, and doesn't create an
-                    // attempt, so the attempt is the evaluation where the
-                    // poll resolves.
+                    // pending gate judged nothing: it carries no stamp and
+                    // no rule counts, and doesn't create an attempt, so the
+                    // attempt is the evaluation where a polling gate's poll
+                    // resolves, or where a decider check stops waiting on
+                    // the agent.
                     let check = if result.outcome == GateOutcome::Pending {
                         pending_check_fields(result)
                     } else {
