@@ -1020,7 +1020,7 @@ Records when an agent bypassed a failing gate via `koto overrides record`.
 | `gate` | string | Yes | Gate identifier string. |
 | `rationale` | string | Yes | Human-readable reason for the override. |
 | `override_applied` | object | Yes | The value substituted as if the gate had produced it. Schema is gate-type-specific. |
-| `actual_output` | object | Yes | The gate's actual output at override time. Schema is gate-type-specific. For a `decider-check` gate it lists the criteria that failed, the only ones that block, under `failed`, and those that got no verdict under `unanswered`. |
+| `actual_output` | object | Yes | The gate's actual output at override time. Schema is gate-type-specific. For a `decider-check` gate it lists the criteria that failed under `failed`, those that got no verdict under `unanswered`, and those waiting on the agent's answer under `awaiting`. |
 | `timestamp` | string | Yes | RFC 3339 UTC timestamp. Matches the outer envelope `timestamp`. |
 
 ---

@@ -53,12 +53,15 @@
 //!
 //! - `check_evaluated`: one per `gate_evaluated` that isn't pending and per
 //!   `default_action_executed` (check `__action__`), with the outcome,
-//!   attempt numbers, rule count and run time.
+//!   attempt numbers, rule count and run time; a decider check's also
+//!   carries its awaiting and agent-answered criterion counts.
 //! - `check_rule`: one per key of that event's `rule_counts`, after its
 //!   `check_evaluated`, with the rule's visit and session counts. A rule id
 //!   outside the name shape is written as its digest ([`name_or_digest`]).
-//! - `check_pending`: one per pending `gate_evaluated` of a polling gate,
-//!   with the poll's run count and elapsed seconds, never an outcome.
+//! - `check_pending`: one per pending `gate_evaluated` of a polling gate or
+//!   of a decider check waiting on the agent, never an outcome. A polling
+//!   gate's carries the poll's run count and elapsed seconds; a decider
+//!   check's carries the two criterion counts instead.
 //!
 //! Four more are relayed the same way, with the same two sequence
 //! numbers, from decider and override events:

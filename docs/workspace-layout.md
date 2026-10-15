@@ -250,7 +250,10 @@ Each line is a JSON object tagged by `kind`:
   carries the state, `visit_seq`, the gate, `rule_id`,
   `declaration_hash`, and `override_kind` (`candidate_false_fail`; lines
   from older builds may also say `overridden_unanswered`, for an
-  unanswered criterion, which no longer blocks).
+  unanswered criterion; koto writes neither for a criterion waiting on the
+  agent or one the agent answered `fail`, and a fallback to the agent
+  writes no ledger line, its record being the session's `decider_fallback`
+  event).
 
 Every kind also carries `v` (always 1), `at` (RFC 3339 UTC), `session`
 (the session name), and `session_id` (the session header's UUID, or

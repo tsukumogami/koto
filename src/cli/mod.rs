@@ -2015,7 +2015,9 @@ pub fn run(app: App) -> Result<()> {
         }
         Command::Config { subcommand } => handle_config(subcommand),
         Command::Decider { subcommand } => match subcommand {
-            // The one decider verb that writes to a session.
+            // The one decider verb that writes to a session. A future verb
+            // that writes to one is wired here, with a backend, as well as in
+            // decider::handle's match.
             decider::DeciderCommand::Answer(args) => {
                 let backend = build_backend()?;
                 decider_answer::handle_answer(&backend, args)

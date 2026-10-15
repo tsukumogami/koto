@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Checks that koto v0.14.1 reads a session and a decider ledger the new build
 # writes while a template uses a decider check
-# (DESIGN-koto-decider-checks.md).
+# (DESIGN-koto-decider-checks.md), including a criterion that falls back to
+# the agent (DESIGN-decider-fallback.md).
 #
 #   KOTO_FLOOR_BIN=/abs/path/to/koto-0.14.1 \
 #   KOTO_NEW_BIN=/abs/path/to/target/release/koto \
@@ -14,9 +15,12 @@
 # state with no decider check whose field the routing decider answers in
 # shadow, so its `decider_consulted` carries the answer's tokens and model. A
 # second session, nv, points at an endpoint nothing listens on: the criterion
-# gets no verdict, which never blocks, so its gate passes with the criterion
-# under output.unanswered and the session moves on to work on its own, where
-# the routing consultation fails to connect and bills nothing. The logs must
+# gets no verdict, so it falls back to the agent. Its gate is pending with the
+# criterion under output.awaiting and a decider_fallback event, and review
+# waits. The script answers pass with `koto decider answer`, which appends a
+# decider_check_answered event, and the next tick passes review on that
+# answer and moves on to work, where the routing consultation fails to
+# connect and bills nothing. The logs must
 # hold every event in EVENT_CHECKS and NV_EVENT_CHECKS, and the new build's
 # `koto template validate-feed` must accept them against
 # docs/reference/session-feed.md. The ledger must hold a `checked` and a
@@ -66,7 +70,10 @@ EVENT_CHECKS=(
 # the criterion listed as unanswered, never read as compliance.
 NV_EVENT_CHECKS=(
   'decider_checked for the unanswered criterion|.type? == "decider_checked" and .payload.rule_id == "comment_reason" and .payload.outcome == "unanswered" and .payload.reason == "provider_error" and .payload.mode == "veto" and .payload.blocked == false'
-  'gate_evaluated passing with the criterion unanswered|.type? == "gate_evaluated" and .payload.gate == "comments" and .payload.outcome == "passed" and .payload.output.failed == [] and .payload.output.unanswered == ["comment_reason"] and (.payload | has("findings") | not)'
+  'decider_fallback handing the criterion to the agent|.type? == "decider_fallback" and .payload.gate == "comments" and .payload.rule_id == "comment_reason" and .payload.reason == "provider_error" and .payload.mode == "veto" and (.payload.visit_seq | type) == "number" and (.payload.declaration_hash | type) == "string" and (.payload.input_sha256 | type) == "string" and (.payload.input_bytes | type) == "number"'
+  'gate_evaluated pending on the waiting criterion|.type? == "gate_evaluated" and .payload.gate == "comments" and .payload.outcome == "pending" and .payload.output.failed == [] and .payload.output.unanswered == ["comment_reason"] and .payload.output.awaiting == ["comment_reason"] and .payload.findings[0].level == "warning"'
+  'decider_check_answered recording pass|.type? == "decider_check_answered" and .payload.gate == "comments" and .payload.rule_id == "comment_reason" and .payload.answer == "pass" and (.payload.fallback_seq | type) == "number" and (.payload.declaration_hash | type) == "string"'
+  'gate_evaluated passing on the answer|.type? == "gate_evaluated" and .payload.gate == "comments" and .payload.outcome == "passed" and .payload.output.agent_answered == ["comment_reason"] and .payload.output.unanswered == [] and .payload.output.awaiting == []'
   'decider_consulted that billed nothing|.type? == "decider_consulted" and .payload.state == "work" and .payload.outcome == "error" and .payload.error_class == "connect" and (.payload | has("input_tokens") | not) and .payload.unread_usage_attempts == 0'
 )
 
@@ -76,6 +83,9 @@ STRIPPED_FIELDS=(
   'visit_seq|.type? == "decider_checked"'
   'outcome|.type? == "decider_checked"'
   'unread_usage_attempts|.type? == "decider_consulted"'
+  'reason|.type? == "decider_fallback"'
+  'answer|.type? == "decider_check_answered"'
+  'fallback_seq|.type? == "decider_check_answered"'
 )
 
 # Values changed in place, every key kept, as "label|log|jq filter selecting
@@ -83,7 +93,8 @@ STRIPPED_FIELDS=(
 ALTERED_VALUES=(
   'a failed verdict read as a pass|wf|.type? == "decider_checked"|.payload.outcome = "pass"'
   'a no-verdict criterion marked as blocking|nv|.type? == "decider_checked"|.payload.blocked = true'
-  'the passing gate forgets its unanswered criterion|nv|.type? == "gate_evaluated" and .payload.gate == "comments"|.payload.output.unanswered = []'
+  'the waiting gate read as passed|nv|.type? == "gate_evaluated" and .payload.gate == "comments" and .payload.outcome == "pending"|.payload.outcome = "passed"'
+  'the agent answer read as fail|nv|.type? == "decider_check_answered"|.payload.answer = "fail"'
   'the routing tokens miscounted|wf|.type? == "decider_consulted"|.payload.input_tokens = 49'
 )
 
@@ -240,8 +251,17 @@ nv_koto init nv --template "$WORK_DIR/decider-checks.md" >/dev/null 2>"$SCRATCH/
   || fail "session: koto init nv failed: $(cat "$SCRATCH/init-nv.err")"
 out="$(nv_koto next nv --no-cleanup 2>&1)" || fail "session: nv's koto next exited non-zero: $out"
 got="$(printf '%s' "$out" | jq -er '.state')" || fail "session: nv's koto next printed no state: $out"
-[ "$got" = "work" ] || fail "session: a missing verdict should not block review, got: $out"
-pass "session: a missing verdict passes review -> $got"
+[ "$got" = "review" ] || fail "session: a missing verdict should stop review for the agent, got: $out"
+printf '%s' "$out" | jq -e '[.blocking_conditions[] | select(.name == "comments" and .status == "pending")] | length == 1' >/dev/null \
+  || fail "session: review shows no pending comments check: $out"
+pass "session: a missing verdict falls back to the agent -> $got"
+out="$(nv_koto decider answer nv --gate comments --criterion comment_reason --answer pass 2>&1)" \
+  || fail "session: koto decider answer failed: $out"
+pass "session: the agent answered pass"
+out="$(nv_koto next nv --no-cleanup 2>&1)" || fail "session: nv's second koto next exited non-zero: $out"
+got="$(printf '%s' "$out" | jq -er '.state')" || fail "session: nv's second koto next printed no state: $out"
+[ "$got" = "work" ] || fail "session: the agent's pass should let review through, got: $out"
+pass "session: the agent's answer passes review -> $got"
 NV_STATE="$(nv_koto status nv | jq -er '.current_state')" || fail "session: koto status nv failed"
 NV_LOG="$(find "$HOME_DIR" "$WORK_DIR" -name 'koto-nv.state.jsonl' -type f | head -n 1)"
 [ -n "$NV_LOG" ] || fail "session: no koto-nv.state.jsonl was written"

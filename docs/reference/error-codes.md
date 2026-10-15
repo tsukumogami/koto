@@ -312,8 +312,8 @@ for real on every tick. The same gate reports `agent_actionable: false` in
 
 `koto decider answer` records the agent's answer to a decider-check criterion
 the decider gave no verdict on. A missing session prints the flat format with
-exit 1, and an unreadable session log or template exits 3, as `koto overrides
-record` does. Three refusals carry a typed code, each with exit code 2 and
+exit 1. A session log that can't be read exits with the code its read error
+carries, and an unreadable template exits 3, as `koto overrides record` does. Three refusals carry a typed code, each with exit code 2 and
 nothing appended to the state log. The `error` object names the `gate`, the
 `criterion` and, once the session is loaded, the `state`.
 

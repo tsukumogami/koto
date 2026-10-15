@@ -523,8 +523,10 @@ states:
   text a criterion judges, never whole files: the redactor replaces known
   credentials, not a secret that happens to be in the text.
 - `max_bytes` (1 to 8,192, default 2,560) bounds the redacted slice. A slice
-  over it is never truncated: nothing is sent and the criterion is
-  unanswered, which doesn't block. The default is the range the accuracy evidence was measured on.
+  over it is never truncated: nothing is sent, the criterion is
+  unanswered, and it falls back to the agent (see [When the decider can't
+  answer](#when-the-decider-cant-answer)). The default is the range the
+  accuracy evidence was measured on.
 - `label` (default `artifact`) names the slice in the request.
 - Each criterion is keyed by its `rule_id`, an opaque id unique on the
   state, and needs a `rule_ref` pointing at the rule's text, the `question`,
@@ -549,7 +551,9 @@ can't `poll:`. The compile errors are the `E-DECIDER-CHECK-*` codes in
 | `pass`: pass is strictly the most likely and at least the threshold | doesn't block, advances nothing | the same |
 | `fail`: likewise for fail | blocks; a finding names the criterion | recorded only |
 | `escape`: anything else, a tie included | doesn't block | recorded only |
-| unanswered: no usable answer after one retry, over budget, the command failed, the per-call cap spent, or another `koto next` holding the lock past the wait | doesn't block; listed under the check's `output.unanswered`, no finding | recorded only |
+| unanswered: no usable answer after one retry, over budget, the command failed, the per-call cap spent, or another `koto next` holding the lock past the wait | falls back to the agent: the check is `pending` and the state waits for the agent's answer, which then decides it as below | the same: it waits for the agent's answer |
+| the agent answered `pass` or `unclear` | doesn't block | the same |
+| the agent answered `fail` | blocks; a finding says the agent answered fail | recorded only |
 | not graded: the slice is empty or only whitespace | doesn't block | recorded only |
 
 A criterion acts in veto only when the template says `veto` and the user's
@@ -558,13 +562,12 @@ effective decider mode is `auto`; under `shadow`, or when a project's
 shadow. Users who aren't opted in never run the command: the state behaves
 as if the check weren't declared.
 
-Only a `fail` blocks. A missing or malformed answer is never read as a pass,
-but it doesn't block either: the gate passes, the check's output keeps the
-criterion under `unanswered`, and its `decider_checked` records outcome
-`unanswered` with the reason and `blocked: false`. The next evaluation in
-the visit asks again. A check that can't grade anything at all passes and
-says why in `output.error`: `log_unreadable` when the session log can't be
-read, with every veto criterion listed as unanswered. A compiled template
+Only a `fail` blocks, and a missing or malformed answer is never read as a
+pass: the criterion falls back to the agent, as the next section says. A
+check that can't read the session log can't grade or record anything: it
+is `pending` with every criterion waiting and `output.error`
+`log_unreadable`, and the state stays stopped until the log can be read
+again. A compiled template
 whose check has lost its spec never gets that far: koto refuses to load it
 (`E-DECIDER-CHECK-SPEC`), so no session starts or resumes on it. When another `koto next` holds the session's decider lock, the
 evaluation waits for it, up to 17 seconds at the default timeout and never
@@ -577,10 +580,54 @@ a wrong verdict is `koto overrides record <session> --gate <check>
 kinds of override record. koto writes a `candidate_false_fail` against each
 criterion that failed in the current visit, the only kind that blocks. The
 other, `overridden_unanswered`, marked an override of a criterion that got no
-verdict; koto no longer writes it, since an unanswered criterion never
-blocks, but ledgers from older builds hold it and it still reads. Within one
+verdict; koto no longer writes it, since an unanswered criterion waits on
+the agent rather than blocking as a fail, but ledgers from older builds hold
+it and it still reads. A criterion the agent answered `fail` gets no
+candidate false fail either: that's the agent's judgment, not the
+decider's. Within one
 visit an unchanged slice reuses its verdict without asking again; a changed
 slice, or a new visit, is asked afresh.
+
+### When the decider can't answer
+
+A criterion that gets no verdict, for any of the reasons in the table,
+isn't passed and doesn't block as a fail: it falls back to the agent doing
+the work (docs/designs/DESIGN-decider-fallback.md). The check's gate is
+`pending`, which stops the state without counting a judgment, and the
+response carries one `warning` finding per waiting criterion. The finding
+names the criterion, the reason, the command that records the answer, and
+then the criterion's own `question` and its `pass`, `fail` and `escape`
+descriptions, so write those for an agent to read as well as for the
+decider. The command comes first because a finding's message is capped at
+1,000 bytes and a long description is cut at its end.
+
+The agent answers with:
+
+```bash
+koto decider answer <session> --gate <check> --criterion <rule_id> --answer <pass|fail|unclear>
+```
+
+The answer binds to the slice the check was judging and decides that
+criterion on the next evaluation of the same slice in the same visit: `pass`
+and `unclear` let it through, and `fail` blocks in veto (in shadow it's
+recorded and doesn't block). The decider isn't asked again about a slice
+the agent answered for. When the work changes, the next evaluation asks the
+decider about the new slice, and falls back again if it still can't
+answer. With `extraction_failed` there's no slice to bind to, so the answer
+stands for the rest of the visit while the extraction keeps failing; the
+agent can answer again, and the latest answer wins.
+
+The agent grades its own work here, as it did before a decider existed. The
+answer is recorded as an agent answer, never as a decider verdict: it adds
+no `decider_checked` event and no ledger line, so nothing that measures a
+criterion's accuracy reads it. An agent can push its own slice over budget
+or break the extraction to reach the fallback on purpose. The
+`decider_fallback` records make that visible: count them per check and
+criterion, by reason, and a criterion whose fallbacks are mostly
+`over_budget` or `extraction_failed` needs its slice or budget looked at.
+
+`koto overrides record` still moves past a waiting check, as it moves past a
+failing one.
 
 ### What's recorded for a check
 

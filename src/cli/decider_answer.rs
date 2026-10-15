@@ -31,14 +31,14 @@ use super::{exit_code_for_engine_error, exit_with_error_code, EXIT_INFRASTRUCTUR
 const COMMAND: &str = "decider answer";
 
 /// The answer isn't `pass`, `fail` or `unclear`.
-pub const INVALID_ANSWER: &str = "invalid_answer";
+const INVALID_ANSWER: &str = "invalid_answer";
 
 /// The gate isn't a decider check of the current state, or it declares no
 /// such criterion.
-pub const UNKNOWN_CRITERION: &str = "unknown_criterion";
+const UNKNOWN_CRITERION: &str = "unknown_criterion";
 
 /// The criterion has no `decider_fallback` in the current visit.
-pub const NO_FALLBACK: &str = "no_fallback";
+const NO_FALLBACK: &str = "no_fallback";
 
 /// Flags of `koto decider answer`.
 #[derive(Args, Debug, Clone)]
@@ -82,8 +82,11 @@ fn fail(code: i32, message: String) -> ! {
 }
 
 /// The latest `decider_fallback` for `gate`/`criterion` in `state`'s
-/// current visit, with its `seq`.
-pub fn latest_fallback<'e>(
+/// current visit, with its `seq`. The visit starts after the state's latest
+/// arrival, the same rule the check evaluator uses to find an applicable
+/// answer; the two must agree, or an answer lands where the next tick won't
+/// read it.
+fn latest_fallback<'e>(
     events: &'e [Event],
     state: &str,
     gate: &str,
