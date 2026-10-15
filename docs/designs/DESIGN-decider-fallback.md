@@ -591,10 +591,17 @@ text reaches the agent, and what the journal says.
   so it can push the slice over budget or break the extraction, then
   answer `pass`. That's not a regression, since those cases passed with
   no answer at all before, but it means a veto check can be reduced to a
-  self-grade on purpose. The `decider_fallback` records make it visible:
-  a session whose fallbacks are all `over_budget` or `extraction_failed`
-  is a signal to alert on. Whether the ruling covers this deliberate case
-  is raised with the maintainers rather than decided here.
+  self-grade on purpose. The maintainers ruled that their 2026-10-14
+  ruling covers this case, on two conditions this design meets. First,
+  an agent's answer is recorded as an agent answer, in its own
+  `decider_check_answered` event and under `agent_answered`, and never as
+  a decider verdict: it appends no `decider_checked` and no ledger
+  `checked` line, so nothing that judges a criterion's pass trust or
+  whether to withhold its rule can read it as a decider pass. Second, the
+  `decider_fallback` records, counted per `koto.check` and `koto.rule.id`
+  and split by `koto.decider.reason`, are the signal for forced
+  fallbacks: a criterion whose fallbacks are mostly `over_budget` or
+  `extraction_failed` is visible and can be tuned.
 - **Unreadable log.** With no readable log, nothing is appended, so
   `koto decider answer` finds no fallback and refuses with `no_fallback`,
   and `koto overrides record` can't read the log either. The state stays
