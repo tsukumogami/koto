@@ -80,12 +80,19 @@ R13, R15).
       `StructuredGateResult::decider_fallbacks`.
 - [ ] The gate output always carries `failed`, `unanswered`, `awaiting`,
       `agent_answered` and `error` as the design's Decision 3 defines them;
-      the gate is `failed` when `failed` or `awaiting` is non-empty.
+      the gate is `failed` when `failed` is non-empty, else `pending` when
+      `awaiting` is non-empty, else `passed`; a shadow check is never
+      `failed`, and an agent-answered criterion is never under
+      `unanswered`.
+- [ ] A `pending` evaluation stamps no attempt and writes no rule counts,
+      and `blocking_conditions_from_gates` renders a pending decider check
+      as `corrective` with its findings.
 - [ ] A waiting criterion gets one `warning` finding (`message_source:
       koto`) whose message starts with the reason and the quoted
       `koto decider answer` line, then the question and three
-      descriptions; an agent `fail` gets an `error` finding quoting the
-      fail description.
+      descriptions; an agent `fail` on a veto criterion gets an `error`
+      finding quoting the fail description, and on a shadow criterion is
+      recorded under `agent_answered` and doesn't block.
 - [ ] The engine blocks a decider check when `failed` or `awaiting` is
       non-empty, whatever the state accepts, and appends
       `decider_fallback` events after `decider_checked` and before
@@ -94,7 +101,7 @@ R13, R15).
       `agent_answered` or `awaiting` id; an `override_default` with only
       the old three keys still compiles and moves past a waiting
       criterion.
-- [ ] The unreadable-log path is `failed`, lists every criterion under
+- [ ] The unreadable-log path is `pending`, lists every criterion under
       `awaiting`, keeps `log_unreadable`, has one `warning` finding named
       for the check, and appends nothing.
 - [ ] Tests cover each `UnansweredReason` in veto and shadow (one
@@ -147,7 +154,8 @@ and add `koto.decider.input_bytes`, `koto.decider.awaiting_count` and
 - [ ] `relays()` and `relayed()` write one `decider_fallback` record per
       committed `decider_fallback` event with the attributes the design's
       table names; `decider_checked` records carry
-      `koto.decider.input_bytes`; decider-check `check_evaluated` records
+      `koto.decider.input_bytes`; decider-check `check_evaluated` and
+      `check_pending` records (the latter without `koto.poll.*`)
       carry both counts, 0 included; a test pins every value.
 - [ ] A test collects every attribute name the journal writes across all
       kinds and fails if a new name equals another or either starts with

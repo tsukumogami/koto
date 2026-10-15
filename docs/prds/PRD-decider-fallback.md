@@ -6,13 +6,14 @@ problem: |
   lead there today (over budget, extraction failed, provider error, unreadable
   response, cap spent, busy), and in every one the criterion is judged by
   nobody, in veto as in shadow. Nothing exported counts these cases or records
-  the slice sizes that caused them, so budgets can't be tuned from Datadog.
+  the slice sizes that caused them, so budgets can't be tuned from the run
+  journal.
 goals: |
   A criterion the decider can't answer is answered by the agent, and that
   answer decides the gate. A log reader can tell a decider verdict from an
   agent answer from a criterion still waiting on one. Every fallback leaves
   one run-journal record naming the check, the criterion, the reason and the
-  slice size, under names the Datadog measurement definitions can admit.
+  slice size, under names that collide with nothing the journal writes.
 motivating_context: |
   koto#297 ruled that a missing verdict never blocks, and its fix (koto#300,
   released since v0.15.0) made every missing verdict pass. The maintainers
@@ -42,10 +43,10 @@ see it.
 
 The outcome this feature exists for has two halves. The agent doing the work
 is asked any criterion the decider couldn't grade, using the template's own
-question and descriptions, and its answer decides the gate in shadow and veto
-alike; a veto fail from the decider still blocks as before. A maintainer
-tuning slice budgets counts every fallback in Datadog by check, criterion and
-reason, with each slice's size.
+question and descriptions, in shadow and veto alike, and its answer decides
+the gate; a veto fail from the decider still blocks as before. A maintainer
+tuning slice budgets counts every fallback by check, criterion and reason,
+with each slice's size, wherever the run journal is read.
 
 The journeys that frame it, carried as the User Stories below: an agent whose
 slice is over budget answers the criterion and moves on; an agent hit by a
@@ -58,7 +59,8 @@ The boundary, carried as the Requirements and Out of Scope below: every
 missing-verdict reason falls back, the answer is recorded and gates the
 state, each fallback is one exported record under collision-free names, docs
 describe it and older readers still read the log. Out: the routing decider,
-budget and criteria changes, shirabe adoption, the Datadog definitions,
+budget and criteria changes, shirabe adoption, how downstream consumers of
+the journal count it,
 ledger and report counting, and the release.
 
 ## Problem Statement
@@ -95,7 +97,7 @@ and nothing marks the moments a criterion was handed on as a countable group.
   judged it, the agent answered it, or it is still waiting on the agent.
 - Every fallback is one exported run-journal record that names the check, the
   criterion, the reason and the slice size, so budgets and slices can be tuned
-  from Datadog.
+  by downstream consumers of the journal.
 - Nothing changes for a template that declares no decider check, for a user
   who isn't opted in to the decider, or for the routing decider.
 
@@ -116,7 +118,8 @@ and nothing marks the moments a criterion was handed on as a countable group.
   show the agent my criterion's own question and descriptions, so that the
   text I already write for the decider is all the agent needs.
 - As a maintainer tuning a check's slice budget, I want to count fallbacks by
-  check, criterion and reason in Datadog and see each fallback's slice size,
+  check, criterion and reason from the run journal and see each fallback's
+  slice size,
   so that I can tell a budget that's too tight from a provider that keeps
   failing.
 - As a pull request reviewer auditing why a bad change passed a veto check, I
@@ -172,10 +175,13 @@ mapping from reason to fallback has no exceptions.
 **R2. A waiting criterion never passes.** While any criterion of a check is
 waiting, the check's gate is not `passed` and the state doesn't advance,
 whether or not it accepts evidence; evidence the agent submits is handled
-exactly as for a decider check blocking on a veto fail today. A waiting
-criterion produces a finding at level `warning`, never at level `error`, and
-so never a rule count or `check_rule` record. The one way past a waiting
-criterion other than answering is `koto overrides record` (R9).
+exactly as for a decider check blocking on a veto fail today. Unless a
+criterion also failed, that evaluation's outcome is `pending`, in veto and in
+shadow: it judged nothing yet, so it stamps no attempt and writes no rule
+counts, as a polling gate's pending evaluation doesn't. A waiting criterion
+produces a finding at level `warning`, never at level `error`. The one way
+past a waiting criterion other than answering is `koto overrides record`
+(R9).
 
 **R3. What the agent is told.** For each waiting criterion, the response that
 stops the state carries one finding naming the check, the criterion's id, the
@@ -207,12 +213,13 @@ agent answer for a criterion that has no reusable decider verdict, the answer
 is the criterion's outcome, and the decider isn't consulted, nothing is
 appended for that criterion (no `decider_checked`, no fallback event, no
 ledger line), and the criterion is listed under `agent_answered`. `pass` and
-`unclear` don't block. `fail` blocks the state in veto and in shadow, with a
-finding at level `error` that says the agent answered fail and quotes the
-criterion's fail description. A fail stops blocking when the agent answers
-again with `pass` or `unclear`, when the slice changes (the decider is then
-consulted again, and another missing verdict falls back again), or when an
-override is recorded.
+`unclear` don't block. In veto, `fail` blocks the state with a finding at
+level `error` that says the agent answered fail and quotes the criterion's
+fail description. In shadow, `fail` is recorded under `agent_answered` and
+doesn't block, as a shadow decider fail doesn't. A veto fail stops blocking
+when the agent answers again with `pass` or `unclear`, when the slice
+changes (the decider is then consulted again, and another missing verdict
+falls back again), or when an override is recorded.
 
 **R7. Decider verdicts are unchanged.** A veto fail still blocks, reaches the
 agent as a finding, and can be overridden. A decider pass or escape, an empty
@@ -227,16 +234,17 @@ output keeps `failed`, `unanswered` and `error`, and always carries two more
 lists of criterion ids in declaration order: `awaiting`, the waiting
 criteria, and `agent_answered`, the criteria whose outcome this evaluation
 took from an agent answer. `failed` lists every criterion that blocks on a
-fail, from the decider in veto or from the agent in either mode.
-`unanswered` keeps its current meaning: every veto criterion that got no
-decider verdict this evaluation, so a veto criterion under `awaiting` or
-`agent_answered` is listed there too. The gate is `failed` when `failed` or `awaiting` is
-non-empty, and `passed` otherwise. A template's existing `override_default`
+fail: a veto criterion the decider or the agent failed. `unanswered` keeps
+meaning "got no verdict": the veto criteria with neither a decider verdict
+nor an applicable agent answer, so an agent-answered criterion is listed
+under `agent_answered` only. The gate is `failed` when `failed` is
+non-empty, else `pending` when `awaiting` is non-empty, and `passed`
+otherwise; a shadow check is therefore never `failed`. A template's existing `override_default`
 for a decider check stays valid without the two new lists, and an override
 value without them doesn't block.
 
 **R9. Overrides.** `koto overrides record` still moves past a decider check
-whose gate is `failed` for any reason, waiting criteria included. A candidate
+whose gate is `failed` or `pending`, waiting criteria included. A candidate
 false fail is recorded only for a criterion the decider failed: never for one
 listed in `agent_answered` or `awaiting`.
 
@@ -252,10 +260,11 @@ captured.
 **R11. The fallback is exported.** koto relays each committed
 `decider_fallback` event to the run journal as one `decider_fallback` record,
 the way it relays its other events, naming the check, the criterion, the
-mode, the reason and the slice size. The decider-check `check_evaluated`
-record also carries the length of `awaiting` and of `agent_answered`,
-including 0. `decider_checked` records gain the slice size too. The agent
-answer event is not relayed.
+mode, the reason and the slice size. A decider check's `check_evaluated`
+record, and the `check_pending` record of a decider check waiting on the
+agent, carry the length of `awaiting` and of `agent_answered`, including 0.
+`decider_checked` records gain the slice size too. The agent answer event is
+not relayed.
 
 **R12. Names.** The DESIGN names the exact attributes. Each is
 `koto.`-prefixed. An attribute this feature reuses keeps its name, its JSON
@@ -265,7 +274,7 @@ kind, N differs from M, N doesn't start with M followed by `.`, and M
 doesn't start with N followed by `.`.
 
 **R13. An unreadable log never passes.** A decider check with an unreadable
-log is `failed`, lists every criterion under `awaiting`, keeps
+log is `pending`, lists every criterion under `awaiting`, keeps
 `output.error: log_unreadable`, and appends nothing; its one finding, at
 level `warning` and named for the check, says the session log couldn't be
 read. With no readable log the agent can't answer
@@ -312,7 +321,7 @@ rule.
 ## Acceptance Criteria
 
 - [ ] For each of the six reasons, in veto and in shadow, a criterion with no
-      verdict leaves its gate `failed` with the criterion under `awaiting`,
+      verdict leaves its gate `pending` with the criterion under `awaiting`,
       the state stopped, and one `warning` finding that contains the
       criterion id, the reason, the question, the three descriptions and the
       line `koto decider answer <session> --gate <check> --criterion <id>`;
@@ -322,15 +331,18 @@ rule.
       produces a fallback.
 - [ ] A state that accepts evidence, with a waiting criterion, doesn't advance
       on submitted evidence matching a transition.
-- [ ] A waiting criterion's `gate_evaluated` has no `rule_counts`, and the
-      journal writes no `check_rule` for it.
+- [ ] A waiting check's `gate_evaluated` (outcome `pending`) has no attempt
+      stamp and no `rule_counts`, and the journal writes a `check_pending`
+      record for it, with no `check_evaluated` or `check_rule`.
 - [ ] Answering `pass`, then evaluating the same slice, passes the gate, lists
       the criterion under `agent_answered`, makes no provider call, and
       appends no `decider_checked`, `decider_fallback` or ledger line for it;
       the same holds for `unclear`.
-- [ ] Answering `fail`, then evaluating the same slice, blocks in veto and in
-      shadow with an `error` finding that quotes the fail description, and
-      lists the criterion under `failed` and `agent_answered`.
+- [ ] Answering `fail`, then evaluating the same slice, blocks in veto with an
+      `error` finding that quotes the fail description, listing the
+      criterion under `failed` and `agent_answered`; in shadow the gate is
+      `passed` with the criterion under `agent_answered` only.
+- [ ] An agent-answered criterion is never listed under `unanswered`.
 - [ ] After a `fail` answer, answering `pass` for the same criterion passes
       the gate on the next evaluation of the same slice.
 - [ ] After any answer, a changed slice consults the decider again; a verdict
@@ -348,7 +360,8 @@ rule.
       visit while extraction keeps failing.
 - [ ] A check with three criteria, one failed by the decider in veto, one
       answered `pass` by the agent and one waiting, reports `failed: [first]`,
-      `agent_answered: [second]`, `awaiting: [third]`, an `error` finding for
+      `agent_answered: [second]`, `awaiting: [third]`, outcome `failed`, an
+      `error` finding for
       the first and a `warning` finding for the third; answering only the
       third with `pass` leaves the gate blocked on the first.
 - [ ] `koto decider answer` refuses an unknown check or criterion
@@ -374,13 +387,13 @@ rule.
       size equals the captured slice's length.
 - [ ] The run journal writes exactly one `decider_fallback` record per
       fallback event with the attributes the DESIGN names, and a test pins
-      each attribute's value; `check_evaluated` for a decider check carries
-      both new counts, 0 included, and `decider_checked` carries the slice
-      size.
+      each attribute's value; `check_evaluated` for a decider check, and
+      `check_pending` for a waiting one, carry both new counts, 0 included,
+      and `decider_checked` carries the slice size.
 - [ ] A test collects every attribute name the run journal writes across all
       record kinds and fails if a new name equals another or either is the
       other followed by `.`.
-- [ ] A decider check with an unreadable log is `failed`, lists every
+- [ ] A decider check with an unreadable log is `pending`, lists every
       criterion under `awaiting`, has `output.error: log_unreadable` and
       appends no `decider_checked` or `decider_fallback`.
 - [ ] A session log that holds an `unanswered` `decider_checked` and a passed
@@ -420,10 +433,9 @@ rule.
   slice-contract work, which needs this fallback first.
 - shirabe adopting the fallback in its templates. It needs a koto release and
   a floor raise before it can use the answer command.
-- The Datadog measurement definitions that admit the new record and
-  attributes, and how they count a decider check's gate while a criterion
-  waits. Those definitions have their own owners and version schedule (see
-  Known Limitations).
+- How downstream consumers of the journal admit and count the new record
+  and attributes. They own that; this PRD keeps the journal's existing
+  counting rules true (see Known Limitations).
 - Counting fallbacks or agent answers in the decider ledger or `koto decider
   report`. The report keeps counting no-verdicts per criterion from the
   ledger, which is unchanged; the run journal carries this feature's new
@@ -435,13 +447,13 @@ rule.
 
 ## Known Limitations
 
-- **Gate counting changes.** Since koto#300 a decider check's gate is only
-  `passed` or `failed`, a shadow check's gate is always `passed`, and the
-  Datadog measurement definitions count it that way, with unanswered
-  criteria under `output.unanswered`. With this feature a check with a
-  waiting criterion, or with an agent fail, logs `failed`, in shadow too, and
-  an agent fail counts as a rule violation. The definitions need a new
-  version to count this; this PRD leaves that to their owners.
+- **Gate counting stays as it was.** Since koto#300 a decider check's gate
+  is `passed` or `failed`, and a shadow check's is always `passed`. With
+  this feature a waiting check logs `pending`, which judged nothing and
+  writes a `check_pending` journal record like a polling gate's wait, and a
+  shadow check is still never `failed`. The new case is an agent `fail` in
+  veto, which logs `failed` with the criterion as its rule, like a decider
+  veto fail.
 - **The agent grades its own work.** An agent answer is self-assessment, and
   the 2026-10-14 ruling accepts that: it's what the agent did before a
   decider existed, and the answer is recorded where a reviewer can see it.
@@ -462,9 +474,14 @@ rule.
   only for veto criteria withheld from the agent. Chosen: both modes, per the
   2026-10-14 ruling. Shadow means koto doesn't act on the decider's verdict;
   it never meant a criterion nobody judged should pass.
-- **An agent fail blocks in shadow.** Alternative: record a shadow agent fail
-  without blocking. Chosen: block, because the fail is the agent's own
-  judgment of its work, not a decider verdict koto has declined to trust.
+- **An agent fail blocks only in veto.** Alternative: block on a shadow
+  agent fail too. Chosen: shadow never blocks on a fail and its gate is never
+  `failed`, whoever answered, so a shadow check keeps meaning "recorded, not
+  acted on" and its gate's counting doesn't change.
+- **A waiting check is `pending`, not `failed`.** Alternative: `failed`,
+  which renders a corrective blocked gate. `pending` says what happened (the
+  check judged nothing yet), stamps no attempt and writes no rule, so the
+  journal's counting rules stay true while the state still stops.
 - **The answer is its own command and event.** Alternatives: route the answer
   through the state's evidence, or through `koto overrides record`. Evidence
   belongs to the template's schema and would need a reserved key; an override
