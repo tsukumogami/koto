@@ -403,6 +403,14 @@ Body text.
                 "decider_consulted",
                 r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"decider_consulted","payload":{"state":"review"}}"#,
             ),
+            (
+                "decider_fallback",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"decider_fallback","payload":{"state":"review"}}"#,
+            ),
+            (
+                "decider_check_answered",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"decider_check_answered","payload":{"state":"review"}}"#,
+            ),
         ] {
             let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), malformed));
             let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());

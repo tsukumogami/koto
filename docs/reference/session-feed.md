@@ -585,6 +585,67 @@ events:
         type: string
         required: false
 
+  decider_fallback:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      visit_seq:
+        type: integer
+        required: true
+      gate:
+        type: string
+        required: true
+      rule_id:
+        type: string
+        required: true
+      declaration_hash:
+        type: string
+        required: true
+      mode:
+        type: string
+        required: true
+        enum: ["shadow", "veto"]
+      reason:
+        type: string
+        required: true
+      input_sha256:
+        type: string
+        required: false
+      input_bytes:
+        type: integer
+        required: false
+
+  decider_check_answered:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      visit_seq:
+        type: integer
+        required: true
+      gate:
+        type: string
+        required: true
+      rule_id:
+        type: string
+        required: true
+      declaration_hash:
+        type: string
+        required: true
+      input_sha256:
+        type: string
+        required: false
+      answer:
+        type: string
+        required: true
+        enum: ["pass", "fail", "unclear"]
+      fallback_seq:
+        type: integer
+        required: true
+
   scheduler_ran:
     tier: 3
     fields:
@@ -1868,6 +1929,87 @@ error text are never recorded. koto also appends each consultation to
 `~/.koto/_decider_ledger.jsonl` as a `checked` line with the same fields, and
 an override of a blocking decider check as one `check_overridden` line per
 failed criterion; see `docs/workspace-layout.md`.
+
+#### `decider_fallback`
+
+Records one criterion of a `decider-check` gate handed to the agent: it got
+no verdict this evaluation, for any `reason` an `unanswered`
+`decider_checked` can carry, and no answer the agent recorded applies to
+it (docs/designs/DESIGN-decider-fallback.md). It appears after the
+evaluation's `decider_checked` events and before the gate's
+`gate_evaluated`, in criterion declaration order, in veto and in shadow
+mode. An evaluation whose criterion takes a recorded agent answer appends
+none for that criterion. A criterion still waiting is evaluated again on
+every `koto next`, so each evaluation that hands it over again appends
+another.
+
+```json
+{
+  "type": "decider_fallback",
+  "payload": {
+    "state": "review",
+    "visit_seq": 2,
+    "gate": "comments",
+    "rule_id": "comment_reason",
+    "declaration_hash": "e0f8...0c2b",
+    "mode": "veto",
+    "reason": "over_budget",
+    "input_sha256": "202c...db4d",
+    "input_bytes": 4096
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `state` | string | Yes | The state evaluated. |
+| `visit_seq` | integer | Yes | As for `decider_checked`. |
+| `gate` | string | Yes | The decider check's name. |
+| `rule_id` | string | Yes | The criterion's id, as the template declares it. |
+| `declaration_hash` | string | Yes | As for `decider_checked`. An answer binds to it. |
+| `mode` | string | Yes | The criterion's effective mode, `veto` or `shadow`. |
+| `reason` | string | Yes | Why no verdict: `provider_error`, `unreadable_response`, `over_budget`, `extraction_failed`, `cap_spent` or `busy`. Consumers MUST tolerate other values; every value is a fixed identifier, never a message, path or instruction text. |
+| `input_sha256` | string | No | The slice's hash, as for `decider_checked`. Absent with `extraction_failed`, which has no slice. An answer binds to it. |
+| `input_bytes` | integer | No | Byte length of the redacted slice as captured. Present with `input_sha256`. Capture stops at 64 KiB, so 65,536 means at least that many. |
+
+#### `decider_check_answered`
+
+Records the agent's answer to a criterion that fell back to it, appended by
+`koto decider answer`. The answer binds to the slice and declaration of the
+latest `decider_fallback` for that check and criterion in the visit, and
+decides the criterion on a later evaluation of the same slice in the same
+visit; the latest answer for a slice wins.
+
+```json
+{
+  "type": "decider_check_answered",
+  "payload": {
+    "state": "review",
+    "visit_seq": 2,
+    "gate": "comments",
+    "rule_id": "comment_reason",
+    "declaration_hash": "e0f8...0c2b",
+    "input_sha256": "202c...db4d",
+    "answer": "fail",
+    "fallback_seq": 7
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `state` | string | Yes | The state the answer was recorded in. |
+| `visit_seq` | integer | Yes | The visit, as for `decider_checked`. |
+| `gate` | string | Yes | The decider check's name. |
+| `rule_id` | string | Yes | The criterion's id. |
+| `declaration_hash` | string | Yes | Copied from the fallback answered. |
+| `input_sha256` | string | No | Copied from the fallback answered; absent when it had none. |
+| `answer` | string | Yes | `pass`, `fail` or `unclear` (the criterion's escape). |
+| `fallback_seq` | integer | Yes | The `seq` of the `decider_fallback` event answered. |
+
+Neither event carries the slice, a question, a description, or anything the
+agent wrote beyond its one-word answer. An agent answer is never a decider
+verdict: it appends no `decider_checked` and no ledger line.
 
 ---
 

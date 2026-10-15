@@ -1414,6 +1414,16 @@ pub enum EventPayload {
     /// Additive: an older build lands it in `Unknown`, and a payload this
     /// build can't parse does the same rather than failing the read.
     DeciderChecked(crate::decider::check::DeciderCheck),
+    /// One decider-check criterion handed to the agent: it got no verdict
+    /// and no answer the agent recorded applies (DESIGN-decider-fallback.md,
+    /// Decision 4). Appended after the evaluation's `decider_checked`
+    /// events and before its gate's `gate_evaluated`. Additive: an older
+    /// build lands it in `Unknown`, and a payload this build can't parse
+    /// does the same rather than failing the read.
+    DeciderFallback(crate::decider::check::DeciderFallback),
+    /// The agent's answer to a criterion that fell back to it, appended by
+    /// `koto decider answer`. Additive, and degrades like `decider_checked`.
+    DeciderCheckAnswered(crate::decider::check::DeciderCheckAnswered),
     InstructionsDelivered {
         /// The phase whose instructions the response carried.
         state: String,
@@ -1769,6 +1779,8 @@ impl EventPayload {
             EventPayload::RequestClosed { .. } => "request.closed",
             EventPayload::DeciderConsulted(_) => "decider_consulted",
             EventPayload::DeciderChecked(_) => "decider_checked",
+            EventPayload::DeciderFallback(_) => "decider_fallback",
+            EventPayload::DeciderCheckAnswered(_) => "decider_check_answered",
             EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
             EventPayload::Unknown { .. } => "unknown",
         }
@@ -2207,6 +2219,28 @@ impl<'de> Deserialize<'de> for Event {
                     payload_val.clone(),
                 ) {
                     Ok(c) => EventPayload::DeciderChecked(c),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            "decider_fallback" => {
+                match serde_json::from_value::<crate::decider::check::DeciderFallback>(
+                    payload_val.clone(),
+                ) {
+                    Ok(f) => EventPayload::DeciderFallback(f),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            "decider_check_answered" => {
+                match serde_json::from_value::<crate::decider::check::DeciderCheckAnswered>(
+                    payload_val.clone(),
+                ) {
+                    Ok(a) => EventPayload::DeciderCheckAnswered(a),
                     Err(_) => EventPayload::Unknown {
                         type_name: event_type.clone(),
                         raw_payload: payload_val.clone(),
@@ -3682,6 +3716,62 @@ mod tests {
         let line = r#"{"seq":9,"timestamp":"2026-09-29T10:00:00Z","type":"decider_checked","payload":{"state":"x"}}"#;
         let ev: Event = serde_json::from_str(line).unwrap();
         assert!(matches!(ev.payload, EventPayload::Unknown { .. }));
+    }
+
+    #[test]
+    fn decider_fallback_and_answer_round_trip_and_degrade_to_unknown() {
+        use crate::decider::check::{
+            AgentAnswer, DeciderCheckAnswered, DeciderFallback, UnansweredReason,
+        };
+        let fallback = EventPayload::DeciderFallback(DeciderFallback {
+            state: "review".into(),
+            visit_seq: 2,
+            gate: "comments".into(),
+            rule_id: "comment_reason".into(),
+            declaration_hash: "h".into(),
+            mode: crate::template::decider_check::CheckMode::Veto,
+            reason: UnansweredReason::OverBudget,
+            input_sha256: Some("a".repeat(64)),
+            input_bytes: Some(2561),
+        });
+        let answered = EventPayload::DeciderCheckAnswered(DeciderCheckAnswered {
+            state: "review".into(),
+            visit_seq: 2,
+            gate: "comments".into(),
+            rule_id: "comment_reason".into(),
+            declaration_hash: "h".into(),
+            input_sha256: Some("a".repeat(64)),
+            answer: AgentAnswer::Pass,
+            fallback_seq: 5,
+        });
+        for (p, name) in [
+            (fallback, "decider_fallback"),
+            (answered, "decider_check_answered"),
+        ] {
+            assert_eq!(p.type_name(), name);
+            let e = Event {
+                seq: 6,
+                timestamp: "2026-10-15T10:00:00Z".to_string(),
+                event_type: p.type_name().to_string(),
+                payload: p,
+                idempotency_hash: None,
+            };
+            let json = serde_json::to_string(&e).unwrap();
+            let back: Event = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, e);
+
+            // A payload this build can't read lands in Unknown.
+            let line = format!(
+                r#"{{"seq":9,"timestamp":"2026-10-15T10:00:00Z","type":"{}","payload":{{"state":"x"}}}}"#,
+                name
+            );
+            let ev: Event = serde_json::from_str(&line).unwrap();
+            assert!(
+                matches!(ev.payload, EventPayload::Unknown { .. }),
+                "{}",
+                name
+            );
+        }
     }
 
     #[test]

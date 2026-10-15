@@ -362,6 +362,75 @@ impl DeciderCheck {
     }
 }
 
+/// The agent's own answer to a criterion the decider gave no verdict on
+/// (DESIGN-decider-fallback.md, Decision 1): the criterion's two values and
+/// its escape, which is `unclear` for every criterion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAnswer {
+    Pass,
+    Fail,
+    Unclear,
+}
+
+impl AgentAnswer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentAnswer::Pass => PASS_VALUE,
+            AgentAnswer::Fail => FAIL_VALUE,
+            AgentAnswer::Unclear => ESCAPE_VALUE,
+        }
+    }
+
+    /// The answer a word names, or `None` for any other word.
+    pub fn parse(s: &str) -> Option<AgentAnswer> {
+        [AgentAnswer::Pass, AgentAnswer::Fail, AgentAnswer::Unclear]
+            .into_iter()
+            .find(|a| a.as_str() == s)
+    }
+}
+
+/// One criterion handed to the agent because it got no verdict and no
+/// answer the agent recorded applies: the payload of the `decider_fallback`
+/// event (DESIGN-decider-fallback.md, Decision 4).
+///
+/// Names, hashes, a closed reason and a size only: never the slice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeciderFallback {
+    pub state: String,
+    pub visit_seq: u64,
+    pub gate: String,
+    pub rule_id: String,
+    pub declaration_hash: String,
+    /// The criterion's effective mode.
+    pub mode: CheckMode,
+    pub reason: UnansweredReason,
+    /// The slice's hash; absent when extraction failed and there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_sha256: Option<String>,
+    /// The slice's size in bytes, as captured; absent with no slice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_bytes: Option<u64>,
+}
+
+/// The agent's answer to one fallback: the payload of the
+/// `decider_check_answered` event `koto decider answer` appends. It binds
+/// to the slice and declaration of the fallback it answers, so it applies
+/// only to an evaluation of the same slice of the same criterion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeciderCheckAnswered {
+    pub state: String,
+    pub visit_seq: u64,
+    pub gate: String,
+    pub rule_id: String,
+    pub declaration_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_sha256: Option<String>,
+    pub answer: AgentAnswer,
+    /// The `seq` of the `decider_fallback` event this answers.
+    pub fallback_seq: u64,
+}
+
 /// Round unrounded probabilities for the record.
 pub fn recorded_probabilities(p: &BTreeMap<String, f64>) -> BTreeMap<String, f64> {
     p.iter()
@@ -558,6 +627,60 @@ mod tests {
         assert_eq!(
             reason_for_error(ErrorClass::Timeout),
             UnansweredReason::ProviderError
+        );
+    }
+
+    #[test]
+    fn an_agent_answer_is_one_of_three_words() {
+        for a in [AgentAnswer::Pass, AgentAnswer::Fail, AgentAnswer::Unclear] {
+            assert_eq!(AgentAnswer::parse(a.as_str()), Some(a));
+            assert_eq!(
+                serde_json::to_value(a).unwrap(),
+                serde_json::json!(a.as_str())
+            );
+        }
+        assert_eq!(AgentAnswer::parse("unclear"), Some(AgentAnswer::Unclear));
+        for bad in ["", "PASS", "escape", "yes", "pass "] {
+            assert_eq!(AgentAnswer::parse(bad), None, "{:?}", bad);
+        }
+    }
+
+    #[test]
+    fn the_fallback_and_answer_records_leave_out_an_absent_slice() {
+        let fb = DeciderFallback {
+            state: "review".into(),
+            visit_seq: 3,
+            gate: "comments".into(),
+            rule_id: "comment_reason".into(),
+            declaration_hash: "h".into(),
+            mode: CheckMode::Shadow,
+            reason: UnansweredReason::ExtractionFailed,
+            input_sha256: None,
+            input_bytes: None,
+        };
+        let v = serde_json::to_value(&fb).unwrap();
+        assert_eq!(v["reason"], "extraction_failed");
+        assert_eq!(v["mode"], "shadow");
+        assert!(v.get("input_sha256").is_none());
+        assert!(v.get("input_bytes").is_none());
+        assert_eq!(serde_json::from_value::<DeciderFallback>(v).unwrap(), fb);
+
+        let ans = DeciderCheckAnswered {
+            state: "review".into(),
+            visit_seq: 3,
+            gate: "comments".into(),
+            rule_id: "comment_reason".into(),
+            declaration_hash: "h".into(),
+            input_sha256: Some("abc".into()),
+            answer: AgentAnswer::Fail,
+            fallback_seq: 9,
+        };
+        let v = serde_json::to_value(&ans).unwrap();
+        assert_eq!(v["answer"], "fail");
+        assert_eq!(v["fallback_seq"], 9);
+        assert_eq!(
+            serde_json::from_value::<DeciderCheckAnswered>(v).unwrap(),
+            ans
         );
     }
 
