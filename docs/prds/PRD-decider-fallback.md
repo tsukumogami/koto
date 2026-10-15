@@ -13,13 +13,14 @@ goals: |
   agent answer from a criterion still waiting on one. Every fallback leaves
   one run-journal record naming the check, the criterion, the reason and the
   slice size, under names the Datadog measurement definitions can admit.
-upstream: docs/briefs/BRIEF-decider-fallback.md
 motivating_context: |
   koto#297 ruled that a missing verdict never blocks, and its fix (koto#300,
   released since v0.15.0) made every missing verdict pass. The maintainers
   ruled on 2026-10-14 that the pass is a defect: a missing verdict still
   shouldn't block on its own, but it no longer counts as a pass. The check
   falls back to the agent, the way the routing decider already does.
+absorbed:
+  - docs/briefs/BRIEF-decider-fallback.md
 ---
 
 # PRD: decider-check fallback to the agent
@@ -27,6 +28,38 @@ motivating_context: |
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-decider-fallback](docs/briefs/BRIEF-decider-fallback.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+A decider check grades the agent's own work, and since koto#300 a criterion
+the decider can't answer passes. Over budget, a failed extraction, a provider
+outage, an unreadable answer, a spent cap and a busy lock all end with nobody
+judging the criterion, even under veto. And nothing exported says how often
+that happens or how big the slices were, so the people tuning budgets can't
+see it.
+
+The outcome this feature exists for has two halves. The agent doing the work
+is asked any criterion the decider couldn't grade, using the template's own
+question and descriptions, and its answer decides the gate in shadow and veto
+alike; a veto fail from the decider still blocks as before. A maintainer
+tuning slice budgets counts every fallback in Datadog by check, criterion and
+reason, with each slice's size.
+
+The journeys that frame it, carried as the User Stories below: an agent whose
+slice is over budget answers the criterion and moves on; an agent hit by a
+provider outage answers fail, fixes its work and answers pass, never passing
+a check nobody graded; a maintainer plots over-budget slice sizes and raises
+a budget; a reviewer reads a run's log and sees that the agent, not the
+decider, passed a bad change.
+
+The boundary, carried as the Requirements and Out of Scope below: every
+missing-verdict reason falls back, the answer is recorded and gates the
+state, each fallback is one exported record under collision-free names, docs
+describe it and older readers still read the log. Out: the routing decider,
+budget and criteria changes, shirabe adoption, the Datadog definitions,
+ledger and report counting, and the release.
 
 ## Problem Statement
 
