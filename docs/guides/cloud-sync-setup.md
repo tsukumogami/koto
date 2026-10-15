@@ -108,6 +108,16 @@ There are no sync commands. These commands read or write the session's copy in t
 
 That list isn't exhaustive: any command that reads a session's state through the cloud backend pulls it from the bucket first. If the bucket is unreachable, a command keeps working on the local copy and prints a warning to stderr.
 
+### Commands a `koto next` runs
+
+A `koto context` call made from a template's command (a default action or a gate) works on the session that `koto next` is advancing, and it doesn't push to the bucket itself. It writes the local copy and leaves the push to the tick, which pushes everything its commands wrote once, before it returns. A call costs a request or two instead of a full round of pulls and pushes, so an action can make many of them inside its time limit.
+
+Two checks still run on every call: whether the session was imported elsewhere, which refuses, and on the first write of the tick, whether another host's writes conflict with this one's, which also refuses. The tick checks both again before it pushes. The tick's own session is pulled from the bucket once, when the tick starts, not again by each command.
+
+While the tick's commands have writes it hasn't pushed, the bucket holds a `batch-open.json` object beside the session's state file, and `koto session import` refuses the session (`import_source_unpushed`). A tick that was killed before it pushed leaves the writes on its host. The next koto command on the session there, `koto status <name>` for instance, pushes them and removes the object.
+
+A `koto context` call for any other session, or made outside a tick, pushes at once, as before.
+
 ### Where a session lives in the bucket
 
 A session's remote objects sit under a prefix derived from the workspace that created it: the first 16 hex digits of the SHA-256 of the canonical path of the directory koto ran in. A session named `review` created in `/srv/ws-a` lives under `<hash-of-/srv/ws-a>/review/`, and the commands above find it there when you run them from `/srv/ws-a`.
@@ -259,7 +269,7 @@ A refusal or failure prints `{"error": {"code": "...", "message": "..."}}`. Exit
 | `import_source_unreadable` | 1 | A source object couldn't be fetched, or failed validation (for example, a state log this koto can't carry intact) | If the bucket was unreachable, run it again; if the message names a validation failure, the source needs repair on its host |
 | `import_push_failed` | 1 | Building the session here, pushing it, or moving it into place failed. Before the source is marked, what the run pushed was taken back; once it's marked (a same-host import whose swap failed), everything is kept and the message says so | Fix what the message names (usually connectivity or local disk) and run the same import again; after the marker, that finishes it. When the message names `--as` (a same-host import this host's store can't swap), import under another name instead |
 | `import_source_running` | 2 | Same host only: another process holds the source session's lock | Stop whatever is advancing the session, then import again |
-| `import_source_unpushed` | 2 | Same host only: the source's local copy holds events or context keys the bucket lacks | Run `koto session resolve <name> --keep local` in the source workspace, then import again |
+| `import_source_unpushed` | 2 | The source's host holds writes the bucket lacks. On the same host: the source's local copy holds events or context keys the bucket lacks. From any host: the bucket holds the source's `batch-open.json`, left by a `koto next` that stopped before it pushed its commands' writes | Same host: run `koto session resolve <name> --keep local` in the source workspace. For `batch-open.json`: run any koto command on the session in the source workspace on its host, such as `koto status <name>`. Then import again |
 | `import_source_has_children` | 2 | Same host only: a local session names the source as its parent | Finish or clean up the child it names, or import under `--as` |
 | `import_unmarked` | 1 | The session was imported and pushed, but the marker on the source couldn't be written, so the old copy won't refuse yet | Run the same import again; it writes only the marker. Keep the source stopped until it succeeds |
 

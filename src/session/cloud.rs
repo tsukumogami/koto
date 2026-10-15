@@ -9,8 +9,13 @@
 //! an updated manifest are transferred on each `add`/`remove`. A short TTL
 //! cache on the remote manifest reduces redundant S3 GETs during rapid
 //! sequential calls.
+//!
+//! The exception is a write a `koto next` tick's command makes to the tick's
+//! own session: it goes to the local copy and a pending-writes journal, and
+//! the tick flushes the whole batch once (see `crate::session::batch` and
+//! [`CloudBackend::flush_pending`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -20,6 +25,8 @@ use s3::error::S3Error;
 use s3::{Bucket, Region};
 
 use crate::config::CloudConfig;
+use crate::engine::reentrancy;
+use crate::session::batch::{self, BatchLock, Journal, Pending};
 use crate::session::context::ContextStore;
 use crate::session::local::{repo_id, LocalBackend};
 use crate::session::sync::{self, ManifestCache};
@@ -37,6 +44,14 @@ pub(crate) const MIGRATED_MARKER: &str = "migrated.json";
 /// File name of the compiled template a cloud session's init pushes beside
 /// its state file, for `koto session import --trust-template`.
 pub(crate) const TEMPLATE_OBJECT: &str = "template.json";
+
+/// File name of the object that says a session's host holds writes the
+/// bucket lacks: a batch of deferred writes is open
+/// ([`crate::session::batch`]). Written with the batch's first write and
+/// deleted by the flush that closes it, so `koto session import` can refuse
+/// a source a stopped tick left mid-batch instead of carrying a copy without
+/// those writes.
+pub(crate) const BATCH_MARKER: &str = "batch-open.json";
 
 /// Per-child outcome emitted by [`CloudBackend::reconcile_child`].
 ///
@@ -167,6 +182,11 @@ pub struct CloudBackend {
     /// from `migration_checks`, which only the bucket's marker fills.
     /// Boxed so the backend stays small beside `LocalBackend` in `Backend`.
     local_migration_checks: Box<Mutex<HashMap<String, LocalCheck>>>,
+    /// The sessions a tick has pulled in this process. A tick pulls its own
+    /// session's state file once: after that, the local copy is the one its
+    /// commands write to, and a second pull would only fetch what it pushed.
+    /// Boxed for the same reason as `local_migration_checks`.
+    pulled: Box<Mutex<HashSet<String>>>,
 }
 
 impl CloudBackend {
@@ -198,6 +218,7 @@ impl CloudBackend {
             manifest_cache: ManifestCache::new(),
             migration_checks: Mutex::new(HashMap::new()),
             local_migration_checks: Box::new(Mutex::new(HashMap::new())),
+            pulled: Box::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -258,15 +279,8 @@ impl CloudBackend {
         let answer = match checks.get(id) {
             Some(answer) => answer.clone(),
             None => {
-                let key = self.marker_key(id);
-                let answer = match self.object_listed(&key) {
-                    Ok(false) => None,
-                    Ok(true) => match self.fetch_object(&key) {
-                        Ok(Some(bytes)) => Some(migrated_from_marker(id, &bytes)),
-                        // Removed between the listing and the GET.
-                        Ok(None) => None,
-                        Err(_) => Some(migrated_from_marker(id, b"")),
-                    },
+                let answer = match self.read_migration_marker_of(id) {
+                    Ok(answer) => answer,
                     Err(e) => {
                         eprintln!(
                             "warning: cloud sync: migration check failed: {}",
@@ -283,6 +297,21 @@ impl CloudBackend {
             Some(migrated) => Err(anyhow::Error::new(migrated)),
             None => Ok(()),
         }
+    }
+
+    /// Ask the bucket, uncached, whether `id` carries a migration marker.
+    /// `Err` when the listing failed and the answer is unknown.
+    fn read_migration_marker_of(&self, id: &str) -> anyhow::Result<Option<SessionMigrated>> {
+        let key = self.marker_key(id);
+        if !self.object_listed(&key)? {
+            return Ok(None);
+        }
+        Ok(match self.fetch_object(&key) {
+            Ok(Some(bytes)) => Some(migrated_from_marker(id, &bytes)),
+            // Removed between the listing and the GET.
+            Ok(None) => None,
+            Err(_) => Some(migrated_from_marker(id, b"")),
+        })
     }
 
     /// The local half of the migration check, which never makes a request.
@@ -429,9 +458,18 @@ impl CloudBackend {
     }
 
     /// Upload the state file to S3. Non-fatal on failure.
+    ///
+    /// With a batch open, the upload is the batch's flush, which pushes the
+    /// state file after the keys its events name. A flush that fails leaves
+    /// the state file unpushed too: on its own it would name keys the
+    /// bucket doesn't hold.
     fn sync_push_state(&self, id: &str) {
         if let Err(e) = self.strict_push_state(id) {
-            eprintln!("warning: cloud sync failed for state upload: {}", e);
+            if is_hard_sync_error(&e) {
+                eprintln!("error: cloud sync: {:#}", e);
+            } else {
+                eprintln!("warning: cloud sync failed for state upload: {:#}", e);
+            }
         }
     }
 
@@ -444,6 +482,13 @@ impl CloudBackend {
     /// happy path.
     fn strict_push_state(&self, id: &str) -> anyhow::Result<()> {
         self.local_guard(id)?;
+        // An open batch is pushed whole, from any process: a state file
+        // pushed on its own would name keys the bucket doesn't hold, and a
+        // caller of `ensure_pushed` needs the bucket to have everything,
+        // even when it is a command the tick that owns the batch runs.
+        if self.journal(id).is_open() {
+            return self.flush_batch(id);
+        }
         let state_path = self.local.session_dir(id).join(state_file_name(id));
         if !state_path.exists() {
             // Nothing to push; mirrors the old no-op behavior. Callers
@@ -515,7 +560,42 @@ impl CloudBackend {
     /// and the local one are the two sides of an import, which only a
     /// same-host import can bring together, and writing one over the other
     /// would destroy a session.
+    ///
+    /// Three cases make no request. A command a tick on `id` runs reads the
+    /// local copy as it is: the tick pulled it, and the writes it and its
+    /// commands made since are there and not yet in the bucket. A tick
+    /// pulls its own session once per process. And a pull never writes over
+    /// an open batch: the batch is flushed instead, after which the local
+    /// copy is the bucket's; a flush that fails leaves the local copy as it
+    /// is, and refuses when the failure is a migration marker or a version
+    /// conflict.
     fn sync_pull_state(&self, id: &str) -> anyhow::Result<()> {
+        if self.defers(id) {
+            return Ok(());
+        }
+        let own_tick =
+            reentrancy::is_tick_process() && reentrancy::enclosing_tick().as_deref() == Some(id);
+        if self.journal(id).is_open() {
+            match self.flush_pending(id) {
+                Ok(()) => {}
+                Err(e) if is_hard_sync_error(&e) => return Err(e),
+                Err(e) => {
+                    eprintln!(
+                        "warning: cloud sync: kept this host's unpushed writes and skipped the \
+                         pull: {:#}",
+                        e
+                    );
+                    return Ok(());
+                }
+            }
+            if own_tick {
+                self.mark_pulled(id);
+            }
+            return Ok(());
+        }
+        if own_tick && !self.mark_pulled(id) {
+            return Ok(());
+        }
         let key = self.state_key(id);
         match self.bucket.get_object(&key) {
             Ok(response) if response.status_code() == 200 => {
@@ -1014,12 +1094,21 @@ impl CloudBackend {
 
     /// Fetch the remote SessionVersion from S3. Returns None if not found.
     fn fetch_remote_version(&self, id: &str) -> Option<crate::session::version::SessionVersion> {
-        let key = self.version_key(id);
-        let response = self.bucket.get_object(&key).ok()?;
-        if response.status_code() != 200 {
-            return None;
-        }
-        serde_json::from_slice(response.bytes()).ok()
+        self.read_remote_version(id).ok().flatten()
+    }
+
+    /// The remote SessionVersion: `Ok(None)` when the bucket has none (or
+    /// one that doesn't parse), `Err` when the bucket couldn't be asked.
+    ///
+    /// Listed before it is fetched, so a session that has never pushed one
+    /// costs a listing rather than a 404 and rust-s3's one-second retry.
+    fn read_remote_version(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<crate::session::version::SessionVersion>> {
+        Ok(self
+            .get_object_if_present(&self.version_key(id))?
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok()))
     }
 
     /// Upload the local version.json to S3.
@@ -1091,6 +1180,260 @@ impl CloudBackend {
         }
     }
 
+    /// The version check before a write: a conflict refuses the write, and
+    /// anything else that stops the check (the bucket unreachable, say) is
+    /// a warning and the write goes on, as it always has.
+    fn version_guard(&self, id: &str) -> anyhow::Result<()> {
+        if let Err(e) = self.check_and_increment_version(id) {
+            if is_hard_sync_error(&e) {
+                return Err(e);
+            }
+            eprintln!("warning: cloud sync: version check failed: {}", e);
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Deferred writes (koto#376): see `crate::session::batch`.
+    // -----------------------------------------------------------------
+
+    /// The pending-writes journal in `id`'s local directory.
+    fn journal(&self, id: &str) -> Journal {
+        Journal::new(&self.local.session_dir(id))
+    }
+
+    /// Whether this process's writes to `id` wait for the tick that runs
+    /// it ([`reentrancy::runs_inside_tick_of`]).
+    fn defers(&self, id: &str) -> bool {
+        reentrancy::runs_inside_tick_of(id)
+    }
+
+    /// Record that this process pulled `id`; false when it already had.
+    fn mark_pulled(&self, id: &str) -> bool {
+        self.pulled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string())
+    }
+
+    /// S3 key of `id`'s batch-open marker.
+    fn batch_marker_key(&self, id: &str) -> String {
+        format!("{}{}", self.session_prefix(id), BATCH_MARKER)
+    }
+
+    /// Hold `id`'s batch open for one deferred write: the lock, with the
+    /// journal created.
+    ///
+    /// The first write of a batch makes the checks the batch's later writes
+    /// skip: the version check, whose conflict refuses the write as it
+    /// always has, and the batch-open marker's PUT. `Ok(None)` means the
+    /// write isn't deferred after all and pushes at once: the session has
+    /// no local directory, or the marker couldn't be written, and a batch
+    /// an import can't see must not be opened.
+    fn open_batch(&self, id: &str) -> anyhow::Result<Option<(Journal, BatchLock)>> {
+        let journal = self.journal(id);
+        let Some(lock) = journal.lock()? else {
+            return Ok(None);
+        };
+        if journal.is_open() {
+            return Ok(Some((journal, lock)));
+        }
+        self.version_guard(id)?;
+        let marker = serde_json::json!({
+            "session": id,
+            "opened_at": crate::engine::types::now_iso8601(),
+        });
+        if let Err(e) = self.put_object(&self.batch_marker_key(id), marker.to_string().as_bytes()) {
+            eprintln!(
+                "warning: cloud sync: couldn't mark a batch open, so this write is pushed at once: \
+                 {:#}",
+                e
+            );
+            return Ok(None);
+        }
+        journal.open(&lock)?;
+        Ok(Some((journal, lock)))
+    }
+
+    /// Push everything an open batch of `id` owes the bucket, then close it.
+    /// A no-op with no batch open, and in a command a tick on `id` runs,
+    /// whose batch is the tick's to flush.
+    ///
+    /// The bucket is asked first, uncached, whether `id` was imported
+    /// elsewhere while the batch was open (a marker refuses) and whether
+    /// another host's version moved past this one's base (a conflict
+    /// refuses). Either leaves the batch open and the bucket untouched.
+    ///
+    /// The writes then go in an order a stop between any two leaves the
+    /// bucket readable: each written key's content, the manifest naming
+    /// them, the state file whose events name them, `version.json`, then
+    /// the objects of removed keys (orphans until then, which nothing
+    /// reads) and last the batch-open marker. A flush that stops part way
+    /// leaves the batch open, and the next one pushes it all again.
+    pub fn flush_pending(&self, id: &str) -> anyhow::Result<()> {
+        if self.defers(id) {
+            return Ok(());
+        }
+        self.flush_batch(id)
+    }
+
+    /// [`CloudBackend::flush_pending`] without the exemption for a tick's
+    /// commands: what `ensure_pushed` runs, from whatever process calls it.
+    fn flush_batch(&self, id: &str) -> anyhow::Result<()> {
+        use crate::session::version::{check_sync, conflict_message, SyncCheck};
+
+        let journal = self.journal(id);
+        if !journal.is_open() {
+            return Ok(());
+        }
+        let Some(lock) = journal.lock()? else {
+            return Ok(());
+        };
+        // Another process flushed it while this one waited for the lock.
+        let Some(pending) = journal.pending()? else {
+            return Ok(());
+        };
+        self.local_guard(id)?;
+        if let Some(migrated) = self.read_migration_marker_of(id)? {
+            return Err(anyhow::Error::new(migrated));
+        }
+
+        let version_path = self.local_version_path(id);
+        let mut local = self.load_or_create_local_version(id)?;
+        let remote = self.read_remote_version(id)?;
+        if let SyncCheck::Conflict {
+            local_version,
+            remote_version,
+            local_machine,
+            remote_machine,
+        } = check_sync(&local, remote.as_ref())
+        {
+            anyhow::bail!(
+                "{}",
+                conflict_message(
+                    local_version,
+                    remote_version,
+                    &local_machine,
+                    &remote_machine
+                )
+            );
+        }
+        // The batch's first write increments the version; its check may
+        // have been skipped (the bucket unreachable then), so the push
+        // still carries a version past the base.
+        if local.version == local.last_sync_base {
+            local.version += 1;
+            local.save(&version_path)?;
+        }
+
+        let manifest = self.local.read_manifest(id).unwrap_or_default();
+        let (present, gone): (Vec<&String>, Vec<&String>) = pending
+            .keys
+            .iter()
+            .partition(|key| manifest.keys.contains_key(key.as_str()));
+        let ctx_dir = self.local.session_dir(id).join("ctx");
+        let ctx_key = |key: &str| format!("{}/{}/ctx/{}", self.prefix, id, key);
+        in_parallel(&present, |key| {
+            let path = ctx_dir.join(key.as_str());
+            let data =
+                std::fs::read(&path).with_context(|| format!("reading context key '{}'", key))?;
+            self.put_object(&ctx_key(key), &data)
+        })?;
+        if !pending.keys.is_empty() {
+            let manifest_path = ctx_dir.join("manifest.json");
+            if manifest_path.exists() {
+                let data = std::fs::read(&manifest_path)
+                    .with_context(|| format!("reading {}", manifest_path.display()))?;
+                self.put_object(&ctx_key("manifest.json"), &data)?;
+            }
+        }
+        let state_path = self.local.session_dir(id).join(state_file_name(id));
+        if state_path.exists() {
+            let data = std::fs::read(&state_path)
+                .with_context(|| format!("reading local state file: {}", state_path.display()))?;
+            self.put_object(&self.state_key(id), &data)?;
+        }
+        local.last_sync_base = local.version;
+        local.save(&version_path)?;
+        self.push_version(id)?;
+        let _ = in_parallel(&gone, |key| {
+            if let Err(e) = self.bucket.delete_object(ctx_key(key)) {
+                eprintln!(
+                    "warning: cloud sync: failed to delete context key '{}': {}",
+                    key, e
+                );
+            }
+            Ok(())
+        });
+        self.manifest_cache.invalidate();
+        // The batch stays open until its marker is gone: with the journal
+        // closed, nothing would come back to delete a marker left behind,
+        // and every import would refuse the session for good. The next
+        // flush pushes the batch again, which changes nothing, and retries.
+        self.bucket
+            .delete_object(self.batch_marker_key(id))
+            .with_context(|| format!("deleting the batch-open marker of '{}'", id))?;
+        journal.close(&lock)
+    }
+
+    /// Before a write that pushes at once: flush a batch another process
+    /// left open, since the manifest this write pushes names the batch's
+    /// keys too. A migration marker or a version conflict refuses the
+    /// write; any other failure is a warning, as the push itself would be.
+    fn settle_batch(&self, id: &str) -> anyhow::Result<()> {
+        match self.flush_pending(id) {
+            Err(e) if is_hard_sync_error(&e) => Err(e),
+            Err(e) => {
+                eprintln!("warning: cloud sync: {:#}", e);
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+
+    /// Drop `id`'s open batch without pushing it, once `koto session
+    /// resolve` has replaced one side with the other wholesale. The marker
+    /// goes first: a failed delete leaves the batch open, so the next flush
+    /// deletes it.
+    fn discard_batch(&self, id: &str) -> anyhow::Result<()> {
+        let journal = self.journal(id);
+        if !journal.is_open() {
+            return Ok(());
+        }
+        let Some(lock) = journal.lock()? else {
+            return Ok(());
+        };
+        self.bucket
+            .delete_object(self.batch_marker_key(id))
+            .with_context(|| format!("deleting the batch-open marker of '{}'", id))?;
+        journal.close(&lock)
+    }
+
+    /// The keys whose local copy answers a read of `session` because an
+    /// open batch wrote them, so a read never pulls the bucket's stale copy
+    /// over one. Outside the tick that owns the batch, the batch is flushed
+    /// first and nothing is left to keep local; a flush that fails keeps
+    /// the batch's keys local all the same.
+    fn pending_keys(&self, session: &str) -> Option<Pending> {
+        let journal = self.journal(session);
+        if !journal.is_open() {
+            return None;
+        }
+        if !self.defers(session) {
+            match self.flush_pending(session) {
+                Ok(()) => return None,
+                Err(e) => eprintln!("warning: cloud sync: {:#}", e),
+            }
+        }
+        match journal.pending() {
+            Ok(pending) => pending,
+            Err(e) => {
+                eprintln!("warning: cloud sync: {:#}", e);
+                None
+            }
+        }
+    }
+
     /// Resolve a version conflict by keeping local or remote state.
     pub fn resolve_conflict(&self, id: &str, keep: &str) -> anyhow::Result<()> {
         use crate::session::version::{get_or_create_machine_id, resolved_version, SessionVersion};
@@ -1125,7 +1468,11 @@ impl CloudBackend {
             _ => unreachable!(), // Validated by caller.
         }
 
-        Ok(())
+        // Either side won whole, which settles whatever an open batch owed:
+        // its writes went up with the rest of the local copy, or the remote
+        // replaced them. Only now, so a resolution that fails part way
+        // leaves the batch, and its marker, for the next flush.
+        self.discard_batch(id)
     }
 
     /// Read the local state file bytes for a session, if present.
@@ -1347,8 +1694,12 @@ impl CloudBackend {
             );
         }
 
-        // Upload state file.
-        self.sync_push_state(id);
+        // Upload state file. Directly, not through `sync_push_state`, which
+        // would flush an open batch and refuse on the very conflict this
+        // upload resolves; the context files below cover the batch's keys.
+        if let Err(e) = self.push_local_state_bytes(id) {
+            eprintln!("warning: cloud sync failed for state upload: {:#}", e);
+        }
 
         // Upload version.json.
         self.push_version(id)?;
@@ -1500,6 +1851,8 @@ impl SessionBackend for CloudBackend {
         Ok(())
     }
 
+    /// Append locally, then push the state file; inside a tick on `id`, the
+    /// append joins the tick's batch instead and the tick pushes it.
     fn append_event(
         &self,
         id: &str,
@@ -1507,6 +1860,11 @@ impl SessionBackend for CloudBackend {
         timestamp: &str,
     ) -> anyhow::Result<()> {
         self.local_guard(id)?;
+        if self.defers(id) {
+            if let Some((_journal, _lock)) = self.open_batch(id)? {
+                return self.local.append_event(id, payload, timestamp);
+            }
+        }
         self.local.append_event(id, payload, timestamp)?;
         self.sync_push_state(id);
         Ok(())
@@ -1567,6 +1925,11 @@ impl SessionBackend for CloudBackend {
         f: &dyn Fn(crate::engine::types::StateFileHeader) -> crate::engine::types::StateFileHeader,
     ) -> anyhow::Result<()> {
         self.local_guard(id)?;
+        if self.defers(id) {
+            if let Some((_journal, _lock)) = self.open_batch(id)? {
+                return self.local.rewrite_header(id, f);
+            }
+        }
         self.local.rewrite_header(id, f)?;
         self.sync_push_state(id);
         Ok(())
@@ -1712,21 +2075,31 @@ impl CloudBackend {
         writer: Option<&str>,
     ) -> anyhow::Result<()> {
         self.check_not_migrated(session)?;
-        match writer {
-            Some(w) => self.local.add_with_writer(session, key, content, w)?,
-            None => self.local.add(session, key, content)?,
+        let write = || match writer {
+            Some(w) => self.local.add_with_writer(session, key, content, w),
+            None => self.local.add(session, key, content),
+        };
+
+        // Inside a tick on this session: record the key, then write it, and
+        // leave the push to the tick. Recorded first, so a write that stops
+        // half way is still one the flush looks at.
+        if self.defers(session) {
+            if let Some((journal, lock)) = self.open_batch(session)? {
+                journal.record(
+                    &lock,
+                    &batch::Op::Add {
+                        key: key.to_string(),
+                    },
+                )?;
+                return write();
+            }
         }
+        self.settle_batch(session)?;
+        write()?;
 
         // Check version before pushing. Conflicts are hard errors;
         // S3 connectivity failures are non-fatal (version check is skipped).
-        if let Err(e) = self.check_and_increment_version(session) {
-            let msg = e.to_string();
-            if msg.starts_with("session conflict:") {
-                return Err(e);
-            }
-            // S3 unreachable or version file missing -- proceed without version check.
-            eprintln!("warning: cloud sync: version check failed: {}", e);
-        }
+        self.version_guard(session)?;
 
         sync::push_context_key(
             &self.local,
@@ -1779,6 +2152,12 @@ impl ContextStore for CloudBackend {
         if !crate::session::context_log::loggable_key(key) {
             return None;
         }
+        if self
+            .pending_keys(session)
+            .is_some_and(|pending| pending.touches(key))
+        {
+            return None;
+        }
         sync::remote_key_meta(
             &self.bucket,
             &self.prefix,
@@ -1790,6 +2169,13 @@ impl ContextStore for CloudBackend {
 
     fn get(&self, session: &str, key: &str) -> anyhow::Result<Vec<u8>> {
         self.check_not_migrated(session)?;
+        // A key an open batch wrote is read as the batch left it.
+        if self
+            .pending_keys(session)
+            .is_some_and(|pending| pending.touches(key))
+        {
+            return self.local.get(session, key);
+        }
         // Pull from remote if a newer version exists. A pull that wrote the
         // local store is a write like any other, so it is logged -- before
         // the read the caller is about to log, which it produced.
@@ -1827,6 +2213,12 @@ impl ContextStore for CloudBackend {
         if self.local.ctx_exists(session, key) {
             return true;
         }
+        if self
+            .pending_keys(session)
+            .is_some_and(|pending| pending.touches(key))
+        {
+            return false;
+        }
         // Fall back to checking remote manifest.
         sync::remote_key_exists(
             &self.bucket,
@@ -1840,16 +2232,39 @@ impl ContextStore for CloudBackend {
 
     fn remove(&self, session: &str, key: &str) -> anyhow::Result<()> {
         self.check_not_migrated(session)?;
+        if self.defers(session) {
+            if let Some((journal, lock)) = self.open_batch(session)? {
+                journal.record(
+                    &lock,
+                    &batch::Op::Remove {
+                        key: key.to_string(),
+                    },
+                )?;
+                return self.local.remove(session, key);
+            }
+        }
+        self.settle_batch(session)?;
+        let held_locally = self.local.ctx_exists(session, key);
         self.local.remove(session, key)?;
 
-        // Check version before pushing deletion.
-        if let Err(e) = self.check_and_increment_version(session) {
-            let msg = e.to_string();
-            if msg.starts_with("session conflict:") {
-                return Err(e);
-            }
-            eprintln!("warning: cloud sync: version check failed: {}", e);
+        // A key neither copy has leaves nothing to delete or to drop from
+        // the manifest: the removal is a no-op, as it is locally, and costs
+        // the one manifest read that says so. A manifest that can't be read
+        // goes the long way round.
+        if !held_locally
+            && sync::remote_key_exists(
+                &self.bucket,
+                &self.prefix,
+                session,
+                key,
+                &self.manifest_cache,
+            ) == Some(false)
+        {
+            return Ok(());
         }
+
+        // Check version before pushing deletion.
+        self.version_guard(session)?;
 
         sync::delete_context_key(
             &self.local,
@@ -1868,7 +2283,9 @@ impl ContextStore for CloudBackend {
     fn list_keys(&self, session: &str, prefix: Option<&str>) -> anyhow::Result<Vec<String>> {
         self.check_not_migrated(session)?;
         let mut keys = self.local.list_keys(session, prefix)?;
-        // Merge in remote-only keys.
+        let pending = self.pending_keys(session).unwrap_or_default();
+        // Merge in remote-only keys, leaving out those an open batch
+        // removed here.
         if let Some(remote_keys) = sync::remote_list_keys(
             &self.bucket,
             &self.prefix,
@@ -1877,7 +2294,7 @@ impl ContextStore for CloudBackend {
             &self.manifest_cache,
         ) {
             for k in remote_keys {
-                if !keys.contains(&k) {
+                if !keys.contains(&k) && !pending.touches(&k) {
                     keys.push(k);
                 }
             }
@@ -1923,8 +2340,9 @@ pub enum ImportErrorCode {
     Unmarked,
     /// A same-host import found another process holding the source's lock.
     SourceRunning,
-    /// A same-host import found the source's local copy ahead of the
-    /// bucket: events or context the bucket lacks.
+    /// The source's host holds writes the bucket lacks: a same-host import
+    /// found the source's local copy ahead of the bucket, or any import
+    /// found the source's batch-open marker.
     SourceUnpushed,
     /// A same-host import found a local session naming the source as its
     /// parent.
@@ -2513,6 +2931,29 @@ impl CloudBackend {
                 Some(bytes.clone())
             }
         };
+
+        // A batch the source's host hasn't flushed: its copy in the bucket
+        // lacks writes the host holds, and an import would carry the copy
+        // without them and mark the source, silently. It refuses rather than
+        // flushes: the writes are in a journal on the source's host, out of
+        // reach from here. A source this import already marked is past that
+        // point.
+        if own_marker.is_none()
+            && self
+                .object_listed(&format!("{}{}", session, BATCH_MARKER))
+                .map_err(|e| unreadable_source(name, &workspace, "the batch-open marker", &e))?
+        {
+            return Err(ImportError::new(
+                SourceUnpushed,
+                format!(
+                    "session '{}' in workspace {} has writes its host hasn't pushed to the \
+                     bucket yet (a `koto next` stopped before it pushed them); run any koto \
+                     command on the session in that workspace, such as `koto status {}`, to \
+                     push them, then import again",
+                    name, workspace, name
+                ),
+            ));
+        }
 
         let state_bytes = self
             .get_object_if_present(&format!("{}{}", session, state_file_name(name)))
@@ -3130,6 +3571,41 @@ fn create_bucket(config: &CloudConfig) -> anyhow::Result<Box<Bucket>> {
 /// Whether an S3 error is a 404: the object (or bucket) isn't there.
 fn is_not_found(e: &S3Error) -> bool {
     matches!(e, S3Error::HttpFailWithBody(404, _))
+}
+
+/// How many of a flush's independent requests (one per context key) are in
+/// flight at once. Each waits a full round trip, so a batch of many keys
+/// would otherwise cost the flush that many round trips in a row.
+const FLUSH_PARALLELISM: usize = 8;
+
+/// Run `f` on every item, [`FLUSH_PARALLELISM`] at a time, and return the
+/// first error once every started call has finished.
+fn in_parallel<T: Sync>(
+    items: &[T],
+    f: impl Fn(&T) -> anyhow::Result<()> + Sync,
+) -> anyhow::Result<()> {
+    for chunk in items.chunks(FLUSH_PARALLELISM) {
+        let results: Vec<anyhow::Result<()>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk.iter().map(|item| scope.spawn(|| f(item))).collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("a cloud sync request panicked")))
+                })
+                .collect()
+        });
+        results.into_iter().collect::<anyhow::Result<()>>()?;
+    }
+    Ok(())
+}
+
+/// Whether a sync failure must stop the command rather than warn: the
+/// session was imported elsewhere, or another host's writes conflict with
+/// this one's. Everything else (an unreachable bucket, a refused request)
+/// leaves the local write standing and the push for later.
+fn is_hard_sync_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<SessionMigrated>().is_some() || e.to_string().starts_with("session conflict:")
 }
 
 /// Whether `key` is the migration marker of the session whose objects live
@@ -5084,5 +5560,69 @@ mod tests {
         let backend = cloud_backend_at(tmp.path(), endpoint);
         backend.read_header("wf").unwrap();
         assert_eq!(fs::read(&state).unwrap(), remote);
+    }
+
+    /// `ensure_pushed` pushes an open batch whole, in the flush's order, and
+    /// closes it, whichever process asks: a state file pushed on its own
+    /// would name keys the bucket doesn't hold (koto#376).
+    #[test]
+    fn ensure_pushed_flushes_an_open_batch_in_order() {
+        let endpoint = serve(Vec::new());
+        let tmp = TempDir::new().unwrap();
+        write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
+        // A version past its base, so the flush needs no machine id.
+        fs::write(
+            tmp.path().join("wf").join("version.json"),
+            r#"{"version":1,"last_sync_base":0,"machine_id":"testhost"}"#,
+        )
+        .unwrap();
+        let backend = cloud_backend_at(tmp.path(), endpoint.url.clone());
+        let journal = backend.journal("wf");
+        {
+            let lock = journal.lock().unwrap().unwrap();
+            journal.open(&lock).unwrap();
+            journal
+                .record(
+                    &lock,
+                    &batch::Op::Add {
+                        key: "notes.md".to_string(),
+                    },
+                )
+                .unwrap();
+            backend.local.add("wf", "notes.md", b"deferred").unwrap();
+            journal
+                .record(
+                    &lock,
+                    &batch::Op::Remove {
+                        key: "gone.md".to_string(),
+                    },
+                )
+                .unwrap();
+        }
+
+        backend.ensure_pushed("wf").unwrap();
+
+        assert!(!journal.is_open());
+        let writes: Vec<String> = endpoint
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PUT" || r.method == "DELETE")
+            .map(|r| {
+                let rest = r.path.rsplit_once("/wf/").map(|(_, rest)| rest);
+                format!("{} {}", r.method, rest.unwrap_or(&r.path))
+            })
+            .collect();
+        assert_eq!(
+            writes,
+            vec![
+                "PUT ctx/notes.md".to_string(),
+                "PUT ctx/manifest.json".to_string(),
+                format!("PUT {}", state_file_name("wf")),
+                "PUT version.json".to_string(),
+                "DELETE ctx/gone.md".to_string(),
+                format!("DELETE {}", BATCH_MARKER),
+            ]
+        );
+        assert_eq!(endpoint.last_put("/ctx/notes.md").unwrap(), b"deferred");
     }
 }

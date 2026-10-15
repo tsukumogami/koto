@@ -30,7 +30,9 @@ pub fn handle_add(
     // This read is load-bearing on the cloud backend for a second reason: it
     // pulls the remote copy over the local one, so an append that follows
     // sees what S3 has. A session whose directory is missing locally still
-    // fails here, because the pull writes no directory of its own.
+    // fails here, because the pull writes no directory of its own. (Inside a
+    // tick on this session there is no pull: the tick pulled, and the local
+    // copy holds writes the bucket doesn't have yet.)
     backend.read_header(session)?;
 
     let content = match from_file {

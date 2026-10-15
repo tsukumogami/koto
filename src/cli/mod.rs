@@ -942,7 +942,20 @@ fn exit_with_error(error: serde_json::Value) -> ! {
 /// Print a JSON error and exit with a specific exit code.
 pub(super) fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
     println!("{}", serde_json::to_string(&error).unwrap_or_default());
+    flush_before_exit();
     std::process::exit(code);
+}
+
+/// What `koto next` runs on its way out, however it exits: the flush of
+/// the writes its commands deferred (koto#376). Set once, by the `next`
+/// arm of [`run`]; other commands leave it unset.
+static EXIT_FLUSH: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
+/// Run the exit flush, if this command set one.
+fn flush_before_exit() {
+    if let Some(flush) = EXIT_FLUSH.get() {
+        flush();
+    }
 }
 
 /// Determine the exit code for an engine error by downcasting to EngineError.
@@ -1534,10 +1547,22 @@ pub fn run(app: App) -> Result<()> {
             redelegation_cap,
             dispatch_epoch,
         } => {
-            let backend = build_backend()?;
-            let context_store: &dyn ContextStore = &backend;
-            handle_next(
-                &backend,
+            // Leaked so the exit flush can reach it from any exit path,
+            // `std::process::exit` included. One per process, which ends.
+            let backend: &'static Backend = Box::leak(Box::new(build_backend()?));
+            let tick = name.clone();
+            let _ = EXIT_FLUSH.set(Box::new(move || {
+                if let Err(e) = backend.flush_pending(&tick) {
+                    eprintln!(
+                        "warning: cloud sync: the writes this tick's commands made are kept on \
+                         this host and pushed by the next koto command on '{}': {:#}",
+                        tick, e
+                    );
+                }
+            }));
+            let context_store: &dyn ContextStore = backend;
+            let result = handle_next(
+                backend,
                 context_store,
                 backend.journal_root(),
                 name,
@@ -1548,7 +1573,9 @@ pub fn run(app: App) -> Result<()> {
                 rationale,
                 redelegation_cap,
                 dispatch_epoch,
-            )
+            );
+            flush_before_exit();
+            result
         }
         Command::Cancel { name, cleanup } => {
             let backend = build_backend()?;
@@ -5387,6 +5414,7 @@ fn handle_next(
                         record,
                     );
                 }
+                flush_before_exit();
                 std::process::exit(0);
             }
             Err(err) => {
@@ -6976,6 +7004,7 @@ fn handle_next(
                     record,
                 );
             }
+            flush_before_exit();
             std::process::exit(0);
         }
         Err(advance_err) => {
