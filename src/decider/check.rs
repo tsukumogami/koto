@@ -414,7 +414,7 @@ pub struct DeciderFallback {
 }
 
 /// The agent's answer to one fallback: the payload of the
-/// `decider_check_answered` event the agent appends to answer. It binds
+/// `decider_check_answered` event `koto decider answer` appends. It binds
 /// to the slice and declaration of the fallback it answers, so it applies
 /// only to an evaluation of the same slice of the same criterion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

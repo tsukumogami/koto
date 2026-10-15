@@ -1422,7 +1422,7 @@ pub enum EventPayload {
     /// does the same rather than failing the read.
     DeciderFallback(crate::decider::check::DeciderFallback),
     /// The agent's answer to a criterion that fell back to it, appended by
-    /// the agent's answer command. Additive, and degrades like `decider_checked`.
+    /// `koto decider answer`. Additive, and degrades like `decider_checked`.
     DeciderCheckAnswered(crate::decider::check::DeciderCheckAnswered),
     InstructionsDelivered {
         /// The phase whose instructions the response carried.

@@ -424,39 +424,22 @@ fn assert_waits_on_the_agent(h: &Harness, out: &Value, reason: &str, mode: &str)
     assert_eq!(fb["declaration_hash"], c["declaration_hash"]);
 }
 
-/// Record the agent's `answer` for criterion `rule`, bound to the latest
-/// fallback for it, by appending the event to the log as the answer command
-/// does.
+/// Record the agent's `answer` for criterion `rule` of `comments` with
+/// `koto decider answer`, as the waiting finding tells the agent to.
 fn answer(h: &Harness, rule: &str, answer: &str) {
-    let events = h.events();
-    let fb = events
-        .iter()
-        .rev()
-        .find(|e| e["type"] == "decider_fallback" && e["payload"]["rule_id"] == rule)
-        .expect("a fallback to answer");
-    let seq = events
-        .iter()
-        .filter_map(|e| e["seq"].as_u64())
-        .max()
-        .unwrap()
-        + 1;
-    let p = &fb["payload"];
-    let mut payload = json!({
-        "state": p["state"], "visit_seq": p["visit_seq"], "gate": p["gate"],
-        "rule_id": p["rule_id"], "declaration_hash": p["declaration_hash"],
-        "answer": answer, "fallback_seq": fb["seq"],
-    });
-    if let Some(sha) = p.get("input_sha256") {
-        payload["input_sha256"] = sha.clone();
-    }
-    let line = json!({"seq": seq, "timestamp": "2026-10-15T00:00:00.000Z",
-        "type": "decider_check_answered", "payload": payload});
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(h.state_path())
-        .unwrap();
-    writeln!(f, "{}", line).unwrap();
+    let out = answer_cmd(
+        h,
+        &[
+            WF,
+            "--gate",
+            "comments",
+            "--criterion",
+            rule,
+            "--answer",
+            answer,
+        ],
+    );
+    assert!(out.status.success(), "{}", describe(&out));
 }
 
 #[test]
@@ -1720,4 +1703,148 @@ fn a_session_whose_cached_check_lost_its_spec_is_refused_on_resume() {
     // Nothing was asked and nothing appended: the session did not resume.
     assert_eq!(h.stub.request_count(), 0);
     assert_eq!(h.raw_log(), log);
+}
+
+// ---------------------------------------------------------------------------
+// koto decider answer
+// ---------------------------------------------------------------------------
+
+/// `koto decider answer` with these arguments, as the agent runs it.
+fn answer_cmd(h: &Harness, args: &[&str]) -> std::process::Output {
+    let mut cmd = h.koto();
+    cmd.args(["decider", "answer"]).args(args);
+    cmd.output().unwrap()
+}
+
+/// Assert `out` is the typed refusal `code` with exit 2, and that the log
+/// gained no event.
+fn assert_refused(h: &Harness, before: usize, out: &std::process::Output, code: &str) {
+    assert_eq!(out.status.code(), Some(2), "{}", describe(out));
+    let body = json_out(out);
+    assert_eq!(body["error"]["code"], code, "{}", body);
+    assert_eq!(body["command"], "decider answer");
+    assert_eq!(h.events().len(), before, "nothing appended");
+}
+
+#[test]
+fn the_command_the_waiting_finding_prints_records_the_answer() {
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    h.stub.push(Reply::status(401));
+    let out = run(&h, "auto");
+    let msg = findings(&out)[0]["message"].as_str().unwrap().to_string();
+    // The command between the first pair of backticks, with a word chosen.
+    let line = msg
+        .split('`')
+        .nth(1)
+        .unwrap()
+        .replace("<pass|fail|unclear>", "pass");
+    let words: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(&words[..3], &["koto", "decider", "answer"], "{}", line);
+    let rec = answer_cmd(&h, &words[3..]);
+    assert!(rec.status.success(), "{}", describe(&rec));
+    let body = json_out(&rec);
+    assert_eq!(body["status"], "recorded");
+    assert_eq!(body["answer"], "pass");
+
+    // The event names everything the next evaluation binds on.
+    let fb = h.events_of("decider_fallback").last().unwrap().clone();
+    let ans = h.events_of("decider_check_answered");
+    assert_eq!(ans.len(), 1);
+    let p = &ans[0]["payload"];
+    assert_eq!(p["state"], "review");
+    assert_eq!(p["gate"], "comments");
+    assert_eq!(p["rule_id"], "r");
+    assert_eq!(p["answer"], "pass");
+    assert_eq!(p["visit_seq"], fb["payload"]["visit_seq"]);
+    assert_eq!(p["declaration_hash"], fb["payload"]["declaration_hash"]);
+    assert_eq!(p["input_sha256"], fb["payload"]["input_sha256"]);
+    assert_eq!(p["fallback_seq"], fb["seq"]);
+
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
+}
+
+#[test]
+fn the_answer_command_refuses_what_it_cannot_record() {
+    let h = harness(&check_template(&criteria(&["r", "s"], "veto")), SLICE);
+    h.stub.push(Reply::status(401));
+    h.stub.push(pass("s"));
+    run(&h, "auto");
+    let before = h.events().len();
+
+    let out = answer_cmd(
+        &h,
+        &[
+            WF,
+            "--gate",
+            "comments",
+            "--criterion",
+            "r",
+            "--answer",
+            "yes",
+        ],
+    );
+    assert_refused(&h, before, &out, "invalid_answer");
+    let out = answer_cmd(
+        &h,
+        &[WF, "--gate", "nope", "--criterion", "r", "--answer", "pass"],
+    );
+    assert_refused(&h, before, &out, "unknown_criterion");
+    let out = answer_cmd(
+        &h,
+        &[
+            WF,
+            "--gate",
+            "comments",
+            "--criterion",
+            "zz",
+            "--answer",
+            "pass",
+        ],
+    );
+    assert_refused(&h, before, &out, "unknown_criterion");
+    // s got a verdict: nothing fell back, so there is nothing to answer.
+    let out = answer_cmd(
+        &h,
+        &[
+            WF,
+            "--gate",
+            "comments",
+            "--criterion",
+            "s",
+            "--answer",
+            "pass",
+        ],
+    );
+    assert_refused(&h, before, &out, "no_fallback");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_answer_is_recorded_while_another_tick_holds_the_lock() {
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    h.stub.push(Reply::status(401));
+    run(&h, "auto");
+    let lock = hold_lock(&h);
+    let started = Instant::now();
+    let out = answer_cmd(
+        &h,
+        &[
+            WF,
+            "--gate",
+            "comments",
+            "--criterion",
+            "r",
+            "--answer",
+            "pass",
+        ],
+    );
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the answer doesn't wait"
+    );
+    drop(lock);
+    let out = run(&h, "auto");
+    assert_eq!(state_of(&out), "done", "{}", out);
 }

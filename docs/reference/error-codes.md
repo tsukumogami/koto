@@ -308,6 +308,41 @@ for real on every tick. The same gate reports `agent_actionable: false` in
 
 ---
 
+### decider answer
+
+`koto decider answer` records the agent's answer to a decider-check criterion
+the decider gave no verdict on. A missing session prints the flat format with
+exit 1, and an unreadable session log or template exits 3, as `koto overrides
+record` does. Three refusals carry a typed code, each with exit code 2 and
+nothing appended to the state log. The `error` object names the `gate`, the
+`criterion` and, once the session is loaded, the `state`.
+
+**`invalid_answer`** -- `--answer` is not `pass`, `fail` or `unclear`. Checked
+before the session is read:
+
+```json
+{"error":{"code":"invalid_answer","message":"answer 'yes' is not one of pass, fail or unclear","gate":"comments","criterion":"comment_reason"},"command":"decider answer"}
+```
+
+**`unknown_criterion`** -- the current state has no decider check with that
+name, or the check declares no such criterion:
+
+```json
+{"error":{"code":"unknown_criterion","message":"state 'review' has no decider check 'nope' with a criterion 'comment_reason'","gate":"nope","criterion":"comment_reason","state":"review"},"command":"decider answer"}
+```
+
+**`no_fallback`** -- the criterion hasn't fallen back to the agent in this
+visit to the state: no `decider_fallback` names it since the session last
+arrived there, so there's nothing to answer. Run `koto next` and read the
+response; only a criterion listed under the check's `output.awaiting` takes an
+answer:
+
+```json
+{"error":{"code":"no_fallback","message":"criterion 'comment_reason' of 'comments' has not fallen back to you in this visit to 'review': only a criterion the decider gave no verdict on takes your answer","gate":"comments","criterion":"comment_reason","state":"review"},"command":"decider answer"}
+```
+
+---
+
 ### template compile
 
 **Compilation failed** — invalid YAML, missing required fields, or unknown gate type:
