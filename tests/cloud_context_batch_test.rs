@@ -587,7 +587,8 @@ fn a_migrated_source_still_refuses_inside_an_action() {
     let out = a.next();
     assert_ne!(out.json()["state"], "wait", "{}", out.describe());
     assert!(
-        out.stdout.contains("session_migrated") || out.stdout.contains("imported"),
+        out.stdout
+            .contains("session_migrated: session 'batch' was migrated to 'batch' in /elsewhere"),
         "the second add should have refused: {}",
         out.describe()
     );
@@ -653,6 +654,33 @@ fn a_version_conflict_is_still_a_hard_error() {
         "{}",
         out.describe()
     );
+}
+
+/// A session that has never pushed a `version.json` is asked about it with
+/// a listing, not a GET: a GET of a missing object is a 404, which rust-s3
+/// retries after a one-second sleep.
+#[test]
+fn a_missing_version_file_costs_no_404() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    h.init("true");
+    assert!(s3.object(&h.key("version.json")).is_none());
+    let mut out = None;
+    let requests = requests_during(&s3, || out = Some(h.add("first.md", b"first")));
+    let out = out.unwrap();
+    assert!(out.ok(), "add: {}", out.describe());
+    let version = h.key("version.json");
+    assert!(
+        requests.contains(&format!("LIST {}", version)),
+        "{:#?}",
+        requests
+    );
+    assert!(
+        !requests.contains(&format!("GET {}", version)),
+        "{:#?}",
+        requests
+    );
+    assert!(s3.object(&version).is_some());
 }
 
 /// The local backend has no batch: an action's context calls write the

@@ -482,8 +482,12 @@ impl CloudBackend {
     /// happy path.
     fn strict_push_state(&self, id: &str) -> anyhow::Result<()> {
         self.local_guard(id)?;
-        if self.journal(id).is_open() && !self.defers(id) {
-            return self.flush_pending(id);
+        // An open batch is pushed whole, from any process: a state file
+        // pushed on its own would name keys the bucket doesn't hold, and a
+        // caller of `ensure_pushed` needs the bucket to have everything,
+        // even when it is a command the tick that owns the batch runs.
+        if self.journal(id).is_open() {
+            return self.flush_batch(id);
         }
         let state_path = self.local.session_dir(id).join(state_file_name(id));
         if !state_path.exists() {
@@ -1267,11 +1271,17 @@ impl CloudBackend {
     /// reads) and last the batch-open marker. A flush that stops part way
     /// leaves the batch open, and the next one pushes it all again.
     pub fn flush_pending(&self, id: &str) -> anyhow::Result<()> {
-        use crate::session::version::{check_sync, conflict_message, SyncCheck};
-
         if self.defers(id) {
             return Ok(());
         }
+        self.flush_batch(id)
+    }
+
+    /// [`CloudBackend::flush_pending`] without the exemption for a tick's
+    /// commands: what `ensure_pushed` runs, from whatever process calls it.
+    fn flush_batch(&self, id: &str) -> anyhow::Result<()> {
+        use crate::session::version::{check_sync, conflict_message, SyncCheck};
+
         let journal = self.journal(id);
         if !journal.is_open() {
             return Ok(());
@@ -1356,12 +1366,13 @@ impl CloudBackend {
             Ok(())
         });
         self.manifest_cache.invalidate();
-        if let Err(e) = self.bucket.delete_object(self.batch_marker_key(id)) {
-            eprintln!(
-                "warning: cloud sync: failed to delete the batch-open marker of '{}': {}",
-                id, e
-            );
-        }
+        // The batch stays open until its marker is gone: with the journal
+        // closed, nothing would come back to delete a marker left behind,
+        // and every import would refuse the session for good. The next
+        // flush pushes the batch again, which changes nothing, and retries.
+        self.bucket
+            .delete_object(self.batch_marker_key(id))
+            .with_context(|| format!("deleting the batch-open marker of '{}'", id))?;
         journal.close(&lock)
     }
 
@@ -1380,24 +1391,22 @@ impl CloudBackend {
         }
     }
 
-    /// Drop `id`'s open batch without pushing it: `koto session resolve`
-    /// replaces one side with the other wholesale, which settles whatever
-    /// the batch owed. Best-effort on the marker, like every delete.
+    /// Drop `id`'s open batch without pushing it, once `koto session
+    /// resolve` has replaced one side with the other wholesale. The marker
+    /// goes first: a failed delete leaves the batch open, so the next flush
+    /// deletes it.
     fn discard_batch(&self, id: &str) -> anyhow::Result<()> {
         let journal = self.journal(id);
         if !journal.is_open() {
             return Ok(());
         }
-        if let Some(lock) = journal.lock()? {
-            journal.close(&lock)?;
-        }
-        if let Err(e) = self.bucket.delete_object(self.batch_marker_key(id)) {
-            eprintln!(
-                "warning: cloud sync: failed to delete the batch-open marker of '{}': {}",
-                id, e
-            );
-        }
-        Ok(())
+        let Some(lock) = journal.lock()? else {
+            return Ok(());
+        };
+        self.bucket
+            .delete_object(self.batch_marker_key(id))
+            .with_context(|| format!("deleting the batch-open marker of '{}'", id))?;
+        journal.close(&lock)
     }
 
     /// The keys whose local copy answers a read of `session` because an
@@ -1433,9 +1442,6 @@ impl CloudBackend {
         // last writes before an import, and must work while one is marked.
         // Only the local guard, which a same-host import's other side trips.
         self.local_guard(id)?;
-        // Either side wins whole, so an open batch's writes are settled:
-        // pushed with the rest of the local copy, or replaced by the remote.
-        self.discard_batch(id)?;
 
         let local_path = self.local_version_path(id);
         let local = self.load_or_create_local_version(id)?;
@@ -1462,7 +1468,11 @@ impl CloudBackend {
             _ => unreachable!(), // Validated by caller.
         }
 
-        Ok(())
+        // Either side won whole, which settles whatever an open batch owed:
+        // its writes went up with the rest of the local copy, or the remote
+        // replaced them. Only now, so a resolution that fails part way
+        // leaves the batch, and its marker, for the next flush.
+        self.discard_batch(id)
     }
 
     /// Read the local state file bytes for a session, if present.
@@ -1684,8 +1694,12 @@ impl CloudBackend {
             );
         }
 
-        // Upload state file.
-        self.sync_push_state(id);
+        // Upload state file. Directly, not through `sync_push_state`, which
+        // would flush an open batch and refuse on the very conflict this
+        // upload resolves; the context files below cover the batch's keys.
+        if let Err(e) = self.push_local_state_bytes(id) {
+            eprintln!("warning: cloud sync failed for state upload: {:#}", e);
+        }
 
         // Upload version.json.
         self.push_version(id)?;
@@ -2920,8 +2934,10 @@ impl CloudBackend {
 
         // A batch the source's host hasn't flushed: its copy in the bucket
         // lacks writes the host holds, and an import would carry the copy
-        // without them and mark the source, silently. A source this import
-        // already marked is past that point.
+        // without them and mark the source, silently. It refuses rather than
+        // flushes: the writes are in a journal on the source's host, out of
+        // reach from here. A source this import already marked is past that
+        // point.
         if own_marker.is_none()
             && self
                 .object_listed(&format!("{}{}", session, BATCH_MARKER))
@@ -5544,5 +5560,69 @@ mod tests {
         let backend = cloud_backend_at(tmp.path(), endpoint);
         backend.read_header("wf").unwrap();
         assert_eq!(fs::read(&state).unwrap(), remote);
+    }
+
+    /// `ensure_pushed` pushes an open batch whole, in the flush's order, and
+    /// closes it, whichever process asks: a state file pushed on its own
+    /// would name keys the bucket doesn't hold (koto#376).
+    #[test]
+    fn ensure_pushed_flushes_an_open_batch_in_order() {
+        let endpoint = serve(Vec::new());
+        let tmp = TempDir::new().unwrap();
+        write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
+        // A version past its base, so the flush needs no machine id.
+        fs::write(
+            tmp.path().join("wf").join("version.json"),
+            r#"{"version":1,"last_sync_base":0,"machine_id":"testhost"}"#,
+        )
+        .unwrap();
+        let backend = cloud_backend_at(tmp.path(), endpoint.url.clone());
+        let journal = backend.journal("wf");
+        {
+            let lock = journal.lock().unwrap().unwrap();
+            journal.open(&lock).unwrap();
+            journal
+                .record(
+                    &lock,
+                    &batch::Op::Add {
+                        key: "notes.md".to_string(),
+                    },
+                )
+                .unwrap();
+            backend.local.add("wf", "notes.md", b"deferred").unwrap();
+            journal
+                .record(
+                    &lock,
+                    &batch::Op::Remove {
+                        key: "gone.md".to_string(),
+                    },
+                )
+                .unwrap();
+        }
+
+        backend.ensure_pushed("wf").unwrap();
+
+        assert!(!journal.is_open());
+        let writes: Vec<String> = endpoint
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PUT" || r.method == "DELETE")
+            .map(|r| {
+                let rest = r.path.rsplit_once("/wf/").map(|(_, rest)| rest);
+                format!("{} {}", r.method, rest.unwrap_or(&r.path))
+            })
+            .collect();
+        assert_eq!(
+            writes,
+            vec![
+                "PUT ctx/notes.md".to_string(),
+                "PUT ctx/manifest.json".to_string(),
+                format!("PUT {}", state_file_name("wf")),
+                "PUT version.json".to_string(),
+                "DELETE ctx/gone.md".to_string(),
+                format!("DELETE {}", BATCH_MARKER),
+            ]
+        );
+        assert_eq!(endpoint.last_put("/ctx/notes.md").unwrap(), b"deferred");
     }
 }

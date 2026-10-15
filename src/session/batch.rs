@@ -24,6 +24,26 @@
 //! - `cloud-batch.lock`: an advisory lock every writer and the flush take,
 //!   so a flush never pushes half of a write. It outlives the batch; a
 //!   lock file that comes and goes would let two processes lock two inodes.
+//!   The lock is `flock`, so the guarantee is Unix's; `koto next`, the only
+//!   thing that runs commands, is Unix-only too.
+//!
+//! The contract the cloud backend keeps, for anything that writes a session
+//! or pushes it:
+//!
+//! - A write from a tick's command to the tick's session (a context add or
+//!   remove, an event append, a header rewrite) opens the batch and records
+//!   itself under the lock; it never pushes.
+//! - Every other push of a session flushes its open batch first and pushes
+//!   nothing of its own while the batch is open: a state file or manifest
+//!   pushed alone would name keys the bucket doesn't hold. `ensure_pushed`
+//!   flushes from any process, a tick's command included, since its caller
+//!   needs the bucket to hold everything.
+//! - A read from outside the tick flushes the batch before it reads the
+//!   bucket, so it can come before the tick's own flush; a read from a
+//!   tick's command answers a key the batch wrote from the local copy.
+//! - A pull never writes over an open batch.
+//! - `koto session resolve` settles a batch by replacing one side with the
+//!   other, and closes it only once that succeeded.
 
 use std::collections::BTreeSet;
 use std::fs;
