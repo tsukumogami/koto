@@ -512,16 +512,27 @@ Deliverables:
 
 ## Security Considerations
 
+The design doesn't download or execute anything new, adds no dependency,
+and asks for no permission beyond writing the session log the agent's own
+koto commands already write. What it does change is who can move a gate,
+what text reaches the agent, and what the journal says.
+
 - **Self-grading.** The agent answers for its own work, and could answer
   `pass` to move on. The 2026-10-14 ruling accepts this: it's what the
   agent did before a decider existed, and the answer is a recorded event a
   reviewer can read beside the gate. It never reaches the routing decider
-  or the ledger's accuracy counts.
-- **Prompt injection through the finding.** The waiting finding carries
-  only template-authored text (question, descriptions, label) and koto's
-  own words. The slice, which is the agent's own output and may hold
+  or the ledger's accuracy counts. An answer leaves a thinner trail than an
+  override, which requires a rationale; the answer takes none on purpose,
+  since a one-word answer is all a closed question needs, and the
+  `agent_answered` list and count make every agent-decided gate visible.
+- **Trusted template text.** The waiting finding carries template-authored
+  text (question, descriptions, label) to the agent. That text is trusted
+  authoring input, like a state's directive, and koto quotes it after its
+  own fixed words and the command, so a description can't displace the
+  command line. The slice, which is the agent's own output and may hold
   instructions aimed at a model, never enters the finding, the events or
-  the journal.
+  the journal; a test feeds marker strings through the slice and asserts
+  none appears in any new event, finding or record.
 - **Answer command input.** Arguments reach koto through clap as literal
   strings and are never evaluated by a shell. The gate and criterion must
   match the template's declarations, the answer must be one of three
@@ -530,14 +541,22 @@ Deliverables:
 - **Integrity of the binding.** An answer applies only to the slice hash
   and declaration hash it was recorded against, in the visit it was
   recorded in, so an answer can't be replayed onto changed work or a
-  changed criterion.
+  changed criterion. The residual case is `extraction_failed`, where there
+  is no slice hash: the answer stands for the rest of the visit while
+  extraction keeps failing, even if the work changes. That's accepted and
+  documented in the authoring guide; the agent can answer again, and a
+  template whose extraction keeps failing is itself a defect the
+  `decider_fallback` records surface by reason.
 - **Telemetry.** The new journal record carries names, ids, a closed
   vocabulary and a byte count. Names outside the journal's name shape are
   left out, and rule ids outside it are digested, as today.
 - **Concurrency.** The subcommand appends without the decider lock. An
   evaluation in progress doesn't see the answer, and the next one does;
   both writers append whole events to the same log as `koto overrides
-  record` already does.
+  record` already does. Two concurrent ticks can each record a fallback for
+  the same slice when the lock wait runs out (`busy`); each is a real
+  fallback the agent was shown, so the journal counts both, and one answer
+  covers both since it binds to the slice.
 
 ## Consequences
 
