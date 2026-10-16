@@ -576,9 +576,15 @@ fn a_polling_check_writes_pending_records_between_its_evaluations() {
     }
     let all = env.check_records("poll");
     // The failed evaluation printed no finding, so koto counted its own
-    // fallback rule; its rule record shares the evaluation's seq.
+    // fallback rule; its rule record, and the fallback finding's record,
+    // share the evaluation's seq.
+    let (findings, all): (Vec<Value>, Vec<Value>) =
+        all.into_iter().partition(|r| r["kind"] == "check_finding");
     let (rules, c): (Vec<Value>, Vec<Value>) =
         all.into_iter().partition(|r| r["kind"] == "check_rule");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["koto.seq"], c[2]["koto.seq"]);
+    assert_eq!(findings[0]["koto.finding.level"], "error");
     assert_eq!(
         kinds(&c),
         vec![
@@ -775,13 +781,18 @@ fn koto_seq_is_the_relayed_events_seq_and_rules_share_it() {
 }
 
 /// A passing check that prints an error-level finding writes no rule
-/// record and a rule count of 0.
+/// record and a rule count of 0, and journals the finding as a
+/// `check_finding`.
 #[test]
 fn a_passing_check_with_an_error_finding_writes_no_rule_record() {
     let env = Env::new();
     run_retry(&env, "clean", &[0], &["E501"], false);
     let c = env.check_records("clean");
-    assert_eq!(kinds(&c), vec!["check_evaluated"]);
+    assert_eq!(kinds(&c), vec!["check_evaluated", "check_finding"]);
+    assert_eq!(c[0]["koto.check.finding_count"], 1);
+    assert_eq!(c[1]["koto.rule.id"], "E501");
+    assert_eq!(c[1]["koto.finding.level"], "error");
+    assert_eq!(c[1]["koto.finding.count"], 1);
     assert_eq!(c[0]["koto.check.outcome"], "passed");
     assert_eq!(c[0]["koto.check.rule_count"], 0);
     assert!(c[0]["koto.check.duration_ms"].is_u64(), "{}", c[0]);
@@ -951,7 +962,13 @@ Done.
     assert_eq!(logged.len(), 1, "{action}");
 
     let c = env.check_records("capture");
-    assert_eq!(kinds(&c), vec!["check_evaluated", "check_rule"], "{c:?}");
+    assert_eq!(
+        kinds(&c),
+        vec!["check_evaluated", "check_rule", "check_finding"],
+        "{c:?}"
+    );
+    assert_eq!(c[2]["koto.rule.id"], logged[0].as_str());
+    assert_eq!(c[2]["koto.finding.level"], "error");
     assert_eq!(c[0]["koto.check"], "__action__");
     assert_eq!(c[0]["koto.state"], "detect");
     assert_eq!(c[0]["koto.check.outcome"], "failed");
@@ -2269,7 +2286,10 @@ fn an_unwritable_journal_changes_nothing_but_one_warning_per_command() {
         "{expected:?}"
     );
     assert_eq!(
-        good.check_records("same").len(),
+        good.check_records("same")
+            .iter()
+            .filter(|r| r["kind"] != "check_finding")
+            .count(),
         7,
         "four evaluations and three rules"
     );
@@ -2610,10 +2630,12 @@ fn a_decider_check_writes_one_decider_checked_per_criterion_before_its_evaluatio
             "decider_fallback",
             "check_evaluated",
             "check_rule",
+            "check_finding",
+            "check_finding",
             "response"
         ]
     );
-    assert_eq!(records[6]["koto.state"], "review");
+    assert_eq!(records[8]["koto.state"], "review");
     for (record, event) in records[..3].iter().zip(&checked_events) {
         let p = &event["payload"];
         assert_eq!(record["koto.seq"], event["seq"], "{record}");
@@ -2700,7 +2722,7 @@ fn a_decider_check_writes_one_decider_checked_per_criterion_before_its_evaluatio
     drop(lock);
     assert_eq!(out.journal_warnings(), 0, "{}", out.stderr);
     assert_eq!(stub.request_count(), 3, "nothing more was asked");
-    let after: Vec<Value> = env.records("dc").into_iter().skip(2 + 7).collect();
+    let after: Vec<Value> = env.records("dc").into_iter().skip(2 + 9).collect();
     assert_eq!(
         kinds(&after),
         vec![
@@ -2708,6 +2730,8 @@ fn a_decider_check_writes_one_decider_checked_per_criterion_before_its_evaluatio
             "decider_fallback",
             "check_evaluated",
             "check_rule",
+            "check_finding",
+            "check_finding",
             "response"
         ],
         "reused verdicts write no decider_checked"
@@ -2780,7 +2804,7 @@ fn reused_verdicts_write_no_decider_checked() {
     let after: Vec<Value> = env.records("reuse").into_iter().skip(first).collect();
     assert_eq!(
         kinds(&after),
-        vec!["check_evaluated", "check_rule", "response"],
+        vec!["check_evaluated", "check_rule", "check_finding", "response"],
         "the blocked tick's printed directive adds a response"
     );
     assert_eq!(after[0]["koto.check.outcome"], "failed");
@@ -3006,8 +3030,8 @@ fn an_overridden_gate_writes_only_check_overridden() {
     env.koto_in(&dir, &["next", "over", "--no-cleanup"]);
     assert_eq!(
         env.check_records("over").len(),
-        2,
-        "one evaluation, one rule"
+        3,
+        "one evaluation, one rule, one finding"
     );
     env.ok_in(
         &dir,
@@ -3035,7 +3059,11 @@ fn an_overridden_gate_writes_only_check_overridden() {
         .into_iter()
         .partition(|r| r["kind"] == "check_overridden");
     assert_eq!(overridden.len(), 1, "{overridden:?}");
-    assert_eq!(evaluations.len(), 2, "nothing more was evaluated");
+    assert_eq!(
+        evaluations.len(),
+        3,
+        "nothing more was evaluated: the first evaluation's record, rule and finding"
+    );
     let runs = std::fs::read_to_string(dir.join("runs.log")).unwrap();
     assert_eq!(runs.lines().count(), 1, "the check didn't run again");
 }

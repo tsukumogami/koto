@@ -90,7 +90,9 @@ fn every_kind_the_reference_names_is_one_koto_writes_and_the_reverse() {
         kinds,
         [
             "cancelled",
+            "check_disputed",
             "check_evaluated",
+            "check_finding",
             "check_overridden",
             "check_pending",
             "check_rule",
@@ -192,7 +194,9 @@ fn every_check_kind_lists_its_fields_and_describes_each() {
     for kind in [
         "check_evaluated",
         "check_rule",
+        "check_finding",
         "check_pending",
+        "check_disputed",
         "context_reads",
         "decider_consulted",
         "decider_checked",
@@ -424,6 +428,37 @@ fn the_session_feed_contract_declares_the_lineage_header_fields() {
 /// another attribute, none starts with another followed by `.`, and none is
 /// such a prefix of another, so a backend that nests dotted names never
 /// sees one as both a value and an object.
+#[test]
+fn the_check_lifecycle_attributes_collide_with_no_other_attribute() {
+    let field = Regex::new(r"^koto\.[a-z_]+(\.[a-z_]+)*$").unwrap();
+    let written: BTreeSet<String> = source_literals()
+        .into_iter()
+        .filter(|s| field.is_match(s))
+        .collect();
+    for new in [
+        "koto.finding.level",
+        "koto.finding.count",
+        "koto.dispute.source",
+    ] {
+        assert!(written.contains(new), "{SOURCE_DIR} never writes {new}");
+        for other in written.iter().filter(|o| o.as_str() != new) {
+            assert!(
+                !other.starts_with(&format!("{new}.")),
+                "{other} nests under {new}"
+            );
+            assert!(
+                !new.starts_with(&format!("{other}.")),
+                "{new} nests under {other}"
+            );
+        }
+    }
+    // The two `check_evaluated` additions sit under `koto.check` beside
+    // that kind's other `koto.check.*` fields, so they add no new shape.
+    for new in ["koto.check.finding_count", "koto.check.findings_truncated"] {
+        assert!(written.contains(new), "{SOURCE_DIR} never writes {new}");
+    }
+}
+
 #[test]
 fn the_decider_fallback_attributes_collide_with_no_other_attribute() {
     let field = Regex::new(r"^koto\.[a-z_]+(\.[a-z_]+)*$").unwrap();
