@@ -842,7 +842,9 @@ fn a_batch_a_live_write_is_opening_is_left_to_it() {
     assert!(a.add("base.md", b"base").ok());
 
     let marker = a.key("batch-open.json");
-    s3.hold("PUT", &marker, Duration::from_secs(3));
+    // Long enough for `koto status` to start and reach the lock while the
+    // write still waits; the test waits it out either way.
+    s3.hold("PUT", &marker, Duration::from_secs(5));
     let tick = a
         .std_cmd(&["next", NAME])
         .stdout(std::process::Stdio::piped())

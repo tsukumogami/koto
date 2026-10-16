@@ -1334,7 +1334,10 @@ impl CloudBackend {
 
         let journal = self.journal(id);
         if !journal.is_open() {
-            return self.clear_unopened_batch(id);
+            // Nothing is owed: a marker this can't delete yet is a warning,
+            // and the opening file stays for the next command.
+            self.try_clear_unopened_batch(id);
+            return Ok(());
         }
         let Some(lock) = journal.lock()? else {
             return Ok(());
@@ -1453,7 +1456,8 @@ impl CloudBackend {
     fn discard_batch(&self, id: &str) -> anyhow::Result<()> {
         let journal = self.journal(id);
         if !journal.is_open() {
-            return self.clear_unopened_batch(id);
+            self.try_clear_unopened_batch(id);
+            return Ok(());
         }
         let Some(lock) = journal.lock()? else {
             return Ok(());
