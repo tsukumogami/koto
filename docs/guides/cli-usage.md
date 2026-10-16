@@ -119,6 +119,8 @@ koto next <name> [--with-data <json>] [--to <target>] [--no-cleanup]
 
 The `--with-data` and `--to` flags are mutually exclusive. Passing both produces a `precondition_failed` error with exit code 2. The `--with-data` payload is capped at 1 MB.
 
+**Advisories.** A check that passes while printing `warning` findings doesn't block, but its warnings still reach you: the response carries a top-level `advisories` list with one entry per such check this call evaluated, as `{"state": ..., "gate": ..., "findings": [...]}` (`gate` is `__action__` for a default action), at most 100 findings in all. A response with none has no `advisories` key. `--to` and `koto status` never carry it. To say a warning is wrong, use [`koto disputes record`](#disputes-record).
+
 #### Directed transitions and non-overridable gates
 
 `--to` skips a state's gates, so it stays the way out of a stuck state, with one exception: a gate declared `overridable: false` that the edge to the target depends on is evaluated first. If its result doesn't satisfy that edge, `--to` exits 1 with `gate_blocked`, names the gate in the message and in `details`, and appends nothing. A `--to` that proceeds appends exactly the `directed_transition` event it always did.
@@ -1149,6 +1151,27 @@ koto decider answer <name> --gate <check> --criterion <criterion id> --answer <p
 The answer binds to the slice the check was judging when the criterion fell back, and decides that criterion on the next `koto next` of the same slice in the same visit: `pass` and `unclear` let it through, `fail` blocks in veto mode until the work changes or you answer again. If you change the work instead, the next `koto next` asks the decider about the new slice. The latest answer for a slice wins. The command never consults the decider and doesn't wait for the decider lock.
 
 Prints `{"status":"recorded","gate":...,"criterion":...,"answer":...}` and exits 0. Refusals (`invalid_answer`, `unknown_criterion`, `no_fallback`) exit 2 with a typed code; see [error-codes.md](../reference/error-codes.md#decider-answer).
+
+### disputes record
+
+Records that a rule's finding at a gate is wrong. A dispute is recorded, not obeyed: it changes no gate outcome, no route and no state, and the next `koto next` responds exactly as it would have without it. A failing check still blocks; to move past one, fix the work or use `koto overrides record`. Disputes are for the record: a reader of the session's log or of the [run journal](../reference/run-journal.md#check_disputed) can see which rules agents and people disagree with.
+
+```bash
+koto disputes record <name> --gate <gate> --rule <rule-id> --reason <text> [--state <state>] [--by agent|person]
+```
+
+**Required flags:**
+- `--gate <gate>` -- The gate whose finding is wrong, or `__action__` for a state's default action. The session's log must hold an evaluation of it in the state; the dispute is about the most recent one.
+- `--rule <rule-id>` -- The finding's `rule_id`, 1 to 128 bytes. koto doesn't require a logged finding for it, since a check's logged findings may have been cut at their cap.
+- `--reason <text>` -- Why the finding is wrong, 1 to 1,000 bytes. It goes through koto's known-credential redaction before it's stored, the same pass a check's output gets, and stays in the session's log; the run journal never copies it.
+
+**Optional flags:**
+- `--state <state>` -- The state the gate was evaluated in. Defaults to the current state; name an earlier state to dispute a check the session has moved past.
+- `--by agent|person` -- Who disputes the finding. Defaults to `agent`.
+
+Appends one `finding_disputed` event, prints `{"status":"recorded"}` and exits 0. A missing session exits 1. Refusals (`gate_not_evaluated`, `invalid_rule`, `invalid_reason`) exit 2 with a typed code and append nothing, as does a `--by` other than `agent` or `person`; see [error-codes.md](../reference/error-codes.md#disputes-record).
+
+A passing check's `warning` findings reach the agent on the `koto next` response that evaluated it, under a top-level `advisories` list (see the koto-user skill's response reference). They are the findings this command is most often for: a warning doesn't block, so the dispute is how an agent says it disagrees.
 
 ### decider report
 

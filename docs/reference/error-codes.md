@@ -342,6 +342,38 @@ answer:
 {"error":{"code":"no_fallback","message":"criterion 'comment_reason' of 'comments' has not fallen back to you in this visit to 'review': only a criterion the decider gave no verdict on takes your answer","gate":"comments","criterion":"comment_reason","state":"review"},"command":"decider answer"}
 ```
 
+### disputes record
+
+`koto disputes record` records that a rule's finding at a gate is wrong,
+without changing any outcome. A missing session prints the flat format with
+exit 1 and appends nothing, and so does an append that fails. A session log
+that can't be read exits with the code its read error carries, and a log
+whose current state can't be derived exits 3. Three refusals carry a typed
+code, each with exit code 2 and nothing appended to the state log. The
+`error` object names the `gate` and, when it is known, the `state`. A `--by`
+other than `agent` or `person` is refused by the argument parser, also with
+exit code 2.
+
+**`invalid_rule`** -- `--rule` is empty or longer than 128 bytes:
+
+```json
+{"error":{"code":"invalid_rule","message":"--rule must be 1 to 128 bytes; got 0","gate":"lint"},"command":"disputes record"}
+```
+
+**`invalid_reason`** -- `--reason` is empty or longer than 1,000 bytes:
+
+```json
+{"error":{"code":"invalid_reason","message":"--reason must be 1 to 1000 bytes; got 0","gate":"lint"},"command":"disputes record"}
+```
+
+**`gate_not_evaluated`** -- the session's log holds no evaluation of the
+gate (a `gate_evaluated`, or a `default_action_executed` for `__action__`)
+in the named state, the current state unless `--state` names another:
+
+```json
+{"error":{"code":"gate_not_evaluated","message":"gate 'lint' has no evaluation logged in state 'work': only a check koto evaluated can be disputed","gate":"lint","state":"work"},"command":"disputes record"}
+```
+
 ---
 
 ### template compile
