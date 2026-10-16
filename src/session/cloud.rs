@@ -53,6 +53,17 @@ pub(crate) const TEMPLATE_OBJECT: &str = "template.json";
 /// those writes.
 pub(crate) const BATCH_MARKER: &str = "batch-open.json";
 
+/// Nanoseconds since the Unix epoch, which sets one writer's batch-open
+/// marker apart from another's ([`CloudBackend::clear_unopened_batch`]
+/// deletes only a marker whose bytes it wrote).
+fn marker_nonce() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Per-child outcome emitted by [`CloudBackend::reconcile_child`].
 ///
 /// Each variant corresponds to a concrete action or a refusal, and is
@@ -489,6 +500,8 @@ impl CloudBackend {
         if self.journal(id).is_open() {
             return self.flush_batch(id);
         }
+        // No batch is open, so this push goes up on its own; a marker a
+        // stopped opener left would still make imports refuse.
         self.try_clear_unopened_batch(id);
         let state_path = self.local.session_dir(id).join(state_file_name(id));
         if !state_path.exists() {
@@ -1242,9 +1255,11 @@ impl CloudBackend {
     /// so a process killed between the two leaves this host something to
     /// find ([`CloudBackend::clear_unopened_batch`]). A marker PUT that
     /// fails leaves the opening file too: the PUT may have landed with its
-    /// reply lost, and the next command deletes it if it did. The marker
-    /// names the process that wrote it, so no two writers' markers have the
-    /// same bytes.
+    /// reply lost, and the next command deletes it if it did. That delete
+    /// tells this writer's marker from another's by its bytes, so the marker
+    /// carries the writer's pid and a nanosecond nonce beside its
+    /// one-second `opened_at`: two writers would have to share a pid and a
+    /// nanosecond to collide.
     fn open_batch(&self, id: &str) -> anyhow::Result<Option<(Journal, BatchLock)>> {
         let journal = self.journal(id);
         let Some(lock) = journal.lock()? else {
@@ -1258,6 +1273,7 @@ impl CloudBackend {
             "session": id,
             "opened_at": crate::engine::types::now_iso8601(),
             "pid": std::process::id(),
+            "nonce": marker_nonce(),
         })
         .to_string();
         journal.begin(&lock, marker.as_bytes())?;
@@ -1375,10 +1391,10 @@ impl CloudBackend {
         // An open batch holds writes the bucket lacks, so this side moved
         // past its base whether or not the batch's first write got its
         // increment to disk (reading or saving the local version can fail
-        // there, and that is only a warning). Counted before the check, a remote that also moved
-        // reads as the conflict it is rather than as a newer copy, which
-        // this push would write over (koto#381). Saved once the check
-        // passes.
+        // there, and that is only a warning). Counted before the check, a
+        // remote that also moved reads as the conflict it is rather than as
+        // a newer copy, which this push would write over (koto#381). Saved
+        // once the check passes.
         let unsaved_increment = local.version == local.last_sync_base;
         if unsaved_increment {
             local.version += 1;
