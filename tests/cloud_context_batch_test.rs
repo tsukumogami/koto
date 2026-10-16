@@ -857,6 +857,13 @@ fn a_batch_a_live_write_is_opening_is_left_to_it() {
     s3.clear_requests();
     let out = a.koto(&["status", NAME]);
     assert!(out.ok(), "status: {}", out.describe());
+    // `status` waited on the lock for the write and then flushed (or waited
+    // for the tick's flush): a status that cleared the marker without
+    // waiting would return while the write was still held.
+    assert!(
+        s3.object(&a.key("ctx/one.md")).is_some(),
+        "status returned before the write it should have waited for"
+    );
     let out = Host::out(tick.wait_with_output().unwrap());
     assert!(out.ok(), "next: {}", out.describe());
     assert_eq!(out.json()["state"], "wait", "{}", out.describe());

@@ -22,20 +22,25 @@
 //!   writes the bucket lacks. A batch with only event appends is an empty
 //!   file.
 //! - `cloud-batch.opening`: the batch's first write, part way through
-//!   opening it. Written before the batch-open marker goes to the bucket
-//!   and renamed into the journal once it is there, so a marker in the
-//!   bucket always has this file or the journal beside it on the host that
-//!   wrote it. Found with no journal, it is what a process killed between
-//!   the two steps left: the marker may be in the bucket with nothing
-//!   locally to flush or close it, and the next command clears it (koto#381).
+//!   opening it, holding the exact bytes of the batch-open marker it puts in
+//!   the bucket. Written before the marker goes up and removed only after
+//!   the journal exists, so a marker in the bucket always has this file or
+//!   the journal beside it on the host that wrote it. Found with no
+//!   journal, it is what a process killed between the two steps (or one
+//!   whose marker PUT failed) left: the marker may be in the bucket with
+//!   nothing locally to flush or close it, and the next command clears it
+//!   (koto#381), but only when the bucket's marker has these bytes, so a
+//!   marker another writer put there since is left alone.
 //! - `cloud-batch.lock`: an advisory lock every writer and the flush take,
 //!   so a flush never pushes half of a write. It outlives the batch; a
 //!   lock file that comes and goes would let two processes lock two inodes.
 //!   The lock is `flock`, so the guarantee is Unix's; `koto next`, the only
 //!   thing that runs commands, is Unix-only too. A process opening a batch
-//!   holds it from the opening file to the rename, and the kernel releases
+//!   holds it from the opening file to the journal, and the kernel releases
 //!   it when the process dies, so holding it is how a command knows no live
-//!   process owns an opening file it found.
+//!   process owns an opening file it found. Nothing takes it twice: a
+//!   second `flock` on a new descriptor in the same process would wait on
+//!   the first forever.
 //!
 //! The journal and the opening file are fsynced, and the directory with
 //! them, before a deferred write returns: the marker says the host holds
@@ -56,8 +61,9 @@
 //!   bucket, so it can come before the tick's own flush; a read from a
 //!   tick's command answers a key the batch wrote from the local copy.
 //! - A pull never writes over an open batch.
-//! - A pull, push or flush that finds a batch begun and never opened
-//!   deletes its marker and then the opening file, under the lock.
+//! - A pull, push, flush or resolve that finds a batch begun and never
+//!   opened deletes its marker, when the bucket's marker is the one the
+//!   opening file holds, and then the opening file, under the lock.
 //! - A flush counts an open batch as a change on this host, so a remote
 //!   version past the base is a conflict even when the batch's first write
 //!   couldn't save its increment.
@@ -137,9 +143,22 @@ impl Journal {
 
     /// Whether a batch was begun and never opened: the opening file with no
     /// journal. Read without the lock, like [`Journal::is_open`]; under the
-    /// lock, the process that began it is gone.
+    /// lock, no process is still opening it (the one that began it died, or
+    /// gave up when its marker PUT failed).
     pub fn is_opening(&self) -> bool {
         self.opening_path().exists() && !self.is_open()
+    }
+
+    /// The marker bytes a batch begun and never opened was putting in the
+    /// bucket, as [`Journal::begin`] wrote them: `None` with no opening file.
+    /// Bytes cut short by a crash match no marker, which is right: the PUT
+    /// comes only after they are on disk.
+    pub fn opening_marker(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        match fs::read(self.opening_path()) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading {}", self.opening_path().display())),
+        }
     }
 
     /// Take the batch lock, blocking until it is free. `None` when the
@@ -151,33 +170,34 @@ impl Journal {
         BatchLock::acquire(&self.dir.join(LOCK_FILE)).map(Some)
     }
 
-    /// Begin opening the batch, before its marker goes to the bucket:
-    /// write the opening file, durably.
-    pub fn begin(&self, _lock: &BatchLock) -> anyhow::Result<()> {
+    /// Begin opening the batch, before its marker goes to the bucket: write
+    /// the opening file, holding the marker's bytes, durably. The caller
+    /// holds the same lock through [`Journal::open`] or
+    /// [`Journal::abandon`], so no other process sees the batch half open.
+    pub fn begin(&self, _lock: &BatchLock, marker: &[u8]) -> anyhow::Result<()> {
         let path = self.opening_path();
-        let file =
+        let mut file =
             fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        file.write_all(marker)
+            .with_context(|| format!("writing {}", path.display()))?;
         sync_file(&file, &path)?;
         sync_dir(&self.dir)
     }
 
-    /// Open the batch, once its marker is in the bucket: rename the opening
-    /// file into the journal, or create the journal empty when nothing was
-    /// begun. A no-op when it is open.
+    /// Open the batch, once its marker is in the bucket: create the journal
+    /// empty, then remove the opening file. In that order, so a crash
+    /// between them leaves an open batch (which [`Journal::close`] clears of
+    /// both files) rather than neither file beside a marker. A no-op when
+    /// the batch is open.
     pub fn open(&self, _lock: &BatchLock) -> anyhow::Result<()> {
         if self.is_open() {
             return Ok(());
         }
         let path = self.path();
-        let opening = self.opening_path();
-        if opening.exists() {
-            fs::rename(&opening, &path)
-                .with_context(|| format!("renaming {} to {}", opening.display(), path.display()))?;
-        } else {
-            let file =
-                fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-            sync_file(&file, &path)?;
-        }
+        let file =
+            fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        sync_file(&file, &path)?;
+        remove_if_present(&self.opening_path())?;
         sync_dir(&self.dir)
     }
 
@@ -226,7 +246,9 @@ impl Journal {
     }
 
     /// Close the batch: everything it owed is in the bucket, or was
-    /// replaced wholesale (`koto session resolve`).
+    /// replaced wholesale (`koto session resolve`). Removes an opening file
+    /// too, which an open crashed part way through can leave beside the
+    /// journal.
     pub fn close(&self, _lock: &BatchLock) -> anyhow::Result<()> {
         remove_if_present(&self.path())?;
         remove_if_present(&self.opening_path())
@@ -394,20 +416,38 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let journal = Journal::new(dir.path());
         let lock = journal.lock().unwrap().unwrap();
-        journal.begin(&lock).unwrap();
+        journal.begin(&lock, b"marker").unwrap();
         assert!(journal.is_opening());
         assert!(!journal.is_open());
+        assert_eq!(journal.opening_marker().unwrap().unwrap(), b"marker");
 
         journal.open(&lock).unwrap();
         assert!(journal.is_open());
         assert!(!journal.is_opening());
-        assert!(!dir.path().join(OPENING_FILE).exists());
+        assert_eq!(journal.opening_marker().unwrap(), None);
+        assert_eq!(journal.pending().unwrap(), Some(Pending::default()));
 
         journal.close(&lock).unwrap();
-        journal.begin(&lock).unwrap();
+        journal.begin(&lock, b"marker").unwrap();
         journal.abandon(&lock).unwrap();
         journal.abandon(&lock).unwrap();
         assert!(!journal.is_opening());
+        assert!(!journal.is_open());
+    }
+
+    /// An open that stopped between creating the journal and removing the
+    /// opening file is an open batch, and closing it removes both.
+    #[test]
+    fn closing_clears_an_opening_file_left_beside_the_journal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = Journal::new(dir.path());
+        let lock = journal.lock().unwrap().unwrap();
+        journal.begin(&lock, b"marker").unwrap();
+        fs::write(dir.path().join(JOURNAL_FILE), "").unwrap();
+        assert!(journal.is_open());
+        assert!(!journal.is_opening());
+        journal.close(&lock).unwrap();
+        assert!(!dir.path().join(OPENING_FILE).exists());
         assert!(!journal.is_open());
     }
 
@@ -419,25 +459,23 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let journal = Journal::new(dir.path());
         let lock = journal.lock().unwrap().unwrap();
-        let opening = dir.path().join(OPENING_FILE);
         let file = dir.path().join(JOURNAL_FILE);
         let at = dir.path().to_path_buf();
 
         synced::take();
-        journal.begin(&lock).unwrap();
-        assert_eq!(synced::take(), vec![opening, at.clone()]);
+        journal.begin(&lock, b"marker").unwrap();
+        assert_eq!(
+            synced::take(),
+            vec![dir.path().join(OPENING_FILE), at.clone()]
+        );
         journal.open(&lock).unwrap();
-        assert_eq!(synced::take(), vec![at.clone()]);
+        assert_eq!(synced::take(), vec![file.clone(), at.clone()]);
         journal.record(&lock, &add("a")).unwrap();
         assert_eq!(synced::take(), vec![file.clone()]);
 
-        // A journal created by its first record, or opened with nothing
-        // begun, syncs its directory too.
+        // A journal created by its first record syncs its directory too.
         journal.close(&lock).unwrap();
         journal.record(&lock, &add("b")).unwrap();
-        assert_eq!(synced::take(), vec![file.clone(), at.clone()]);
-        journal.close(&lock).unwrap();
-        journal.open(&lock).unwrap();
         assert_eq!(synced::take(), vec![file, at]);
     }
 
