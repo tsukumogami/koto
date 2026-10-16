@@ -10,6 +10,7 @@ pub mod dashboard_state;
 pub mod decider;
 pub mod decider_answer;
 pub mod decider_port;
+pub mod disputes;
 pub mod init_child;
 pub mod init_entry;
 pub mod next;
@@ -307,6 +308,12 @@ pub enum Command {
     Overrides {
         #[command(subcommand)]
         subcommand: overrides::OverridesSubcommand,
+    },
+
+    /// Finding dispute recording (moves nothing)
+    Disputes {
+        #[command(subcommand)]
+        subcommand: disputes::DisputesSubcommand,
     },
 
     /// Configuration management subcommands
@@ -2039,6 +2046,10 @@ pub fn run(app: App) -> Result<()> {
                     overrides::handle_overrides_list(&backend, name)
                 }
             }
+        }
+        Command::Disputes { subcommand } => {
+            let backend = build_backend()?;
+            disputes::handle(&backend, subcommand)
         }
         Command::Config { subcommand } => handle_config(subcommand),
         Command::Decider { subcommand } => match subcommand {
