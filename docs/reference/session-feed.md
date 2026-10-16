@@ -2074,7 +2074,7 @@ a gate, record an override instead.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `state` | string | Yes | The state whose evaluation of the gate is disputed: the current state, or an earlier one the command named. |
-| `gate` | string | Yes | The gate's name, or `__action__` for a state's default action. The state's log holds at least one evaluation of it; the dispute is about the most recent. |
+| `gate` | string | Yes | The gate's name, or `__action__` for a state's default action. The log holds at least one settled evaluation of it in that state (an outcome other than `pending`); the dispute is about the most recent. |
 | `rule_id` | string | Yes | The disputed rule's id, 1 to 128 bytes. The evaluation needn't have logged a finding for it, since a logged finding list may have been cut. |
 | `reason` | string | Yes | Why the finding is wrong, 1 to 1,000 bytes, after koto's known-credential redaction (the same pass captured output and findings get), so a credential value koto knows appears as a `[REDACTED:<source>]` marker. |
 | `source` | string | Yes | Who disputed it: `agent` or `person`. Open on read. |

@@ -1161,7 +1161,7 @@ koto disputes record <name> --gate <gate> --rule <rule-id> --reason <text> [--st
 ```
 
 **Required flags:**
-- `--gate <gate>` -- The gate whose finding is wrong, or `__action__` for a state's default action. The session's log must hold an evaluation of it in the state; the dispute is about the most recent one.
+- `--gate <gate>` -- The gate whose finding is wrong, or `__action__` for a state's default action. The session's log must hold a settled evaluation of it in the state, one with an outcome: a polling gate that has only answered pending can't be disputed yet. The dispute is about the most recent one.
 - `--rule <rule-id>` -- The finding's `rule_id`, 1 to 128 bytes. koto doesn't require a logged finding for it, since a check's logged findings may have been cut at their cap.
 - `--reason <text>` -- Why the finding is wrong, 1 to 1,000 bytes. It goes through koto's known-credential redaction before it's stored, the same pass a check's output gets, and stays in the session's log; the run journal never copies it.
 

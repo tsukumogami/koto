@@ -8,9 +8,10 @@
 //! the next `koto next` responds as it would have without it. To move past a
 //! gate, `koto overrides record` is the verb.
 //!
-//! The gate must have an evaluation logged in the named state (the current
-//! state unless `--state` names another) anywhere in the session's log; the
-//! dispute is about the most recent one. A finding for the rule isn't
+//! The gate must have a settled evaluation logged in the named state (the
+//! current state unless `--state` names another) anywhere in the session's
+//! log, one with an outcome rather than `pending`; the dispute is about the
+//! most recent one. A finding for the rule isn't
 //! required, since a logged finding list may have been cut at its cap.
 //!
 //! The reason goes through koto's known-credential redaction, the same pass
@@ -35,8 +36,12 @@ use super::{exit_code_for_engine_error, exit_with_error_code, EXIT_INFRASTRUCTUR
 /// The command name every error body carries.
 const COMMAND: &str = "disputes record";
 
-/// The gate has no evaluation logged in the named state.
+/// The gate has no settled evaluation logged in the named state: none at
+/// all, or only pending ones.
 pub const GATE_NOT_EVALUATED: &str = "gate_not_evaluated";
+
+/// The outcome of a `gate_evaluated` that judged nothing yet.
+const PENDING_OUTCOME: &str = "pending";
 
 /// The rule id is empty or longer than [`RULE_ID_MAX_BYTES`].
 pub const INVALID_RULE: &str = "invalid_rule";
@@ -121,14 +126,19 @@ fn fail(code: i32, message: String) -> ! {
     );
 }
 
-/// Whether `events` hold an evaluation of `gate` in `state`: a
-/// `gate_evaluated` for a gate, a `default_action_executed` for
-/// `__action__`. Any outcome counts, across the whole log.
+/// Whether `events` hold a settled evaluation of `gate` in `state`: a
+/// `gate_evaluated` with an outcome other than `pending` for a gate, a
+/// `default_action_executed` for `__action__`, anywhere in the log. A
+/// pending evaluation (a polling gate still waiting, a decider check
+/// waiting on the agent) judged nothing, so there is nothing to dispute.
 pub(crate) fn gate_evaluated_in(events: &[Event], state: &str, gate: &str) -> bool {
     events.iter().any(|e| match &e.payload {
         EventPayload::GateEvaluated {
-            state: s, gate: g, ..
-        } => s == state && g == gate,
+            state: s,
+            gate: g,
+            outcome,
+            ..
+        } => s == state && g == gate && outcome != PENDING_OUTCOME,
         EventPayload::DefaultActionExecuted { state: s, .. } => {
             gate == ACTION_CONDITION_NAME && s == state
         }
@@ -234,8 +244,9 @@ fn handle_record(
         refuse(
             GATE_NOT_EVALUATED,
             format!(
-                "gate '{}' has no evaluation logged in state '{}': \
-                 only a check koto evaluated can be disputed",
+                "gate '{}' has no settled evaluation logged in state '{}': \
+                 only a check koto evaluated to an outcome can be disputed, \
+                 not one still pending",
                 gate, state
             ),
             &gate,
@@ -305,6 +316,28 @@ mod tests {
         assert!(!gate_evaluated_in(&events, "build", "test"));
         assert!(gate_evaluated_in(&events, "ship", ACTION_CONDITION_NAME));
         assert!(!gate_evaluated_in(&events, "build", ACTION_CONDITION_NAME));
+    }
+
+    #[test]
+    fn a_pending_evaluation_alone_is_not_one_to_dispute() {
+        let gate = |outcome: &str| {
+            event(EventPayload::GateEvaluated {
+                state: "ci".into(),
+                gate: "ci".into(),
+                output: serde_json::json!({}),
+                outcome: outcome.into(),
+                timestamp: now_iso8601(),
+                check: Default::default(),
+                streams: None,
+                poll: None,
+            })
+        };
+        let pending_only = vec![gate("pending"), gate("pending")];
+        assert!(!gate_evaluated_in(&pending_only, "ci", "ci"));
+        for settled in ["passed", "failed", "timed_out", "error"] {
+            let events = vec![gate("pending"), gate(settled)];
+            assert!(gate_evaluated_in(&events, "ci", "ci"), "{settled}");
+        }
     }
 
     #[test]

@@ -572,7 +572,7 @@ without it. A failing check still blocks; this is not a way past one (that's
 | Argument/Flag | Required | Description |
 |---|---|---|
 | `<name>` | Yes | Workflow name |
-| `--gate <gate>` | Yes | The gate whose finding is wrong, or `__action__` for a state's `default_action`. The session must have evaluated it in the state. |
+| `--gate <gate>` | Yes | The gate whose finding is wrong, or `__action__` for a state's `default_action`. The session must have evaluated it to an outcome in the state; a polling gate that has only answered pending can't be disputed yet. |
 | `--rule <rule-id>` | Yes | The finding's `rule_id`, 1 to 128 bytes. A logged finding for it isn't required. |
 | `--reason <text>` | Yes | Why the finding is wrong, 1 to 1,000 bytes. Known credentials in it are redacted before it's stored. |
 | `--state <state>` | No | The state the gate was evaluated in. Defaults to the current state; name an earlier one to dispute a check you've moved past, such as one listed in `advisories`. |
@@ -590,7 +590,7 @@ dispute to get unblocked: the check still decides.
 
 **Error cases:**
 - Exit 1: workflow not found. Nothing is recorded.
-- Exit 2, `error.code: "gate_not_evaluated"`: the session never evaluated that gate in the state. Check `--state`, or run `koto next` first.
+- Exit 2, `error.code: "gate_not_evaluated"`: the session never evaluated that gate to an outcome in the state (never at all, or only pending). Check `--state`, or run `koto next` first.
 - Exit 2, `error.code: "invalid_rule"` or `"invalid_reason"`: the rule id or reason is empty or too long.
 - Exit 2: `--by` other than `agent` or `person`.
 

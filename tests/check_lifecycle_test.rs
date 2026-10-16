@@ -546,6 +546,77 @@ fn refused_disputes_exit_two_with_a_code_and_append_nothing() {
     assert!(out.status.success(), "{}", describe(&out));
 }
 
+/// A polling gate that has only answered pending judged nothing, so a
+/// dispute of it is refused; once it settles (here, failing), the same
+/// dispute is recorded.
+#[test]
+fn a_dispute_of_a_gate_only_ever_pending_is_refused() {
+    let env = Env::new();
+    let ci = env.script("ci.sh", &[("W1", "warning")], 75);
+    let tpl = format!(
+        r#"---
+name: polling
+version: "1.0"
+initial_state: ci
+states:
+  ci:
+    accepts:
+      again:
+        type: enum
+        values: ["yes"]
+    gates:
+      ci:
+        type: command
+        command: '{ci}'
+        poll:
+          interval_secs: 1
+          timeout_secs: 600
+    transitions:
+      - target: done
+        when:
+          gates.ci.exit_code: 0
+      - target: ci
+        when:
+          gates.ci.exit_code: 75
+          again: "yes"
+  done:
+    terminal: true
+---
+
+## ci
+
+Wait for CI.
+
+## done
+
+Done.
+"#
+    );
+    env.init(&tpl);
+    env.next();
+    let evals = env.events("gate_evaluated");
+    assert!(!evals.is_empty());
+    assert!(
+        evals.iter().all(|e| e["payload"]["outcome"] == "pending"),
+        "{evals:?}"
+    );
+
+    let log = env.log();
+    let args = ["--gate", "ci", "--rule", "W1", "--reason", "flaky runner"];
+    let out = env.dispute(&args);
+    assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
+    let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body["error"]["code"], "gate_not_evaluated", "{body}");
+    assert_eq!(env.log(), log, "the refused dispute appended nothing");
+
+    // The gate now fails: a settled evaluation, which can be disputed.
+    env.script("ci.sh", &[("W1", "warning")], 1);
+    env.next();
+    let out = env.dispute(&args);
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(env.events("finding_disputed").len(), 1);
+}
+
 #[test]
 fn a_dispute_of_a_missing_session_exits_one() {
     let env = Env::new();

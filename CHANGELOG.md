@@ -39,7 +39,8 @@ to `0.9.x`).
   --reason <text> [--state <state>] [--by agent|person]` appends one
   `finding_disputed` event naming the state (the current one by default),
   gate, rule id, reason and source, and prints `{"status":"recorded"}`. The
-  gate must have an evaluation logged in that state; the rule needn't have a
+  gate must have a settled evaluation logged in that state (a polling gate
+  that has only answered pending doesn't count); the rule needn't have a
   logged finding. The reason goes through koto's known-credential redaction
   before it's stored. A dispute changes no gate outcome, route or state, and
   the next `koto next` responds as it would have without it. A missing

@@ -366,12 +366,15 @@ exit code 2.
 {"error":{"code":"invalid_reason","message":"--reason must be 1 to 1000 bytes; got 0","gate":"lint"},"command":"disputes record"}
 ```
 
-**`gate_not_evaluated`** -- the session's log holds no evaluation of the
-gate (a `gate_evaluated`, or a `default_action_executed` for `__action__`)
-in the named state, the current state unless `--state` names another:
+**`gate_not_evaluated`** -- the session's log holds no settled evaluation
+of the gate in the named state, the current state unless `--state` names
+another: no `gate_evaluated` with an outcome other than `pending` (or, for
+`__action__`, no `default_action_executed`). A polling gate that has only
+answered pending, or a decider check only waiting on the agent, has judged
+nothing yet:
 
 ```json
-{"error":{"code":"gate_not_evaluated","message":"gate 'lint' has no evaluation logged in state 'work': only a check koto evaluated can be disputed","gate":"lint","state":"work"},"command":"disputes record"}
+{"error":{"code":"gate_not_evaluated","message":"gate 'lint' has no settled evaluation logged in state 'work': only a check koto evaluated to an outcome can be disputed, not one still pending","gate":"lint","state":"work"},"command":"disputes record"}
 ```
 
 ---

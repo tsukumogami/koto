@@ -246,7 +246,7 @@ The fields and the order to work through them are in [response-shapes.md](refere
 koto disputes record <name> --gate <gate> --rule <rule-id> --reason "<why the finding is wrong>" [--state <state>] [--by agent|person]
 ```
 
-`--state` defaults to the current state; pass the state an advisory names to dispute a check you've moved past. The gate must have been evaluated in that state, or koto refuses with `gate_not_evaluated` (exit 2). The dispute is recorded for whoever reviews the rule and changes no outcome, route or state: a failing check still blocks, and the next `koto next` responds the same. Don't use it to get unblocked; that's fixing the work, or an override when `agent_actionable` allows one. Details in the [command reference](references/command-reference.md#koto-disputes-record).
+`--state` defaults to the current state; pass the state an advisory names to dispute a check you've moved past. The gate must have been evaluated to an outcome in that state (a polling gate still pending doesn't count), or koto refuses with `gate_not_evaluated` (exit 2). The dispute is recorded for whoever reviews the rule and changes no outcome, route or state: a failing check still blocks, and the next `koto next` responds the same. Don't use it to get unblocked; that's fixing the work, or an override when `agent_actionable` allows one. Details in the [command reference](references/command-reference.md#koto-disputes-record).
 
 ## Where a session's commands run
 
