@@ -114,7 +114,7 @@ A `koto context` call made from a template's command (a default action or a gate
 
 Two checks still run on every call: whether the session was imported elsewhere, which refuses, and on the first write of the tick, whether another host's writes conflict with this one's, which also refuses. The tick checks both again before it pushes. The tick's own session is pulled from the bucket once, when the tick starts, not again by each command.
 
-While the tick's commands have writes it hasn't pushed, the bucket holds a `batch-open.json` object beside the session's state file, and `koto session import` refuses the session (`import_source_unpushed`). A tick that was killed before it pushed leaves the writes on its host. The next koto command on the session there, `koto status <name>` for instance, pushes them and removes the object.
+While the tick's commands have writes it hasn't pushed, the bucket holds a `batch-open.json` object beside the session's state file, and `koto session import` refuses the session (`import_source_unpushed`). A tick that was killed before it pushed leaves the writes on its host. The next koto command on the session there, `koto status <name>` for instance, pushes them and removes the object. The same command removes an object left by a `koto context` call killed while it was putting the object in the bucket, before it had written anything.
 
 A `koto context` call for any other session, or made outside a tick, pushes at once, as before.
 
