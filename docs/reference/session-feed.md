@@ -646,6 +646,25 @@ events:
         type: integer
         required: true
 
+  finding_disputed:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      gate:
+        type: string
+        required: true
+      rule_id:
+        type: string
+        required: true
+      reason:
+        type: string
+        required: true
+      source:
+        type: string
+        required: true
+
   scheduler_ran:
     tier: 3
     fields:
@@ -2030,6 +2049,39 @@ visit; the latest answer for a slice wins.
 Neither event carries the slice, a question, a description, or anything the
 agent wrote beyond its one-word answer. An agent answer is never a decider
 verdict: it appends no `decider_checked` and no ledger line.
+
+#### `finding_disputed`
+
+Records that an agent or a person says a rule's finding at a gate is wrong,
+appended by `koto disputes record`. A dispute is recorded, not obeyed:
+nothing that decides a gate outcome, a route or the current state reads it,
+and the next `koto next` responds as it would have without it. To move past
+a gate, record an override instead.
+
+```json
+{
+  "type": "finding_disputed",
+  "payload": {
+    "state": "implement",
+    "gate": "lint",
+    "rule_id": "W291",
+    "reason": "the file is generated; trailing whitespace is upstream's",
+    "source": "agent"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `state` | string | Yes | The state whose evaluation of the gate is disputed: the current state, or an earlier one the command named. |
+| `gate` | string | Yes | The gate's name, or `__action__` for a state's default action. The state's log holds at least one evaluation of it; the dispute is about the most recent. |
+| `rule_id` | string | Yes | The disputed rule's id, 1 to 128 bytes. The evaluation needn't have logged a finding for it, since a logged finding list may have been cut. |
+| `reason` | string | Yes | Why the finding is wrong, 1 to 1,000 bytes, after koto's known-credential redaction (the same pass captured output and findings get), so a credential value koto knows appears as a `[REDACTED:<source>]` marker. |
+| `source` | string | Yes | Who disputed it: `agent` or `person`. Open on read. |
+
+The [run journal](run-journal.md#check_disputed) relays each one as a
+`check_disputed` record without the reason. Additive: an older koto lands
+the event in its unknown-event bucket and reads the rest of the log.
 
 ---
 

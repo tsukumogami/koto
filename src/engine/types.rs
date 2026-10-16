@@ -756,6 +756,30 @@ impl CheckEventFields {
     }
 }
 
+/// The event type `koto disputes record` appends.
+pub const FINDING_DISPUTED: &str = "finding_disputed";
+
+/// A dispute of one rule's finding at a gate: the payload of the
+/// [`FINDING_DISPUTED`] event `koto disputes record` appends.
+///
+/// A dispute is recorded, never obeyed: no gate outcome, route or state
+/// reads it. `reason` has been through koto's known-credential redaction.
+/// `source` is who disputed it, `agent` or `person` when koto writes it,
+/// open on read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FindingDispute {
+    /// The state whose gate evaluation is disputed.
+    pub state: String,
+    /// The gate, or `__action__` for a state's default action.
+    pub gate: String,
+    /// The disputed rule's id.
+    pub rule_id: String,
+    /// Why the finding is wrong, redacted.
+    pub reason: String,
+    /// Who disputed it.
+    pub source: String,
+}
+
 /// The leading bytes of a failed command gate's streams, as
 /// `gate_evaluated` records them beside its unchanged `output`.
 ///
@@ -1424,6 +1448,11 @@ pub enum EventPayload {
     /// The agent's answer to a criterion that fell back to it, appended by
     /// `koto decider answer`. Additive, and degrades like `decider_checked`.
     DeciderCheckAnswered(crate::decider::check::DeciderCheckAnswered),
+    /// A dispute of one rule's finding at a gate, appended by
+    /// `koto disputes record`. Nothing the advance loop routes on reads it.
+    /// Additive: an older build lands it in `Unknown`, and a payload this
+    /// build can't parse does the same rather than failing the read.
+    FindingDisputed(FindingDispute),
     InstructionsDelivered {
         /// The phase whose instructions the response carried.
         state: String,
@@ -1781,6 +1810,7 @@ impl EventPayload {
             EventPayload::DeciderChecked(_) => "decider_checked",
             EventPayload::DeciderFallback(_) => "decider_fallback",
             EventPayload::DeciderCheckAnswered(_) => "decider_check_answered",
+            EventPayload::FindingDisputed(_) => FINDING_DISPUTED,
             EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
             EventPayload::Unknown { .. } => "unknown",
         }
@@ -2254,6 +2284,15 @@ impl<'de> Deserialize<'de> for Event {
                     payload_val.clone(),
                 ) {
                     Ok(c) => EventPayload::DeciderConsulted(c),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            FINDING_DISPUTED => {
+                match serde_json::from_value::<FindingDispute>(payload_val.clone()) {
+                    Ok(d) => EventPayload::FindingDisputed(d),
                     Err(_) => EventPayload::Unknown {
                         type_name: event_type.clone(),
                         raw_payload: payload_val.clone(),
