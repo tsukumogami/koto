@@ -616,13 +616,23 @@ pub struct AdvanceResult {
     /// response that has blocking conditions.
     pub attempts: Option<AttemptCounts>,
     /// The `warning` findings of the checks this invocation evaluated that
-    /// passed, at most [`RESPONSE_ADVISORY_FINDINGS_CAP`] in all. The CLI
-    /// adds them to a `koto next` response when there are any.
-    pub advisories: Vec<Advisory>,
+    /// passed, at most [`RESPONSE_ADVISORY_FINDINGS_CAP`] in all, and whether
+    /// the cap cut any. The CLI adds them to a `koto next` response when
+    /// there are any.
+    pub advisories: Advisories,
 }
 
 /// Most findings a response's `advisories` carries, across its entries.
 pub const RESPONSE_ADVISORY_FINDINGS_CAP: usize = 100;
+
+/// A tick's advisories: the entries a `koto next` response lists under
+/// `advisories`, and whether [`RESPONSE_ADVISORY_FINDINGS_CAP`] left some
+/// warning findings out.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Advisories {
+    pub entries: Vec<Advisory>,
+    pub truncated: bool,
+}
 
 /// One entry of a `koto next` response's top-level `advisories` list: a
 /// check this invocation evaluated that passed while reporting `warning`
@@ -641,15 +651,13 @@ pub struct Advisory {
 /// invocation appended): every passing `gate_evaluated` and passing
 /// `default_action_executed` whose logged findings include `warning`
 /// ones, in event order, with at most [`RESPONSE_ADVISORY_FINDINGS_CAP`]
-/// findings in all. A default action passes when it exited 0 and logged no
+/// findings in all, the later ones left out and `truncated` set when the
+/// cap cuts any. A default action passes when it exited 0 and logged no
 /// rule counts, the run journal's rule. Nothing here routes or blocks.
-pub(crate) fn advisories(in_tick: &[Event]) -> Vec<Advisory> {
-    let mut out = Vec::new();
+pub(crate) fn advisories(in_tick: &[Event]) -> Advisories {
+    let mut out = Advisories::default();
     let mut room = RESPONSE_ADVISORY_FINDINGS_CAP;
     for e in in_tick {
-        if room == 0 {
-            break;
-        }
         let (state, gate, check) = match &e.payload {
             EventPayload::GateEvaluated {
                 state,
@@ -666,18 +674,21 @@ pub(crate) fn advisories(in_tick: &[Event]) -> Vec<Advisory> {
             } if check.rule_counts.is_none() => (state, ACTION_CONDITION_NAME, check),
             _ => continue,
         };
-        let findings: Vec<crate::findings::Finding> = check
+        let warnings: Vec<&crate::findings::Finding> = check
             .findings
             .iter()
             .filter(|f| f.level == FindingLevel::Warning)
-            .take(room)
-            .cloned()
             .collect();
+        if warnings.len() > room {
+            out.truncated = true;
+        }
+        let findings: Vec<crate::findings::Finding> =
+            warnings.into_iter().take(room).cloned().collect();
         if findings.is_empty() {
             continue;
         }
         room -= findings.len();
-        out.push(Advisory {
+        out.entries.push(Advisory {
             state: state.clone(),
             gate: gate.to_string(),
             findings,
@@ -1247,7 +1258,7 @@ where
         if shutdown.load(Ordering::Relaxed) {
             return Ok(AdvanceResult {
                 attempts: None,
-                advisories: Vec::new(),
+                advisories: Advisories::default(),
                 final_state: state,
                 advanced,
                 stop_reason: StopReason::SignalReceived,
@@ -1258,7 +1269,7 @@ where
         if transition_count >= MAX_CHAIN_LENGTH {
             return Ok(AdvanceResult {
                 attempts: None,
-                advisories: Vec::new(),
+                advisories: Advisories::default(),
                 final_state: state,
                 advanced,
                 stop_reason: StopReason::ChainLimitReached,
@@ -1278,7 +1289,7 @@ where
         if template_state.terminal {
             return Ok(AdvanceResult {
                 attempts: None,
-                advisories: Vec::new(),
+                advisories: Advisories::default(),
                 final_state: state,
                 advanced,
                 stop_reason: StopReason::Terminal,
@@ -1310,7 +1321,7 @@ where
                 Ok(output) => {
                     return Ok(AdvanceResult {
                         attempts: None,
-                        advisories: Vec::new(),
+                        advisories: Advisories::default(),
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::Integration {
@@ -1322,7 +1333,7 @@ where
                 Err(IntegrationError::Unavailable) => {
                     return Ok(AdvanceResult {
                         attempts: None,
-                        advisories: Vec::new(),
+                        advisories: Advisories::default(),
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::IntegrationUnavailable {
@@ -1333,7 +1344,7 @@ where
                 Err(IntegrationError::Failed(msg)) => {
                     return Ok(AdvanceResult {
                         attempts: None,
-                        advisories: Vec::new(),
+                        advisories: Advisories::default(),
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::IntegrationUnavailable {
@@ -1395,7 +1406,7 @@ where
                     )? {
                         return Ok(AdvanceResult {
                             attempts: None,
-                            advisories: Vec::new(),
+                            advisories: Advisories::default(),
                             final_state: state,
                             advanced,
                             stop_reason: StopReason::GateBlocked(conditions),
@@ -1421,7 +1432,7 @@ where
                     // template.
                     return Ok(AdvanceResult {
                         attempts: None,
-                        advisories: Vec::new(),
+                        advisories: Advisories::default(),
                         final_state: state.clone(),
                         advanced,
                         stop_reason: StopReason::ActionRefusedUnsetCapture {
@@ -1445,7 +1456,7 @@ where
                     // than at two stops that could drift.
                     return Ok(AdvanceResult {
                         attempts: None,
-                        advisories: Vec::new(),
+                        advisories: Advisories::default(),
                         final_state: state.clone(),
                         advanced,
                         stop_reason: StopReason::GateRefusedUnsetCapture {
@@ -1522,7 +1533,7 @@ where
                     }
                     return Ok(AdvanceResult {
                         attempts: None,
-                        advisories: Vec::new(),
+                        advisories: Advisories::default(),
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::GateBlocked(conditions),
@@ -1563,7 +1574,7 @@ where
                     )? {
                         return Ok(AdvanceResult {
                             attempts: None,
-                            advisories: Vec::new(),
+                            advisories: Advisories::default(),
                             final_state: state,
                             advanced,
                             stop_reason: StopReason::GateBlocked(conditions),
@@ -1571,7 +1582,7 @@ where
                     }
                     return Ok(AdvanceResult {
                         attempts: None,
-                        advisories: Vec::new(),
+                        advisories: Advisories::default(),
                         final_state: state.clone(),
                         advanced,
                         stop_reason: StopReason::ActionRequiresConfirmation {
@@ -1666,7 +1677,7 @@ where
                     Err(refusal) => {
                         return Ok(AdvanceResult {
                             attempts: None,
-                            advisories: Vec::new(),
+                            advisories: Advisories::default(),
                             final_state: state.clone(),
                             advanced,
                             stop_reason: StopReason::GateRefusedUnsetCapture {
@@ -1822,7 +1833,7 @@ where
                 {
                     return Ok(AdvanceResult {
                         attempts: None,
-                        advisories: Vec::new(),
+                        advisories: Advisories::default(),
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::GateBlocked(gate_results),
@@ -1897,7 +1908,7 @@ where
                         if visited.contains(&target) {
                             return Ok(AdvanceResult {
                                 attempts: None,
-                                advisories: Vec::new(),
+                                advisories: Advisories::default(),
                                 final_state: state,
                                 advanced,
                                 stop_reason: StopReason::CycleDetected { state: target },
@@ -2029,7 +2040,7 @@ where
                     }
                     return Ok(AdvanceResult {
                         attempts: None,
-                        advisories: Vec::new(),
+                        advisories: Advisories::default(),
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::EvidenceRequired {
@@ -2041,7 +2052,7 @@ where
                     // matched -- the gate itself is blocking.
                     return Ok(AdvanceResult {
                         attempts: None,
-                        advisories: Vec::new(),
+                        advisories: Advisories::default(),
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::GateBlocked(gate_results),
@@ -2049,7 +2060,7 @@ where
                 } else {
                     return Ok(AdvanceResult {
                         attempts: None,
-                        advisories: Vec::new(),
+                        advisories: Advisories::default(),
                         final_state: state,
                         advanced,
                         stop_reason: StopReason::UnresolvableTransition,
@@ -2099,7 +2110,7 @@ where
     if visited.contains(&target) {
         return Ok(Some(AdvanceResult {
             attempts: None,
-            advisories: Vec::new(),
+            advisories: Advisories::default(),
             final_state: state.clone(),
             advanced: *advanced,
             stop_reason: StopReason::CycleDetected { state: target },

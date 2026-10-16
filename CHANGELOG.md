@@ -29,8 +29,9 @@ to `0.9.x`).
   reporting `warning` findings, the response carries a top-level
   `advisories` list, one entry per such check with its `state`, its `gate`
   (`__action__` for a default action) and those findings in the usual
-  finding shape, at most 100 findings in all. A response with none carries
-  no `advisories` key and is otherwise unchanged. `koto next --to` and
+  finding shape, at most 100 findings in all, with
+  `advisories_truncated: true` beside it when that cap left warnings out. A
+  response with none carries no `advisories` key and is otherwise unchanged. `koto next --to` and
   `koto status` never carry it, and a warning never blocks.
 
 - **`koto disputes record` records that a finding is wrong without obeying

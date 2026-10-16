@@ -119,7 +119,7 @@ koto next <name> [--with-data <json>] [--to <target>] [--no-cleanup]
 
 The `--with-data` and `--to` flags are mutually exclusive. Passing both produces a `precondition_failed` error with exit code 2. The `--with-data` payload is capped at 1 MB.
 
-**Advisories.** A check that passes while printing `warning` findings doesn't block, but its warnings still reach you: the response carries a top-level `advisories` list with one entry per such check this call evaluated, as `{"state": ..., "gate": ..., "findings": [...]}` (`gate` is `__action__` for a default action), at most 100 findings in all. A response with none has no `advisories` key. `--to` and `koto status` never carry it. To say a warning is wrong, use [`koto disputes record`](#disputes-record).
+**Advisories.** A check that passes while printing `warning` findings doesn't block, but its warnings still reach you: the response carries a top-level `advisories` list with one entry per such check this call evaluated, as `{"state": ..., "gate": ..., "findings": [...]}` (`gate` is `__action__` for a default action), at most 100 findings in all; when that cap leaves warnings out, the response also carries `advisories_truncated: true` (absent otherwise). A response with none has no `advisories` key. `--to` and `koto status` never carry it. To say a warning is wrong, use [`koto disputes record`](#disputes-record).
 
 #### Directed transitions and non-overridable gates
 

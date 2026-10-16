@@ -24,6 +24,7 @@ agent will encounter, including which fields are absent and why.
 | `leg` | conditional | conditional | conditional | conditional | conditional | conditional |
 | `leg_abandoned` | conditional | conditional | conditional | conditional | conditional | conditional |
 | `advisories` | conditional | conditional | conditional | conditional | conditional | conditional |
+| `advisories_truncated` | conditional | conditional | conditional | conditional | conditional | conditional |
 
 `leg` is present on every response — `done` included — for a session bound to a request
 leg, and absent otherwise. It carries `request_id` and `leg_name` and never
@@ -68,7 +69,8 @@ other action types the key does not appear.
 
 `advisories` is present only when this call evaluated a check that passed while reporting
 `warning` findings, whatever the `action`; otherwise the key is absent. It never appears on
-`koto next --to` or `koto status`. See [`advisories`](#advisories).
+`koto next --to` or `koto status`. `advisories_truncated: true` rides beside it only when
+the 100-finding cap left warnings out. See [`advisories`](#advisories).
 
 `attempts` appears only when `blocking_conditions` is non-empty and koto has counted an
 attempt at the current state; check for it before reading. A failed `command`, `context-exists` or `context-matches` gate, and a failed
@@ -862,7 +864,8 @@ its warnings in a top-level list:
 - `findings` holds that check's `warning` findings only, in the finding shape `failure`
   uses. Errors and info findings of a passing check aren't listed.
 - At most 100 findings in all, across the entries. Later checks' warnings are the ones
-  left out.
+  left out, and the response then carries a top-level `advisories_truncated: true`, as
+  `findings_truncated` does for a failure. The key is absent unless warnings were cut.
 - The key is absent when there are none, and on `koto next --to` and `koto status`.
 
 Nothing here blocks or routes. Read the warnings, fix the ones you agree with while

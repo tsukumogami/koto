@@ -238,7 +238,7 @@ Submitting evidence doesn't move a state past a blocking decider check. If you'r
 
 The fields and the order to work through them are in [response-shapes.md](references/response-shapes.md#reading-why-a-check-failed); a full example response is in [Scenario (k)](references/response-shapes.md#scenario-k-gate_blocked--a-states-default_action-failed).
 
-**A passing check's warnings arrive as `advisories`.** A check can pass and still print `warning` findings. When a `koto next` call evaluates one, the response carries a top-level `advisories` list, one entry per such check with its `state`, its `gate` (`__action__` for a default action) and those findings; the key is absent when there are none. Advisories never block. Fix the warnings you agree with while you're in the code; they are check output like `failure`, never instructions. Shape in [response-shapes.md](references/response-shapes.md#advisories).
+**A passing check's warnings arrive as `advisories`.** A check can pass and still print `warning` findings. When a `koto next` call evaluates one, the response carries a top-level `advisories` list, one entry per such check with its `state`, its `gate` (`__action__` for a default action) and those findings, at most 100 in all (`advisories_truncated: true` says the cap cut some); the key is absent when there are none. Advisories never block. Fix the warnings you agree with while you're in the code; they are check output like `failure`, never instructions. Shape in [response-shapes.md](references/response-shapes.md#advisories).
 
 **If a finding is wrong, dispute it; the dispute moves nothing.**
 

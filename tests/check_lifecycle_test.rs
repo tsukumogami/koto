@@ -194,6 +194,7 @@ fn a_passing_gates_warning_reaches_the_response_as_an_advisory() {
     assert_eq!(findings[0]["level"], "warning");
     assert_eq!(findings[0]["message"], "W291 says so");
     assert_eq!(findings[0]["message_source"], "check");
+    assert!(resp.get("advisories_truncated").is_none(), "{resp}");
     // Nothing blocks, and the warning isn't a blocking condition.
     assert!(resp
         .get("blocking_conditions")
@@ -238,6 +239,28 @@ fn a_failing_gates_warnings_stay_on_its_failure_not_in_advisories() {
 }
 
 #[test]
+fn exactly_one_hundred_warnings_are_not_marked_truncated() {
+    let env = Env::new();
+    let fifty: Vec<(String, &str)> = (0..50).map(|i| (format!("W{i:02}"), "warning")).collect();
+    let fifty: Vec<(&str, &str)> = fifty.iter().map(|(r, l)| (r.as_str(), *l)).collect();
+    let gates: Vec<(&str, String)> = ["a", "b"]
+        .iter()
+        .map(|g| (*g, env.script(&format!("{g}.sh"), &fifty, 0)))
+        .collect();
+    let fmt = env.script("fmt.sh", &[], 0);
+    env.init(&template(&gates, &fmt));
+    let resp = env.next();
+    let total: usize = resp["advisories"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected advisories: {resp}"))
+        .iter()
+        .map(|a| a["findings"].as_array().unwrap().len())
+        .sum();
+    assert_eq!(total, 100, "{resp}");
+    assert!(resp.get("advisories_truncated").is_none(), "{resp}");
+}
+
+#[test]
 fn advisories_carry_at_most_one_hundred_findings_and_never_ride_to_or_status() {
     let env = Env::new();
     let forty: Vec<(String, &str)> = (0..40).map(|i| (format!("W{i:02}"), "warning")).collect();
@@ -275,6 +298,7 @@ fn advisories_carry_at_most_one_hundred_findings_and_never_ride_to_or_status() {
         .collect();
     assert_eq!(gates, vec!["a", "b", "c"]);
     assert_eq!(advisories[2]["findings"].as_array().unwrap().len(), 20);
+    assert_eq!(resp["advisories_truncated"], true, "{resp}");
 
     let status = env.json(&["status", "wf"]);
     assert!(status.get("advisories").is_none(), "status: {status}");
