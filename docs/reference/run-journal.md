@@ -4,7 +4,7 @@ The run journal is a local record of session identity and progress for
 tooling outside koto. koto appends one JSON object per line as sessions
 start, enter states, reach a terminal, are cancelled, or are driven by a new
 Claude Code session, each time koto evaluates one of their checks or
-consults the decider, each time an override is recorded, once per state
+consults the decider, each time an override or a dispute is recorded, once per state
 visit for the context keys the visit read, and each time `koto next` or
 `koto status` prints a state's directive. The journal is
 append-only: koto never rewrites or reads back its records, so a
@@ -60,7 +60,7 @@ A field with no value is left out, never written as `null` or an empty
 string. Ids (every `*.id` field except `koto.rule.id`, and
 `koto.template.hash`, `koto.context.first_hash` and `koto.context.last_hash`)
 must match `^[A-Za-z0-9._:-]{1,128}$`. Names (`koto.template.name`,
-`koto.state`, `koto.terminal`, `koto.check`, `koto.context.key`, and the
+`koto.state`, `koto.terminal`, `koto.check`, `koto.check.name`, `koto.context.key`, and the
 string values of the check, decider, override, response and context kinds)
 must match `^[A-Za-z0-9._:/@-]{1,128}$` and not start with `/` or `~`. A
 value outside its shape is left out and the record is still written.
@@ -79,9 +79,11 @@ their digest (see
 | `terminal` | `koto.terminal` | The session arrives at a terminal state. |
 | `cancelled` | none | The session is cancelled. |
 | `driver_seen` | `koto.driver.session.id` | A command runs under a driving session other than the last one recorded for it. |
-| `check_evaluated` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.check.outcome`, `koto.attempt`, `koto.visit_attempt`, `koto.check.rule_count`, `koto.check.rule_counts_truncated`, `koto.check.duration_ms`, `koto.poll.status`, `koto.check.unanswered_count`, `koto.check.error`, `koto.decider.awaiting_count`, `koto.decider.agent_answered_count` | koto evaluates a gate and the result isn't pending, or runs a state's default action. |
+| `check_evaluated` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.check.outcome`, `koto.attempt`, `koto.visit_attempt`, `koto.check.rule_count`, `koto.check.rule_counts_truncated`, `koto.check.finding_count`, `koto.check.findings_truncated`, `koto.check.duration_ms`, `koto.poll.status`, `koto.check.unanswered_count`, `koto.check.error`, `koto.decider.awaiting_count`, `koto.decider.agent_answered_count` | koto evaluates a gate and the result isn't pending, or runs a state's default action. |
 | `check_rule` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.rule.visit_count`, `koto.rule.session_count` | Once for each error rule of a check evaluation, after its `check_evaluated`. |
+| `check_finding` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check.name`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.finding.level`, `koto.finding.count` | Once for each distinct rule id and level among a check evaluation's logged findings, passing or failing, after its `check_rule` records. |
 | `check_pending` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.poll.status`, `koto.poll.evaluations`, `koto.poll.elapsed_secs`, `koto.decider.awaiting_count`, `koto.decider.agent_answered_count` | A polling gate's evaluation is still pending, or a decider check is waiting on the agent. |
+| `check_disputed` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check.name`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.dispute.source` | `koto disputes record` records a dispute of a rule's finding at a gate. |
 | `decider_consulted` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.outcome`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.latency_ms`, `koto.decider.directive_bytes` | koto consults the decider about a state's evidence. |
 | `decider_checked` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.mode`, `koto.decider.outcome`, `koto.decider.reason`, `koto.decider.blocked`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.attempts`, `koto.decider.latency_ms`, `koto.decider.input_bytes` | koto grades one criterion of a decider check. |
 | `decider_fallback` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.mode`, `koto.decider.reason`, `koto.decider.input_bytes` | A decider-check criterion that got no verdict is handed to the agent. |
@@ -89,7 +91,7 @@ their digest (see
 | `response` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.response.source`, `koto.response.directive_bytes`, `koto.response.details_bytes` | `koto next` or `koto status` has printed a non-terminal state's directive. |
 | `context_reads` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.context.key`, `koto.context.reader`, `koto.context.access`, `koto.context.overflow`, `koto.context.read_count`, `koto.context.present_count`, `koto.context.first_hash`, `koto.context.last_hash` | A state visit that read context keys ends. |
 
-The first five are the identity kinds. The next three are the check kinds,
+The first five are the identity kinds. The next five are the check kinds,
 described in [Check records](#check-records), the four after them are the
 decider and override kinds, described in
 [Decider and override records](#decider-and-override-records), `response`
@@ -176,6 +178,8 @@ One record per check evaluation: a `gate_evaluated` whose outcome isn't
 | `koto.visit_attempt` | integer | when logged | The state's attempt number in the current visit. |
 | `koto.check.rule_count` | integer | always | How many error rules the evaluation counted, the keys of its `rule_counts`; 0 when it has none. |
 | `koto.check.rule_counts_truncated` | boolean | when `true` | The check reported more error rules than koto counts (50), so some have no `check_rule`. |
+| `koto.check.finding_count` | integer | always, from this koto on | How many findings the evaluation's event logged, of every level and whatever the outcome, koto's own fallback finding included; 0 when it logged none. An event logs at most 50, so this is at most 50. Left out only by a koto that predates the field. |
+| `koto.check.findings_truncated` | boolean | when `true` | The check reported more findings than its event logged (koto logs at most 50, keeping `error` findings first, then `warning`, then `info`), so `koto.check.finding_count` and the `check_finding` records undercount what it printed. |
 | `koto.check.duration_ms` | integer | when logged | The check command's run time in milliseconds. Command gates, decider checks and default actions log it; context gates don't. |
 | `koto.poll.status` | string | polling gates | Where the poll settled: `done`, `failed` or `timed_out`. |
 | `koto.check.unanswered_count` | integer | decider checks | How many veto criteria got no verdict. |
@@ -190,7 +194,9 @@ saw each rule reported, right after the evaluation's `check_evaluated`.
 koto counts error rules only on a check that didn't pass: the rule ids it
 reported at level `error`, or koto's own fallback finding's id when none of
 its findings was an error. A passing check writes no `check_rule`, whatever
-it printed, and an evaluation writes at most 50.
+it printed, and an evaluation writes at most 50. Every level of finding, a
+passing check's included, is in its [`check_finding`](#check_finding)
+records instead.
 
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|
@@ -205,6 +211,32 @@ it printed, and an evaluation writes at most 50.
 A rule whose `koto.rule.visit_count` keeps rising within one visit is a
 check the agent isn't converging on; one that stops before a passing
 `check_evaluated` in the same visit converged.
+
+### `check_finding`
+
+One record per distinct pair of rule id and level among the findings a
+check evaluation's event logged, whether the check passed or failed, after
+the evaluation's `check_evaluated` and `check_rule` records and in the same
+write, so a reader never sees one without the other. koto's own fallback
+finding, whose rule id is the check's name, is a finding like any other. The
+order is `error` pairs first, then `warning`, then `info`, then any other
+level, each level in the order its pairs were first logged. An evaluation
+writes at most 50; past that, the pairs of the later levels are the ones
+left out. A pending evaluation writes none.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.state` | string | always | As its evaluation's. |
+| `koto.check.name` | string | always | The gate's name, or `__action__`: its evaluation's `koto.check`, under the path a tool that nests dotted names gives that field, so a join reads one path. The record has no `koto.check` of its own. |
+| `koto.attempt` | integer | when its evaluation has it | As its evaluation's. |
+| `koto.visit_attempt` | integer | when its evaluation has it | As its evaluation's. |
+| `koto.rule.id` | string | always | The rule id, or its digest (see [Rule ids](#rule-ids)). |
+| `koto.finding.level` | string | always | The findings' level: `error`, `warning` or `info` from this koto. The vocabulary is open, so a reader keeps a level it doesn't know rather than rejecting the record. |
+| `koto.finding.count` | integer | always | How many of the logged findings had this rule id and level, at least 1. |
+
+The counts of one evaluation's records sum to its `koto.check.finding_count`
+unless more than 50 pairs were logged. A finding's message, path, location
+and rule reference stay in the session's log.
 
 ### `check_pending`
 
@@ -228,6 +260,33 @@ or where the decider check stops waiting, is a check evaluation.
 A polling gate re-run several times inside one evaluation (a `hold_secs`
 wait) writes one record for that evaluation, and `koto.poll.evaluations`
 counts the runs.
+
+### `check_disputed`
+
+One record per committed `finding_disputed` event, which
+`koto disputes record` appends when an agent or a person says a rule's
+finding at a gate is wrong. A dispute changes no outcome, route or state;
+this record says only that it was made. The reason given stays in the
+session's log and is never copied.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.state` | string | always | The state whose evaluation of the gate is disputed. It can be a state the session has left (`--state`), so it can differ from the state of the visit `koto.visit.seq` names, which is the one the session was in when the dispute was recorded. |
+| `koto.check.name` | string | always | The gate's name, or `__action__` for a default action, under the same path as on `check_finding`. The record has no `koto.check` of its own. |
+| `koto.attempt` | integer | when the disputed evaluation has it | The disputed evaluation's `koto.attempt`. |
+| `koto.visit_attempt` | integer | when the disputed evaluation has it | The disputed evaluation's `koto.visit_attempt`. |
+| `koto.rule.id` | string | always | The disputed rule's id, or its digest (see [Rule ids](#rule-ids)). |
+| `koto.dispute.source` | string | always | Who disputed it: `agent` or `person`. |
+
+A dispute names the most recent settled evaluation of the gate in that
+state, one with an outcome rather than pending. Its `check_evaluated` is the
+one with the same `koto.session.id` and `koto.state`, a `koto.check` equal to
+the dispute's `koto.check.name`, and the same `koto.attempt` and
+`koto.visit_attempt`. A dispute of an evaluation from before attempt
+numbers carries neither; its evaluation is then the latest such
+`check_evaluated` with a lower `koto.seq`. koto doesn't require that
+evaluation to have logged a finding for the rule, since its logged findings
+may have been cut.
 
 ### Rule ids
 
@@ -256,9 +315,13 @@ literal id of that form can't be told apart from a digest.
 ### Example
 
 ```json
-{"kind":"check_evaluated","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check":"lint","koto.check.outcome":"failed","koto.attempt":2,"koto.visit_attempt":2,"koto.check.rule_count":2,"koto.check.duration_ms":840}
+{"kind":"check_evaluated","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check":"lint","koto.check.outcome":"failed","koto.attempt":2,"koto.visit_attempt":2,"koto.check.rule_count":2,"koto.check.finding_count":4,"koto.check.duration_ms":840}
 {"kind":"check_rule","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"E501","koto.rule.visit_count":2,"koto.rule.session_count":2}
 {"kind":"check_rule","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"no-unused-vars","koto.rule.visit_count":1,"koto.rule.session_count":1}
+{"kind":"check_finding","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check.name":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"E501","koto.finding.level":"error","koto.finding.count":2}
+{"kind":"check_finding","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check.name":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"no-unused-vars","koto.finding.level":"error","koto.finding.count":1}
+{"kind":"check_finding","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check.name":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"W291","koto.finding.level":"warning","koto.finding.count":1}
+{"kind":"check_disputed","v":1,"at":"2026-10-10T03:15:40.020Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":16,"koto.visit.seq":9,"koto.state":"implement","koto.check.name":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"W291","koto.dispute.source":"agent"}
 {"kind":"check_pending","v":1,"at":"2026-10-10T03:21:40.502Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":19,"koto.visit.seq":17,"koto.state":"ci","koto.check":"ci","koto.poll.status":"pending","koto.poll.evaluations":2,"koto.poll.elapsed_secs":31}
 ```
 
@@ -589,7 +652,8 @@ An imported session is a new run: its own id is its run id.
   processes. Use file order within a session.
 - Order one session's check, decider, override and response records by
   `koto.seq`, then by file order. A `check_evaluated` comes before its own
-  `check_rule` records, which share its `koto.seq`. A `response` comes
+  `check_rule` records and then its `check_finding` records, all in one
+  write and sharing its `koto.seq`. A `response` comes
   after the records of the events committed before it printed.
 - A visit's `context_reads` come after any `driver_seen` of the same
   command. A visit that ends in another state, a rewind or a cancel has
@@ -605,8 +669,8 @@ An imported session is a new run: its own id is its run id.
   sender that retries, for example) holds exact duplicates. Treat two
   check, decider, override, response or context-read records as duplicates
   only when every field, `at` included, is equal. Distinct check, decider
-  and override records differ in `kind`, `at`, `koto.seq` or
-  `koto.rule.id`, and distinct context-read records in `at`, `koto.seq` or
+  and override records differ in `kind`, `at`, `koto.seq`,
+  `koto.rule.id` or `koto.finding.level`, and distinct context-read records in `at`, `koto.seq` or
   their key, reader and access. Two `response` records can be equal without
   being a duplicate; see the note on responses printed in the same
   millisecond under [Response records](#response-records).
@@ -746,9 +810,12 @@ No session-lifecycle command deletes or rewrites the journal:
 at its terminal tick, a parent's sweep of its children,
 `koto init --replace-terminal` and `koto session import` all leave existing
 lines byte-identical. The journal grows by a few hundred bytes per state
-entered, per check evaluation, decider call, override and printed
+entered, per check evaluation, decider call, override, dispute and printed
 directive, by up to 50 more lines for a check that reports many error
-rules, and by up to 51 lines per visit for the context keys it read.
+rules and up to 50 more for the distinct rule ids and levels of its
+findings, and by up to 51 lines per visit for the context keys it read. A
+check that reports no findings adds no `check_finding` line; a typical one
+adds one line per rule it reports, at roughly 450 bytes each.
 
 To remove it by hand, delete the file (or move it aside) while no koto
 command is running. The next record creates a new file. Lines removed this

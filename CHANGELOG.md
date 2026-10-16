@@ -10,6 +10,50 @@ to `0.9.x`).
 
 ### Added
 
+- **The run journal records every finding a check logs, passing or
+  failing.** Each check evaluation now adds one `check_finding` line per
+  distinct rule id and level among the findings its event logged, with how
+  many findings had that pair, the state, the check (as `koto.check.name`,
+  the path a tool that nests dotted names gives `check_evaluated`'s
+  `koto.check`) and the attempt numbers.
+  Error pairs come first, then warnings, then info, at most 50 lines per
+  evaluation, in the same write as the evaluation's `check_evaluated`.
+  `check_evaluated` gains `koto.check.finding_count`, always written (0
+  included), and `koto.check.findings_truncated` when the check reported
+  more findings than its event kept. `check_rule` is unchanged: it still
+  counts the error rules of failing checks only. A dispute adds a
+  `check_disputed` line with the state, the gate as `koto.check.name`, the
+  disputed evaluation's attempt numbers (so it joins to exactly that
+  evaluation), the rule id and who disputed it, never the reason. The line format stays at version 1, and tools that send
+  journal lines off the host see the new kinds without a format change.
+
+- **A passing check's warnings reach the agent as `advisories`.** When a
+  `koto next` call evaluates a gate or default action that passes while
+  reporting `warning` findings, the response carries a top-level
+  `advisories` list, one entry per such check with its `state`, its `gate`
+  (`__action__` for a default action) and those findings in the usual
+  finding shape, at most 100 findings in all, with
+  `advisories_truncated: true` beside it when that cap left warnings out. A
+  response with none carries no `advisories` key and is otherwise unchanged. `koto next --to` and
+  `koto status` never carry it, and a warning never blocks.
+
+- **`koto disputes record` records that a finding is wrong without obeying
+  it.** `koto disputes record <session> --gate <gate> --rule <rule-id>
+  --reason <text> [--state <state>] [--by agent|person]` appends one
+  `finding_disputed` event naming the state (the current one by default),
+  gate, rule id, reason and source, and the disputed evaluation's attempt
+  numbers, and prints `{"status":"recorded"}`. The
+  gate must have a settled evaluation logged in that state (a polling gate
+  that has only answered pending doesn't count); the rule needn't have a
+  logged finding. The reason goes through koto's known-credential redaction
+  before it's stored. A dispute changes no gate outcome, route or state, and
+  the next `koto next` responds as it would have without it. A missing
+  session exits 1; a gate not evaluated in the state (`gate_not_evaluated`),
+  a rule id outside 1 to 128 bytes (`invalid_rule`), a reason outside 1 to
+  1,000 bytes (`invalid_reason`) or a `--by` other than `agent` or `person`
+  exits 2 and appends nothing. The event is additive: koto v0.14.1 reads a
+  log holding it and reports the same current state.
+
 - **The run journal records check evaluations.** Each gate evaluation and
   default-action run a session commits now adds a `check_evaluated` line to
   `~/.koto/_run_journal.jsonl`, with the check's outcome, attempt numbers,
