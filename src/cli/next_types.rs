@@ -1187,6 +1187,28 @@ pub fn attach_attempts(
     Ok(())
 }
 
+/// The top-level key a `koto next` response carries a passing check's
+/// `warning` findings under.
+pub const ADVISORIES_KEY: &str = "advisories";
+
+/// Add the top-level `advisories` list to a serialized response envelope:
+/// the checks the invocation evaluated that passed while reporting
+/// `warning` findings, with those findings. Only when there are any, so a
+/// response without them is left byte-identical. `koto next --to` and
+/// `koto status` never call this.
+pub fn attach_advisories(
+    envelope: &mut serde_json::Map<String, serde_json::Value>,
+    advisories: &[crate::engine::advance::Advisory],
+) -> Result<(), serde_json::Error> {
+    if !advisories.is_empty() {
+        envelope.insert(
+            ADVISORIES_KEY.to_string(),
+            serde_json::to_value(advisories)?,
+        );
+    }
+    Ok(())
+}
+
 /// Convert gate evaluation results into a list of blocking conditions.
 ///
 /// Passed gates are excluded. Each non-passing gate produces a `BlockingCondition`

@@ -6238,6 +6238,7 @@ fn handle_next(
             let final_state = &advance_result.final_state;
             let advanced = advance_result.advanced;
             let attempts = advance_result.attempts.clone();
+            let advisories = advance_result.advisories.clone();
 
             let final_template_state = match compiled.states.get(final_state) {
                 Some(s) => s,
@@ -6969,6 +6970,9 @@ fn handle_next(
             // response with blocking conditions
             // (DESIGN-koto-failure-reporting.md, Decision 3).
             next_types::attach_attempts(&mut envelope, attempts.as_ref())?;
+            // A passing check's warnings, after `attempts` and only when
+            // there are any.
+            next_types::attach_advisories(&mut envelope, &advisories)?;
 
             println!(
                 "{}",
