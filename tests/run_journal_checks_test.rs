@@ -544,7 +544,13 @@ fn a_converged_retry_writes_four_evaluations_and_three_rule_records() {
     assert_eq!(rules, vec![("E501", 1), ("E501", 2), ("E501", 3)]);
     for r in &c {
         assert_eq!(r["koto.state"], "work");
-        assert_eq!(r["koto.check"], "lint");
+        // `check_finding` names its gate under `koto.check.name`.
+        let check = if r["kind"] == "check_finding" {
+            &r["koto.check.name"]
+        } else {
+            &r["koto.check"]
+        };
+        assert_eq!(check, "lint", "{r}");
     }
 }
 

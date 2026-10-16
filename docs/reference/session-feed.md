@@ -664,6 +664,12 @@ events:
       source:
         type: string
         required: true
+      attempt:
+        type: integer
+        required: false
+      visit_attempt:
+        type: integer
+        required: false
 
   scheduler_ran:
     tier: 3
@@ -2066,7 +2072,9 @@ a gate, record an override instead.
     "gate": "lint",
     "rule_id": "W291",
     "reason": "the file is generated; trailing whitespace is upstream's",
-    "source": "agent"
+    "source": "agent",
+    "attempt": 2,
+    "visit_attempt": 2
   }
 }
 ```
@@ -2078,9 +2086,12 @@ a gate, record an override instead.
 | `rule_id` | string | Yes | The disputed rule's id, 1 to 128 bytes. The evaluation needn't have logged a finding for it, since a logged finding list may have been cut. |
 | `reason` | string | Yes | Why the finding is wrong, 1 to 1,000 bytes, after koto's known-credential redaction (the same pass captured output and findings get), so a credential value koto knows appears as a `[REDACTED:<source>]` marker. |
 | `source` | string | Yes | Who disputed it: `agent` or `person`. Open on read. |
+| `attempt` | integer | No | The disputed evaluation's `attempt`, copied from the most recent settled evaluation of the gate in `state`, so a reader can join the dispute to exactly that evaluation. Absent when that evaluation predates attempt numbers. |
+| `visit_attempt` | integer | No | The disputed evaluation's `visit_attempt`, under the same rule. |
 
 The [run journal](run-journal.md#check_disputed) relays each one as a
-`check_disputed` record without the reason. Additive: an older koto lands
+`check_disputed` record, with the gate as `koto.check.name` and the two
+attempt numbers, without the reason. Additive: an older koto lands
 the event in its unknown-event bucket and reads the rest of the log.
 
 ---

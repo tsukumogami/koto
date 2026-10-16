@@ -60,7 +60,7 @@ A field with no value is left out, never written as `null` or an empty
 string. Ids (every `*.id` field except `koto.rule.id`, and
 `koto.template.hash`, `koto.context.first_hash` and `koto.context.last_hash`)
 must match `^[A-Za-z0-9._:-]{1,128}$`. Names (`koto.template.name`,
-`koto.state`, `koto.terminal`, `koto.check`, `koto.context.key`, and the
+`koto.state`, `koto.terminal`, `koto.check`, `koto.check.name`, `koto.context.key`, and the
 string values of the check, decider, override, response and context kinds)
 must match `^[A-Za-z0-9._:/@-]{1,128}$` and not start with `/` or `~`. A
 value outside its shape is left out and the record is still written.
@@ -81,9 +81,9 @@ their digest (see
 | `driver_seen` | `koto.driver.session.id` | A command runs under a driving session other than the last one recorded for it. |
 | `check_evaluated` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.check.outcome`, `koto.attempt`, `koto.visit_attempt`, `koto.check.rule_count`, `koto.check.rule_counts_truncated`, `koto.check.finding_count`, `koto.check.findings_truncated`, `koto.check.duration_ms`, `koto.poll.status`, `koto.check.unanswered_count`, `koto.check.error`, `koto.decider.awaiting_count`, `koto.decider.agent_answered_count` | koto evaluates a gate and the result isn't pending, or runs a state's default action. |
 | `check_rule` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.rule.visit_count`, `koto.rule.session_count` | Once for each error rule of a check evaluation, after its `check_evaluated`. |
-| `check_finding` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.finding.level`, `koto.finding.count` | Once for each distinct rule id and level among a check evaluation's logged findings, passing or failing, after its `check_rule` records. |
+| `check_finding` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check.name`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.finding.level`, `koto.finding.count` | Once for each distinct rule id and level among a check evaluation's logged findings, passing or failing, after its `check_rule` records. |
 | `check_pending` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.poll.status`, `koto.poll.evaluations`, `koto.poll.elapsed_secs`, `koto.decider.awaiting_count`, `koto.decider.agent_answered_count` | A polling gate's evaluation is still pending, or a decider check is waiting on the agent. |
-| `check_disputed` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.dispute.source` | `koto disputes record` records a dispute of a rule's finding at a gate. |
+| `check_disputed` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check.name`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.dispute.source` | `koto disputes record` records a dispute of a rule's finding at a gate. |
 | `decider_consulted` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.outcome`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.latency_ms`, `koto.decider.directive_bytes` | koto consults the decider about a state's evidence. |
 | `decider_checked` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.mode`, `koto.decider.outcome`, `koto.decider.reason`, `koto.decider.blocked`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.attempts`, `koto.decider.latency_ms`, `koto.decider.input_bytes` | koto grades one criterion of a decider check. |
 | `decider_fallback` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.mode`, `koto.decider.reason`, `koto.decider.input_bytes` | A decider-check criterion that got no verdict is handed to the agent. |
@@ -227,7 +227,7 @@ left out. A pending evaluation writes none.
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|
 | `koto.state` | string | always | As its evaluation's. |
-| `koto.check` | string | always | As its evaluation's. |
+| `koto.check.name` | string | always | The gate's name, or `__action__`: its evaluation's `koto.check`, under the path a tool that nests dotted names gives that field, so a join reads one path. The record has no `koto.check` of its own. |
 | `koto.attempt` | integer | when its evaluation has it | As its evaluation's. |
 | `koto.visit_attempt` | integer | when its evaluation has it | As its evaluation's. |
 | `koto.rule.id` | string | always | The rule id, or its digest (see [Rule ids](#rule-ids)). |
@@ -272,14 +272,21 @@ session's log and is never copied.
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|
 | `koto.state` | string | always | The state whose evaluation of the gate is disputed. It can be a state the session has left (`--state`), so it can differ from the state of the visit `koto.visit.seq` names, which is the one the session was in when the dispute was recorded. |
-| `koto.check` | string | always | The gate's name, or `__action__` for a default action. |
+| `koto.check.name` | string | always | The gate's name, or `__action__` for a default action, under the same path as on `check_finding`. The record has no `koto.check` of its own. |
+| `koto.attempt` | integer | when the disputed evaluation has it | The disputed evaluation's `koto.attempt`. |
+| `koto.visit_attempt` | integer | when the disputed evaluation has it | The disputed evaluation's `koto.visit_attempt`. |
 | `koto.rule.id` | string | always | The disputed rule's id, or its digest (see [Rule ids](#rule-ids)). |
 | `koto.dispute.source` | string | always | Who disputed it: `agent` or `person`. |
 
-The disputed evaluation is the latest `check_evaluated` with the same
-`koto.session.id`, `koto.state` and `koto.check` and a lower `koto.seq`.
-koto doesn't require that evaluation to have logged a finding for the rule,
-since its logged findings may have been cut.
+A dispute names the most recent settled evaluation of the gate in that
+state, one with an outcome rather than pending. Its `check_evaluated` is the
+one with the same `koto.session.id` and `koto.state`, a `koto.check` equal to
+the dispute's `koto.check.name`, and the same `koto.attempt` and
+`koto.visit_attempt`. A dispute of an evaluation from before attempt
+numbers carries neither; its evaluation is then the latest such
+`check_evaluated` with a lower `koto.seq`. koto doesn't require that
+evaluation to have logged a finding for the rule, since its logged findings
+may have been cut.
 
 ### Rule ids
 
@@ -311,10 +318,10 @@ literal id of that form can't be told apart from a digest.
 {"kind":"check_evaluated","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check":"lint","koto.check.outcome":"failed","koto.attempt":2,"koto.visit_attempt":2,"koto.check.rule_count":2,"koto.check.finding_count":4,"koto.check.duration_ms":840}
 {"kind":"check_rule","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"E501","koto.rule.visit_count":2,"koto.rule.session_count":2}
 {"kind":"check_rule","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"no-unused-vars","koto.rule.visit_count":1,"koto.rule.session_count":1}
-{"kind":"check_finding","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"E501","koto.finding.level":"error","koto.finding.count":2}
-{"kind":"check_finding","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"no-unused-vars","koto.finding.level":"error","koto.finding.count":1}
-{"kind":"check_finding","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"W291","koto.finding.level":"warning","koto.finding.count":1}
-{"kind":"check_disputed","v":1,"at":"2026-10-10T03:15:40.020Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":16,"koto.visit.seq":9,"koto.state":"implement","koto.check":"lint","koto.rule.id":"W291","koto.dispute.source":"agent"}
+{"kind":"check_finding","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check.name":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"E501","koto.finding.level":"error","koto.finding.count":2}
+{"kind":"check_finding","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check.name":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"no-unused-vars","koto.finding.level":"error","koto.finding.count":1}
+{"kind":"check_finding","v":1,"at":"2026-10-10T03:15:02.114Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":14,"koto.visit.seq":9,"koto.state":"implement","koto.check.name":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"W291","koto.finding.level":"warning","koto.finding.count":1}
+{"kind":"check_disputed","v":1,"at":"2026-10-10T03:15:40.020Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":16,"koto.visit.seq":9,"koto.state":"implement","koto.check.name":"lint","koto.attempt":2,"koto.visit_attempt":2,"koto.rule.id":"W291","koto.dispute.source":"agent"}
 {"kind":"check_pending","v":1,"at":"2026-10-10T03:21:40.502Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":19,"koto.visit.seq":17,"koto.state":"ci","koto.check":"ci","koto.poll.status":"pending","koto.poll.evaluations":2,"koto.poll.elapsed_secs":31}
 ```
 

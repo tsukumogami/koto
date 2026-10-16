@@ -61,7 +61,8 @@
 //!   outside the name shape is written as its digest ([`name_or_digest`]).
 //! - `check_finding`: one per distinct (rule id, level) among that event's
 //!   logged findings, passing or failing, after its `check_rule` records,
-//!   with how many findings had the pair (see [`with_findings`]).
+//!   with the gate as `koto.check.name` and how many findings had the pair
+//!   (see [`with_findings`]).
 //! - `check_pending`: one per pending `gate_evaluated` of a polling gate or
 //!   of a decider check waiting on the agent, never an outcome. A polling
 //!   gate's carries the poll's run count and elapsed seconds; a decider
@@ -82,7 +83,8 @@
 //!   as `koto.rule.id`, the mode, the reason and the slice's size.
 //! - `check_overridden`: one per `gate_override_recorded`, with the state
 //!   and gate only.
-//! - `check_disputed`: one per `finding_disputed`, with the state, gate,
+//! - `check_disputed`: one per `finding_disputed`, with the state, the gate
+//!   as `koto.check.name`, the disputed evaluation's attempt numbers, the
 //!   rule id (digested like a rule id) and who disputed it, never the
 //!   reason.
 //!
@@ -690,6 +692,11 @@ const ACTION_CHECK: &str = "__action__";
 const CHECK_FINDING: &str = "check_finding";
 /// One record per `finding_disputed` event.
 const CHECK_DISPUTED: &str = "check_disputed";
+/// On `check_finding` and `check_disputed`: the gate's name (or
+/// `__action__`). The path an exporter that nests dotted names gives
+/// `check_evaluated`'s scalar `koto.check`, so joins read one path; the
+/// older kinds keep `koto.check` unchanged.
+const CHECK_NAME_FIELD: &str = "koto.check.name";
 /// On `check_evaluated`: how many findings the event logged, 0 included.
 const FINDING_COUNT_FIELD: &str = "koto.check.finding_count";
 /// On `check_evaluated`, when `true`: the check reported more findings than
@@ -832,11 +839,15 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
             .record("check_overridden")
             .name("koto.state", Some(state.as_str()))
             .name("koto.check", Some(gate.as_str()))],
-        // The reason stays in the log.
+        // The reason stays in the log. The attempt numbers are the disputed
+        // evaluation's, which the event carries, so a reader joins the
+        // dispute to exactly that `check_evaluated`.
         EventPayload::FindingDisputed(d) => vec![relay
             .record(CHECK_DISPUTED)
             .name("koto.state", Some(d.state.as_str()))
-            .name("koto.check", Some(d.gate.as_str()))
+            .name(CHECK_NAME_FIELD, Some(d.gate.as_str()))
+            .int("koto.attempt", d.attempt)
+            .int("koto.visit_attempt", d.visit_attempt)
             .name("koto.rule.id", Some(name_or_digest(&d.rule_id).as_str()))
             .name(DISPUTE_SOURCE_FIELD, Some(d.source.as_str()))],
         _ => Vec::new(),
@@ -1002,7 +1013,7 @@ fn with_findings(
             relay
                 .record(CHECK_FINDING)
                 .name("koto.state", Some(state))
-                .name("koto.check", Some(check_name))
+                .name(CHECK_NAME_FIELD, Some(check_name))
                 .int("koto.attempt", check.attempt)
                 .int("koto.visit_attempt", check.visit_attempt)
                 .name("koto.rule.id", Some(name_or_digest(rule_id).as_str()))

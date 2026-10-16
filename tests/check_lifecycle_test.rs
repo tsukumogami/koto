@@ -205,7 +205,7 @@ fn a_passing_gates_warning_reaches_the_response_as_an_advisory() {
     let journal = env.journal();
     let found: Vec<(&str, &str)> = journal
         .iter()
-        .filter(|r| r["kind"] == "check_finding" && r["koto.check"] == "lint")
+        .filter(|r| r["kind"] == "check_finding" && r["koto.check.name"] == "lint")
         .map(|r| {
             (
                 r["koto.rule.id"].as_str().unwrap(),
@@ -408,6 +408,8 @@ fn a_dispute_in_the_current_state_and_one_in_an_earlier_state_each_append_one_ev
             "rule_id": "F1",
             "reason": "the formatter disagrees with itself",
             "source": "agent",
+            "attempt": 1,
+            "visit_attempt": 1,
         })
     );
     assert_eq!(
@@ -418,6 +420,8 @@ fn a_dispute_in_the_current_state_and_one_in_an_earlier_state_each_append_one_ev
             "rule_id": "W291",
             "reason": "generated file",
             "source": "person",
+            "attempt": 1,
+            "visit_attempt": 1,
         })
     );
 
@@ -428,11 +432,26 @@ fn a_dispute_in_the_current_state_and_one_in_an_earlier_state_each_append_one_ev
         .collect();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0]["koto.state"], "work");
-    assert_eq!(records[0]["koto.check"], "fmt");
+    assert_eq!(records[0]["koto.check.name"], "fmt");
+    assert!(records[0].get("koto.check").is_none(), "{}", records[0]);
     assert_eq!(records[0]["koto.rule.id"], "F1");
     assert_eq!(records[0]["koto.dispute.source"], "agent");
     assert_eq!(records[1]["koto.state"], "check");
     assert_eq!(records[1]["koto.dispute.source"], "person");
+    // Each dispute joins exactly the evaluation it names.
+    for d in &records {
+        let joined: Vec<&Value> = journal
+            .iter()
+            .filter(|r| {
+                r["kind"] == "check_evaluated"
+                    && r["koto.state"] == d["koto.state"]
+                    && r["koto.check"] == d["koto.check.name"]
+                    && r["koto.attempt"] == d["koto.attempt"]
+                    && r["koto.visit_attempt"] == d["koto.visit_attempt"]
+            })
+            .collect();
+        assert_eq!(joined.len(), 1, "{d}: {joined:?}");
+    }
     let raw =
         std::fs::read_to_string(env.path().join("sessions").join("_run_journal.jsonl")).unwrap();
     assert!(!raw.contains("generated file"), "{raw}");
@@ -450,6 +469,10 @@ fn a_dispute_changes_nothing_the_next_response_shows() {
     let after = env.next();
     assert_eq!(after, before);
     assert_eq!(after["state"], "work");
+    // fmt ran twice before the dispute; the dispute names the second run.
+    let payload = &env.events("finding_disputed")[0]["payload"];
+    assert_eq!(payload["attempt"], 2, "{payload}");
+    assert_eq!(payload["visit_attempt"], 2, "{payload}");
 }
 
 #[test]

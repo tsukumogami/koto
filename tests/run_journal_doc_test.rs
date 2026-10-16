@@ -454,7 +454,15 @@ fn the_check_lifecycle_attributes_collide_with_no_other_attribute() {
     }
     // The two `check_evaluated` additions sit under `koto.check` beside
     // that kind's other `koto.check.*` fields, so they add no new shape.
-    for new in ["koto.check.finding_count", "koto.check.findings_truncated"] {
+    // `koto.check.name` is the path an exporter that nests dotted names
+    // gives `check_evaluated`'s scalar `koto.check`; `check_finding` and
+    // `check_disputed` write it so joins read one path, and carry no scalar
+    // `koto.check` of their own.
+    for new in [
+        "koto.check.finding_count",
+        "koto.check.findings_truncated",
+        "koto.check.name",
+    ] {
         assert!(written.contains(new), "{SOURCE_DIR} never writes {new}");
     }
 }

@@ -27,7 +27,9 @@ use anyhow::Result;
 use clap::{Subcommand, ValueEnum};
 
 use crate::engine::persistence::{derive_machine_state, derive_state_from_log};
-use crate::engine::types::{now_iso8601, Event, EventPayload, FindingDispute, StateFileHeader};
+use crate::engine::types::{
+    now_iso8601, CheckEventFields, Event, EventPayload, FindingDispute, StateFileHeader,
+};
 use crate::session::SessionBackend;
 use crate::template::types::ACTION_CONDITION_NAME;
 
@@ -126,23 +128,29 @@ fn fail(code: i32, message: String) -> ! {
     );
 }
 
-/// Whether `events` hold a settled evaluation of `gate` in `state`: a
-/// `gate_evaluated` with an outcome other than `pending` for a gate, a
-/// `default_action_executed` for `__action__`, anywhere in the log. A
-/// pending evaluation (a polling gate still waiting, a decider check
-/// waiting on the agent) judged nothing, so there is nothing to dispute.
-pub(crate) fn gate_evaluated_in(events: &[Event], state: &str, gate: &str) -> bool {
-    events.iter().any(|e| match &e.payload {
+/// The check fields of the most recent settled evaluation of `gate` in
+/// `state`, the one a dispute names: a `gate_evaluated` with an outcome
+/// other than `pending` for a gate, a `default_action_executed` for
+/// `__action__`, anywhere in the log. `None` when there is none. A pending
+/// evaluation (a polling gate still waiting, a decider check waiting on the
+/// agent) judged nothing, so there is nothing to dispute.
+pub(crate) fn disputed_evaluation<'e>(
+    events: &'e [Event],
+    state: &str,
+    gate: &str,
+) -> Option<&'e CheckEventFields> {
+    events.iter().rev().find_map(|e| match &e.payload {
         EventPayload::GateEvaluated {
             state: s,
             gate: g,
             outcome,
+            check,
             ..
-        } => s == state && g == gate && outcome != PENDING_OUTCOME,
-        EventPayload::DefaultActionExecuted { state: s, .. } => {
-            gate == ACTION_CONDITION_NAME && s == state
-        }
-        _ => false,
+        } if s == state && g == gate && outcome != PENDING_OUTCOME => Some(check),
+        EventPayload::DefaultActionExecuted {
+            state: s, check, ..
+        } if gate == ACTION_CONDITION_NAME && s == state => Some(check),
+        _ => None,
     })
 }
 
@@ -240,7 +248,7 @@ fn handle_record(
         }),
     };
 
-    if !gate_evaluated_in(&events, &state, &gate) {
+    let Some(evaluation) = disputed_evaluation(&events, &state, &gate) else {
         refuse(
             GATE_NOT_EVALUATED,
             format!(
@@ -252,7 +260,8 @@ fn handle_record(
             &gate,
             Some(&state),
         );
-    }
+    };
+    let (attempt, visit_attempt) = (evaluation.attempt, evaluation.visit_attempt);
 
     let redactor = redactor_for(backend, &name, &header, &events);
     let (reason, _) = crate::redact::redact_str(&reason, &redactor).cut_bytes(REASON_MAX_BYTES);
@@ -263,6 +272,8 @@ fn handle_record(
         rule_id: rule,
         reason: reason.into_string(),
         source: by.as_str().to_string(),
+        attempt,
+        visit_attempt,
     });
     if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
         fail(1, e.to_string());
@@ -289,6 +300,27 @@ mod tests {
         }
     }
 
+    fn found(events: &[Event], state: &str, gate: &str) -> bool {
+        disputed_evaluation(events, state, gate).is_some()
+    }
+
+    fn gate_with(outcome: &str, attempt: Option<u64>, visit_attempt: Option<u64>) -> Event {
+        event(EventPayload::GateEvaluated {
+            state: "ci".into(),
+            gate: "ci".into(),
+            output: serde_json::json!({}),
+            outcome: outcome.into(),
+            timestamp: now_iso8601(),
+            check: CheckEventFields {
+                attempt,
+                visit_attempt,
+                ..Default::default()
+            },
+            streams: None,
+            poll: None,
+        })
+    }
+
     #[test]
     fn an_evaluation_of_the_gate_in_the_state_is_found_and_no_other() {
         let gate = event(EventPayload::GateEvaluated {
@@ -311,11 +343,11 @@ mod tests {
             check: Default::default(),
         });
         let events = vec![gate, action];
-        assert!(gate_evaluated_in(&events, "build", "lint"));
-        assert!(!gate_evaluated_in(&events, "ship", "lint"));
-        assert!(!gate_evaluated_in(&events, "build", "test"));
-        assert!(gate_evaluated_in(&events, "ship", ACTION_CONDITION_NAME));
-        assert!(!gate_evaluated_in(&events, "build", ACTION_CONDITION_NAME));
+        assert!(found(&events, "build", "lint"));
+        assert!(!found(&events, "ship", "lint"));
+        assert!(!found(&events, "build", "test"));
+        assert!(found(&events, "ship", ACTION_CONDITION_NAME));
+        assert!(!found(&events, "build", ACTION_CONDITION_NAME));
     }
 
     #[test]
@@ -333,11 +365,28 @@ mod tests {
             })
         };
         let pending_only = vec![gate("pending"), gate("pending")];
-        assert!(!gate_evaluated_in(&pending_only, "ci", "ci"));
+        assert!(!found(&pending_only, "ci", "ci"));
         for settled in ["passed", "failed", "timed_out", "error"] {
             let events = vec![gate("pending"), gate(settled)];
-            assert!(gate_evaluated_in(&events, "ci", "ci"), "{settled}");
+            assert!(found(&events, "ci", "ci"), "{settled}");
         }
+    }
+
+    /// The dispute names the most recent settled evaluation: a later pending
+    /// one is skipped, and an evaluation from before attempt numbers gives
+    /// none.
+    #[test]
+    fn the_disputed_evaluation_is_the_latest_settled_one() {
+        let events = vec![
+            gate_with("failed", Some(1), Some(1)),
+            gate_with("failed", Some(2), Some(2)),
+            gate_with("pending", None, None),
+        ];
+        let e = disputed_evaluation(&events, "ci", "ci").unwrap();
+        assert_eq!((e.attempt, e.visit_attempt), (Some(2), Some(2)));
+        let old = vec![gate_with("passed", None, None)];
+        let e = disputed_evaluation(&old, "ci", "ci").unwrap();
+        assert_eq!((e.attempt, e.visit_attempt), (None, None));
     }
 
     #[test]

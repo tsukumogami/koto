@@ -690,7 +690,7 @@ fn check_kind_fields(kind: &str) -> &'static [&'static str] {
         ],
         "check_finding" => &[
             "koto.state",
-            "koto.check",
+            "koto.check.name",
             "koto.attempt",
             "koto.visit_attempt",
             "koto.rule.id",
@@ -699,7 +699,9 @@ fn check_kind_fields(kind: &str) -> &'static [&'static str] {
         ],
         "check_disputed" => &[
             "koto.state",
-            "koto.check",
+            "koto.check.name",
+            "koto.attempt",
+            "koto.visit_attempt",
             "koto.rule.id",
             "koto.dispute.source",
         ],
@@ -3692,7 +3694,8 @@ fn a_passing_gate_writes_one_check_finding_per_rule_and_level_and_no_check_rule(
         assert_eq!(r["koto.seq"], c[0]["koto.seq"], "{r}");
         assert_eq!(r["koto.visit.seq"], c[0]["koto.visit.seq"], "{r}");
         assert_eq!(r["koto.state"], "a");
-        assert_eq!(r["koto.check"], "lint");
+        assert_eq!(r["koto.check.name"], "lint");
+        assert!(r.get("koto.check").is_none(), "{r}");
         assert_eq!(r["koto.attempt"], 3);
         assert_eq!(r["koto.visit_attempt"], 2);
     }
@@ -3821,7 +3824,7 @@ fn more_pairs_than_the_record_cap_write_fifty_by_level() {
     assert_eq!(&levels[30..], &["info"; 20]);
     assert_eq!(found[10]["koto.rule.id"], "W00");
     assert_eq!(found[49]["koto.rule.id"], "I19");
-    assert!(found.iter().all(|r| r["koto.check"] == "__action__"));
+    assert!(found.iter().all(|r| r["koto.check.name"] == "__action__"));
     assert_eq!(c[0]["koto.check.finding_count"], 65);
 }
 
@@ -3900,12 +3903,25 @@ fn finding_records_digest_odd_rule_ids_and_follow_their_evaluations_attempts() {
 }
 
 fn dispute(state: &str, gate: &str, rule_id: &str, source: &str) -> EventPayload {
+    disputed_attempt(state, gate, rule_id, source, Some(2), Some(1))
+}
+
+fn disputed_attempt(
+    state: &str,
+    gate: &str,
+    rule_id: &str,
+    source: &str,
+    attempt: Option<u64>,
+    visit_attempt: Option<u64>,
+) -> EventPayload {
     EventPayload::FindingDisputed(crate::engine::types::FindingDispute {
         state: state.into(),
         gate: gate.into(),
         rule_id: rule_id.into(),
         reason: "PLANTED-REASON the rule misreads generated code".into(),
         source: source.into(),
+        attempt,
+        visit_attempt,
     })
 }
 
@@ -3932,13 +3948,72 @@ fn a_dispute_relays_check_disputed_without_its_reason() {
     assert_eq!(c[0]["koto.seq"], 3);
     assert_eq!(c[0]["koto.visit.seq"], 2);
     assert_eq!(c[0]["koto.state"], "a");
-    assert_eq!(c[0]["koto.check"], "lint");
+    assert_eq!(c[0]["koto.check.name"], "lint");
+    assert_eq!(c[0]["koto.attempt"], 2);
+    assert_eq!(c[0]["koto.visit_attempt"], 1);
     assert_eq!(c[0]["koto.rule.id"], "E501");
     assert_eq!(c[0]["koto.dispute.source"], "agent");
     let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
     for absent in ["PLANTED", "reason", "misreads"] {
         assert!(!raw.contains(absent), "{absent} in {raw}");
     }
+}
+
+/// A dispute carries the disputed evaluation's attempt numbers, so it joins
+/// to exactly that `check_evaluated` (same state, `koto.check` equal to its
+/// `koto.check.name`, same attempt) and not to the gate's other attempts. A
+/// dispute of an evaluation from before attempt numbers leaves them out.
+#[test]
+fn a_dispute_joins_the_evaluation_it_names_by_attempt() {
+    let f = session_in_a();
+    for attempt in 1..=3 {
+        commit_as(
+            &f,
+            None,
+            "wf",
+            &gate_event(
+                "a",
+                "lint",
+                "failed",
+                command_output(1),
+                stamped(attempt, attempt, None),
+                None,
+            ),
+        );
+    }
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &disputed_attempt("a", "lint", "E501", "agent", Some(2), Some(2)),
+    );
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &disputed_attempt("a", "lint", "E501", "person", None, None),
+    );
+    let c = check_records(&f.journal());
+    let disputes: Vec<&serde_json::Value> =
+        c.iter().filter(|r| r["kind"] == "check_disputed").collect();
+    assert_eq!(disputes.len(), 2);
+    let d = disputes[0];
+    let joined: Vec<&serde_json::Value> = c
+        .iter()
+        .filter(|r| {
+            r["kind"] == "check_evaluated"
+                && r["koto.state"] == d["koto.state"]
+                && r["koto.check"] == d["koto.check.name"]
+                && r["koto.attempt"] == d["koto.attempt"]
+                && r["koto.visit_attempt"] == d["koto.visit_attempt"]
+        })
+        .collect();
+    assert_eq!(joined.len(), 1, "{joined:?}");
+    assert_eq!(joined[0]["koto.attempt"], 2);
+    let old = disputes[1];
+    assert!(old.get("koto.attempt").is_none(), "{old}");
+    assert!(old.get("koto.visit_attempt").is_none(), "{old}");
+    assert_eq!(old["koto.dispute.source"], "person");
 }
 
 /// With the longest names koto keeps (a 255-byte session name, 128-byte
@@ -3989,7 +4064,14 @@ fn finding_and_dispute_records_fit_the_line_cap_at_the_longest_names() {
         &relay,
     );
     records.extend(relayed(
-        &dispute(&state, &gate, &"r".repeat(128), &level),
+        &disputed_attempt(
+            &state,
+            &gate,
+            &"r".repeat(128),
+            &level,
+            Some(u64::MAX),
+            Some(u64::MAX),
+        ),
         &relay,
     ));
     let lines: Vec<String> = records.iter().map(Record::to_line).collect();
@@ -4004,7 +4086,10 @@ fn finding_and_dispute_records_fit_the_line_cap_at_the_longest_names() {
     let c = check_records(&parsed);
     assert_eq!(c[0]["koto.check.findings_truncated"], true);
     assert_eq!(c[51]["koto.finding.level"], level.as_str());
+    assert_eq!(c[51]["koto.check.name"], gate.as_str());
     assert_eq!(c[51]["koto.finding.count"], 1);
     assert_eq!(c[101]["koto.rule.id"], "r".repeat(128));
     assert_eq!(c[101]["koto.dispute.source"], level.as_str());
+    assert_eq!(c[101]["koto.check.name"], gate.as_str());
+    assert_eq!(c[101]["koto.attempt"], u64::MAX);
 }

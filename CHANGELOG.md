@@ -13,15 +13,18 @@ to `0.9.x`).
 - **The run journal records every finding a check logs, passing or
   failing.** Each check evaluation now adds one `check_finding` line per
   distinct rule id and level among the findings its event logged, with how
-  many findings had that pair, the state, the check and the attempt numbers.
+  many findings had that pair, the state, the check (as `koto.check.name`,
+  the path a tool that nests dotted names gives `check_evaluated`'s
+  `koto.check`) and the attempt numbers.
   Error pairs come first, then warnings, then info, at most 50 lines per
   evaluation, in the same write as the evaluation's `check_evaluated`.
   `check_evaluated` gains `koto.check.finding_count`, always written (0
   included), and `koto.check.findings_truncated` when the check reported
   more findings than its event kept. `check_rule` is unchanged: it still
   counts the error rules of failing checks only. A dispute adds a
-  `check_disputed` line with the state, gate, rule id and who disputed it,
-  never the reason. The line format stays at version 1, and tools that send
+  `check_disputed` line with the state, the gate as `koto.check.name`, the
+  disputed evaluation's attempt numbers (so it joins to exactly that
+  evaluation), the rule id and who disputed it, never the reason. The line format stays at version 1, and tools that send
   journal lines off the host see the new kinds without a format change.
 
 - **A passing check's warnings reach the agent as `advisories`.** When a
@@ -38,7 +41,8 @@ to `0.9.x`).
   it.** `koto disputes record <session> --gate <gate> --rule <rule-id>
   --reason <text> [--state <state>] [--by agent|person]` appends one
   `finding_disputed` event naming the state (the current one by default),
-  gate, rule id, reason and source, and prints `{"status":"recorded"}`. The
+  gate, rule id, reason and source, and the disputed evaluation's attempt
+  numbers, and prints `{"status":"recorded"}`. The
   gate must have a settled evaluation logged in that state (a polling gate
   that has only answered pending doesn't count); the rule needn't have a
   logged finding. The reason goes through koto's known-credential redaction

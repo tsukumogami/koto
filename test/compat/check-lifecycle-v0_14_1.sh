@@ -45,13 +45,14 @@ REASON="the file is generated; the whitespace is upstream's"
 # Events the session must leave in its log, as "label|jq filter".
 EVENT_CHECKS=(
   'passing gate with a warning|.type? == "gate_evaluated" and .payload.gate == "style" and .payload.outcome == "passed" and (.payload.findings // [] | map(select(.rule_id == "W291" and .level == "warning")) | length) == 1'
-  'dispute of an earlier state|.type? == "finding_disputed" and .payload.state == "lint" and .payload.gate == "style" and .payload.rule_id == "W291" and .payload.source == "agent" and (.payload.reason // "" | length) > 0'
+  'dispute of an earlier state|.type? == "finding_disputed" and .payload.state == "lint" and .payload.gate == "style" and .payload.rule_id == "W291" and .payload.source == "agent" and .payload.attempt == 1 and .payload.visit_attempt == 1 and (.payload.reason // "" | length) > 0'
 )
 
 # Fields the change relies on, as "field|jq filter selecting the events".
 STRIPPED_FIELDS=(
   'findings|.type? == "gate_evaluated"'
   'source|.type? == "finding_disputed"'
+  'attempt|.type? == "finding_disputed"'
 )
 
 fail() {
@@ -181,11 +182,11 @@ NEW_STATE="$(new_koto status wf | jq -er '.current_state')" || fail "session: ko
 # The run journal relays the finding and the dispute, never the reason.
 JOURNAL="$HOME_DIR/.koto/_run_journal.jsonl"
 [ -f "$JOURNAL" ] || fail "journal: $JOURNAL was not written"
-jq -se '[.[] | select(.kind == "check_finding" and .["koto.check"] == "style" and .["koto.rule.id"] == "W291" and .["koto.finding.level"] == "warning" and .["koto.finding.count"] == 1)] | length == 1' "$JOURNAL" >/dev/null \
+jq -se '[.[] | select(.kind == "check_finding" and .["koto.check.name"] == "style" and .["koto.rule.id"] == "W291" and .["koto.finding.level"] == "warning" and .["koto.finding.count"] == 1)] | length == 1' "$JOURNAL" >/dev/null \
   || fail "journal: no check_finding for style's warning"
 jq -se '[.[] | select(.kind == "check_evaluated" and .["koto.check"] == "style" and .["koto.check.finding_count"] == 2)] | length == 1' "$JOURNAL" >/dev/null \
   || fail "journal: style's check_evaluated doesn't count its two findings"
-jq -se '[.[] | select(.kind == "check_disputed" and .["koto.state"] == "lint" and .["koto.check"] == "style" and .["koto.rule.id"] == "W291" and .["koto.dispute.source"] == "agent")] | length == 1' "$JOURNAL" >/dev/null \
+jq -se '[.[] | select(.kind == "check_disputed" and .["koto.state"] == "lint" and .["koto.check.name"] == "style" and .["koto.attempt"] == 1 and .["koto.visit_attempt"] == 1 and .["koto.rule.id"] == "W291" and .["koto.dispute.source"] == "agent")] | length == 1' "$JOURNAL" >/dev/null \
   || fail "journal: no check_disputed for the dispute"
 if grep -q "generated" "$JOURNAL"; then
   fail "journal: the dispute's reason reached the journal"

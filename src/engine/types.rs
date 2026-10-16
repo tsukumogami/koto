@@ -778,6 +778,15 @@ pub struct FindingDispute {
     pub reason: String,
     /// Who disputed it.
     pub source: String,
+    /// The disputed evaluation's session attempt number: that of the most
+    /// recent settled evaluation of `gate` in `state`. Absent when that
+    /// evaluation predates attempt numbers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u64>,
+    /// The disputed evaluation's attempt number within its visit, under the
+    /// same rule as `attempt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visit_attempt: Option<u64>,
 }
 
 /// The leading bytes of a failed command gate's streams, as
