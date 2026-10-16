@@ -18,6 +18,8 @@
 //! been handled, the way another writer racing the command would.
 //! [`FakeS3::set_latency`] holds every reply for a fixed time, so a test can
 //! see what a command's round trips cost against a distant bucket.
+//! [`FakeS3::hold`] holds one request's reply after handling it, so a test
+//! can stop the command waiting on it at that exact point.
 //!
 //! Authentication is ignored. A missing object or bucket answers 404 with an
 //! S3 XML error body, as a real endpoint does. Each connection is read and
@@ -71,12 +73,20 @@ struct Trigger {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct Hold {
+    method: String,
+    key: String,
+    duration: Duration,
+}
+
 #[derive(Debug, Default)]
 struct State {
     objects: BTreeMap<String, Vec<u8>>,
     requests: Vec<Request>,
     faults: Vec<Fault>,
     triggers: Vec<Trigger>,
+    holds: Vec<Hold>,
     latency: Duration,
     shutdown: bool,
 }
@@ -202,6 +212,18 @@ impl FakeS3 {
             key: key.to_string(),
             put_key: put_key.to_string(),
             bytes: bytes.to_vec(),
+        });
+    }
+
+    /// Once, when the next `method` request for exactly `key` has been
+    /// handled (a PUT's object stored), hold its reply for `duration`: the
+    /// command that sent it waits there, with the request's effect already
+    /// in the bucket.
+    pub fn hold(&self, method: &str, key: &str, duration: Duration) {
+        lock(&self.state).holds.push(Hold {
+            method: method.to_string(),
+            key: key.to_string(),
+            duration,
         });
     }
 
@@ -332,11 +354,29 @@ fn serve(stream: TcpStream, bucket: &str, state: &Mutex<State>) {
     // Before the reply goes out, so the client's next request already
     // sees what the trigger stored.
     fire_triggers(&req, bucket, state);
+    if let Some(hold) = take_hold(&req, bucket, state) {
+        thread::sleep(hold);
+    }
     let latency = lock(state).latency;
     if !latency.is_zero() {
         thread::sleep(latency);
     }
     write_reply(stream, &req.method, &reply);
+}
+
+/// Forget, and return, the first hold `req` matches.
+fn take_hold(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Option<Duration> {
+    let rest = req.path.strip_prefix('/').unwrap_or(&req.path);
+    let key = match rest.split_once('/') {
+        Some((b, k)) if b == bucket => k,
+        _ => return None,
+    };
+    let mut st = lock(state);
+    let at = st
+        .holds
+        .iter()
+        .position(|h| h.method == req.method && h.key == key)?;
+    Some(st.holds.remove(at).duration)
 }
 
 /// Run, and forget, the triggers `req` matches.

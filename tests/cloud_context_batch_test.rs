@@ -155,7 +155,13 @@ impl Host {
 
     /// A koto with nothing inherited from the test process.
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::cargo_bin("koto").unwrap();
+        Command::from_std(self.std_cmd(args))
+    }
+
+    /// [`Host::cmd`] as a `std` command, for a test that spawns koto and
+    /// stops it part way.
+    fn std_cmd(&self, args: &[&str]) -> std::process::Command {
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("koto"));
         cmd.env_clear()
             .current_dir(&self.ws)
             .env("PATH", format!("{}:{}", koto_dir().display(), SYSTEM_PATH))
@@ -723,4 +729,199 @@ fn the_local_backend_keeps_no_batch() {
     );
     assert!(!session.join("cloud-batch.jsonl").exists());
     assert!(!session.join("cloud-batch.lock").exists());
+}
+
+/// Poll `ready` until it holds, for at most `limit`.
+fn wait_for(limit: Duration, what: &str, ready: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !ready() {
+        assert!(started.elapsed() < limit, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Kill `pid`, a process this test's own action started, and wait until it
+/// is gone.
+fn kill_and_reap(pid: libc::pid_t) {
+    // SAFETY: plain syscalls on one pid, read from the action's pid file.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    wait_for(Duration::from_secs(10), "the killed write to exit", || {
+        // A zombie still answers; the action's shell reaps it.
+        unsafe { libc::kill(pid, 0) != 0 }
+    });
+}
+
+/// An action whose one context write runs in the background, with its PID
+/// in `pid_file`, so the test can stop it part way.
+fn background_write(pid_file: &Path) -> String {
+    format!(
+        "printf one > one.txt\nkoto context add {NAME} one.md < one.txt &\necho $! > {}\nwait",
+        pid_file.display()
+    )
+}
+
+/// A `koto context` call killed after the batch-open marker reached the
+/// bucket and before its journal was opened used to leave the marker with
+/// nothing on its host that would push or close it, and every import
+/// refused until some later batch came along (koto#381). The call now
+/// writes an opening file before the marker, and the next koto command on
+/// that host clears both, so the import goes through, without the write
+/// that never happened.
+#[test]
+fn a_write_killed_between_marker_and_journal_is_cleared_by_the_next_command() {
+    let s3 = FakeS3::start(BUCKET);
+    let a = Host::new(&s3);
+    let pid_file = a.ws.join("write.pid");
+    a.init(&background_write(&pid_file));
+    assert!(a.add("base.md", b"base").ok());
+
+    // The write stops with the marker stored and its reply held back.
+    let marker = a.key("batch-open.json");
+    s3.hold("PUT", &marker, Duration::from_secs(120));
+    let mut tick = a
+        .std_cmd(&["next", NAME])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for(Duration::from_secs(60), "the marker PUT", || {
+        s3.object(&marker).is_some()
+            && std::fs::read_to_string(&pid_file).is_ok_and(|p| p.ends_with('\n'))
+    });
+    let write: libc::pid_t = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The tick first, so its exit flush can't run; then the write.
+    tick.kill().unwrap();
+    tick.wait().unwrap();
+    kill_and_reap(write);
+
+    assert!(s3.object(&marker).is_some());
+    assert!(a.session_dir().join("cloud-batch.opening").exists());
+    assert!(!a.session_dir().join("cloud-batch.jsonl").exists());
+    let b = Host::new(&s3);
+    let ws = a.ws.to_string_lossy().into_owned();
+    let import = || b.koto(&["session", "import", NAME, "--from", &ws, "--trust-template"]);
+    let out = import();
+    assert_eq!(
+        out.json()["error"]["code"],
+        "import_source_unpushed",
+        "{}",
+        out.describe()
+    );
+
+    let out = a.koto(&["status", NAME]);
+    assert!(out.ok(), "status: {}", out.describe());
+    assert!(s3.object(&marker).is_none());
+    assert!(!a.session_dir().join("cloud-batch.opening").exists());
+    assert!(!a.session_dir().join("cloud-batch.jsonl").exists());
+    let keys = assert_remote_consistent(&s3, &a);
+    assert_eq!(keys, vec!["base.md".to_string()]);
+
+    let out = import();
+    assert!(out.ok(), "import: {}", out.describe());
+    let out = b.koto(&["context", "get", NAME, "base.md"]);
+    assert_eq!(out.stdout, "base", "{}", out.describe());
+    assert_eq!(b.koto(&["context", "exists", NAME, "one.md"]).code, Some(1));
+}
+
+/// The clearing waits on the batch lock, which a live process opening the
+/// batch holds: a command run while the write still waits on its marker
+/// PUT leaves the marker to it, and the batch it opens is flushed whole,
+/// its content before the marker's DELETE.
+#[test]
+fn a_batch_a_live_write_is_opening_is_left_to_it() {
+    let s3 = FakeS3::start(BUCKET);
+    let a = Host::new(&s3);
+    let pid_file = a.ws.join("write.pid");
+    a.init(&background_write(&pid_file));
+    assert!(a.add("base.md", b"base").ok());
+
+    let marker = a.key("batch-open.json");
+    // Long enough for `koto status` to start and reach the lock while the
+    // write still waits; the test waits it out either way.
+    s3.hold("PUT", &marker, Duration::from_secs(5));
+    let tick = a
+        .std_cmd(&["next", NAME])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(Duration::from_secs(60), "the marker PUT", || {
+        s3.object(&marker).is_some()
+    });
+    s3.clear_requests();
+    let out = a.koto(&["status", NAME]);
+    assert!(out.ok(), "status: {}", out.describe());
+    // `status` waited on the lock for the write and then flushed (or waited
+    // for the tick's flush): a status that cleared the marker without
+    // waiting would return while the write was still held.
+    assert!(
+        s3.object(&a.key("ctx/one.md")).is_some(),
+        "status returned before the write it should have waited for"
+    );
+    let out = Host::out(tick.wait_with_output().unwrap());
+    assert!(out.ok(), "next: {}", out.describe());
+    assert_eq!(out.json()["state"], "wait", "{}", out.describe());
+
+    let requests: Vec<String> = s3.requests().iter().map(describe).collect();
+    let content = requests
+        .iter()
+        .position(|r| r.starts_with("PUT ") && r.ends_with("/ctx/one.md"))
+        .unwrap_or_else(|| panic!("the write was never pushed: {:#?}", requests));
+    let first_delete = requests
+        .iter()
+        .position(|r| r == &format!("DELETE {}", marker))
+        .unwrap_or_else(|| panic!("the marker was never deleted: {:#?}", requests));
+    assert!(
+        content < first_delete,
+        "the marker went before the write it marks: {:#?}",
+        requests
+    );
+    assert!(s3.object(&marker).is_none());
+    let keys = assert_remote_consistent(&s3, &a);
+    assert_eq!(keys, vec!["base.md".to_string(), "one.md".to_string()]);
+}
+
+/// A batch whose first write couldn't save its version increment still
+/// counts as a change on this host: when another host pushes while the
+/// batch is open, the flush refuses with the conflict and leaves the bucket
+/// alone, instead of reading the remote as newer and writing over it
+/// (koto#381).
+#[test]
+fn a_failed_first_version_save_still_flushes_into_a_conflict() {
+    // SAFETY: a plain syscall with no arguments.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root writes a read-only version file anyway");
+        return;
+    }
+    let other = br#"{"version":9,"last_sync_base":9,"machine_id":"otherhost"}"#;
+    let s3 = FakeS3::start(BUCKET);
+    let a = Host::new(&s3);
+    let version_path = a.session_dir().join("version.json");
+    a.init(&format!(
+        "set -e\nchmod a-w {v}\nprintf one | koto context add {NAME} one.md\nchmod u+w {v}",
+        v = version_path.display()
+    ));
+    assert!(a.add("base.md", b"base").ok());
+    let before = std::fs::read(&version_path).unwrap();
+
+    // Another host pushes right after the batch's first write checked.
+    s3.put_after("GET", &a.key("version.json"), &a.key("version.json"), other);
+    let out = a.next();
+    assert!(
+        out.stderr.contains("session conflict"),
+        "{}",
+        out.describe()
+    );
+    // The first write's save did fail: the local version never moved.
+    assert_eq!(std::fs::read(&version_path).unwrap(), before);
+    assert!(s3.object(&a.key("ctx/one.md")).is_none());
+    assert_eq!(s3.object(&a.key("version.json")).unwrap(), other);
+    assert!(s3.object(&a.key("batch-open.json")).is_some());
+    assert!(a.session_dir().join("cloud-batch.jsonl").exists());
 }

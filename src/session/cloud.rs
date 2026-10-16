@@ -53,6 +53,17 @@ pub(crate) const TEMPLATE_OBJECT: &str = "template.json";
 /// those writes.
 pub(crate) const BATCH_MARKER: &str = "batch-open.json";
 
+/// Nanoseconds since the Unix epoch, which sets one writer's batch-open
+/// marker apart from another's ([`CloudBackend::clear_unopened_batch`]
+/// deletes only a marker whose bytes it wrote).
+fn marker_nonce() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Per-child outcome emitted by [`CloudBackend::reconcile_child`].
 ///
 /// Each variant corresponds to a concrete action or a refusal, and is
@@ -489,6 +500,9 @@ impl CloudBackend {
         if self.journal(id).is_open() {
             return self.flush_batch(id);
         }
+        // No batch is open, so this push goes up on its own; a marker a
+        // stopped opener left would still make imports refuse.
+        self.try_clear_unopened_batch(id);
         let state_path = self.local.session_dir(id).join(state_file_name(id));
         if !state_path.exists() {
             // Nothing to push; mirrors the old no-op behavior. Callers
@@ -569,12 +583,17 @@ impl CloudBackend {
     /// copy is the bucket's; a flush that fails leaves the local copy as it
     /// is, and refuses when the failure is a migration marker or a version
     /// conflict.
+    ///
+    /// A batch begun and never opened (its process killed, or its marker
+    /// PUT failed) is cleared first ([`CloudBackend::clear_unopened_batch`]):
+    /// the only requests a pull adds, and only when such a batch is there.
     fn sync_pull_state(&self, id: &str) -> anyhow::Result<()> {
         if self.defers(id) {
             return Ok(());
         }
         let own_tick =
             reentrancy::is_tick_process() && reentrancy::enclosing_tick().as_deref() == Some(id);
+        self.try_clear_unopened_batch(id);
         if self.journal(id).is_open() {
             match self.flush_pending(id) {
                 Ok(()) => {}
@@ -1230,6 +1249,17 @@ impl CloudBackend {
     /// write isn't deferred after all and pushes at once: the session has
     /// no local directory, or the marker couldn't be written, and a batch
     /// an import can't see must not be opened.
+    ///
+    /// The opening file, holding the marker's bytes, goes to disk before the
+    /// marker goes to the bucket, and gives way to the journal only after,
+    /// so a process killed between the two leaves this host something to
+    /// find ([`CloudBackend::clear_unopened_batch`]). A marker PUT that
+    /// fails leaves the opening file too: the PUT may have landed with its
+    /// reply lost, and the next command deletes it if it did. That delete
+    /// tells this writer's marker from another's by its bytes, so the marker
+    /// carries the writer's pid and a nanosecond nonce beside its
+    /// one-second `opened_at`: two writers would have to share a pid and a
+    /// nanosecond to collide.
     fn open_batch(&self, id: &str) -> anyhow::Result<Option<(Journal, BatchLock)>> {
         let journal = self.journal(id);
         let Some(lock) = journal.lock()? else {
@@ -1242,8 +1272,12 @@ impl CloudBackend {
         let marker = serde_json::json!({
             "session": id,
             "opened_at": crate::engine::types::now_iso8601(),
-        });
-        if let Err(e) = self.put_object(&self.batch_marker_key(id), marker.to_string().as_bytes()) {
+            "pid": std::process::id(),
+            "nonce": marker_nonce(),
+        })
+        .to_string();
+        journal.begin(&lock, marker.as_bytes())?;
+        if let Err(e) = self.put_object(&self.batch_marker_key(id), marker.as_bytes()) {
             eprintln!(
                 "warning: cloud sync: couldn't mark a batch open, so this write is pushed at once: \
                  {:#}",
@@ -1255,9 +1289,60 @@ impl CloudBackend {
         Ok(Some((journal, lock)))
     }
 
+    /// Clear what a process that stopped while it opened `id`'s batch left
+    /// (killed, or given up after its marker PUT failed): an opening file
+    /// with no journal, and the batch-open marker it may have put in the
+    /// bucket, which would make every import refuse with nothing on this
+    /// host to flush it (koto#381). A no-op without an opening file, which
+    /// costs a `stat`; with one, a listing, a GET and a DELETE at most.
+    ///
+    /// Only under the batch lock, which the opening process held from the
+    /// opening file to the journal and lost when it stopped: a live process
+    /// still opening the batch makes this wait, and then finds a journal and
+    /// leaves the batch to the flush. The caller must not hold the lock
+    /// itself. The marker is deleted only when it has the bytes the opening
+    /// file holds; any other marker at the key was written since, by
+    /// another process or host, and is left to it. The marker goes first,
+    /// so a failed request keeps the opening file for the next command to
+    /// retry.
+    fn clear_unopened_batch(&self, id: &str) -> anyhow::Result<()> {
+        let journal = self.journal(id);
+        if !journal.is_opening() {
+            return Ok(());
+        }
+        let Some(lock) = journal.lock()? else {
+            return Ok(());
+        };
+        if !journal.is_opening() {
+            return Ok(());
+        }
+        let Some(ours) = journal.opening_marker()? else {
+            return Ok(());
+        };
+        let key = self.batch_marker_key(id);
+        let in_bucket = self
+            .get_object_if_present(&key)
+            .with_context(|| format!("reading the batch-open marker of '{}'", id))?;
+        if in_bucket.as_deref() == Some(ours.as_slice()) {
+            self.bucket
+                .delete_object(&key)
+                .with_context(|| format!("deleting the batch-open marker of '{}'", id))?;
+        }
+        journal.abandon(&lock)
+    }
+
+    /// [`CloudBackend::clear_unopened_batch`] for a caller with its own work
+    /// to do whatever happens: a failure is a warning.
+    fn try_clear_unopened_batch(&self, id: &str) {
+        if let Err(e) = self.clear_unopened_batch(id) {
+            eprintln!("warning: cloud sync: {:#}", e);
+        }
+    }
+
     /// Push everything an open batch of `id` owes the bucket, then close it.
-    /// A no-op with no batch open, and in a command a tick on `id` runs,
-    /// whose batch is the tick's to flush.
+    /// A no-op in a command a tick on `id` runs, whose batch is the tick's
+    /// to flush. With no batch open there is nothing to push, and the only
+    /// work is clearing a batch begun and never opened, if one is there.
     ///
     /// The bucket is asked first, uncached, whether `id` was imported
     /// elsewhere while the batch was open (a marker refuses) and whether
@@ -1284,6 +1369,9 @@ impl CloudBackend {
 
         let journal = self.journal(id);
         if !journal.is_open() {
+            // Nothing is owed: a marker this can't delete yet is a warning,
+            // and the opening file stays for the next command.
+            self.try_clear_unopened_batch(id);
             return Ok(());
         }
         let Some(lock) = journal.lock()? else {
@@ -1300,6 +1388,17 @@ impl CloudBackend {
 
         let version_path = self.local_version_path(id);
         let mut local = self.load_or_create_local_version(id)?;
+        // An open batch holds writes the bucket lacks, so this side moved
+        // past its base whether or not the batch's first write got its
+        // increment to disk (reading or saving the local version can fail
+        // there, and that is only a warning). Counted before the check, a
+        // remote that also moved reads as the conflict it is rather than as
+        // a newer copy, which this push would write over (koto#381). Saved
+        // once the check passes.
+        let unsaved_increment = local.version == local.last_sync_base;
+        if unsaved_increment {
+            local.version += 1;
+        }
         let remote = self.read_remote_version(id)?;
         if let SyncCheck::Conflict {
             local_version,
@@ -1318,11 +1417,7 @@ impl CloudBackend {
                 )
             );
         }
-        // The batch's first write increments the version; its check may
-        // have been skipped (the bucket unreachable then), so the push
-        // still carries a version past the base.
-        if local.version == local.last_sync_base {
-            local.version += 1;
+        if unsaved_increment {
             local.save(&version_path)?;
         }
 
@@ -1392,10 +1487,12 @@ impl CloudBackend {
     /// Drop `id`'s open batch without pushing it, once `koto session
     /// resolve` has replaced one side with the other wholesale. The marker
     /// goes first: a failed delete leaves the batch open, so the next flush
-    /// deletes it.
+    /// deletes it. With no batch open, clears a batch begun and never
+    /// opened, if one is there.
     fn discard_batch(&self, id: &str) -> anyhow::Result<()> {
         let journal = self.journal(id);
         if !journal.is_open() {
+            self.try_clear_unopened_batch(id);
             return Ok(());
         }
         let Some(lock) = journal.lock()? else {
@@ -4031,7 +4128,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{
         cloud_backend_at, header_of, list_body, listing_prefix, seed_session, serve,
-        state_key_suffix,
+        state_key_suffix, Endpoint,
     };
     use super::*;
     use crate::engine::persistence::append_header;
@@ -5693,5 +5790,103 @@ mod tests {
             ]
         );
         assert_eq!(endpoint.last_put("/ctx/notes.md").unwrap(), b"deferred");
+    }
+
+    /// The bucket path of each request that wrote to `wf`'s copy.
+    fn writes_to_wf(endpoint: &Endpoint) -> Vec<String> {
+        endpoint
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PUT" || r.method == "DELETE")
+            .map(|r| {
+                let rest = r.path.rsplit_once("/wf/").map(|(_, rest)| rest);
+                format!("{} {}", r.method, rest.unwrap_or(&r.path))
+            })
+            .collect()
+    }
+
+    /// A deferred write reaches the disk before it returns (koto#381):
+    /// opening the batch syncs the opening file and its directory, then the
+    /// directory again once the journal replaces the opening file, and
+    /// recording the write syncs the journal.
+    #[test]
+    fn a_deferred_write_is_synced_before_it_returns() {
+        let endpoint = serve(Vec::new());
+        let tmp = TempDir::new().unwrap();
+        write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
+        fs::write(
+            tmp.path().join("wf").join("version.json"),
+            r#"{"version":1,"last_sync_base":1,"machine_id":"testhost"}"#,
+        )
+        .unwrap();
+        let backend = cloud_backend_at(tmp.path(), endpoint.url.clone());
+        let dir = tmp.path().join("wf");
+
+        batch::synced::take();
+        let (journal, lock) = backend.open_batch("wf").unwrap().unwrap();
+        assert_eq!(
+            batch::synced::take(),
+            vec![
+                dir.join(batch::OPENING_FILE),
+                dir.clone(),
+                dir.join(batch::JOURNAL_FILE),
+                dir.clone()
+            ]
+        );
+        assert_eq!(
+            writes_to_wf(&endpoint),
+            vec![format!("PUT {}", BATCH_MARKER)]
+        );
+        assert!(journal.is_open());
+        assert!(!dir.join(batch::OPENING_FILE).exists());
+
+        journal
+            .record(
+                &lock,
+                &batch::Op::Add {
+                    key: "notes.md".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(batch::synced::take(), vec![dir.join(batch::JOURNAL_FILE)]);
+    }
+
+    /// A batch a killed process began and never opened (the opening file,
+    /// no journal) is cleared by the next flush (koto#381): the marker it
+    /// put in the bucket is deleted when it is the one the opening file
+    /// holds, then the opening file goes, and nothing else is written. A
+    /// marker with other bytes was written since by another writer, and is
+    /// left to it.
+    #[test]
+    fn a_batch_begun_and_never_opened_is_cleared() {
+        let ours = br#"{"session":"wf","opened_at":"2026-01-01T00:00:00Z","pid":1}"#;
+        let theirs = br#"{"session":"wf","opened_at":"2026-01-01T00:00:01Z","pid":2}"#;
+        for (in_bucket, deleted) in [(ours, true), (theirs, false)] {
+            let endpoint = serve(vec![(format!("/wf/{}", BATCH_MARKER), in_bucket.to_vec())]);
+            let tmp = TempDir::new().unwrap();
+            write_state_file(tmp.path(), "wf", "2026-01-01T00:00:00Z");
+            let backend = cloud_backend_at(tmp.path(), endpoint.url.clone());
+            let journal = backend.journal("wf");
+            {
+                let lock = journal.lock().unwrap().unwrap();
+                journal.begin(&lock, ours).unwrap();
+            }
+
+            backend.flush_pending("wf").unwrap();
+
+            assert!(!journal.is_opening());
+            assert!(!journal.is_open());
+            let want: Vec<String> = if deleted {
+                vec![format!("DELETE {}", BATCH_MARKER)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(writes_to_wf(&endpoint), want);
+
+            // With nothing begun, a flush asks nothing of the bucket.
+            let before = endpoint.requests().len();
+            backend.flush_pending("wf").unwrap();
+            assert_eq!(endpoint.requests().len(), before);
+        }
     }
 }
