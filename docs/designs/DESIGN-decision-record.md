@@ -519,7 +519,7 @@ A decision line (one JSON object, field names indicative):
     "kind": "dispatch",
     "dispatch_id": [{"value": "disp-...", "source": "handed"}],
     "instructions_digest": [],
-    "run_mode": "unattended",
+    "run_mode": [{"value": "unattended", "source": "observed"}],
     "dispatcher": [{"value": "session:4b2d...", "source": "handed"}]
   },
   "chain": {"links": [[{"value": "session:4b2d...", "source": "handed"}]], "incomplete": true},

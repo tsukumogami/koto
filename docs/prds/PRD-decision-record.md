@@ -245,7 +245,8 @@ time anyone above it wants to question them.
   recorded with surface `terminal` or `forge` as the caller states. With
   surface `relay` (a session passing on what a person said elsewhere), the
   decider is recorded as `person` only when the caller supplies a link to a
-  forge review or comment, which koto accepts as any absolute `https` URL.
+  forge review or comment, which koto accepts as an absolute `https` URL
+  with no credentials or query string.
   Without one, the decider is the entering session and the reported person
   is kept as a handed note. koto stores links and never fetches them.
 - **R8.** A decision records the run mode (`attended`, `unattended` or
