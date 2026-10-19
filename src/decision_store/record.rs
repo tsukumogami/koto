@@ -267,7 +267,7 @@ impl Chain {
 }
 
 /// What a decision is about. Which fields are required, and which are
-/// allowed at all, depends on the kind; [`validate`] checks that.
+/// allowed at all, depends on the kind; [`validate_subject`] checks that.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subject {
     /// What an `accept` accepts (`document`, `plan`, `step`, `test-change`,

@@ -283,6 +283,11 @@ impl Filter {
     }
 
     /// The literals a matching line must contain.
+    ///
+    /// They are a prefilter only: they assume the writer's compact
+    /// `serde_json` output, and every line that passes is still checked
+    /// by [`Filter::matches`] after parsing, so a literal that over-admits
+    /// costs a parse, never a wrong result.
     fn needles(&self) -> Needles {
         let mut n: Vec<Vec<u8>> = Vec::new();
         if let Some(k) = self.kind {
@@ -482,19 +487,10 @@ pub fn show(root: &Path, id: &str) -> Result<Option<Shown>, StoreError> {
     if !store_present(root)? {
         return Ok(None);
     }
-    let Some(month) = id_month(id) else {
+    let Some(decision) = find_decision(root, id)? else {
         return Ok(None);
     };
     let reversals = read_reversals(root)?;
-    let needles = Needles::new([id.as_bytes()]);
-    let in_month = read_file(&root.join(format!("{}.jsonl", month)), &needles)?
-        .decisions
-        .into_iter()
-        .find(|d| d.id == id);
-    let found = in_month.or_else(|| reversals.decisions.iter().find(|d| d.id == id).cloned());
-    let Some(decision) = found else {
-        return Ok(None);
-    };
     let index = reversal_index(&reversals.decisions);
     let reversal = index.get(id).map(|r| (*r).clone());
     Ok(Some(Shown {

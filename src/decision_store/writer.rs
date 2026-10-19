@@ -126,6 +126,14 @@ pub fn assemble_line(d: &Decision) -> Result<String, FieldError> {
         ));
     }
     validate_outcome(d.kind, &d.outcome)?;
+    // Links are checked here, not only in the CLI, so every caller of the
+    // writer gets the rule.
+    if let Some(link) = d.decided_by.link.as_deref() {
+        super::validate_link("link", link)?;
+    }
+    if let Some(link) = d.subject.source_link.as_deref() {
+        super::validate_link("source_link", link)?;
+    }
     validate_subject(d.kind, &d.subject, &d.evidence)?;
     if d.basis.len() > MAX_BASIS {
         return Err(FieldError::new(

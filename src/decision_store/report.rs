@@ -75,7 +75,9 @@ pub struct Report {
     /// `gate-pass` decisions made in the window whose decider was
     /// defaulted.
     pub gate_pass_defaulted: usize,
-    /// Lines the readers couldn't read and skipped.
+    /// Lines the readers couldn't read and skipped, plus reversal lines in
+    /// the window that carry no copy of their original and so can't be
+    /// tabled.
     pub skipped_lines: usize,
 }
 

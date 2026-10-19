@@ -278,6 +278,20 @@ fn subject_from(args: &RecordKindArgs, kind: Kind) -> Result<Subject, FieldError
     Ok(subject)
 }
 
+/// The decider `record --kind` uses until the decider and lineage resolvers
+/// land, kept as one seam for them to replace: the harness session koto
+/// observes, marked defaulted because the caller named none. The agent
+/// slot stays empty and the chain is recorded `incomplete`
+/// ([`Chain::unknown`]), because nothing here resolves either yet.
+fn placeholder_decider() -> DecidedBy {
+    let session: Vec<Sourced> = crate::host_env::host_env(crate::host_env::CLAUDE_SESSION_ID_ENV)
+        .filter(|v| !v.is_empty())
+        .map(Sourced::observed)
+        .into_iter()
+        .collect();
+    DecidedBy::session(session, Vec::new(), true)
+}
+
 /// `koto decisions record --kind ...`.
 pub fn handle_record_kind(args: RecordKindArgs) -> Result<()> {
     const CMD: &str = "decisions record";
@@ -328,14 +342,7 @@ pub fn handle_record_kind(args: RecordKindArgs) -> Result<()> {
         }
     }
 
-    // The decider until the resolver lands: the harness session koto
-    // observes, marked defaulted because the caller named none.
-    let session: Vec<Sourced> = crate::host_env::host_env(crate::host_env::CLAUDE_SESSION_ID_ENV)
-        .filter(|v| !v.is_empty())
-        .map(Sourced::observed)
-        .into_iter()
-        .collect();
-    let mut decided_by = DecidedBy::session(session, Vec::new(), true);
+    let mut decided_by = placeholder_decider();
     decided_by.link = args.link.clone();
 
     let time = now_to_second();
