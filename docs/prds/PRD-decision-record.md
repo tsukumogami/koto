@@ -203,6 +203,11 @@ time anyone above it wants to question them.
   | `reverse` | the identifier of the decision it overrules |
   | `refused` | the attempted kind and subject, and the reason for refusal |
 
+  A verdict's evidence pointer is required because the verdict is only as
+  good as what it judged: `show` returns it for a reviewer to follow, and the
+  review and release work that consumes verdicts checks it against the
+  commit judged.
+
 - **R3.** Every decision carries:
   - a stable identifier, unique across the record;
   - a UTC time to the second;
@@ -248,7 +253,9 @@ time anyone above it wants to question them.
   forge review or comment, which koto accepts as an absolute `https` URL
   with no credentials or query string.
   Without one, the decider is the entering session and the reported person
-  is kept as a handed note. koto stores links and never fetches them.
+  is kept as a handed note, which `show` returns so an auditor can follow up
+  with the person the relayer named. koto stores links and never fetches
+  them.
 - **R8.** A decision records the run mode (`attended`, `unattended` or
   `unknown`): `observed` when the agent harness reports whether its session
   is attended, otherwise as handed by the caller, and `unknown` when neither
