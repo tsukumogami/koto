@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 problem: |
   koto keeps everything about a workflow inside its session directory, which
   is removed when the workflow succeeds, and its decision-like events carry
@@ -37,7 +37,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
