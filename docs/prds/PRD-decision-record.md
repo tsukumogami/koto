@@ -186,22 +186,31 @@ time anyone above it wants to question them.
     surface (one of `terminal`, `forge`, `relay`), an optional link to the
     original (such as a forge review), and the session that entered the
     decision.
-  - `check`: the name of an automated check, such as koto's grader.
+  - `check`: the name of an automated check, such as koto's grader, and the
+    session that ran it.
+
+  Two deciders are the same decider when they are the same session (whatever
+  agent within it), the same person handle, or the same check run by the same
+  session.
 - **R5.** koto stores a person's handle as an opaque string. koto has no user
   table, account field, login, registration or credential for any decider,
   and never requires one to record or read a decision.
 - **R6.** Each identity in a decision (the session, the agent, the person,
   each link in the dispatch chain) carries one source label: `observed` when
-  koto read the value itself, or `handed` when a caller supplied it. When a
-  handed value differs from the value koto observes, both are recorded.
-- **R7.** A decision entered by someone other than its decider (an agent
-  typing a person's approval, a coordinator relaying an answer) is recorded
-  with a `person` decider only when the caller supplies a link to a forge
-  review or comment, and the person's handle is labelled `handed`. Without
-  such a link, the decider is the entering session, and the reported person
-  is kept as a handed note on the decision. koto stores the link and doesn't
-  fetch it.
-- **R8.** A decision records the run mode (`attended` or `unattended`) and,
+  koto read the value itself from its environment or from the workspace
+  manager's lineage, or `handed` when the caller of the koto command supplied
+  it. When a handed value and an observed value exist for the same identity
+  and differ, both are recorded.
+- **R7.** A person's handle is always `handed`: koto can't tell a person at a
+  terminal from an agent running the same command. A `person` decider is
+  recorded with surface `terminal` or `forge` as the caller states. With
+  surface `relay` (a session passing on what a person said elsewhere), the
+  decider is recorded as `person` only when the caller supplies a link to a
+  forge review or comment. Without one, the decider is the entering session
+  and the reported person is kept as a handed note. koto stores links and
+  never fetches them.
+- **R8.** A decision records the run mode (`attended`, `unattended` or
+  `unknown`), as handed by the caller and `unknown` when not given, and,
   optionally, the decider's confidence (`high`, `medium`, `low`), separately
   from who the decider is.
 
@@ -217,10 +226,13 @@ time anyone above it wants to question them.
   - the run mode;
   - the immediate dispatcher (a session or a person), labelled per R6.
 
-  A later authority setting adds a different `basis` value without changing
-  what `dispatch` records mean.
+  For a `person` decider, `basis` is `person` and the other fields are the
+  entering session's. For a `check` decider, they are the session's that ran
+  the check. A later authority setting adds another `basis` value without
+  changing what `dispatch` and `person` records mean.
 - **R10.** Every decision records its dispatch chain: an ordered list of
-  links from the deciding session up to the root, which is a person or a
+  links from the deciding session (for a `person` decider the entering
+  session, for a `check` the session that ran it) up to the root, which is a person or a
   session with no dispatcher. Each link is labelled per R6. A chain koto
   can't follow to its root is marked `incomplete`, and its missing links are
   never guessed.
@@ -235,34 +247,43 @@ time anyone above it wants to question them.
 
 **Overruling**
 
-- **R12.** A `reverse` decision is accepted when its decider is one of:
-  - the original decider itself;
-  - a session that appears in the original decision's recorded chain;
-  - a person whose handle equals the person at the root of that chain.
+- **R12.** Only the original decision's chain decides who may reverse it.
+  A `reverse` decision is accepted, with authority `verified`, when its
+  decider is:
+  - the same decider as the original (R4);
+  - for an original decided by a `session` or a `check`, a session that
+    appears in the original's chain, or the person at that chain's root;
+  - for an original decided by a `person`, the person at the root of the
+    original's chain. A session can't reverse a person's decision.
 
-  Matching is on recorded values. When either chain is `incomplete` and no
-  match is found, koto records the reversal with its authority marked
-  `asserted`. When both chains are complete and no match is found, koto
-  refuses the reversal and records a `refused` decision.
+  Matching is on recorded values. When nothing matches and the original's
+  chain is `incomplete`, koto records the reversal with authority
+  `asserted`. When nothing matches and the original's chain is complete,
+  koto refuses the reversal and records a `refused` decision.
 - **R13.** koto refuses, and records as `refused`, a reversal of a `refused`
-  decision, of a `reverse` decision, or of a decision that is already
-  reversed.
+  decision, of a `reverse` decision, of a decision that is already reversed,
+  or of an identifier that isn't on the record. When two reversals of the
+  same decision race, exactly one is recorded as `reverse` and the other is
+  refused as already reversed.
 - **R14.** Once reversed, a decision reads as `reversed` in every query and
   view, with its reversal's identifier. The original is never edited or
   removed. To restore what was reversed, a decider records a new decision of
   the original kind.
 - **R15.** What a reversal means, per kind:
-  - `accept`: the subject is no longer accepted. Every decision whose
-    `basis` names the reversed acceptance is returned with it as affected.
+  - `accept`: the subject is no longer accepted. The reversal's result, and
+    showing the reversed decision, list every decision whose `basis` names it
+    directly as affected; following those lists gives the transitive set.
     koto doesn't edit the document's status.
   - `merge`: the merge is no longer endorsed. The reversal carries a pointer
     to the compensating change (a revert pull request), or records that none
     exists yet. koto doesn't change the forge.
   - `gate-pass`: the pass no longer stands. If the workflow that passed the
-    gate still exists, every later `koto next` on it reports the reversal as
-    a blocking condition. The block clears when the workflow is rewound to or
-    before the gated state, or when the reverser, or someone R12 would let
-    reverse the reverser, records a new `gate-pass` for that gate.
+    gate still exists, every later `koto next` on it, at whatever state the
+    workflow has reached, refuses to advance and reports the reversal as a
+    blocking condition. koto doesn't move the workflow back itself. The
+    block clears when the workflow is rewound to or before the gated state,
+    or when the reverser, or a decider R12 would let reverse the reverser,
+    records a new `gate-pass` for that gate.
   - `escalate`: the question is withdrawn from its recipient.
   - `decline-escalation`: the question counts as escalated to the reverser.
   - `judgment` and `verdict`: the call or verdict no longer stands. The
@@ -301,17 +322,20 @@ time anyone above it wants to question them.
   - a time window.
 
   Every result says whether the decision is in effect or reversed.
-- **R20.** koto reports, for a time window and grouped by kind and by decider
-  kind:
-  - the decisions made in the window, and how many of them have been
-    reversed as of the report;
-  - the reversals recorded in the window, grouped by the kind of the
-    decision they reverse;
-  - each reversed decision listed with its reversal.
-- **R21.** A decision can carry pointers to records the agent harness keeps
-  about the same moment: the harness's session identifier, a tool-call
-  identifier, and the agent identifier when supplied. The record stores the
-  identifiers only and never copies the harness's records.
+- **R20.** koto reports, for a time window:
+  - the decisions made in the window and how many of them have been reversed
+    as of the report, as a table of kind by decider kind;
+  - the reversals recorded in the window, as a table of the reversed
+    decision's kind by its decider kind;
+  - each reversed decision, listed with its reversal.
+- **R21.** A decision can carry evidence pointers:
+  - to records the agent harness keeps about the same moment (the harness's
+    session identifier, a tool-call identifier, and the agent identifier
+    when supplied);
+  - to a koto run-journal record, by session and sequence number, such as
+    the grader's check record a decision relied on.
+
+  The record stores the pointers only and never copies what they point at.
 
 **Bringing existing records together**
 
@@ -329,6 +353,13 @@ time anyone above it wants to question them.
   | The shirabe coordinator's decision table and reversals | a view rendered from the record; settled entries are `judgment` or the question's kind, escalations `escalate`, reversals `reverse` linked by identifier | "the coordinator" becomes the coordinator's `session`; "a person" becomes `person` with its surface |
   | Document acceptance through the plugin's status transition, and merges through its merge step | `accept` and `merge` decisions | the transitioning or merging session, or the person |
 
+  Each existing koto command keeps writing what it writes today and also
+  writes the decision. The coordinator's table is a view; the findings
+  ledger keeps its own records and also writes the decision. The caller
+  chooses the kind: `verdict` for a pass or fail on named evidence,
+  `judgment` for anything else settled, and koto validates only the subject
+  each kind requires.
+
   koto delivers the record and the koto rows of this table. The shirabe
   rows are delivered in that plugin against this vocabulary, and they belong
   to this feature even though they ship from another repository.
@@ -339,8 +370,11 @@ time anyone above it wants to question them.
 - **R24.** koto offers a command to import decisions recorded before the
   record existed, such as those a coordinator kept in its own record. An
   imported decision keeps its recorded decider and authority, labelled
-  `handed`, with a pointer to where it was recorded. Importing the same
-  source entry twice adds it once.
+  `handed`, with a pointer to where it was recorded. The pointer (source
+  location plus the entry's identifier there) is the entry's identity:
+  importing the same source entry twice adds it once. Which source formats
+  are read first is the design's choice; the coordinator's decision table is
+  one of them.
 
 ### Non-functional
 
@@ -348,7 +382,10 @@ time anyone above it wants to question them.
   writers on the same machine never lose an entry and never corrupt one.
 - **R26.** Readers of koto's existing events, run journal and feed keep
   working unchanged. Every existing command keeps working with the arguments
-  it accepts today.
+  it accepts today, with one deliberate exception: R16's refusal of a gate
+  pass whose decider can't be established. Tests that run the three
+  gate-passing commands with no harness session identifier set must now set
+  one or name a decider.
 - **R27.** A decision's reason text follows the run journal's privacy rule
   for override rationales: it stays in the local record and isn't copied
   into exported telemetry.
@@ -374,6 +411,11 @@ time anyone above it wants to question them.
   the session has been reclaimed.
 - [ ] Two decisions recorded in one run have different identifiers, and a
   decision recorded with a reason returns that reason.
+- [ ] An `accept` recorded with outcome `rejected` lists with that outcome.
+  Recording a decision with a kind or outcome outside R1, or a `verdict`
+  with no evidence pointer, is refused with an error naming the field.
+- [ ] A decision recorded from a session whose acting agent can't be
+  established lists the agent as `unknown`.
 
 **People as deciders**
 
@@ -395,13 +437,18 @@ time anyone above it wants to question them.
   different session identifier keeps both values.
 - [ ] A decision recorded in a session the workspace manager launched by
   direct dispatch, by detached dispatch, and for an incoming event each
-  carries a chain whose links are labelled. A session started outside the
-  workspace manager records a chain marked `incomplete`.
+  carries a chain that reaches its root, is not marked `incomplete`, and has
+  every link read from the workspace manager's lineage labelled `observed`.
+  A session started outside the workspace manager, with nothing handed,
+  records a chain marked `incomplete`.
 - [ ] Dispatching a session with koto absent from the dispatcher's path
   succeeds, showing the workspace manager runs no koto command.
 - [ ] A decision recorded with run mode `unattended` and confidence `high`
   returns decider kind `session`, run mode `unattended` and confidence
-  `high`.
+  `high`. A decision recorded with no run mode returns `unknown`.
+- [ ] A `verdict` recorded with decider kind `check` naming the grader, and
+  an evidence pointer to a run-journal check record, lists with that decider,
+  the session that ran the check, and the pointer.
 
 **Overruling**
 
@@ -412,11 +459,21 @@ time anyone above it wants to question them.
 - [ ] Reversing the merge with a revert pull request link stores the link.
   Reversing a merge without one records that no compensating change exists.
 - [ ] Reversing an acceptance that a later acceptance names in its `basis`
-  returns the later acceptance as affected.
-- [ ] After the gate pass is reversed while its workflow still exists, `koto
-  next` on that workflow reports the reversal as a blocking condition. After
-  `koto rewind` to the gated state, the block is gone. In a second run, a new
-  `gate-pass` recorded by the reverser clears it instead.
+  returns the later acceptance as affected, both in the reversal's result
+  and when showing the reversed acceptance.
+- [ ] After the gate pass is reversed while its workflow still exists and
+  has moved one state past the gate, `koto next` on that workflow refuses to
+  advance, leaves the state unchanged, and reports the reversal as a blocking
+  condition. After `koto rewind` to the gated state, the block is gone. In a
+  second run, a new `gate-pass` recorded by the reverser clears it instead.
+- [ ] A worker reverses its own `judgment`, and the reversal is accepted
+  with authority `verified`.
+- [ ] A coordinator's attempt to reverse a decision whose decider is a
+  `person` is refused, and the person at the chain's root reversing it is
+  accepted.
+- [ ] Reversing an identifier that isn't on the record is refused.
+- [ ] Two sessions reversing the same decision at the same time produce
+  exactly one `reverse` and one `refused`.
 - [ ] A maintainer whose handle is the root of the chain reverses a worker's
   judgment call from the terminal, and the reversal is accepted.
 - [ ] A worker's attempt to reverse a decision made by its coordinator, with
@@ -461,18 +518,20 @@ time anyone above it wants to question them.
 - [ ] A session records a `judgment` about another session's workflow, and
   a third session lists it.
 - [ ] For a fixture spanning two months, the report for the second month
-  counts the decisions made in it and how many are reversed. It also counts
-  a reversal recorded in the second month of a first-month decision under the
-  reversals recorded in the window.
+  counts the decisions made in it and how many are reversed, in a kind by
+  decider-kind table whose cells match the fixture. It also counts a
+  reversal recorded in the second month of a first-month decision under the
+  reversals recorded in the window, in the cell of that decision's kind and
+  decider kind.
 - [ ] A decision recorded with a harness tool-call identifier returns that
   identifier and contains no copied harness content.
 
 **Existing records**
 
 - [ ] `koto overrides record` writes a `gate-pass` decision with a session
-  decider.
+  decider, and `koto overrides list` still returns the override.
 - [ ] `koto decisions record` writes a `judgment` decision with a session
-  decider.
+  decider, and `koto decisions list` still returns the choice.
 - [ ] `koto decider answer` writes a `gate-pass` for a passing answer and a
   `judgment` for a failing one.
 - [ ] Recording a disputed finding writes a `judgment` whose decider uses the
@@ -494,9 +553,10 @@ time anyone above it wants to question them.
 - [ ] Two sessions recording 100 decisions each at the same time produce 200
   complete entries, and no existing entry changes.
 - [ ] The existing test suites for the run journal, the feed and the grader
-  report pass unchanged, and the existing functional tests for `koto
-  overrides record`, `koto decisions record`, `koto next --to` and `koto
-  decider answer` pass without changes to their arguments.
+  report pass unchanged. The existing functional tests for `koto overrides
+  record`, `koto decisions record`, `koto next --to` and `koto decider
+  answer` pass without changes to their arguments, with at most a harness
+  session identifier added to their environment.
 - [ ] Exporting telemetry for a run whose decisions carry reasons produces no
   record containing any reason text.
 - [ ] With networking disabled, the harness session identifier unset and no
