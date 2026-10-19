@@ -10,6 +10,7 @@ pub mod dashboard_state;
 pub mod decider;
 pub mod decider_answer;
 pub mod decider_port;
+pub mod decisions;
 pub mod init_child;
 pub mod init_entry;
 pub mod next;
@@ -895,18 +896,46 @@ pub enum TemplateSubcommand {
 
 #[derive(Subcommand)]
 pub enum DecisionsSubcommand {
-    /// Record a structured decision without advancing state
+    /// Record a decision: a workflow's structured decision with
+    /// `<name> --with-data`, or any decision kind in the host-level
+    /// decision store with `--kind`
     Record {
-        /// Workflow name
-        name: String,
+        /// Workflow name (with --with-data)
+        #[arg(required_unless_present = "kind", conflicts_with = "kind")]
+        name: Option<String>,
         /// Decision data as JSON (must include "choice" and "rationale" fields)
-        #[arg(long = "with-data")]
-        with_data: String,
+        #[arg(
+            long = "with-data",
+            required_unless_present = "kind",
+            conflicts_with = "kind"
+        )]
+        with_data: Option<String>,
+        #[command(flatten)]
+        kind_args: Box<decisions::RecordKindArgs>,
     },
-    /// List accumulated decisions for the current state
+    /// List a workflow's decisions for its current state, or, with no
+    /// workflow name, decisions host-wide from the decision store
     List {
-        /// Workflow name
-        name: String,
+        /// Workflow name; leave out to list host-wide with the filters below
+        name: Option<String>,
+        #[command(flatten)]
+        filters: decisions::ListFilterArgs,
+    },
+    /// Show one decision from the decision store, with whether it is in
+    /// effect or reversed
+    Show {
+        /// Decision identifier (d-YYYYMM-...)
+        id: String,
+    },
+    /// Report on the decisions made, and the reversals recorded, in a UTC
+    /// window that includes its start and excludes its end
+    Report {
+        /// Window start, inclusive (YYYY-MM, YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)
+        #[arg(long)]
+        since: String,
+        /// Window end, exclusive (same forms as --since)
+        #[arg(long)]
+        until: String,
     },
 }
 
@@ -2017,15 +2046,50 @@ pub fn run(app: App) -> Result<()> {
                 }
             }
         },
-        Command::Decisions { subcommand } => {
-            let backend = build_backend()?;
-            match subcommand {
-                DecisionsSubcommand::Record { name, with_data } => {
-                    handle_decisions_record(&backend, name, with_data)
+        Command::Decisions { subcommand } => match subcommand {
+            DecisionsSubcommand::Record {
+                name: Some(name),
+                with_data: Some(with_data),
+                kind_args,
+            } => {
+                if kind_args.any_set() {
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": "the decision-store flags need --kind and no workflow name",
+                            "command": "decisions record"
+                        }),
+                        2,
+                    );
                 }
-                DecisionsSubcommand::List { name } => handle_decisions_list(&backend, name),
+                let backend = build_backend()?;
+                handle_decisions_record(&backend, name, with_data)
             }
-        }
+            DecisionsSubcommand::Record { kind_args, .. } => {
+                decisions::handle_record_kind(*kind_args)
+            }
+            DecisionsSubcommand::List {
+                name: Some(name),
+                filters,
+            } => {
+                if filters.any_set() {
+                    exit_with_error_code(
+                        serde_json::json!({
+                            "error": "list filters apply to the host-wide listing: leave out the workflow name",
+                            "command": "decisions list"
+                        }),
+                        2,
+                    );
+                }
+                let backend = build_backend()?;
+                handle_decisions_list(&backend, name)
+            }
+            DecisionsSubcommand::List {
+                name: None,
+                filters,
+            } => decisions::handle_list_host(filters),
+            DecisionsSubcommand::Show { id } => decisions::handle_show(id),
+            DecisionsSubcommand::Report { since, until } => decisions::handle_report(since, until),
+        },
         Command::Overrides { subcommand } => {
             let backend = build_backend()?;
             match subcommand {

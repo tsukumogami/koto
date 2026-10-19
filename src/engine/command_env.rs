@@ -80,7 +80,7 @@ pub const DEFAULT_LIVE_NAMES: &[&str] = &[
 /// Default live names whose values can carry a credential: the tokens, and
 /// the proxy URLs, which may embed a user and password. A fixed value that
 /// contains one of these values is recorded unset rather than written.
-const CREDENTIAL_CARRIERS: &[&str] = &[
+pub(crate) const CREDENTIAL_CARRIERS: &[&str] = &[
     "GH_TOKEN",
     "GITHUB_TOKEN",
     "GH_ENTERPRISE_TOKEN",
