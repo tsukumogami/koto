@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 problem: |
   Agents a person dispatches, and the agents those start, make real decisions
   unattended: they accept documents and plan steps, merge, get past gates,
@@ -26,7 +26,7 @@ upstream: docs/briefs/BRIEF-decision-record.md
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
