@@ -234,10 +234,12 @@ time anyone above it wants to question them.
   and never requires one to record or read a decision.
 - **R6.** Each identity in a decision (the session, the agent, the person,
   each link in the dispatch chain) carries one source label: `observed` when
-  koto read the value itself from its environment or from the workspace
-  manager's lineage, or `handed` when the caller of the koto command supplied
-  it. When a handed value and an observed value exist for the same identity
-  and differ, both are recorded.
+  koto read the value itself and nobody upstream merely claimed it, or
+  `handed` when a caller supplied it. A value read from the workspace
+  manager's records keeps the provenance those records give it: today the
+  workspace manager records a session's parent as its dispatcher supplied it,
+  so koto labels that parent `handed`. When a handed value and an observed
+  value exist for the same identity and differ, both are recorded.
 - **R7.** A person's handle is always `handed`: koto can't tell a person at a
   terminal from an agent running the same command. A `person` decider is
   recorded with surface `terminal` or `forge` as the caller states. With
@@ -279,26 +281,31 @@ time anyone above it wants to question them.
   chain whose next link no source supplies is marked `incomplete`; missing
   lineage never counts as a root, and missing links are never guessed.
 - **R11.** The workspace manager doesn't read or write workflow state, and
-  it doesn't run koto. koto obtains each link of the chain either from
-  lineage the workspace manager keeps about the sessions it launched, outside
-  workflow state, or from the dispatching session handing it over. This must
-  work for each way the workspace manager launches a session (a direct
-  dispatch, a detached dispatch, and a session started for an incoming
-  event). Where a launch supplies no lineage, the link is recorded as absent
-  and the chain as `incomplete`.
+  it doesn't run koto, and this feature doesn't change it. koto obtains each
+  link of the chain from the records the workspace manager already keeps
+  about the sessions it launched (today the dispatch identifier and the
+  parent), or from the dispatching session handing it over. koto defines a
+  versioned lineage format through which the workspace manager can later
+  supply a fuller chain (an affirmed root, a copied chain that survives an
+  ancestor's removal, and entries for sessions started for an incoming
+  event), and reads it when present. Where a launch supplies no lineage, the
+  link is recorded as absent and the chain as `incomplete`.
 
 **Overruling**
 
 - **R12.** Only the original decision's chain decides who may reverse it.
-  A `reverse` decision is accepted, with authority `verified`, when its
-  decider is:
+  A `reverse` decision is accepted when its decider is:
   - the same decider as the original (R4);
   - for an original decided by a `session` or a `check`, a session that
     appears in the original's chain, or the person at that chain's root;
   - for an original decided by a `person`, the person at the root of the
     original's chain. A session can't reverse a person's decision.
 
-  Matching is on recorded values. When nothing matches and the original's
+  Matching is on recorded values. The reversal's standing is `verified`
+  when the match rests on an `observed` value and `asserted` when it rests on
+  `handed` values only; handed values never raise standing, and a match
+  through an `incomplete` chain is never `verified`. When nothing matches and
+  the original's
   chain is `incomplete`, koto records the reversal with authority
   `asserted`. When nothing matches and the original's chain is complete,
   koto refuses the reversal and records a `refused` decision.
@@ -492,11 +499,17 @@ time anyone above it wants to question them.
   set has its session labelled `observed`. A decision whose caller hands a
   different session identifier keeps both values.
 - [ ] A decision recorded in a session the workspace manager launched by
-  direct dispatch, by detached dispatch, and for an incoming event each
-  carries a chain that reaches its root, is not marked `incomplete`, and has
-  every link read from the workspace manager's lineage labelled `observed`.
-  A session started outside the workspace manager, with nothing handed,
+  direct dispatch, and one by detached dispatch, each carry the dispatch
+  identifier and parent from the workspace manager's records, labelled
+  `handed`, with the chain marked `incomplete`. A session started for an
+  incoming event, or outside the workspace manager, with nothing handed,
   records a chain marked `incomplete`.
+- [ ] With a fixture session entry in the versioned lineage format carrying
+  a copied chain and `parent: none`, a decision's chain reaches that root,
+  is not marked `incomplete`, and each link carries the label the entry gives
+  it.
+- [ ] A decision recorded with a handed `--dispatched-by none` closes the
+  chain at a handed root.
 - [ ] Dispatching a session with koto absent from the dispatcher's path
   succeeds, showing the workspace manager runs no koto command.
 - [ ] A decision recorded with run mode `unattended` and confidence `high`
@@ -639,6 +652,11 @@ time anyone above it wants to question them.
   requests or edit documents when a decision is overruled.
 - **Cross-machine durability.** The record lives in koto's local store on one
   machine.
+- **Changes to the workspace manager.** Publishing the versioned lineage
+  format, copying a session's chain into its children's records, and
+  recording sessions started for an incoming event belong to planned work on
+  the recorded dispatch tree. This feature reads them once they exist and
+  works without them.
 - **Pruning and compaction.** R17 keeps decisions until pruned; a pruning
   command is later work.
 - **Duplicating the harness's records.** Tool permission decisions and

@@ -1,14 +1,36 @@
 ---
+schema: design/v1
 status: Proposed
-problem: |
-  koto has no durable, cross-session record of the decisions dispatched
-  sessions make. Decision-like events live in session logs that are deleted
-  on success, carry no actor, and can't be overruled from another session.
-decision: |
-  To be settled in this design.
-rationale: |
-  To be settled in this design.
 upstream: docs/prds/PRD-decision-record.md
+problem: |
+  koto keeps everything about a workflow inside its session directory, which
+  is removed when the workflow succeeds, and its decision-like events carry
+  no actor, no identifier another session can point at, and no way to be
+  overruled. The decision record needs a host-wide store that outlives
+  sessions, identity and authority on every decision, reversal that a live
+  workflow honours, and the existing commands writing into it.
+decision: |
+  Decisions live in a new store at ~/.koto/decisions/: one JSONL file per
+  UTC month plus an all-time reversal log and an import log, written through
+  one locked writer whose check settles reversal races and import repeats.
+  koto decisions grows into the front end (record, list, show, reverse,
+  report, import) with shared decider flags. Existing gate-passing commands
+  resolve a decider first (handed, else the observed harness session marked
+  defaulted, else refuse), write their own session event carrying the whole
+  decision, then append to the store, with repair on the next tick. koto
+  next blocks on reversed gate passes. Lineage comes from the workspace
+  manager's existing session map, labelled handed, through a versioned
+  interface a fuller chain can fill later; the acting agent comes from a
+  koto-skills hook.
+rationale: |
+  Plain JSONL with koto's existing lock and repair patterns meets the
+  timing budget with no new dependency, and a month-bounded layout plus a
+  small reversal log keeps every timed query and the per-tick check cheap.
+  Session-first writes keep existing readers unchanged and lose nothing on a
+  crash. Reading the workspace manager's records without changing it keeps
+  this feature off the dispatch path, and labelling the caller-supplied
+  parent as handed keeps the record from claiming more than anyone checked.
+decision_provenance: inline-resolved
 ---
 
 # DESIGN: The decision record
@@ -60,11 +82,12 @@ on reversals, a `verified` or `asserted` standing. The dispatch chain (R10)
 runs from the deciding session to a root that a source affirms; missing
 lineage is `incomplete`, never a root. The workspace manager doesn't read or
 write workflow state and doesn't run koto (R11). Today it publishes lineage
-only in two places: each worker's `OTEL_RESOURCE_ATTRIBUTES`
-(`niwa.dispatch.id`, `niwa.parent.session.id`) and its per-instance session
-mapping, which it deletes at reap. A check run inside a dispatched worker
-for this design found neither present, so neither can be relied on in every
-launch path as things stand.
+in two places: each worker's `OTEL_RESOURCE_ATTRIBUTES`
+(`niwa.dispatch.id`, `niwa.parent.session.id`), which the agent harness
+strips from tool subprocesses before koto could read it, and its session map
+at `<root>/.niwa/sessions/<id>.json`, which records the dispatch identifier
+and the caller-supplied parent and is deleted at reap. Sessions started by
+`niwa watch` get no entry.
 
 Overruling (R12 to R15) is a new decision that points at the original. The
 original's chain alone decides who may reverse it; a reversal is final; a
@@ -197,67 +220,76 @@ Key assumptions:
   doesn't depend on it.
 - koto finds the workspace root by walking up from its working directory to
   `.niwa/workspace.toml`; when it can't, the chain is `incomplete`.
-- The workspace manager agrees to publish the versioned lineage object below,
-  and to write entries for watch launches.
+- The session map's `dispatch_id` and `parent_session_id` keep their current
+  names and meaning. The parent is the dispatching caller's own claim, which
+  the workspace manager records without verifying it.
 
-#### Chosen: Observed lineage from the workspace manager's session entry, chain copied at dispatch, snapshotted per decision, handed values as a separate fallback
+#### Chosen: Read the workspace manager's existing session map as handed lineage, through a versioned lineage interface that a richer chain can fill later
 
-On the workspace manager's side, all file writes it already knows how to
-make, none touching workflow state:
-
-1. Every session entry under `<root>/.niwa/sessions/<id>.json` carries a
-   versioned `lineage` object: `dispatch_id`, `brief_digest` (the `sha256:`
-   digest it already computes), and `parent` as `session:<id>`, `none`
-   (dispatched from a shell with no caller session, which affirms a root) or
-   `unknown`.
-2. At dispatch, while every ancestor's entry still exists, it copies the
-   dispatching session's chain into the child's entry, so a reaped ancestor
-   leaves no gap.
-3. `niwa watch` writes the same entry for each session it launches, with
-   `parent: none` and the trigger as an opaque string.
-4. The format is documented as a contract other tools read by name.
-
-On koto's side:
+koto reads only what the workspace manager already writes, and stays off its
+dispatch path:
 
 1. koto reads `CLAUDE_CODE_SESSION_ID`, finds the workspace root, and reads
-   that session's entry from disk, ignoring unknown fields and treating an
-   unknown version as absent. It never runs `niwa`.
-2. The session's own link comes from the entry, then koto's own run-journal
-   stamp for that driver. Ancestor links come from the copied chain, then a
-   parent-by-parent walk of root entries, then ancestors' run-journal stamps.
-   All of these are `observed`.
-3. A link is the root only when an observed `parent: none` says so, or a
-   handed root closes a chain no observed link goes past. `parent: unknown`,
-   a missing entry or an unreadable one ends the chain as `incomplete`.
-4. The first time koto sees a driver, it stamps the observed lineage into its
-   run-journal record for that driver, so a session resumed after its entry
-   is reaped still resolves.
-5. Every decision stores a snapshot of its resolved chain, dispatch
-   identifier and digest, so a later reap can't change what it says.
-6. Handed values arrive only on commands that record decisions:
+   `<root>/.niwa/sessions/<id>.json` from disk. It never runs `niwa` and
+   never writes there.
+2. From today's entry it takes `dispatch_id` and `parent_session_id`, labelled
+   `handed`: the workspace manager records the parent as the caller supplied
+   it, so koto passes that provenance on rather than upgrading it. It walks
+   parent by parent through the entries that still exist. An entry with no
+   parent ends the chain as `incomplete`, because today's map can't say
+   whether the session was a root or its parent was simply not recorded.
+3. koto defines a versioned lineage interface it reads when an entry carries
+   one: an object `lineage` with `v`, `dispatch_id`, `brief_digest`, `parent`
+   as `session:<id>`, `none` or `unknown`, an optional copied `chain` of such
+   links, and a per-field `source` of `observed` or `handed`. koto takes each
+   value with the label the interface gives it, treats `parent: none` as an
+   affirmed root, and treats an unknown version as absent.
+4. The first time koto sees a driver, it stamps the lineage it resolved into
+   its run-journal record for that driver, so a session resumed after its
+   entry is reaped still resolves. Every decision stores a snapshot of its
+   resolved chain, dispatch identifier and digest.
+5. Handed values also arrive on commands that record decisions:
    `--dispatched-by session:<id>|person:<handle>|none`, `--chain-file
-   <path>` (links above the dispatcher, in a JSON format koto owns),
-   `--instructions-digest sha256:<hex>`, and `--dispatch-id` for
-   orchestrators other than this workspace manager. Handed values sit in
-   their own slot per link, are never merged into the observed slot, and a
-   disagreement marks the chain `incomplete`.
+   <path>` (links above the dispatcher, in the same lineage format),
+   `--instructions-digest sha256:<hex>`, and `--dispatch-id`. They sit in
+   their own slot per link, and a disagreement with another source marks the
+   chain `incomplete`.
 
-A reversal that matches the original's chain only on a handed link gets
-standing `asserted`, never `verified`.
+Three workspace manager changes would fill the interface. They belong to the
+planned work on the recorded dispatch tree, not to this feature, and this
+design consumes them once they land without needing them to ship:
+
+- every session entry carries the versioned `lineage` object above, with the
+  instruction digest the workspace manager already computes and an explicit
+  `parent: none` for a dispatch with no caller session;
+- at dispatch, the dispatching session's chain is copied into the child's
+  entry while every ancestor still exists, so a reaped ancestor leaves no gap;
+- sessions started by `niwa watch` get an entry, with `parent: none`.
+
+Until then, chains read from the workspace manager end `incomplete` and carry
+`handed` labels, and a root is affirmed only by a handed `--dispatched-by
+none` or a chain file.
+
+Handed values never raise a reversal's standing: a reversal earns `verified`
+only when the matching link is `observed` (the original decider's own
+observed session, for example), and is `asserted` when the match rests on
+handed links alone.
 
 #### Alternatives Considered
 
 - **koto parses the telemetry resource attributes.** The harness strips them
   before koto runs.
-- **Plain environment variables as the primary channel.** Environment holds
-  only what the parent's environment held, breaks at any hop launched by
-  older tooling or a person, is lost on a plain resume, and its delivery to
-  tool subprocesses is unmeasured. Kept as a possible later cross-check for
-  the session's own link, gated on a live test.
-- **A new reap-proof lineage log owned by the workspace manager.**
-  Unnecessary once the chain is copied into each child's entry at dispatch.
-- **Handed only.** Watch sessions have no dispatcher to hand anything, and
-  reversal refusals would rest on the dispatching skills' honesty.
+- **Plain environment variables.** Environment holds only what the parent's
+  environment held, is lost on a plain resume, and its delivery to tool
+  subprocesses is unmeasured.
+- **Require the workspace manager changes before this feature ships.** Would
+  put this feature on the dispatch path and behind another feature's
+  delivery, when the record is useful with incomplete chains.
+- **Label the session map's parent `observed`.** koto does read it from disk
+  itself, but the value is the dispatcher's claim. Upgrading it would make
+  the record say more than anyone checked.
+- **Handed only, ignoring the session map.** Throws away the dispatch
+  identifier and parent the workspace manager already records.
 
 ### Decision 3: The command surface and how existing commands write decisions
 
@@ -358,26 +390,6 @@ when the payload names no sub-agent. koto reads it as `observed`; `--agent` is
 - **Session only.** Always `unknown`, which empties the session-and-agent
   distinction in practice.
 
-## Decision Outcome
-
-The five choices form one path. A decision starts at a recording command (a
-new `koto decisions` subcommand or one of the existing gate-passing
-commands). koto resolves the decider: a handed `--by`, or the observed
-harness session marked `defaulted`, with the agent from the koto-skills hook
-or `--agent`, or a refusal when nothing can be established. It resolves the
-authority and chain from the workspace manager's session entry and its own
-run-journal stamps, takes any handed lineage into a separate slot, and
-snapshots the result onto the decision. The decision then lands in the
-host-level store: a month file for most kinds, the reversal log for
-reversals, under one lock whose check settles reversal races and import
-repeats. Existing commands write their own session event first, carrying the
-whole decision, and a lost store append is repaired on the next tick. Reading
-is lock-free over one month file plus the reversal log. `koto next` consults
-the reversal log for the session's own gate passes and blocks when one has
-been reversed and not cleared. The workspace manager's part is limited to
-writing a versioned lineage object, and a copied chain, into session entries
-it already writes.
-
 ### Decision 6: Smaller choices made while writing the architecture
 
 Resolved inline.
@@ -397,6 +409,26 @@ Resolved inline.
   identifiers and kinds, never reasons, matching its existing rule for
   override rationales (R27). Carrying the reason was rejected because the
   run journal is what telemetry exporters read.
+
+## Decision Outcome
+
+The five choices form one path. A decision starts at a recording command (a
+new `koto decisions` subcommand or one of the existing gate-passing
+commands). koto resolves the decider: a handed `--by`, or the observed
+harness session marked `defaulted`, with the agent from the koto-skills hook
+or `--agent`, or a refusal when nothing can be established. It resolves the
+authority and chain from the workspace manager's session entry and its own
+run-journal stamps, takes any handed lineage into a separate slot, and
+snapshots the result onto the decision. The decision then lands in the
+host-level store: a month file for most kinds, the reversal log for
+reversals, under one lock whose check settles reversal races and import
+repeats. Existing commands write their own session event first, carrying the
+whole decision, and a lost store append is repaired on the next tick. Reading
+is lock-free over one month file plus the reversal log. `koto next` consults
+the reversal log for the session's own gate passes and blocks when one has
+been reversed and not cleared. The workspace manager is unchanged: koto reads
+its existing session map, and a versioned lineage interface lets later
+workspace manager work supply a fuller chain.
 
 ## Solution Architecture
 
@@ -438,8 +470,9 @@ chain snapshot each decision carries.
 - **koto-skills plugin**: the PreToolUse hook that sets `KOTO_AGENT_ID`, and
   updated `koto-user`, `koto-author` and `koto-adhoc` documentation for the
   new flags and subcommands.
-- **Workspace manager** (separate repository): the versioned `lineage`
-  object, the chain copy at dispatch, and entries for watch launches.
+- **Workspace manager**: no change in this feature. koto reads its existing
+  session map, and the lineage interface defines what later workspace
+  manager work can add.
 - **shirabe plugin** (separate repository): the findings ledger writing
   `verdict` and `judgment` decisions, the coordinator's decision table
   rendered from `koto decisions list`, and document acceptance and merges
@@ -548,10 +581,10 @@ Deliverables:
 ### Phase 2: Identity, authority and lineage
 
 The lineage resolver against the workspace manager's current session entries
-(which already carry the parent and dispatch identifier), the run-journal
-driver stamp, handed lineage flags, the agent variable, and R6 and R10
-labelling. Works before the workspace manager change lands, with chains that
-end `incomplete` where the entry lacks a root marker.
+(dispatch identifier and parent, labelled handed) and the versioned lineage
+interface when present, the run-journal driver stamp, handed lineage flags,
+the agent variable, and R6 and R10 labelling, tested against fixture entries
+of both shapes.
 
 Deliverables:
 - `src/decision_store/lineage.rs`
@@ -594,17 +627,32 @@ Deliverables:
 - Hook script and plugin manifest entry
 - Skill updates and eval results
 
-### Phase 6: Workspace manager and shirabe (separate repositories)
+### Phase 6: shirabe (separate repository)
 
-The versioned lineage object, chain copy and watch entries in the workspace
-manager; the findings ledger, coordinator table view, document acceptance and
-merge writers in the shirabe plugin, and the disputes change adopting the R4
+The findings ledger, coordinator table view, document acceptance and merge
+writers in the shirabe plugin, and the disputes change adopting the R4
 vocabulary. These depend on Phases 1 to 4 being released.
 
 Deliverables:
-- Workspace manager: lineage object, chain copy, watch entries, documented
-  format
 - shirabe: decision writers and the coordinator table view
+
+## Security Considerations
+
+The decision record is attribution, not authorization. koto stores who claims to have decided, what it observed in its environment and the workspace manager's files, and what the caller handed it. Anything running as the same user can set `CLAUDE_CODE_SESSION_ID` or `KOTO_AGENT_ID`, edit a session entry, or write the store directly, so `observed` means koto read the value from its environment or from files, not that anyone authenticated it. Standing on a reversal works the same way: `verified` means the reversal's chain agrees with the original's on observed links, and `asserted` means it agreed only on links the caller handed in. Neither is a permission check. The `decision_reversed` block in `koto next` is an engine safeguard for honest disputes and mistakes. Any reversal in effect blocks, whatever its standing, because a forged reversal can only stop a workflow, never pass a gate, so the failure is safe. Merges, releases and anything else that needs real authorization must be enforced by the forge or the workspace manager.
+
+Handed lineage can't raise standing. Handed values live in their own slot on each link and are never merged into the observed slot. A handed value that disagrees with an observed one marks the chain `incomplete`, and so does a handed `none` against an observed parent. An `incomplete` chain is never eligible for `verified`. Reports and listings show handed values separately from observed ones and don't count handed-only authority as observed.
+
+koto validates every identifier it turns into a path or a command. Session ids, dispatch ids and parent ids from the environment or from session entries must match a fixed pattern (letters, digits, `.`, `_`, `-`, bounded length) before koto builds `<root>/.niwa/sessions/<id>.json`, and the parent-by-parent walk stops at a fixed depth and at the first repeated id. `KOTO_AGENT_ID` is held to the same pattern, and a value that fails it is read as `unknown`. The hook that sets it quotes the value. koto reads a workspace manager entry only if the entry is a regular file owned by the current user that no other user can write, and treats it as absent otherwise. `--chain-file` and `import` sources are opened without following symlinks, must be regular files, are size-capped and parsed as strict versioned JSON before koto takes the store lock. Everything taken from an import source is recorded as handed, with the source location.
+
+The store is private to the user. `~/.koto/decisions/` is created with mode 0700 and koto refuses to use it if it's owned by someone else or writable by group or others. The month files, `reversals.jsonl`, `imports.jsonl` and the lock are opened with mode 0600 and `O_NOFOLLOW`, and torn-tail repair truncates the opened file descriptor after confirming it's a regular file, never a path. On a shared host the directory mode is the only barrier, and every session of the same user can read every decision, including ones about unrelated projects.
+
+Line and field sizes are capped. A decision line may not exceed a fixed size (64 KiB), repeated flags (`--basis`, `--evidence`) and chain depth have fixed maxima, and koto refuses an oversized record with an error instead of truncating it, so one write can't slow every reader or the per-tick reversal lookup. Readers skip a malformed or unknown-version line and report how many they skipped. A malformed line in `reversals.jsonl` is surfaced as a warning, never silently read as "not reversed". All inputs are read, parsed and assembled before the store lock is taken, so the lock is held only for the check, the append and the sync. A lock timeout during the repair tick fails neither the tick nor a gate pass: the tick retries on the next one, and a timeout never turns into a passed gate.
+
+The repair on `koto next` appends only decisions named in session events that pass koto's usual event validation, whose identifier matches its own time's month and isn't already in the store, and marks them as repaired with the session that supplied them, so a forged session event can't pass as a direct recording.
+
+What's stored is permanent and has no delete path: handles, reasons, links and evidence pointers. Reasons and links go through koto's redaction before they're written, `--link` must be `https` with no credentials or query string, and the documentation says not to put secrets in reasons. Handles are opaque strings the caller chooses; koto doesn't validate or resolve them. Reasons, handles and links are data: consumers such as the coordinator's table and the shirabe skills must not read instructions into them. Nothing under `~/.koto/decisions/` is read by any telemetry exporter, and the run journal receives decision identifiers and kinds only, never reasons, handles or links. Backups or syncs that copy the user's `~/.koto/` copy this history with them. Scrubbing a leaked secret means stopping writers, taking the lock and rewriting the file by hand, and the documentation describes that procedure.
+
+No new crates are added, so the design adds no dependency risk. It depends on the workspace manager's session map and on the koto-skills hook, and trusts them no more than it trusts the file permissions around them.
 
 ## Consequences
 
@@ -632,9 +680,9 @@ Deliverables:
   between a crash and that tick.
 - Agent identity depends on a hook only one harness provides; elsewhere it is
   `unknown`.
-- Observed lineage depends on a change in the workspace manager and on koto
-  finding the workspace root. Until then, chains often end `incomplete` and
-  reversals are `asserted` more often than `verified`.
+- Until the workspace manager publishes the lineage interface, chains read
+  from it carry `handed` labels and end `incomplete`, so reversals by a
+  coordinator are `asserted` unless lineage is handed explicitly.
 - The record is per host; a session resumed on another host doesn't see
   reversals recorded on the first.
 
