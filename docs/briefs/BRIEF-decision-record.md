@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Draft
+status: Accepted
 problem: |
   Agents a person dispatches make real decisions while nobody watches, and
   afterwards no one can tell who made each decision, what entitled them to
@@ -24,7 +24,7 @@ motivating_context: |
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
@@ -43,9 +43,9 @@ decisions:
    under it, and a session was itself dispatched by a person or by an agent in
    another session. Today nothing distinguishes these. Where a person decided,
    nothing names them.
-2. **What entitled them to?** Authority narrows as it is handed down: no
-   agent holds more than its session's main agent, and no session holds more
-   than whoever dispatched it. Nothing records what authority a decision was
+2. **What entitled them to?** The toolkit's rule is that authority narrows
+   as it is handed down: no agent holds more than its session's main agent,
+   and no session holds more than whoever dispatched it. Nothing records what authority a decision was
    made under, so nobody can tell a decision that was within bounds from one
    that wasn't.
 3. **How is it overruled?** The person or agent above can see results but not
@@ -107,13 +107,17 @@ the forge; the reversal is recorded alongside the revert that undoes it.
 
 A dispatched session takes one question to its coordinator, decides another
 isn't worth escalating, and settles a small judgment call itself. The
-coordinator reads all three with their deciders, then overrules the judgment
-call, and the overrule is recorded the same way.
+coordinator reads all three, telling an escalation apart from a deliberate
+decision not to escalate, each with its decider. These are the decisions that
+leave no trace today, because nothing happens in the workflow when a question
+is kept rather than asked.
 
-### A check without a decider is refused
+### An anonymous check pass is turned away
 
-A session tries to get past a check without saying who is passing it, and
-koto refuses, naming what's missing.
+A maintainer running unattended work wants every check pass attributable, so
+an audit never meets a pass nobody owns. A session in their workspace tries
+to get past a check without saying who is passing it. koto refuses and names
+what's missing, and the session retries naming itself as the decider.
 
 ### A consumer counts overrules
 
@@ -137,8 +141,9 @@ from those made by a person or an automated check.
 - What overruling each kind of decision means, and how the record shows a
   decision no longer stands.
 - Bringing koto's existing grader, override, agent-answer and dispute records
-  and the shirabe plugin's review ledger and coordinator decision table onto
-  one vocabulary, each as a writer of the record or a view over it.
+  and the shirabe plugin's review ledger and coordinator decision table into
+  agreement, so they no longer disagree about who decided or keep
+  decisions the record doesn't hold.
 - Refusing to get past a check when no decider is named.
 
 ### Out
@@ -159,18 +164,6 @@ from those made by a person or an automated check.
 - **Duplicating the agent harness's own records.** The harness's tool
   permission decisions and transcripts stay where they are; the record may
   point at them as evidence.
-
-## Open Questions
-
-- How the dispatcher chain reaches koto when the workspace manager never reads
-  or writes workflow state. The PRD states what must be recorded; how it gets
-  there is the design's.
-- Whether planning elsewhere that expects the accepter to be someone other
-  than the author needs anything from this record beyond the decider and the
-  authority. This brief follows the framing that the authoring session may
-  accept its own work when it holds the authority.
-
-None of these questions block the brief.
 
 ## References
 
