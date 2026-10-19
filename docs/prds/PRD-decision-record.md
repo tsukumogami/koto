@@ -206,9 +206,9 @@ time anyone above it wants to question them.
   recorded with surface `terminal` or `forge` as the caller states. With
   surface `relay` (a session passing on what a person said elsewhere), the
   decider is recorded as `person` only when the caller supplies a link to a
-  forge review or comment. Without one, the decider is the entering session
-  and the reported person is kept as a handed note. koto stores links and
-  never fetches them.
+  forge review or comment, which koto accepts as any absolute `https` URL.
+  Without one, the decider is the entering session and the reported person
+  is kept as a handed note. koto stores links and never fetches them.
 - **R8.** A decision records the run mode (`attended`, `unattended` or
   `unknown`), as handed by the caller and `unknown` when not given, and,
   optionally, the decider's confidence (`high`, `medium`, `low`), separately
@@ -218,24 +218,29 @@ time anyone above it wants to question them.
 
 - **R9.** Every decision records the authority its decider held, with these
   fields:
-  - `basis`: `dispatch` for every decision this feature records;
+  - the authority kind: `dispatch` for a `session` or `check` decider,
+    `person` for a `person` decider;
   - the dispatch identifier the deciding session was launched under, when
     there is one;
   - a content digest of the instructions handed to the deciding session at
     dispatch, when available;
   - the run mode;
-  - the immediate dispatcher (a session or a person), labelled per R6.
+  - the immediate dispatcher (a session or a person), labelled per R6;
+  - on `reverse` decisions only, the standing R12 assigned: `verified` or
+    `asserted`.
 
-  For a `person` decider, `basis` is `person` and the other fields are the
-  entering session's. For a `check` decider, they are the session's that ran
-  the check. A later authority setting adds another `basis` value without
-  changing what `dispatch` and `person` records mean.
+  For a `person` decider the session fields are the entering session's, and
+  for a `check` decider the session's that ran the check. A later authority
+  setting adds another authority kind without changing what `dispatch` and
+  `person` records mean.
 - **R10.** Every decision records its dispatch chain: an ordered list of
   links from the deciding session (for a `person` decider the entering
-  session, for a `check` the session that ran it) up to the root, which is a person or a
-  session with no dispatcher. Each link is labelled per R6. A chain koto
-  can't follow to its root is marked `incomplete`, and its missing links are
-  never guessed.
+  session, for a `check` the session that ran it) up to the root. A link is
+  the root only when its source says so: the workspace manager's lineage
+  records no dispatcher for that session, or the caller hands the link as a
+  person or as a session with no dispatcher. Each link is labelled per R6. A
+  chain whose next link no source supplies is marked `incomplete`; missing
+  lineage never counts as a root, and missing links are never guessed.
 - **R11.** The workspace manager doesn't read or write workflow state, and
   it doesn't run koto. koto obtains each link of the chain either from
   lineage the workspace manager keeps about the sessions it launched, outside
@@ -270,6 +275,9 @@ time anyone above it wants to question them.
   removed. To restore what was reversed, a decider records a new decision of
   the original kind.
 - **R15.** What a reversal means, per kind:
+  - `accept` with outcome `rejected`: the rejection no longer stands, and
+    the subject is neither accepted nor rejected until a new `accept` says
+    so.
   - `accept`: the subject is no longer accepted. The reversal's result, and
     showing the reversed decision, list every decision whose `basis` names it
     directly as affected; following those lists gives the transitive set.
@@ -280,8 +288,9 @@ time anyone above it wants to question them.
   - `gate-pass`: the pass no longer stands. If the workflow that passed the
     gate still exists, every later `koto next` on it, at whatever state the
     workflow has reached, refuses to advance and reports the reversal as a
-    blocking condition. koto doesn't move the workflow back itself. The
-    block clears when the workflow is rewound to or before the gated state,
+    blocking condition. koto doesn't move the workflow back itself. A
+    reversal blocks on the one pass it names, even when the gate was passed
+    several times. The block clears when the workflow is rewound to or before the gated state,
     or when the reverser, or a decider R12 would let reverse the reverser,
     records a new `gate-pass` for that gate.
   - `escalate`: the question is withdrawn from its recipient.
@@ -294,11 +303,14 @@ time anyone above it wants to question them.
 - **R16.** Each way of getting past a gate by choice (`koto overrides
   record`, `koto next --to` past a gate that hasn't passed, and `koto decider
   answer` with an answer that lets the check pass) records a `gate-pass`
-  decision with a decider. When the caller names no decider, koto uses the
-  session it observes and marks the decider `defaulted` in addition to its R6
-  label. When no decider can be established at all, koto refuses the pass,
-  names the missing decider in its error, leaves the workflow where it was,
-  and records a `refused` decision.
+  decision with a decider. A decider the caller names, labelled `handed`,
+  is used as given. When the caller names none, koto uses the session it
+  observes and marks the decider `defaulted` in addition to its R6 label.
+  When neither exists, koto refuses the pass, names the missing decider in
+  its error, leaves the workflow where it was, writes none of the records the
+  command writes today, and records a `refused` decision. Otherwise the
+  command's existing records and its decision are written together or not
+  at all.
 
 **Durability, access and reading**
 
@@ -321,8 +333,13 @@ time anyone above it wants to question them.
   - the decider kind;
   - a time window.
 
-  Every result says whether the decision is in effect or reversed.
-- **R20.** koto reports, for a time window:
+  Every result says whether the decision is in effect or reversed. Results
+  are ordered by time, oldest first, with the identifier breaking ties. A
+  record command given a kind, outcome or subject that R1 and R2 don't allow
+  fails with an error naming the field and records nothing.
+- **R20.** koto reports, for a time window in UTC that includes its start
+  and excludes its end, counting every kind except `reverse` and `refused`
+  as decisions:
   - the decisions made in the window and how many of them have been reversed
     as of the report, as a table of kind by decider kind;
   - the reversals recorded in the window, as a table of the reversed
@@ -372,7 +389,9 @@ time anyone above it wants to question them.
   imported decision keeps its recorded decider and authority, labelled
   `handed`, with a pointer to where it was recorded. The pointer (source
   location plus the entry's identifier there) is the entry's identity:
-  importing the same source entry twice adds it once. Which source formats
+  importing the same source entry twice adds it once. An imported decision
+  gets a new identifier, keeps the time the source recorded, and has a chain
+  marked `incomplete` unless the source records one. Which source formats
   are read first is the design's choice; the coordinator's decision table is
   one of them.
 
