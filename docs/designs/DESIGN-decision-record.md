@@ -1,7 +1,6 @@
 ---
 schema: design/v1
 status: Proposed
-upstream: docs/prds/PRD-decision-record.md
 problem: |
   koto keeps everything about a workflow inside its session directory, which
   is removed when the workflow succeeds, and its decision-like events carry
@@ -30,6 +29,7 @@ rationale: |
   crash. Reading the workspace manager's records without changing it keeps
   this feature off the dispatch path, and labelling the caller-supplied
   parent as handed keeps the record from claiming more than anyone checked.
+upstream: docs/prds/PRD-decision-record.md
 decision_provenance: inline-resolved
 ---
 
@@ -164,7 +164,10 @@ A new host-level directory beside the request store, `~/.koto/decisions/`:
 
 - `<YYYY-MM>.jsonl` holds every decision except reversals, in the UTC month
   of its own recorded time. The identifier names the month
-  (`d-202610-<random>`), so finding a decision by identifier reads one file.
+  and carries 128 random bits (`d-202610-<32 hex>`), so finding a decision by
+  identifier reads one file and collisions are negligible. The writer skips
+  an append only when the same identifier with identical content is already
+  present; the same identifier with different content is an error.
 - `reversals.jsonl` holds every `reverse` decision for all time, each line
   copying the original's identifier, kind, decider kind, deciding session and
   subject key from the same locked read that authorized it. Reversal status,
@@ -379,9 +382,15 @@ Key assumptions:
 #### Chosen: A koto-skills hook sets `KOTO_AGENT_ID`; `--agent` is the handed fallback
 
 The koto-skills plugin ships a PreToolUse hook that, for Bash calls invoking
-`koto`, prefixes `KOTO_AGENT_ID=<id>` from the payload, or `KOTO_AGENT_ID=main`
-when the payload names no sub-agent. koto reads it as `observed`; `--agent` is
-`handed`; both are kept when they differ; neither means `unknown`.
+`koto`, prefixes `KOTO_AGENT_ID=<id>` (quoted, and only when the value
+matches koto's identifier pattern) from the payload's agent identifier. It
+sets `main` only when the payload positively identifies the main agent, and
+otherwise sets nothing, so an ambiguous call records `unknown` rather than
+over-claiming. koto reads the variable as `observed`; `--agent` is `handed`;
+both are kept when they differ; neither means `unknown`. A command that
+reassigns the variable or wraps koto in another shell can still defeat the
+hook; the label says the value came from the environment, not that it was
+authenticated.
 
 #### Alternatives Considered
 
@@ -453,6 +462,10 @@ chain snapshot each decision carries.
   and marking chains `incomplete` per R10. Reads `CLAUDE_CODE_SESSION_ID`,
   `KOTO_AGENT_ID`, the workspace manager's session entries, and the run
   journal's driver stamps.
+- **`src/decision_store/decider.rs`** (new): the decider resolver shared by
+  every recording command (handed `--by`, else the observed session marked
+  `defaulted`, else `decider_missing`), and the agent read from
+  `KOTO_AGENT_ID` or `--agent`.
 - **`src/decision_store/authority.rs`** (new): R12's reversal rules over two
   recorded chains, returning `verified`, `asserted` or a refusal reason.
 - **`src/cli/decisions.rs`** (extended from the current handler): `record`,
@@ -485,25 +498,25 @@ A decision line (one JSON object, field names indicative):
 ```json
 {
   "v": 1,
-  "id": "d-202610-7f3a9c",
+  "id": "d-202610-3f9a0c1e5b7d42a8a61c0e9f2b4d7e11",
   "time": "2026-10-19T17:04:11Z",
   "kind": "gate-pass",
   "outcome": "passed",
   "subject": {"workflow": "work-on-123", "workflow_session_id": "s-...", "state": "review", "gate": "panel"},
   "decided_by": {
     "kind": "session",
-    "session": {"observed": "9c1e...", "handed": null},
-    "agent": {"observed": "main", "handed": null},
+    "session": [{"value": "9c1e...", "source": "observed"}],
+    "agent": [{"value": "main", "source": "observed"}],
     "defaulted": true
   },
   "authority": {
     "kind": "dispatch",
-    "dispatch_id": {"observed": "disp-...", "handed": null},
-    "instructions_digest": {"observed": "sha256:...", "handed": null},
+    "dispatch_id": [{"value": "disp-...", "source": "handed"}],
+    "instructions_digest": [],
     "run_mode": "unattended",
-    "dispatcher": {"observed": "session:4b2d...", "handed": null}
+    "dispatcher": [{"value": "session:4b2d...", "source": "handed"}]
   },
-  "chain": {"links": [{"session": "...", "source": "observed"}, {"root": "none", "source": "observed"}], "incomplete": false},
+  "chain": {"links": [[{"value": "session:4b2d...", "source": "handed"}]], "incomplete": true},
   "basis": [],
   "evidence": ["journal:work-on-123#42"],
   "reason": "panel finding is a false positive",
@@ -511,12 +524,30 @@ A decision line (one JSON object, field names indicative):
 }
 ```
 
+Every identity, and every chain link, has one shape: a list of values each
+with its `source`. One entry is the usual case; two entries mean an observed
+and a handed value disagreed (R6); an empty list means nothing was found.
+Standing is computed from these labels when a reversal is checked.
+
 A reversal line in `reversals.jsonl` adds `reverses` (the original's
 identifier) and `original` (its kind, decider kind, deciding session and
 subject key), and its authority carries `standing: verified|asserted`. A
 `person` decider carries `handle` (`handed`), `surface`, an optional `link`
 and `entered_by` (a session). A `check` decider carries `name` and `ran_in`
-(a session).
+(a session). A decision re-appended by the repair tick carries
+`repaired_from` (the session whose event supplied it); an imported one
+carries `import_source` and keeps the source's time in `time` alongside its
+own `recorded_at`.
+
+Session events: `GateOverrideRecorded`, `DirectedTransition`,
+`DeciderCheckAnswered` and `DecisionRecorded` gain one optional field,
+`decision`, holding the full decision line the command is about to append.
+Existing readers ignore it, because no payload struct denies unknown fields.
+The repair tick scans the session's own events for `decision` fields whose
+identifier the store lacks and appends them through the locked writer. It
+never re-appends a `reverse` line, so a forged session event can't bypass
+R12 and R13, and it runs before a terminal tick's cleanup, so the last
+decision of a run is repaired before its session is removed.
 
 Commands (flags indicative; names resolve against the clap tree once built):
 
@@ -567,61 +598,66 @@ The workspace manager's `lineage` object (in `<root>/.niwa/sessions/<id>.json`):
 
 ## Implementation Approach
 
-### Phase 1: The store
+### Phase 1: The store and its readers
 
-The record format, the locked writer, readers, `show` and `list` over the new
-store, with the two race tests (two reversals racing, a reversal racing an
-import of the same entry) as acceptance tests.
+The record format, the locked writer with its check closure, the readers,
+`show` and `list` filters, `report` and the R29 performance fixture. The
+writer's refuse-and-skip behaviour is tested with a stub check closure here;
+the real race tests arrive with the operations that race.
 
 Deliverables:
-- `src/decision_store/` (format, writer, readers)
-- `koto decisions record --kind`, `show`, `list` filters
-- Race and torn-tail tests
+- `src/decision_store/` (format, writer, readers, report)
+- `koto decisions record --kind`, `show`, `list` filters, `report`
+- Torn-tail, identifier-collision, stub-closure and performance tests
 
 ### Phase 2: Identity, authority and lineage
 
-The lineage resolver against the workspace manager's current session entries
-(dispatch identifier and parent, labelled handed) and the versioned lineage
-interface when present, the run-journal driver stamp, handed lineage flags,
-the agent variable, and R6 and R10 labelling, tested against fixture entries
-of both shapes.
+The decider resolver, the lineage resolver against the workspace manager's
+current session entries (dispatch identifier and parent, labelled handed) and
+the versioned lineage interface when present, the run-journal driver stamp,
+handed lineage flags, the agent variable, and R6 and R10 labelling, tested
+against fixture entries of both shapes.
 
 Deliverables:
-- `src/decision_store/lineage.rs`
+- `src/decision_store/decider.rs`, `src/decision_store/lineage.rs`
 - Run-journal driver stamp extension
-- Unit tests for every label and `incomplete` case
+- Unit tests for every label, `defaulted` and `incomplete` case
 
 ### Phase 3: Reversal
 
-`koto decisions reverse`, R12's rules, R13's refusals, per-kind effects
-(affected `basis` dependents, compensating link, replacement outcome), the
-`decision_reversed` blocking condition in `handle_next`, and the store repair
-tick.
+`koto decisions reverse`, R12's rules and standing, R13's refusals, per-kind
+effects (affected `basis` dependents, compensating link, replacement
+outcome), and the `decision_reversed` blocking condition in `handle_next`,
+with its clearing rule reusing the R12 function.
 
 Deliverables:
 - `src/decision_store/authority.rs`
 - Engine check and blocking condition
-- Functional tests for each R15 case
+- Functional tests for each R15 case, clearing by a qualifying decider and
+  refusal to clear by an unrelated one, and the race test of two reversals
+  of one decision
 
-### Phase 4: Existing commands and the report
+### Phase 4: Existing commands, import and repair
 
 The decider resolver and dual-write in `koto overrides record`, `koto next
 --to` and `koto decider answer`; today's `koto decisions record` writing a
-`judgment`; run-journal records gaining the decision identifier; `koto
-decisions report`; `koto decisions import` for the coordinator's table; the
-performance fixture for R29.
+`judgment`; the `decision` field on session events and the repair tick;
+run-journal records gaining the decision identifier; `koto decisions import`
+for the coordinator's table.
 
 Deliverables:
 - Changes in `src/cli/overrides.rs`, `src/cli/decider_answer.rs`, the `--to`
-  path, `src/cli/decisions.rs`
-- Report and import
+  path, `src/cli/decisions.rs`, and the session event payloads
+- Import, with the race test of a reversal racing an import of the same
+  entry
 - Existing functional tests updated only to set a harness session
   identifier where they pass gates
 
 ### Phase 5: koto-skills
 
 The PreToolUse hook, and `koto-user`, `koto-author` and `koto-adhoc` updates
-with evals.
+with evals. The hook can be built alongside Phase 2; the documentation lands
+with Phase 4.
 
 Deliverables:
 - Hook script and plugin manifest entry
@@ -631,26 +667,28 @@ Deliverables:
 
 The findings ledger, coordinator table view, document acceptance and merge
 writers in the shirabe plugin, and the disputes change adopting the R4
-vocabulary. These depend on Phases 1 to 4 being released.
+vocabulary. These depend on Phases 1 to 4 being released; each shirabe
+writer checks for `koto decisions record --kind` and keeps its current
+behaviour against an older koto.
 
 Deliverables:
 - shirabe: decision writers and the coordinator table view
 
 ## Security Considerations
 
-The decision record is attribution, not authorization. koto stores who claims to have decided, what it observed in its environment and the workspace manager's files, and what the caller handed it. Anything running as the same user can set `CLAUDE_CODE_SESSION_ID` or `KOTO_AGENT_ID`, edit a session entry, or write the store directly, so `observed` means koto read the value from its environment or from files, not that anyone authenticated it. Standing on a reversal works the same way: `verified` means the reversal's chain agrees with the original's on observed links, and `asserted` means it agreed only on links the caller handed in. Neither is a permission check. The `decision_reversed` block in `koto next` is an engine safeguard for honest disputes and mistakes. Any reversal in effect blocks, whatever its standing, because a forged reversal can only stop a workflow, never pass a gate, so the failure is safe. Merges, releases and anything else that needs real authorization must be enforced by the forge or the workspace manager.
+The decision record is attribution, not authorization. koto stores who claims to have decided, what it observed in its environment and the workspace manager's files, and what the caller handed it. Anything running as the same user can set `CLAUDE_CODE_SESSION_ID` or `KOTO_AGENT_ID`, edit a session entry, or write the store directly, so `observed` means koto read the value from its environment or from files, not that anyone authenticated it. Standing on a reversal works the same way: `verified` means the reversal's chain agrees with the original's on observed links, and `asserted` means it agreed only on links the caller handed in. Neither is a permission check. The `decision_reversed` block in `koto next` is an engine safeguard for honest disputes and mistakes. Any reversal in effect blocks, whatever its standing, because a forged reversal can only stop a workflow, never pass a gate, so the failure is safe. Clearing a block needs the same standing the reversal had: a `verified` reversal is cleared only by a rewind or by a `gate-pass` from a decider whose R12 match over the reverser is `verified`, so an `asserted` claim can't undo it. A mistaken or forged reversal is recovered the same way, by the reverser, someone above it, or a rewind. The blocking condition carries only the reversal's identifier, kind, standing and time; its reason and handle are shown by `koto decisions show`, marked as quoted data, so a reversal can't put text in front of a running worker. Merges, releases and anything else that needs real authorization must be enforced by the forge or the workspace manager.
 
 Handed lineage can't raise standing. Handed values live in their own slot on each link and are never merged into the observed slot. A handed value that disagrees with an observed one marks the chain `incomplete`, and so does a handed `none` against an observed parent. An `incomplete` chain is never eligible for `verified`. Reports and listings show handed values separately from observed ones and don't count handed-only authority as observed.
 
-koto validates every identifier it turns into a path or a command. Session ids, dispatch ids and parent ids from the environment or from session entries must match a fixed pattern (letters, digits, `.`, `_`, `-`, bounded length) before koto builds `<root>/.niwa/sessions/<id>.json`, and the parent-by-parent walk stops at a fixed depth and at the first repeated id. `KOTO_AGENT_ID` is held to the same pattern, and a value that fails it is read as `unknown`. The hook that sets it quotes the value. koto reads a workspace manager entry only if the entry is a regular file owned by the current user that no other user can write, and treats it as absent otherwise. `--chain-file` and `import` sources are opened without following symlinks, must be regular files, are size-capped and parsed as strict versioned JSON before koto takes the store lock. Everything taken from an import source is recorded as handed, with the source location.
+koto validates every identifier it turns into a path or a command. Session ids, dispatch ids and parent ids from the environment or from session entries must match a fixed pattern (letters, digits, `.`, `_`, `-`, bounded length) before koto builds `<root>/.niwa/sessions/<id>.json`, and the parent-by-parent walk stops at a fixed depth and at the first repeated id. `KOTO_AGENT_ID` is held to the same pattern, and a value that fails it is read as `unknown`. The hook that sets it quotes the value. koto reads a workspace manager entry only if, checked with `fstat` on the opened descriptor, it is a regular file owned by the current user that no other user can write, and treats it as absent otherwise. A planted `.niwa/` tree in an untrusted checkout can at most supply `handed` lineage. `--chain-file` and `import` sources are opened without following symlinks, must be regular files, are size-capped and parsed as strict versioned JSON before koto takes the store lock. Everything taken from an import source is recorded as handed, with the source location.
 
 The store is private to the user. `~/.koto/decisions/` is created with mode 0700 and koto refuses to use it if it's owned by someone else or writable by group or others. The month files, `reversals.jsonl`, `imports.jsonl` and the lock are opened with mode 0600 and `O_NOFOLLOW`, and torn-tail repair truncates the opened file descriptor after confirming it's a regular file, never a path. On a shared host the directory mode is the only barrier, and every session of the same user can read every decision, including ones about unrelated projects.
 
-Line and field sizes are capped. A decision line may not exceed a fixed size (64 KiB), repeated flags (`--basis`, `--evidence`) and chain depth have fixed maxima, and koto refuses an oversized record with an error instead of truncating it, so one write can't slow every reader or the per-tick reversal lookup. Readers skip a malformed or unknown-version line and report how many they skipped. A malformed line in `reversals.jsonl` is surfaced as a warning, never silently read as "not reversed". All inputs are read, parsed and assembled before the store lock is taken, so the lock is held only for the check, the append and the sync. A lock timeout during the repair tick fails neither the tick nor a gate pass: the tick retries on the next one, and a timeout never turns into a passed gate.
+Line and field sizes are capped. A decision line may not exceed a fixed size (64 KiB), repeated flags (`--basis`, `--evidence`) and chain depth have fixed maxima, and koto refuses an oversized record with an error instead of truncating it, so one write can't slow every reader or the per-tick reversal lookup. Readers of month files skip a malformed or unknown-version line and report how many they skipped. The reversal log fails closed: if `koto next` meets a line in `reversals.jsonl` it can't read, it returns a `decision_store_unreadable` blocking condition rather than treating any pass as not reversed. Torn-tail repair appends the missing newline when the last line is complete JSON, and truncates only a line that doesn't parse. All inputs are read, parsed and assembled before the store lock is taken, so the lock is held only for the check, the append and the sync. A lock timeout during the repair tick fails neither the tick nor a gate pass: the tick retries on the next one, and a timeout never turns into a passed gate.
 
 The repair on `koto next` appends only decisions named in session events that pass koto's usual event validation, whose identifier matches its own time's month and isn't already in the store, and marks them as repaired with the session that supplied them, so a forged session event can't pass as a direct recording.
 
-What's stored is permanent and has no delete path: handles, reasons, links and evidence pointers. Reasons and links go through koto's redaction before they're written, `--link` must be `https` with no credentials or query string, and the documentation says not to put secrets in reasons. Handles are opaque strings the caller chooses; koto doesn't validate or resolve them. Reasons, handles and links are data: consumers such as the coordinator's table and the shirabe skills must not read instructions into them. Nothing under `~/.koto/decisions/` is read by any telemetry exporter, and the run journal receives decision identifiers and kinds only, never reasons, handles or links. Backups or syncs that copy the user's `~/.koto/` copy this history with them. Scrubbing a leaked secret means stopping writers, taking the lock and rewriting the file by hand, and the documentation describes that procedure.
+What's stored is permanent and has no delete path: handles, reasons, links and evidence pointers. Reasons, links, handles, evidence pointers, compensating URLs, chain-file contents and imported fields all go through koto's redaction and the field caps before they're written, `--link` must be `https` with no credentials or query string, and the documentation says not to put secrets in reasons. Handles are opaque strings the caller chooses; koto doesn't validate or resolve them. Reasons, handles and links are data: consumers such as the coordinator's table and the shirabe skills must not read instructions into them. Nothing under `~/.koto/decisions/` is read by any telemetry exporter, and the run journal receives decision identifiers and kinds only, never reasons, handles or links. Backups or syncs that copy the user's `~/.koto/` copy this history with them. Scrubbing a leaked secret means stopping writers, taking the lock and rewriting the file by hand, and the documentation describes that procedure.
 
 No new crates are added, so the design adds no dependency risk. It depends on the workspace manager's session map and on the koto-skills hook, and trusts them no more than it trusts the file permissions around them.
 
@@ -690,7 +728,7 @@ No new crates are added, so the design adds no dependency risk. It depends on th
 
 - Month sharding keeps the timed queries bounded, and a derived index can be
   added later without changing the record.
-- The two race tests are acceptance tests for Phase 1.
+- The two race tests are acceptance tests for Phases 3 and 4.
 - The repair runs on every `koto next`, and the session event carries the
   whole decision, so nothing is lost.
 - `unknown` and `incomplete` are recorded honestly, so consumers can tell
