@@ -101,7 +101,8 @@ Decider and agent
 - [ ] `KOTO_AGENT_ID=main` records agent `main` labelled `observed`; `--agent <id>` records it `handed`; when both are given and differ, both values are kept.
 - [ ] A `KOTO_AGENT_ID` value that fails koto's identifier pattern is recorded as `unknown`.
 - [ ] With no `--by`, the decider is the observed session marked `defaulted`; with `--by` it is used as given, labelled `handed`, and not marked `defaulted`; with neither, the resolver returns `decider_missing`.
-- [ ] A decision recorded with run mode `unattended` and confidence `high` returns decider kind `session`, run mode `unattended` and confidence `high`; a decision recorded with no run mode returns `unknown`. (PRD: Identity labels and chains, 6th)
+- [ ] A decision recorded with run mode `unattended` returns decider kind `session` and run mode `unattended`, a decision recorded with no run mode returns `unknown`, and listing filtered by run mode `unattended` returns the first and not the second. (PRD: Identity labels and chains, 6th)
+- [ ] Listing filtered by a dispatch identifier, and by an instructions digest, each returns exactly the decisions recorded under it from a fixture of known decisions. (PRD: Identity labels and chains, 7th)
 - [ ] A worker records an `escalate` to its coordinator, a `decline-escalation` and a `judgment`; listing returns all three with their deciders and the escalation's recipient. (PRD: Escalation and judgment, 1st)
 - [ ] A session records a `judgment` about another session's workflow, and a third session lists it. (PRD: Querying and reporting, 3rd)
 

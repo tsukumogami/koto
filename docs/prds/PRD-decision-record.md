@@ -249,9 +249,10 @@ time anyone above it wants to question them.
   Without one, the decider is the entering session and the reported person
   is kept as a handed note. koto stores links and never fetches them.
 - **R8.** A decision records the run mode (`attended`, `unattended` or
-  `unknown`), as handed by the caller and `unknown` when not given, and,
-  optionally, the decider's confidence (`high`, `medium`, `low`), separately
-  from who the decider is.
+  `unknown`), as handed by the caller and `unknown` when not given,
+  separately from who the decider is, so an agent's decision in an
+  unattended run is never read as a person's confirmation. R19 filters on
+  it.
 
 **Authority**
 
@@ -336,7 +337,10 @@ time anyone above it wants to question them.
     reversal blocks on the one pass it names, even when the gate was passed
     several times. The block clears when the workflow is rewound to or before the gated state,
     or when the reverser, or a decider R12 would let reverse the reverser,
-    records a new `gate-pass` for that gate.
+    records a new `gate-pass` for that gate. A new `gate-pass` clears a
+    reversal whose standing is `verified` only when its own R12 match over
+    the reverser is `verified`; an `asserted` match clears only an
+    `asserted` reversal.
   - `escalate`: the question is withdrawn from its recipient.
   - `decline-escalation`: the question counts as escalated to the reverser.
   - `judgment` and `verdict`: the call or verdict no longer stands. The
@@ -375,7 +379,11 @@ time anyone above it wants to question them.
   - the subject;
   - the kind;
   - the decider kind;
-  - a time window.
+  - a time window;
+  - the run mode;
+  - the dispatch identifier or instructions digest the decider acted under,
+    so a coordinator can find every decision made under one set of
+    instructions when those instructions turn out to be wrong.
 
   Every result says whether the decision is in effect or reversed. Results
   are ordered by time, oldest first, with the identifier breaking ties. A
@@ -512,9 +520,13 @@ time anyone above it wants to question them.
   chain at a handed root.
 - [ ] Dispatching a session with koto absent from the dispatcher's path
   succeeds, showing the workspace manager runs no koto command.
-- [ ] A decision recorded with run mode `unattended` and confidence `high`
-  returns decider kind `session`, run mode `unattended` and confidence
-  `high`. A decision recorded with no run mode returns `unknown`.
+- [ ] A decision recorded with run mode `unattended` returns decider kind
+  `session` and run mode `unattended`, and a decision recorded with no run
+  mode returns `unknown`. Listing filtered by run mode `unattended` returns
+  the first and not the second.
+- [ ] Listing filtered by a dispatch identifier, and by an instructions
+  digest, each returns exactly the decisions recorded under it from a
+  fixture of known decisions.
 - [ ] A `verdict` recorded with decider kind `check` naming the grader, and
   an evidence pointer to a run-journal check record, lists with that decider,
   the session that ran the check, and the pointer.
@@ -535,6 +547,8 @@ time anyone above it wants to question them.
   advance, leaves the state unchanged, and reports the reversal as a blocking
   condition. After `koto rewind` to the gated state, the block is gone. In a
   second run, a new `gate-pass` recorded by the reverser clears it instead.
+  In a third run, a `verified` reversal stays blocking after a new
+  `gate-pass` whose match over the reverser is only `asserted`.
 - [ ] A worker reverses its own `judgment`, and the reversal is accepted
   with authority `verified`.
 - [ ] A coordinator's attempt to reverse a decision whose decider is a

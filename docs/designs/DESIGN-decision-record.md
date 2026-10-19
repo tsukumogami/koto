@@ -98,8 +98,9 @@ decider answer` with a passing answer) must record a `gate-pass` decision;
 an unnamed decider defaults to the observed session and is marked
 `defaulted`, and a pass with no establishable decider is refused without
 writing the command's existing records (R16). The existing commands keep
-writing what they write today and also write the decision, atomically (R22,
-R26).
+writing what they write today and also write the decision, together or not
+at all (R22, R26); Decision 3 says how that holds without a shared
+transaction.
 
 Reading (R19, R20) is by session (made or received), subject, kind, decider
 kind and time window, ordered oldest first, plus a report that cross-tabulates
@@ -519,8 +520,7 @@ A decision line (one JSON object, field names indicative):
   "chain": {"links": [[{"value": "session:4b2d...", "source": "handed"}]], "incomplete": true},
   "basis": [],
   "evidence": ["journal:work-on-123#42"],
-  "reason": "panel finding is a false positive",
-  "confidence": "medium"
+  "reason": "panel finding is a false positive"
 }
 ```
 
@@ -555,7 +555,7 @@ Commands (flags indicative; names resolve against the clap tree once built):
 |---|---|
 | `koto decisions record --kind <k> --outcome <o> <subject flags> [decider flags]` | record any kind (R1 to R3) |
 | `koto decisions record <name> --with-data <json>` | today's form, recorded as `judgment` |
-| `koto decisions list [<name>] [--session <id> [--received]] [--subject ...] [--kind ...] [--decider-kind ...] [--since ...] [--until ...]` | filtered listing, oldest first, each with in-effect status (R19) |
+| `koto decisions list [<name>] [--session <id> [--received]] [--subject ...] [--kind ...] [--decider-kind ...] [--run-mode ...] [--dispatch-id ...] [--instructions-digest ...] [--since ...] [--until ...]` | filtered listing, oldest first, each with in-effect status (R19) |
 | `koto decisions show <id>` | one decision, its reversal and its affected `basis` dependents (R15) |
 | `koto decisions reverse <id> [--compensating <url>] [--replacement <outcome>] [decider flags]` | record a reversal subject to R12 and R13 |
 | `koto decisions report --since <t> --until <t>` | the R20 tables and list |
@@ -563,7 +563,7 @@ Commands (flags indicative; names resolve against the clap tree once built):
 
 Shared decider flags: `--by session|person:<handle>|check:<name>`,
 `--surface terminal|forge|relay`, `--link <https-url>`, `--agent <id|main>`,
-`--run-mode attended|unattended`, `--confidence high|medium|low`, `--basis
+`--run-mode attended|unattended`, `--basis
 <id>` (repeatable), `--evidence <pointer>` (repeatable), `--reason <text>`.
 Handed lineage flags: `--dispatched-by`, `--chain-file`,
 `--instructions-digest`, `--dispatch-id`. All output is JSON.
