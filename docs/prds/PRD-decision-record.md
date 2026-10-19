@@ -193,13 +193,13 @@ time anyone above it wants to question them.
   | `accept` of a document or plan | repository, path, commit |
   | `accept` of a plan step | repository, plan path, step identifier, commit |
   | `accept` of a test change | repository, path or paths, commit |
-  | `accept` of a request's intent | the koto request identifier |
+  | `accept` of a request's intent | where the intent lives (a koto request identifier, a repository path, or a forge issue), plus an optional link to the ticket or alert it was drafted from |
   | `merge` | repository, pull request number, merged head commit |
   | `gate-pass` | workflow (koto session name), state, gate |
   | `escalate` | a question identifier and text, and the recipient (a session or a person) |
   | `decline-escalation` | a question identifier and text |
   | `judgment` | what was judged, as free text plus an optional pointer |
-  | `verdict` | what was judged, and at least one pointer to the evidence judged |
+  | `verdict` | what was judged, at least one pointer to the evidence judged, and, when the verdict is on a change or a release, the repository and the commit judged |
   | `reverse` | the identifier of the decision it overrules |
   | `refused` | the attempted kind and subject, and the reason for refusal |
 
@@ -249,7 +249,9 @@ time anyone above it wants to question them.
   Without one, the decider is the entering session and the reported person
   is kept as a handed note. koto stores links and never fetches them.
 - **R8.** A decision records the run mode (`attended`, `unattended` or
-  `unknown`), as handed by the caller and `unknown` when not given,
+  `unknown`): `observed` when the agent harness reports whether its session
+  is attended, otherwise as handed by the caller, and `unknown` when neither
+  gives it,
   separately from who the decider is, so an agent's decision in an
   unattended run is never read as a person's confirmation. R19 filters on
   it.
@@ -344,7 +346,9 @@ time anyone above it wants to question them.
   - `escalate`: the question is withdrawn from its recipient.
   - `decline-escalation`: the question counts as escalated to the reverser.
   - `judgment` and `verdict`: the call or verdict no longer stands. The
-    reversal may carry the outcome that replaces it.
+    reversal may carry the outcome that replaces it and, for a verdict that
+    let a release through, a pointer to the compensating action (a
+    rollback), or a note that none exists yet.
 
 **Every gate pass has a decider**
 
@@ -359,6 +363,13 @@ time anyone above it wants to question them.
   command writes today, and records a `refused` decision. Otherwise the
   command's existing records and its decision are written together or not
   at all.
+- **R16a.** Where a team declares who may decide at a gate, a pass whose
+  decider is none of the declared deciders is refused and recorded as
+  `refused`, whether the decider was named or defaulted. This rule takes
+  effect when such declarations exist; until then no gate has declared
+  deciders and R16 alone applies. A person passing a gate from inside an
+  agent's session names themselves with `--by person:<handle>`; otherwise the
+  pass is recorded as the session's, marked `defaulted`.
 
 **Durability, access and reading**
 
@@ -383,7 +394,8 @@ time anyone above it wants to question them.
   - the run mode;
   - the dispatch identifier or instructions digest the decider acted under,
     so a coordinator can find every decision made under one set of
-    instructions when those instructions turn out to be wrong.
+    instructions when those instructions turn out to be wrong;
+  - whether the decider was `defaulted`.
 
   Every result says whether the decision is in effect or reversed. Results
   are ordered by time, oldest first, with the identifier breaking ties. A
@@ -396,7 +408,8 @@ time anyone above it wants to question them.
     as of the report, as a table of kind by decider kind;
   - the reversals recorded in the window, as a table of the reversed
     decision's kind by its decider kind;
-  - each reversed decision, listed with its reversal.
+  - each reversed decision, listed with its reversal;
+  - for `gate-pass` decisions, how many had a `defaulted` decider.
 - **R21.** A decision can carry evidence pointers:
   - to records the agent harness keeps about the same moment (the harness's
     session identifier, a tool-call identifier, and the agent identifier
@@ -482,6 +495,11 @@ time anyone above it wants to question them.
   the session has been reclaimed.
 - [ ] Two decisions recorded in one run have different identifiers, and a
   decision recorded with a reason returns that reason.
+- [ ] A `verdict` on a change records and lists the repository and commit
+  judged; recording a verdict on a change without a commit is refused with an
+  error naming the field.
+- [ ] An `accept` of a request's intent recorded with a forge issue as its
+  location and a link to its source ticket lists both.
 - [ ] An `accept` recorded with outcome `rejected` lists with that outcome.
   Recording a decision with a kind or outcome outside R1, or a `verdict`
   with no evidence pointer, is refused with an error naming the field.
@@ -524,6 +542,8 @@ time anyone above it wants to question them.
   `session` and run mode `unattended`, and a decision recorded with no run
   mode returns `unknown`. Listing filtered by run mode `unattended` returns
   the first and not the second.
+- [ ] A decision recorded where the harness reports its session as attended,
+  with no run mode handed, records run mode `attended` labelled `observed`.
 - [ ] Listing filtered by a dispatch identifier, and by an instructions
   digest, each returns exactly the decisions recorded under it from a
   fixture of known decisions.
@@ -537,6 +557,9 @@ time anyone above it wants to question them.
   the merge from its own session. Each reversal has decider kind `session`
   naming the coordinator, its own authority, and the original's identifier.
   Each original then lists as `reversed`.
+- [ ] Reversing a `verdict` that let a release through, with a rollback
+  link, stores the link; without one, it records that no compensating action
+  exists yet.
 - [ ] Reversing the merge with a revert pull request link stores the link.
   Reversing a merge without one records that no compensating change exists.
 - [ ] Reversing an acceptance that a later acceptance names in its `basis`
@@ -584,7 +607,8 @@ time anyone above it wants to question them.
 - [ ] `koto overrides record`, `koto next --to` past an unmet gate, and `koto
   decider answer` with a passing answer, each run with no decider named, each
   record a `gate-pass` whose decider is the observed session marked
-  `defaulted`.
+  `defaulted`. Listing filtered on `defaulted` returns exactly those three,
+  and a pass recorded with `--by person:<handle>` is not among them.
 - [ ] The same three commands run with the harness session identifier unset
   and no decider named are each refused. The error names the missing
   decider, the workflow's state is unchanged, and a `refused` decision is
@@ -605,7 +629,8 @@ time anyone above it wants to question them.
   decider-kind table whose cells match the fixture. It also counts a
   reversal recorded in the second month of a first-month decision under the
   reversals recorded in the window, in the cell of that decision's kind and
-  decider kind.
+  decider kind. Its count of `gate-pass` decisions with a `defaulted`
+  decider matches the fixture.
 - [ ] A decision recorded with a harness tool-call identifier returns that
   identifier and contains no copied harness content.
 
@@ -654,11 +679,15 @@ time anyone above it wants to question them.
 - **On whose behalf a decision was made.** Recording the person a session was
   acting for at the top of its chain is a later extension built on this
   record.
-- **Rules about who may decide.** Requiring a person at a point, forbidding a
-  session from accepting its own work, and the settings that narrow
-  authority are policy layers that read this record later. This record says
-  who decided and under what authority; R12's matching only decides who may
-  overrule.
+- **Rules about who may decide.** Requiring a person at a point, and the
+  settings that narrow authority, are policy layers that read this record
+  later. Excluding the author from a decision is one such setting, chosen per
+  decision point: off at the solo end, where an authoring session may accept
+  its own work when its authority covers it, and on at the strict end, where
+  "non-author" means a decider in a different session. Later separation-of-duties
+  work enforces it by reading this record's decider and subject. This record
+  says who decided and under what authority; R12's matching only decides who
+  may overrule.
 - **Record-health instruments.** Detecting a workspace that stopped
   recording, or auditing whether escalations were warranted, read this record
   later.
@@ -681,6 +710,9 @@ time anyone above it wants to question them.
 
 ## Known Limitations
 
+- R16a, the refusal at gates with declared deciders, has no acceptance
+  criterion here because nothing declares deciders yet. It gets one when
+  declarations exist.
 - An `observed` session identifier can still be forged by anything running
   as the operator. The record makes misattribution visible (R6), not
   impossible.
@@ -706,8 +738,8 @@ time anyone above it wants to question them.
   would break about fifty call sites across koto's plugin and the shirabe
   plugin and add an argument that records nothing koto can't observe.
   Defaulting keeps every pass attributed and marks it `defaulted`, and the
-  refusal still fires where no decider can be established. See the open item
-  below on what this does to one acceptance scenario.
+  refusal still fires where no decider can be established. The project
+  owner settled this; see the settled items below.
 - **Reversal is a new decision, never an edit.** Letting the latest record
   win is what the findings ledger and several koto paths do today, and it
   erases who overturned what. Prior art from approval systems and delegation
@@ -735,27 +767,24 @@ time anyone above it wants to question them.
   vocabulary; the shirabe plugin and other workflows write to it where they
   already decide, and render their own views from it.
 
-### Open items for the project owner
+### Items the project owner settled
 
-These are recorded here rather than as open questions because the
-requirements above are written to hold either way. Each is with the owner.
+The project owner settled these on 2026-10-19; each was open in an earlier
+draft of this PRD.
 
-- **Literal refusal of an unnamed gate pass.** The planning that asked for
-  this feature includes a scenario where a session tries to get past a gate
-  without naming a decider and sees it refused. Read literally, R16 doesn't
-  meet it: a session that names nobody is attributed to itself, marked
-  `defaulted`, and allowed. The amendment that fits R16 reads "every gate
-  pass records its decider, and a pass whose decider can't be established is
-  refused". If the owner keeps the literal reading instead, R16 changes to
-  require an explicit decider, and the defaulting trade-off above is
-  dropped.
-- **Who may accept their own work.** Some planning above this PRD expects
-  the decider at acceptance and merge to be someone other than the author.
-  This PRD follows the framing that an authoring session may accept its own
-  work when its authority covers it, and leaves that expectation to the
-  policy layer named in Out of Scope.
-- **Further consumers.** Review verdicts bound to a pull request head,
-  release-time verdicts and rollbacks beyond the production verdict,
-  accepting a ticket's intent, and reverting a change to how strict a
-  decision point is are candidate consumers. The kinds in R1 cover them, but
-  none adds a requirement until the owner decides.
+- **Gate passes with no named decider.** Decided: keep R16's default to the
+  observed session, marked `defaulted`, with `defaulted` as a filter (R19)
+  and a report column (R20), and add R16a's refusal at gates with declared
+  deciders. The acceptance scenario the planning above this PRD gave, a pass
+  naming no decider being refused, is restated as: every gate pass records
+  its decider, and a pass whose decider can't be established is refused.
+- **Who may accept their own work.** Decided: excluding the author is a
+  setting per decision point, off at the solo end and on at the strict end,
+  enforced by later separation-of-duties work (see Out of Scope). This record
+  doesn't encode it.
+- **Further consumers.** Decided: review verdicts record the repository and
+  commit judged, and intent acceptance records where the intent lives and an
+  optional link to its source (R2). Release-time verdicts, rollbacks and
+  reverting a change to how strict a decision point is need nothing new: a
+  release gate pass outside a koto workflow is a `verdict` on the release's
+  repository and commit, and its reversal carries the rollback (R15).

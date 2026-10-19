@@ -349,7 +349,12 @@ The three gate-passing commands share a resolver: a handed `--by` wins;
 otherwise the observed `CLAUDE_CODE_SESSION_ID`, marked `defaulted`;
 otherwise exit non-zero with `decider_missing`, write none of the command's
 records, and record a `refused` decision. The resolver runs before the gate
-is touched.
+is touched. Once a team can declare who may decide at a gate, the resolver
+also checks the resolved decider against that declaration and refuses a pass
+by anyone else (R16a); until declarations exist, that check finds no
+declared deciders and changes nothing, so no code for it is written now.
+People passing a gate from inside an agent's session are told, in
+koto-user, to pass `--by person:<handle>`.
 
 `koto next` already loads the session's own gate-pass decision identifiers,
 rewinds and re-passes from its events. Beside the cancelled-workflow check in
@@ -555,16 +560,21 @@ Commands (flags indicative; names resolve against the clap tree once built):
 |---|---|
 | `koto decisions record --kind <k> --outcome <o> <subject flags> [decider flags]` | record any kind (R1 to R3) |
 | `koto decisions record <name> --with-data <json>` | today's form, recorded as `judgment` |
-| `koto decisions list [<name>] [--session <id> [--received]] [--subject ...] [--kind ...] [--decider-kind ...] [--run-mode ...] [--dispatch-id ...] [--instructions-digest ...] [--since ...] [--until ...]` | filtered listing, oldest first, each with in-effect status (R19) |
+| `koto decisions list [<name>] [--session <id> [--received]] [--subject ...] [--kind ...] [--decider-kind ...] [--run-mode ...] [--dispatch-id ...] [--instructions-digest ...] [--defaulted] [--since ...] [--until ...]` | filtered listing, oldest first, each with in-effect status (R19) |
 | `koto decisions show <id>` | one decision, its reversal and its affected `basis` dependents (R15) |
-| `koto decisions reverse <id> [--compensating <url>] [--replacement <outcome>] [decider flags]` | record a reversal subject to R12 and R13 |
-| `koto decisions report --since <t> --until <t>` | the R20 tables and list |
+| `koto decisions reverse <id> [--compensating <url>] [--replacement <outcome>] [decider flags]` | record a reversal subject to R12 and R13; `--compensating` takes a revert pull request for a merge or a rollback for a release verdict |
+| `koto decisions report --since <t> --until <t>` | the R20 tables, the count of defaulted gate passes, and the list |
 | `koto decisions import <source>` | idempotent import (R24), first format the coordinator's decision table |
 
 Shared decider flags: `--by session|person:<handle>|check:<name>`,
 `--surface terminal|forge|relay`, `--link <https-url>`, `--agent <id|main>`,
 `--run-mode attended|unattended`, `--basis
 <id>` (repeatable), `--evidence <pointer>` (repeatable), `--reason <text>`.
+Subject flags include `--repo` and `--commit` (required on a `verdict` about
+a change or release) and, for intent acceptance, `--intent-location` and
+`--source-link`. When the harness sets `CLAUDE_CODE_SESSION_ATTENDED`, koto
+records the run mode from it as `observed`; `--run-mode` is the handed
+fallback.
 Handed lineage flags: `--dispatched-by`, `--chain-file`,
 `--instructions-digest`, `--dispatch-id`. All output is JSON.
 

@@ -68,6 +68,8 @@ Recording and validation
 - [ ] All `koto decisions` output is JSON.
 
 Reading
+- [ ] A `verdict` on a change records and lists the repository and commit judged, and one recorded without a commit is refused naming the field; an `accept` of a request's intent recorded with a forge issue as its location and a source-ticket link lists both. (PRD: Reading an unattended run)
+- [ ] Listing filtered on `defaulted` returns exactly the decisions whose decider is marked `defaulted`, and the report's count of `gate-pass` decisions with a `defaulted` decider matches a fixture. (PRD: Gate passes, 1st; Querying and reporting, 4th)
 - [ ] `koto decisions show <id>` reads only the month file the identifier names plus `reversals.jsonl`, and reports whether the decision is in effect or reversed (with the reversal's identifier when reversed).
 - [ ] Listing filtered by subject, by kind, by decider kind and by a time window each returns exactly the matching decisions from a fixture of known decisions, ordered oldest first with the identifier breaking ties, each with its in-effect or reversed status. (PRD: Querying and reporting, 1st)
 - [ ] Unwindowed filters use a literal byte search across month files and parse only matching lines.
@@ -100,6 +102,7 @@ Decider and agent
 - [ ] A decision recorded from a session whose acting agent can't be established lists the agent as `unknown`, never `main`. (PRD: Reading an unattended run, 5th)
 - [ ] `KOTO_AGENT_ID=main` records agent `main` labelled `observed`; `--agent <id>` records it `handed`; when both are given and differ, both values are kept.
 - [ ] A `KOTO_AGENT_ID` value that fails koto's identifier pattern is recorded as `unknown`.
+- [ ] With `CLAUDE_CODE_SESSION_ATTENDED` set by the harness and no `--run-mode`, a decision records the run mode from it labelled `observed`; `--run-mode` is labelled `handed`. (PRD: Identity labels and chains)
 - [ ] With no `--by`, the decider is the observed session marked `defaulted`; with `--by` it is used as given, labelled `handed`, and not marked `defaulted`; with neither, the resolver returns `decider_missing`.
 - [ ] A decision recorded with run mode `unattended` returns decider kind `session` and run mode `unattended`, a decision recorded with no run mode returns `unknown`, and listing filtered by run mode `unattended` returns the first and not the second. (PRD: Identity labels and chains, 6th)
 - [ ] Listing filtered by a dispatch identifier, and by an instructions digest, each returns exactly the decisions recorded under it from a fixture of known decisions. (PRD: Identity labels and chains, 7th)
@@ -175,6 +178,7 @@ Engine enforcement
 - [ ] After a gate pass is reversed while its workflow still exists and has moved one state past the gate, `koto next` on that workflow refuses to advance, leaves the state unchanged, and reports a `decision_reversed` blocking condition. After `koto rewind` to the gated state the block is gone. In a second run, a new `gate-pass` for that gate recorded by the reverser clears it instead. (PRD: Overruling, 4th)
 - [ ] A `gate-pass` for the same gate recorded by a decider R12 would not let reverse the reverser does not clear the block; a `verified` reversal is not cleared by a `gate-pass` whose match over the reverser is only `asserted`.
 - [ ] When the gate was passed several times, the block applies only to the one pass the reversal names.
+- [ ] Reversing a release `verdict` with `--compensating <rollback link>` stores the link; without it, the reversal records that no compensating action exists yet. (PRD: Overruling)
 - [ ] The blocking condition carries only the reversal's identifier, kind, standing and time, never its reason, handle or link.
 - [ ] A session with no reversed gate passes does not open month files on `koto next` (the check reads `reversals.jsonl` only).
 - [ ] An unreadable line in `reversals.jsonl` makes `koto next` return a `decision_store_unreadable` blocking condition rather than treating any pass as not reversed.
@@ -253,7 +257,7 @@ Hook
 - [ ] With the hook installed, a decision recorded from a sub-agent's koto call lists that agent labelled `observed`.
 
 Skills
-- [ ] koto-user documents `koto decisions record --kind`, `list` filters including `--received`, `show`, `reverse`, `report` and `import`, the shared decider flags and the handed lineage flags, matching the clap tree from <<ISSUE:4>>.
+- [ ] koto-user documents `koto decisions record --kind`, `list` filters including `--received`, `show`, `reverse`, `report` and `import`, the shared decider flags and the handed lineage flags, matching the clap tree from <<ISSUE:4>>, and tells a person passing a gate from inside an agent's session to use `--by person:<handle>`.
 - [ ] koto-user explains that `koto overrides record`, `koto next --to` past an unmet gate and `koto decider answer` record a `gate-pass` decision, default the decider to the observed session, and fail with `decider_missing` when none can be established.
 - [ ] koto-user explains the `decision_reversed` and `decision_store_unreadable` blocking conditions and how to clear the former (rewind, or a new `gate-pass` by a decider with standing).
 - [ ] koto-author and koto-adhoc are updated wherever they show gate-passing commands or decisions, and any example that passes a gate still runs.
