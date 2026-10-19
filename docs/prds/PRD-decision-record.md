@@ -19,7 +19,8 @@ goals: |
   the original reads as no longer in effect everywhere the record is read.
   The partial records that exist today write to it or read from it instead
   of keeping their own answer.
-upstream: docs/briefs/BRIEF-decision-record.md
+absorbed:
+  - docs/briefs/BRIEF-decision-record.md
 ---
 
 # PRD: The decision record
@@ -27,6 +28,42 @@ upstream: docs/briefs/BRIEF-decision-record.md
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-decision-record](docs/briefs/BRIEF-decision-record.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+Dispatched agents, and the agents they start, accept documents and plan
+steps, merge, get past gates, decide whether to escalate, and settle judgment
+calls while nobody watches. Often the session that wrote something also
+accepts it, which is legitimate when it holds the authority. What's missing
+is any way to tell afterwards who made each decision (a session and the agent
+within it, a person, or an automated check), what authority they held, or how
+to overrule it so the rest of the toolkit honours the overrule. The partial
+records koto and the shirabe plugin keep each answer "who decided"
+differently, and a worker's decisions usually disappear with its session.
+
+The outcome this feature exists for: the person or agent that dispatched a
+session opens the record after the session is gone and reads every decision
+it made or received, with its kind, decider and authority. When they
+disagree, they overrule it with a decision of their own, the original visibly
+no longer stands, and work built on decisions reads one record instead of
+each keeping its own.
+
+The journeys that frame it, carried as the User Stories below: a coordinator
+audits an unattended run that accepted, passed a gate and merged; a
+maintainer decides at an acceptance point and is named without an account;
+the coordinator overrules all three decisions; a worker escalates one
+question, keeps another and settles a judgment call; an anonymous gate pass
+is turned away; a reporting tool counts overrules by kind.
+
+The boundary, carried as the Requirements and Out of Scope below: in are the
+decision kinds and what reversing each means, the two-level decider and
+people without accounts, the authority and dispatch chain, a record that
+outlives its session, bringing the existing records into agreement, and
+refusing an unattributable gate pass. Out are on whose behalf a decision was
+made, rules about who may decide, record-health instruments, undoing effects
+outside koto, cross-machine durability and copying the harness's records.
 
 ## Problem Statement
 
