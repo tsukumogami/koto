@@ -11,6 +11,17 @@
         "type": "command",
         "command": "WORKFLOWS=$(koto workflows 2>/dev/null); if [ \"$WORKFLOWS\" != \"[]\" ] && [ -n \"$WORKFLOWS\" ] && echo \"$WORKFLOWS\" | grep -qE '^\\[.*\\]$'; then echo 'Active koto workflow detected. Run `koto next <name>` to resume.'; fi"
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/pre-tool-use-agent-id.sh\""
+          }
+        ]
+      }
     ]
   }
 }

@@ -27,6 +27,7 @@ default list and passes the gate without the checks this file names for them: ru
   - `P=plugins/koto-skills/.claude-plugin/plugin.json && test -f "$P" && jq -e ".name and (.name | length > 0)" "$P" >/dev/null && jq -e ".version and (.version | length > 0)" "$P" >/dev/null && jq -e ".skills and (.skills | length > 0)" "$P" >/dev/null`
   - `M=.claude-plugin/marketplace.json && test -f "$M" && jq -e ".name and (.name | length > 0)" "$M" >/dev/null && jq -e ".owner and (.owner | length > 0)" "$M" >/dev/null && jq -e ".plugins and (.plugins | length > 0)" "$M" >/dev/null`
   - `cargo build --release && K="${CARGO_TARGET_DIR:-target}/release/koto" && { test -x "$K" || { echo "no koto binary at $K" >&2; exit 1; }; } && T=$(find plugins/koto-skills/skills/ -path "*/koto-templates/*.md" ! -name "*.mermaid.md" -type f) && test -n "$T" && printf "%s\n" "$T" | xargs -r -n1 "$K" template compile` (unlike CI: fails on an empty list, so it can't pass having compiled nothing, and finds the binary through `CARGO_TARGET_DIR`)
+  - `cargo build --release && KOTO_BIN="${CARGO_TARGET_DIR:-target}/release/koto" bash plugins/koto-skills/hooks/pre-tool-use-agent-id_test.sh`
   - `cargo build --release -q && ( K="${CARGO_TARGET_DIR:-target}/release" && { test -x "$K/koto" || { echo "no koto binary at $K/koto" >&2; exit 1; }; } && S=$(mktemp -d) && mkdir -p "$S/mock" && printf '{"schema_version":1,"workflow":"mock","template_hash":"abc123","created_at":"2025-01-01T00:00:00Z"}\n{"seq":1,"timestamp":"2025-01-01T00:00:00Z","type":"workflow_initialized","payload":{"template_path":"mock","variables":{}}}\n{"seq":2,"timestamp":"2025-01-01T00:00:00Z","type":"transitioned","payload":{"from":null,"to":"test-state","condition_type":"auto"}}\n' > "$S/mock/koto-mock.state.jsonl" && HOOK_CMD=$(jq -r ".hooks.Stop[0].command" plugins/koto-skills/hooks.json) && export PATH="$(cd "$K" && pwd):$PATH" && export KOTO_SESSIONS_BASE="$S" && eval "$HOOK_CMD" 2>/dev/null | grep -q "Active koto workflow detected" && export KOTO_SESSIONS_BASE=$(mktemp -d) && test -z "$(eval "$HOOK_CMD" 2>/dev/null || true)" )` (unlike CI, finds the binary through `CARGO_TARGET_DIR` and fails if none was built, so it can't test an installed koto)
 - `docs/**` -> all of:
   - `cargo test --test doc_names` and `cargo test --lib shipped_spec` (the only tests that read `docs/`)
@@ -69,7 +70,7 @@ default list and passes the gate without the checks this file names for them: ru
 - `.github/**` (except `.github/pull_request_template.md` and the two workflows in the previous
   entry); `install.sh`; `scripts/**` (except `scripts/check-evals-exist.sh` and the three
   run-evals files above); `.release/**`; `.goreleaser.yaml`; `.cargo/**`;
-  `plugins/koto-skills/hooks/*.sh`; `.claude/settings.json` -> no local check exists. Still run
+  `plugins/koto-skills/hooks/*.sh` (the agent-id hook has its test in the `plugins/**` entry, but other hooks have none); `.claude/settings.json` -> no local check exists. Still run
   every other selected command; if one fails the outcome is failed, otherwise it is cannot-verify:
   no command here checks what these files do and most are not read by PR CI either, so the run
   stops for a person to check them. (shirabe's schema has no form for such an entry yet:

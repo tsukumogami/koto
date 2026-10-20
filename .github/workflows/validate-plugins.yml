@@ -105,6 +105,10 @@ jobs:
             exit 1
           fi
 
+      # Copied into .claude/shirabe-extensions/work-on.md (the /work-on verification map); change both together.
+      - name: Test PreToolUse agent-id hook
+        run: KOTO_BIN="$PWD/target/release/koto" bash plugins/koto-skills/hooks/pre-tool-use-agent-id_test.sh
+
   schema-validation:
     name: Schema Validation
     if: ${{ github.event.pull_request.draft != true }}

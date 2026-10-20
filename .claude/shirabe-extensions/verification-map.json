@@ -9,7 +9,8 @@
     "doc-names": {"run": ["cargo", "test", "--locked", "--test", "doc_names"], "timeout_secs": 3600},
     "shipped-spec": {"run": ["cargo", "test", "--locked", "--lib", "shipped_spec"], "timeout_secs": 3600},
     "evals-exist": {"run": ["bash", "scripts/check-evals-exist.sh"]},
-    "run-evals-test": {"run": ["bash", "scripts/run-evals_test.sh"]}
+    "run-evals-test": {"run": ["bash", "scripts/run-evals_test.sh"]},
+    "hook-agent-id": {"run": ["bash", "plugins/koto-skills/hooks/pre-tool-use-agent-id_test.sh"]}
   },
   "entries": [
     {
@@ -18,7 +19,7 @@
     },
     {
       "paths": ["plugins/**", ".claude-plugin/**", "scripts/check-evals-exist.sh"],
-      "commands": ["doc-names", "evals-exist"]
+      "commands": ["doc-names", "evals-exist", "hook-agent-id"]
     },
     {
       "paths": ["docs/**"],
