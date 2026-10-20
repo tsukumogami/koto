@@ -17,7 +17,11 @@
 #     leaves the command unchanged, so koto records `unknown`.
 #   - No `agent_id`, but the payload carries the `agent_type` key: the
 #     harness is reporting agent context and says this call is not from a
-#     sub-agent, so it is the main agent. Set KOTO_AGENT_ID=main.
+#     sub-agent, so it is the main agent. Set KOTO_AGENT_ID=main. The
+#     harness's hook reference says a sub-agent's tool call always carries
+#     `agent_id`, and that `agent_type` is sent for a session started with
+#     a named agent; no field names the main agent outright, so this is the
+#     only payload that says so.
 #   - Neither key: the payload doesn't say (an older harness sends neither
 #     for any agent), so set nothing. koto records `unknown` rather than
 #     over-claim `main`.
@@ -25,6 +29,11 @@
 # The value is single-quoted, and since it has passed the pattern it holds
 # no quote to escape. It is exported ahead of the whole command, so it
 # reaches koto in a pipeline or after `cd dir &&` as well as at the start.
+# An inline `KOTO_AGENT_ID=... cmd` prefix would reach only the first simple
+# command. The harness runs each Bash call with a fresh environment, so the
+# export doesn't carry over to a later call; a harness that kept one shell's
+# environment across calls could show koto a stale value on a call this hook
+# leaves unchanged.
 #
 # The rewritten input goes back as hookSpecificOutput.updatedInput with no
 # permissionDecision, so the call still goes through the normal permission
