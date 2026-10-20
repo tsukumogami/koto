@@ -11,6 +11,7 @@ pub mod decider;
 pub mod decider_answer;
 pub mod decider_port;
 pub mod decisions;
+pub mod disputes;
 pub mod init_child;
 pub mod init_entry;
 pub mod next;
@@ -315,6 +316,12 @@ pub enum Command {
     Overrides {
         #[command(subcommand)]
         subcommand: overrides::OverridesSubcommand,
+    },
+
+    /// Finding dispute recording (moves nothing)
+    Disputes {
+        #[command(subcommand)]
+        subcommand: disputes::DisputesSubcommand,
     },
 
     /// Configuration management subcommands
@@ -2150,6 +2157,10 @@ pub fn run(app: App) -> Result<()> {
                     overrides::handle_overrides_list(&backend, name)
                 }
             }
+        }
+        Command::Disputes { subcommand } => {
+            let backend = build_backend()?;
+            disputes::handle(&backend, subcommand)
         }
         Command::Config { subcommand } => handle_config(subcommand),
         Command::Decider { subcommand } => match subcommand {
@@ -6508,6 +6519,7 @@ fn handle_next(
             let final_state = &advance_result.final_state;
             let advanced = advance_result.advanced;
             let attempts = advance_result.attempts.clone();
+            let advisories = advance_result.advisories.clone();
 
             let final_template_state = match compiled.states.get(final_state) {
                 Some(s) => s,
@@ -7239,6 +7251,9 @@ fn handle_next(
             // response with blocking conditions
             // (DESIGN-koto-failure-reporting.md, Decision 3).
             next_types::attach_attempts(&mut envelope, attempts.as_ref())?;
+            // A passing check's warnings, after `attempts` and only when
+            // there are any.
+            next_types::attach_advisories(&mut envelope, &advisories)?;
 
             println!(
                 "{}",

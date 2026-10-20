@@ -680,12 +680,31 @@ fn check_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.visit_attempt",
             "koto.check.rule_count",
             "koto.check.rule_counts_truncated",
+            "koto.check.finding_count",
+            "koto.check.findings_truncated",
             "koto.check.duration_ms",
             "koto.poll.status",
             "koto.check.unanswered_count",
             "koto.check.error",
             "koto.decider.awaiting_count",
             "koto.decider.agent_answered_count",
+        ],
+        "check_finding" => &[
+            "koto.state",
+            "koto.check.name",
+            "koto.attempt",
+            "koto.visit_attempt",
+            "koto.rule.id",
+            "koto.finding.level",
+            "koto.finding.count",
+        ],
+        "check_disputed" => &[
+            "koto.state",
+            "koto.check.name",
+            "koto.attempt",
+            "koto.visit_attempt",
+            "koto.rule.id",
+            "koto.dispute.source",
         ],
         "check_rule" => &[
             "koto.state",
@@ -3644,4 +3663,483 @@ fn session_started_and_driver_seen_carry_the_drivers_lineage_stamp() {
         seen[1].get("koto.lineage.dispatch.id").is_none(),
         "a driver with no entry gets no stamp"
     );
+}
+
+// ----- Finding and dispute records -----
+
+/// A finding as a check event logs it, with a planted message, path and
+/// rule reference that must never reach the journal.
+fn finding(rule_id: &str, level: &str) -> crate::findings::Finding {
+    serde_json::from_value(serde_json::json!({
+        "rule_id": rule_id,
+        "level": level,
+        "message": "PLANTED-MESSAGE",
+        "path": "PLANTED/path.rs",
+        "line": 3,
+        "rule_ref": "https://example.org/PLANTED",
+        "message_source": "check",
+    }))
+    .unwrap()
+}
+
+fn with_findings_logged(
+    mut check: CheckEventFields,
+    findings: Vec<crate::findings::Finding>,
+    truncated: bool,
+) -> CheckEventFields {
+    check.findings = findings;
+    check.findings_truncated = truncated;
+    check
+}
+
+fn assert_no_finding_content(f: &Fixture) {
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    for planted in ["PLANTED", "message", "rule_ref"] {
+        assert!(!raw.contains(planted), "{planted} in {raw}");
+    }
+}
+
+#[test]
+fn a_passing_gate_writes_one_check_finding_per_rule_and_level_and_no_check_rule() {
+    let f = session_in_a();
+    reset_for_test();
+    let check = with_findings_logged(
+        stamped(3, 2, None),
+        vec![
+            finding("A", "error"),
+            finding("B", "warning"),
+            finding("A", "error"),
+        ],
+        false,
+    );
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event("a", "lint", "passed", command_output(0), check, None),
+    );
+    // The evaluation and its findings are one batch.
+    assert_eq!(batches_for_test(), (1, 0));
+    let c = check_records(&f.journal());
+    assert_eq!(
+        kinds(&c),
+        vec!["check_evaluated", "check_finding", "check_finding"]
+    );
+    assert_eq!(c[0]["koto.check.outcome"], "passed");
+    assert_eq!(c[0]["koto.check.finding_count"], 3);
+    assert_eq!(c[0]["koto.check.rule_count"], 0);
+    assert!(c[0].get("koto.check.findings_truncated").is_none());
+    let pairs: Vec<(&str, &str, u64)> = c[1..]
+        .iter()
+        .map(|r| {
+            (
+                r["koto.rule.id"].as_str().unwrap(),
+                r["koto.finding.level"].as_str().unwrap(),
+                r["koto.finding.count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(pairs, vec![("A", "error", 2), ("B", "warning", 1)]);
+    for r in &c[1..] {
+        assert_eq!(r["koto.seq"], c[0]["koto.seq"], "{r}");
+        assert_eq!(r["koto.visit.seq"], c[0]["koto.visit.seq"], "{r}");
+        assert_eq!(r["koto.state"], "a");
+        assert_eq!(r["koto.check.name"], "lint");
+        assert!(r.get("koto.check").is_none(), "{r}");
+        assert_eq!(r["koto.attempt"], 3);
+        assert_eq!(r["koto.visit_attempt"], 2);
+    }
+    assert_no_finding_content(&f);
+}
+
+#[test]
+fn a_failing_gate_keeps_its_check_rule_and_adds_a_check_finding() {
+    let f = session_in_a();
+    let check = with_findings_logged(
+        stamped(1, 1, Some(counts(&[("E501", 1, 1)]))),
+        vec![finding("E501", "error")],
+        false,
+    );
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event("a", "lint", "failed", command_output(1), check, None),
+    );
+    let c = check_records(&f.journal());
+    assert_eq!(
+        kinds(&c),
+        vec!["check_evaluated", "check_rule", "check_finding"]
+    );
+    let keys: BTreeSet<String> = c[1].as_object().unwrap().keys().cloned().collect();
+    let expected: BTreeSet<String> = RELAY_FIELDS
+        .iter()
+        .chain(check_kind_fields("check_rule"))
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(keys, expected, "check_rule's fields are unchanged");
+    assert_eq!(c[1]["koto.rule.id"], "E501");
+    assert_eq!(c[1]["koto.rule.visit_count"], 1);
+    assert_eq!(c[2]["koto.rule.id"], "E501");
+    assert_eq!(c[2]["koto.finding.level"], "error");
+    assert_eq!(c[2]["koto.finding.count"], 1);
+    assert_eq!(c[0]["koto.check.finding_count"], 1);
+}
+
+#[test]
+fn a_passing_gate_with_no_findings_writes_a_zero_count_and_no_check_finding() {
+    let f = session_in_a();
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event(
+            "a",
+            "lint",
+            "passed",
+            command_output(0),
+            stamped(1, 1, None),
+            None,
+        ),
+    );
+    let c = check_records(&f.journal());
+    assert_eq!(kinds(&c), vec!["check_evaluated"]);
+    assert_eq!(c[0]["koto.check.finding_count"], 0);
+    assert!(c[0].get("koto.check.findings_truncated").is_none());
+}
+
+/// Sixty findings reported, ten `error` and fifty `info`: the event logs
+/// fifty (koto's log cap keeps the errors), and the journal writes at most
+/// fifty `check_finding` records with every error pair first.
+#[test]
+fn findings_cut_at_the_log_cap_keep_every_error_pair_and_say_so() {
+    let f = session_in_a();
+    let reported: Vec<crate::findings::Finding> = (0..50)
+        .map(|i| finding(&format!("I{i:02}"), "info"))
+        .chain((0..10).map(|i| finding(&format!("E{i:02}"), "error")))
+        .collect();
+    let (logged, truncated) =
+        crate::findings::cap_findings(&reported, None, crate::findings::LOG_FINDINGS_CAP);
+    assert!(truncated);
+    let check = with_findings_logged(stamped(1, 1, None), logged.clone(), truncated);
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event("a", "lint", "passed", command_output(0), check, None),
+    );
+    let c = check_records(&f.journal());
+    assert_eq!(c[0]["koto.check.finding_count"], logged.len() as u64);
+    assert_eq!(c[0]["koto.check.findings_truncated"], true);
+    let found: Vec<&serde_json::Value> =
+        c.iter().filter(|r| r["kind"] == "check_finding").collect();
+    assert!(found.len() <= 50, "{}", found.len());
+    for i in 0..10 {
+        let id = format!("E{i:02}");
+        assert!(
+            found
+                .iter()
+                .any(|r| r["koto.rule.id"] == id.as_str() && r["koto.finding.level"] == "error"),
+            "{id} missing"
+        );
+    }
+    assert!(found[..10]
+        .iter()
+        .all(|r| r["koto.finding.level"] == "error"));
+}
+
+/// An event holding more distinct pairs than the record cap still writes
+/// fifty records, levels in order and each level in first-seen order.
+#[test]
+fn more_pairs_than_the_record_cap_write_fifty_by_level() {
+    let f = session_in_a();
+    let findings: Vec<crate::findings::Finding> = (0..30)
+        .map(|i| finding(&format!("I{i:02}"), "info"))
+        .chain((0..5).map(|i| finding(&format!("X{i:02}"), "notice")))
+        .chain((0..20).map(|i| finding(&format!("W{i:02}"), "warning")))
+        .chain((0..10).map(|i| finding(&format!("E{i:02}"), "error")))
+        .collect();
+    let check = with_findings_logged(stamped(1, 1, None), findings, false);
+    commit_as(&f, None, "wf", &action_event(0, check));
+    let c = check_records(&f.journal());
+    let found: Vec<&serde_json::Value> =
+        c.iter().filter(|r| r["kind"] == "check_finding").collect();
+    assert_eq!(found.len(), 50);
+    let levels: Vec<&str> = found
+        .iter()
+        .map(|r| r["koto.finding.level"].as_str().unwrap())
+        .collect();
+    assert_eq!(&levels[..10], &["error"; 10]);
+    assert_eq!(&levels[10..30], &["warning"; 20]);
+    assert_eq!(&levels[30..], &["info"; 20]);
+    assert_eq!(found[10]["koto.rule.id"], "W00");
+    assert_eq!(found[49]["koto.rule.id"], "I19");
+    assert!(found.iter().all(|r| r["koto.check.name"] == "__action__"));
+    assert_eq!(c[0]["koto.check.finding_count"], 65);
+}
+
+/// koto's own fallback finding, whose rule id is the check's name, is a
+/// finding like any other; a pending evaluation writes none.
+#[test]
+fn the_fallback_finding_is_journaled_and_a_pending_evaluation_writes_none() {
+    let f = session_in_a();
+    let mut fallback = finding("lint", "error");
+    fallback.message_source = crate::findings::MessageSource::Koto;
+    let check = with_findings_logged(
+        stamped(1, 1, Some(counts(&[("lint", 1, 1)]))),
+        vec![fallback],
+        false,
+    );
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event("a", "lint", "failed", command_output(1), check, None),
+    );
+    let pending = with_findings_logged(
+        CheckEventFields::default(),
+        vec![finding("ci", "warning")],
+        false,
+    );
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event(
+            "a",
+            "ci",
+            "pending",
+            command_output(75),
+            pending,
+            Some(poll("pending", 1, 0)),
+        ),
+    );
+    let c = check_records(&f.journal());
+    assert_eq!(
+        kinds(&c),
+        vec![
+            "check_evaluated",
+            "check_rule",
+            "check_finding",
+            "check_pending"
+        ]
+    );
+    assert_eq!(c[2]["koto.rule.id"], "lint");
+    assert!(c[3].get("koto.check.finding_count").is_none());
+}
+
+/// A rule id outside the name shape is digested on `check_finding` as on
+/// `check_rule`, and an evaluation from before attempt numbers leaves them
+/// out of its findings too.
+#[test]
+fn finding_records_digest_odd_rule_ids_and_follow_their_evaluations_attempts() {
+    let f = session_in_a();
+    let odd = "no explicit any [x]";
+    let check = with_findings_logged(
+        CheckEventFields::default(),
+        vec![finding(odd, "warning")],
+        false,
+    );
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event("a", "lint", "passed", command_output(0), check, None),
+    );
+    let c = check_records(&f.journal());
+    assert_eq!(c[1]["koto.rule.id"], name_or_digest(odd).as_str());
+    assert!(c[1].get("koto.attempt").is_none());
+    assert!(c[1].get("koto.visit_attempt").is_none());
+}
+
+fn dispute(state: &str, gate: &str, rule_id: &str, source: &str) -> EventPayload {
+    disputed_attempt(state, gate, rule_id, source, Some(2), Some(1))
+}
+
+fn disputed_attempt(
+    state: &str,
+    gate: &str,
+    rule_id: &str,
+    source: &str,
+    attempt: Option<u64>,
+    visit_attempt: Option<u64>,
+) -> EventPayload {
+    EventPayload::FindingDisputed(crate::engine::types::FindingDispute {
+        state: state.into(),
+        gate: gate.into(),
+        rule_id: rule_id.into(),
+        reason: "PLANTED-REASON the rule misreads generated code".into(),
+        source: source.into(),
+        attempt,
+        visit_attempt,
+    })
+}
+
+#[test]
+fn a_dispute_relays_check_disputed_without_its_reason() {
+    let f = session_in_a();
+    reset_for_test();
+    commit_as(&f, None, "wf", &dispute("a", "lint", "E501", "agent"));
+    assert_eq!(batches_for_test(), (1, 0), "relayed records aren't flushed");
+    let c = check_records(&f.journal());
+    assert_eq!(kinds(&c), vec!["check_disputed"]);
+    let keys: BTreeSet<&str> = c[0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let expected: BTreeSet<&str> = RELAY_FIELDS
+        .iter()
+        .chain(check_kind_fields("check_disputed"))
+        .copied()
+        .collect();
+    assert_eq!(keys, expected);
+    assert_eq!(c[0]["koto.seq"], 3);
+    assert_eq!(c[0]["koto.visit.seq"], 2);
+    assert_eq!(c[0]["koto.state"], "a");
+    assert_eq!(c[0]["koto.check.name"], "lint");
+    assert_eq!(c[0]["koto.attempt"], 2);
+    assert_eq!(c[0]["koto.visit_attempt"], 1);
+    assert_eq!(c[0]["koto.rule.id"], "E501");
+    assert_eq!(c[0]["koto.dispute.source"], "agent");
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    for absent in ["PLANTED", "reason", "misreads"] {
+        assert!(!raw.contains(absent), "{absent} in {raw}");
+    }
+}
+
+/// A dispute carries the disputed evaluation's attempt numbers, so it joins
+/// to exactly that `check_evaluated` (same state, `koto.check` equal to its
+/// `koto.check.name`, same attempt) and not to the gate's other attempts. A
+/// dispute of an evaluation from before attempt numbers leaves them out.
+#[test]
+fn a_dispute_joins_the_evaluation_it_names_by_attempt() {
+    let f = session_in_a();
+    for attempt in 1..=3 {
+        commit_as(
+            &f,
+            None,
+            "wf",
+            &gate_event(
+                "a",
+                "lint",
+                "failed",
+                command_output(1),
+                stamped(attempt, attempt, None),
+                None,
+            ),
+        );
+    }
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &disputed_attempt("a", "lint", "E501", "agent", Some(2), Some(2)),
+    );
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &disputed_attempt("a", "lint", "E501", "person", None, None),
+    );
+    let c = check_records(&f.journal());
+    let disputes: Vec<&serde_json::Value> =
+        c.iter().filter(|r| r["kind"] == "check_disputed").collect();
+    assert_eq!(disputes.len(), 2);
+    let d = disputes[0];
+    let joined: Vec<&serde_json::Value> = c
+        .iter()
+        .filter(|r| {
+            r["kind"] == "check_evaluated"
+                && r["koto.state"] == d["koto.state"]
+                && r["koto.check"] == d["koto.check.name"]
+                && r["koto.attempt"] == d["koto.attempt"]
+                && r["koto.visit_attempt"] == d["koto.visit_attempt"]
+        })
+        .collect();
+    assert_eq!(joined.len(), 1, "{joined:?}");
+    assert_eq!(joined[0]["koto.attempt"], 2);
+    let old = disputes[1];
+    assert!(old.get("koto.attempt").is_none(), "{old}");
+    assert!(old.get("koto.visit_attempt").is_none(), "{old}");
+    assert_eq!(old["koto.dispute.source"], "person");
+}
+
+/// With the longest names koto keeps (a 255-byte session name, 128-byte
+/// state, gate, rule id and level) and the largest numbers, every finding
+/// and dispute record and the evaluation carrying the finding fields fit
+/// the line cap.
+#[test]
+fn finding_and_dispute_records_fit_the_line_cap_at_the_longest_names() {
+    let session = "s".repeat(255);
+    let id = "i".repeat(128);
+    let state = "t".repeat(128);
+    let gate = "g".repeat(128);
+    let level = "l".repeat(128);
+    let relay = Relay {
+        session: &session,
+        session_id: &id,
+        run_id: Some(&id),
+        seq: u64::MAX,
+        visit_seq: Some(u64::MAX),
+    };
+    let ids: Vec<String> = (0..50)
+        .map(|i| format!("{i:02}{}", "r".repeat(126)))
+        .collect();
+    let findings: Vec<crate::findings::Finding> =
+        ids.iter().map(|id| finding(id, &level)).collect();
+    let rules: Vec<(&str, u64, u64)> = ids
+        .iter()
+        .map(|id| (id.as_str(), u64::MAX, u64::MAX))
+        .collect();
+    let mut check = CheckEventFields {
+        attempt: Some(u64::MAX),
+        visit_attempt: Some(u64::MAX),
+        rule_counts: Some(counts(&rules)),
+        duration_ms: Some(u64::MAX),
+        ..CheckEventFields::default()
+    };
+    check.rule_counts_truncated = true;
+    let check = with_findings_logged(check, findings, true);
+    let mut records = relayed(
+        &gate_event(
+            &state,
+            &gate,
+            "failed",
+            command_output(1),
+            check,
+            Some(poll("timed_out", u64::MAX, u64::MAX)),
+        ),
+        &relay,
+    );
+    records.extend(relayed(
+        &disputed_attempt(
+            &state,
+            &gate,
+            &"r".repeat(128),
+            &level,
+            Some(u64::MAX),
+            Some(u64::MAX),
+        ),
+        &relay,
+    ));
+    let lines: Vec<String> = records.iter().map(Record::to_line).collect();
+    assert_eq!(lines.len(), 1 + 50 + 50 + 1);
+    for line in &lines {
+        assert!(line.len() < MAX_LINE_BYTES, "{} bytes: {line}", line.len());
+    }
+    let parsed: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let c = check_records(&parsed);
+    assert_eq!(c[0]["koto.check.findings_truncated"], true);
+    assert_eq!(c[51]["koto.finding.level"], level.as_str());
+    assert_eq!(c[51]["koto.check.name"], gate.as_str());
+    assert_eq!(c[51]["koto.finding.count"], 1);
+    assert_eq!(c[101]["koto.rule.id"], "r".repeat(128));
+    assert_eq!(c[101]["koto.dispute.source"], level.as_str());
+    assert_eq!(c[101]["koto.check.name"], gate.as_str());
+    assert_eq!(c[101]["koto.attempt"], u64::MAX);
 }

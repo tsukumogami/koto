@@ -1194,6 +1194,39 @@ pub fn attach_attempts(
     Ok(())
 }
 
+/// The top-level key a `koto next` response carries a passing check's
+/// `warning` findings under.
+pub const ADVISORIES_KEY: &str = "advisories";
+
+/// The top-level key a `koto next` response sets to `true` when the
+/// advisory cap left some passing checks' warnings out.
+pub const ADVISORIES_TRUNCATED_KEY: &str = "advisories_truncated";
+
+/// Add the top-level `advisories` list to a serialized response envelope:
+/// the checks the invocation evaluated that passed while reporting
+/// `warning` findings, with those findings. Only when there are any, so a
+/// response without them is left byte-identical, and with
+/// `advisories_truncated: true` beside it only when the cap cut some.
+/// `koto next --to` and `koto status` never call this.
+pub fn attach_advisories(
+    envelope: &mut serde_json::Map<String, serde_json::Value>,
+    advisories: &crate::engine::advance::Advisories,
+) -> Result<(), serde_json::Error> {
+    if !advisories.entries.is_empty() {
+        envelope.insert(
+            ADVISORIES_KEY.to_string(),
+            serde_json::to_value(&advisories.entries)?,
+        );
+        if advisories.truncated {
+            envelope.insert(
+                ADVISORIES_TRUNCATED_KEY.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Convert gate evaluation results into a list of blocking conditions.
 ///
 /// Passed gates are excluded. Each non-passing gate produces a `BlockingCondition`

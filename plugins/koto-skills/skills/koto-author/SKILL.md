@@ -44,7 +44,7 @@ If your skill is a single linear task with no decision points, koto adds unneces
 
 ## Prerequisites
 
-- koto >= 0.20.1 must be installed and on PATH (`koto version` to verify)
+- koto >= 0.20.2 must be installed and on PATH (`koto version` to verify)
 - This skill is installed via the koto-skills plugin
 
 If koto is not installed or the version is too old, install the latest release:
@@ -141,7 +141,7 @@ A failing `command` gate or `default_action` already tells the agent something: 
 ::koto-finding::{"rule_id":"E501","level":"error","message":"line too long (104 > 88)","path":"src/app.py","line":12,"column":89}
 ```
 
-The line must start with `::koto-finding::` and hold exactly one JSON object. `rule_id` (non-empty string), `level` (`"error"`, `"warning"` or `"info"`) and `message` are required; `path`, `line` (only with `path`), `column` (only with `line`), `rule_ref` and `effect_landed` are optional. A line that breaks any rule is ordinary output, stderr is never read for findings, and a check that exits 0 reports no failure whatever it printed. Level doesn't decide pass or fail; the exit status does. Emit the lines from a wrapper (`jq`, a short script converting a linter's JSON) rather than hand-written `echo`. The [`default_action` authoring guide](../../../../docs/guides/default-action-authoring.md#reporting-findings) has the full rules: caps, ordering, the fallback finding, `effect_landed` and `message_source`. Check authors own what their scripts print: koto redacts only the credentials it knows about.
+The line must start with `::koto-finding::` and hold exactly one JSON object. `rule_id` (non-empty string), `level` (`"error"`, `"warning"` or `"info"`) and `message` are required; `path`, `line` (only with `path`), `column` (only with `line`), `rule_ref` and `effect_landed` are optional. A line that breaks any rule is ordinary output, stderr is never read for findings, and a check that exits 0 reports no failure whatever it printed. Level doesn't decide pass or fail; the exit status does. A passing check's `warning` findings still reach the agent as `advisories` on the response, without blocking; `info` findings don't. Emit the lines from a wrapper (`jq`, a short script converting a linter's JSON) rather than hand-written `echo`. The [`default_action` authoring guide](../../../../docs/guides/default-action-authoring.md#reporting-findings) has the full rules: caps, ordering, the fallback finding, `effect_landed` and `message_source`. Check authors own what their scripts print: koto redacts only the credentials it knows about.
 
 The [`default_action` authoring guide](../../../../docs/guides/default-action-authoring.md) carries the rule in full, with worked examples on both sides, the burden-of-proof rule for a classification that turns on an unchecked claim, and the failure, capture, and anchoring mechanics. The [template format guide](references/template-format.md) carries the field schema. Read the rule before you write your first action.
 

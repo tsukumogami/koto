@@ -16,6 +16,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto workflows` | Runner — primary |
 | `koto overrides record` | Runner — primary |
 | `koto overrides list` | Runner — primary |
+| `koto disputes record` | Runner — when a check's finding is wrong |
 | `koto decisions record` | Runner — primary |
 | `koto decisions list` | Runner — primary |
 | `koto decisions show` | Runner — reading one decision and whether it was reversed |
@@ -120,7 +121,7 @@ Gets the current state directive. Submits evidence when `--with-data` is provide
 | `--full` | Always include the `details` field, even if it was already delivered since you last arrived at the state. By default `details` is omitted once delivered, until the workflow arrives at the state again — from a different state, or via `koto rewind`. A self-transition is a lap rather than an arrival and does not bring it back; a tick that leaves and comes back through another state does. |
 | `--dispatch-epoch <n>` | The epoch this writer was dispatched with. Required for `--with-data` writes against a child workflow's log; validated before any persistence call and rejected with `epoch_fence_violation` (exit 65) on a mismatch. Parent-workflow ticks don't need it. The same value goes on `koto request progress` / `resolve` / `abandon` for a bound leg. |
 
-**Output shapes** are determined by the `action` field. See `response-shapes.md` for the annotated scenarios.
+**Output shapes** are determined by the `action` field. See `response-shapes.md` for the annotated scenarios. A call that evaluated a check which passed while reporting `warning` findings also carries a top-level `advisories` list with those warnings (absent otherwise, and never on `--to`); see `response-shapes.md#advisories`.
 
 **Before any of that**, the tick is checked against the session's execution anchor — the directory recorded at `koto init`. The check runs before the template is read and before any gate or action closure exists, so a refusal means nothing ran, nothing was evaluated, and nothing moved. Running from a subdirectory of the anchor is fine; running from a different tree is refused with `execution_anchor_mismatch` (exit 2), and an anchor that no longer resolves on this machine with `execution_anchor_unresolvable` (exit 3). A session with no recorded anchor adopts the directory of its first tick and says so once on the `directive`. The anchor binds where a session's commands *start*; it does not bound what a running command can reach. Details in `error-handling.md#execution-anchor-refusals`.
 
@@ -572,6 +573,44 @@ Records an override for a blocked gate so that the next `koto next` call treats 
 - Exit 2, `reason: "decider_missing"`: no `--by` and no harness session. Only a `refused` decision is recorded (its id is in `refused_id`); the session is unchanged. See `error-handling.md#decider_missing`.
 - Exit 2 with a `field`: a decider flag is malformed (for example `--surface` without `--by person:<handle>`).
 - Exit 3: template hash mismatch, corrupt state file
+
+---
+
+## koto disputes record
+
+```
+koto disputes record <name> --gate <gate> --rule <rule-id> --reason <text> [--state <state>] [--by agent|person]
+```
+
+Records that a rule's finding at a gate is wrong. **It moves nothing**: no gate outcome,
+no route and no state changes, and the next `koto next` responds exactly as it would have
+without it. A failing check still blocks; this is not a way past one (that's
+`koto overrides record`, when `agent_actionable` allows it).
+
+| Argument/Flag | Required | Description |
+|---|---|---|
+| `<name>` | Yes | Workflow name |
+| `--gate <gate>` | Yes | The gate whose finding is wrong, or `__action__` for a state's `default_action`. The session must have evaluated it to an outcome in the state; a polling gate that has only answered pending can't be disputed yet. |
+| `--rule <rule-id>` | Yes | The finding's `rule_id`, 1 to 128 bytes. A logged finding for it isn't required. |
+| `--reason <text>` | Yes | Why the finding is wrong, 1 to 1,000 bytes. Known credentials in it are redacted before it's stored. |
+| `--state <state>` | No | The state the gate was evaluated in. Defaults to the current state; name an earlier one to dispute a check you've moved past, such as one listed in `advisories`. |
+| `--by agent\|person` | No | Who disputes it. Defaults to `agent`; use `person` when relaying a user's objection. |
+
+**Success output:**
+```json
+{"status": "recorded"}
+```
+
+**When to use:** a finding you're confident is wrong, typically a passing check's warning
+from `advisories`, or a failing check's finding you can't fix because the rule misfires.
+Keep the reason to the facts (what the rule claims and why it doesn't hold). Don't
+dispute to get unblocked: the check still decides.
+
+**Error cases:**
+- Exit 1: workflow not found. Nothing is recorded.
+- Exit 2, `error.code: "gate_not_evaluated"`: the session never evaluated that gate to an outcome in the state (never at all, or only pending). Check `--state`, or run `koto next` first.
+- Exit 2, `error.code: "invalid_rule"` or `"invalid_reason"`: the rule id or reason is empty or too long.
+- Exit 2: `--by` other than `agent` or `person`.
 
 ---
 
