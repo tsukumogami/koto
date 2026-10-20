@@ -2160,7 +2160,11 @@ pub fn run(app: App) -> Result<()> {
         }
         Command::Disputes { subcommand } => {
             let backend = build_backend()?;
-            disputes::handle(&backend, subcommand)
+            disputes::handle(
+                &backend,
+                backend.journal_root().map(Path::to_path_buf),
+                subcommand,
+            )
         }
         Command::Config { subcommand } => handle_config(subcommand),
         Command::Decider { subcommand } => match subcommand {

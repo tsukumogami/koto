@@ -2085,9 +2085,10 @@ a gate, record an override instead.
 | `gate` | string | Yes | The gate's name, or `__action__` for a state's default action. The log holds at least one settled evaluation of it in that state (an outcome other than `pending`); the dispute is about the most recent. |
 | `rule_id` | string | Yes | The disputed rule's id, 1 to 128 bytes. The evaluation needn't have logged a finding for it, since a logged finding list may have been cut. |
 | `reason` | string | Yes | Why the finding is wrong, 1 to 1,000 bytes, after koto's known-credential redaction (the same pass captured output and findings get), so a credential value koto knows appears as a `[REDACTED:<source>]` marker. |
-| `source` | string | Yes | Who disputed it: `agent` or `person`. Open on read. |
+| `source` | string | Yes | Who disputed it: `agent` or `person`. koto writes `person` for a `--by person:<handle>` decider and `agent` for every other. Open on read. |
 | `attempt` | integer | No | The disputed evaluation's `attempt`, copied from the most recent settled evaluation of the gate in `state`, so a reader can join the dispute to exactly that evaluation. Absent when that evaluation predates attempt numbers. |
 | `visit_attempt` | integer | No | The disputed evaluation's `visit_attempt`, under the same rule. |
+| `decision_records` | array | No | The `judgment` decision the command wrote to the host-level decision store beside this event, about the disputed finding, as on the other events that carry a decision. `koto next` uses the copy to repair a store append that was lost. Omitted when no decider resolved (no `--by` and no harness session), so such a dispute serializes as before. |
 
 The [run journal](run-journal.md#check_disputed) relays each one as a
 `check_disputed` record, with the gate as `koto.check.name` and the two

@@ -1,8 +1,8 @@
 //! Writing a decision beside a session event, and repairing a lost append.
 //!
-//! `koto overrides record`, `koto next --to`, `koto decider answer` and
-//! `koto decisions record <name>` each write their own session event and a
-//! decision. The session log can't share a transaction with the store, so
+//! `koto overrides record`, `koto next --to`, `koto decider answer`,
+//! `koto decisions record <name>` and `koto disputes record` each write their
+//! own session event and a decision. The session log can't share a transaction with the store, so
 //! the order is fixed (DESIGN-decision-record.md, Decision 3):
 //!
 //! 1. resolve the decider before anything is written, refusing a gate pass

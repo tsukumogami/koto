@@ -579,7 +579,7 @@ Records an override for a blocked gate so that the next `koto next` call treats 
 ## koto disputes record
 
 ```
-koto disputes record <name> --gate <gate> --rule <rule-id> --reason <text> [--state <state>] [--by agent|person]
+koto disputes record <name> --gate <gate> --rule <rule-id> --reason <text> [--state <state>] [--by <decider>] [decider flags]
 ```
 
 Records that a rule's finding at a gate is wrong. **It moves nothing**: no gate outcome,
@@ -594,12 +594,21 @@ without it. A failing check still blocks; this is not a way past one (that's
 | `--rule <rule-id>` | Yes | The finding's `rule_id`, 1 to 128 bytes. A logged finding for it isn't required. |
 | `--reason <text>` | Yes | Why the finding is wrong, 1 to 1,000 bytes. Known credentials in it are redacted before it's stored. |
 | `--state <state>` | No | The state the gate was evaluated in. Defaults to the current state; name an earlier one to dispute a check you've moved past, such as one listed in `advisories`. |
-| `--by agent\|person` | No | Who disputes it. Defaults to `agent`; use `person` when relaying a user's objection. |
+| `--by` and the other decider flags | No | Who disputes it. See [Shared decider flags](#shared-decider-flags). With none, the observed harness session, marked `defaulted`. `--by agent` is kept as an alias of `--by session`. When relaying a user's objection, use `--by person:<handle> --surface terminal`; a bare `--by person` exits 2 naming that form. |
 
 **Success output:**
 ```json
-{"status": "recorded"}
+{"status": "recorded", "decision": "<id>"}
 ```
+
+The dispute is also a decision on the host's record: a `judgment` about the disputed
+finding (`what`: `finding of rule '<rule>' at gate '<gate>' in state '<state>' disputed`,
+`pointer`: `workflow:<name>/<state>`, evidence `gate:<gate>` and `rule:<rule>`, and the
+redacted reason as its reason). `decision` carries its id. The `finding_disputed` event
+carries a copy in `decision_records`, and its `source` is `person` for a
+`person:<handle>` decider and `agent` for every other. With no `--by` and no harness
+session there's no decider: the dispute is still recorded, with no decision and no
+`decision` field. A dispute is never refused for want of a decider, since it passes no gate.
 
 **When to use:** a finding you're confident is wrong, typically a passing check's warning
 from `advisories`, or a failing check's finding you can't fix because the rule misfires.
@@ -610,6 +619,7 @@ dispute to get unblocked: the check still decides.
 - Exit 1: workflow not found. Nothing is recorded.
 - Exit 2, `error.code: "gate_not_evaluated"`: the session never evaluated that gate to an outcome in the state (never at all, or only pending). Check `--state`, or run `koto next` first.
 - Exit 2, `error.code: "invalid_rule"` or `"invalid_reason"`: the rule id or reason is empty or too long.
+- Exit 2 with `field`: a malformed decider flag, such as a bare `--by person` or a person with no `--surface`. Nothing is recorded.
 - Exit 2: `--by` other than `agent` or `person`.
 
 ---
@@ -685,7 +695,7 @@ Every identity (session, agent, handle, run mode, dispatch id, chain link) is a 
 
 ### Shared decider flags
 
-These flags work the same on `koto decisions record` (both forms), `koto decisions reverse`, `koto overrides record`, `koto next --to` and `koto decider answer`. All are optional.
+These flags work the same on `koto decisions record` (both forms), `koto decisions reverse`, `koto overrides record`, `koto next --to`, `koto decider answer` and `koto disputes record`. All are optional. `koto disputes record` also takes `--by agent`, an alias of `--by session`.
 
 | Flag | Meaning |
 |---|---|
@@ -707,6 +717,7 @@ How the decider resolves:
 - **`--by person:<handle>`**: needs `--surface`. The handle is always `handed`; koto doesn't validate or resolve it. With `--surface relay` and no `--link`, the decision is recorded as the observed session's own, with the person kept only as a handed `relayed_person` note (and with no session observed, `decider_missing`).
 - **`--by check:<name>`**: the check, with the observed session as `ran_in`.
 - `--surface` or `--link` with any decider other than a person exits 2 naming the field.
+- A command that records only a judgment (`koto decisions record <name>`, a `fail` or `unclear` from `koto decider answer`, `koto disputes record`) doesn't refuse for want of a decider: it writes its own event alone, with no decision.
 
 A person passing a gate or accepting something from inside an agent's session must be recorded with `--by person:<handle>` and a `--surface`. Without it, the decision lands as the agent's session's own.
 

@@ -407,7 +407,7 @@ The `koto decisions` commands print every error as one flat JSON object on stdou
 | 1, `field: "id"` | `koto decisions show` found no decision with that id | Check the id |
 | 1, no `field` | The record couldn't be used: no home directory, a store directory another user owns or others can write, the store lock not acquired in time, an I/O error | Retry once for a lock timeout; otherwise report it |
 
-A command that writes a session event and then a decision (`koto overrides record`, `koto next --to`, `koto decider answer`, `koto decisions record <name>`) doesn't fail when only the second write fails. It warns on stderr that the decision wasn't written and that the next `koto next <name>` writes it from the session's log, and the next tick does. Carry on.
+A command that writes a session event and then a decision (`koto overrides record`, `koto next --to`, `koto decider answer`, `koto decisions record <name>`, `koto disputes record`) doesn't fail when only the second write fails. It warns on stderr that the decision wasn't written and that the next `koto next <name>` writes it from the session's log, and the next tick does. Carry on.
 
 ### decider_missing
 

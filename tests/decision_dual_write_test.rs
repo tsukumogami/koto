@@ -698,6 +698,142 @@ fn todays_decisions_record_writes_a_judgment_and_still_lists_the_choice() {
     assert_eq!(ws.list(&["--kind", "judgment"]).len(), 1);
 }
 
+// ----- Disputes -----
+
+fn dispute_args<'a>(by: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec![
+        "disputes",
+        "record",
+        "wf",
+        "--gate",
+        "g",
+        "--rule",
+        "R1",
+        "--reason",
+        "the flag file is created later",
+    ];
+    args.extend_from_slice(by);
+    args
+}
+
+/// A dispute is a `judgment` about the disputed finding, written beside its
+/// `finding_disputed` event, whichever decider form names who disputed it.
+#[test]
+fn a_dispute_records_a_judgment_about_the_disputed_finding() {
+    let ws = Ws::new();
+    ws.init("wf", GATED);
+    ws.ok(Some(W), &["next", "wf"]);
+
+    // No --by: the observed session, defaulted.
+    let out = ws.ok(Some(W), &dispute_args(&[]));
+    assert_eq!(out["status"], "recorded");
+    let id = out["decision"].as_str().unwrap().to_string();
+    let d = ws.show(&id)["decision"].clone();
+    assert_eq!(d["kind"], "judgment");
+    assert_eq!(d["outcome"], "settled");
+    assert_eq!(
+        d["subject"],
+        json!({
+            "what": "finding of rule 'R1' at gate 'g' in state 'gated' disputed",
+            "pointer": "workflow:wf/gated",
+        })
+    );
+    assert_eq!(d["evidence"], json!(["gate:g", "rule:R1"]));
+    assert_eq!(d["reason"], "the flag file is created later");
+    assert_eq!(d["decided_by"]["kind"], "session");
+    assert_eq!(d["decided_by"]["defaulted"], true);
+    assert_eq!(
+        d["decided_by"]["session"],
+        json!([{"value": W, "source": "observed"}])
+    );
+    let ev = ws
+        .events("wf")
+        .into_iter()
+        .rfind(|e| e["type"] == "finding_disputed")
+        .unwrap();
+    assert_eq!(ev["payload"]["source"], "agent");
+    assert_eq!(ev["payload"]["rule_id"], "R1");
+    assert_eq!(ev["payload"]["decision_records"][0]["id"], json!(id));
+
+    // --by agent is an alias of --by session: named, not defaulted.
+    let id = ws.ok(Some(W), &dispute_args(&["--by", "agent"]))["decision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let d = ws.show(&id)["decision"].clone();
+    assert_eq!(d["decided_by"]["kind"], "session");
+    assert_eq!(d["decided_by"]["defaulted"], false);
+    assert_eq!(d["decided_by"]["session"][0]["value"], W);
+
+    // A person, with the surface the decision came through.
+    let id = ws.ok(
+        Some(W),
+        &dispute_args(&["--by", "person:ana", "--surface", "terminal"]),
+    )["decision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let d = ws.show(&id)["decision"].clone();
+    assert_eq!(d["decided_by"]["kind"], "person");
+    assert_eq!(d["decided_by"]["handle"][0]["value"], "ana");
+    assert_eq!(d["decided_by"]["surface"], "terminal");
+    let ev = ws
+        .events("wf")
+        .into_iter()
+        .rfind(|e| e["type"] == "finding_disputed")
+        .unwrap();
+    assert_eq!(ev["payload"]["source"], "person");
+
+    // A handed session and a check.
+    let id = ws.ok(
+        None,
+        &dispute_args(&["--by", &format!("session:{}", COORD)]),
+    )["decision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let d = ws.show(&id)["decision"].clone();
+    assert_eq!(
+        d["decided_by"]["session"],
+        json!([{"value": COORD, "source": "handed"}])
+    );
+    let id = ws.ok(Some(W), &dispute_args(&["--by", "check:lint-audit"]))["decision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(ws.show(&id)["decision"]["decided_by"]["kind"], "check");
+
+    // A person with no surface is refused before anything is written.
+    let before = ws.events("wf").len();
+    let (code, body) = ws.run(Some(W), &dispute_args(&["--by", "person:ana"]));
+    assert_eq!(code, 2, "{}", body);
+    assert_eq!(body["field"], "surface");
+    assert_eq!(ws.events("wf").len(), before);
+
+    assert_eq!(ws.list(&["--kind", "judgment"]).len(), 5);
+}
+
+#[test]
+fn a_disputes_lost_append_is_repaired_by_the_next_tick() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: a release build doesn't read the decision store's test variables");
+        return;
+    }
+    let ws = Ws::new();
+    ws.init("wf", GATED);
+    ws.ok(Some(W), &["next", "wf"]);
+    let (code, out, stderr) = ws.run_env(Some(W), &[(FAULT_ENV, "append")], &dispute_args(&[]));
+    assert_eq!(code, 0, "{} {}", out, stderr);
+    let id = out["decision"].as_str().unwrap().to_string();
+    assert!(ws.month_lines().is_empty(), "the append was lost");
+    ws.ok(Some(W), &["next", "wf"]);
+    let lines = ws.month_lines();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["id"], json!(id));
+    assert_eq!(lines[0]["kind"], "judgment");
+    assert_eq!(lines[0]["repaired_from"], "wf");
+}
+
 // ----- Repair -----
 
 #[test]

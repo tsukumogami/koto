@@ -350,9 +350,19 @@ exit 1 and appends nothing, and so does an append that fails. A session log
 that can't be read exits with the code its read error carries, and a log
 whose current state can't be derived exits 3. Three refusals carry a typed
 code, each with exit code 2 and nothing appended to the state log. The
-`error` object names the `gate` and, when it is known, the `state`. A `--by`
-other than `agent` or `person` is refused by the argument parser, also with
-exit code 2.
+`error` object names the `gate` and, when it is known, the `state`.
+
+A malformed decider flag is refused in the flat format with a `field`, exit
+code 2, and nothing appended or written to the decision store, as on the
+other recording commands: a `--by` that isn't a decider, a person with no
+`--surface`, and a bare `--by person`, which names nobody:
+
+```json
+{"command":"disputes record","error":"--by person names no one: use --by person:<handle> with --surface (terminal, forge, relay)","field":"by"}
+```
+
+A dispute is never refused for want of a decider. With no `--by` and no
+harness session it is recorded without a decision.
 
 **`invalid_rule`** -- `--rule` is empty or longer than 128 bytes:
 

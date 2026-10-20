@@ -17,15 +17,33 @@
 //! The reason goes through koto's known-credential redaction, the same pass
 //! captured output and findings get, before it is stored.
 //!
+//! Beside the event, the dispute is a `judgment` decision in the host-level
+//! decision store, about the disputed finding: its subject names the rule,
+//! the gate and the state, and points at the workflow. It is written the way
+//! `koto decisions record <name>` writes its judgment: the decider resolves
+//! before anything is written, the event carries the decision in
+//! `decision_records`, the store append follows, and the next `koto next`
+//! repairs a lost append. `--by` takes the decider forms every recording
+//! command shares, plus `agent`, kept as an alias of `session`; a bare
+//! `person` is refused, since a person decider needs a handle. With no
+//! decider at all (nothing named, no harness session observed) the dispute
+//! is written alone, as before decisions existed: a dispute passes no gate,
+//! so nothing is refused.
+//!
 //! Errors print a JSON body on stdout: exit 1 for a missing session or an
 //! append that fails, nothing appended; exit 2 with a typed `code` for a
 //! caller problem (a gate not evaluated in the state, a rule id or reason
-//! outside its bounds), nothing appended; exit 3 when the session's state
-//! can't be derived.
+//! outside its bounds), nothing appended; exit 2 naming the `field` for a
+//! malformed decider flag, nothing appended; exit 3 when the session's
+//! state can't be derived.
+
+use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Subcommand, ValueEnum};
+use clap::Subcommand;
 
+use crate::decision_store::dual_write;
+use crate::decision_store::FieldError;
 use crate::engine::persistence::{derive_machine_state, derive_state_from_log};
 use crate::engine::types::{
     now_iso8601, CheckEventFields, Event, EventPayload, FindingDispute, StateFileHeader,
@@ -33,6 +51,7 @@ use crate::engine::types::{
 use crate::session::SessionBackend;
 use crate::template::types::ACTION_CONDITION_NAME;
 
+use super::decisions::{self, DeciderArgs};
 use super::{exit_code_for_engine_error, exit_with_error_code, EXIT_INFRASTRUCTURE};
 
 /// The command name every error body carries.
@@ -57,8 +76,11 @@ pub const RULE_ID_MAX_BYTES: usize = crate::findings::RULE_ID_MAX_BYTES;
 /// Longest reason, in bytes, as given and as stored after redaction.
 pub const REASON_MAX_BYTES: usize = 1000;
 
-/// Who disputed the finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+/// `--by agent`: the agent running the workflow, an alias of `--by session`.
+pub const BY_AGENT: &str = "agent";
+
+/// Who disputed the finding, as the event's `source` records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisputeSource {
     /// The agent running the workflow.
     Agent,
@@ -80,6 +102,7 @@ impl DisputeSource {
 pub enum DisputesSubcommand {
     /// Record that a rule's finding at a gate is wrong. Changes no gate
     /// outcome, route or state
+    #[command(mut_arg("by", |a| a.help(BY_HELP)))]
     Record {
         /// Workflow name
         name: String,
@@ -101,10 +124,44 @@ pub enum DisputesSubcommand {
         #[arg(long)]
         state: Option<String>,
 
-        /// Who disputes the finding
-        #[arg(long = "by", value_enum, default_value = "agent")]
-        by: DisputeSource,
+        /// Who disputed the finding and under what lineage. `--by` takes
+        /// agent (an alias of session), session, session:<id>,
+        /// person:<handle> (with --surface) or check:<name>; with none, the
+        /// observed harness session, marked defaulted; with neither, the
+        /// dispute is recorded without a decision
+        #[command(flatten)]
+        decider: Box<DeciderArgs>,
     },
+}
+
+/// The help `--by` shows on this command, which also takes `agent`.
+pub const BY_HELP: &str = "Who disputes the finding: agent (an alias of session), session \
+     (the observed harness session), session:<id>, person:<handle> (with --surface) or \
+     check:<name>. With none, the observed harness session, marked defaulted";
+
+/// The decider flags with `--by agent` read as `--by session`, and the
+/// `source` the event records: `person` for a `person:<handle>` decider,
+/// `agent` for every other. A bare `--by person` names nobody and is
+/// refused, naming the form that does.
+pub(crate) fn dispute_decider(
+    mut args: DeciderArgs,
+) -> Result<(DeciderArgs, DisputeSource), FieldError> {
+    let source = match args.by.as_deref() {
+        Some(BY_AGENT) => {
+            args.by = Some("session".to_string());
+            DisputeSource::Agent
+        }
+        Some("person") => {
+            return Err(FieldError::new(
+                "by",
+                "--by person names no one: use --by person:<handle> with --surface \
+                 (terminal, forge, relay)",
+            ))
+        }
+        Some(by) if by.starts_with("person:") => DisputeSource::Person,
+        _ => DisputeSource::Agent,
+    };
+    Ok((args, source))
 }
 
 /// A typed refusal: exit 2, nothing appended.
@@ -184,7 +241,13 @@ fn redactor_for(
     })
 }
 
-pub fn handle(backend: &dyn SessionBackend, subcommand: DisputesSubcommand) -> Result<()> {
+/// Run a disputes subcommand. `journal_root` is the run journal of the
+/// backend the command writes through, where a decider's lineage is read.
+pub fn handle(
+    backend: &dyn SessionBackend,
+    journal_root: Option<PathBuf>,
+    subcommand: DisputesSubcommand,
+) -> Result<()> {
     match subcommand {
         DisputesSubcommand::Record {
             name,
@@ -192,23 +255,72 @@ pub fn handle(backend: &dyn SessionBackend, subcommand: DisputesSubcommand) -> R
             rule,
             reason,
             state,
-            by,
-        } => handle_record(backend, name, gate, rule, reason, state, by),
+            decider,
+        } => handle_record(
+            backend,
+            journal_root,
+            Dispute {
+                name,
+                gate,
+                rule,
+                reason,
+                state,
+            },
+            *decider,
+        ),
     }
 }
 
-fn handle_record(
-    backend: &dyn SessionBackend,
+/// What a dispute names, as given.
+struct Dispute {
     name: String,
     gate: String,
     rule: String,
     reason: String,
     state: Option<String>,
-    by: DisputeSource,
+}
+
+/// The `judgment` a dispute records: about the finding of `rule` at `gate`
+/// in `state`, pointing at the workflow, with the gate and the rule as
+/// evidence and the redacted reason as its reason.
+fn dispute_judgment(
+    identity: &dual_write::Identity,
+    name: &str,
+    state: &str,
+    gate: &str,
+    rule: &str,
+    reason: &str,
+) -> Result<crate::decision_store::Decision, FieldError> {
+    dual_write::judgment(
+        identity,
+        format!(
+            "finding of rule '{}' at gate '{}' in state '{}' disputed",
+            rule, gate, state
+        ),
+        Some(format!("workflow:{}/{}", name, state)),
+        vec![format!("gate:{}", gate), format!("rule:{}", rule)],
+        Some(reason.to_string()),
+    )
+}
+
+fn handle_record(
+    backend: &dyn SessionBackend,
+    journal_root: Option<PathBuf>,
+    dispute: Dispute,
+    decider: DeciderArgs,
 ) -> Result<()> {
+    let Dispute {
+        name,
+        gate,
+        rule,
+        reason,
+        state,
+    } = dispute;
     if !backend.exists(&name) {
         fail(1, format!("workflow '{}' not found", name));
     }
+    let (decider, by) =
+        dispute_decider(decider).unwrap_or_else(|e| decisions::fail_command_field(COMMAND, e));
     if rule.is_empty() || rule.len() > RULE_ID_MAX_BYTES {
         refuse(
             INVALID_RULE,
@@ -266,23 +378,47 @@ fn handle_record(
     let redactor = redactor_for(backend, &name, &header, &events);
     let (reason, _) = crate::redact::redact_str(&reason, &redactor).cut_bytes(REASON_MAX_BYTES);
 
+    let reason = reason.into_string();
+
+    // The decider resolves before anything is written. With none, the
+    // dispute is written alone and the store isn't opened.
+    let mut judgments = Vec::new();
+    let mut store = None;
+    if let Some(identity) = decisions::resolve_command_decider(COMMAND, &decider, journal_root) {
+        store = Some(decisions::command_store(COMMAND));
+        judgments.push(
+            dispute_judgment(&identity, &name, &state, &gate, &rule, &reason)
+                .unwrap_or_else(|e| decisions::fail_command_field(COMMAND, e)),
+        );
+    }
+    let decision_records = match &store {
+        Some(store) => dual_write::prepare(store, &mut judgments)
+            .unwrap_or_else(|e| decisions::fail_command_store(COMMAND, e)),
+        None => Vec::new(),
+    };
+
     let payload = EventPayload::FindingDisputed(FindingDispute {
         state,
         gate,
         rule_id: rule,
-        reason: reason.into_string(),
+        reason,
         source: by.as_str().to_string(),
         attempt,
         visit_attempt,
+        decision_records,
     });
     if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
         fail(1, e.to_string());
     }
+    if let Some(store) = &store {
+        dual_write::append_after_event(store, &name, &judgments);
+    }
 
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({"status": "recorded"}))?
-    );
+    let mut body = serde_json::json!({"status": "recorded"});
+    if let Some(d) = judgments.first() {
+        body["decision"] = serde_json::json!(d.id);
+    }
+    println!("{}", serde_json::to_string(&body)?);
     Ok(())
 }
 
@@ -393,5 +529,40 @@ mod tests {
     fn sources_are_written_as_their_wire_values() {
         assert_eq!(DisputeSource::Agent.as_str(), "agent");
         assert_eq!(DisputeSource::Person.as_str(), "person");
+    }
+
+    fn by(value: Option<&str>) -> Result<(Option<String>, DisputeSource), FieldError> {
+        let args = DeciderArgs {
+            by: value.map(str::to_string),
+            ..Default::default()
+        };
+        dispute_decider(args).map(|(a, s)| (a.by, s))
+    }
+
+    #[test]
+    fn agent_is_an_alias_of_session_and_the_default_names_no_one() {
+        assert_eq!(by(None).unwrap(), (None, DisputeSource::Agent));
+        assert_eq!(
+            by(Some("agent")).unwrap(),
+            (Some("session".into()), DisputeSource::Agent)
+        );
+        for other in ["session", "session:s-1", "check:lint"] {
+            assert_eq!(
+                by(Some(other)).unwrap(),
+                (Some(other.into()), DisputeSource::Agent),
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_person_needs_a_handle() {
+        assert_eq!(
+            by(Some("person:ana")).unwrap(),
+            (Some("person:ana".into()), DisputeSource::Person)
+        );
+        let e = by(Some("person")).unwrap_err();
+        assert_eq!(e.field, "by");
+        assert!(e.message.contains("--by person:<handle>"), "{}", e.message);
     }
 }

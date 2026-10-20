@@ -1157,7 +1157,7 @@ Prints `{"status":"recorded","gate":...,"criterion":...,"answer":...}` and exits
 Records that a rule's finding at a gate is wrong. A dispute is recorded, not obeyed: it changes no gate outcome, no route and no state, and the next `koto next` responds exactly as it would have without it. A failing check still blocks; to move past one, fix the work or use `koto overrides record`. Disputes are for the record: a reader of the session's log or of the [run journal](../reference/run-journal.md#check_disputed) can see which rules agents and people disagree with.
 
 ```bash
-koto disputes record <name> --gate <gate> --rule <rule-id> --reason <text> [--state <state>] [--by agent|person]
+koto disputes record <name> --gate <gate> --rule <rule-id> --reason <text> [--state <state>] [--by <decider>] [decider flags]
 ```
 
 **Required flags:**
@@ -1167,9 +1167,13 @@ koto disputes record <name> --gate <gate> --rule <rule-id> --reason <text> [--st
 
 **Optional flags:**
 - `--state <state>` -- The state the gate was evaluated in. Defaults to the current state; name an earlier state to dispute a check the session has moved past.
-- `--by agent|person` -- Who disputes the finding. Defaults to `agent`.
+- `--by <decider>` and the other decider flags -- Who disputes the finding, in the forms every recording command takes: `session`, `session:<id>`, `person:<handle>` (with `--surface`) or `check:<name>`. `--by agent` is an alias of `--by session`. With no `--by`, the observed harness session, marked `defaulted`. A bare `--by person` names nobody and is refused, naming the `--by person:<handle>` form.
 
-Appends one `finding_disputed` event, prints `{"status":"recorded"}` and exits 0. A missing session exits 1. Refusals (`gate_not_evaluated`, `invalid_rule`, `invalid_reason`) exit 2 with a typed code and append nothing, as does a `--by` other than `agent` or `person`; see [error-codes.md](../reference/error-codes.md#disputes-record).
+Appends one `finding_disputed` event, prints `{"status":"recorded"}` and exits 0. The event's `source` is `person` for a `person:<handle>` decider and `agent` for every other.
+
+The dispute is also a `judgment` decision in the host-level decision store, about the disputed finding: its subject's `what` is `finding of rule '<rule>' at gate '<gate>' in state '<state>' disputed` and its `pointer` is `workflow:<name>/<state>`, with `gate:<gate>` and `rule:<rule>` as evidence and the redacted reason as its reason. It is written the way the gate-passing commands write theirs: the `finding_disputed` event carries a copy in `decision_records`, the store append follows, and the next `koto next` repairs an append that was lost. The printed body then carries the decision's id as `decision`. With no decider at all (no `--by`, no harness session) the dispute is recorded as before, with no decision: a dispute passes no gate, so it isn't refused.
+
+A missing session exits 1. Refusals (`gate_not_evaluated`, `invalid_rule`, `invalid_reason`) exit 2 with a typed code and append nothing, as does a malformed decider flag, named by `field`; see [error-codes.md](../reference/error-codes.md#disputes-record).
 
 A passing check's `warning` findings reach the agent on the `koto next` response that evaluated it, under a top-level `advisories` list (see the koto-user skill's response reference). They are the findings this command is most often for: a warning doesn't block, so the dispute is how an agent says it disagrees.
 

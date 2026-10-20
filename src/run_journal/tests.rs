@@ -3972,6 +3972,7 @@ fn disputed_attempt(
         source: source.into(),
         attempt,
         visit_attempt,
+        decision_records: Vec::new(),
     })
 }
 

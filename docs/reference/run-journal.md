@@ -447,8 +447,10 @@ koto writes one per override, not one per criterion of a decider check.
 One record per decision a committed event carries for the decision store:
 `koto overrides record` (`gate_override_recorded`), `koto next --to` past a
 gate that hadn't passed (`directed_transition`, one per gate it passed),
-`koto decider answer` (`decider_check_answered`) and `koto decisions record`
-(`decision_recorded`). An event that carries no decision writes none.
+`koto decider answer` (`decider_check_answered`), `koto decisions record`
+(`decision_recorded`) and `koto disputes record` (`finding_disputed`, after
+its unchanged `check_disputed` record). An event that carries no decision
+writes none.
 
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|

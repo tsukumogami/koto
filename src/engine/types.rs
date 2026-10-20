@@ -787,6 +787,16 @@ pub struct FindingDispute {
     /// same rule as `attempt`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visit_attempt: Option<u64>,
+    /// The `judgment` decision the command wrote to the host-level decision
+    /// store beside this event, kept raw as on the other events that carry
+    /// one. Omitted when empty: a dispute with no decider is written alone,
+    /// as before decisions existed.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_decision_records"
+    )]
+    pub decision_records: Vec<serde_json::Value>,
 }
 
 /// The leading bytes of a failed command gate's streams, as
@@ -1809,7 +1819,8 @@ pub struct ChildSnapshot {
 impl EventPayload {
     /// The decision lines this event carries for the decision store: the
     /// copies `koto overrides record`, `koto next --to`, `koto decider
-    /// answer` and `koto decisions record` write beside their own event.
+    /// answer`, `koto decisions record` and `koto disputes record` write
+    /// beside their own event.
     /// Empty for every other payload.
     pub fn decision_records(&self) -> &[serde_json::Value] {
         match self {
@@ -1823,6 +1834,7 @@ impl EventPayload {
                 decision_records, ..
             } => decision_records,
             EventPayload::DeciderCheckAnswered(a) => &a.decision_records,
+            EventPayload::FindingDisputed(d) => &d.decision_records,
             _ => &[],
         }
     }

@@ -394,9 +394,13 @@ fn a_dispute_in_the_current_state_and_one_in_an_earlier_state_each_append_one_ev
         "--state",
         "check",
         "--by",
-        "person",
+        "person:ana",
+        "--surface",
+        "terminal",
     ]);
     assert!(out.status.success(), "{}", describe(&out));
+    let printed: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let decision = printed["decision"].as_str().unwrap().to_string();
 
     let disputes = env.events("finding_disputed");
     assert_eq!(disputes.len(), 2);
@@ -412,8 +416,18 @@ fn a_dispute_in_the_current_state_and_one_in_an_earlier_state_each_append_one_ev
             "visit_attempt": 1,
         })
     );
+    // A person is a decider: the second dispute carries its judgment, and
+    // its other fields are as the first's.
+    let mut second = disputes[1]["payload"].clone();
+    let records = second
+        .as_object_mut()
+        .unwrap()
+        .remove("decision_records")
+        .unwrap();
+    assert_eq!(records[0]["id"], decision.as_str());
+    assert_eq!(records[0]["kind"], "judgment");
     assert_eq!(
-        disputes[1]["payload"],
+        second,
         serde_json::json!({
             "state": "check",
             "gate": "lint",
@@ -549,6 +563,25 @@ fn refused_disputes_exit_two_with_a_code_and_append_nothing() {
             ],
             None,
         ),
+        (
+            vec![
+                "--gate", "fmt", "--rule", "R", "--reason", "x", "--by", "person",
+            ],
+            None,
+        ),
+        (
+            vec![
+                "--gate",
+                "fmt",
+                "--rule",
+                "R",
+                "--reason",
+                "x",
+                "--by",
+                "person:ana",
+            ],
+            None,
+        ),
     ];
     let log = env.log();
     for (args, code) in cases {
@@ -646,4 +679,50 @@ fn a_dispute_of_a_missing_session_exits_one() {
     let out = env.dispute(&["--gate", "lint", "--rule", "R", "--reason", "x"]);
     assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
     assert!(!env.path().join("sessions").join("wf").exists());
+}
+
+/// A bare `--by person` names nobody: it is refused naming the form that
+/// does, and nothing reaches the log or the decision store.
+#[test]
+fn a_bare_person_is_refused_naming_the_handle_form() {
+    let env = disputed_session();
+    let log = env.log();
+    let out = env.dispute(&[
+        "--gate", "fmt", "--rule", "F1", "--reason", "wrong", "--by", "person",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
+    let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body["command"], "disputes record");
+    assert_eq!(body["field"], "by");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("--by person:<handle>"),
+        "{body}"
+    );
+    assert_eq!(env.log(), log);
+    assert!(!env.path().join(".koto").join("decisions").exists());
+}
+
+/// With no decider named and no harness session observed, `--by agent` and
+/// no `--by` both record the dispute as before: no decision, no store.
+#[test]
+fn with_no_decider_a_dispute_is_recorded_without_a_decision() {
+    let env = disputed_session();
+    for by in [None, Some("agent")] {
+        let mut args = vec!["--gate", "fmt", "--rule", "F1", "--reason", "wrong"];
+        if let Some(by) = by {
+            args.extend(["--by", by]);
+        }
+        let out = env.dispute(&args);
+        assert!(out.status.success(), "{by:?}: {}", describe(&out));
+        let printed: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(printed, serde_json::json!({"status": "recorded"}));
+    }
+    for d in env.events("finding_disputed") {
+        assert!(d["payload"].get("decision_records").is_none(), "{d}");
+        assert_eq!(d["payload"]["source"], "agent");
+    }
+    assert!(!env.path().join(".koto").join("decisions").exists());
 }
