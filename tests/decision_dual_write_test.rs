@@ -621,6 +621,28 @@ fn reversing_a_commands_gate_pass_blocks_the_next_tick() {
     );
 }
 
+#[test]
+fn reversing_a_directed_transitions_gate_pass_blocks_the_next_tick() {
+    let ws = Ws::new();
+    ws.init("wf", GATED);
+    assert_eq!(
+        ws.ok(Some(W), &["next", "wf", "--to", "after"])["state"],
+        "after"
+    );
+    let id = ws.list(&["--kind", "gate-pass"])[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (code, out) = ws.run(Some(COORD), &["decisions", "reverse", &id]);
+    assert_eq!(code, 0, "{}", out);
+    let out = ws.ok(Some(W), &["next", "wf", "--with-data", r#"{"go":"yes"}"#]);
+    assert_eq!(out["action"], "gate_blocked", "{}", out);
+    assert_eq!(
+        out["blocking_conditions"][0]["category"],
+        "decision_reversed"
+    );
+}
+
 fn out_id(ws: &Ws, reversed: &str) -> Value {
     ws.show(reversed)["reversed_by"].clone()
 }
@@ -680,6 +702,10 @@ fn todays_decisions_record_writes_a_judgment_and_still_lists_the_choice() {
 
 #[test]
 fn a_lost_append_is_repaired_by_the_next_tick() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: a release build doesn't read the decision store's test variables");
+        return;
+    }
     let ws = Ws::new();
     ws.init("wf", GATED);
     ws.ok(Some(W), &["next", "wf"]);
@@ -719,6 +745,10 @@ fn a_lost_append_is_repaired_by_the_next_tick() {
 
 #[test]
 fn a_decision_lost_on_the_terminal_tick_survives_the_cleanup() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: a release build doesn't read the decision store's test variables");
+        return;
+    }
     let ws = Ws::new();
     ws.init("wf", GATE_TO_DONE);
     let (code, out, stderr) = ws.run_env(
@@ -741,6 +771,10 @@ fn a_decision_lost_on_the_terminal_tick_survives_the_cleanup() {
 #[cfg(unix)]
 #[test]
 fn a_store_lock_timeout_fails_neither_the_tick_nor_the_gate_and_is_retried() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: a release build doesn't read the decision store's test variables");
+        return;
+    }
     use std::os::unix::io::AsRawFd;
     let ws = Ws::new();
     ws.init("wf", GATED);

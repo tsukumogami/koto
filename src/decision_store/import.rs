@@ -17,7 +17,9 @@
 //! The import ledger (`imports.jsonl`) holds one line per imported entry,
 //! written under the store lock before the decision, so importing the same
 //! entry again is a lookup and adds nothing, and a reversal racing an
-//! import sees either the one imported decision or none.
+//! import sees either the one imported decision or none. A ledger line
+//! whose decision never landed (the append after it failed) doesn't count:
+//! the next import writes the entry again under a new line.
 //!
 //! Everything taken from a source is recorded as `handed`: the decider, the
 //! authority's values and any chain the source records. With no chain, the
@@ -553,9 +555,15 @@ pub fn import(store: &Store, src: &Source) -> Result<Outcome, ImportError> {
         let id = decision.id.clone();
         let recorded_at = decision.recorded_at.clone().unwrap_or_default();
         let result = store.append(decision, |locked| {
+            // An entry counts as imported only when the decision its
+            // ledger line names is on the record: a ledger line whose
+            // decision append failed is superseded by a new one, and the
+            // ledger reads its last line for an entry.
             if let Some(found) = read_ledger(locked.root())?.get(&key) {
-                *existing.borrow_mut() = Some(found.clone());
-                return Ok(Check::Skip);
+                if locked.find(found)?.is_some() {
+                    *existing.borrow_mut() = Some(found.clone());
+                    return Ok(Check::Skip);
+                }
             }
             append_ledger(
                 locked.root(),
@@ -651,6 +659,31 @@ mod tests {
             })
             .sum();
         assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn a_ledger_line_whose_decision_never_landed_is_imported_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let src = source(serde_json::json!([
+            {"entry": "1", "time": "2026-10-01T10:00Z", "kind": "judgment",
+             "question": "q", "decided_by": "coordinator"},
+        ]));
+        crate::decision_store::writer::ensure_dir(s.root()).unwrap();
+        append_ledger(
+            s.root(),
+            &LedgerLine {
+                v: 1,
+                source: src.source.clone(),
+                entry: "1".into(),
+                decision: format!("d-202610-{}", "b".repeat(32)),
+                recorded_at: "2026-10-01T10:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        let out = import(&s, &src).unwrap();
+        assert_eq!(out.imported.len(), 1, "{:?}", out);
+        assert!(import(&s, &src).unwrap().imported.is_empty());
     }
 
     #[test]
