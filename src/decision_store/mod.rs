@@ -23,6 +23,8 @@
 //! Readers take no lock, skip a torn final line and any line they can't
 //! read, and report how many they skipped.
 
+pub mod decider;
+pub mod lineage;
 pub mod reader;
 pub mod record;
 pub mod report;
@@ -344,6 +346,18 @@ pub fn redact_decision(d: &mut Decision, redactor: &crate::redact::Redactor) {
     d.evidence.iter_mut().for_each(r);
     ro(&mut d.decided_by.link);
     d.decided_by.handle.iter_mut().for_each(|h| r(&mut h.value));
+    d.decided_by
+        .relayed_person
+        .iter_mut()
+        .for_each(|h| r(&mut h.value));
+    // A person named as a dispatcher carries a handle too.
+    d.chain
+        .links
+        .iter_mut()
+        .chain(std::iter::once(&mut d.authority.dispatcher))
+        .flatten()
+        .filter(|v| v.value.starts_with("person:"))
+        .for_each(|v| r(&mut v.value));
     redact_subject(&mut d.subject, redactor);
 }
 

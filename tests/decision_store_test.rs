@@ -4,7 +4,9 @@
 //! Every test points `HOME` at its own temporary directory, which is where
 //! the store resolves (`$HOME/.koto/decisions`), and puts sessions under a
 //! separate `KOTO_SESSIONS_BASE` so removing a session can be checked
-//! against the store.
+//! against the store. Each run carries a harness session id, which the
+//! decider resolver defaults to; `tests/decision_identity_test.rs` covers
+//! deciders and lineage.
 
 use assert_cmd::Command;
 use assert_fs::TempDir;
@@ -16,7 +18,9 @@ fn koto(dir: &Path) -> Command {
     cmd.current_dir(dir);
     cmd.env("HOME", dir);
     cmd.env("KOTO_SESSIONS_BASE", dir.join("sessions"));
-    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
+    cmd.env("CLAUDE_CODE_SESSION_ID", "test-session-1");
+    cmd.env_remove("KOTO_AGENT_ID");
+    cmd.env_remove("CLAUDE_CODE_SESSION_ATTENDED");
     cmd.env_remove("KOTO_WORKFLOWS_DIR");
     for name in [
         "GH_TOKEN",
@@ -367,6 +371,10 @@ fn links_must_be_plain_https() {
                 "judgment",
                 "--what",
                 "x",
+                "--by",
+                "person:dana",
+                "--surface",
+                "forge",
                 "--link",
                 bad,
             ],
@@ -382,6 +390,10 @@ fn links_must_be_plain_https() {
             "judgment",
             "--what",
             "x",
+            "--by",
+            "person:dana",
+            "--surface",
+            "forge",
             "--link",
             "https://example.com/o/r/pull/1#review-3",
         ],

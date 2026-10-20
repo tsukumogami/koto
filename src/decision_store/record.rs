@@ -180,6 +180,12 @@ pub struct DecidedBy {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ran_in: Slot,
+    /// On a `session` decider that relayed what a person said with no link
+    /// to the original: the person the relaying session named, kept as a
+    /// handed note so an auditor can follow up. The person is not the
+    /// decider; the relaying session is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relayed_person: Slot,
 }
 
 impl DecidedBy {
@@ -196,6 +202,30 @@ impl DecidedBy {
             entered_by: Vec::new(),
             name: None,
             ran_in: Vec::new(),
+            relayed_person: Vec::new(),
+        }
+    }
+
+    /// A `person` decider: a handed handle, the surface it came through, an
+    /// optional link to the original and the session that entered it.
+    pub fn person(handle: Slot, surface: String, link: Option<String>, entered_by: Slot) -> Self {
+        Self {
+            kind: DeciderKind::Person,
+            handle,
+            surface: Some(surface),
+            link,
+            entered_by,
+            ..Self::session(Vec::new(), Vec::new(), false)
+        }
+    }
+
+    /// A `check` decider: the check's name and the session that ran it.
+    pub fn check(name: String, ran_in: Slot) -> Self {
+        Self {
+            kind: DeciderKind::Check,
+            name: Some(name),
+            ran_in,
+            ..Self::session(Vec::new(), Vec::new(), false)
         }
     }
 

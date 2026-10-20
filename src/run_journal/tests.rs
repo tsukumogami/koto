@@ -3595,3 +3595,50 @@ fn a_waiting_decider_check_writes_check_pending_with_its_counts_and_no_poll() {
         assert!(r.get(absent).is_none(), "{absent}: {r}");
     }
 }
+
+// ----- Lineage stamp -----
+
+#[test]
+fn session_started_and_driver_seen_carry_the_drivers_lineage_stamp() {
+    use crate::decision_store::lineage::set_search_start_for_test;
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let ws = TempDir::new().unwrap();
+    std::fs::create_dir_all(ws.path().join(".niwa/sessions")).unwrap();
+    std::fs::write(ws.path().join(".niwa/workspace.toml"), "").unwrap();
+    let entry = |id: &str, body: &str| {
+        let p = ws.path().join(format!(".niwa/sessions/{}.json", id));
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    entry(
+        "driver-a",
+        r#"{"dispatch_id":"disp-a","parent_session_id":"coord"}"#,
+    );
+    entry(
+        "driver-b",
+        r#"{"lineage":{"v":1,"dispatch_id":"disp-b","parent":"none","source":{"parent":"observed"}}}"#,
+    );
+    set_search_start_for_test(Some(ws.path()));
+    set_host_env_for_test(CLAUDE_SESSION_ID_ENV, Some("driver-a"));
+    f.init("wf", header("wf", "wf-id", None), Some("a"));
+    commit_as(&f, Some("driver-b"), "wf", &transitioned(Some("a"), "b"));
+    commit_as(&f, Some("driver-c"), "wf", &transitioned(Some("b"), "c"));
+    set_search_start_for_test(None);
+
+    let j = f.journal();
+    assert_eq!(j[0]["kind"], "session_started");
+    assert_eq!(j[0]["koto.lineage.dispatch.id"], "disp-a");
+    assert_eq!(j[0]["koto.lineage.dispatch.id.source"], "handed");
+    assert_eq!(j[0]["koto.lineage.parent"], "session:coord");
+    assert_eq!(j[0]["koto.lineage.parent.source"], "handed");
+    let seen: Vec<&serde_json::Value> = j.iter().filter(|r| r["kind"] == "driver_seen").collect();
+    assert_eq!(seen[0]["koto.lineage.dispatch.id"], "disp-b");
+    assert_eq!(seen[0]["koto.lineage.dispatch.id.source"], "handed");
+    assert_eq!(seen[0]["koto.lineage.parent"], "none");
+    assert_eq!(seen[0]["koto.lineage.parent.source"], "observed");
+    assert!(
+        seen[1].get("koto.lineage.dispatch.id").is_none(),
+        "a driver with no entry gets no stamp"
+    );
+}

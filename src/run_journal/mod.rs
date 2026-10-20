@@ -4,8 +4,8 @@
 //! koto appends one JSON object per line to `<koto home>/_run_journal.jsonl`
 //! (the same `~/.koto` the decider ledger uses) as sessions are created,
 //! enter states, reach a terminal, are cancelled and change driver. The
-//! journal is append-only: koto never rewrites, deletes or reads back its
-//! records, so its lines outlive the sessions they describe, including
+//! journal is append-only: koto never rewrites or deletes its records, and
+//! reads back only the lineage stamp (see below), so its lines outlive the sessions they describe, including
 //! sessions koto removes at their terminal tick or on
 //! `koto session cleanup`. `docs/reference/run-journal.md` documents the
 //! format for readers.
@@ -44,6 +44,14 @@
 //! - `cancelled`: nothing more.
 //! - `driver_seen`: `koto.driver.session.id`, the Claude Code session now
 //!   driving the session, when it differs from the last one recorded.
+//!
+//! `session_started` and `driver_seen` also carry the driver's lineage
+//! stamp when the workspace manager's session map has an entry for it:
+//! `koto.lineage.dispatch.id`, `koto.lineage.digest` and
+//! `koto.lineage.parent`, each with a `.source` of `observed` or `handed`.
+//! The decision store's lineage resolver reads the newest stamp back when
+//! the entry itself is gone; it is the one reader of the journal inside
+//! koto.
 //!
 //! Those five are the identity kinds. Three more are relayed from check
 //! events, and each carries `koto.seq` (the relayed event's sequence
@@ -204,6 +212,17 @@ pub(crate) use run_id::child_lineage;
 /// The journal's file name inside the koto home.
 pub(crate) const JOURNAL_FILE: &str = "_run_journal.jsonl";
 
+/// The fields of the driver's lineage stamp on `session_started` and
+/// `driver_seen`, which `decision_store::lineage` writes and reads back.
+pub(crate) mod lineage_fields {
+    pub const DISPATCH_ID: &str = "koto.lineage.dispatch.id";
+    pub const DISPATCH_ID_SOURCE: &str = "koto.lineage.dispatch.id.source";
+    pub const DIGEST: &str = "koto.lineage.digest";
+    pub const DIGEST_SOURCE: &str = "koto.lineage.digest.source";
+    pub const PARENT: &str = "koto.lineage.parent";
+    pub const PARENT_SOURCE: &str = "koto.lineage.parent.source";
+}
+
 /// The most bytes one journal line may take, newline included. Within
 /// `PIPE_BUF`, so concurrent appends never interleave.
 pub(crate) const MAX_LINE_BYTES: usize = 4096;
@@ -312,6 +331,23 @@ impl Record {
     fn int(mut self, key: &'static str, value: Option<u64>) -> Self {
         if let Some(v) = value {
             self.fields.push((key, Value::from(v)));
+        }
+        self
+    }
+
+    /// Add the lineage stamp for `driver`: what the workspace manager's
+    /// session map says about it, each value with its label, so a session
+    /// resumed after that entry is removed still resolves its lineage
+    /// (`decision_store::lineage`). Adds nothing when there is no driver or
+    /// no entry, and only values of the id shape.
+    fn lineage(mut self, driver: Option<&str>) -> Self {
+        let Some(d) = driver else {
+            return self;
+        };
+        for (key, value) in crate::decision_store::lineage::driver_stamp(d) {
+            if is_id(&value) {
+                self.fields.push((key, Value::from(value)));
+            }
         }
         self
     }
@@ -937,6 +973,7 @@ fn session_started(
             header.parent_session_id.as_deref(),
         )
         .id("koto.driver.session.id", driver)
+        .lineage(driver)
         .name("koto.template.name", header.template_name.as_deref())
         .id("koto.template.hash", hash)
         .flag(
@@ -1112,7 +1149,8 @@ pub(crate) fn after_commit(
                 &header.session_id,
                 run_id.as_deref(),
             )
-            .id("koto.driver.session.id", Some(d)),
+            .id("koto.driver.session.id", Some(d))
+            .lineage(Some(d)),
         );
     }
     // A commit that ends a visit writes that visit's reads first, before

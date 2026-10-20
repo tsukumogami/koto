@@ -7,7 +7,8 @@ Claude Code session, each time koto evaluates one of their checks or
 consults the decider, each time an override is recorded, once per state
 visit for the context keys the visit read, and each time `koto next` or
 `koto status` prints a state's directive. The journal is
-append-only: koto never rewrites or reads back its records, so a
+append-only: koto never rewrites its records, and reads back only the
+[lineage stamp](#lineage-stamp), so a
 session's lines outlive the session itself, including sessions koto removes
 at their terminal tick or on `koto session cleanup`.
 
@@ -74,11 +75,11 @@ their digest (see
 
 | Kind | Its own fields | Written when |
 |------|----------------|--------------|
-| `session_started` | `koto.parent.session.id`, `koto.driver.session.id`, `koto.template.name`, `koto.template.hash`, `koto.fixture`, `koto.imported_from.session.id` | A session is created. |
+| `session_started` | `koto.parent.session.id`, `koto.driver.session.id`, `koto.lineage.dispatch.id`, `koto.lineage.dispatch.id.source`, `koto.lineage.digest`, `koto.lineage.digest.source`, `koto.lineage.parent`, `koto.lineage.parent.source`, `koto.template.name`, `koto.template.hash`, `koto.fixture`, `koto.imported_from.session.id` | A session is created. |
 | `state_entered` | `koto.state` | The session enters a state. |
 | `terminal` | `koto.terminal` | The session arrives at a terminal state. |
 | `cancelled` | none | The session is cancelled. |
-| `driver_seen` | `koto.driver.session.id` | A command runs under a driving session other than the last one recorded for it. |
+| `driver_seen` | `koto.driver.session.id`, `koto.lineage.dispatch.id`, `koto.lineage.dispatch.id.source`, `koto.lineage.digest`, `koto.lineage.digest.source`, `koto.lineage.parent`, `koto.lineage.parent.source` | A command runs under a driving session other than the last one recorded for it. |
 | `check_evaluated` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.check.outcome`, `koto.attempt`, `koto.visit_attempt`, `koto.check.rule_count`, `koto.check.rule_counts_truncated`, `koto.check.duration_ms`, `koto.poll.status`, `koto.check.unanswered_count`, `koto.check.error`, `koto.decider.awaiting_count`, `koto.decider.agent_answered_count` | koto evaluates a gate and the result isn't pending, or runs a state's default action. |
 | `check_rule` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.rule.visit_count`, `koto.rule.session_count` | Once for each error rule of a check evaluation, after its `check_evaluated`. |
 | `check_pending` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.poll.status`, `koto.poll.evaluations`, `koto.poll.elapsed_secs`, `koto.decider.awaiting_count`, `koto.decider.agent_answered_count` | A polling gate's evaluation is still pending, or a decider check is waiting on the agent. |
@@ -648,6 +649,28 @@ driver writes nothing, so the records after a `driver_seen` aren't
 guaranteed to come from that driver. The set of distinct driver values on a
 session's records is the reliable signal; attributing each record to the
 latest `driver_seen` before it is best-effort.
+
+### Lineage stamp
+
+When the driver has an entry in the workspace manager's session map
+(`<workspace root>/.niwa/sessions/<driver>.json`, found by walking up from
+koto's working directory to the directory holding `.niwa/workspace.toml`),
+`session_started` and `driver_seen` also carry what that entry says about
+the driver's dispatch. koto only reads the entry; it never runs the
+workspace manager or writes under `.niwa/`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `koto.lineage.dispatch.id` | string | The dispatch identifier the driver was launched under. |
+| `koto.lineage.digest` | string | The digest of the instructions the driver was dispatched with (`sha256:<hex>`), when the entry gives one. |
+| `koto.lineage.parent` | string | The driver's dispatcher: `session:<id>`, `none` when the entry affirms there is none, or `unknown`. |
+| `koto.lineage.dispatch.id.source`, `koto.lineage.digest.source`, `koto.lineage.parent.source` | string | `observed` or `handed`: the label the entry gives the value. A value from today's entry fields (`dispatch_id`, `parent_session_id`) is `handed`, because the workspace manager records it as its caller supplied it. |
+
+Each field is left out when the entry doesn't give it, and all of them are
+left out when there is no entry. The stamp is the one part of the journal
+koto reads back: when a decision is recorded in a session whose map entry
+has since been removed, the decision store takes the session's lineage from
+the newest stamp for that driver in the active journal file.
 
 ## Fixture rules
 

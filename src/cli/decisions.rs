@@ -10,8 +10,7 @@ use clap::Args;
 
 use crate::decision_store::reader::{self, Filter};
 use crate::decision_store::record::{
-    Authority, Chain, DecidedBy, DeciderKind, Decision, Kind, Sourced, Subject,
-    DECISION_FORMAT_VERSION,
+    Authority, Chain, DecidedBy, DeciderKind, Decision, Kind, Subject, DECISION_FORMAT_VERSION,
 };
 use crate::decision_store::{
     new_id, normalize_time, now_to_second, report, validate_link, Check, FieldError, Store,
@@ -94,9 +93,163 @@ pub struct RecordKindArgs {
     /// Why, as free text; don't put secrets here, the record is permanent
     #[arg(long)]
     pub reason: Option<String>,
-    /// A link to the original decision, such as a forge review (https URL)
+    #[command(flatten)]
+    pub decider: DeciderArgs,
+}
+
+/// The decider and handed-lineage flags every recording command shares.
+/// All are optional: with none, the decider is the observed harness
+/// session, marked defaulted.
+#[derive(Args, Debug, Default, Clone)]
+pub struct DeciderArgs {
+    /// Who decided: session (the observed harness session), session:<id>,
+    /// person:<handle> or check:<name>
+    #[arg(long)]
+    pub by: Option<String>,
+    /// For a person: the surface the decision came through (terminal, forge,
+    /// relay)
+    #[arg(long)]
+    pub surface: Option<String>,
+    /// For a person: a link to the original, such as a forge review (https
+    /// URL, no credentials or query string); stored, never fetched
     #[arg(long)]
     pub link: Option<String>,
+    /// The agent within the session that decided (main or an agent id), when
+    /// the koto-skills hook didn't set KOTO_AGENT_ID
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// The run mode (attended, unattended), when the harness doesn't report it
+    #[arg(long = "run-mode")]
+    pub run_mode: Option<String>,
+    /// Who dispatched the deciding session: session:<id>, person:<handle> or
+    /// none (a root)
+    #[arg(long = "dispatched-by")]
+    pub dispatched_by: Option<String>,
+    /// A file holding the dispatch chain above the dispatcher, in koto's
+    /// versioned lineage format
+    #[arg(long = "chain-file")]
+    pub chain_file: Option<std::path::PathBuf>,
+    /// The digest of the instructions the deciding session was dispatched
+    /// with (sha256:<hex>)
+    #[arg(long = "instructions-digest")]
+    pub instructions_digest: Option<String>,
+    /// The dispatch identifier the deciding session was launched under
+    #[arg(long = "dispatch-id")]
+    pub dispatch_id: Option<String>,
+}
+
+impl DeciderArgs {
+    /// Whether any decider or handed-lineage flag was given.
+    pub fn any_set(&self) -> bool {
+        let Self {
+            by,
+            surface,
+            link,
+            agent,
+            run_mode,
+            dispatched_by,
+            chain_file,
+            instructions_digest,
+            dispatch_id,
+        } = self;
+        [
+            by,
+            surface,
+            link,
+            agent,
+            run_mode,
+            dispatched_by,
+            instructions_digest,
+            dispatch_id,
+        ]
+        .iter()
+        .any(|o| o.is_some())
+            || chain_file.is_some()
+    }
+}
+
+/// Why the decider and lineage didn't resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityError {
+    /// No decider was named and no harness session was observed.
+    DeciderMissing,
+    /// A flag is malformed, naming the field at fault.
+    Invalid(FieldError),
+}
+
+/// Resolve who decided, under what authority and through which chain, from
+/// the shared flags and what koto observes. Every file read (the chain file,
+/// the workspace manager's session map, the run journal) happens here,
+/// before any store lock is taken.
+pub fn resolve_identity(
+    args: &DeciderArgs,
+    journal_root: Option<std::path::PathBuf>,
+) -> Result<(DecidedBy, Chain, Authority), IdentityError> {
+    use crate::decision_store::decider::{self, DeciderError, DeciderInput, Observed};
+    use crate::decision_store::lineage::{self, HandedLineage, Sources};
+    let invalid = IdentityError::Invalid;
+
+    if let Some(l) = &args.link {
+        validate_link("link", l).map_err(invalid)?;
+    }
+    if let Some(m) = &args.run_mode {
+        decider::validate_run_mode(m).map_err(invalid)?;
+    }
+    if let Some(v) = &args.dispatched_by {
+        lineage::validate_dispatched_by(v).map_err(invalid)?;
+    }
+    if let Some(v) = &args.dispatch_id {
+        lineage::validate_dispatch_id(v).map_err(invalid)?;
+    }
+    if let Some(v) = &args.instructions_digest {
+        lineage::validate_digest(v).map_err(invalid)?;
+    }
+    let by = match &args.by {
+        Some(b) => Some(decider::parse_by(b).map_err(invalid)?),
+        None => None,
+    };
+    let chain_file = match &args.chain_file {
+        Some(p) => Some(lineage::read_chain_file(p).map_err(invalid)?),
+        None => None,
+    };
+
+    let observed = Observed::from_host();
+    let input = DeciderInput {
+        by,
+        surface: args.surface.clone(),
+        link: args.link.clone(),
+        agent: args.agent.clone(),
+    };
+    let decided_by = decider::resolve_decider(&input, &observed).map_err(|e| match e {
+        DeciderError::Missing => IdentityError::DeciderMissing,
+        DeciderError::Invalid(fe) => IdentityError::Invalid(fe),
+    })?;
+    let run_mode = decider::run_mode_slot(&observed, args.run_mode.as_deref());
+    let handed = HandedLineage {
+        dispatched_by: args.dispatched_by.clone(),
+        chain_file,
+        dispatch_id: args.dispatch_id.clone(),
+        instructions_digest: args.instructions_digest.clone(),
+    };
+    let resolved = lineage::resolve_lineage(
+        decided_by.kind,
+        observed.session.as_deref(),
+        run_mode,
+        &handed,
+        &Sources::discover(journal_root),
+    );
+    Ok((decided_by, resolved.chain, resolved.authority))
+}
+
+/// The run journal's home for the store this process would use: the
+/// `KOTO_SESSIONS_BASE` store journals inside its base, the user's store in
+/// `~/.koto`. Built without constructing a backend, so resolving lineage
+/// never touches a cloud configuration.
+pub fn journal_root() -> Option<std::path::PathBuf> {
+    match std::env::var_os("KOTO_SESSIONS_BASE") {
+        Some(base) => Some(std::path::PathBuf::from(base)),
+        None => dirs::home_dir().map(|h| h.join(".koto")),
+    }
 }
 
 impl RecordKindArgs {
@@ -125,7 +278,7 @@ impl RecordKindArgs {
             basis,
             evidence,
             reason,
-            link,
+            decider,
         } = self;
         [
             kind,
@@ -146,10 +299,10 @@ impl RecordKindArgs {
             what,
             pointer,
             reason,
-            link,
         ]
         .iter()
         .any(|o| o.is_some())
+            || decider.any_set()
             || pr.is_some()
             || !paths.is_empty()
             || !basis.is_empty()
@@ -220,6 +373,20 @@ fn fail(command: &str, field: Option<&str>, message: impl Into<String>, code: i3
     exit_with_error_code(body, code)
 }
 
+/// Refuse a decision nobody can be named for: exit 2, field `by`, reason
+/// `decider_missing`, nothing written.
+pub fn fail_decider_missing(command: &str) -> ! {
+    exit_with_error_code(
+        serde_json::json!({
+            "error": crate::decision_store::decider::DeciderError::Missing.to_string(),
+            "command": command,
+            "field": "by",
+            "reason": crate::decision_store::decider::DeciderError::MISSING_REASON,
+        }),
+        2,
+    )
+}
+
 fn fail_field(command: &str, e: FieldError) -> ! {
     fail(command, Some(&e.field), e.message, 2)
 }
@@ -278,20 +445,6 @@ fn subject_from(args: &RecordKindArgs, kind: Kind) -> Result<Subject, FieldError
     Ok(subject)
 }
 
-/// The decider `record --kind` uses until the decider and lineage resolvers
-/// land, kept as one seam for them to replace: the harness session koto
-/// observes, marked defaulted because the caller named none. The agent
-/// slot stays empty and the chain is recorded `incomplete`
-/// ([`Chain::unknown`]), because nothing here resolves either yet.
-fn placeholder_decider() -> DecidedBy {
-    let session: Vec<Sourced> = crate::host_env::host_env(crate::host_env::CLAUDE_SESSION_ID_ENV)
-        .filter(|v| !v.is_empty())
-        .map(Sourced::observed)
-        .into_iter()
-        .collect();
-    DecidedBy::session(session, Vec::new(), true)
-}
-
 /// `koto decisions record --kind ...`.
 pub fn handle_record_kind(args: RecordKindArgs) -> Result<()> {
     const CMD: &str = "decisions record";
@@ -331,19 +484,17 @@ pub fn handle_record_kind(args: RecordKindArgs) -> Result<()> {
         ),
     };
     let subject = subject_from(&args, kind).unwrap_or_else(|e| fail_field(CMD, e));
-    for (field, link) in [
-        ("link", args.link.as_deref()),
-        ("source_link", args.source_link.as_deref()),
-    ] {
-        if let Some(l) = link {
-            if let Err(e) = validate_link(field, l) {
-                fail_field(CMD, e);
-            }
+    if let Some(l) = args.source_link.as_deref() {
+        if let Err(e) = validate_link("source_link", l) {
+            fail_field(CMD, e);
         }
     }
 
-    let mut decided_by = placeholder_decider();
-    decided_by.link = args.link.clone();
+    let (decided_by, chain, authority) = match resolve_identity(&args.decider, journal_root()) {
+        Ok(r) => r,
+        Err(IdentityError::Invalid(e)) => fail_field(CMD, e),
+        Err(IdentityError::DeciderMissing) => fail_decider_missing(CMD),
+    };
 
     let time = now_to_second();
     let id = new_id(&time).unwrap_or_else(|e| fail_field(CMD, e));
@@ -355,8 +506,8 @@ pub fn handle_record_kind(args: RecordKindArgs) -> Result<()> {
         outcome,
         subject,
         decided_by,
-        authority: Authority::for_decider(DeciderKind::Session),
-        chain: Chain::unknown(),
+        authority,
+        chain,
         basis: args.basis.clone(),
         evidence: args.evidence.clone(),
         reason: args.reason.clone(),
