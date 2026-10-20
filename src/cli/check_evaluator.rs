@@ -1262,6 +1262,7 @@ mod tests {
             input_sha256: fallback.input_sha256.clone(),
             answer,
             fallback_seq: 3,
+            decision_records: Vec::new(),
         });
         backend
             .append_event("wf", &p, &crate::engine::types::now_iso8601())

@@ -52,7 +52,11 @@ fn init_workflow(dir: &Path, name: &str, template: &str) {
 }
 
 fn run(dir: &Path, args: &[&str]) -> (i32, serde_json::Value, String) {
-    let output = koto_cmd(dir).args(args).output().unwrap();
+    let output = koto_cmd(dir)
+        .envs(harness_session(args))
+        .args(args)
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let last = stdout.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("");
@@ -536,4 +540,19 @@ fn directed_transition_allowed_to_edge_routing_on_gate_failure() {
 
     // `fix` is conditioned on the gate failing, which it does: allowed.
     assert_directed(d, "wf", "fix");
+}
+
+/// A harness session identifier for the commands that pass a gate by
+/// choice (`koto overrides record`, `koto next --to`, `koto decider
+/// answer`), which koto refuses when no decider can be established.
+fn harness_session(args: &[&str]) -> Vec<(&'static str, &'static str)> {
+    let passes_gate = args.contains(&"--to")
+        || args
+            .windows(2)
+            .any(|w| w == ["overrides", "record"] || w == ["decider", "answer"]);
+    if passes_gate {
+        vec![("CLAUDE_CODE_SESSION_ID", "test-harness-session")]
+    } else {
+        Vec::new()
+    }
 }

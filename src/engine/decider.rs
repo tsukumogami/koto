@@ -766,6 +766,7 @@ mod tests {
                             from: "gather".to_string(),
                             to: "review".to_string(),
                             rationale: None,
+                            decision_records: Vec::new(),
                         },
                     ),
                     ev(4, evidence("review")),

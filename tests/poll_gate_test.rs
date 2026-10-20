@@ -34,7 +34,11 @@ fn koto_cmd(dir: &Path) -> Command {
 }
 
 fn run(dir: &Path, args: &[&str]) -> std::process::Output {
-    koto_cmd(dir).args(args).output().unwrap()
+    koto_cmd(dir)
+        .envs(harness_session(args))
+        .args(args)
+        .output()
+        .unwrap()
 }
 
 fn run_ok(dir: &Path, args: &[&str]) -> std::process::Output {
@@ -563,4 +567,19 @@ Done.
     // Under one shared schedule both would run at the fast gate's pace.
     assert!(fast >= 3, "the 1-second gate ran {fast} times");
     assert!(slow <= 2, "the 3-second gate ran {slow} times, fast {fast}");
+}
+
+/// A harness session identifier for the commands that pass a gate by
+/// choice (`koto overrides record`, `koto next --to`, `koto decider
+/// answer`), which koto refuses when no decider can be established.
+fn harness_session(args: &[&str]) -> Vec<(&'static str, &'static str)> {
+    let passes_gate = args.contains(&"--to")
+        || args
+            .windows(2)
+            .any(|w| w == ["overrides", "record"] || w == ["decider", "answer"]);
+    if passes_gate {
+        vec![("CLAUDE_CODE_SESSION_ID", "test-harness-session")]
+    } else {
+        Vec::new()
+    }
 }

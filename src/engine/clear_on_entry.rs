@@ -280,6 +280,7 @@ mod tests {
                     from: "work".to_string(),
                     to: "review".to_string(),
                     rationale: None,
+                    decision_records: Vec::new(),
                 },
             ),
         ];

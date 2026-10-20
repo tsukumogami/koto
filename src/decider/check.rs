@@ -432,6 +432,16 @@ pub struct DeciderCheckAnswered {
     pub answer: AgentAnswer,
     /// The `seq` of the `decider_fallback` event this answers.
     pub fallback_seq: u64,
+    /// The decision `koto decider answer` wrote beside this event: a
+    /// `gate-pass` for a `pass` answer, a `judgment` otherwise. Raw, read
+    /// leniently and omitted when empty, like the other events' copies
+    /// (`EventPayload::decision_records`).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::engine::types::lenient_decision_records"
+    )]
+    pub decision_records: Vec<serde_json::Value>,
 }
 
 /// Round unrounded probabilities for the record.
@@ -677,6 +687,7 @@ mod tests {
             input_sha256: Some("abc".into()),
             answer: AgentAnswer::Fail,
             fallback_seq: 9,
+            decision_records: Vec::new(),
         };
         let v = serde_json::to_value(&ans).unwrap();
         assert_eq!(v["answer"], "fail");

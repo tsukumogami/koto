@@ -163,7 +163,12 @@ impl Env {
     }
 
     fn koto_in(&self, cwd: &Path, args: &[&str]) -> Out {
-        let output = self.cmd(cwd).args(args).output().unwrap();
+        let output = self
+            .cmd(cwd)
+            .envs(harness_session(args))
+            .args(args)
+            .output()
+            .unwrap();
         Out {
             code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -2175,11 +2180,14 @@ fn running_as_root() -> bool {
 fn masked(value: &Value, tmp: &str) -> Value {
     let uuid =
         regex::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap();
+    // A decision identifier is random too.
+    let decision = regex::Regex::new(r"d-\d{6}-[0-9a-f]{32}").unwrap();
     let time = regex::Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z").unwrap();
     match value {
         Value::String(s) => {
             let s = s.replace(tmp, "<tmp>");
             let s = uuid.replace_all(&s, "<id>");
+            let s = decision.replace_all(&s, "<decision>");
             Value::String(time.replace_all(&s, "<time>").into_owned())
         }
         Value::Array(items) => Value::Array(items.iter().map(|v| masked(v, tmp)).collect()),
@@ -2330,6 +2338,7 @@ fn decider_in(env: &Env, cwd: &Path, stub: &DeciderStub, args: &[&str]) -> Out {
         .env("KOTO_DECIDER", "auto")
         .env("KOTO_DECIDER_API_KEY", DECIDER_KEY)
         .env("KOTO_DECIDER_ENDPOINT", stub.url())
+        .envs(harness_session(args))
         .args(args)
         .output()
         .unwrap();
@@ -3929,5 +3938,20 @@ fn an_unwritable_journal_changes_nothing_in_the_context_scenario() {
             assert_eq!(*warnings, usize::from(*wrote), "{label} step {i}");
         }
         assert_eq!(log, expected_log, "{label}");
+    }
+}
+
+/// A harness session identifier for the commands that pass a gate by
+/// choice (`koto overrides record`, `koto next --to`, `koto decider
+/// answer`), which koto refuses when no decider can be established.
+fn harness_session(args: &[&str]) -> Vec<(&'static str, &'static str)> {
+    let passes_gate = args.contains(&"--to")
+        || args
+            .windows(2)
+            .any(|w| w == ["overrides", "record"] || w == ["decider", "answer"]);
+    if passes_gate {
+        vec![("CLAUDE_CODE_SESSION_ID", "test-harness-session")]
+    } else {
+        Vec::new()
     }
 }

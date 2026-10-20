@@ -230,6 +230,13 @@ pub enum Command {
         /// (`koto next <coord_workflow>`) do NOT require the flag.
         #[arg(long = "dispatch-epoch")]
         dispatch_epoch: Option<u32>,
+
+        /// With --to: who decided to take the transition past a gate that
+        /// hasn't passed. With none named, the observed harness session is
+        /// recorded, marked defaulted; with neither, the transition is
+        /// refused (decider_missing)
+        #[command(flatten)]
+        decider: decisions::DeciderArgs,
     },
 
     /// Cancel a workflow, preventing further advancement
@@ -935,6 +942,14 @@ pub enum DecisionsSubcommand {
         #[command(flatten)]
         args: Box<decisions::ReverseArgs>,
     },
+    /// Import decisions recorded before the decision store existed, such as
+    /// a coordinator's decision table exported as versioned JSON. Each
+    /// entry is imported once, however often the source is imported, with
+    /// its decider and authority labelled handed
+    Import {
+        /// The import source: a regular file of strict versioned JSON
+        source: PathBuf,
+    },
     /// Report on the decisions made, and the reversals recorded, in a UTC
     /// window that includes its start and excludes its end
     Report {
@@ -1584,6 +1599,7 @@ pub fn run(app: App) -> Result<()> {
             rationale,
             redelegation_cap,
             dispatch_epoch,
+            decider,
         } => {
             // Leaked so the exit flush can reach it from any exit path,
             // `std::process::exit` included. One per process, which ends.
@@ -1611,6 +1627,7 @@ pub fn run(app: App) -> Result<()> {
                 rationale,
                 redelegation_cap,
                 dispatch_epoch,
+                decider,
             );
             flush_before_exit();
             result
@@ -2060,17 +2077,28 @@ pub fn run(app: App) -> Result<()> {
                 with_data: Some(with_data),
                 kind_args,
             } => {
-                if kind_args.any_set() {
+                // The decider flags apply to the workflow form too; every
+                // other decision-store flag needs --kind.
+                let decider = kind_args.decider.clone();
+                let mut rest = *kind_args;
+                rest.decider = decisions::DeciderArgs::default();
+                if rest.any_set() {
                     exit_with_error_code(
                         serde_json::json!({
-                            "error": "the decision-store flags need --kind and no workflow name",
+                            "error": "the decision-store flags other than the decider flags need --kind and no workflow name",
                             "command": "decisions record"
                         }),
                         2,
                     );
                 }
                 let backend = build_backend()?;
-                handle_decisions_record(&backend, name, with_data)
+                handle_decisions_record(
+                    &backend,
+                    backend.journal_root().map(Path::to_path_buf),
+                    name,
+                    with_data,
+                    decider,
+                )
             }
             DecisionsSubcommand::Record { kind_args, .. } => {
                 decisions::handle_record_kind(*kind_args)
@@ -2098,6 +2126,7 @@ pub fn run(app: App) -> Result<()> {
             DecisionsSubcommand::Show { id } => decisions::handle_show(id),
             DecisionsSubcommand::Reverse { args } => decisions::handle_reverse(*args),
             DecisionsSubcommand::Report { since, until } => decisions::handle_report(since, until),
+            DecisionsSubcommand::Import { source } => decisions::handle_import(source),
         },
         Command::Overrides { subcommand } => {
             let backend = build_backend()?;
@@ -2107,7 +2136,16 @@ pub fn run(app: App) -> Result<()> {
                     gate,
                     rationale,
                     with_data,
-                } => overrides::handle_overrides_record(&backend, name, gate, rationale, with_data),
+                    decider,
+                } => overrides::handle_overrides_record(
+                    &backend,
+                    backend.journal_root().map(Path::to_path_buf),
+                    name,
+                    gate,
+                    rationale,
+                    with_data,
+                    *decider,
+                ),
                 overrides::OverridesSubcommand::List { name } => {
                     overrides::handle_overrides_list(&backend, name)
                 }
@@ -2120,7 +2158,11 @@ pub fn run(app: App) -> Result<()> {
             // decider::handle's match.
             decider::DeciderCommand::Answer(args) => {
                 let backend = build_backend()?;
-                decider_answer::handle_answer(&backend, args)
+                decider_answer::handle_answer(
+                    &backend,
+                    backend.journal_root().map(Path::to_path_buf),
+                    args,
+                )
             }
             other => decider::handle(other),
         },
@@ -3485,6 +3527,17 @@ fn finish_terminal_tick(
         return;
     }
     if !defer_for_parent && !defer_for_promotion {
+        // A decision this run's events carry that the store still lacks
+        // (an append lost on this very tick, say) is put back before the
+        // session, and with it the event, is removed. Best effort: it warns
+        // and the removal goes on.
+        match backend.read_events(name) {
+            Ok((_, events)) => crate::decision_store::dual_write::repair_or_warn(name, &events),
+            Err(e) => eprintln!(
+                "warning: the decisions of '{}' couldn't be checked before cleanup: {}",
+                name, e
+            ),
+        }
         // The finished record goes after the journal's terminal record above
         // and before anything is removed, so `koto status` can answer for the
         // session once it is gone. A record that can't be written warns and
@@ -4336,6 +4389,7 @@ fn handle_next(
     rationale: Option<String>,
     redelegation_cap: Option<u32>,
     dispatch_epoch: Option<u32>,
+    decider: decisions::DeciderArgs,
 ) -> Result<()> {
     use crate::cli::next::dispatch_next;
     use crate::cli::next_types::{
@@ -4525,6 +4579,17 @@ fn handle_next(
         let err = NextError {
             code: NextErrorCode::PreconditionFailed,
             message: "--with-data and --to are mutually exclusive".to_string(),
+            details: vec![],
+        };
+        let json = serde_json::json!({"error": err});
+        exit_with_error_code(json, err.code.exit_code());
+    }
+    // The decider flags name who took a directed transition past a gate;
+    // without --to there is no such transition.
+    if to.is_none() && decider.any_set() {
+        let err = NextError {
+            code: NextErrorCode::PreconditionFailed,
+            message: "the decider flags (--by and the rest) apply only with --to".to_string(),
             details: vec![],
         };
         let json = serde_json::json!({"error": err});
@@ -4929,6 +4994,12 @@ fn handle_next(
     // the check evaluator.
     let consult_budget = crate::cli::check_evaluator::ConsultBudget::new();
 
+    // Put back any decision this session's events carry that the decision
+    // store lacks: an append lost after its command wrote the event. It
+    // warns on failure and never fails the tick, and it never re-appends a
+    // reversal (DESIGN-decision-record.md, Decision 3).
+    crate::decision_store::dual_write::repair_or_warn(&name, &events);
+
     // A reversed gate pass stops the workflow wherever it stands, before
     // `--to`, `--with-data` or any gate or action runs, and nothing is
     // written (DESIGN-decision-record.md, Decision 4).
@@ -5109,6 +5180,99 @@ fn handle_next(
         // passing `--to` appends exactly what it did before this check.
         let guard_gates =
             crate::engine::advance::directed_target_guard_gates(current_template_state, target);
+
+        // A `--to` that leaves the state with a gate that hasn't passed is a
+        // gate pass by choice: resolve who made it before any gate runs or
+        // anything is written, and refuse it when nobody can be named
+        // (DESIGN-decision-record.md, Decision 4). A transition back into
+        // the same state passes nothing.
+        let unmet_gates = if target == current_state {
+            Vec::new()
+        } else {
+            directed_unmet_gates(&events, current_state, current_template_state, &guard_gates)
+        };
+        let mut gate_passes: Vec<crate::decision_store::Decision> = Vec::new();
+        let mut decision_store: Option<crate::decision_store::Store> = None;
+        if !unmet_gates.is_empty() {
+            const CMD: &str = "next";
+            let store = decisions::command_store(CMD);
+            let subject = |gate: &str| {
+                crate::decision_store::dual_write::gate_subject(
+                    &name,
+                    &header.session_id,
+                    current_state,
+                    gate,
+                )
+            };
+            let Some(identity) = decisions::resolve_command_decider(
+                CMD,
+                &decider,
+                journal_root.map(Path::to_path_buf),
+            ) else {
+                let refused: Vec<String> = unmet_gates
+                    .iter()
+                    .filter_map(|g| decisions::record_gate_refusal(&store, CMD, subject(g)))
+                    .collect();
+                let err = NextError {
+                    code: NextErrorCode::DeciderMissing,
+                    message: format!(
+                        "cannot take --to '{}': it passes {} {} of state '{}' that {} not \
+                         passed, and no decider could be established (decider_missing): name \
+                         one with --by or run inside a harness session; nothing was recorded \
+                         except the refusal{}",
+                        target,
+                        if unmet_gates.len() == 1 {
+                            "gate"
+                        } else {
+                            "gates"
+                        },
+                        unmet_gates
+                            .iter()
+                            .map(|g| format!("'{}'", g))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        current_state,
+                        if unmet_gates.len() == 1 {
+                            "has"
+                        } else {
+                            "have"
+                        },
+                        if refused.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", refused.join(", "))
+                        }
+                    ),
+                    details: vec![ErrorDetail {
+                        field: "by".to_string(),
+                        reason: crate::decision_store::dual_write::DECIDER_MISSING.to_string(),
+                    }],
+                };
+                let json = serde_json::json!({"error": err});
+                exit_with_error_code(json, err.code.exit_code());
+            };
+            let reason = rationale
+                .as_deref()
+                .map(crate::decision_store::dual_write::clip);
+            for gate in &unmet_gates {
+                gate_passes.push(
+                    crate::decision_store::dual_write::gate_pass(
+                        &identity,
+                        subject(gate),
+                        Vec::new(),
+                        reason.clone(),
+                    )
+                    .unwrap_or_else(|e| decisions::fail_command_field(CMD, e)),
+                );
+            }
+            decision_store = Some(store);
+        }
+        let decision_records = match &decision_store {
+            Some(store) => crate::decision_store::dual_write::prepare(store, &mut gate_passes)
+                .unwrap_or_else(|e| decisions::fail_command_store("next", e)),
+            None => Vec::new(),
+        };
+
         if !guard_gates.is_empty() {
             // The children-complete evaluator reads the log as the tick found
             // it: nothing has been appended yet on this path.
@@ -5210,6 +5374,7 @@ fn handle_next(
             from: current_state.clone(),
             to: target.clone(),
             rationale: rationale.clone(),
+            decision_records,
         };
         // Captured so the in-memory event built below (for the delivery
         // predicate) carries the same timestamp actually persisted,
@@ -5223,6 +5388,12 @@ fn handle_next(
             };
             let json = serde_json::json!({"error": ne});
             exit_with_error_code(json, ne.code.exit_code());
+        }
+        // The gate passes go to the store once the transition is recorded. A
+        // lost append warns, and the next tick, or this one's terminal
+        // cleanup, repairs it from the event.
+        if let Some(store) = &decision_store {
+            crate::decision_store::dual_write::append_after_event(store, &name, &gate_passes);
         }
 
         // Clear the target's `clear_on_entry` keys for this entry before the
@@ -7121,6 +7292,52 @@ fn handle_next(
     }
 }
 
+/// The gates of `state` a `koto next --to` leaves without their having
+/// passed: every gate the state declares except the `overridable: false`
+/// ones the transition was just checked against (`guards`), the ones whose
+/// latest evaluation in the current visit passed, and the ones overridden
+/// in it. Each is a gate pass by choice and gets a `gate-pass` decision.
+#[cfg(unix)]
+fn directed_unmet_gates(
+    events: &[crate::engine::types::Event],
+    state: &str,
+    template_state: &crate::template::types::TemplateState,
+    guards: &std::collections::BTreeMap<String, crate::template::types::Gate>,
+) -> Vec<String> {
+    let visit_start = events
+        .iter()
+        .rposition(|e| match &e.payload {
+            EventPayload::Transitioned { to, .. }
+            | EventPayload::DirectedTransition { to, .. }
+            | EventPayload::Rewound { to, .. } => to == state,
+            _ => false,
+        })
+        .map_or(0, |i| i + 1);
+    let visit = &events[visit_start..];
+    template_state
+        .gates
+        .keys()
+        .filter(|gate| !guards.contains_key(*gate))
+        .filter(|gate| {
+            let overridden = visit.iter().any(|e| {
+                matches!(&e.payload, EventPayload::GateOverrideRecorded { state: s, gate: g, .. }
+                    if s == state && g == *gate)
+            });
+            let passed = visit.iter().rev().find_map(|e| match &e.payload {
+                EventPayload::GateEvaluated {
+                    state: s,
+                    gate: g,
+                    outcome,
+                    ..
+                } if s == state && g == *gate => Some(outcome == "passed"),
+                _ => None,
+            });
+            !overridden && passed != Some(true)
+        })
+        .cloned()
+        .collect()
+}
+
 /// The `gate_blocked` response for a workflow a reversed gate pass stops,
 /// or `None` when nothing does. Each blocking condition carries only the
 /// reversal's identifier, the reversed kind, its standing and its time;
@@ -7231,6 +7448,7 @@ fn handle_next(
     _rationale: Option<String>,
     _redelegation_cap: Option<u32>,
     _dispatch_epoch: Option<u32>,
+    _decider: decisions::DeciderArgs,
 ) -> Result<()> {
     exit_with_error_code(
         serde_json::json!({
@@ -7250,8 +7468,10 @@ fn handle_next(
 /// - "alternatives_considered" (array of strings, optional)
 fn handle_decisions_record(
     backend: &dyn SessionBackend,
+    journal_root: Option<PathBuf>,
     name: String,
     with_data: String,
+    decider: decisions::DeciderArgs,
 ) -> Result<()> {
     // 0. Resolve --with-data source (inline JSON or @file.json). Keeps this
     //    handler aligned with `koto next`; see `resolve_with_data_source`.
@@ -7441,11 +7661,35 @@ fn handle_decisions_record(
         }
     }
 
-    // 5. Append DecisionRecorded event
+    // 5. The decision store gets a `judgment` decided by the resolved
+    //    decider. With none, the event is written alone, as before
+    //    decisions existed: a judgment isn't a gate pass, so nothing is
+    //    refused.
+    const CMD: &str = "decisions record";
     let current_state = machine_state.current_state.clone();
+    let store = decisions::command_store(CMD);
+    let mut judgments = match decisions::resolve_command_decider(CMD, &decider, journal_root) {
+        Some(identity) => {
+            let field = |k: &str| obj.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+            vec![crate::decision_store::dual_write::judgment(
+                &identity,
+                crate::decision_store::dual_write::clip(field("choice")),
+                Some(format!("workflow:{}/{}", name, current_state)),
+                Vec::new(),
+                Some(crate::decision_store::dual_write::clip(field("rationale"))),
+            )
+            .unwrap_or_else(|e| decisions::fail_command_field(CMD, e))]
+        }
+        None => Vec::new(),
+    };
+    let decision_records = crate::decision_store::dual_write::prepare(&store, &mut judgments)
+        .unwrap_or_else(|e| decisions::fail_command_store(CMD, e));
+
+    // 6. Append DecisionRecorded event, then the decision to the store.
     let payload = EventPayload::DecisionRecorded {
         state: current_state.clone(),
-        decision: data,
+        decision: data.clone(),
+        decision_records,
     };
     if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
         exit_with_error(serde_json::json!({
@@ -7453,8 +7697,9 @@ fn handle_decisions_record(
             "command": "decisions record"
         }));
     }
+    crate::decision_store::dual_write::append_after_event(&store, &name, &judgments);
 
-    // 6. Count decisions in current epoch
+    // 7. Count decisions in current epoch
     let (_, updated_events) = match backend.read_events(&name) {
         Ok(result) => result,
         Err(err) => {
@@ -7470,14 +7715,15 @@ fn handle_decisions_record(
     };
     let decision_count = derive_decisions(&updated_events).len();
 
-    // 7. Print confirmation
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "state": current_state,
-            "decisions_recorded": decision_count
-        }))?
-    );
+    // 8. Print confirmation
+    let mut body = serde_json::json!({
+        "state": current_state,
+        "decisions_recorded": decision_count
+    });
+    if let Some(d) = judgments.first() {
+        body["decision"] = serde_json::json!(d.id);
+    }
+    println!("{}", serde_json::to_string(&body)?);
     Ok(())
 }
 

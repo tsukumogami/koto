@@ -57,6 +57,12 @@ pub struct AnswerArgs {
     /// Your answer: pass, fail, or unclear (the criterion's escape)
     #[arg(long)]
     pub answer: String,
+
+    /// Who answered. With none named, the observed harness session is
+    /// recorded, marked defaulted; a `pass` with neither is refused
+    /// (decider_missing)
+    #[command(flatten)]
+    pub decider: super::decisions::DeciderArgs,
 }
 
 /// A typed refusal: exit 2, nothing appended.
@@ -106,12 +112,91 @@ fn latest_fallback<'e>(
     })
 }
 
-pub fn handle_answer(backend: &dyn SessionBackend, args: AnswerArgs) -> Result<()> {
+/// The decision an answer writes beside its event: a `gate-pass` for
+/// `pass`, which lets the criterion through, and a `judgment` for `fail` or
+/// `unclear`. A `pass` with no decider is refused (exit 2, nothing appended,
+/// a `refused` decision recorded); a `judgment` with no decider writes the
+/// event alone, as the command did before decisions existed.
+#[allow(clippy::too_many_arguments)]
+fn answer_decision(
+    store: &crate::decision_store::Store,
+    decider: &super::decisions::DeciderArgs,
+    journal_root: Option<std::path::PathBuf>,
+    name: &str,
+    session_id: &str,
+    state: &str,
+    gate: &str,
+    criterion: &str,
+    answer: AgentAnswer,
+) -> Vec<crate::decision_store::Decision> {
+    use crate::decision_store::dual_write;
+    let identity = super::decisions::resolve_command_decider(COMMAND, decider, journal_root);
+    let evidence = vec![format!("criterion:{}", criterion)];
+    let built = match (answer, identity) {
+        (AgentAnswer::Pass, Some(identity)) => dual_write::gate_pass(
+            &identity,
+            dual_write::gate_subject(name, session_id, state, gate),
+            evidence,
+            None,
+        ),
+        (AgentAnswer::Pass, None) => {
+            let refused = super::decisions::record_gate_refusal(
+                store,
+                COMMAND,
+                dual_write::gate_subject(name, session_id, state, gate),
+            );
+            refuse_decider_missing(gate, criterion, state, refused);
+        }
+        (_, Some(identity)) => dual_write::judgment(
+            &identity,
+            format!(
+                "decider check '{}' criterion '{}' answered {}",
+                gate,
+                criterion,
+                answer.as_str()
+            ),
+            Some(format!("workflow:{}/{}", name, state)),
+            evidence,
+            None,
+        ),
+        (_, None) => return Vec::new(),
+    };
+    vec![built.unwrap_or_else(|e| super::decisions::fail_command_field(COMMAND, e))]
+}
+
+/// The refusal of a `pass` nobody can be named for: exit 2 in this
+/// command's error shape, with code `decider_missing`.
+fn refuse_decider_missing(
+    gate: &str,
+    criterion: &str,
+    state: &str,
+    refused_id: Option<String>,
+) -> ! {
+    let mut error = serde_json::json!({
+        "code": crate::decision_store::dual_write::DECIDER_MISSING,
+        "message": crate::decision_store::decider::DeciderError::Missing.to_string(),
+        "field": "by",
+        "gate": gate,
+        "criterion": criterion,
+        "state": state,
+    });
+    if let Some(id) = refused_id {
+        error["refused_id"] = serde_json::json!(id);
+    }
+    exit_with_error_code(serde_json::json!({"error": error, "command": COMMAND}), 2);
+}
+
+pub fn handle_answer(
+    backend: &dyn SessionBackend,
+    journal_root: Option<std::path::PathBuf>,
+    args: AnswerArgs,
+) -> Result<()> {
     let AnswerArgs {
         name,
         gate,
         criterion,
         answer,
+        decider,
     } = args;
 
     // The answer is checked first: it needs nothing loaded.
@@ -202,6 +287,21 @@ pub fn handle_answer(backend: &dyn SessionBackend, args: AnswerArgs) -> Result<(
         );
     };
 
+    let store = super::decisions::command_store(COMMAND);
+    let mut decisions = answer_decision(
+        &store,
+        &decider,
+        journal_root,
+        &name,
+        &header.session_id,
+        &state,
+        &gate,
+        &criterion,
+        answer,
+    );
+    let decision_records = crate::decision_store::dual_write::prepare(&store, &mut decisions)
+        .unwrap_or_else(|e| super::decisions::fail_command_store(COMMAND, e));
+
     let payload = EventPayload::DeciderCheckAnswered(DeciderCheckAnswered {
         state: state.clone(),
         visit_seq: fallback.visit_seq,
@@ -211,19 +311,22 @@ pub fn handle_answer(backend: &dyn SessionBackend, args: AnswerArgs) -> Result<(
         input_sha256: fallback.input_sha256.clone(),
         answer,
         fallback_seq,
+        decision_records,
     });
     if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
         fail(1, e.to_string());
     }
+    crate::decision_store::dual_write::append_after_event(&store, &name, &decisions);
 
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "status": "recorded",
-            "gate": gate,
-            "criterion": criterion,
-            "answer": answer.as_str(),
-        }))?
-    );
+    let mut body = serde_json::json!({
+        "status": "recorded",
+        "gate": gate,
+        "criterion": criterion,
+        "answer": answer.as_str(),
+    });
+    if let Some(d) = decisions.first() {
+        body["decision"] = serde_json::json!(d.id);
+    }
+    println!("{}", serde_json::to_string(&body)?);
     Ok(())
 }

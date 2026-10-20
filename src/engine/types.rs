@@ -888,6 +888,15 @@ pub enum EventPayload {
         /// Optional human-readable reason for this directed transition.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rationale: Option<String>,
+        /// The full decision line this event's command wrote to the
+        /// host-level decision store, or more than one for a `--to` past
+        /// several gates. Kept raw so a malformed copy can't fail the log's
+        /// read: the repair tick in `koto next` parses each one and skips
+        /// what doesn't validate. Omitted when empty, so events without a
+        /// decision serialize as before (DESIGN-decision-record.md,
+        /// Decision 3).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        decision_records: Vec<serde_json::Value>,
     },
     Rewound {
         from: String,
@@ -992,6 +1001,15 @@ pub enum EventPayload {
     DecisionRecorded {
         state: String,
         decision: serde_json::Value,
+        /// The full decision line this event's command wrote to the
+        /// host-level decision store, or more than one for a `--to` past
+        /// several gates. Kept raw so a malformed copy can't fail the log's
+        /// read: the repair tick in `koto next` parses each one and skips
+        /// what doesn't validate. Omitted when empty, so events without a
+        /// decision serialize as before (DESIGN-decision-record.md,
+        /// Decision 3).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        decision_records: Vec<serde_json::Value>,
     },
     GateEvaluated {
         state: String,
@@ -1019,6 +1037,15 @@ pub enum EventPayload {
         override_applied: serde_json::Value,
         actual_output: serde_json::Value,
         timestamp: String,
+        /// The full decision line this event's command wrote to the
+        /// host-level decision store, or more than one for a `--to` past
+        /// several gates. Kept raw so a malformed copy can't fail the log's
+        /// read: the repair tick in `koto next` parses each one and skips
+        /// what doesn't validate. Omitted when empty, so events without a
+        /// decision serialize as before (DESIGN-decision-record.md,
+        /// Decision 3).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        decision_records: Vec<serde_json::Value>,
     },
     /// Per-tick audit record emitted by the batch scheduler on
     /// non-trivial ticks (Decision 11 / Issue #16). `tick_summary`
@@ -1742,6 +1769,26 @@ pub struct ChildSnapshot {
 }
 
 impl EventPayload {
+    /// The decision lines this event carries for the decision store: the
+    /// copies `koto overrides record`, `koto next --to`, `koto decider
+    /// answer` and `koto decisions record` write beside their own event.
+    /// Empty for every other payload.
+    pub fn decision_records(&self) -> &[serde_json::Value] {
+        match self {
+            EventPayload::DirectedTransition {
+                decision_records, ..
+            }
+            | EventPayload::DecisionRecorded {
+                decision_records, ..
+            }
+            | EventPayload::GateOverrideRecorded {
+                decision_records, ..
+            } => decision_records,
+            EventPayload::DeciderCheckAnswered(a) => &a.decision_records,
+            _ => &[],
+        }
+    }
+
     /// Return the string name matching the serialized `type` field.
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -1938,6 +1985,7 @@ impl<'de> Deserialize<'de> for Event {
                     from: p.from,
                     to: p.to,
                     rationale: p.rationale,
+                    decision_records: p.decision_records,
                 }
             }
             "integration_invoked" => {
@@ -2025,6 +2073,7 @@ impl<'de> Deserialize<'de> for Event {
                 EventPayload::DecisionRecorded {
                     state: p.state,
                     decision: p.decision,
+                    decision_records: p.decision_records,
                 }
             }
             "gate_evaluated" => {
@@ -2054,6 +2103,7 @@ impl<'de> Deserialize<'de> for Event {
                     override_applied: p.override_applied,
                     actual_output: p.actual_output,
                     timestamp: p.timestamp,
+                    decision_records: p.decision_records,
                 }
             }
             "scheduler_ran" => {
@@ -2328,6 +2378,8 @@ struct DirectedTransitionPayload {
     to: String,
     #[serde(default)]
     rationale: Option<String>,
+    #[serde(default, deserialize_with = "lenient_decision_records")]
+    decision_records: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -2382,6 +2434,20 @@ struct ContextReadPayload {
     gate: Option<String>,
 }
 
+/// The `decision_records` field read leniently: anything but an array reads
+/// as empty rather than failing the whole log. Each element stays raw; the
+/// repair tick validates it.
+pub(crate) fn lenient_decision_records<'de, D>(d: D) -> Result<Vec<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::Array(items) => items,
+        _ => Vec::new(),
+    })
+}
+
 /// A string field read leniently: anything but a string reads as absent
 /// rather than failing the whole log.
 fn lenient_string(v: Option<serde_json::Value>) -> Option<String> {
@@ -2414,6 +2480,8 @@ struct DefaultActionExecutedPayload {
 struct DecisionRecordedPayload {
     state: String,
     decision: serde_json::Value,
+    #[serde(default, deserialize_with = "lenient_decision_records")]
+    decision_records: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -2433,6 +2501,8 @@ struct GateOverrideRecordedPayload {
     override_applied: serde_json::Value,
     actual_output: serde_json::Value,
     timestamp: String,
+    #[serde(default, deserialize_with = "lenient_decision_records")]
+    decision_records: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -3214,6 +3284,7 @@ mod tests {
                     "rationale": "The API has no batch endpoint",
                     "alternatives_considered": ["Parallel requests", "Queue-based processing"]
                 }),
+                decision_records: Vec::new(),
             },
             idempotency_hash: None,
         };
@@ -3389,6 +3460,7 @@ mod tests {
                 override_applied: serde_json::json!({"exit_code": 0, "error": ""}),
                 actual_output: serde_json::json!({"exit_code": 1, "error": "timeout"}),
                 timestamp: "2026-04-01T00:01:00Z".to_string(),
+                decision_records: Vec::new(),
             },
             idempotency_hash: None,
         };
@@ -3411,6 +3483,7 @@ mod tests {
             override_applied: serde_json::Value::Null,
             actual_output: serde_json::Value::Null,
             timestamp: "2026-04-01T00:00:00Z".to_string(),
+            decision_records: Vec::new(),
         };
         assert_eq!(p.type_name(), "gate_override_recorded");
     }
@@ -3743,6 +3816,7 @@ mod tests {
             input_sha256: Some("a".repeat(64)),
             answer: AgentAnswer::Pass,
             fallback_seq: 5,
+            decision_records: Vec::new(),
         });
         for (p, name) in [
             (fallback, "decider_fallback"),
@@ -4009,6 +4083,7 @@ mod tests {
                 from: "analysis".to_string(),
                 to: "implementation".to_string(),
                 rationale: Some("Design approved by stakeholders".to_string()),
+                decision_records: Vec::new(),
             },
             idempotency_hash: None,
         };
@@ -4028,6 +4103,7 @@ mod tests {
                 from: "analysis".to_string(),
                 to: "implementation".to_string(),
                 rationale: None,
+                decision_records: Vec::new(),
             },
             idempotency_hash: None,
         };

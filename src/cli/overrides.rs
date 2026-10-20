@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::cache::sha256_hex;
+use crate::decision_store::dual_write;
 use crate::engine::persistence::{
     derive_last_gate_evaluated, derive_machine_state, derive_overrides_all, derive_state_from_log,
 };
@@ -39,6 +40,12 @@ pub enum OverridesSubcommand {
         /// then built-in default for the gate type)
         #[arg(long = "with-data")]
         with_data: Option<String>,
+
+        /// Who decided to pass the gate. With none named, the observed
+        /// harness session is recorded, marked defaulted; with neither, the
+        /// override is refused (decider_missing)
+        #[command(flatten)]
+        decider: Box<super::decisions::DeciderArgs>,
     },
 
     /// List all gate overrides across the full session history
@@ -125,13 +132,18 @@ pub fn override_refusal(
 ///    --with-data (the refusal comes first so no payload error can mask it)
 /// 4. Resolve override_applied: --with-data → gate.override_default → built_in_default
 /// 5. Read actual_output from derive_last_gate_evaluated (null if absent)
-/// 6. Append GateOverrideRecorded event
+/// 6. Resolve the decider (refusing the override when there is none) and
+///    build the `gate-pass` decision
+/// 7. Append GateOverrideRecorded event, carrying the decision
+/// 8. Append the decision to the decision store
 pub fn handle_overrides_record(
     backend: &dyn SessionBackend,
+    journal_root: Option<std::path::PathBuf>,
     name: String,
     gate: String,
     rationale: String,
     with_data: Option<String>,
+    decider: super::decisions::DeciderArgs,
 ) -> Result<()> {
     // 1. Size-limit check on --rationale. The --with-data checks run after
     //    the gate is found and known to accept overrides (step 3b), so a
@@ -329,7 +341,29 @@ pub fn handle_overrides_record(
     let actual_output: serde_json::Value =
         derive_last_gate_evaluated(&events, &gate).unwrap_or(serde_json::Value::Null);
 
-    // 6. Append GateOverrideRecorded event
+    // 6. Resolve who decided before anything is written. With no decider
+    //    the override is refused: only a `refused` decision is recorded and
+    //    the session is left as it was (DESIGN-decision-record.md,
+    //    Decision 4).
+    const CMD: &str = "overrides record";
+    let store = super::decisions::command_store(CMD);
+    let subject = dual_write::gate_subject(&name, &header.session_id, &current_state, &gate);
+    let Some(identity) = super::decisions::resolve_command_decider(CMD, &decider, journal_root)
+    else {
+        let refused = super::decisions::record_gate_refusal(&store, CMD, subject);
+        super::decisions::fail_decider_missing_refused(CMD, refused);
+    };
+    let mut decisions = vec![dual_write::gate_pass(
+        &identity,
+        subject,
+        Vec::new(),
+        Some(dual_write::clip(&rationale)),
+    )
+    .unwrap_or_else(|e| super::decisions::fail_command_field(CMD, e))];
+    let decision_records = dual_write::prepare(&store, &mut decisions)
+        .unwrap_or_else(|e| super::decisions::fail_command_store(CMD, e));
+
+    // 7. Append GateOverrideRecorded event
     let ts = now_iso8601();
     let payload = EventPayload::GateOverrideRecorded {
         state: current_state.clone(),
@@ -338,6 +372,7 @@ pub fn handle_overrides_record(
         override_applied: override_applied.clone(),
         actual_output: actual_output.clone(),
         timestamp: ts.clone(),
+        decision_records,
     };
     if let Err(e) = backend.append_event(&name, &payload, &ts) {
         exit_with_error_code(
@@ -349,7 +384,11 @@ pub fn handle_overrides_record(
         );
     }
 
-    // 7. An override of a blocking decider check is recorded in the decider
+    // 8. The decision goes to the store after the event committed. A lost
+    //    append warns; the next `koto next` repairs it from the event.
+    dual_write::append_after_event(&store, &name, &decisions);
+
+    // 9. An override of a blocking decider check is recorded in the decider
     //    ledger against each criterion it moved past: a candidate false fail
     //    for each one the decider failed. A criterion waiting on the agent,
     //    or one the agent answered `fail`, says nothing about the decider,
@@ -376,7 +415,8 @@ pub fn handle_overrides_record(
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({
-            "status": "recorded"
+            "status": "recorded",
+            "decision": decisions[0].id,
         }))?
     );
     Ok(())
@@ -424,6 +464,7 @@ pub fn handle_overrides_list(backend: &dyn SessionBackend, name: String) -> Resu
                 override_applied,
                 actual_output,
                 timestamp,
+                ..
             } = &e.payload
             {
                 Some(serde_json::json!({

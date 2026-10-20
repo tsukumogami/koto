@@ -25,7 +25,9 @@
 
 pub mod authority;
 pub mod decider;
+pub mod dual_write;
 pub mod enforce;
+pub mod import;
 pub mod lineage;
 pub mod reader;
 pub mod record;

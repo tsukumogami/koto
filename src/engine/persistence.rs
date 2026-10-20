@@ -2288,6 +2288,7 @@ mod tests {
                     from: "b".to_string(),
                     to: "b".to_string(),
                     rationale: None,
+                    decision_records: Vec::new(),
                 },
                 Some(6),
                 Some(6),
@@ -2307,6 +2308,7 @@ mod tests {
                     from: "a".to_string(),
                     to: "c".to_string(),
                     rationale: None,
+                    decision_records: Vec::new(),
                 },
                 Some(9),
                 Some(11),
@@ -2813,6 +2815,7 @@ mod tests {
                         "choice": "Use retry",
                         "rationale": "No batch endpoint"
                     }),
+                    decision_records: Vec::new(),
                 },
             ),
             make_event(
@@ -2823,6 +2826,7 @@ mod tests {
                         "choice": "Skip migration",
                         "rationale": "Data volume too small"
                     }),
+                    decision_records: Vec::new(),
                 },
             ),
         ];
@@ -2863,6 +2867,7 @@ mod tests {
                         "choice": "Use retry",
                         "rationale": "No batch endpoint"
                     }),
+                    decision_records: Vec::new(),
                 },
             ),
             make_event(
@@ -2924,6 +2929,7 @@ mod tests {
                         "choice": "Wrong state",
                         "rationale": "Should not appear"
                     }),
+                    decision_records: Vec::new(),
                 },
             ),
             make_event(
@@ -2934,6 +2940,7 @@ mod tests {
                         "choice": "Correct state",
                         "rationale": "Should appear"
                     }),
+                    decision_records: Vec::new(),
                 },
             ),
         ];
@@ -2957,6 +2964,7 @@ mod tests {
                 override_applied: serde_json::json!({"exit_code": 0, "error": ""}),
                 actual_output: serde_json::json!({"exit_code": 1, "error": "failed"}),
                 timestamp: "2026-04-01T00:00:00Z".to_string(),
+                decision_records: Vec::new(),
             },
         )
     }
@@ -3364,6 +3372,7 @@ mod tests {
                 from: "plan".to_string(),
                 to: "implement".to_string(),
                 rationale: None,
+                decision_records: Vec::new(),
             },
         )];
         let counts = derive_visit_counts(&events);
@@ -3423,6 +3432,7 @@ mod tests {
                     from: "gather".to_string(),
                     to: "analyze".to_string(),
                     rationale: None,
+                    decision_records: Vec::new(),
                 },
             ),
             make_event(
@@ -3430,6 +3440,7 @@ mod tests {
                 EventPayload::DecisionRecorded {
                     state: "analyze".to_string(),
                     decision: serde_json::json!({"choice": "A"}),
+                    decision_records: Vec::new(),
                 },
             ),
             make_event(
@@ -3473,6 +3484,7 @@ mod tests {
                 EventPayload::DecisionRecorded {
                     state: "gather".to_string(),
                     decision: serde_json::json!({"choice": "X"}),
+                    decision_records: Vec::new(),
                 },
             ),
             make_event(
@@ -3543,6 +3555,7 @@ mod tests {
                 from: from.to_string(),
                 to: to.to_string(),
                 rationale: None,
+                decision_records: Vec::new(),
             },
         )
     }

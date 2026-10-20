@@ -254,6 +254,58 @@ pub fn journal_root() -> Option<std::path::PathBuf> {
     }
 }
 
+/// The decider of a command that passes a gate or records a judgment
+/// beside its own session event, resolved before anything is written. A
+/// malformed flag exits 2 naming the field; `None` means no decider could
+/// be established. `journal_root` is the run journal of the backend the
+/// command writes through, so a session's lineage stamp is read where its
+/// session journals.
+pub(crate) fn resolve_command_decider(
+    command: &str,
+    args: &DeciderArgs,
+    journal_root: Option<std::path::PathBuf>,
+) -> Option<crate::decision_store::dual_write::Identity> {
+    match resolve_identity(args, journal_root) {
+        Ok((decided_by, chain, authority)) => Some(crate::decision_store::dual_write::Identity {
+            decided_by,
+            chain,
+            authority,
+        }),
+        Err(IdentityError::Invalid(e)) => fail_field(command, e),
+        Err(IdentityError::DeciderMissing) => None,
+    }
+}
+
+/// The store a recording command writes to, or exit 1 naming why there is
+/// none.
+pub(crate) fn command_store(command: &str) -> Store {
+    open_store(command)
+}
+
+/// Record the `refused` decision for a gate pass on `attempted` that has no
+/// decider, returning its identifier when it was written.
+pub(crate) fn record_gate_refusal(
+    store: &Store,
+    command: &str,
+    attempted: Subject,
+) -> Option<String> {
+    use crate::decision_store::dual_write;
+    let refused = dual_write::refused_no_decider(Kind::GatePass, attempted)
+        .unwrap_or_else(|e| fail_field(command, e));
+    dual_write::record_refusal(store, refused)
+}
+
+/// Exit for a malformed decision or a store that can't take it, before the
+/// command's own event is written.
+pub(crate) fn fail_command_store(command: &str, e: StoreError) -> ! {
+    fail_store(command, e)
+}
+
+/// Exit for a decision that couldn't be built, before anything is written.
+pub(crate) fn fail_command_field(command: &str, e: FieldError) -> ! {
+    fail_field(command, e)
+}
+
 impl RecordKindArgs {
     /// Whether any flag of the `--kind` form was given.
     pub fn any_set(&self) -> bool {
@@ -383,15 +435,23 @@ fn fail(command: &str, field: Option<&str>, message: impl Into<String>, code: i3
 /// Refuse a decision nobody can be named for: exit 2, field `by`, reason
 /// `decider_missing`, nothing written.
 pub fn fail_decider_missing(command: &str) -> ! {
-    exit_with_error_code(
-        serde_json::json!({
-            "error": crate::decision_store::decider::DeciderError::Missing.to_string(),
-            "command": command,
-            "field": "by",
-            "reason": crate::decision_store::decider::DeciderError::MISSING_REASON,
-        }),
-        2,
-    )
+    fail_decider_missing_refused(command, None)
+}
+
+/// The same refusal for a gate pass, naming the `refused` decision recorded
+/// in its place when there is one. The command's own records are not
+/// written.
+pub fn fail_decider_missing_refused(command: &str, refused_id: Option<String>) -> ! {
+    let mut body = serde_json::json!({
+        "error": crate::decision_store::decider::DeciderError::Missing.to_string(),
+        "command": command,
+        "field": "by",
+        "reason": crate::decision_store::decider::DeciderError::MISSING_REASON,
+    });
+    if let Some(id) = refused_id {
+        body["refused_id"] = serde_json::Value::String(id);
+    }
+    exit_with_error_code(body, 2)
 }
 
 fn fail_field(command: &str, e: FieldError) -> ! {
@@ -660,6 +720,33 @@ pub fn handle_report(since: String, until: String) -> Result<()> {
     let r = report::report(store.root(), &since, &until).unwrap_or_else(|e| fail_store(CMD, e));
     println!("{}", serde_json::to_string(&r)?);
     Ok(())
+}
+
+/// `koto decisions import <source>`.
+pub fn handle_import(source: std::path::PathBuf) -> Result<()> {
+    use crate::decision_store::import::{self, ImportError};
+    const CMD: &str = "decisions import";
+    // The source is read and every entry checked before the store is
+    // opened or its lock taken.
+    let parsed = match import::read_source(&source) {
+        Ok(s) => s,
+        Err(ImportError::Source(msg)) => fail(CMD, Some("source"), msg, 2),
+        Err(ImportError::Invalid(e)) => fail_field(CMD, e),
+        Err(ImportError::Store(e)) => fail_store(CMD, e),
+    };
+    if let Err(e) = import::prepare(&parsed) {
+        fail_field(CMD, e);
+    }
+    let store = open_store(CMD);
+    match import::import(&store, &parsed) {
+        Ok(outcome) => {
+            println!("{}", serde_json::to_string(&outcome)?);
+            Ok(())
+        }
+        Err(ImportError::Source(msg)) => fail(CMD, Some("source"), msg, 2),
+        Err(ImportError::Invalid(e)) => fail_field(CMD, e),
+        Err(ImportError::Store(e)) => fail_store(CMD, e),
+    }
 }
 
 /// The session id in a workflow's state-file header, when the workflow

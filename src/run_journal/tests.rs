@@ -190,6 +190,7 @@ fn commits_map_to_records_and_other_payloads_write_nothing() {
             from: "b".into(),
             to: "c".into(),
             rationale: Some("PLANTED-RATIONALE".into()),
+            decision_records: Vec::new(),
         },
         &ts,
     )
@@ -2533,6 +2534,7 @@ fn an_override_relays_check_overridden_with_its_state_and_gate_only() {
             override_applied: serde_json::json!({"exit_code": 0, "note": "PLANTED-VALUE"}),
             actual_output: serde_json::json!({"exit_code": 1, "error": "PLANTED-OUTPUT"}),
             timestamp: crate::engine::types::now_iso8601(),
+            decision_records: Vec::new(),
         },
     );
     assert_eq!(batches_for_test(), (1, 0));
@@ -2613,6 +2615,7 @@ fn decider_and_override_records_fit_the_line_cap_at_the_longest_names() {
         override_applied: serde_json::json!({"v": "x".repeat(8192)}),
         actual_output: serde_json::json!({"v": "x".repeat(8192)}),
         timestamp: crate::engine::types::now_iso8601(),
+        decision_records: Vec::new(),
     };
     let mut records = Vec::new();
     for payload in [

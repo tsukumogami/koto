@@ -71,8 +71,8 @@
 //!   gate's carries the poll's run count and elapsed seconds; a decider
 //!   check's carries the two criterion counts instead.
 //!
-//! Four more are relayed the same way, with the same two sequence
-//! numbers, from decider and override events:
+//! Five more are relayed the same way, with the same two sequence
+//! numbers, from decider, override and decision-carrying events:
 //!
 //! - `decider_consulted`: one per `decider_consulted` event, with the
 //!   provider, model, outcome, token counts and timings.
@@ -86,6 +86,11 @@
 //!   as `koto.rule.id`, the mode, the reason and the slice's size.
 //! - `check_overridden`: one per `gate_override_recorded`, with the state
 //!   and gate only.
+//! - `decision_recorded`: one per decision a `gate_override_recorded`,
+//!   `directed_transition`, `decider_check_answered` or `decision_recorded`
+//!   event carries for the decision store, with the decision's identifier
+//!   (`koto.decision.id`) and kind (`koto.decision.kind`) only, never its
+//!   reason, decider or links.
 //!
 //! None of them copies a probability, hash, threshold, endpoint, rule
 //! reference, rationale, override value or output, and `koto.visit.seq` is
@@ -704,7 +709,23 @@ fn relays(payload: &EventPayload) -> bool {
             | EventPayload::DeciderChecked(_)
             | EventPayload::DeciderFallback(_)
             | EventPayload::GateOverrideRecorded { .. }
-    )
+    ) || !payload.decision_records().is_empty()
+}
+
+/// One `decision_recorded` record per decision `payload` carries for the
+/// decision store: its identifier and kind, copied by name, and nothing
+/// else (R27: reasons, handles and links stay in the store).
+fn decisions_relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
+    payload
+        .decision_records()
+        .iter()
+        .map(|d| {
+            relay
+                .record("decision_recorded")
+                .id("koto.decision.id", d.get("id").and_then(Value::as_str))
+                .name("koto.decision.kind", d.get("kind").and_then(Value::as_str))
+        })
+        .collect()
 }
 
 /// The check name a default action's records carry.
@@ -1169,16 +1190,15 @@ pub(crate) fn after_commit(
     // of its own. Apart from the closing commits above, every other commit
     // skips the scan of the log.
     if relays(payload) {
-        records.extend(relayed(
-            payload,
-            &Relay {
-                session,
-                session_id: &header.session_id,
-                run_id: run_id.as_deref(),
-                seq: commit.seq,
-                visit_seq: commit.visit_seq_for(payload),
-            },
-        ));
+        let relay = Relay {
+            session,
+            session_id: &header.session_id,
+            run_id: run_id.as_deref(),
+            seq: commit.seq,
+            visit_seq: commit.visit_seq_for(payload),
+        };
+        records.extend(relayed(payload, &relay));
+        records.extend(decisions_relayed(payload, &relay));
     }
     write(root, &records);
     // The cache moves only after the journal write, so a crash between the

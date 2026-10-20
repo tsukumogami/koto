@@ -996,6 +996,12 @@ pub enum NextErrorCode {
     /// beside this copy. Caller error: continue the session where the
     /// message says it now lives; ticking this copy would fork it.
     SessionMigrated,
+    /// `koto next --to` would pass a gate that hasn't passed, and no decider
+    /// could be established: none was named with `--by` and no harness
+    /// session was observed. Nothing was appended; a `refused` decision is
+    /// recorded in the decision store (DESIGN-decision-record.md,
+    /// Decision 4). Caller error: name a decider or run inside a session.
+    DeciderMissing,
 }
 
 impl NextErrorCode {
@@ -1018,6 +1024,7 @@ impl NextErrorCode {
             // re-running the nested tick will refuse identically.
             NextErrorCode::NestedInvocation => 2,
             NextErrorCode::SessionMigrated => 2,
+            NextErrorCode::DeciderMissing => 2,
             NextErrorCode::TemplateError => 3,
             NextErrorCode::PersistenceError => 3,
             NextErrorCode::ExecutionAnchorUnresolvable => 3,

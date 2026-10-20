@@ -862,7 +862,7 @@ fn an_override_default_without_the_new_lists_still_compiles_and_moves_past_a_wai
     let out = run(&h, "auto");
     assert_waits_on_the_agent(&h, &out, "provider_error", "veto");
     let mut cmd = h.koto();
-    cmd.args([
+    cmd.env(HARNESS_SESSION_ENV, HARNESS_SESSION).args([
         "overrides",
         "record",
         WF,
@@ -1141,6 +1141,7 @@ fn status_and_directed_transitions_never_extract() {
 
     let out = h
         .koto_mode("auto")
+        .env(HARNESS_SESSION_ENV, HARNESS_SESSION)
         .args(["next", WF, "--to", "work"])
         .output()
         .unwrap();
@@ -1265,6 +1266,7 @@ fn an_override_records_only_the_failed_criterion_as_a_candidate() {
     run(&h, "auto");
     let out = h
         .koto()
+        .env(HARNESS_SESSION_ENV, HARNESS_SESSION)
         .args([
             "overrides",
             "record",
@@ -1312,6 +1314,7 @@ fn the_report_tallies_each_criterion() {
     run(&h, "auto");
     let out = h
         .koto()
+        .env(HARNESS_SESSION_ENV, HARNESS_SESSION)
         .args([
             "overrides",
             "record",
@@ -1424,6 +1427,7 @@ fn a_ledger_with_an_overridden_unanswered_line_still_reads() {
     run(&h, "auto");
     let out = h
         .koto()
+        .env(HARNESS_SESSION_ENV, HARNESS_SESSION)
         .args([
             "overrides",
             "record",
@@ -1611,6 +1615,7 @@ fn overriding_a_check_that_blocks_nothing_writes_no_override_record() {
         run_with(&h, "auto", r#"{"go": true}"#);
         let out = h
             .koto()
+            .env(HARNESS_SESSION_ENV, HARNESS_SESSION)
             .args([
                 "overrides",
                 "record",
@@ -1712,7 +1717,9 @@ fn a_session_whose_cached_check_lost_its_spec_is_refused_on_resume() {
 /// `koto decider answer` with these arguments, as the agent runs it.
 fn answer_cmd(h: &Harness, args: &[&str]) -> std::process::Output {
     let mut cmd = h.koto();
-    cmd.args(["decider", "answer"]).args(args);
+    cmd.env(HARNESS_SESSION_ENV, HARNESS_SESSION)
+        .args(["decider", "answer"])
+        .args(args);
     cmd.output().unwrap()
 }
 
@@ -1762,6 +1769,105 @@ fn the_command_the_waiting_finding_prints_records_the_answer() {
 
     let out = run(&h, "auto");
     assert_eq!(state_of(&out), "done", "{}", out);
+}
+
+/// `koto decider answer` with no harness session: what a person typing it
+/// outside an agent's session runs.
+fn answer_without_session(h: &Harness, answer: &str) -> std::process::Output {
+    h.koto()
+        .args([
+            "decider",
+            "answer",
+            WF,
+            "--gate",
+            "comments",
+            "--criterion",
+            "r",
+            "--answer",
+            answer,
+        ])
+        .output()
+        .unwrap()
+}
+
+/// The decision store's host-wide listing of `kind`, read as the harness.
+fn store_decisions(h: &Harness, kind: &str) -> Vec<Value> {
+    let out = h
+        .koto()
+        .args(["decisions", "list", "--kind", kind])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+    json_out(&out)["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["decision"].clone())
+        .collect()
+}
+
+#[test]
+fn a_passing_answer_writes_a_gate_pass_and_a_failing_one_a_judgment() {
+    let h = harness(&check_template(&criterion("r", "veto")), SLICE);
+    h.stub.push(Reply::status(401));
+    run(&h, "auto");
+    let before = h.events().len();
+
+    // A pass nobody can be named for is refused, and only the refusal is
+    // recorded.
+    let out = answer_without_session(&h, "pass");
+    assert_refused(&h, before, &out, "decider_missing");
+    assert!(json_out(&out)["error"]["refused_id"].is_string());
+    let refused = store_decisions(&h, "refused");
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0]["subject"]["attempted_kind"], "gate-pass");
+    assert_eq!(refused[0]["subject"]["refusal_reason"], "decider_missing");
+
+    // A failing answer with no decider is the event alone, as before.
+    let out = answer_without_session(&h, "fail");
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(json_out(&out).get("decision").is_none());
+    assert!(store_decisions(&h, "judgment").is_empty());
+
+    // Under a harness session: a judgment for a failing answer...
+    let out = answer_cmd(
+        &h,
+        &[
+            WF,
+            "--gate",
+            "comments",
+            "--criterion",
+            "r",
+            "--answer",
+            "unclear",
+        ],
+    );
+    assert!(out.status.success(), "{}", describe(&out));
+    let judgments = store_decisions(&h, "judgment");
+    assert_eq!(judgments.len(), 1);
+    assert_eq!(json_out(&out)["decision"], judgments[0]["id"]);
+    assert_eq!(
+        judgments[0]["decided_by"]["session"][0]["value"],
+        HARNESS_SESSION
+    );
+    assert_eq!(judgments[0]["evidence"], json!(["criterion:r"]));
+
+    // ...and a defaulted gate pass for a passing one, carried by its event.
+    answer(&h, "r", "pass");
+    let passes = store_decisions(&h, "gate-pass");
+    assert_eq!(passes.len(), 1);
+    let p = &passes[0];
+    assert_eq!(p["decided_by"]["defaulted"], true);
+    assert_eq!(p["decided_by"]["session"][0]["value"], HARNESS_SESSION);
+    assert_eq!(p["subject"]["workflow"], WF);
+    assert_eq!(p["subject"]["state"], "review");
+    assert_eq!(p["subject"]["gate"], "comments");
+    assert!(p["subject"]["workflow_session_id"].is_string());
+    let answered = h.events_of("decider_check_answered");
+    assert_eq!(
+        answered.last().unwrap()["payload"]["decision_records"][0]["id"],
+        p["id"]
+    );
 }
 
 #[test]
@@ -1848,3 +1954,10 @@ fn an_answer_is_recorded_while_another_tick_holds_the_lock() {
     let out = run(&h, "auto");
     assert_eq!(state_of(&out), "done", "{}", out);
 }
+
+/// The harness session the commands that pass a gate by choice run under:
+/// koto refuses `koto overrides record`, `koto next --to` past an unmet
+/// gate and a passing `koto decider answer` when no decider can be
+/// established.
+const HARNESS_SESSION_ENV: &str = "CLAUDE_CODE_SESSION_ID";
+const HARNESS_SESSION: &str = "test-harness-session";

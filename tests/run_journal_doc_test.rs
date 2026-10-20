@@ -98,6 +98,7 @@ fn every_kind_the_reference_names_is_one_koto_writes_and_the_reverse() {
             "decider_checked",
             "decider_consulted",
             "decider_fallback",
+            "decision_recorded",
             "driver_seen",
             "response",
             "session_started",

@@ -87,6 +87,7 @@ their digest (see
 | `decider_checked` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.mode`, `koto.decider.outcome`, `koto.decider.reason`, `koto.decider.blocked`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.attempts`, `koto.decider.latency_ms`, `koto.decider.input_bytes` | koto grades one criterion of a decider check. |
 | `decider_fallback` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.mode`, `koto.decider.reason`, `koto.decider.input_bytes` | A decider-check criterion that got no verdict is handed to the agent. |
 | `check_overridden` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check` | An override is recorded for a gate. |
+| `decision_recorded` | `koto.seq`, `koto.visit.seq`, `koto.decision.id`, `koto.decision.kind` | A command wrote a decision to the decision store beside its event. |
 | `response` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.response.source`, `koto.response.directive_bytes`, `koto.response.details_bytes` | `koto next` or `koto status` has printed a non-terminal state's directive. |
 | `context_reads` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.context.key`, `koto.context.reader`, `koto.context.access`, `koto.context.overflow`, `koto.context.read_count`, `koto.context.present_count`, `koto.context.first_hash`, `koto.context.last_hash` | A state visit that read context keys ends. |
 
@@ -377,6 +378,23 @@ koto writes one per override, not one per criterion of a decider check.
 |-------|------|---------|-------------|
 | `koto.state` | string | always | The state the override was recorded in. |
 | `koto.check` | string | always | The overridden gate's name. |
+
+### `decision_recorded`
+
+One record per decision a committed event carries for the decision store:
+`koto overrides record` (`gate_override_recorded`), `koto next --to` past a
+gate that hadn't passed (`directed_transition`, one per gate it passed),
+`koto decider answer` (`decider_check_answered`) and `koto decisions record`
+(`decision_recorded`). An event that carries no decision writes none.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.decision.id` | string | always | The decision's identifier in the decision store (`d-YYYYMM-<32 hex>`). |
+| `koto.decision.kind` | string | always | The decision's kind: `gate-pass` or `judgment`. |
+
+The decision's reason, decider, handles and links stay in the decision
+store (`koto decisions show <id>`); the journal carries its identifier and
+kind only.
 
 ### Joining an override
 

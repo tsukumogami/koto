@@ -6319,6 +6319,7 @@ fn gate_override_full_flow() {
 
     // Step 2: koto overrides record — record the override with rationale.
     let record = koto_cmd(dir.path())
+        .env("CLAUDE_CODE_SESSION_ID", HARNESS_SESSION)
         .args([
             "overrides",
             "record",
@@ -6426,6 +6427,7 @@ fn gate_overrides_list_returns_full_history() {
 
     // Record an override in the first epoch.
     let record1 = koto_cmd(dir.path())
+        .env("CLAUDE_CODE_SESSION_ID", HARNESS_SESSION)
         .args([
             "overrides",
             "record",
@@ -6468,6 +6470,7 @@ fn gate_overrides_list_returns_full_history() {
 
     // Record another override in the second epoch (after rewind).
     let record2 = koto_cmd(dir.path())
+        .env("CLAUDE_CODE_SESSION_ID", HARNESS_SESSION)
         .args([
             "overrides",
             "record",
@@ -6603,6 +6606,7 @@ fn gate_override_record_phantom_gate_returns_error() {
     );
 
     let output = koto_cmd(dir.path())
+        .env("CLAUDE_CODE_SESSION_ID", HARNESS_SESSION)
         .args([
             "overrides",
             "record",
@@ -8524,6 +8528,7 @@ fn overrides_record_with_data_at_file_reads_value_from_file() {
 
     let arg = format!("@{}", value_path.display());
     let output = koto_cmd(dir.path())
+        .env("CLAUDE_CODE_SESSION_ID", HARNESS_SESSION)
         .args([
             "overrides",
             "record",
@@ -8590,6 +8595,7 @@ fn overrides_record_with_data_at_file_missing_returns_clear_error() {
     let missing = dir.path().join("absent.json");
     let arg = format!("@{}", missing.display());
     let output = koto_cmd(dir.path())
+        .env("CLAUDE_CODE_SESSION_ID", HARNESS_SESSION)
         .args([
             "overrides",
             "record",
@@ -9548,3 +9554,7 @@ fn skip_if_chain_triggers_limit() {
         json2
     );
 }
+
+/// The harness session `koto overrides record` runs under: koto refuses a
+/// gate pass by choice when no decider can be established.
+const HARNESS_SESSION: &str = "test-harness-session";

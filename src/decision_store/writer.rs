@@ -25,6 +25,23 @@ const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Sleep between non-blocking lock attempts.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
+/// The lock wait a debug build reads from the environment in place of
+/// [`LOCK_WAIT_TIMEOUT`], in milliseconds, so the binary's tests can hold
+/// the lock past the bound without waiting seconds. Release builds don't
+/// read it, so it is not a setting.
+pub const LOCK_WAIT_TEST_ENV: &str = "KOTO_TEST_DECISION_LOCK_WAIT_MS";
+
+fn lock_wait() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var(LOCK_WAIT_TEST_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    LOCK_WAIT_TIMEOUT
+}
+
 /// What the check closure decides about a decision under the lock.
 #[derive(Debug)]
 pub enum Check {
@@ -391,7 +408,7 @@ pub fn acquire_lock(root: &Path) -> Result<StoreLock, StoreError> {
         if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
             return Err(StoreError::io(format!("locking {}", path.display()), err));
         }
-        if started.elapsed() >= LOCK_WAIT_TIMEOUT {
+        if started.elapsed() >= lock_wait() {
             return Err(StoreError::LockContention {
                 waited_ms: started.elapsed().as_millis() as u64,
             });
@@ -402,7 +419,7 @@ pub fn acquire_lock(root: &Path) -> Result<StoreLock, StoreError> {
 
 #[cfg(not(unix))]
 pub fn acquire_lock(_root: &Path) -> Result<StoreLock, StoreError> {
-    let _ = (Instant::now(), LOCK_WAIT_TIMEOUT, LOCK_RETRY_INTERVAL);
+    let _ = (Instant::now(), lock_wait(), LOCK_RETRY_INTERVAL);
     Err(StoreError::Unsupported)
 }
 

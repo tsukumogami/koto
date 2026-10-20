@@ -700,5 +700,6 @@ fn todays_workflow_forms_are_unchanged_and_cleanup_leaves_the_store() {
     );
     assert!(!d.join("sessions").join("wf").exists());
     assert_eq!(month_lines(d), before);
-    assert_eq!(ok(d, &["decisions", "list"])["count"], 1);
+    // The workflow form's judgment and the `--kind` one.
+    assert_eq!(ok(d, &["decisions", "list"])["count"], 2);
 }
