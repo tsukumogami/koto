@@ -3529,14 +3529,27 @@ fn finish_terminal_tick(
     if !defer_for_parent && !defer_for_promotion {
         // A decision this run's events carry that the store still lacks
         // (an append lost on this very tick, say) is put back before the
-        // session, and with it the event, is removed. Best effort: it warns
-        // and the removal goes on.
-        match backend.read_events(name) {
+        // session, and with it the event, is removed. When the repair can't
+        // finish (the store lock timed out, say), the session is kept: its
+        // events are the decision's only copy, and the next `koto next`
+        // repairs it and removes the session then.
+        let repaired = match backend.read_events(name) {
             Ok((_, events)) => crate::decision_store::dual_write::repair_or_warn(name, &events),
-            Err(e) => eprintln!(
-                "warning: the decisions of '{}' couldn't be checked before cleanup: {}",
-                name, e
-            ),
+            Err(e) => {
+                eprintln!(
+                    "warning: the decisions of '{}' couldn't be checked before cleanup: {}",
+                    name, e
+                );
+                false
+            }
+        };
+        if !repaired {
+            eprintln!(
+                "warning: '{}' is kept until its decisions are in the decision store; \
+                 the next `koto next {}` writes them and removes it",
+                name, name
+            );
+            return;
         }
         // The finished record goes after the journal's terminal record above
         // and before anything is removed, so `koto status` can answer for the
@@ -4998,7 +5011,7 @@ fn handle_next(
     // store lacks: an append lost after its command wrote the event. It
     // warns on failure and never fails the tick, and it never re-appends a
     // reversal (DESIGN-decision-record.md, Decision 3).
-    crate::decision_store::dual_write::repair_or_warn(&name, &events);
+    let _ = crate::decision_store::dual_write::repair_or_warn(&name, &events);
 
     // A reversed gate pass stops the workflow wherever it stands, before
     // `--to`, `--with-data` or any gate or action runs, and nothing is

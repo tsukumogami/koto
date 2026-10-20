@@ -977,3 +977,38 @@ fn koto_version_names_the_decision_store_format() {
     let v = ws.ok(None, &["version", "--json"]);
     assert_eq!(v["decision_store"], 1, "{}", v);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_terminal_tick_that_cant_repair_keeps_the_session_for_the_next_tick() {
+    use std::os::unix::io::AsRawFd;
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: a release build doesn't read the decision store's test variables");
+        return;
+    }
+    let ws = Ws::new();
+    ws.init("wf", GATE_TO_DONE);
+    std::fs::create_dir_all(ws.store()).unwrap();
+    let holder = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(ws.store().join("store.lock"))
+        .unwrap();
+    // SAFETY: flock on a descriptor `holder` owns until it is dropped.
+    assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let (code, out, stderr) = ws.run_env(
+        Some(W),
+        &[(FAULT_ENV, "append"), (LOCK_WAIT_ENV, "100")],
+        &["next", "wf", "--to", "done"],
+    );
+    assert_eq!(code, 0, "{} {}", out, stderr);
+    assert_eq!(out["action"], "done", "{}", out);
+    assert!(ws.sessions().join("wf").exists(), "kept: {}", stderr);
+    assert!(ws.month_lines().is_empty());
+    drop(holder);
+
+    ws.ok(Some(W), &["next", "wf"]);
+    assert_eq!(ws.month_lines().len(), 1, "the next tick repairs it");
+    assert!(!ws.sessions().join("wf").exists(), "and then removes it");
+}

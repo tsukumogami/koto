@@ -366,12 +366,15 @@ pub fn repair(store: &Store, session: &str, events: &[Event]) -> Repair {
 /// Run [`repair`] against the default store, warning on stderr when it
 /// stops early. Used by `koto next` at the start of a tick and before a
 /// terminal tick's cleanup; it never fails the tick or passes a gate.
-pub fn repair_or_warn(session: &str, events: &[Event]) {
+/// Returns `false` when a decision the events carry may still be missing
+/// from the store, so the terminal tick keeps the session (and its events)
+/// for the next tick to retry rather than removing the only copy.
+pub fn repair_or_warn(session: &str, events: &[Event]) -> bool {
     if !events
         .iter()
         .any(|e| !e.payload.decision_records().is_empty())
     {
-        return;
+        return true;
     }
     let store = match Store::open_default() {
         Ok(s) => s,
@@ -380,15 +383,19 @@ pub fn repair_or_warn(session: &str, events: &[Event]) {
                 "warning: the decision store couldn't be opened to repair '{}': {}",
                 session, e
             );
-            return;
+            return false;
         }
     };
     let r = repair(&store, session, events);
-    if let Some(e) = r.error {
-        eprintln!(
-            "warning: repairing the decisions of '{}' stopped ({}); the next `koto next` retries",
-            session, e
-        );
+    match r.error {
+        Some(e) => {
+            eprintln!(
+                "warning: repairing the decisions of '{}' stopped ({}); the next `koto next` retries",
+                session, e
+            );
+            false
+        }
+        None => true,
     }
 }
 
