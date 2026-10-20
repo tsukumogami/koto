@@ -647,7 +647,11 @@ unfinished last line is never read as a finding.
 A check that printed the two lines above and exited 1 returns both findings as written, each with
 `"message_source":"check"`, and no koto-written one, because it reported an error. A check that
 reports only warnings and fails still gets koto's `error` finding after them. A check that exits 0
-passes whatever it printed, and its response carries no `failure`.
+passes whatever it printed, and its response carries no `failure`. Its `warning` findings still reach
+the agent, under the response's top-level `advisories` list, and every finding it logged, of any
+level, is counted in the [run journal](../reference/run-journal.md#check_finding). An agent that
+thinks a finding is wrong can say so with `koto disputes record`, which records the dispute and
+changes nothing else.
 
 Every finding carries `effect_landed`. Unless the check states it, koto sets it to `true` when the
 invocation that ran the check recorded the evidence the agent submitted for the state, or when the

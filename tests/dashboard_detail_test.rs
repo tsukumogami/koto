@@ -494,6 +494,8 @@ fn detail_leaves_the_feed_and_the_verb_list_untouched() {
             "status",
             "decisions",
             "overrides",
+            // Added by the check lifecycle work, not by the dashboard.
+            "disputes",
             "config",
             "decider",
             "workspace",

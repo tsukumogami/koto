@@ -45,7 +45,7 @@
 //! - `driver_seen`: `koto.driver.session.id`, the Claude Code session now
 //!   driving the session, when it differs from the last one recorded.
 //!
-//! Those five are the identity kinds. Three more are relayed from check
+//! Those five are the identity kinds. Four more are relayed from check
 //! events, and each carries `koto.seq` (the relayed event's sequence
 //! number in the session's log) and `koto.visit.seq` (the sequence number
 //! of the event that opened the visit it belongs to, by
@@ -53,18 +53,23 @@
 //!
 //! - `check_evaluated`: one per `gate_evaluated` that isn't pending and per
 //!   `default_action_executed` (check `__action__`), with the outcome,
-//!   attempt numbers, rule count and run time; a decider check's also
-//!   carries its awaiting and agent-answered criterion counts.
+//!   attempt numbers, rule count, logged finding count (and whether the
+//!   findings were cut) and run time; a decider check's also carries its
+//!   awaiting and agent-answered criterion counts.
 //! - `check_rule`: one per key of that event's `rule_counts`, after its
 //!   `check_evaluated`, with the rule's visit and session counts. A rule id
 //!   outside the name shape is written as its digest ([`name_or_digest`]).
+//! - `check_finding`: one per distinct (rule id, level) among that event's
+//!   logged findings, passing or failing, after its `check_rule` records,
+//!   with the gate as `koto.check.name` and how many findings had the pair
+//!   (see [`with_findings`]).
 //! - `check_pending`: one per pending `gate_evaluated` of a polling gate or
 //!   of a decider check waiting on the agent, never an outcome. A polling
 //!   gate's carries the poll's run count and elapsed seconds; a decider
 //!   check's carries the two criterion counts instead.
 //!
-//! Four more are relayed the same way, with the same two sequence
-//! numbers, from decider and override events:
+//! Five more are relayed the same way, with the same two sequence
+//! numbers, from decider, override and dispute events:
 //!
 //! - `decider_consulted`: one per `decider_consulted` event, with the
 //!   provider, model, outcome, token counts and timings.
@@ -78,9 +83,13 @@
 //!   as `koto.rule.id`, the mode, the reason and the slice's size.
 //! - `check_overridden`: one per `gate_override_recorded`, with the state
 //!   and gate only.
+//! - `check_disputed`: one per `finding_disputed`, with the state, the gate
+//!   as `koto.check.name`, the disputed evaluation's attempt numbers, the
+//!   rule id (digested like a rule id) and who disputed it, never the
+//!   reason.
 //!
 //! None of them copies a probability, hash, threshold, endpoint, rule
-//! reference, rationale, override value or output, and `koto.visit.seq` is
+//! reference, rationale, dispute reason, override value or output, and `koto.visit.seq` is
 //! always koto's visit, never the `visit_seq` a decider event carries.
 //!
 //! One more sums a visit's `context_read` events when the visit ends (see
@@ -123,8 +132,8 @@
 //!   `directed_transition` and `rewound` event, `cancelled` for
 //!   `workflow_cancelled`, the check kinds for `gate_evaluated` and
 //!   `default_action_executed`, and the decider and override kinds for
-//!   `decider_consulted`, `decider_checked`, `decider_fallback` and
-//!   `gate_override_recorded`.
+//!   `decider_consulted`, `decider_checked`, `decider_fallback`,
+//!   `gate_override_recorded` and `finding_disputed`.
 //!   A commit that ends a visit (an arrival, a rewind, a cancel, or the
 //!   terminal tick's `request_store.result`) writes the visit's
 //!   `context_reads` just before its own record. Before those, on any
@@ -668,11 +677,40 @@ fn relays(payload: &EventPayload) -> bool {
             | EventPayload::DeciderChecked(_)
             | EventPayload::DeciderFallback(_)
             | EventPayload::GateOverrideRecorded { .. }
+            | EventPayload::FindingDisputed(_)
     )
 }
 
 /// The check name a default action's records carry.
 const ACTION_CHECK: &str = "__action__";
+
+// The names the check-lifecycle records add. They are provisional, so each
+// is written once here and every writer uses the constant.
+
+/// One record per distinct (rule id, level) among an evaluation's logged
+/// findings (see [`with_findings`]).
+const CHECK_FINDING: &str = "check_finding";
+/// One record per `finding_disputed` event.
+const CHECK_DISPUTED: &str = "check_disputed";
+/// On `check_finding` and `check_disputed`: the gate's name (or
+/// `__action__`). The path an exporter that nests dotted names gives
+/// `check_evaluated`'s scalar `koto.check`, so joins read one path; the
+/// older kinds keep `koto.check` unchanged.
+const CHECK_NAME_FIELD: &str = "koto.check.name";
+/// On `check_evaluated`: how many findings the event logged, 0 included.
+const FINDING_COUNT_FIELD: &str = "koto.check.finding_count";
+/// On `check_evaluated`, when `true`: the check reported more findings than
+/// the event logged.
+const FINDINGS_TRUNCATED_FIELD: &str = "koto.check.findings_truncated";
+/// On `check_finding`: the findings' level.
+const FINDING_LEVEL_FIELD: &str = "koto.finding.level";
+/// On `check_finding`: how many logged findings had the record's rule id
+/// and level.
+const FINDING_PAIR_COUNT_FIELD: &str = "koto.finding.count";
+/// On `check_disputed`: who disputed the finding.
+const DISPUTE_SOURCE_FIELD: &str = "koto.dispute.source";
+/// The most `check_finding` records one evaluation writes.
+const MAX_FINDING_RECORDS: usize = 50;
 
 /// What every record placed in a session's log shares: the records relayed
 /// from one committed event, or a `response` record.
@@ -701,15 +739,16 @@ impl Relay<'_> {
 /// The records a committed event relays. A check event writes a
 /// `check_pending` for a pending polling gate; otherwise a
 /// `check_evaluated`, then one `check_rule` per key of the event's
-/// `rule_counts`, in their order. A `decider_consulted` or
-/// `decider_checked` event writes one record of its own name, and a
-/// `gate_override_recorded` one `check_overridden`. Every other payload
-/// relays nothing.
+/// `rule_counts`, in their order, then its `check_finding` records. A
+/// `decider_consulted` or `decider_checked` event writes one record of its
+/// own name, a `gate_override_recorded` one `check_overridden`, and a
+/// `finding_disputed` one `check_disputed`. Every other payload relays
+/// nothing.
 ///
 /// Each field is copied by name from the event, never by stripping it, so
-/// nothing the event carries beyond these (output, streams, findings,
-/// commands, probabilities, hashes, thresholds, rationales, override
-/// values) can reach the journal.
+/// nothing the event carries beyond these (output, streams, a finding's
+/// message, path or reference, commands, probabilities, hashes, thresholds,
+/// rationales, dispute reasons, override values) can reach the journal.
 fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
     match payload {
         EventPayload::GateEvaluated {
@@ -772,7 +811,9 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
                     "koto.decider.agent_answered_count",
                     decider_count("agent_answered"),
                 );
-            with_rules(evaluated, relay, state, gate, check)
+            let mut records = with_rules(evaluated, relay, state, gate, check);
+            records.extend(with_findings(relay, state, gate, check));
+            records
         }
         EventPayload::DefaultActionExecuted {
             state,
@@ -784,7 +825,9 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
             let failed = *exit_code != 0 || check.rule_counts.is_some();
             let outcome = if failed { "failed" } else { "passed" };
             let evaluated = check_evaluated(relay, state, ACTION_CHECK, outcome, check);
-            with_rules(evaluated, relay, state, ACTION_CHECK, check)
+            let mut records = with_rules(evaluated, relay, state, ACTION_CHECK, check);
+            records.extend(with_findings(relay, state, ACTION_CHECK, check));
+            records
         }
         EventPayload::DeciderConsulted(c) => vec![decider_consulted(relay, c)],
         EventPayload::DeciderChecked(c) => vec![decider_checked(relay, c)],
@@ -796,6 +839,17 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
             .record("check_overridden")
             .name("koto.state", Some(state.as_str()))
             .name("koto.check", Some(gate.as_str()))],
+        // The reason stays in the log. The attempt numbers are the disputed
+        // evaluation's, which the event carries, so a reader joins the
+        // dispute to exactly that `check_evaluated`.
+        EventPayload::FindingDisputed(d) => vec![relay
+            .record(CHECK_DISPUTED)
+            .name("koto.state", Some(d.state.as_str()))
+            .name(CHECK_NAME_FIELD, Some(d.gate.as_str()))
+            .int("koto.attempt", d.attempt)
+            .int("koto.visit_attempt", d.visit_attempt)
+            .name("koto.rule.id", Some(name_or_digest(&d.rule_id).as_str()))
+            .name(DISPUTE_SOURCE_FIELD, Some(d.source.as_str()))],
         _ => Vec::new(),
     }
 }
@@ -893,6 +947,10 @@ fn check_evaluated(
     if check.rule_counts_truncated {
         record = record.flag("koto.check.rule_counts_truncated", true);
     }
+    record = record.int(FINDING_COUNT_FIELD, Some(check.findings.len() as u64));
+    if check.findings_truncated {
+        record = record.flag(FINDINGS_TRUNCATED_FIELD, true);
+    }
     record.int("koto.check.duration_ms", check.duration_ms)
 }
 
@@ -921,6 +979,48 @@ fn with_rules(
         );
     }
     records
+}
+
+/// One `check_finding` per distinct (rule id, level) among the event's
+/// logged findings, whether the check passed or failed: `error` pairs
+/// first, then `warning`, then `info`, then any other level, each level in
+/// the order its pairs were first seen, at most [`MAX_FINDING_RECORDS`].
+/// Each counts the logged findings with its pair. Nothing else of a finding
+/// (message, path, location, rule reference) is copied.
+fn with_findings(
+    relay: &Relay<'_>,
+    state: &str,
+    check_name: &str,
+    check: &CheckEventFields,
+) -> Vec<Record> {
+    // (rule id, level, count), in first-seen order.
+    let mut pairs: Vec<(&str, &crate::findings::FindingLevel, u64)> = Vec::new();
+    for f in &check.findings {
+        match pairs
+            .iter_mut()
+            .find(|(id, level, _)| *id == f.rule_id && **level == f.level)
+        {
+            Some(pair) => pair.2 += 1,
+            None => pairs.push((f.rule_id.as_str(), &f.level, 1)),
+        }
+    }
+    // Stable, so each level keeps first-seen order.
+    pairs.sort_by_key(|(_, level, _)| crate::findings::level_rank(level));
+    pairs.truncate(MAX_FINDING_RECORDS);
+    pairs
+        .into_iter()
+        .map(|(rule_id, level, count)| {
+            relay
+                .record(CHECK_FINDING)
+                .name("koto.state", Some(state))
+                .name(CHECK_NAME_FIELD, Some(check_name))
+                .int("koto.attempt", check.attempt)
+                .int("koto.visit_attempt", check.visit_attempt)
+                .name("koto.rule.id", Some(name_or_digest(rule_id).as_str()))
+                .name(FINDING_LEVEL_FIELD, Some(level.as_str()))
+                .int(FINDING_PAIR_COUNT_FIELD, Some(count))
+        })
+        .collect()
 }
 
 fn session_started(
