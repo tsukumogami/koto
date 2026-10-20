@@ -215,9 +215,20 @@ fn cloud_state_sync_on_next() {
         .success();
 
     // Advance state — should sync updated state to R2
-    // Use --no-cleanup to prevent auto-cleanup from deleting everything
+    // Use --no-cleanup to prevent auto-cleanup from deleting everything.
+    // `--to` takes the workflow past `has-plan`, whose last evaluation in
+    // this visit predates the context key, so it counts as a gate pass by
+    // choice and needs a named decider.
     koto_cmd(dir.path())
-        .args(["next", "state-test-2", "--to", "done", "--no-cleanup"])
+        .args([
+            "next",
+            "state-test-2",
+            "--to",
+            "done",
+            "--no-cleanup",
+            "--by",
+            "session:cloud-test",
+        ])
         .assert()
         .success();
 
