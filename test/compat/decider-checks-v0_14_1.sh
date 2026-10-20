@@ -214,8 +214,11 @@ koto_in() {
     -u KOTO_SESSIONS_BASE HOME="$HOME_DIR" "$@")
 }
 # The new build, opted in at auto against the stub.
+# The new build refuses a gate pass whose decider can't be established. A
+# harness session is what names the decider here, as in an agent run.
 new_koto() {
   (cd "$WORK_DIR" && env -u KOTO_SESSIONS_BASE HOME="$HOME_DIR" KOTO_DECIDER=auto \
+    CLAUDE_CODE_SESSION_ID=compat-session \
     KOTO_DECIDER_API_KEY="$KEY" KOTO_DECIDER_ENDPOINT="$ENDPOINT" "$KOTO_NEW_BIN" "$@")
 }
 floor_koto() { koto_in "$KOTO_FLOOR_BIN" "$@"; }
@@ -247,6 +250,7 @@ LOG_FILE="$(find "$HOME_DIR" "$WORK_DIR" -name 'koto-wf.state.jsonl' -type f | h
 # attempts fail to connect.
 nv_koto() {
   (cd "$WORK_DIR" && env -u KOTO_SESSIONS_BASE HOME="$HOME_DIR" KOTO_DECIDER=auto \
+    CLAUDE_CODE_SESSION_ID=compat-session \
     KOTO_DECIDER_API_KEY="$KEY" KOTO_DECIDER_ENDPOINT="http://127.0.0.1:9/v1/systemone" \
     "$KOTO_NEW_BIN" "$@")
 }
