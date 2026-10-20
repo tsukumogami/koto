@@ -927,6 +927,14 @@ pub enum DecisionsSubcommand {
         /// Decision identifier (d-YYYYMM-...)
         id: String,
     },
+    /// Reverse a decision in the decision store. Only the original's
+    /// decider, a session in its dispatch chain, or the person at the
+    /// chain's root may reverse it; a refused attempt is recorded as
+    /// `refused`
+    Reverse {
+        #[command(flatten)]
+        args: Box<decisions::ReverseArgs>,
+    },
     /// Report on the decisions made, and the reversals recorded, in a UTC
     /// window that includes its start and excludes its end
     Report {
@@ -2088,6 +2096,7 @@ pub fn run(app: App) -> Result<()> {
                 filters,
             } => decisions::handle_list_host(filters),
             DecisionsSubcommand::Show { id } => decisions::handle_show(id),
+            DecisionsSubcommand::Reverse { args } => decisions::handle_reverse(*args),
             DecisionsSubcommand::Report { since, until } => decisions::handle_report(since, until),
         },
         Command::Overrides { subcommand } => {
@@ -4920,6 +4929,19 @@ fn handle_next(
     // the check evaluator.
     let consult_budget = crate::cli::check_evaluator::ConsultBudget::new();
 
+    // A reversed gate pass stops the workflow wherever it stands, before
+    // `--to`, `--with-data` or any gate or action runs, and nothing is
+    // written (DESIGN-decision-record.md, Decision 4).
+    if let Some(resp) = decision_reversed_block(
+        &name,
+        &header.session_id,
+        &events,
+        &machine_state.current_state,
+    ) {
+        println!("{}", serde_json::to_string(&resp)?);
+        return Ok(());
+    }
+
     // Check for reserved variable name collisions in the template.
     for reserved in crate::cli::vars::RESERVED_VARIABLE_NAMES {
         if compiled.variables.contains_key(*reserved) {
@@ -7097,6 +7119,78 @@ fn handle_next(
             exit_with_error_code(json, err.code.exit_code());
         }
     }
+}
+
+/// The `gate_blocked` response for a workflow a reversed gate pass stops,
+/// or `None` when nothing does. Each blocking condition carries only the
+/// reversal's identifier, the reversed kind, its standing and its time;
+/// the reason, handles and links stay in `koto decisions show`.
+#[cfg(unix)]
+fn decision_reversed_block(
+    name: &str,
+    session_id: &str,
+    events: &[crate::engine::types::Event],
+    current_state: &str,
+) -> Option<next_types::NextResponse> {
+    use crate::decision_store::enforce::{check, Verdict};
+    let root = crate::decision_store::default_root()?;
+    let condition = |name: &str, output: serde_json::Value| next_types::BlockingCondition {
+        name: name.to_string(),
+        condition_type: name.to_string(),
+        status: "failed".to_string(),
+        category: name.to_string(),
+        agent_actionable: false,
+        output,
+        failure: None,
+        poll: None,
+    };
+    let (directive, conditions) = match check(&root, name, session_id, events) {
+        Verdict::Clear => return None,
+        Verdict::Blocked(blocking) => {
+            let mut states: Vec<&str> = blocking.iter().map(|b| b.state.as_str()).collect();
+            states.dedup();
+            let directive = format!(
+                "A gate pass this workflow relied on was reversed, so koto will not advance it. \
+                 Rewind the workflow to state '{}' or earlier, or have the reverser (or a decider \
+                 with standing over it) record a new gate pass for that gate. \
+                 `koto decisions show <reversal>` gives the reversal's reason.",
+                states.join("', '")
+            );
+            let conditions = blocking
+                .iter()
+                .map(|b| {
+                    condition(
+                        "decision_reversed",
+                        serde_json::json!({
+                            "reversal": b.reversal,
+                            "kind": crate::decision_store::Kind::GatePass.as_str(),
+                            "standing": b.standing.as_str(),
+                            "time": b.time,
+                        }),
+                    )
+                })
+                .collect();
+            (directive, conditions)
+        }
+        Verdict::Unreadable(why) => (
+            "koto can't read the decision store's reversal log, so it can't tell whether a \
+             gate pass this workflow relied on was reversed, and will not advance it until \
+             the log is readable."
+                .to_string(),
+            vec![condition(
+                "decision_store_unreadable",
+                serde_json::json!({ "error": why }),
+            )],
+        ),
+    };
+    Some(next_types::NextResponse::GateBlocked {
+        state: current_state.to_string(),
+        directive,
+        details: None,
+        advanced: false,
+        blocking_conditions: conditions,
+        unassigned_children: Vec::new(),
+    })
 }
 
 /// Journal a `koto next` response that has just been printed: one

@@ -8,9 +8,11 @@
 use anyhow::Result;
 use clap::Args;
 
+use crate::decision_store::authority::authorize;
 use crate::decision_store::reader::{self, Filter};
 use crate::decision_store::record::{
-    Authority, Chain, DecidedBy, DeciderKind, Decision, Kind, Subject, DECISION_FORMAT_VERSION,
+    subject_key, Authority, Chain, Compensating, DecidedBy, DeciderKind, Decision, Kind, Original,
+    Subject, DECISION_FORMAT_VERSION,
 };
 use crate::decision_store::{
     new_id, normalize_time, now_to_second, report, validate_link, Check, FieldError, Store,
@@ -345,6 +347,10 @@ pub struct ListFilterArgs {
     /// Only decisions made under this instructions digest
     #[arg(long = "instructions-digest")]
     pub instructions_digest: Option<String>,
+    /// With --session: list what that session received instead of what it
+    /// decided (escalations addressed to it and reversals of its decisions)
+    #[arg(long, requires = "session")]
+    pub received: bool,
 }
 
 impl ListFilterArgs {
@@ -359,6 +365,7 @@ impl ListFilterArgs {
             || self.run_mode.is_some()
             || self.dispatch_id.is_some()
             || self.instructions_digest.is_some()
+            || self.received
     }
 }
 
@@ -483,7 +490,12 @@ pub fn handle_record_kind(args: RecordKindArgs) -> Result<()> {
             2,
         ),
     };
-    let subject = subject_from(&args, kind).unwrap_or_else(|e| fail_field(CMD, e));
+    let mut subject = subject_from(&args, kind).unwrap_or_else(|e| fail_field(CMD, e));
+    if kind == Kind::GatePass {
+        if let Some(w) = subject.workflow.as_deref() {
+            subject.workflow_session_id = workflow_session_id(w);
+        }
+    }
     if let Some(l) = args.source_link.as_deref() {
         if let Err(e) = validate_link("source_link", l) {
             fail_field(CMD, e);
@@ -516,6 +528,8 @@ pub fn handle_record_kind(args: RecordKindArgs) -> Result<()> {
         repaired_from: None,
         import_source: None,
         recorded_at: None,
+        compensating: None,
+        replacement: None,
     };
 
     let store = open_store(CMD);
@@ -620,6 +634,7 @@ pub fn filter_from(args: &ListFilterArgs) -> Result<Filter, FieldError> {
         run_mode: args.run_mode.clone(),
         dispatch_id: args.dispatch_id.clone(),
         instructions_digest: args.instructions_digest.clone(),
+        received: args.received,
     })
 }
 
@@ -644,5 +659,339 @@ pub fn handle_report(since: String, until: String) -> Result<()> {
     let store = open_store(CMD);
     let r = report::report(store.root(), &since, &until).unwrap_or_else(|e| fail_store(CMD, e));
     println!("{}", serde_json::to_string(&r)?);
+    Ok(())
+}
+
+/// The session id in a workflow's state-file header, when the workflow
+/// exists here and has one. A gate pass carries it so the reversal check in
+/// `koto next` can tell this run of the workflow from another of the same
+/// name. Best effort: a workflow that can't be read records none.
+fn workflow_session_id(workflow: &str) -> Option<String> {
+    use crate::session::SessionBackend;
+    let backend = super::build_backend().ok()?;
+    if !backend.exists(workflow) {
+        return None;
+    }
+    let id = backend.read_header(workflow).ok()?.session_id;
+    (!id.is_empty()).then_some(id)
+}
+
+/// Flags for `koto decisions reverse`.
+#[derive(Args, Debug, Clone)]
+pub struct ReverseArgs {
+    /// Identifier of the decision to reverse (d-YYYYMM-...)
+    pub id: String,
+    /// For a merge, the revert pull request; for a release verdict, the
+    /// rollback (https URL, stored, never fetched). Leave out to record that
+    /// none exists yet
+    #[arg(long)]
+    pub compensating: Option<String>,
+    /// For a judgment or verdict, the outcome that replaces the reversed one
+    /// (a verdict's is pass or fail)
+    #[arg(long)]
+    pub replacement: Option<String>,
+    /// A pointer to evidence (repeatable); stored as given, never followed
+    #[arg(long = "evidence")]
+    pub evidence: Vec<String>,
+    /// Why, as free text; don't put secrets here, the record is permanent
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[command(flatten)]
+    pub decider: DeciderArgs,
+}
+
+/// Why koto refused a reversal before checking who asked.
+const NOT_ON_RECORD: &str = "not_on_record";
+const REVERSE_OF_REVERSE: &str = "reverse_of_reverse";
+const REVERSE_OF_REFUSED: &str = "reverse_of_refused";
+const ALREADY_REVERSED: &str = "already_reversed";
+
+struct Reverser {
+    decided_by: DecidedBy,
+    chain: Chain,
+    authority: Authority,
+    evidence: Vec<String>,
+    reason: Option<String>,
+}
+
+impl Reverser {
+    /// The `refused` decision recording a refused reversal of `target`.
+    fn refused(&self, target: &str, refusal_reason: &str) -> Result<Decision, FieldError> {
+        let time = now_to_second();
+        Ok(Decision {
+            v: DECISION_FORMAT_VERSION,
+            id: new_id(&time)?,
+            time,
+            kind: Kind::Refused,
+            outcome: "refused".to_string(),
+            subject: Subject {
+                attempted_kind: Some(Kind::Reverse.as_str().to_string()),
+                attempted: Some(Box::new(Subject {
+                    decision: Some(target.to_string()),
+                    ..Default::default()
+                })),
+                refusal_reason: Some(refusal_reason.to_string()),
+                ..Default::default()
+            },
+            decided_by: self.decided_by.clone(),
+            authority: self.authority.clone(),
+            chain: self.chain.clone(),
+            basis: Vec::new(),
+            evidence: self.evidence.clone(),
+            reason: self.reason.clone(),
+            reverses: None,
+            original: None,
+            repaired_from: None,
+            import_source: None,
+            recorded_at: None,
+            compensating: None,
+            replacement: None,
+        })
+    }
+}
+
+/// Record the refusal and exit 1, naming the reason and the `refused` line.
+fn refuse_reversal(store: &Store, reverser: &Reverser, target: &str, why: &str, msg: &str) -> ! {
+    const CMD: &str = "decisions reverse";
+    let refused = reverser
+        .refused(target, why)
+        .unwrap_or_else(|e| fail_field(CMD, e));
+    let outcome = store
+        .append(refused, |_| Ok(Check::Append))
+        .unwrap_or_else(|e| fail_store(CMD, e));
+    let refused_id = match outcome {
+        WriteOutcome::Appended { id } | WriteOutcome::Skipped { id } => Some(id),
+        WriteOutcome::Refused { refused_id } => refused_id,
+    };
+    exit_with_error_code(
+        serde_json::json!({
+            "error": msg,
+            "command": CMD,
+            "reason": why,
+            "decision": target,
+            "refused_id": refused_id,
+        }),
+        1,
+    )
+}
+
+/// The compensating record a reversal of `original` carries, and a refusal
+/// of `--compensating` on a kind that takes none.
+fn compensating_for(
+    original: &Decision,
+    link: Option<&str>,
+) -> Result<Option<Compensating>, FieldError> {
+    let takes = original.kind == Kind::Merge
+        || (original.kind == Kind::Verdict && original.subject.of.as_deref() == Some("release"));
+    if !takes {
+        return match link {
+            Some(_) => Err(FieldError::new(
+                "compensating",
+                format!(
+                    "--compensating applies to the reversal of a merge or a release verdict, not a {}",
+                    original.kind
+                ),
+            )),
+            None => Ok(None),
+        };
+    }
+    if let Some(l) = link {
+        validate_link("compensating", l)?;
+    }
+    Ok(Some(Compensating {
+        exists: link.is_some(),
+        link: link.map(str::to_string),
+    }))
+}
+
+/// Check `--replacement` against the reversed decision's kind.
+fn replacement_for(original: &Decision, replacement: Option<&str>) -> Result<(), FieldError> {
+    let Some(r) = replacement else {
+        return Ok(());
+    };
+    match original.kind {
+        Kind::Judgment if !r.trim().is_empty() => Ok(()),
+        Kind::Verdict if Kind::Verdict.outcomes().contains(&r) => Ok(()),
+        Kind::Verdict => Err(FieldError::new(
+            "replacement",
+            format!(
+                "a verdict's replacement is one of: {}",
+                Kind::Verdict.outcomes().join(", ")
+            ),
+        )),
+        Kind::Judgment => Err(FieldError::new(
+            "replacement",
+            "--replacement must not be empty",
+        )),
+        other => Err(FieldError::new(
+            "replacement",
+            format!(
+                "--replacement applies to the reversal of a judgment or a verdict, not a {}",
+                other
+            ),
+        )),
+    }
+}
+
+/// `koto decisions reverse <id>`.
+pub fn handle_reverse(args: ReverseArgs) -> Result<()> {
+    const CMD: &str = "decisions reverse";
+    if let Some(l) = args.compensating.as_deref() {
+        if let Err(e) = validate_link("compensating", l) {
+            fail_field(CMD, e);
+        }
+    }
+    let (decided_by, chain, authority) = match resolve_identity(&args.decider, journal_root()) {
+        Ok(r) => r,
+        Err(IdentityError::Invalid(e)) => fail_field(CMD, e),
+        Err(IdentityError::DeciderMissing) => fail_decider_missing(CMD),
+    };
+    let reverser = Reverser {
+        decided_by,
+        chain,
+        authority,
+        evidence: args.evidence.clone(),
+        reason: args.reason.clone(),
+    };
+    let target = args.id.clone();
+    let store = open_store(CMD);
+
+    // The original's line never changes once written, so reading it and
+    // deciding standing before the lock is the same as doing it under the
+    // lock. Only "already reversed" can change, and the writer's check
+    // closure settles that under the lock.
+    let original =
+        match reader::find_decision(store.root(), &target).unwrap_or_else(|e| fail_store(CMD, e)) {
+            Some(d) => d,
+            None => refuse_reversal(
+                &store,
+                &reverser,
+                &target,
+                NOT_ON_RECORD,
+                &format!("decision '{}' is not on the record", target),
+            ),
+        };
+    match original.kind {
+        Kind::Reverse => refuse_reversal(
+            &store,
+            &reverser,
+            &target,
+            REVERSE_OF_REVERSE,
+            "a reversal can't be reversed; record a new decision of the original kind instead",
+        ),
+        Kind::Refused => refuse_reversal(
+            &store,
+            &reverser,
+            &target,
+            REVERSE_OF_REFUSED,
+            "a refused decision can't be reversed",
+        ),
+        _ => {}
+    }
+    let reversed_already = |reversals: &[Decision]| {
+        reversals
+            .iter()
+            .any(|r| r.kind == Kind::Reverse && r.reverses.as_deref() == Some(target.as_str()))
+    };
+    let current = reader::read_reversals(store.root()).unwrap_or_else(|e| fail_store(CMD, e));
+    if reversed_already(&current.decisions) {
+        refuse_reversal(
+            &store,
+            &reverser,
+            &target,
+            ALREADY_REVERSED,
+            &format!("decision '{}' is already reversed", target),
+        );
+    }
+    let standing = match authorize(&original.decided_by, &original.chain, &reverser.decided_by) {
+        Ok(s) => s,
+        Err(refusal) => refuse_reversal(
+            &store,
+            &reverser,
+            &target,
+            refusal.reason(),
+            refusal.message(),
+        ),
+    };
+    let compensating = compensating_for(&original, args.compensating.as_deref())
+        .unwrap_or_else(|e| fail_field(CMD, e));
+    replacement_for(&original, args.replacement.as_deref()).unwrap_or_else(|e| fail_field(CMD, e));
+
+    let time = now_to_second();
+    let id = new_id(&time).unwrap_or_else(|e| fail_field(CMD, e));
+    let mut authority = reverser.authority.clone();
+    authority.standing = Some(standing.as_str().to_string());
+    let reversal = Decision {
+        v: DECISION_FORMAT_VERSION,
+        id,
+        time,
+        kind: Kind::Reverse,
+        outcome: "reversed".to_string(),
+        subject: Subject {
+            decision: Some(target.clone()),
+            ..Default::default()
+        },
+        decided_by: reverser.decided_by.clone(),
+        authority,
+        chain: reverser.chain.clone(),
+        basis: Vec::new(),
+        evidence: reverser.evidence.clone(),
+        reason: reverser.reason.clone(),
+        reverses: Some(target.clone()),
+        original: Some(Original {
+            kind: original.kind,
+            decider_kind: original.decided_by.kind,
+            session: original.decided_by.sessions().cloned().collect(),
+            subject_key: Some(subject_key(original.kind, &original.subject)),
+        }),
+        repaired_from: None,
+        import_source: None,
+        recorded_at: None,
+        compensating,
+        replacement: args.replacement.clone(),
+    };
+
+    let lost_race = reverser
+        .refused(&target, ALREADY_REVERSED)
+        .unwrap_or_else(|e| fail_field(CMD, e));
+    let outcome = store
+        .append(reversal, |locked| {
+            if reversed_already(&locked.reversals()?) {
+                Ok(Check::Refuse(Some(Box::new(lost_race))))
+            } else {
+                Ok(Check::Append)
+            }
+        })
+        .unwrap_or_else(|e| fail_store(CMD, e));
+    let id = match outcome {
+        WriteOutcome::Appended { id } | WriteOutcome::Skipped { id } => id,
+        WriteOutcome::Refused { refused_id } => exit_with_error_code(
+            serde_json::json!({
+                "error": format!("decision '{}' is already reversed", target),
+                "command": CMD,
+                "reason": ALREADY_REVERSED,
+                "decision": target,
+                "refused_id": refused_id,
+            }),
+            1,
+        ),
+    };
+    let stored = reader::find_decision(store.root(), &id).unwrap_or_else(|e| fail_store(CMD, e));
+    let affected = match original.kind {
+        Kind::Accept => {
+            Some(reader::dependents(store.root(), &target).unwrap_or_else(|e| fail_store(CMD, e)))
+        }
+        _ => None,
+    };
+    let mut body = serde_json::json!({
+        "id": id,
+        "standing": standing.as_str(),
+        "decision": stored,
+        "effect": stored.as_ref().map(|r| reader::effect_of(&original, r)),
+    });
+    if let Some(a) = affected {
+        body["affected"] = serde_json::json!(a);
+    }
+    println!("{}", serde_json::to_string(&body)?);
     Ok(())
 }

@@ -23,7 +23,9 @@
 //! Readers take no lock, skip a torn final line and any line they can't
 //! read, and report how many they skipped.
 
+pub mod authority;
 pub mod decider;
+pub mod enforce;
 pub mod lineage;
 pub mod reader;
 pub mod record;
@@ -38,8 +40,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub use record::{
-    Authority, Chain, DecidedBy, DeciderKind, Decision, FieldError, Kind, Original, Slot, Source,
-    Sourced, Subject, DECISION_FORMAT_VERSION,
+    Authority, Chain, Compensating, DecidedBy, DeciderKind, Decision, FieldError, Kind, Original,
+    Slot, Source, Sourced, Subject, DECISION_FORMAT_VERSION,
 };
 pub use writer::{Check, LockedStore, WriteOutcome};
 
@@ -343,6 +345,10 @@ pub fn redact_decision(d: &mut Decision, redactor: &crate::redact::Redactor) {
         }
     };
     ro(&mut d.reason);
+    ro(&mut d.replacement);
+    if let Some(c) = d.compensating.as_mut() {
+        ro(&mut c.link);
+    }
     d.evidence.iter_mut().for_each(r);
     ro(&mut d.decided_by.link);
     d.decided_by.handle.iter_mut().for_each(|h| r(&mut h.value));

@@ -438,6 +438,79 @@ pub struct Decision {
     pub import_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_at: Option<String>,
+    /// On the reversal of a merge or a release verdict: the compensating
+    /// change or action, or that none exists yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compensating: Option<Compensating>,
+    /// On the reversal of a judgment or a verdict: the outcome that
+    /// replaces the reversed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
+}
+
+/// What compensates for a reversed merge or release verdict: a revert pull
+/// request or a rollback, by link, or a record that none exists yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Compensating {
+    /// Whether a compensating change or action exists.
+    pub exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+}
+
+/// A stable key for what a decision is about, copied onto a reversal line
+/// so readers of the reversal log never need the month files.
+///
+/// It is a JSON array of strings, the kind first. A `gate-pass` key is
+/// `["gate-pass", workflow, workflow_session_id, state, gate]`, with an
+/// empty session id when the pass named none; [`gate_pass_key`] reads one
+/// back.
+pub fn subject_key(kind: Kind, s: &Subject) -> String {
+    let f = |o: &Option<String>| o.clone().unwrap_or_default();
+    let mut parts: Vec<String> = vec![kind.as_str().to_string()];
+    match kind {
+        Kind::GatePass => parts.extend([
+            f(&s.workflow),
+            f(&s.workflow_session_id),
+            f(&s.state),
+            f(&s.gate),
+        ]),
+        Kind::Merge => parts.extend([f(&s.repo), s.pr.map(|p| p.to_string()).unwrap_or_default()]),
+        Kind::Accept => {
+            parts.extend([
+                f(&s.of),
+                f(&s.repo),
+                f(&s.path),
+                f(&s.plan),
+                f(&s.step),
+                f(&s.intent_location),
+            ]);
+            parts.extend(s.paths.iter().cloned());
+        }
+        Kind::Escalate | Kind::DeclineEscalation => parts.push(f(&s.question_id)),
+        Kind::Judgment | Kind::Verdict => parts.extend([
+            f(&s.of),
+            f(&s.what),
+            f(&s.pointer),
+            f(&s.repo),
+            f(&s.commit),
+        ]),
+        Kind::Reverse => parts.push(f(&s.decision)),
+        Kind::Refused => parts.push(f(&s.attempted_kind)),
+    }
+    serde_json::to_string(&parts).unwrap_or_default()
+}
+
+/// The parts of a `gate-pass` subject key: workflow, workflow session id,
+/// state and gate. `None` when the key is not a gate pass's.
+pub fn gate_pass_key(key: &str) -> Option<[String; 4]> {
+    let parts: Vec<String> = serde_json::from_str(key).ok()?;
+    match <[String; 5]>::try_from(parts) {
+        Ok([kind, w, sid, state, gate]) if kind == Kind::GatePass.as_str() => {
+            Some([w, sid, state, gate])
+        }
+        _ => None,
+    }
 }
 
 /// A decision that fails validation, naming the field at fault.
@@ -638,6 +711,28 @@ pub fn validate_subject(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gate_pass_key_reads_back_and_other_keys_dont() {
+        let s = Subject {
+            workflow: Some("wf".into()),
+            workflow_session_id: Some("sid".into()),
+            state: Some("review".into()),
+            gate: Some("panel".into()),
+            ..Default::default()
+        };
+        let key = subject_key(Kind::GatePass, &s);
+        assert_eq!(
+            gate_pass_key(&key),
+            Some(["wf".into(), "sid".into(), "review".into(), "panel".into()])
+        );
+        let j = Subject {
+            what: Some("x".into()),
+            ..Default::default()
+        };
+        assert_eq!(gate_pass_key(&subject_key(Kind::Judgment, &j)), None);
+        assert_eq!(gate_pass_key("not json"), None);
+    }
 
     #[test]
     fn every_kind_round_trips_its_name() {

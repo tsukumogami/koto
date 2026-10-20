@@ -87,6 +87,8 @@ fn decision(kind: Kind, time: &str, n: u64) -> Decision {
         repaired_from: None,
         import_source: None,
         recorded_at: None,
+        compensating: None,
+        replacement: None,
     }
 }
 
@@ -109,7 +111,10 @@ fn reversal_of(original: &Decision, time: &str, n: u64) -> Decision {
             ..Default::default()
         },
         decided_by: DecidedBy::session(vec![Sourced::observed("sess-b")], vec![], false),
-        authority: Authority::for_decider(DeciderKind::Session),
+        authority: Authority {
+            standing: Some("asserted".into()),
+            ..Authority::for_decider(DeciderKind::Session)
+        },
         chain: Chain::unknown(),
         basis: vec![],
         evidence: vec![],
@@ -119,11 +124,16 @@ fn reversal_of(original: &Decision, time: &str, n: u64) -> Decision {
             kind: original.kind,
             decider_kind: original.decided_by.kind,
             session: original.decided_by.session.clone(),
-            subject_key: None,
+            subject_key: Some(crate::decision_store::record::subject_key(
+                original.kind,
+                &original.subject,
+            )),
         }),
         repaired_from: None,
         import_source: None,
         recorded_at: None,
+        compensating: None,
+        replacement: None,
     }
 }
 

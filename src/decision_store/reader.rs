@@ -224,6 +224,57 @@ pub enum Status {
     Reversed,
 }
 
+/// What a reversal means for the decision it reversed, per kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Effect {
+    /// `not_accepted`, `neither_accepted_nor_rejected`, `merge_not_endorsed`,
+    /// `pass_no_longer_stands`, `question_withdrawn`, `question_escalated`
+    /// or `no_longer_stands`.
+    pub meaning: &'static str,
+    /// For a reversed escalation: the recipient the question is withdrawn
+    /// from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withdrawn_from: Option<String>,
+    /// For a reversed decline: the reverser the question now counts as
+    /// escalated to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalated_to: Option<String>,
+}
+
+/// A decider as one reference: `session:<id>`, `person:<handle>` or
+/// `check:<name>`, from the first value recorded for it.
+pub fn decider_ref(by: &super::record::DecidedBy) -> Option<String> {
+    match by.kind {
+        DeciderKind::Session => by.session.first().map(|v| format!("session:{}", v.value)),
+        DeciderKind::Person => by.handle.first().map(|v| format!("person:{}", v.value)),
+        DeciderKind::Check => by.name.as_ref().map(|n| format!("check:{}", n)),
+    }
+}
+
+/// What `reversal` means for `original`.
+pub fn effect_of(original: &Decision, reversal: &Decision) -> Effect {
+    let plain = |meaning| Effect {
+        meaning,
+        withdrawn_from: None,
+        escalated_to: None,
+    };
+    match original.kind {
+        Kind::Accept if original.outcome == "rejected" => plain("neither_accepted_nor_rejected"),
+        Kind::Accept => plain("not_accepted"),
+        Kind::Merge => plain("merge_not_endorsed"),
+        Kind::GatePass => plain("pass_no_longer_stands"),
+        Kind::Escalate => Effect {
+            withdrawn_from: original.subject.recipient.clone(),
+            ..plain("question_withdrawn")
+        },
+        Kind::DeclineEscalation => Effect {
+            escalated_to: decider_ref(&reversal.decided_by),
+            ..plain("question_escalated")
+        },
+        Kind::Judgment | Kind::Verdict | Kind::Reverse | Kind::Refused => plain("no_longer_stands"),
+    }
+}
+
 /// One result: the decision and its status.
 #[derive(Debug, Clone, Serialize)]
 pub struct Listed {
@@ -231,6 +282,9 @@ pub struct Listed {
     pub status: Status,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reversed_by: Option<String>,
+    /// On a reversed decision: what the reversal means for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effect: Option<Effect>,
 }
 
 impl Listed {
@@ -238,6 +292,7 @@ impl Listed {
         match index.get(&decision.id) {
             Some(r) => Listed {
                 reversed_by: Some(r.id.clone()),
+                effect: Some(effect_of(&decision, r)),
                 decision,
                 status: Status::Reversed,
             },
@@ -245,6 +300,7 @@ impl Listed {
                 decision,
                 status: Status::InEffect,
                 reversed_by: None,
+                effect: None,
             },
         }
     }
@@ -268,6 +324,10 @@ pub struct Filter {
     pub run_mode: Option<String>,
     pub dispatch_id: Option<String>,
     pub instructions_digest: Option<String>,
+    /// With `session`: instead of the decisions that session made, the ones
+    /// addressed to it: escalations whose recipient is the session, and
+    /// reversals of decisions it made.
+    pub received: bool,
 }
 
 /// JSON-escape a string the way the writer serializes it, without its
@@ -356,7 +416,12 @@ impl Filter {
         }
         let has = |slot: &[super::Sourced], want: &str| slot.iter().any(|s| s.value == want);
         if let Some(s) = &self.session {
-            if !d.decided_by.sessions().any(|v| v.value == *s) {
+            let hit = if self.received {
+                Self::received_by(d, s)
+            } else {
+                d.decided_by.sessions().any(|v| v.value == *s)
+            };
+            if !hit {
                 return false;
             }
         }
@@ -376,6 +441,24 @@ impl Filter {
             }
         }
         true
+    }
+
+    /// Whether `d` is addressed to `session`: an escalation whose recipient is
+    /// the session (named bare or as `session:<id>`), or a reversal of a
+    /// decision the session made.
+    fn received_by(d: &Decision, session: &str) -> bool {
+        match d.kind {
+            Kind::Escalate => d
+                .subject
+                .recipient
+                .as_deref()
+                .is_some_and(|r| r == session || r.strip_prefix("session:") == Some(session)),
+            Kind::Reverse => d
+                .original
+                .as_ref()
+                .is_some_and(|o| o.session.iter().any(|v| v.value == session)),
+            _ => false,
+        }
     }
 
     /// Whether the month `YYYY-MM` can hold a decision inside the window.
@@ -479,6 +562,28 @@ pub struct Shown {
     pub listed: Listed,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reversal: Option<Decision>,
+    /// On a reversed `accept`: every decision whose `basis` names it
+    /// directly. Following each one's own list gives the transitive set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affected: Option<Vec<String>>,
+}
+
+/// The identifiers of every decision whose `basis` names `id` directly,
+/// oldest first. Reads every month file, parsing only lines that contain
+/// the identifier.
+pub fn dependents(root: &Path, id: &str) -> Result<Vec<String>, StoreError> {
+    let needles = Needles::new([id.as_bytes()]);
+    let mut found: Vec<Decision> = Vec::new();
+    for (_, path) in month_files(root)? {
+        found.extend(
+            read_file(&path, &needles)?
+                .decisions
+                .into_iter()
+                .filter(|d| d.basis.iter().any(|b| b == id)),
+        );
+    }
+    found.sort_by(|a, b| order_key(a).cmp(&order_key(b)));
+    Ok(found.into_iter().map(|d| d.id).collect())
 }
 
 /// Show one decision. Reads only the month file the identifier names and
@@ -493,8 +598,55 @@ pub fn show(root: &Path, id: &str) -> Result<Option<Shown>, StoreError> {
     let reversals = read_reversals(root)?;
     let index = reversal_index(&reversals.decisions);
     let reversal = index.get(id).map(|r| (*r).clone());
+    let affected = match (&reversal, decision.kind) {
+        (Some(_), Kind::Accept) => Some(dependents(root, id)?),
+        _ => None,
+    };
     Ok(Some(Shown {
         listed: Listed::new(decision, &index),
         reversal,
+        affected,
     }))
+}
+
+/// Why the reversal log couldn't be read strictly.
+#[derive(Debug)]
+pub enum StrictError {
+    /// The store couldn't be opened or read.
+    Store(StoreError),
+    /// A complete line in the log is not a decision this koto can read; its
+    /// 1-based line number.
+    Unreadable { line: usize },
+}
+
+/// Every line of the reversal log, failing on any complete line that
+/// isn't a readable decision. A final line with no newline is a writer's
+/// append in progress and is skipped, as every reader skips it. A store
+/// that doesn't exist yet has no reversals.
+pub fn read_reversals_strict(root: &Path) -> Result<Vec<Decision>, StrictError> {
+    use std::io::Read;
+    if !store_present(root).map_err(StrictError::Store)? {
+        return Ok(Vec::new());
+    }
+    let path = root.join(REVERSALS_FILE);
+    let Some(mut file) = open_for_read(&path).map_err(StrictError::Store)? else {
+        return Ok(Vec::new());
+    };
+    let mut content = Vec::new();
+    file.read_to_end(&mut content).map_err(|e| {
+        StrictError::Store(StoreError::io(format!("reading {}", path.display()), e))
+    })?;
+    let mut lines: Vec<&[u8]> = content.split(|b| *b == b'\n').collect();
+    lines.pop();
+    let mut out = Vec::with_capacity(lines.len());
+    for (i, line) in lines.into_iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        match parse_line(line) {
+            Some(d) => out.push(d),
+            None => return Err(StrictError::Unreadable { line: i + 1 }),
+        }
+    }
+    Ok(out)
 }

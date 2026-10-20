@@ -135,6 +135,7 @@ pub fn assemble_line(d: &Decision) -> Result<String, FieldError> {
         super::validate_link("source_link", link)?;
     }
     validate_subject(d.kind, &d.subject, &d.evidence)?;
+    validate_reversal_fields(d)?;
     if d.basis.len() > MAX_BASIS {
         return Err(FieldError::new(
             "basis",
@@ -168,6 +169,54 @@ pub fn assemble_line(d: &Decision) -> Result<String, FieldError> {
         ));
     }
     Ok(line)
+}
+
+/// A `reverse` line names what it reverses twice (the subject's `decision`
+/// and `reverses`), carries the copy of the original and its standing; no
+/// other kind carries any of these, nor a compensating link or replacement.
+fn validate_reversal_fields(d: &Decision) -> Result<(), FieldError> {
+    if d.kind == Kind::Reverse {
+        if d.reverses.is_none() || d.reverses != d.subject.decision {
+            return Err(FieldError::new(
+                "reverses",
+                "a reverse decision names the decision it reverses in 'reverses' and its subject",
+            ));
+        }
+        if d.original.is_none() {
+            return Err(FieldError::new(
+                "original",
+                "a reverse decision carries a copy of the original it reverses",
+            ));
+        }
+        if !matches!(
+            d.authority.standing.as_deref(),
+            Some("verified" | "asserted")
+        ) {
+            return Err(FieldError::new(
+                "standing",
+                "a reverse decision's authority carries its standing (verified or asserted)",
+            ));
+        }
+        if let Some(link) = d.compensating.as_ref().and_then(|c| c.link.as_deref()) {
+            super::validate_link("compensating", link)?;
+        }
+        return Ok(());
+    }
+    for (present, field) in [
+        (d.reverses.is_some(), "reverses"),
+        (d.original.is_some(), "original"),
+        (d.authority.standing.is_some(), "standing"),
+        (d.compensating.is_some(), "compensating"),
+        (d.replacement.is_some(), "replacement"),
+    ] {
+        if present {
+            return Err(FieldError::new(
+                field,
+                format!("only a reverse decision carries '{}'", field),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Store {
