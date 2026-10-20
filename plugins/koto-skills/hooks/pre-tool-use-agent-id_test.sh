@@ -95,6 +95,10 @@ for bad_id in 'has space' "has'quote" 'semi;colon' 'dollar$x' '$(id)' '.hidden' 
   expect_unchanged "invalid agent_id [$bad_id] is left unchanged" \
     "$(payload 'koto next wf' "$(jq -nc --arg id "$bad_id" '{agent_id: $id}')")"
 done
+expect_unchanged "agent_id with a trailing newline is left unchanged" \
+  "$(payload 'koto next wf' '{"agent_id":"a1\n"}')"
+expect_unchanged "agent_id with an embedded newline is left unchanged" \
+  "$(payload 'koto next wf' '{"agent_id":"a1\nrm -rf x"}')"
 expect_unchanged "agent_id longer than 128 is left unchanged" \
   "$(payload 'koto next wf' "$(jq -nc --arg id "$(printf 'a%.0s' $(seq 1 129))" '{agent_id: $id}')")"
 expect_unchanged "numeric agent_id is left unchanged" \
@@ -127,8 +131,7 @@ if [ -n "$koto_bin" ] && [ -x "$koto_bin" ]; then
     bad "end to end: koto decisions record failed: $(cat "$tmp_home/err")"
   else
     listing="$(env -u KOTO_AGENT_ID HOME="$tmp_home" "$koto_bin" decisions list --kind judgment 2>/dev/null)"
-    if printf '%s' "$listing" | grep -q 'sub-agent-7' \
-      && printf '%s' "$listing" | jq -e '[.. | objects | select(.value? == "sub-agent-7" and .source? == "observed")] | length > 0' >/dev/null 2>&1; then
+    if printf '%s' "$listing" | jq -e '[.. | objects | select(.value? == "sub-agent-7" and .source? == "observed")] | length > 0' >/dev/null 2>&1; then
       ok "end to end: the decision lists the sub-agent as observed"
     else
       bad "end to end: listing does not show sub-agent-7 as observed: $listing"

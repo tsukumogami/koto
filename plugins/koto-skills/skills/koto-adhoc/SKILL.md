@@ -122,7 +122,7 @@ koto next <name> --to <target-state> --rationale "<why the gate can be passed>" 
 A gate pass can be reversed with `koto decisions reverse <id>` by its original decider, a session in that decider's dispatch chain, or the person at the chain's root. From the next tick, `koto next` returns `gate_blocked` with a blocking condition named `decision_reversed` whose `output` carries only `reversal`, `kind`, `standing` and `time`. Evidence and `--to` get the same response, and `agent_actionable` is `false`: an override doesn't clear it. `koto decisions show <reversal>` gives the reason. There are two ways forward:
 
 - Rewind with `koto rewind <name>`, once per state, until the workflow is at the gated state the directive names or earlier, then let the gate run again.
-- Have the reverser, or a decider with standing over them, record a new pass with `koto decisions record --kind gate-pass --workflow <name> --state <gated state> --gate <gate> --by ...`.
+- Have the reverser, or a decider with standing over them, record a new pass with `koto decisions record --kind gate-pass --workflow <name> --state <gated state> --gate <gate> --by ...`. A `verified` reversal is cleared only by a decider whose standing is also verified, so naming the reverser by hand with `--by session:<id>` from another session doesn't clear it.
 
 A `decision_store_unreadable` condition means koto couldn't read the store's reversal log, so it can't tell whether a pass was reversed and won't advance. Its `output.error` says what failed. Fix the store (its ownership, its permissions, or the line the error names); don't delete or truncate the reversal log to get past it, since that discards reversals that may still apply.
 

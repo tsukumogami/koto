@@ -671,7 +671,7 @@ How the decider resolves:
 
 A person passing a gate or accepting something from inside an agent's session must be recorded with `--by person:<handle>` and a `--surface`. Without it, the decision lands as the agent's session's own.
 
-**The acting agent** comes from `KOTO_AGENT_ID` (observed). The koto-skills plugin ships a PreToolUse hook that sets it on koto calls: to the sub-agent's identifier when the call comes from a sub-agent, to `main` only when the harness payload positively identifies the main agent, and otherwise not at all. A value that isn't identifier-shaped is ignored. With neither the variable nor `--agent`, the agent is `unknown`. `--agent` is handed, and both are kept when they differ. The label says where the value came from, not that it was authenticated.
+**The acting agent** comes from `KOTO_AGENT_ID` (observed). The koto-skills plugin ships a PreToolUse hook that sets it on koto calls: to the sub-agent's identifier when the call comes from a sub-agent, to `main` only when the payload names an agent type but no sub-agent (a session started as a named agent), and otherwise not at all, so a plain main-agent session records `unknown`. A value that isn't identifier-shaped is ignored. With neither the variable nor `--agent`, the agent is `unknown`. `--agent` is handed, and both are kept when they differ. The label says where the value came from, not that it was authenticated.
 
 **The run mode** comes from `CLAUDE_CODE_SESSION_ATTENDED` (`1`/`true` is `attended`, `0`/`false` is `unattended`), else `--run-mode`, else `unknown`.
 

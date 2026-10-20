@@ -60,31 +60,24 @@ cmd="$(printf '%s' "$payload" | jq -r '.tool_input.command // empty' 2>/dev/null
 koto_re='(^|[[:space:];&|(`"'"'"'])([^[:space:];&|()`"'"'"']*/)?koto([[:space:];&|)`"'"'"']|$)'
 [[ "$cmd" =~ $koto_re ]] || exit 0
 
-is_identifier() {
-  local v="$1"
-  [ "${#v}" -ge 1 ] && [ "${#v}" -le 128 ] || return 1
-  [[ "$v" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
-  [[ "$v" != .* ]] || return 1
-  [[ "$v" != *..* ]] || return 1
-  return 0
-}
-
-has_agent_id="$(printf '%s' "$payload" | jq -r 'has("agent_id") and .agent_id != null' 2>/dev/null)" || exit 0
-has_agent_type="$(printf '%s' "$payload" | jq -r 'has("agent_type")' 2>/dev/null)" || exit 0
-
-agent=""
-if [ "$has_agent_id" = "true" ]; then
-  # Only a string can be an identifier; a number or object is not one.
-  is_string="$(printf '%s' "$payload" | jq -r '.agent_id | type == "string"' 2>/dev/null)" || exit 0
-  [ "$is_string" = "true" ] || exit 0
-  raw="$(printf '%s' "$payload" | jq -r '.agent_id' 2>/dev/null)" || exit 0
-  is_identifier "$raw" || exit 0
-  agent="$raw"
-elif [ "$has_agent_type" = "true" ]; then
-  agent="main"
-else
-  exit 0
-fi
+# One jq call decides the agent: the sub-agent's id when it is a string
+# that passes koto's identifier rule (`is_identifier` in
+# src/decision_store/decider.rs; keep the two in step), `main` when only
+# agent_type is present, and nothing otherwise. The check runs inside jq on
+# the raw string, with \A and \z anchors, so a trailing newline can't be
+# stripped into a valid-looking value on the way out.
+agent="$(printf '%s' "$payload" | jq -r '
+  if (has("agent_id") and .agent_id != null) then
+    .agent_id
+    | if type == "string"
+         and length <= 128
+         and test("\\A[A-Za-z0-9._-]+\\z")
+         and (startswith(".") | not)
+         and (contains("..") | not)
+      then . else empty end
+  elif has("agent_type") then "main"
+  else empty end' 2>/dev/null)" || exit 0
+[ -n "$agent" ] || exit 0
 
 new_cmd="export KOTO_AGENT_ID='${agent}'; ${cmd}"
 
