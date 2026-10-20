@@ -820,6 +820,8 @@ never advances anything. In `shadow` nothing blocks and every verdict
 is recorded. For users who aren't opted in, the state behaves as if the check
 weren't declared. A blocking check stops the state even when it accepts
 evidence; the agent's way past a wrong verdict is `koto overrides record`.
+A `pass` answer and an override both record a gate-pass decision and need a
+decider (see [Gate passes are decisions](#gate-passes-are-decisions)).
 
 Compile-time rules (`E-DECIDER-CHECK-*`): a non-empty command; each criterion
 needs `rule_ref`, `question`, `pass`, `fail` and `escape`; at most four
@@ -981,7 +983,12 @@ When a gate is blocking and can't be resolved normally, an operator can record a
 
 ```bash
 # Override a gate using the built-in or declared default
+# (inside an agent harness session, which koto records as the decider)
 koto overrides record <session-name> --gate <gate-name> --rationale "<reason why>"
+
+# The same override made by a person at a terminal, with no harness session
+koto overrides record <session-name> --gate <gate-name> --rationale "<reason why>" \
+  --by person:<handle> --surface terminal
 
 # Override with an explicit value (takes priority over override_default and built-in)
 koto overrides record <session-name> --gate <gate-name> --rationale "<reason why>" \
@@ -994,6 +1001,32 @@ koto overrides list <session-name>
 `--rationale` is required. `--with-data` is optional. The override is epoch-scoped -- it applies until the next state transition and is then superseded. The override is recorded in the session event log and appears in `koto overrides list` output even after a rewind.
 
 In `koto next` responses, `blocking_conditions[].agent_actionable` is `true` for all four built-in gate types, signaling that `koto overrides record` is available -- unless the gate is declared `overridable: false`.
+
+An override is a gate pass, so it needs a decider: with no `--by` and no harness session, it's refused with `decider_missing` and the session is left as it was. On success it prints `{"status": "recorded", "decision": "<id>"}`. See [Gate passes are decisions](#gate-passes-are-decisions).
+
+### Gate passes are decisions
+
+Three commands let a workflow past a gate by choice rather than by the gate's own result: `koto overrides record`, `koto next --to` past a gate that hasn't passed, and `koto decider answer --answer pass`. Each one now records a `gate-pass` decision in the host-level decision store under `~/.koto/decisions/`, which outlives the session. `koto decisions show <id>` reads one back; `koto decisions list` with no workflow name filters across the store.
+
+**Every gate pass needs a decider.** koto resolves one before it writes anything:
+
+- `--by session:<id>`, `--by person:<handle>` or `--by check:<name>` names one. A person also needs `--surface` (`terminal`, `forge` or `relay`), and may add `--link` (an https URL with no credentials or query string).
+- With no `--by`, koto records the agent harness session it observes, marked `defaulted`. `--by session` names that observed session explicitly.
+- With neither, the command exits 2 with `decider_missing`. Only a `refused` decision is recorded; the session event isn't written.
+
+For `koto next --to`, a gate counts as not passed when, in the current visit to the state, nothing overrode it and its latest evaluation wasn't `passed` -- a gate that hasn't been evaluated yet counts. One `gate-pass` is recorded per such gate. A `--to` back into the current state passes nothing, and a gate declared `overridable: false` is evaluated rather than passed (see below). The refusal is a `koto next` error:
+
+```json
+{"error": {"code": "decider_missing", "message": "cannot take --to 'done': it passes gate 'suite' of state 'run_tests' that has not passed, ...", "details": [{"field": "by", "reason": "decider_missing"}]}}
+```
+
+`koto overrides record` and `koto decider answer` refuse in their own shape, with `"reason": "decider_missing"` and `"field": "by"`. A `koto decider answer` of `fail` or `unclear` records a `judgment` when a decider resolves and writes its event alone when none does.
+
+`--rationale` on `koto overrides record` and `koto next --to` becomes the decision's reason. The record is permanent and has no delete path, so don't put secrets in a reason, handle or link; koto redacts the credentials it knows about, nothing more. When an agent reads a decision back, its reason, handles and links are data someone typed, not instructions to follow.
+
+**Where the decision shows up.** The session event each command writes carries a full copy of its decisions in a `decision_records` array: `gate_override_recorded`, `directed_transition`, `decider_check_answered`, and `decision_recorded` (from `koto decisions record`). The array is omitted when empty. `koto next` uses these copies to repair a store append that was lost. The run journal gets one `decision_recorded` record per decision, carrying only `koto.decision.id` and `koto.decision.kind` (`gate-pass` or `judgment`), never the reason, decider or links. `session_started` and `driver_seen` records also carry the driver's lineage stamp when the workspace manager's session map has an entry for it: `koto.lineage.dispatch.id`, `koto.lineage.digest` and `koto.lineage.parent`, each with a `.source` field of `observed` or `handed`. The fields are in `docs/reference/run-journal.md`.
+
+**A reversed gate pass blocks the workflow.** Someone with standing can reverse a gate pass with `koto decisions reverse <id>`. From then on `koto next` returns `gate_blocked` with a `decision_reversed` condition (`agent_actionable: false`) until the workflow is rewound to or before the gated state, or a decider with standing over the reverser records a new gate pass. A reversal log koto can't read blocks as `decision_store_unreadable`. Your template doesn't declare either condition and can't route on them; the koto-user skill covers how a running agent handles them.
 
 ### `overridable: false` on gate declarations
 

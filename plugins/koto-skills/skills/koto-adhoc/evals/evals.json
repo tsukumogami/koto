@@ -87,6 +87,19 @@
         "STRUCTURE (mechanical): the authored definition has more than one state and declares at least one gate.",
         "QUALITY (LLM-judged): the gate sits at the real verification boundary — routed on `verify-counts`'s exit code (`gates.<name>.exit_code`), not on an agent-asserted boolean. Distinct from VALIDITY: a valid definition can still gate on the wrong thing."
       ]
+    },
+    {
+      "id": 6,
+      "name": "to-past-unmet-gate-needs-decider",
+      "prompt": "I'm running a one-off workflow I started with `koto init deploy-check --from-stdin`, from a plain terminal (no agent session). It's sitting in `verify`, whose `smoke` gate keeps failing because the smoke-test host is down, and I've confirmed by hand that the deploy is fine. I ran `koto next deploy-check --to release` and got an error with code `decider_missing`. What does that mean and how do I move on?",
+      "expected_output": "Agent explains that a `koto next --to` past a gate that hasn't passed is a gate pass that koto records as a decision, and it needs a decider; with no harness session and no `--by`, koto refuses with decider_missing and leaves the session unchanged. A person at the terminal re-runs with `--by person:<handle> --surface terminal`, ideally with a `--rationale` that carries no secrets.",
+      "files": [],
+      "assertions": [
+        "Response explains that `--to` past a gate that hasn't passed records a gate-pass decision and needs a decider, which is why `decider_missing` came back",
+        "Response tells the user to re-run `koto next deploy-check --to release` with `--by person:<handle>` and `--surface terminal`",
+        "Response notes the refused command didn't move the workflow (nothing but the refusal was recorded)",
+        "Response does NOT suggest editing the session's state file or event log by hand to get past the gate"
+      ]
     }
   ]
 }

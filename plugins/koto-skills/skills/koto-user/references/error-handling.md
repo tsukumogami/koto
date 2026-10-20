@@ -87,6 +87,7 @@ All `koto next` error codes, their exit codes, and what to do:
 | `import_source_running`, `import_source_unpushed`, `import_source_has_children` | 2 | No | A same-host `koto session import` (no `--as`, run on the host that created the session) found the source still held by another process, ahead of the bucket, or with a local child. `import_source_unpushed` also refuses from any host while a `koto next` on the source stopped before pushing what its commands wrote (the bucket holds the source's `batch-open.json`). Nothing was written | Stop the source, run `koto session resolve <name> --keep local` in its workspace, or deal with the child, as the code says. For a stopped `koto next`, run any koto command on the session in the source workspace on its host, such as `koto status <name>`, which pushes the writes. Then run the same import again. See `command-reference.md`, "koto session import" |
 | `session_migrated` | 2 | No | Under the cloud backend, the session was imported into another workspace with `koto session import`, and this copy carries the marker the import left. The message names the session and workspace it went to | Continue the session where the message says; don't advance this copy. See [session_migrated](#session_migrated) |
 | `nested_invocation` | 2 | No | The tick was started from inside a command koto is running. The message names the session whose tick is in flight | Don't tick koto from a template's command. Take the `koto next` call out and let the enclosing tick advance the session |
+| `decider_missing` | 2 | No | `koto next --to` would leave a gate that hasn't passed, and no decider could be established: no `--by` was given and no harness session was observed. Only a `refused` decision per unmet gate was recorded; the session is unchanged. `error.details` names `by` | Re-run with `--by` naming who decided. See [decider_missing](#decider_missing) |
 | `needs_agent_not_dispatched` | 66 | No | `koto next` was called against a `--needs-agent` child that the coordinator has not yet claimed/dispatched | Stop ticking the child directly; route through the coordinator's `koto next` on the parent root instead |
 | `recursion_cap_exceeded` | 64 | No | `koto session start --needs-agent` would push the workflow tree past one of the three recursion caps (`depth`, `fanout`, or `total_unassigned`) | Surface the cap dimension and threshold to the user; restructure the dispatch fanout (collapse a level, batch siblings, or split into separate trees) before retrying |
 
@@ -390,6 +391,58 @@ Rejecting is chosen over truncating, since truncation silently drops the newest 
 | Bytes in `--rationale` | 4 KiB | `rationale_bytes` |
 
 The rationale cap is much tighter than koto's 1 MiB rationale precedent elsewhere because that text reaches a delegate's response on every tick until it terminates. Every bound is checked inside the per-request lock, so none can be raced past, and a rejected `create` leaves no directory behind.
+
+---
+
+## Decision record errors
+
+The `koto decisions` commands print every error as one flat JSON object on stdout: `error` (the message), `command`, and `field` when one flag or subject field is at fault. Branch on `field` and `reason`, not the message.
+
+| Exit | When | What to do |
+|---|---|---|
+| 2, with `field` | A malformed flag, an unknown kind or outcome, a subject field the kind doesn't take or lacks (`koto decisions record --kind`), a bad `--since`/`--until`, `--compensating` or `--replacement` on a kind that takes none, a malformed import source or entry (the message names the entry) | Fix the named field; retrying unchanged fails the same way |
+| 2, `reason: "decider_missing"` | No decider: no `--by` and no harness session | Name the decider with `--by` (see below) |
+| 2, `field: "id"` | A line with that id is already on the record with different content | Report it |
+| 1, with `reason` | `koto decisions reverse` refused the reversal; the attempt is recorded as `refused` and `refused_id` names it. Reasons: `not_on_record`, `reverse_of_reverse`, `reverse_of_refused`, `already_reversed`, `session_over_person`, `no_standing` | Don't retry. See `command-reference.md#koto-decisions-reverse` for what each means and who may reverse |
+| 1, `field: "id"` | `koto decisions show` found no decision with that id | Check the id |
+| 1, no `field` | The record couldn't be used: no home directory, a store directory another user owns or others can write, the store lock not acquired in time, an I/O error | Retry once for a lock timeout; otherwise report it |
+
+A command that writes a session event and then a decision (`koto overrides record`, `koto next --to`, `koto decider answer`, `koto decisions record <name>`) doesn't fail when only the second write fails. It warns on stderr that the decision wasn't written and that the next `koto next <name>` writes it from the session's log, and the next tick does. Carry on.
+
+### decider_missing
+
+A gate pass needs someone to have decided it. koto resolves the decider before it touches anything: a handed `--by`, else the harness session in `CLAUDE_CODE_SESSION_ID` (recorded as `defaulted`). With neither, a gate-passing command refuses with `decider_missing` (exit 2). Its own session event isn't written and the session is left unchanged; the only thing recorded is a `refused` decision (`subject.attempted_kind: "gate-pass"`, `subject.refusal_reason: "decider_missing"`, the attempted workflow, state and gate under `subject.attempted`, and no session). Each command words it in its own error shape.
+
+`koto overrides record` (flat):
+
+```json
+{"command": "overrides record",
+ "error": "decider_missing: no decider was named with --by and no harness session was observed",
+ "field": "by", "reason": "decider_missing",
+ "refused_id": "d-202610-1187e90d5dca7b56725653cb6258ac34"}
+```
+
+`koto next --to` (the `koto next` error shape; one `refused` decision per unmet gate, their ids at the end of the message):
+
+```json
+{"error": {"code": "decider_missing",
+           "message": "cannot take --to 'after': it passes gate 'g' of state 'gated' that has not passed, and no decider could be established (decider_missing): name one with --by or run inside a harness session; nothing was recorded except the refusal (d-202610-a0254d1819dcd490b200790850c56a07)",
+           "details": [{"field": "by", "reason": "decider_missing"}]}}
+```
+
+`koto decider answer` with `--answer pass` (that command's nested shape):
+
+```json
+{"command": "decider answer",
+ "error": {"code": "decider_missing",
+           "message": "decider_missing: no decider was named with --by and no harness session was observed",
+           "field": "by", "gate": "comment_reasons", "criterion": "comment_reason", "state": "review",
+           "refused_id": "d-202610-..."}}
+```
+
+`refused_id` is left out when the refusal itself couldn't be written (a warning on stderr says so). `koto decisions record --kind` and `koto decisions reverse` refuse in the flat shape too, with `command` set to theirs and no `refused_id`: they record nothing at all. `koto decisions record <name> --with-data`, and a `fail` or `unclear` answer, never refuse for this; with no decider they write the session event alone.
+
+**What to do.** Re-run with `--by`. If the user is the one deciding, `--by person:<handle> --surface terminal`. If it's your session and the harness just didn't export a session id, `--by session:<id>`. Test suites and scripts that pass gates outside a harness need `CLAUDE_CODE_SESSION_ID` set to an identifier (letters, digits, `.`, `_`, `-`) or a `--by` on each gate-passing call.
 
 ---
 
