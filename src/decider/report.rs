@@ -67,6 +67,11 @@ pub const LOW_COVERAGE_MIN_CONSULTATIONS: u64 = 30;
 /// Coverage (percent) below which such a question is flagged.
 pub const LOW_COVERAGE_PERCENT: u64 = 30;
 
+// The three column words below are also the run journal's
+// `koto.decider.answer` values (through `ledger_column`), which external
+// readers key on: renaming one changes exported data, and the
+// run-journal reference has to change with it.
+
 /// Column name for a declared value chosen below its threshold.
 pub const COL_BELOW_THRESHOLD: &str = "below_threshold";
 /// Column name for the escape, a tie, or a boolean with no single winner.

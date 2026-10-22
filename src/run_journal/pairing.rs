@@ -17,8 +17,15 @@ use crate::engine::types::{Event, EventPayload};
 /// state, a self-loop included (`Boundary::AnyEntry`, the rule
 /// `engine::decider::prior_consultation` reads the parsed log by), so an
 /// answer pairs with the consultation of its own lap, never an earlier one.
+/// Like `prior_consultation`, it takes the visit's first consultation of
+/// the state (the port makes only one), so the ledger's `answered` record
+/// and the journal's `decider_answered` pair with the same one. The engine
+/// reads a parsed log and this one raw bytes, so the rule lives in both;
+/// `the_journal_pairs_with_the_consultation_the_engine_finds` holds them
+/// to the same logs.
 pub(super) fn consultation(log: &str, state: &str) -> Option<(u64, DeciderConsultation)> {
-    let mut latest: Option<(u64, DeciderConsultation)> = None;
+    // The state's consultations after the visit's entry, latest first.
+    let mut found: Vec<(u64, DeciderConsultation)> = Vec::new();
     for line in log.lines().rev() {
         let entry = may_be_entry(line);
         if !entry && !line.contains("\"decider_consulted\"") {
@@ -28,13 +35,19 @@ pub(super) fn consultation(log: &str, state: &str) -> Option<(u64, DeciderConsul
             continue;
         };
         if let Some(to) = entered_state(&event.payload) {
-            // The visit's opening entry: the consultation found after it
-            // belongs to it only if it names this state and this visit.
-            return latest.filter(|(_, c)| to == state && c.visit_seq == event.seq);
+            // The visit's opening entry: the earliest consultation after it
+            // that names this visit, when the entry is into this state.
+            if to != state {
+                return None;
+            }
+            return found
+                .into_iter()
+                .rev()
+                .find(|(_, c)| c.visit_seq == event.seq);
         }
         if let EventPayload::DeciderConsulted(c) = event.payload {
-            if latest.is_none() && c.state == state {
-                latest = Some((event.seq, c));
+            if c.state == state {
+                found.push((event.seq, c));
             }
         }
     }

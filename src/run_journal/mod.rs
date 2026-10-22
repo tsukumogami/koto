@@ -773,7 +773,8 @@ impl Relay<'_> {
 /// `decider_checked` or `decider_fallback` event writes one record of its
 /// own name, a `gate_override_recorded` one `check_overridden`, and a
 /// `finding_disputed` one `check_disputed`. Every other payload relays
-/// nothing.
+/// nothing here: `decider_answered` and `decider_check_answered`, which
+/// need the earlier event they answer, come from [`paired`].
 ///
 /// Each field is copied by name from the event, never by stripping it, so
 /// nothing the event carries beyond these (output, streams, a finding's
@@ -963,8 +964,8 @@ const OTHER_ANSWER: &str = "other";
 /// `escape`, or `no_answer` when the consultation got no usable answer.
 /// The mode is the winner's when it is a
 /// declared value, otherwise the one mode every declared value shares, and
-/// otherwise absent. `koto.decider.threshold_met` is written only for a
-/// field the decider answered. The field and a value are names the template
+/// otherwise absent. `koto.decider.threshold_met` is written only when a
+/// declared value won, so never with `escape` or `no_answer`. The field and a value are names the template
 /// declares, digested like rule ids when outside the name shape; nothing
 /// the session wrote is copied.
 fn with_field(
@@ -977,7 +978,13 @@ fn with_field(
     // never read one consultation two ways. It is a declared value or one
     // of the report's fixed words, all of them name-shaped but a declared
     // value outside the shape, which is digested.
-    let answer = name_or_digest(&crate::decider::report::ledger_column(outcome, fc));
+    let column = crate::decider::report::ledger_column(outcome, fc);
+    // A threshold was met or missed only by a declared value that won: an
+    // escape or no answer has none to report.
+    let threshold_met = (column != crate::decider::report::COL_ESCAPE
+        && column != crate::decider::report::COL_NO_ANSWER)
+        .then_some(fc.at_threshold);
+    let answer = name_or_digest(&column);
     let declared_winner = fc.winning.as_deref().filter(|w| fc.modes.contains_key(*w));
     let mode = declared_winner
         .and_then(|w| fc.modes.get(w).copied())
@@ -990,10 +997,7 @@ fn with_field(
         .name("koto.decider.field", Some(name_or_digest(field).as_str()))
         .name("koto.decider.answer", Some(answer.as_str()))
         .name("koto.decider.mode", mode.map(|m| m.as_str()))
-        .opt_flag(
-            "koto.decider.threshold_met",
-            fc.outcome.is_some().then_some(fc.at_threshold),
-        )
+        .opt_flag("koto.decider.threshold_met", threshold_met)
 }
 
 /// Whether a payload writes records that pair it with an earlier event in

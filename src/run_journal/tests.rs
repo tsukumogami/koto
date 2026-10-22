@@ -2822,12 +2822,13 @@ fn a_consultation_of_one_field_carries_its_answer_mode_and_threshold() {
             Some("auto"),
             Some(false),
         ),
-        // The escape isn't a declared value; the modes differ, so none.
+        // The escape isn't a declared value; the modes differ, so none, and
+        // no declared value won, so no threshold either.
         (
             answered_field(&mixed, Some("unclear"), Some(FieldOutcome::Escape), false),
             "escape",
             None,
-            Some(false),
+            None,
         ),
         // No answer: every declared value shares one mode, so that one.
         (
@@ -3029,6 +3030,97 @@ fn verdict_consultation(outcome: ConsultationOutcome) -> EventPayload {
             ),
         )])
     })
+}
+
+/// The journal finds a visit's consultation in the raw log by the rule the
+/// engine reads the parsed log by (`prior_consultation`, which the ledger's
+/// `answered` record pairs with), on every shape of log that rule turns on.
+#[test]
+fn the_journal_pairs_with_the_consultation_the_engine_finds() {
+    let consulted = |visit_seq: u64, model: &str| {
+        EventPayload::DeciderConsulted(DeciderConsultation {
+            visit_seq,
+            model: model.into(),
+            ..consultation()
+        })
+    };
+    let other_state = EventPayload::DeciderConsulted(DeciderConsultation {
+        state: "b".into(),
+        visit_seq: 2,
+        ..consultation()
+    });
+    let logs: Vec<(&str, Vec<EventPayload>)> = vec![
+        ("one consultation", vec![consulted(2, "m1")]),
+        (
+            "two in one visit: the first",
+            vec![consulted(2, "m1"), consulted(2, "m2")],
+        ),
+        (
+            "one naming another visit, then this one",
+            vec![consulted(1, "stale"), consulted(2, "m1")],
+        ),
+        ("another state's only", vec![other_state.clone()]),
+        (
+            "a self-loop after it",
+            vec![consulted(2, "m1"), transitioned(Some("a"), "a")],
+        ),
+        (
+            "a self-loop, then the new lap's",
+            vec![
+                consulted(2, "m1"),
+                transitioned(Some("a"), "a"),
+                consulted(4, "m2"),
+            ],
+        ),
+        (
+            "left for another state",
+            vec![consulted(2, "m1"), transitioned(Some("a"), "b")],
+        ),
+        ("no consultation", vec![]),
+    ];
+    for (name, payloads) in logs {
+        let mut events = vec![crate::engine::types::Event {
+            seq: 1,
+            timestamp: crate::engine::types::now_iso8601(),
+            event_type: "workflow_initialized".into(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "t.json".into(),
+                variables: Default::default(),
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+        for (i, payload) in std::iter::once(transitioned(None, "a"))
+            .chain(payloads)
+            .enumerate()
+        {
+            events.push(crate::engine::types::Event {
+                seq: i as u64 + 2,
+                timestamp: crate::engine::types::now_iso8601(),
+                event_type: payload.type_name().to_string(),
+                payload,
+                idempotency_hash: None,
+            });
+        }
+        let log: String = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
+        let engine = crate::engine::decider::prior_consultation(&events, "a");
+        let journal = super::pairing::consultation(&log, "a");
+        assert_eq!(
+            journal.as_ref().map(|(_, c)| c),
+            engine,
+            "{name}: the journal and the engine disagree"
+        );
+        if let Some((seq, c)) = &journal {
+            let at = events
+                .iter()
+                .find(|e| matches!(&e.payload, EventPayload::DeciderConsulted(x) if x == c))
+                .unwrap();
+            assert_eq!(*seq, at.seq, "{name}");
+        }
+    }
 }
 
 #[test]

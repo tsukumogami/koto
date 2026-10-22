@@ -371,14 +371,14 @@ committed `decider_consulted` event.
 | `koto.decider.unread_usage_attempts` | integer | always | Billed answers whose token usage couldn't be read, so an undercount of the two counts above is visible. 0 when the event doesn't log it. |
 | `koto.decider.latency_ms` | integer | always | Wall time of the provider call, in milliseconds. |
 | `koto.decider.directive_bytes` | integer | always | UTF-8 bytes of the directive plus its details (and the recovery pointer a state with details gets) that `koto next` would have returned to the agent for the consulted state, had the routing decider not been consulted; details already delivered in that visit don't count, and an applied consultation spares the agent these bytes. This differs from a `response` record's `koto.response.directive_bytes`, which counts only the printed directive. |
-| `koto.decider.reason` | string | `input_unavailable` | Why a declared input stopped the consultation before anything was sent: `unset` (the context key or variable it reads isn't set), `over_budget` (it is longer than its `max_bytes`) or `not_text` (the context key holds bytes that aren't UTF-8 text). Left out in the one case the request can't be built from the declaration, which a compiled template rules out. |
+| `koto.decider.reason` | string | `input_unavailable` | Why a declared input stopped the consultation before anything was sent (on the check kinds the same key says why a criterion got no verdict, from another set of values): `unset` (the context key or variable it reads isn't set), `over_budget` (it is longer than its `max_bytes`) or `not_text` (the context key holds bytes that aren't UTF-8 text). Left out in the one case the request can't be built from the declaration, which a compiled template rules out. |
 | `koto.decider.input_label` | string | with `koto.decider.reason` | The declared `label` of the input that stopped it, the first one in declaration order. Never its context key, a path or its content. |
 | `koto.decider.input_bytes` | integer | `over_budget`, `not_text` | That input's size in bytes, before any budget. An unset input has none. The same key on the check kinds is a slice's size, so read it by kind. |
 | `koto.decider.field_count` | integer | always | How many fields the consultation asked about. |
 | `koto.decider.field` | string | one field | The field's name. |
 | `koto.decider.answer` | string | one field | What the decider answered for it, the column `koto decider report` puts it in: the winning declared value (`"true"` or `"false"` for a boolean) when it met its threshold, whether or not it was applied; `below_threshold` when the winner fell short of its threshold; `escape` when no declared value won (the escape, a tie, or a boolean with neither or both sides at threshold); or `no_answer` when the consultation got no usable answer (`input_unavailable` or `error`). |
 | `koto.decider.mode` | string | one field, when known | The declared mode for that answer, after the user's and project's modes: the winner's (`shadow`, `auto` or `never`) when it is a declared value, below threshold included; otherwise the mode every declared value of the field shares, and left out when they differ. |
-| `koto.decider.threshold_met` | boolean | one field, when answered | Whether the winner met its threshold. Left out with `no_answer`. |
+| `koto.decider.threshold_met` | boolean | one field, when a declared value won | Whether the winning declared value met its threshold: `true` with that value as the answer, `false` with `below_threshold`. Left out with `escape` and `no_answer`, where no declared value won. |
 
 The answer keys describe one field. A consultation of one field, which is
 every shipped template's case, carries them itself. A consultation of
@@ -409,7 +409,11 @@ are the visits the decider ledger pairs (see
 [Joining a consultation's answers](#joining-a-consultations-answers)). The
 agent's answer is never known when the decider is consulted, since koto
 doesn't consult once the agent's evidence holds a declared field, so it
-always comes in this later record.
+comes in this later record. One case writes none: when the agent's
+evidence lands while the provider call is in flight, koto records the
+consultation after the evidence (as `not_applied`, never applied), so
+nothing came before the answer to pair it with. The ledger writes no
+`answered` record for that visit either, so the two agree.
 
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|
