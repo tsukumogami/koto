@@ -516,8 +516,10 @@ impl LedgerReport {
     }
 }
 
-/// The decider's column for one field of a consultation.
-fn ledger_column(outcome: ConsultationOutcome, fc: &FieldConsultation) -> String {
+/// The decider's column for one field of a consultation. The run journal's
+/// `koto.decider.answer` is this value, so the export and the report read
+/// a consultation the same way.
+pub(crate) fn ledger_column(outcome: ConsultationOutcome, fc: &FieldConsultation) -> String {
     if matches!(
         outcome,
         ConsultationOutcome::InputUnavailable | ConsultationOutcome::Error

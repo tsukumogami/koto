@@ -2855,6 +2855,49 @@ fn a_consultation_of_one_field_carries_its_answer_mode_and_threshold() {
     }
 }
 
+/// The exported answer is the report's own column for the field, including
+/// the cases a compiled template can't produce, so the export and
+/// `koto decider report` never read one consultation two ways.
+#[test]
+fn the_answer_is_the_reports_column_for_every_field() {
+    let modes = [("proceed", SHADOW), ("exit", SHADOW)];
+    let cases = [
+        (
+            ConsultationOutcome::NotApplied,
+            answered_field(&modes, Some("proceed"), Some(FieldOutcome::Shadow), true),
+            "proceed",
+        ),
+        // A winner that isn't declared, under a qualifying outcome.
+        (
+            ConsultationOutcome::NotApplied,
+            answered_field(&modes, Some("maybe"), Some(FieldOutcome::Shadow), true),
+            "escape",
+        ),
+        // A qualifying outcome whose winner missed its threshold.
+        (
+            ConsultationOutcome::NotApplied,
+            answered_field(&modes, Some("exit"), Some(FieldOutcome::Shadow), false),
+            "below_threshold",
+        ),
+        // A field outcome on a consultation that got no answer.
+        (
+            ConsultationOutcome::Error,
+            answered_field(&modes, Some("exit"), Some(FieldOutcome::Shadow), true),
+            "no_answer",
+        ),
+    ];
+    for (outcome, field, answer) in cases {
+        let column = crate::decider::report::ledger_column(outcome, &field);
+        assert_eq!(column, answer);
+        let d = relayed_values(&EventPayload::DeciderConsulted(DeciderConsultation {
+            outcome,
+            ..consultation_of(vec![("verdict", field)])
+        }));
+        assert_eq!(d[0]["koto.decider.answer"], answer, "{}", d[0]);
+        assert!(!d[0].to_string().contains("maybe"), "{}", d[0]);
+    }
+}
+
 #[test]
 fn a_consultation_of_several_fields_writes_one_decider_field_per_field() {
     let d = relayed_values(&EventPayload::DeciderConsulted(consultation_of(vec![

@@ -373,10 +373,10 @@ committed `decider_consulted` event.
 | `koto.decider.directive_bytes` | integer | always | UTF-8 bytes of the directive plus its details (and the recovery pointer a state with details gets) that `koto next` would have returned to the agent for the consulted state, had the routing decider not been consulted; details already delivered in that visit don't count, and an applied consultation spares the agent these bytes. This differs from a `response` record's `koto.response.directive_bytes`, which counts only the printed directive. |
 | `koto.decider.reason` | string | `input_unavailable` | Why a declared input stopped the consultation before anything was sent: `unset` (the context key or variable it reads isn't set), `over_budget` (it is longer than its `max_bytes`) or `not_text` (the context key holds bytes that aren't UTF-8 text). Left out in the one case the request can't be built from the declaration, which a compiled template rules out. |
 | `koto.decider.input_label` | string | with `koto.decider.reason` | The declared `label` of the input that stopped it, the first one in declaration order. Never its context key, a path or its content. |
-| `koto.decider.input_bytes` | integer | `over_budget`, `not_text` | That input's size in bytes. An unset input has none. |
+| `koto.decider.input_bytes` | integer | `over_budget`, `not_text` | That input's size in bytes, before any budget. An unset input has none. The same key on the check kinds is a slice's size, so read it by kind. |
 | `koto.decider.field_count` | integer | always | How many fields the consultation asked about. |
 | `koto.decider.field` | string | one field | The field's name. |
-| `koto.decider.answer` | string | one field | What the decider answered for it: the winning declared value (`"true"` or `"false"` for a boolean) when it met its threshold, whether or not it was applied; `below_threshold` when the winner fell short of its threshold; `escape` when no declared value won (the escape, a tie, or a boolean with neither or both sides at threshold); or `no_answer` when the consultation got no usable answer (`input_unavailable` or `error`). |
+| `koto.decider.answer` | string | one field | What the decider answered for it, the column `koto decider report` puts it in: the winning declared value (`"true"` or `"false"` for a boolean) when it met its threshold, whether or not it was applied; `below_threshold` when the winner fell short of its threshold; `escape` when no declared value won (the escape, a tie, or a boolean with neither or both sides at threshold); or `no_answer` when the consultation got no usable answer (`input_unavailable` or `error`). |
 | `koto.decider.mode` | string | one field, when known | The declared mode for that answer, after the user's and project's modes: the winner's (`shadow`, `auto` or `never`) when it is a declared value, below threshold included; otherwise the mode every declared value of the field shares, and left out when they differ. |
 | `koto.decider.threshold_met` | boolean | one field, when answered | Whether the winner met its threshold. Left out with `no_answer`. |
 
@@ -430,9 +430,14 @@ consultation's `koto.decider.answer` (or its `decider_field` records'), the
 pairs give agreement, coverage and the below-threshold rate per field, as
 `koto decider report` computes them from the ledger.
 
+An agent that submits the same field more than once in the visit writes a
+`decider_answered` for each submission. Its answer is the one with the
+highest `koto.seq`, as the ledger keeps the latest.
+
 A consultation the decider applied has no `decider_answered`: its answer
 was submitted as the evidence. A visit the agent leaves with `koto next
---to` before answering has none either.
+--to` before answering has none either, and nothing in the journal records
+that exit; the ledger's `directed_exit` records it.
 
 ### `decider_checked`
 
@@ -521,8 +526,12 @@ to a criterion handed to it, recorded with `koto decider answer`.
 | `koto.decider.reason` | string | when the log holds the fallback | Why the criterion fell back, from the `decider_fallback` it answers, with the same values. |
 | `koto.decider.fallback_seq` | integer | always | The `koto.seq` of the `decider_fallback` record it answers. |
 
-When the decider later grades the same slice of the same criterion, that
-`decider_checked` and this record together say whether the two agreed.
+To set the agent's answer beside the decider's, join it to the
+`decider_checked` records with the same `koto.session.id`,
+`koto.visit.seq`, `koto.check` and `koto.rule.id` and a higher `koto.seq`:
+those grade the criterion later in the same visit. The journal carries no
+slice hash, so it can't say whether such a grading was of the slice the
+agent answered; a slice that changed between the two is graded afresh.
 
 ### `check_overridden`
 

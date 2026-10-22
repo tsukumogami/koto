@@ -923,7 +923,7 @@ fn decider_consulted(relay: &Relay<'_>, c: &crate::decider::DeciderConsultation)
         .int("koto.decider.field_count", Some(c.fields.len() as u64));
     if c.fields.len() == 1 {
         let (field, fc) = c.fields.iter().next().expect("one field");
-        return vec![with_field(consulted, field, fc)];
+        return vec![with_field(consulted, c.outcome, field, fc)];
     }
     let mut records = vec![consulted];
     for (field, fc) in &c.fields {
@@ -932,6 +932,7 @@ fn decider_consulted(relay: &Relay<'_>, c: &crate::decider::DeciderConsultation)
                 .record(DECIDER_FIELD)
                 .name("koto.state", Some(c.state.as_str()))
                 .int(CONSULTED_SEQ_FIELD, Some(relay.seq)),
+            c.outcome,
             field,
             fc,
         ));
@@ -949,33 +950,35 @@ const DECIDER_CHECK_ANSWERED: &str = "decider_check_answered";
 /// On `decider_field` and `decider_answered`: the `koto.seq` of the
 /// `decider_consulted` record the row belongs to.
 const CONSULTED_SEQ_FIELD: &str = "koto.decider.consulted_seq";
-/// The answer a field records when the decider gave none: the consultation
-/// stopped before or at the provider.
-const NO_ANSWER: &str = "no_answer";
-/// The answer written for a value that isn't one of the field's declared
-/// values, so no submitted text reaches the journal.
+/// The answer written for an agent's value that isn't one of the field's
+/// declared values, so no submitted text reaches the journal.
 const OTHER_ANSWER: &str = "other";
 
 /// `record` with one field's answer keys: the field's name, the decider's
 /// answer, the declared mode for it, and whether it met its threshold.
 ///
-/// The answer is the winning declared value when the field qualified (or
-/// would have, in `shadow` or `never`), and otherwise koto's own word for
-/// what happened: `below_threshold`, `escape`, or `no_answer` when the
-/// consultation got no usable answer. The mode is the winner's when it is a
+/// The answer is the column `koto decider report` puts the field in: the
+/// winning declared value when it met its threshold (applied or not), and
+/// otherwise koto's own word for what happened: `below_threshold`,
+/// `escape`, or `no_answer` when the consultation got no usable answer.
+/// The mode is the winner's when it is a
 /// declared value, otherwise the one mode every declared value shares, and
 /// otherwise absent. `koto.decider.threshold_met` is written only for a
 /// field the decider answered. The field and a value are names the template
 /// declares, digested like rule ids when outside the name shape; nothing
 /// the session wrote is copied.
-fn with_field(record: Record, field: &str, fc: &crate::decider::FieldConsultation) -> Record {
-    use crate::decider::FieldOutcome;
+fn with_field(
+    record: Record,
+    outcome: crate::decider::ConsultationOutcome,
+    field: &str,
+    fc: &crate::decider::FieldConsultation,
+) -> Record {
+    // The report's own column, so the export and `koto decider report`
+    // never read one consultation two ways. It is a declared value or one
+    // of the report's fixed words, all of them name-shaped but a declared
+    // value outside the shape, which is digested.
+    let answer = name_or_digest(&crate::decider::report::ledger_column(outcome, fc));
     let declared_winner = fc.winning.as_deref().filter(|w| fc.modes.contains_key(*w));
-    let answer = match fc.outcome {
-        None => NO_ANSWER.to_string(),
-        Some(o @ (FieldOutcome::Escape | FieldOutcome::BelowThreshold)) => o.as_str().to_string(),
-        Some(_) => declared_winner.map_or(OTHER_ANSWER.to_string(), name_or_digest),
-    };
     let mode = declared_winner
         .and_then(|w| fc.modes.get(w).copied())
         .or_else(|| {
