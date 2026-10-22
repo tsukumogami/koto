@@ -29,7 +29,10 @@ pub mod request;
 pub mod types;
 
 pub use evaluate::{evaluate, EffectiveModes, Evaluation, FieldEvaluation, FieldOutcome};
-pub use record::{ConsultationOutcome, DeciderConsultation, FieldConsultation};
+pub use record::{
+    ConsultationOutcome, DeciderConsultation, FieldConsultation, UnavailableInput,
+    UnavailableReason,
+};
 pub use request::{
     build_request, declared_fields, AssembledInputs, BuildRequestError, DeclaredField,
     DeclaredKind, InputTextError,

@@ -2252,6 +2252,36 @@ fn decider_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.decider.unread_usage_attempts",
             "koto.decider.latency_ms",
             "koto.decider.directive_bytes",
+            "koto.decider.reason",
+            "koto.decider.input_label",
+            "koto.decider.input_bytes",
+            "koto.decider.field_count",
+            "koto.decider.field",
+            "koto.decider.answer",
+            "koto.decider.mode",
+            "koto.decider.threshold_met",
+        ],
+        "decider_field" => &[
+            "koto.state",
+            "koto.decider.consulted_seq",
+            "koto.decider.field",
+            "koto.decider.answer",
+            "koto.decider.mode",
+            "koto.decider.threshold_met",
+        ],
+        "decider_answered" => &[
+            "koto.state",
+            "koto.decider.field",
+            "koto.decider.agent_answer",
+            "koto.decider.consulted_seq",
+        ],
+        "decider_check_answered" => &[
+            "koto.state",
+            "koto.check",
+            "koto.rule.id",
+            "koto.decider.answer",
+            "koto.decider.reason",
+            "koto.decider.fallback_seq",
         ],
         "decider_checked" => &[
             "koto.state",
@@ -2291,7 +2321,13 @@ fn decider_records(j: &[serde_json::Value]) -> Vec<serde_json::Value> {
         .filter(|r| {
             matches!(
                 r["kind"].as_str().unwrap(),
-                "decider_consulted" | "decider_checked" | "decider_fallback" | "check_overridden"
+                "decider_consulted"
+                    | "decider_field"
+                    | "decider_answered"
+                    | "decider_checked"
+                    | "decider_fallback"
+                    | "decider_check_answered"
+                    | "check_overridden"
             )
         })
         .map(|r| {
@@ -2347,6 +2383,9 @@ fn consultation() -> DeciderConsultation {
         input_tokens: Some(812),
         output_tokens: Some(9),
         unread_usage_attempts: 0,
+        reason: None,
+        input_label: None,
+        input_bytes: None,
     }
 }
 
@@ -2384,7 +2423,9 @@ fn criterion_check(rule_id: &str) -> DeciderCheck {
 }
 
 /// Nothing the decider events carry beyond the record's fields reaches the
-/// journal.
+/// journal. The field's name, `verdict`, is one of them
+/// (`koto.decider.field`); its winning value, `proceed`, isn't, since the
+/// fixture's field got no answer.
 fn assert_no_decider_content(f: &Fixture) {
     let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
     for absent in [
@@ -2392,10 +2433,9 @@ fn assert_no_decider_content(f: &Fixture) {
         "0.4321",
         "0.875",
         "probabilit",
-        "threshold",
+        "\"threshold\"",
         "endpoint",
         "rule_ref",
-        "verdict",
         "proceed",
         "\"env\"",
     ] {
@@ -2449,6 +2489,19 @@ fn a_consultation_relays_decider_consulted_with_the_events_values() {
     assert_eq!(r["koto.decider.latency_ms"], 321);
     assert_eq!(r["koto.decider.directive_bytes"], 4567);
     assert!(r.get("koto.decider.error_class").is_none(), "{r}");
+    // One field, which got no answer and declares no values.
+    assert_eq!(r["koto.decider.field_count"], 1);
+    assert_eq!(r["koto.decider.field"], "verdict");
+    assert_eq!(r["koto.decider.answer"], "no_answer");
+    for absent in [
+        "koto.decider.mode",
+        "koto.decider.threshold_met",
+        "koto.decider.reason",
+        "koto.decider.input_label",
+        "koto.decider.input_bytes",
+    ] {
+        assert!(r.get(absent).is_none(), "{absent}: {r}");
+    }
 
     let r = &d[1];
     assert_eq!(r["koto.seq"], 4);
@@ -2660,6 +2713,917 @@ fn decider_and_override_records_fit_the_line_cap_at_the_longest_names() {
         .unwrap()
         .starts_with("sha256:"));
     assert_eq!(parsed[3]["koto.check"], name.as_str());
+}
+
+// ----- Decider answers -----
+
+use crate::decider::check::{AgentAnswer, DeciderCheckAnswered, DeciderFallback};
+use crate::decider::{FieldOutcome, UnavailableReason};
+use crate::template::decider::DeciderMode;
+
+/// A relay for records built straight from a payload, at `seq` 7 in visit 2.
+fn answer_relay() -> Relay<'static> {
+    Relay {
+        session: "wf",
+        session_id: "wf-id",
+        run_id: Some("wf-id"),
+        seq: 7,
+        visit_seq: Some(2),
+    }
+}
+
+/// A field declaring `modes`, answered `winning` with `outcome`.
+fn answered_field(
+    modes: &[(&str, DeciderMode)],
+    winning: Option<&str>,
+    outcome: Option<FieldOutcome>,
+    at_threshold: bool,
+) -> FieldConsultation {
+    FieldConsultation {
+        declaration_hash: "PLANTED-DECLARATION-HASH".into(),
+        modes: modes.iter().map(|(v, m)| (v.to_string(), *m)).collect(),
+        probabilities: Default::default(),
+        winning: winning.map(str::to_string),
+        confidence: Some(0.4321),
+        threshold: Some(0.875),
+        at_threshold,
+        outcome,
+    }
+}
+
+/// [`consultation`] of state `a` in koto's visit 2 with `fields`.
+fn consultation_of(fields: Vec<(&str, FieldConsultation)>) -> DeciderConsultation {
+    DeciderConsultation {
+        visit_seq: 2,
+        fields: fields
+            .into_iter()
+            .map(|(name, f)| (name.to_string(), f))
+            .collect(),
+        ..consultation()
+    }
+}
+
+/// The records `payload` relays, parsed and checked by [`decider_records`].
+fn relayed_values(payload: &EventPayload) -> Vec<serde_json::Value> {
+    let lines: Vec<serde_json::Value> = relayed(payload, &answer_relay())
+        .iter()
+        .map(|r| serde_json::from_str(&r.to_line()).unwrap())
+        .collect();
+    decider_records(&lines)
+}
+
+const SHADOW: DeciderMode = DeciderMode::Shadow;
+const AUTO: DeciderMode = DeciderMode::Auto;
+const NEVER: DeciderMode = DeciderMode::Never;
+
+#[test]
+fn a_consultation_of_one_field_carries_its_answer_mode_and_threshold() {
+    let both_shadow = [("proceed", SHADOW), ("exit", SHADOW)];
+    let mixed = [("proceed", SHADOW), ("exit", AUTO)];
+    // (field, answer, mode, threshold_met)
+    let cases: Vec<(FieldConsultation, &str, Option<&str>, Option<bool>)> = vec![
+        (
+            answered_field(
+                &both_shadow,
+                Some("proceed"),
+                Some(FieldOutcome::Shadow),
+                true,
+            ),
+            "proceed",
+            Some("shadow"),
+            Some(true),
+        ),
+        (
+            answered_field(&mixed, Some("exit"), Some(FieldOutcome::Qualified), true),
+            "exit",
+            Some("auto"),
+            Some(true),
+        ),
+        (
+            answered_field(
+                &[("proceed", SHADOW), ("exit", NEVER)],
+                Some("exit"),
+                Some(FieldOutcome::Never),
+                true,
+            ),
+            "exit",
+            Some("never"),
+            Some(true),
+        ),
+        // Below its threshold: koto's word, and the near-winner's mode.
+        (
+            answered_field(
+                &mixed,
+                Some("exit"),
+                Some(FieldOutcome::BelowThreshold),
+                false,
+            ),
+            "below_threshold",
+            Some("auto"),
+            Some(false),
+        ),
+        // The escape isn't a declared value; the modes differ, so none, and
+        // no declared value won, so no threshold either.
+        (
+            answered_field(&mixed, Some("unclear"), Some(FieldOutcome::Escape), false),
+            "escape",
+            None,
+            None,
+        ),
+        // No answer: every declared value shares one mode, so that one.
+        (
+            answered_field(&both_shadow, None, None, false),
+            "no_answer",
+            Some("shadow"),
+            None,
+        ),
+    ];
+    for (field, answer, mode, met) in cases {
+        let d = relayed_values(&EventPayload::DeciderConsulted(consultation_of(vec![(
+            "verdict", field,
+        )])));
+        assert_eq!(kinds(&d), vec!["decider_consulted"]);
+        let r = &d[0];
+        assert_eq!(r["koto.decider.field_count"], 1, "{r}");
+        assert_eq!(r["koto.decider.field"], "verdict", "{r}");
+        assert_eq!(r["koto.decider.answer"], answer, "{r}");
+        assert_eq!(r["koto.decider.mode"].as_str(), mode, "{r}");
+        assert_eq!(r["koto.decider.threshold_met"].as_bool(), met, "{r}");
+        let raw = r.to_string();
+        for absent in ["PLANTED", "0.4321", "0.875"] {
+            assert!(!raw.contains(absent), "{absent} in {raw}");
+        }
+    }
+}
+
+/// The exported answer is the report's own column for the field, including
+/// the cases a compiled template can't produce, so the export and
+/// `koto decider report` never read one consultation two ways.
+#[test]
+fn the_answer_is_the_reports_column_for_every_field() {
+    let modes = [("proceed", SHADOW), ("exit", SHADOW)];
+    let cases = [
+        (
+            ConsultationOutcome::NotApplied,
+            answered_field(&modes, Some("proceed"), Some(FieldOutcome::Shadow), true),
+            "proceed",
+        ),
+        // A winner that isn't declared, under a qualifying outcome.
+        (
+            ConsultationOutcome::NotApplied,
+            answered_field(&modes, Some("maybe"), Some(FieldOutcome::Shadow), true),
+            "escape",
+        ),
+        // A qualifying outcome whose winner missed its threshold.
+        (
+            ConsultationOutcome::NotApplied,
+            answered_field(&modes, Some("exit"), Some(FieldOutcome::Shadow), false),
+            "below_threshold",
+        ),
+        // A field outcome on a consultation that got no answer.
+        (
+            ConsultationOutcome::Error,
+            answered_field(&modes, Some("exit"), Some(FieldOutcome::Shadow), true),
+            "no_answer",
+        ),
+    ];
+    for (outcome, field, answer) in cases {
+        let column = crate::decider::report::ledger_column(outcome, &field);
+        assert_eq!(column, answer);
+        let d = relayed_values(&EventPayload::DeciderConsulted(DeciderConsultation {
+            outcome,
+            ..consultation_of(vec![("verdict", field)])
+        }));
+        assert_eq!(d[0]["koto.decider.answer"], answer, "{}", d[0]);
+        assert!(!d[0].to_string().contains("maybe"), "{}", d[0]);
+    }
+}
+
+#[test]
+fn a_consultation_of_several_fields_writes_one_decider_field_per_field() {
+    let d = relayed_values(&EventPayload::DeciderConsulted(consultation_of(vec![
+        (
+            "verdict",
+            answered_field(
+                &[("proceed", SHADOW), ("exit", SHADOW)],
+                Some("proceed"),
+                Some(FieldOutcome::Shadow),
+                true,
+            ),
+        ),
+        (
+            "size",
+            answered_field(
+                &[("small", SHADOW), ("large", SHADOW)],
+                Some("large"),
+                Some(FieldOutcome::BelowThreshold),
+                false,
+            ),
+        ),
+    ])));
+    assert_eq!(
+        kinds(&d),
+        vec!["decider_consulted", "decider_field", "decider_field"]
+    );
+    let c = &d[0];
+    assert_eq!(c["koto.decider.field_count"], 2);
+    for absent in [
+        "koto.decider.field",
+        "koto.decider.answer",
+        "koto.decider.mode",
+        "koto.decider.threshold_met",
+    ] {
+        assert!(c.get(absent).is_none(), "{absent}: {c}");
+    }
+    // The tokens and timings stay on the consultation alone.
+    assert_eq!(c["koto.decider.input_tokens"], 812);
+    for f in &d[1..] {
+        assert_eq!(f["koto.decider.consulted_seq"], c["koto.seq"], "{f}");
+        assert_eq!(f["koto.seq"], c["koto.seq"], "{f}");
+        assert_eq!(f["koto.visit.seq"], c["koto.visit.seq"], "{f}");
+        assert_eq!(f["koto.state"], "a");
+        assert!(f.get("koto.decider.input_tokens").is_none(), "{f}");
+    }
+    // In field-name order.
+    assert_eq!(d[1]["koto.decider.field"], "size");
+    assert_eq!(d[1]["koto.decider.answer"], "below_threshold");
+    assert_eq!(d[1]["koto.decider.threshold_met"], false);
+    assert_eq!(d[2]["koto.decider.field"], "verdict");
+    assert_eq!(d[2]["koto.decider.answer"], "proceed");
+    assert_eq!(d[2]["koto.decider.mode"], "shadow");
+}
+
+#[test]
+fn an_unavailable_consultation_carries_its_reason_and_the_inputs_label_and_size() {
+    let unavailable = |reason, label: &str, bytes| DeciderConsultation {
+        outcome: ConsultationOutcome::InputUnavailable,
+        input_tokens: None,
+        output_tokens: None,
+        reason: Some(reason),
+        input_label: Some(label.to_string()),
+        input_bytes: bytes,
+        ..consultation()
+    };
+    for (c, reason, label, bytes) in [
+        (
+            unavailable(UnavailableReason::Unset, "issue", None),
+            "unset",
+            "issue".to_string(),
+            None,
+        ),
+        (
+            unavailable(UnavailableReason::OverBudget, "diff", Some(18_000)),
+            "over_budget",
+            "diff".to_string(),
+            Some(18_000),
+        ),
+        (
+            unavailable(UnavailableReason::NotText, "notes", Some(3)),
+            "not_text",
+            "notes".to_string(),
+            Some(3),
+        ),
+        // A declared label outside the name shape is digested.
+        (
+            unavailable(UnavailableReason::Unset, "the issue body", None),
+            "unset",
+            name_or_digest("the issue body"),
+            None,
+        ),
+    ] {
+        let d = relayed_values(&EventPayload::DeciderConsulted(c));
+        let r = &d[0];
+        assert_eq!(r["koto.decider.outcome"], "input_unavailable");
+        assert_eq!(r["koto.decider.reason"], reason, "{r}");
+        assert_eq!(r["koto.decider.input_label"], label.as_str(), "{r}");
+        assert_eq!(r["koto.decider.input_bytes"].as_u64(), bytes, "{r}");
+        assert_eq!(r["koto.decider.answer"], "no_answer");
+        assert!(!r.to_string().contains("the issue body"), "{r}");
+    }
+}
+
+/// Evidence for state `a` from the agent.
+fn agent_evidence(fields: &[(&str, serde_json::Value)]) -> EventPayload {
+    EventPayload::EvidenceSubmitted {
+        state: "a".into(),
+        fields: fields
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect(),
+        submitter_cwd: Some("/PLANTED/host/path".into()),
+        source: None,
+    }
+}
+
+/// A one-field consultation of `verdict` (`proceed` or `exit`) in koto's
+/// visit 2 that ended `outcome`.
+fn verdict_consultation(outcome: ConsultationOutcome) -> EventPayload {
+    EventPayload::DeciderConsulted(DeciderConsultation {
+        outcome,
+        ..consultation_of(vec![(
+            "verdict",
+            answered_field(
+                &[("proceed", SHADOW), ("exit", SHADOW)],
+                Some("proceed"),
+                Some(FieldOutcome::Shadow),
+                true,
+            ),
+        )])
+    })
+}
+
+/// The journal finds a visit's consultation in the raw log by the rule the
+/// engine reads the parsed log by (`prior_consultation`, which the ledger's
+/// `answered` record pairs with), on every shape of log that rule turns on.
+#[test]
+fn the_journal_pairs_with_the_consultation_the_engine_finds() {
+    let consulted = |visit_seq: u64, model: &str| {
+        EventPayload::DeciderConsulted(DeciderConsultation {
+            visit_seq,
+            model: model.into(),
+            ..consultation()
+        })
+    };
+    let other_state = EventPayload::DeciderConsulted(DeciderConsultation {
+        state: "b".into(),
+        visit_seq: 2,
+        ..consultation()
+    });
+    let logs: Vec<(&str, Vec<EventPayload>)> = vec![
+        ("one consultation", vec![consulted(2, "m1")]),
+        (
+            "two in one visit: the first",
+            vec![consulted(2, "m1"), consulted(2, "m2")],
+        ),
+        (
+            "one naming another visit, then this one",
+            vec![consulted(1, "stale"), consulted(2, "m1")],
+        ),
+        ("another state's only", vec![other_state.clone()]),
+        (
+            "a self-loop after it",
+            vec![consulted(2, "m1"), transitioned(Some("a"), "a")],
+        ),
+        (
+            "a self-loop, then the new lap's",
+            vec![
+                consulted(2, "m1"),
+                transitioned(Some("a"), "a"),
+                consulted(4, "m2"),
+            ],
+        ),
+        (
+            "left for another state",
+            vec![consulted(2, "m1"), transitioned(Some("a"), "b")],
+        ),
+        ("no consultation", vec![]),
+    ];
+    for (name, payloads) in logs {
+        let mut events = vec![crate::engine::types::Event {
+            seq: 1,
+            timestamp: crate::engine::types::now_iso8601(),
+            event_type: "workflow_initialized".into(),
+            payload: EventPayload::WorkflowInitialized {
+                template_path: "t.json".into(),
+                variables: Default::default(),
+                spawn_entry: None,
+            },
+            idempotency_hash: None,
+        }];
+        for (i, payload) in std::iter::once(transitioned(None, "a"))
+            .chain(payloads)
+            .enumerate()
+        {
+            events.push(crate::engine::types::Event {
+                seq: i as u64 + 2,
+                timestamp: crate::engine::types::now_iso8601(),
+                event_type: payload.type_name().to_string(),
+                payload,
+                idempotency_hash: None,
+            });
+        }
+        let log: String = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
+        let engine = crate::engine::decider::prior_consultation(&events, "a");
+        let journal = super::pairing::consultation(&log, "a");
+        assert_eq!(
+            journal.as_ref().map(|(_, c)| c),
+            engine,
+            "{name}: the journal and the engine disagree"
+        );
+        if let Some((seq, c)) = &journal {
+            let at = events
+                .iter()
+                .find(|e| matches!(&e.payload, EventPayload::DeciderConsulted(x) if x == c))
+                .unwrap();
+            assert_eq!(*seq, at.seq, "{name}");
+        }
+    }
+}
+
+#[test]
+fn an_agent_answer_to_a_consulted_visit_writes_decider_answered() {
+    let f = session_in_a();
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &verdict_consultation(ConsultationOutcome::NotApplied),
+    );
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &agent_evidence(&[
+            ("verdict", serde_json::json!("exit")),
+            ("notes", serde_json::json!("PLANTED free text")),
+        ]),
+    );
+    let d = decider_records(&f.journal());
+    assert_eq!(kinds(&d), vec!["decider_consulted", "decider_answered"]);
+    let (c, a) = (&d[0], &d[1]);
+    assert_eq!(c["koto.seq"], 3);
+    assert_eq!(a["koto.seq"], 4);
+    assert_eq!(a["koto.visit.seq"], c["koto.visit.seq"]);
+    assert_eq!(a["koto.decider.consulted_seq"], c["koto.seq"]);
+    assert_eq!(a["koto.state"], "a");
+    assert_eq!(a["koto.decider.field"], "verdict");
+    assert_eq!(a["koto.decider.agent_answer"], "exit");
+    assert_eq!(c["koto.decider.answer"], "proceed");
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    for absent in ["PLANTED", "notes", "host/path"] {
+        assert!(!raw.contains(absent), "{absent} in {raw}");
+    }
+}
+
+#[test]
+fn an_agent_value_outside_the_declared_values_is_written_other() {
+    let flag = answered_field(
+        &[("true", SHADOW), ("false", SHADOW)],
+        Some("true"),
+        Some(FieldOutcome::Shadow),
+        true,
+    );
+    let f = session_in_a();
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::DeciderConsulted(consultation_of(vec![
+            (
+                "verdict",
+                answered_field(&[("proceed", SHADOW), ("exit", SHADOW)], None, None, false),
+            ),
+            ("ready", flag.clone()),
+            ("count", flag),
+        ])),
+    );
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &agent_evidence(&[
+            ("verdict", serde_json::json!("PLANTED free text")),
+            ("ready", serde_json::json!(false)),
+            ("count", serde_json::json!(3)),
+        ]),
+    );
+    let answers: Vec<(String, String)> = decider_records(&f.journal())
+        .iter()
+        .filter(|r| r["kind"] == "decider_answered")
+        .map(|r| {
+            (
+                r["koto.decider.field"].as_str().unwrap().to_string(),
+                r["koto.decider.agent_answer"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        vec![
+            ("count".to_string(), "other".to_string()),
+            ("ready".to_string(), "false".to_string()),
+            ("verdict".to_string(), "other".to_string()),
+        ]
+    );
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("PLANTED"), "{raw}");
+}
+
+#[test]
+fn evidence_with_no_unapplied_consultation_of_its_visit_writes_no_decider_answered() {
+    let answer = || agent_evidence(&[("verdict", serde_json::json!("exit"))]);
+    let answered = |f: &Fixture| {
+        f.journal()
+            .iter()
+            .filter(|r| r["kind"] == "decider_answered")
+            .count()
+    };
+
+    // No consultation at all.
+    let f = session_in_a();
+    commit_as(&f, None, "wf", &answer());
+    assert_eq!(answered(&f), 0);
+
+    // An applied consultation, and the decider's own evidence.
+    let f = session_in_a();
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &verdict_consultation(ConsultationOutcome::Applied),
+    );
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::EvidenceSubmitted {
+            state: "a".into(),
+            fields: [("verdict".to_string(), serde_json::json!("proceed"))]
+                .into_iter()
+                .collect(),
+            submitter_cwd: None,
+            source: Some(crate::engine::decider::DECIDER_SOURCE.to_string()),
+        },
+    );
+    commit_as(&f, None, "wf", &answer());
+    assert_eq!(answered(&f), 0);
+
+    // A consultation of an earlier lap: a self-loop began a new decider
+    // visit, which nothing consulted.
+    let f = session_in_a();
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &verdict_consultation(ConsultationOutcome::NotApplied),
+    );
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "a"));
+    commit_as(&f, None, "wf", &answer());
+    assert_eq!(answered(&f), 0);
+
+    // Evidence that holds no consulted field.
+    let f = session_in_a();
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &verdict_consultation(ConsultationOutcome::NotApplied),
+    );
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &agent_evidence(&[("other_field", serde_json::json!("exit"))]),
+    );
+    assert_eq!(answered(&f), 0);
+}
+
+/// A fallback of criterion `comment_reason` on gate `comments`.
+fn fallback_event(reason: UnansweredReason) -> EventPayload {
+    EventPayload::DeciderFallback(DeciderFallback {
+        state: "a".into(),
+        visit_seq: 2,
+        gate: "comments".into(),
+        rule_id: "comment_reason".into(),
+        declaration_hash: "PLANTED-DECLARATION-HASH".into(),
+        mode: CheckMode::Veto,
+        reason,
+        input_sha256: Some("PLANTED-INPUT-HASH".into()),
+        input_bytes: Some(34),
+    })
+}
+
+/// The agent's `answer` to the fallback at `fallback_seq`.
+fn check_answered(answer: AgentAnswer, fallback_seq: u64) -> EventPayload {
+    EventPayload::DeciderCheckAnswered(DeciderCheckAnswered {
+        state: "a".into(),
+        visit_seq: 2,
+        gate: "comments".into(),
+        rule_id: "comment_reason".into(),
+        declaration_hash: "PLANTED-DECLARATION-HASH".into(),
+        input_sha256: Some("PLANTED-INPUT-HASH".into()),
+        answer,
+        fallback_seq,
+    })
+}
+
+#[test]
+fn an_answered_fallback_relays_decider_check_answered_with_the_fallbacks_reason() {
+    let f = session_in_a();
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &fallback_event(UnansweredReason::OverBudget),
+    );
+    commit_as(&f, None, "wf", &check_answered(AgentAnswer::Fail, 3));
+    // An answer whose fallback the log doesn't hold carries no reason.
+    commit_as(&f, None, "wf", &check_answered(AgentAnswer::Unclear, 99));
+    let d = decider_records(&f.journal());
+    assert_eq!(
+        kinds(&d),
+        vec![
+            "decider_fallback",
+            "decider_check_answered",
+            "decider_check_answered"
+        ]
+    );
+    let a = &d[1];
+    assert_eq!(a["koto.seq"], 4);
+    assert_eq!(a["koto.visit.seq"], 2);
+    assert_eq!(a["koto.state"], "a");
+    assert_eq!(a["koto.check"], "comments");
+    assert_eq!(a["koto.rule.id"], "comment_reason");
+    assert_eq!(a["koto.decider.answer"], "fail");
+    assert_eq!(a["koto.decider.reason"], "over_budget");
+    assert_eq!(a["koto.decider.fallback_seq"], d[0]["koto.seq"]);
+    let b = &d[2];
+    assert_eq!(b["koto.decider.answer"], "unclear");
+    assert_eq!(b["koto.decider.fallback_seq"], 99);
+    assert!(b.get("koto.decider.reason").is_none(), "{b}");
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("PLANTED"), "{raw}");
+}
+
+/// Every value the answer and reason keys carry is one of the template's
+/// declared names (a field, a declared value, an input label, or the
+/// digest of one outside the name shape), one of koto's own fixed words, a
+/// boolean, or a number. The test feeds them free text wherever the
+/// session could put it and checks none of it comes out.
+#[test]
+fn every_decider_answer_value_is_declared_fixed_a_boolean_or_a_number() {
+    let declared: BTreeSet<String> = [
+        "verdict",
+        "proceed",
+        "exit",
+        "ready",
+        "true",
+        "false",
+        "diff",
+        "comment_reason",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .chain([name_or_digest("odd value"), name_or_digest("odd label")])
+    .collect();
+    let fixed: BTreeSet<&str> = [
+        "no_answer",
+        "other",
+        "below_threshold",
+        "escape",
+        "unset",
+        "over_budget",
+        "not_text",
+        "pass",
+        "fail",
+        "unclear",
+        "off",
+        "shadow",
+        "auto",
+        "never",
+    ]
+    .into_iter()
+    .chain(
+        [
+            UnansweredReason::ProviderError,
+            UnansweredReason::UnreadableResponse,
+            UnansweredReason::OverBudget,
+            UnansweredReason::ExtractionFailed,
+            UnansweredReason::CapSpent,
+            UnansweredReason::Busy,
+        ]
+        .map(|r| r.as_str()),
+    )
+    .collect();
+
+    let f = session_in_a();
+    // A consultation answered with a declared value outside the name shape,
+    // one that stopped at an odd label, and the agent's free text.
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::DeciderConsulted(consultation_of(vec![
+            (
+                "verdict",
+                answered_field(
+                    &[("proceed", SHADOW), ("odd value", AUTO)],
+                    Some("odd value"),
+                    Some(FieldOutcome::Qualified),
+                    true,
+                ),
+            ),
+            (
+                "ready",
+                answered_field(&[("true", SHADOW), ("false", SHADOW)], None, None, false),
+            ),
+        ])),
+    );
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &agent_evidence(&[
+            ("verdict", serde_json::json!("PLANTED free text")),
+            ("ready", serde_json::json!(true)),
+        ]),
+    );
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::DeciderConsulted(DeciderConsultation {
+            outcome: ConsultationOutcome::InputUnavailable,
+            reason: Some(UnavailableReason::OverBudget),
+            input_label: Some("odd label".into()),
+            input_bytes: Some(18_000),
+            ..consultation_of(vec![(
+                "verdict",
+                answered_field(&[("proceed", SHADOW), ("exit", NEVER)], None, None, false),
+            )])
+        }),
+    );
+    commit_as(&f, None, "wf", &fallback_event(UnansweredReason::Busy));
+    commit_as(&f, None, "wf", &check_answered(AgentAnswer::Pass, 6));
+
+    // The kinds this checks are the ones that carry answers; the
+    // `decider_fallback` between them has its own test.
+    let records: Vec<serde_json::Value> = decider_records(&f.journal())
+        .into_iter()
+        .filter(|r| r["kind"] != "decider_fallback")
+        .collect();
+    assert_eq!(
+        kinds(&records),
+        vec![
+            "decider_consulted",
+            "decider_field",
+            "decider_field",
+            "decider_answered",
+            "decider_answered",
+            "decider_consulted",
+            "decider_check_answered"
+        ]
+    );
+    let mut seen = 0;
+    for r in &records {
+        for (key, value) in r.as_object().unwrap() {
+            if !key.starts_with("koto.decider.") {
+                continue;
+            }
+            let suffix = &key["koto.decider.".len()..];
+            match suffix {
+                "provider" | "model" | "outcome" | "error_class" => continue,
+                "field" | "answer" | "agent_answer" | "mode" | "reason" | "input_label" => {
+                    let v = value.as_str().unwrap_or_else(|| panic!("{key}: {r}"));
+                    assert!(
+                        declared.contains(v) || fixed.contains(v),
+                        "{key} = {v} is neither declared nor fixed: {r}"
+                    );
+                    seen += 1;
+                }
+                _ => assert!(
+                    value.is_boolean() || value.is_u64(),
+                    "{key} = {value} is not a boolean or a number: {r}"
+                ),
+            }
+        }
+    }
+    assert!(seen >= 12, "{seen} values checked: {records:?}");
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    for absent in ["PLANTED", "odd value", "odd label", "host/path"] {
+        assert!(!raw.contains(absent), "{absent} in {raw}");
+    }
+}
+
+/// With 128-byte names everywhere a declared name goes, the largest
+/// numbers, and a 255-byte session name, the new decider records fit the
+/// line cap.
+#[test]
+fn decider_answer_records_fit_the_line_cap_at_the_longest_names() {
+    let session = "s".repeat(255);
+    let id = "i".repeat(128);
+    let name = "n".repeat(128);
+    let relay = Relay {
+        session: &session,
+        session_id: &id,
+        run_id: Some(&id),
+        seq: u64::MAX,
+        visit_seq: Some(u64::MAX),
+    };
+    let field = |value: &str| {
+        answered_field(
+            &[(value, SHADOW), ("x", AUTO)],
+            Some(value),
+            Some(FieldOutcome::Shadow),
+            true,
+        )
+    };
+    let wide = DeciderConsultation {
+        state: name.clone(),
+        provider: name.clone(),
+        model: name.clone(),
+        error_class: Some(ErrorClass::HttpStatus),
+        input_tokens: Some(u64::MAX),
+        output_tokens: Some(u64::MAX),
+        unread_usage_attempts: u32::MAX,
+        latency_ms: u64::MAX,
+        directive_bytes: u64::MAX,
+        outcome: ConsultationOutcome::InputUnavailable,
+        reason: Some(UnavailableReason::OverBudget),
+        input_label: Some(name.clone()),
+        input_bytes: Some(u64::MAX),
+        ..consultation_of(vec![(name.as_str(), field(&name))])
+    };
+    let several = consultation_of(vec![
+        (name.as_str(), field(&name)),
+        ("m".repeat(128).as_str(), field(&name)),
+    ]);
+    let mut records = relayed(&EventPayload::DeciderConsulted(wide), &relay);
+    records.extend(relayed(&EventPayload::DeciderConsulted(several), &relay));
+    let log = |payload: &EventPayload, seq: u64| {
+        serde_json::to_string(&crate::engine::types::Event {
+            seq,
+            timestamp: crate::engine::types::now_iso8601(),
+            event_type: payload.type_name().to_string(),
+            payload: payload.clone(),
+            idempotency_hash: None,
+        })
+        .unwrap()
+    };
+    let entry = log(&transitioned(None, &name), 1);
+    let consulted = log(
+        &EventPayload::DeciderConsulted(DeciderConsultation {
+            state: name.clone(),
+            visit_seq: 1,
+            ..consultation_of(vec![(name.as_str(), field(&name))])
+        }),
+        2,
+    );
+    let evidence = EventPayload::EvidenceSubmitted {
+        state: name.clone(),
+        fields: [(name.clone(), serde_json::json!(name.clone()))]
+            .into_iter()
+            .collect(),
+        submitter_cwd: None,
+        source: None,
+    };
+    records.extend(paired(
+        &evidence,
+        &relay,
+        &format!("{entry}\n{consulted}\n"),
+    ));
+    let fallback = log(
+        &EventPayload::DeciderFallback(DeciderFallback {
+            state: name.clone(),
+            gate: name.clone(),
+            rule_id: name.clone(),
+            reason: UnansweredReason::UnreadableResponse,
+            ..match fallback_event(UnansweredReason::Busy) {
+                EventPayload::DeciderFallback(f) => f,
+                _ => unreachable!(),
+            }
+        }),
+        u64::MAX - 1,
+    );
+    let answer = EventPayload::DeciderCheckAnswered(DeciderCheckAnswered {
+        state: name.clone(),
+        gate: name.clone(),
+        rule_id: name.clone(),
+        ..match check_answered(AgentAnswer::Unclear, u64::MAX - 1) {
+            EventPayload::DeciderCheckAnswered(a) => a,
+            _ => unreachable!(),
+        }
+    });
+    records.extend(paired(&answer, &relay, &format!("{fallback}\n")));
+
+    let lines: Vec<String> = records.iter().map(Record::to_line).collect();
+    for line in &lines {
+        assert!(line.len() < MAX_LINE_BYTES, "{} bytes: {line}", line.len());
+    }
+    let parsed: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let parsed = decider_records(&parsed);
+    assert_eq!(
+        kinds(&parsed),
+        vec![
+            "decider_consulted",
+            "decider_consulted",
+            "decider_field",
+            "decider_field",
+            "decider_answered",
+            "decider_check_answered"
+        ]
+    );
+    assert_eq!(parsed[0]["koto.decider.input_label"], name.as_str());
+    assert_eq!(parsed[0]["koto.decider.field"], name.as_str());
+    assert_eq!(parsed[4]["koto.decider.agent_answer"], name.as_str());
+    assert_eq!(parsed[4]["koto.decider.consulted_seq"], 2);
+    assert_eq!(parsed[5]["koto.decider.reason"], "unreadable_response");
 }
 
 // ----- Context reads -----

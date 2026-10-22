@@ -10,6 +10,28 @@ to `0.9.x`).
 
 ### Added
 
+- **The run journal carries what a routing decider answered, and what the
+  agent answered for the same field.** `decider_consulted` now records the
+  field (`koto.decider.field`), the decider's answer (`koto.decider.answer`:
+  the winning declared value, or `below_threshold`, `escape` or
+  `no_answer`), the declared mode for it (`koto.decider.mode`), whether it
+  met its threshold (`koto.decider.threshold_met`) and the field count. A
+  consultation of several fields writes one new `decider_field` record per
+  field instead. When the agent answers a visit the decider didn't settle, a
+  new `decider_answered` record carries its value
+  (`koto.decider.agent_answer`) and the consultation's `koto.seq`
+  (`koto.decider.consulted_seq`), so agreement, coverage and the
+  below-threshold rate can be read from the journal. `decider_check_answered`
+  is now relayed too, with the check, the criterion, the agent's answer and
+  the reason the criterion fell back. Every answer is a value the template
+  declares or a word koto defines: an agent's value outside the declared
+  values is written `other`, and no probability is copied.
+- **An `input_unavailable` consultation says why.** The `decider_consulted`
+  event, the ledger's `consulted` line and the journal record now carry the
+  reason (`unset`, `over_budget` or `not_text`), the declared label of the
+  input that stopped it, and its size in bytes. `koto decider report` counts
+  each question's `input_unavailable` consultations by reason; a ledger
+  written before the reason existed reports as it did.
 - **The run journal records every finding a check logs, passing or
   failing.** Each check evaluation now adds one `check_finding` line per
   distinct rule id and level among the findings its event logged, with how

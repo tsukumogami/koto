@@ -18,7 +18,9 @@ use serde_json::{Map, Value};
 
 use crate::config::resolve::DeciderSettings;
 use crate::decider::evaluate::{evaluate, EffectiveModes};
-use crate::decider::record::{ConsultationOutcome, DeciderConsultation, FieldConsultation};
+use crate::decider::record::{
+    ConsultationOutcome, DeciderConsultation, FieldConsultation, UnavailableInput,
+};
 use crate::decider::request::{declared_fields, DeclaredField};
 use crate::decider::types::{
     DeciderError, DecisionResponse, GlobalMode, SettingOrigin, UsageTally,
@@ -160,8 +162,11 @@ pub struct ConsultRequest<'a> {
 /// What the provider call produced.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConsultResult {
-    /// A declared input was unset or over its byte budget; nothing was sent.
-    InputUnavailable,
+    /// A declared input was unset, over its byte budget or not text;
+    /// nothing was sent. Names the input that stopped it; `None` when the
+    /// request couldn't be built from the declaration, which a compiled
+    /// template rules out.
+    InputUnavailable(Option<UnavailableInput>),
     /// The provider call failed. A 2xx answer koto couldn't use is one of
     /// these too, and was billed: the error carries its usage and model.
     Failed(DeciderError),
@@ -446,8 +451,10 @@ where
     // transport failure was not billed and adds nothing.
     let mut usage = UsageTally::default();
     let mut apply: Option<(Map<String, Value>, (usize, String))> = None;
+    let mut unavailable: Option<UnavailableInput> = None;
     let (mut outcome, error_class, recorded_fields) = match result {
-        ConsultResult::InputUnavailable => {
+        ConsultResult::InputUnavailable(input) => {
+            unavailable = input;
             (ConsultationOutcome::InputUnavailable, None, unevaluated())
         }
         ConsultResult::Failed(e) => {
@@ -523,6 +530,9 @@ where
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         unread_usage_attempts: usage.unread_attempts,
+        reason: unavailable.as_ref().map(|u| u.reason),
+        input_label: unavailable.as_ref().map(|u| u.label.clone()),
+        input_bytes: unavailable.and_then(|u| u.bytes),
     });
     // The inputs the consultation read come just before it, best-effort.
     for read in port.take_context_reads() {
@@ -703,6 +713,9 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             unread_usage_attempts: 0,
+            reason: None,
+            input_label: None,
+            input_bytes: None,
         })
     }
 
@@ -854,6 +867,7 @@ mod tests {
 
     // -- the arm, through the loop with a fake port -----------------------
 
+    use crate::decider::record::UnavailableReason;
     use crate::decider::types::Answer;
     use crate::engine::advance::{
         advance_until_stop_with_decider, ActionResult, AdvanceResult, IntegrationError, StopReason,
@@ -970,7 +984,11 @@ mod tests {
             self.calls += 1;
             let result = match self.replies.pop_front().expect("unscripted consult") {
                 Scripted::Skip => return ConsultReply::Skipped,
-                Scripted::Input => ConsultResult::InputUnavailable,
+                Scripted::Input => ConsultResult::InputUnavailable(Some(UnavailableInput {
+                    reason: UnavailableReason::OverBudget,
+                    label: "diff".to_string(),
+                    bytes: Some(18_000),
+                })),
                 Scripted::Fail(c) => ConsultResult::Failed(DeciderError::new(c, "scripted")),
                 Scripted::Answer(go, hold, unclear) => {
                     let mut answers = BTreeMap::new();
@@ -1522,6 +1540,15 @@ mod tests {
             let c = consultation(&events);
             assert_eq!(c.outcome, outcome);
             assert_eq!(c.error_class, class);
+            if outcome == ConsultationOutcome::InputUnavailable {
+                assert_eq!(c.reason, Some(UnavailableReason::OverBudget));
+                assert_eq!(c.input_label.as_deref(), Some("diff"));
+                assert_eq!(c.input_bytes, Some(18_000));
+            } else {
+                assert_eq!(c.reason, None);
+                assert_eq!(c.input_label, None);
+                assert_eq!(c.input_bytes, None);
+            }
             if outcome == ConsultationOutcome::InputUnavailable
                 || class == Some(ErrorClass::Connect)
             {

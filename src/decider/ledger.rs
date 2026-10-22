@@ -422,6 +422,9 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             unread_usage_attempts: 0,
+            reason: None,
+            input_label: None,
+            input_bytes: None,
         }
     }
 

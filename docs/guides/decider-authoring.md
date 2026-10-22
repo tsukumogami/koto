@@ -358,7 +358,13 @@ Each consultation appends a `decider_consulted` event to the session log. It
 holds the state and visit, the provider and model, a SHA-256 of the assembled
 inputs, each field's declaration hash, effective modes, probabilities, winning
 value, confidence, threshold, and outcome, plus the overall outcome, latency,
-and where the endpoint came from. An applied answer is followed by an
+and where the endpoint came from. A consultation that stopped at
+`input_unavailable` also names why, as `reason`: `unset` (the input's context
+key or variable isn't set), `over_budget` (it's longer than its `max_bytes`)
+or `not_text` (the context key holds bytes that aren't UTF-8), with the
+input's `input_label` and, when it was read, its size as `input_bytes`. A
+routing input that keeps going over budget shows up as `over_budget` on the
+same label. An applied answer is followed by an
 `evidence_submitted` event marked `source: "decider"`. The event format is in
 `docs/reference/session-feed.md`.
 
@@ -366,7 +372,9 @@ koto also appends a `consulted` record to `~/.koto/_decider_ledger.jsonl`,
 and, when the agent later answers a visit koto didn't settle, an `answered`
 record with the agent's declared values. When the agent leaves such a visit
 with `koto next --to` instead of answering, koto appends a `directed_exit`
-record naming the target state. A `--to` back into the same state is a lap,
+record naming the target state. The `consulted` record carries the same
+`reason`, `input_label` and `input_bytes`, and `koto decider report` counts each
+question's `input_unavailable` consultations by reason. A `--to` back into the same state is a lap,
 not an exit, and records nothing. A directed exit isn't an answer, so it never
 counts as a paired observation, but it is the evidence that matters most:
 `--to` is how an agent overrides a routing decision, so these are the visits
@@ -377,6 +385,22 @@ fails, koto prints a warning and carries on.
 
 Neither the event nor the ledger holds input content, the API key, or the
 provider's response body. Inputs appear only as their hash.
+
+The run journal (`docs/reference/run-journal.md`) carries what the decider
+answered, so its export can compute agreement and coverage across hosts. Each
+`decider_consulted` record names the field (`koto.decider.field`), the
+decider's answer (`koto.decider.answer`: the winning declared value, or
+`below_threshold`, `escape` or `no_answer`), the declared mode for it
+(`koto.decider.mode`), whether it met its threshold
+(`koto.decider.threshold_met`), and, for `input_unavailable`, the reason, label
+and size (`koto.decider.reason`, `koto.decider.input_label`,
+`koto.decider.input_bytes`). A state with several decider fields gets one
+`decider_field` record per field instead. When the agent answers a visit koto
+didn't settle, a `decider_answered` record carries its value
+(`koto.decider.agent_answer`) and the consultation's `koto.seq`
+(`koto.decider.consulted_seq`). Every one of these is a name the template
+declares or a word koto defines: an agent's value that isn't one of the
+field's declared values is written `other`, and no probability is copied.
 
 ## Promoting a value to `auto`
 
@@ -625,7 +649,12 @@ agent can answer again, and the latest answer wins.
 The agent grades its own work here, as it did before a decider existed. The
 answer is recorded as an agent answer, never as a decider verdict: it adds
 no `decider_checked` event and no ledger line, so nothing that measures a
-criterion's accuracy reads it. An agent can push its own slice over budget
+criterion's accuracy counts it as the decider's. Its
+`decider_check_answered` event reaches the run journal with the check, the
+criterion, the answer and the reason the criterion fell back
+(`koto.decider.answer`, `koto.decider.reason`, `koto.decider.fallback_seq`),
+so the agent's answer can be set beside the decider's when it later grades
+the same slice. An agent can push its own slice over budget
 or break the extraction to reach the fallback on purpose. The
 `decider_fallback` records make that visible: count them per check and
 criterion, by reason, and a criterion whose fallbacks are mostly
