@@ -315,7 +315,7 @@ If the session is interrupted mid-workflow:
 3. Continue from wherever the workflow left off.
 ```
 
-The koto-skills plugin includes a Stop hook that reminds the agent about active workflows when a session ends.
+The koto-skills plugin doesn't register a hook for this, so the skill's own instructions are what bring the agent back to an active workflow.
 
 #### Entering the same session on every invocation
 
@@ -374,8 +374,8 @@ plugins/koto-skills/
 │       ├── references/
 │       └── evals/
 │           └── evals.json
-├── hooks.json
 └── hooks/
+    └── hooks.json
 ```
 
 To add a new skill:
@@ -738,7 +738,7 @@ The rules the compiler enforces:
 The `validate-plugins` workflow (`.github/workflows/validate-plugins.yml`) runs automatically on PRs that touch `plugins/`. It checks three things:
 
 1. **Template compilation** -- Runs `koto template compile` on every template file under `plugins/koto-skills/skills/`. If your template has syntax errors, this catches them.
-2. **Hook smoke test** -- Verifies the Stop hook produces output when a workflow is active and stays silent when no workflows exist.
+2. **Hook smoke test** -- Runs the unregistered Stop reminder script, `plugins/koto-skills/hooks/stop-workflows.sh`, and checks it prints the reminder when a workflow is active and stays silent when no workflows exist.
 3. **Schema validation** -- Checks that `plugin.json` and `marketplace.json` have all required fields.
 
 For project-scoped skills, you can run template compilation locally:

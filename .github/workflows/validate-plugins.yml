@@ -69,19 +69,18 @@ jobs:
           mkdir -p "$SESSION_DIR"
           printf '{"schema_version":1,"workflow":"mock","template_hash":"abc123","created_at":"2025-01-01T00:00:00Z"}\n{"seq":1,"timestamp":"2025-01-01T00:00:00Z","type":"workflow_initialized","payload":{"template_path":"mock","variables":{}}}\n{"seq":2,"timestamp":"2025-01-01T00:00:00Z","type":"transitioned","payload":{"from":null,"to":"test-state","condition_type":"auto"}}\n' > "$SESSION_DIR/koto-mock.state.jsonl"
 
-          # Extract the hook command from hooks.json.
-          HOOK_CMD=$(jq -r '.hooks.Stop[0].command' plugins/koto-skills/hooks.json)
-
-          # The hook references 'koto' on PATH -- put our built binary on PATH.
+          # The Stop reminder is kept on disk, unregistered, as
+          # plugins/koto-skills/hooks/stop-workflows.sh; run it directly.
+          # It references 'koto' on PATH -- put our built binary on PATH.
           export PATH="$PWD/target/release:$PATH"
           export KOTO_SESSIONS_BASE="$SESSIONS_BASE"
 
-          # Run the hook and capture output.
-          OUTPUT=$(eval "$HOOK_CMD" 2>/dev/null || true)
+          # Run the script and capture output.
+          OUTPUT=$(bash plugins/koto-skills/hooks/stop-workflows.sh 2>/dev/null || true)
           if echo "$OUTPUT" | grep -q 'Active koto workflow detected'; then
-            echo "PASS: hook produced reminder with active workflow"
+            echo "PASS: Stop reminder script produced reminder with active workflow"
           else
-            echo "::error::Hook did not produce expected reminder text"
+            echo "::error::Stop reminder script did not produce expected reminder text"
             echo "Got: '$OUTPUT'"
             exit 1
           fi
@@ -92,15 +91,14 @@ jobs:
           # Use an empty sessions directory so no workflows are active.
           SESSIONS_BASE=$(mktemp -d)
 
-          HOOK_CMD=$(jq -r '.hooks.Stop[0].command' plugins/koto-skills/hooks.json)
           export PATH="$PWD/target/release:$PATH"
           export KOTO_SESSIONS_BASE="$SESSIONS_BASE"
 
-          OUTPUT=$(eval "$HOOK_CMD" 2>/dev/null || true)
+          OUTPUT=$(bash plugins/koto-skills/hooks/stop-workflows.sh 2>/dev/null || true)
           if [ -z "$OUTPUT" ]; then
-            echo "PASS: hook is silent with no active workflows"
+            echo "PASS: Stop reminder script is silent with no active workflows"
           else
-            echo "::error::Hook produced unexpected output when no workflows are active"
+            echo "::error::Stop reminder script produced unexpected output when no workflows are active"
             echo "Got: '$OUTPUT'"
             exit 1
           fi

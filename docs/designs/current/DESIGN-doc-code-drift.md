@@ -382,8 +382,9 @@ this design rather than to the implementer:
 | `*.json`, `*.sh`, and extensionless files under `plugins/koto-skills/` | code font throughout, so a line-initial `koto` anchors, plus backticked spans |
 
 The third row exists because a skill package is configuration an agent executes
-as much as prose it reads: `plugins/koto-skills/hooks.json` carries a shell
-command inside a JSON string, and a phantom verb there fails a real workflow.
+as much as prose it reads: the plugin's hook file, now
+`plugins/koto-skills/hooks/hooks.json`, can carry a shell command inside a
+JSON string, and a phantom verb there fails a real workflow.
 Without the row, "across the nine surfaces" would be false of five `.json`, one
 `.sh`, one `.mdc` and three extensionless files that R5's glob already names.
 

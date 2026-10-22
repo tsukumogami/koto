@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
-# SessionStart hook: enable koto's native Claude Code /workflows rendering.
+# SessionStart hook script, not registered: enable koto's native Claude Code
+# /workflows rendering.
+#
+# Not registered in hooks/hooks.json, so Claude Code never runs it: registering
+# it would start a command at every session start for every koto-skills user.
+# The rest of this header describes what it does when run as a SessionStart
+# hook.
 #
 # Claude Code's /workflows screen renders `*.json` files under
 # `<projectDir>/<sessionId>/workflows/`. koto cannot self-discover that
-# per-session directory, so this hook -- which receives `session_id` and
+# per-session directory, so this script -- which receives `session_id` and
 # `transcript_path` on stdin -- derives it and hands it to koto through the
 # `KOTO_WORKFLOWS_DIR` environment variable. koto sessions driven in this
 # Claude Code session then materialize their own `koto-<uuid>.json` into that

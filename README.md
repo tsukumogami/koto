@@ -156,7 +156,7 @@ Once a skill is installed, the agent follows a simple cycle:
 4. `koto next --with-data @<file>` -- submit evidence matching the schema, written to a file first, or `koto next --to <state>` for a directed transition
 5. Repeat from step 2 until `action` is `"done"`
 
-The plugin includes a Stop hook that detects active workflows when a session ends, so the agent can resume where it left off.
+The plugin registers no hooks. To pick up a workflow in a new session, run `koto workflows` to list active sessions and `koto next <name>` to resume one.
 
 ### For other AI agents
 
