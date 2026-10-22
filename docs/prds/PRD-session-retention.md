@@ -101,8 +101,10 @@ agent session exists and closes when niwa observes the agent session's
 deletion. The owner's idle close covers two cases only: an anchor whose
 deletion nothing observes, such as a plain terminal session's, and an anchor
 imported to another workspace, each closing after a configured idle period.
-After any close, a configured retention runs. koto and the workspace manager (niwa) never require each
-other, and only shirabe may require koto.
+An observed anchor closes only when niwa observes the deletion, never on
+idleness. After any close, a configured retention runs. koto and the
+workspace manager (niwa) never require each other, and only shirabe may
+require koto.
 
 ### Terms
 
@@ -135,15 +137,10 @@ These terms are used from here on with exactly these meanings.
 - **Stop instant**: when a member stopped being alive. For a koto session,
   its terminal or cancel event's timestamp. For an anchor, its close
   instant: the recorded time of an observed close, the last activity plus
-  the idle period for an idle close (unobserved and imported anchors only),
-  or, for a lineage close (R12), the later of the last activity plus the
-  observed backstop and the latest observed close among the anchors that
-  confirmed it.
-  When more than one applies, the earliest wins. An observed close is final;
-  an idle or lineage close is a reading, so new activity in the anchor makes
-  it read open again.
-- **Confirmed gone**: a session that has been removed from the store, or an
-  anchor with a valid observed close. Idle alone never confirms anything.
+  the idle period for an idle close (unobserved and imported anchors only).
+  When both apply, the earlier wins. An observed close is final; an idle
+  close is a reading, so new activity in the anchor makes it read open
+  again.
 - **Last activity** of an anchor: the latest event timestamp in the
   anchor's own log, where only the anchor's own agent session writes: its
   start events, the activity events koto records there when that agent
@@ -154,7 +151,7 @@ These terms are used from here on with exactly these meanings.
 - **Release instant** of a hierarchy: the latest stop instant among its
   members, once none is alive. Absent and migrated members have none; the
   session being judged is present and always has one.
-- **Retention**, **idle period**, **observed backstop**: the three
+- **Retention**, **idle period**, **stale threshold**: the three
   configured durations (R24).
 - **Migrated**: a session that `koto session import` copied elsewhere. Its
   source carries koto's migrated marker under the cloud backend, or, on the
@@ -344,17 +341,19 @@ names only in passing.
   no observed marker is closed once the idle period has passed since its last
   activity. koto computes this when it reads the anchor; nothing writes into
   the anchor to close it.
-- **R12. An observed anchor is never closed on idleness alone.** An
-  observed anchor with no close record stays open, however long it idles.
-  Once the observed backstop has passed since its last activity, the
-  hierarchy query and prune report it as stale, naming it, and it closes
-  (a lineage close) only when every session directly linked to it through
-  dispatched-by and held-by links, in either direction, is confirmed gone; koto's
-  parent-child lineage plays no part. Lost closes are niwa's to repeat
-  (R27, R28): a destroy that keeps its session, a failed or skipped close command
-  and an instance deleted by hand are closed by a later reap once the
-  session is gone. A host where niwa was removed before it reaped leaves the
-  anchor open and reported stale until someone removes it.
+- **R12. An observed anchor closes only through an observed close.** An
+  observed anchor with no close record stays open, however long it idles;
+  no idle or other rule closes it. Once the stale threshold has passed
+  since its last activity, the hierarchy query and both prunes (`koto
+  session prune` and `koto workspace prune`) report it as stale. Each stale
+  anchor is named together with the one command that closes it by hand,
+  `koto session anchor close --key=<marker> --harness-session=<id>`, with
+  its observed marker and harness session id filled in. This is a report
+  only; nothing closes. Lost closes are niwa's to repeat (R27, R28): a
+  destroy that keeps its session, a failed or skipped close command and an
+  instance deleted by hand are closed by a later reap once the session is
+  gone. A host where niwa was removed before it reaped leaves the anchor
+  open and reported stale until someone runs that command or removes it.
 - **R13. A session with no anchor uses the koto-level reading.** koto run
   from a bare shell, a harness without the plugin, or a failed hook opens
   sessions with no held-by link. Such a session is alive while its koto
@@ -431,8 +430,11 @@ names only in passing.
   sessions, which were never part of its own visits; anything that reads
   `context_read` events from session logs finds those reads in the readers'
   anchors, each naming the session it read: the run journal attributes such
-  a record to the session it names, and a session archive that ships logs off
-  the host does the same. The idle computation is a consumer too: a read
+  a record to the session it names. Read records carry context key names and
+  value hashes, so they stay on the host. The one exception is the user's
+  own koto cloud backend, which they enabled and which syncs to their own
+  bucket; every other shipper keeps `context_read` events local, and this
+  build changes none. The idle computation is a consumer too: a read
   record in the reader's anchor is the reader's own activity and extends its
   anchor's last activity; nothing a reader does extends the read session's.
   The anchorless row is tracked by koto#412.
@@ -455,15 +457,17 @@ names only in passing.
 
 ### Settings
 
-- **R24. Retention, idle period and observed backstop are configured.**
+- **R24. Retention, idle period and stale threshold are configured.**
   Each is a koto setting with a default: retention 7 days, idle period 7
-  days, observed backstop 30 days. Each is read, highest precedence first,
+  days, stale threshold 30 days. Each is read, highest precedence first,
   from an environment variable for the one command, the project
   configuration, the user configuration, then the default, as koto's
   session-backend settings are. Values are a whole number with a unit of
-  seconds, minutes, hours or days. koto refuses an observed backstop that
-  isn't longer than the retention, and an unparseable value, naming the
-  setting and exiting non-zero.
+  seconds, minutes, hours or days. The stale threshold only sets when an
+  observed anchor is reported stale (R12). koto refuses a stale threshold
+  that isn't longer than the retention, so a stale report never comes
+  before a correct close would have released anything, and an unparseable
+  value, naming the setting and exiting non-zero.
 
 ### niwa
 
@@ -574,7 +578,7 @@ names only in passing.
 Unless a criterion says otherwise: every agent session involved has been
 deleted and its anchor closed, so a member counts as alive only while its
 koto session is open; durations are set through the environment to short
-values (for example retention 20s, idle period 10s, observed backstop 60s),
+values (for example retention 20s, idle period 10s, stale threshold 60s),
 and "after the retention" means after waiting past it; only the relation
 under test can keep a session; "reads from A" means the read runs with A's
 anchor named in the environment, whether that anchor is open or closed; and
@@ -711,7 +715,9 @@ S3.
   closed by an observed close, or is migrated, opens a new anchor holding a
   dispatched-by link to the old one. A resume under a session id with no
   anchor, given a transcript path or prior id that names an existing anchor,
-  opens a successor holding a dispatched-by link to it. A live session
+  opens a successor holding a dispatched-by link to it; the successor takes
+  an observed marker only from its own environment or its own start-time
+  watch, never from the anchor it was linked to. A live session
   confirms the same by hand, including whether resume keeps the session id.
 - [ ] **Close records last.** After an observed close, a prune apply inside
   the retention and another after the release leave the anchor reading
@@ -755,15 +761,13 @@ S3.
   step, and `koto context add` from a bare shell writes a key into the held
   session; the anchor still closes 10 seconds after its own last activity.
 - [ ] **Observed anchors never idle-close.** An observed anchor whose close
-  command never runs stays open past the idle period and past the observed
-  backstop while it holds B, so B is kept; past the backstop the hierarchy
-  query and prune report the anchor as stale. Once every session directly linked
-  to it through dispatched-by and held-by links is confirmed gone (B removed with
-  `koto session cleanup`, its dispatcher's anchor closed by an observed
-  close), it reads closed with kind `lineage`, at the later of its last
-  activity plus the backstop and the dispatcher's observed close, and it is
-  removed only after the retention from that instant. An idle dispatcher's anchor never counts as
-  confirmed gone.
+  command never runs stays open past the idle period and past the stale
+  threshold while it holds B, so B is kept throughout. Past the threshold
+  the hierarchy query and prune report the anchor as stale, naming it with
+  `koto session anchor close --key=<marker> --harness-session=<id>` filled
+  in with its observed marker and harness session id, and still close
+  nothing. Running that printed command closes the anchor with kind
+  `observed`, and a prune after the retention from that close removes B.
 - [ ] **Anchor kept while resumable.** Overrides the setup. An agent session
   launched by `niwa dispatch` into an ephemeral instance niwa reaps, with
   koto-skills installed and the workspace declaring koto-skills' close
@@ -888,10 +892,10 @@ S3.
 ### Settings
 
 - [ ] **Settings.** With no configuration the hierarchy query reports a
-  retention of 7 days, an idle period of 7 days and an observed backstop of
+  retention of 7 days, an idle period of 7 days and a stale threshold of
   30 days. Each takes a user setting, a project setting over the user
   setting, and an environment value over both. Values in seconds, minutes,
-  hours and days are each accepted. An observed backstop of 7 days with a
+  hours and days are each accepted. A stale threshold of 7 days with a
   retention of 7 days, including when one comes from the environment and the
   other from the user configuration, and a value of `7x`, are each refused
   with a message naming the setting and a non-zero exit.
@@ -1052,9 +1056,11 @@ S3.
   which is every shirabe skill, see no difference.
 - An observed anchor whose close never lands, on a host where niwa was
   removed before it reaped, stays open and keeps its hierarchy until someone
-  removes it; prune and the hierarchy query report it as stale after the
-  observed backstop. This over-retains rather than release a session that
-  might still be alive.
+  closes or removes it; prune and the hierarchy query report it as stale
+  after the stale threshold, with the command that closes it by hand. This
+  over-retains rather than release a session that might still be alive,
+  and it is the only case that can linger: niwa repeats every other lost
+  close.
 - A worker with no start hook (a Codex worker, for one) has no anchor, so
   its sessions use the koto-level reading.
 
@@ -1079,23 +1085,24 @@ S3.
 - **Unobserved and imported anchors close after an idle period; observed
   ones only on the observed deletion** (the owner's idle close covers the
   first two cases only). A lease was rejected: an idle session can't renew
-  it. An idle backstop for observed anchors was rejected: it would close a
-  live agent session idle for longer than the backstop and release its
-  records, which the owner's rule forbids. Past the backstop an observed
-  anchor is only reported as stale, and it closes only when every session
-  directly linked to it is confirmed gone; lost closes are
-  repeated by niwa at its next reap. The backstop must still exceed the
-  retention, so a stale report never comes before a correct close would
-  have released anything.
-- **Defaults: retention 7 days, idle period 7 days, stale report after 30
-  days.** An
-  idle period of 24 hours would close a person's own session over a
-  weekend, against the owner's ruling that idle and resumable counts as
-  alive. All three stay configurable.
+  it. An idle close for observed anchors after a longer period was
+  rejected: it would close a live agent session idle for longer than that
+  period and release its records, which the owner's rule forbids. A close
+  once every directly linked session was gone was rejected for the same
+  reason: the anchor's own agent session can't be shown gone except by the
+  observed close itself, so that close could never fire. Past the stale
+  threshold an observed anchor is only reported as stale, with the command
+  that closes it by hand; lost closes are repeated by niwa at its next
+  reap. The threshold must still exceed the retention, so a stale report
+  never comes before a correct close would have released anything.
+- **Defaults: retention 7 days, idle period 7 days, stale threshold 30
+  days.** An idle period of 24 hours would close a person's own session
+  over a weekend, against the owner's ruling that idle and resumable counts
+  as alive. All three stay configurable.
 - **An observed close is recorded in the close command's own session.**
   Writing it into the anchor would need the owner's exception to the
-  one-writer rule; the idle close, niwa's repeated close and the lineage
-  close cover the cases without it.
+  one-writer rule; the idle close and niwa's repeated close cover the cases
+  without it.
 - **The terminal tick keeps every session with an edge** rather than relying
   on every caller's `--no-cleanup`, including koto children while their
   parent runs. Otherwise retention holds only for callers that remember the
@@ -1108,8 +1115,7 @@ S3.
   Unreadable present sessions still count as alive, and an unreadable link
   keeps its hierarchy (R35).
 - **A read from another agent session is recorded in the reader's anchor.**
-  Recording nothing would cost the run journal and the session archive their
-  read events; recording in the read session is the cross-session write the
+  Recording nothing would cost the run journal its read events; recording in the read session is the cross-session write the
   rule forbids.
 - **koto doesn't warn when a session opens with no anchor.** The bare-shell
   fallback is expected, and a warning on every bare-shell `koto init` would
@@ -1131,7 +1137,7 @@ S3.
   koto records throttled activity in the anchor instead, from the agent
   session's own commands.
 - **A failed on-reap command is repeated at the next reap.** With no idle
-  backstop for observed anchors, a lost close has to be repeated: niwa keeps
+  close for observed anchors, a lost close has to be repeated: niwa keeps
   the session's mapping until the command succeeds, up to ten runs. The
   close command is idempotent, so a repeat is safe.
 - **shirabe's reclaimable rule is retired, not re-pointed.** Nothing calls
