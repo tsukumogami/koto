@@ -385,7 +385,7 @@ Set up the plugin and marketplace structure in the koto repo, plus a minimal ski
 
 - **`.claude-plugin/marketplace.json`** at the repo root
 - **`plugins/koto-skills/.claude-plugin/plugin.json`** -- plugin manifest
-- **`plugins/koto-skills/hooks.json`** -- Stop hook
+- **`plugins/koto-skills/hooks/hooks.json`** -- Stop hook (planned here at the plugin root; the file has since moved under `hooks/` and registers no hook)
 - **`plugins/koto-skills/skills/hello-koto/SKILL.md`** -- a hello-koto skill invoked as `/hello-koto <name>`. The template has two states (awakening + terminal), one variable (`SPIRIT_NAME`), and one `command` gate (`test -f wip/spirit-greeting.txt`). Exercises: template compilation, cache, variable interpolation, command gate, state transition, and the full next/execute/transition/done loop.
 
 The flow:

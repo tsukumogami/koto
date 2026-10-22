@@ -399,6 +399,21 @@ to `0.9.x`).
 
 ### Fixed
 
+- **The koto-skills plugin's hook file moved to where Claude Code reads
+  it, and registers no hook.** The plugin shipped its hooks in a root
+  `hooks.json` with each command directly under its event, a place and a
+  shape Claude Code doesn't load, so neither hook ever ran. The file is
+  now `plugins/koto-skills/hooks/hooks.json`, in the matcher-group shape
+  (each event maps to groups that carry a `hooks` list), and it registers
+  no event: the /workflows `SessionStart` script and the `Stop` reminder
+  stay off, since running them at every session start and every turn end
+  would cost every plugin user a command each time. Both stay on disk,
+  unregistered, as `hooks/session-start-workflows.sh` and
+  `hooks/stop-workflows.sh` (the reminder's command text is unchanged),
+  and CI's plugin smoke test now runs the reminder script directly.
+  `tests/plugin_hooks_shape.rs` fails if the file goes missing, stops
+  parsing, returns to the old shape or registers either script.
+
 - **A held run-journal lock can no longer hang a koto command (koto#354).**
   Run-journal writes waited for the journal's lock with no limit, so a
   process that stopped while holding it left every later `koto next`

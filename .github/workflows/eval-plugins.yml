@@ -36,7 +36,7 @@ jobs:
             fi
           done < <(find plugins/*/skills/*/ -maxdepth 0 -type d 2>/dev/null)
           if [ "$failed" -eq 1 ]; then
-            echo "hooks.json belongs at the plugin root, not in individual skill directories."
+            echo "A plugin's hooks belong in its hooks/hooks.json, not in individual skill directories."
             exit 1
           fi
           echo "No hooks.json found in skill directories."

@@ -90,6 +90,8 @@ Trigger the hello-koto skill and verify the full init / next / execute / directe
 
 Verify the Stop hook detects an active workflow and outputs a resume reminder.
 
+The plugin no longer registers this hook: `plugins/koto-skills/hooks/hooks.json` registers no event, so stopping a session prints nothing. Until it is registered again, check the reminder by running `bash plugins/koto-skills/hooks/stop-workflows.sh` from the project root in place of steps 2 and 3, and run Test 4 the same way.
+
 ### Steps
 
 1. Start a workflow but stop the session before it completes:

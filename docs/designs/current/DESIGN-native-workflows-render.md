@@ -363,7 +363,9 @@ Wiring:
   `#[command(subcommand)] WorkflowsSubcommand::Publish { dir, session }`, so
   bare `koto workflows` (used by the plugin's `Stop` hook) is unchanged and the
   new verb is additive.
-- Plugin: a `SessionStart` entry in `plugins/koto-skills/hooks.json` runs a
+- Plugin: a `SessionStart` entry in the plugin's hook file (then at the plugin
+  root; now `plugins/koto-skills/hooks/hooks.json`, which no longer registers
+  it) runs a
   small script (`plugins/koto-skills/hooks/session-start-workflows.sh`) that
   reads `session_id` / `transcript_path` from stdin JSON, computes the
   `/workflows` directory, and exposes `KOTO_WORKFLOWS_DIR` (emitting the
