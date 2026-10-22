@@ -14,7 +14,7 @@ The script detects your platform, downloads the latest release, verifies the che
 
 Or download a binary directly from the [GitHub Releases page](https://github.com/tsukumogami/koto/releases).
 
-Or build from source with Rust:
+Or build from source with Rust 1.88 or newer (the `rust-version` in `Cargo.toml`):
 
 ```bash
 git clone https://github.com/tsukumogami/koto.git

@@ -15,6 +15,12 @@ name = "koto"
 # docs/STABILITY.md for the bump protocol.
 version = "0.21.1-dev"
 edition = "2021"
+# The lowest toolchain the locked dependency tree builds with: time 0.3.47 and
+# home 0.5.12 (through rust-s3) and darling 0.23 and instability 0.3.12
+# (through ratatui) each declare 1.88. The validate workflow's MSRV job builds
+# koto on exactly this version, so a change that needs a newer toolchain fails
+# in its own PR; raise this value there when a bump sets a higher floor.
+rust-version = "1.88"
 description = "Workflow orchestration engine for AI coding agents"
 license = "MIT"
 repository = "https://github.com/tsukumogami/koto"

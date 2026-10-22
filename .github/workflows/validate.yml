@@ -89,6 +89,49 @@ jobs:
       - name: Run external-consumer stability tests
         run: cargo test -p koto-stability-tests -- --test-threads=1
 
+  msrv:
+    # Builds koto on exactly the toolchain Cargo.toml's rust-version declares,
+    # read from Cargo.toml so the job and the declaration can't disagree. A
+    # dependency bump or a std API that needs a newer toolchain fails here, in
+    # the PR that introduces it, instead of on a user's older toolchain.
+    name: MSRV (rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version="$(sed -n 's/^rust-version = "\([0-9.]*\)"$/\1/p' Cargo.toml)"
+          if [ -z "$version" ]; then
+            echo "::error::Cargo.toml declares no rust-version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the active toolchain is the declared one
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: |
+          active="$(rustc --version)"
+          echo "$active"
+          case "$active" in
+            "rustc $MSRV "*|"rustc $MSRV."*) ;;
+            *)
+              echo "::error::active toolchain is '$active', expected rustc $MSRV"
+              exit 1
+              ;;
+          esac
+
+      - name: Build koto on the declared rust-version
+        run: cargo build --locked
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -645,7 +688,7 @@ jobs:
 
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, stability-tests, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, poll-forge-neutral, inline-evidence, audit, tsuku-distributed-install, cloud-integration]
+    needs: [check-artifacts, unit-tests, stability-tests, msrv, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, poll-forge-neutral, inline-evidence, audit, tsuku-distributed-install, cloud-integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -654,6 +697,7 @@ jobs:
           if [ "${{ needs.check-artifacts.result }}" = "failure" ] || \
              [ "${{ needs.unit-tests.result }}" = "failure" ] || \
              [ "${{ needs.stability-tests.result }}" = "failure" ] || \
+             [ "${{ needs.msrv.result }}" = "failure" ] || \
              [ "${{ needs.fmt.result }}" = "failure" ] || \
              [ "${{ needs.clippy.result }}" = "failure" ] || \
              [ "${{ needs.decider-checks.result }}" = "failure" ] || \
