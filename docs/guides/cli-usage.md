@@ -45,6 +45,9 @@ koto init <name> --template <path>
 **Variables:**
 - `--var KEY=VALUE` -- Set a template variable (repeatable). A value may hold letters, digits, `.`, `_`, `-`, `/`, `:`, `@`, `+` and spaces, because it can land unquoted in a gate command run through `sh -c`. Every other character, including `;` `|` `&` `$` `(` `)` `<` `>` `*` `?`, quotes, backticks and newlines, is refused with `invalid_var` (`constraint: "allowlist"`). A variable that declares `values:` or `pattern:` narrows that set further. The same check runs wherever a value is set later: `--vars-file`, a rebind through `--attach-live`, and `--replace-terminal`.
 
+**Dispatcher:**
+- `--dispatched-by <name>` -- Record that session `<name>` dispatched this one: a dispatched-by link in the new (or attached, or replacement) session's own context, the same link [`koto session link`](#session-link) writes. Nothing is written into `<name>`, which need not exist. A name that fails the session-name rule, or that is the session's own, exits 2 with `invalid_usage` before anything is created. A link that can't be written after the session was created prints a warning on stderr and leaves the session in place; `koto session link` records it later. Works with every init path, `--from-stdin` and `--parent` included.
+
 **Output (JSON):**
 
 ```json
@@ -90,11 +93,11 @@ koto init <name> --template <path> --vars-file <file> [--attach-live] [--replace
 - `--replace-terminal` replaces a session that is finished (in a terminal state, or cancelled): koto removes it and creates a fresh one under the same name. The output carries the old session's `replaced_state` and `replaced_result`, its workflow result (`null` for a cancelled session that recorded none). Removing the session removes its override log too. A running session is refused with `session_live`.
 - `--attach-live` attaches to a running session instead of refusing the name. koto checks, in order, that the session was built from a template file with the same name as `--template` (`template_mismatch`, with `recorded` and `requested`); that its origin record equals this invocation's, meaning the same execution anchor (`--execution-dir` or the working directory) and the same session store (`origin_mismatch`); and that every non-`rebind` variable passed explicitly equals the recorded value (`var_mismatch`, naming `var`, `recorded` and `requested`). Variables the caller doesn't pass aren't compared. A session with no origin record is refused with `origin_mismatch` and a message that says so: finish it with the koto version that started it, or remove it with `koto session cleanup <name>`. On acceptance every `rebind: true` variable is re-applied from this invocation (its value, else the declared default), recorded as one `variables_rebound` event, and the output lists the changes under `rebound`. A finished session is refused with `session_terminal`. `--intent` is not applied to an attached session. If the caller's `PATH`, `HOME` or `XDG_CONFIG_HOME` differs from the session's recorded values, the attach still succeeds: koto prints one warning on stderr and adds `environment_drift`, an array naming the differing variables (never their values), to the output. The session's commands keep running with the recorded values. A session with no record yet, or one created with `--legacy-environment`, isn't compared.
 - With both `--attach-live` and `--replace-terminal`, a running session is attached, a finished one is replaced, and a missing one is created.
-- `--koto-leg <request-id>:<leg>` attaches the created, attached or replacement session to a request leg in the same call, with every check `koto request attach` makes (see [request attach](#request-attach)). A value that doesn't match the request-id and leg-name grammars is a usage error. The output gains `leg`: `{"request_id", "leg", "written"}`.
+- `--koto-leg <request-id>:<leg>` attaches the created, attached or replacement session to a request leg in the same call, with every check `koto request attach` makes (see [request attach](#request-attach)). A value that doesn't match the request-id and leg-name grammars is a usage error. The output gains `leg`: `{"request_id", "leg", "written"}`. Once the leg is bound, the session gets a dispatched-by link naming the request's `requested_by`, as `--dispatched-by` would record it; a `requested_by` that a link can't name (one that fails the session-name rule, makes a key over 255 characters, or is the session itself) gets no link.
 
 Without `--attach-live` or `--replace-terminal`, an existing session still gets the "already exists" message and exit 1. The three entry flags are rejected with `--from-stdin` and with `--parent` (`invalid_usage`, exit 2).
 
-**Order of checks and writes.** Every check runs before anything is written: variables, then the existing session's template, origin and fixed variables, then the leg checks. Writes follow in a fixed order: create or replace the session, bind the leg, then re-apply the rebind variables. So a refused invocation leaves the session and its variables as they were; a stale invocation that names an abandoned leg, or a leg another session holds, can't flip a rebind variable such as `MERGE`. If the leg bind loses a race after the checks passed, the invocation exits with the bind's error, removes a session it just created, and leaves an attached session's variables unchanged.
+**Order of checks and writes.** Every check runs before anything is written: variables, then the existing session's template, origin and fixed variables, then the leg checks. Writes follow in a fixed order: create or replace the session, bind the leg, then re-apply the rebind variables, and last the dispatched-by links. So a refused invocation leaves the session and its variables as they were; a stale invocation that names an abandoned leg, or a leg another session holds, can't flip a rebind variable such as `MERGE`. If the leg bind loses a race after the checks passed, the invocation exits with the bind's error, removes a session it just created, and leaves an attached session's variables unchanged.
 
 **Refusals recorded on the leg.** Under `--koto-leg`, every refusal is also written onto the named leg when that leg is open and unbound: it resolves with `result_source: refused`, status `failure`, and a payload `{"outcome": "refused", "reason", "var", "recorded", "requested"}`. `reason` is `invalid-var:<V>`, `duplicate-var:<V>`, `unknown-var:<V>`, `var-mismatch:<V>`, `template-mismatch`, `origin-mismatch`, or, for any other refusal, its error code in the same kebab form (`session-terminal`, `session-live`, `leg-abandoned`, `input-mismatch`, and so on). The other three keys are empty strings when they don't apply. A leg that is bound, resolved or abandoned, or a request that is closed or doesn't exist, gets nothing, and a refusal never binds the leg or writes a leg pointer. The exit code and the printed error are the same with and without `--koto-leg`.
 
@@ -607,6 +610,26 @@ Names passed to `--session` that match nothing in the quarantine come back under
 
 Under a cloud backend, recovery works on the local session store. Recovered sessions are not pushed to the configured bucket by this command, and the report says so in a `note` field.
 
+#### session link
+
+Records that another session dispatched this one.
+
+```bash
+koto session link <session> --dispatched-by <name>
+```
+
+Writes one dispatched-by link, the context key `koto/links/dispatched-by/<name>`, into `<session>`'s own context and nowhere else. The dispatcher isn't written and need not exist. The command is meant for the session's own driver, when a dispatch had no request leg to record it; `koto init --dispatched-by` does the same as the session is created, and a leg-bound session gets its link from the request (see [init](#entry-flags) and [request attach](#request-attach)).
+
+The link's value is one JSON object:
+
+```json
+{"v":1,"session":"deliver-a","session_id":"3f2c...","workspace":"/home/me/repo","at":"2026-10-22T18:01:02.000Z"}
+```
+
+`session_id` and `workspace` are hints taken from the dispatcher's header when it is in the local store, and `null` when it isn't. The key is written with writer `koto`, and a `context_added` event naming that writer goes into the session's log.
+
+Prints `{"name", "kind", "peer", "written"}`. Recording a link the session already holds changes nothing, prints `"written": false` and exits 0. A dispatcher name that fails the session-name rule (`~` included), makes a key longer than 255 characters, or is `<session>` itself, exits 2 and writes nothing, as does a session that doesn't exist. A failed write exits 3.
+
 #### session cleanup
 
 Removes a session directory and all its contents. Idempotent -- succeeds even if the session doesn't exist.
@@ -699,6 +722,10 @@ That is narrower than what a variable value may hold, and the gap is exactly fou
 
 The two meet when a context gate's `key` resolves a `{{KEY}}` reference. `key: "{{TITLE}}-note"` with a `TITLE` of `Weekly Planning` asks for `Weekly Planning-note`, which is not a usable key. koto says which character it refused, at the gate and at `koto context exists` alike, in the same words -- but the fix is to scope the key on a slug-shaped variable rather than on the prose one.
 
+#### The reserved `koto/` area
+
+Keys under `koto/` belong to koto, which writes its own records about a session there, such as the dispatched-by links [`koto session link`](#session-link) records. `koto context add` and `koto context remove` refuse any key whose first component is `koto`, compared case-insensitively (`KOTO/...` too), with exit 2 and an error naming the prefix, and change nothing. The refusal sits in the context store itself, so no other path for agent writes gets around it. `koto context get`, `exists` and `list` read the area like any other key.
+
 #### context add
 
 Submits content to the store for a given session and key. Reads from stdin by default.
@@ -720,7 +747,7 @@ koto context add <name> <key> --from-file <path>
 **Optional flags:**
 - `--from-file` -- Read content from the specified file instead of stdin.
 
-Exits 2 if the session has no state log (it was never initialized, it's a batch child that is still `pending` or `blocked`, or it has already finished and been cleaned up), and stores nothing. Exits non-zero if the input can't be read. Overwrites any existing content for the same key.
+Exits 2 if the session has no state log (it was never initialized, it's a batch child that is still `pending` or `blocked`, or it has already finished and been cleaned up), and stores nothing. Exits 2 for a key in the reserved `koto/` area, before reading the input. Exits non-zero if the input can't be read. Overwrites any existing content for the same key.
 
 #### context get
 
@@ -790,7 +817,8 @@ deliberate — the alternative would push every caller to probe with `context
 exists` first, and per the note above that probe still cannot tell "absent" from
 "unreadable", so the guard would silently skip keys it should have removed. The
 session itself must exist: on a session with no state log, `context remove`
-exits 2 and changes nothing.
+exits 2 and changes nothing. A key in the reserved `koto/` area exits 2 and is
+left in place.
 
 The removal appends a `context_removed` event to the session's event log,
 mirroring the `context_added` event that `context add` writes. A workflow whose
@@ -1336,6 +1364,8 @@ A **root session** (created without `--parent`) binds itself to the leg. It has 
 - the session doesn't already answer another live leg. It moves to the new leg only when its old leg was abandoned or its old request closed (`child_bound_to_different_leg` otherwise).
 
 All refusals exit 2. On success the command prints the standard request envelope, and the leg shows `"attach": "self"` and a `bound_template` object with the template's `name`, `hash` and `source` file name. The session's leg pointer is written so its ticks know which leg they answer.
+
+A root session that attaches itself also gets a dispatched-by link naming the request's `requested_by`, written into that session only (see [session link](#session-link)), unless the requester is a name a link can't carry or is the session itself. The attach counts as the session's own unless `--issued-by` names some other issuer: an attach issued for another session binds the leg as before and writes nothing into the session's context.
 
 On a self-attached leg, `koto request progress`, `koto request resolve` and `koto request abandon` are refused with `self_attached_leg` whatever `--dispatch-epoch` says: the leg's result arrives only when the session reaches a terminal state, including under `koto next --no-cleanup`, which keeps the session on disk. `koto request abandon-request` and `koto request close` stay available, and abandoning the request is how a newer run releases a session for re-attachment.
 

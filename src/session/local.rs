@@ -665,7 +665,9 @@ impl LocalBackend {
 }
 
 impl LocalBackend {
-    /// Write `content` under `key`, recording `writer` in the manifest.
+    /// Write `content` under `key`, recording `writer` in the manifest. The
+    /// agent writer is refused the reserved `koto/` area before anything is
+    /// written.
     fn add_as(
         &self,
         session: &str,
@@ -673,6 +675,9 @@ impl LocalBackend {
         content: &[u8],
         writer: Option<&str>,
     ) -> anyhow::Result<()> {
+        if let Some(writer) = writer {
+            crate::session::links::check_writer_key(key, writer)?;
+        }
         validate_context_key(key)?;
 
         let ctx_dir = self.ctx_dir(session);

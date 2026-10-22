@@ -517,6 +517,97 @@ pub fn handle_update(backend: &dyn SessionBackend, name: &str, intent: &str) -> 
     Ok(())
 }
 
+/// `koto session link <session> --dispatched-by <name>`: record a
+/// dispatched-by link to `dispatched_by` in `session`, and only there.
+///
+/// Every check runs before anything is written: the session name, the
+/// dispatcher name (the session-name rule and the context-key grammar,
+/// and not the session itself), that the session exists and, under the
+/// cloud backend, that it wasn't imported elsewhere. Each refusal exits 2
+/// with `{"error", "command"}`; a write that fails exits 3. Prints
+/// `{"name", "kind", "peer", "written"}`, `written: false` when the link
+/// was already there and nothing changed.
+pub fn handle_link(backend: &Backend, session: &str, dispatched_by: &str) -> Result<()> {
+    use crate::session::links::{self, LinkHints, LinkKind};
+
+    let kind = LinkKind::DispatchedBy;
+    let refuse = |error: String| -> ! {
+        super::exit_with_error_code(
+            serde_json::json!({ "error": error, "command": "session link" }),
+            super::EXIT_CALLER_ERROR,
+        )
+    };
+
+    if let Err(e) = ValidatedSessionId::new(session) {
+        refuse(e.to_string());
+    }
+    if let Err(e) = links::validate_peer(kind, dispatched_by) {
+        refuse(e.to_string());
+    }
+    if dispatched_by == session {
+        refuse(format!(
+            "session '{session}' can't be recorded as dispatched by itself"
+        ));
+    }
+    if !backend.exists(session) {
+        refuse(format!("session '{session}' does not exist"));
+    }
+    if let Err(e) = backend.check_not_migrated(session) {
+        refuse(e.to_string());
+    }
+
+    let hints = LinkHints::for_peer(backend, dispatched_by);
+    let outcome = match links::write_link(backend, session, kind, dispatched_by, &hints) {
+        Ok(outcome) => outcome,
+        Err(e) => super::exit_with_error_code(
+            serde_json::json!({
+                "error": format!("could not record the link in '{session}': {e}"),
+                "command": "session link"
+            }),
+            super::EXIT_INFRASTRUCTURE,
+        ),
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "name": session,
+            "kind": kind.as_str(),
+            "peer": dispatched_by,
+            "written": outcome.written(),
+        }))?
+    );
+    Ok(())
+}
+
+/// Record a dispatched-by link to `dispatcher` in `session` after the
+/// session was opened, warning on stderr instead of failing when it can't
+/// be written: the session is already there, and `koto session link`
+/// repairs a missing link. `dispatcher` was validated before the session
+/// was opened.
+pub(crate) fn record_dispatched_by(backend: &Backend, session: &str, dispatcher: &str) {
+    use crate::session::links::{self, LinkHints, LinkKind};
+    let hints = LinkHints::for_peer(backend, dispatcher);
+    if let Err(e) = links::write_link(backend, session, LinkKind::DispatchedBy, dispatcher, &hints)
+    {
+        eprintln!(
+            "warning: could not record that '{session}' was dispatched by '{dispatcher}': {e}; \
+             run `koto session link {session} --dispatched-by {dispatcher}` to record it"
+        );
+    }
+}
+
+/// Record the dispatched-by link a leg-bound session gets: `requested_by`,
+/// the request's requester, when it passes the session-name rule and isn't
+/// the session itself. Any other value writes nothing, silently: a
+/// requester need not be a session. A write that fails warns on stderr.
+pub(crate) fn record_requester_link(backend: &Backend, session: &str, requested_by: &str) {
+    use crate::session::links::{validate_peer, LinkKind};
+    if requested_by == session || validate_peer(LinkKind::DispatchedBy, requested_by).is_err() {
+        return;
+    }
+    record_dispatched_by(backend, session, requested_by);
+}
+
 /// Move a session's execution anchor to `to`, defaulting to the
 /// current working directory.
 ///

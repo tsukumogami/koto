@@ -1778,9 +1778,12 @@ fn precheck_attach_agrees_with_attach_and_writes_nothing() {
     let id = seed_scope(root);
     let before = log_bytes(root, &id);
 
-    // Admitted, not yet bound: `false`, and nothing written.
+    // Admitted, not yet bound: `false`, and nothing written. The
+    // requester comes back with the answer.
     let ok = attach_req(root_session("scope-t1", "scope.md"));
-    assert!(!precheck_attach(root, &id, &ok).expect("admitted"));
+    let admitted = precheck_attach(root, &id, &ok).expect("admitted");
+    assert!(!admitted.already_bound);
+    assert_eq!(admitted.requested_by, "coord-a");
     // Refused the way attach refuses it.
     let err = precheck_attach(root, &id, &attach_req(root_session("s", "other.md"))).unwrap_err();
     assert!(
@@ -1791,7 +1794,11 @@ fn precheck_attach_agrees_with_attach_and_writes_nothing() {
 
     // Once bound to this session: `true`, a no-op attach.
     attach_leg(root, &id, &ok).expect("attach");
-    assert!(precheck_attach(root, &id, &ok).expect("already bound"));
+    assert!(
+        precheck_attach(root, &id, &ok)
+            .expect("already bound")
+            .already_bound
+    );
     // Bound to another session: refused.
     let err =
         precheck_attach(root, &id, &attach_req(root_session("other", "scope.md"))).unwrap_err();

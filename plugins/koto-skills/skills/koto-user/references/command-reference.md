@@ -25,6 +25,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session prune` | Runner and operator — removing finished sessions in bulk |
 | `koto session recover` | Operator — one-time migration recovery |
 | `koto session rebind` | Runner — after a checkout moves |
+| `koto session link` | Runner — the dispatched session's own driver, after a dispatch with no request leg |
 | `koto session import` | Runner — cloud backend only, after a session moves to another host or workspace |
 | `koto session resolve` | Runner — cloud backend only |
 | `koto status` | Runner — primary |
@@ -50,9 +51,9 @@ Subcommands confirmed from `src/cli/mod.rs`:
 ## koto init
 
 ```
-koto init <name> --template <path> [--parent <parent-name>] [--var KEY=VALUE ...] [--execution-dir <path>] [--legacy-environment]
-koto init <name> --from-stdin [--var KEY=VALUE ...] [--execution-dir <path>] [--legacy-environment]
-koto init <name> --template <path> --vars-file <file> [--attach-live] [--replace-terminal] [--koto-leg <request-id>:<leg>]
+koto init <name> --template <path> [--parent <parent-name>] [--var KEY=VALUE ...] [--execution-dir <path>] [--legacy-environment] [--dispatched-by <name>]
+koto init <name> --from-stdin [--var KEY=VALUE ...] [--execution-dir <path>] [--legacy-environment] [--dispatched-by <name>]
+koto init <name> --template <path> --vars-file <file> [--attach-live] [--replace-terminal] [--koto-leg <request-id>:<leg>] [--dispatched-by <name>]
 ```
 
 Initializes a new workflow. Provide the definition one of two ways:
@@ -72,7 +73,8 @@ Initializes a new workflow. Provide the definition one of two ways:
 | `--replace-terminal` | No | If a finished session (terminal or cancelled) has the name, remove it and start fresh; the output carries `replaced_result`. A running session is refused with `session_live`. |
 | `--attach-live` | No | If a running session has the name, attach to it when its template file name, origin record (anchor and session store) and every explicitly passed non-`rebind` variable match (`template_mismatch`, `origin_mismatch`, `var_mismatch` otherwise), then re-apply its `rebind: true` variables. A caller whose `PATH`, `HOME` or `XDG_CONFIG_HOME` differs from the session's record still attaches; the output adds `environment_drift` naming the variables (never values) and one warning goes to stderr. A finished session is refused with `session_terminal` unless `--replace-terminal` is also given. |
 | `--legacy-environment` | No | Run this session's commands with the caller's whole environment, plus `KOTO_TICK_SESSION`, as before koto recorded one. Recorded at creation; no effect when attaching to an existing session; refused with `--parent`. **Removed in the next release.** |
-| `--koto-leg <request-id>:<leg>` | No | Attach the resulting session to a request leg in the same call, with every `koto request attach` check. Any refusal is recorded on an open, unbound leg as `result_source: refused`. |
+| `--koto-leg <request-id>:<leg>` | No | Attach the resulting session to a request leg in the same call, with every `koto request attach` check. Any refusal is recorded on an open, unbound leg as `result_source: refused`. Once bound, the session gets a dispatched-by link naming the request's `requested_by` (none when that name can't be a link's peer). |
+| `--dispatched-by <name>` | No | Record that session `<name>` dispatched this one: a dispatched-by link in this session's own context, as `koto session link` writes. `<name>` isn't written and need not exist. A name failing the session-name rule, or naming the session itself, exits 2 (`invalid_usage`) before anything is created. |
 
 **Entry flags.** With `--vars-file` or any entry flag, the output adds `"outcome": "created" | "attached" | "replaced"` (plus `rebound` on an attach, `replaced_state`/`replaced_result` on a replace, and `leg` under `--koto-leg`). Every check runs before any write, so a refusal changes nothing, and rebind variables are re-applied only after the leg bind succeeds. Without `--attach-live`/`--replace-terminal` an existing name is still "already exists" (exit 1). The entry flags are rejected with `--from-stdin` and `--parent`. Branch on `code`, never on the message.
 
@@ -497,6 +499,8 @@ The epoch recorded on the bind event is read from the child's header, not from y
 
 `attach` lets a **root session** (one started without `--parent`) bind itself to a leg it will answer, typically a stable `--no-cleanup` session run on a requester's behalf. It has no dispatch epoch, so koto checks instead, all before any write: the request and leg are open; the session isn't terminal or cancelled (`session_terminal`); the session's template file name is one the leg's `template` names (`template_mismatch`; a `--from-stdin` session has none); each key in the leg's `inputs` is a variable the template declares and, unless it's `rebind: true`, equals the session's recorded value (`input_mismatch`); the leg is unbound or already bound to this session (a no-op, `written: false`); and the session isn't answering another live leg — it moves only when its old leg was abandoned or its old request closed (`child_bound_to_different_leg`).
 
+A root session that attaches itself also gets a dispatched-by link naming the request's `requested_by`, in its own context only (see `koto session link`). With `--issued-by` naming anyone other than the session, the attach still binds the leg but writes no link.
+
 On a self-attached leg, `progress`, `resolve`, and `abandon` are refused with `self_attached_leg` whatever `--dispatch-epoch` says. The result arrives when the session reaches a terminal state, including under `koto next --no-cleanup`. `abandon-request` and `close` still work. A dispatched child passed to `attach` is bound exactly as `bind` binds it; any other child is refused with `child_not_fenceable`.
 
 ### wait
@@ -829,6 +833,22 @@ Which refusal you are repairing matters. On the same host, `execution_anchor_unr
 
 ---
 
+## koto session link
+
+```
+koto session link <session> --dispatched-by <name>
+```
+
+Records that session `<name>` dispatched `<session>`: one context key, `koto/links/dispatched-by/<name>`, written into `<session>` and nowhere else. The dispatcher isn't touched and need not exist. Run it from the dispatched session's own driver when the dispatch had no request leg; `koto init --dispatched-by` does the same at creation, and `koto init --koto-leg` or a self-run `koto request attach` records the requester on its own.
+
+```json
+{"name":"work-on-12","kind":"dispatched-by","peer":"execute-plan","written":true}
+```
+
+The link's value is `{"v":1,"session":"<name>","session_id":"<id or null>","workspace":"<path or null>","at":"<rfc3339>"}`; the two hints come from the dispatcher's header when it's in the local store. Running the command again leaves the session byte-identical and prints `"written": false`, exit 0. A name that fails the session-name rule (`~` included), makes a key over 255 characters, or is `<session>` itself exits 2 and writes nothing; so does a session that doesn't exist. A failed write exits 3.
+
+---
+
 ## koto session import (cloud backend only)
 
 ```
@@ -946,6 +966,8 @@ Stores content under `<key>` in the session's context store. When `--from-file` 
 
 Keys are hierarchical path strings (e.g., `scope.md`, `research/r1/lead.md`). Keys must not start with `.` or contain `..`.
 
+**Keys under `koto/` are reserved.** koto writes its own records there (the dispatched-by links of `koto session link`). `context add` and `context remove` refuse any key whose first component is `koto`, in any case (`KOTO/...` too), with exit 2 and an error naming the prefix, and change nothing. `context get`, `exists` and `list` read them like any other key.
+
 No stdout on success. Exit 2 with `workflow '<session>' not found` if the session has no state log, and nothing is stored. That covers a name that was never initialized, a session that finished and was cleaned up, a child moved by its parent's `koto rewind`, and a batch child that is still `pending` or `blocked`. To give a batch child input before it starts, put it in the task entry's `vars`, or store it on the parent and read it from the child with `koto context get <parent> <key>`. Exit 3 on infrastructure errors, including a state log that exists but has no header.
 
 ---
@@ -1054,6 +1076,7 @@ call it unconditionally, which is the correct usage — see the `exists` caveat
 above for why probing first is worse than not probing. The session itself must
 exist: on a session with no state log, `context remove` exits 2 with
 `workflow '<session>' not found`, the same as `context add`, and appends nothing.
+A key in the reserved `koto/` area exits 2 and stays in place.
 
 **This is the verb that makes a `context-exists` gate fail again.** Overwriting a
 key with `context add` leaves it present, so a state gated on `context-exists`

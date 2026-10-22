@@ -100,6 +100,18 @@ pub fn validate_transition_assignments(
                 state_name, transition.target, key, reason
             ));
         }
+        if crate::session::links::is_reserved_key(key) {
+            return Err(format!(
+                "state {:?} transition to {:?}: context_assignments key {:?} is under the \
+                 reserved prefix '{}', which only koto writes\n  \
+                 remedy: choose a key outside '{}'",
+                state_name,
+                transition.target,
+                key,
+                crate::session::links::RESERVED_PREFIX,
+                crate::session::links::RESERVED_PREFIX
+            ));
+        }
         for reference in parse_refs(value) {
             match reference {
                 AssignmentRef::Var(name) => {

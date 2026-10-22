@@ -11,7 +11,9 @@
 //! the live session's template identity, its origin record, its fixed
 //! variables, and -- under `--koto-leg` -- every check `koto request
 //! attach` makes. Writes then happen in a fixed order: create or replace
-//! the session, bind the leg, re-apply the `rebind: true` variables. So a
+//! the session, bind the leg, re-apply the `rebind: true` variables, and
+//! last record the session's dispatched-by links (`--dispatched-by`, and the
+//! leg's requester under `--koto-leg`), in this session only. So a
 //! refused invocation changes nothing, and a stale invocation naming a
 //! leg it no longer owns can't flip a rebind variable such as `MERGE`.
 //!
@@ -481,6 +483,8 @@ pub(crate) struct InitArgs<'a> {
     pub template: &'a str,
     pub vars: &'a [String],
     pub intent: Option<&'a str>,
+    /// `--dispatched-by`, already validated.
+    pub dispatched_by: Option<&'a str>,
     pub execution_dir: Option<&'a Path>,
     pub legacy_environment: bool,
 }
@@ -606,19 +610,23 @@ fn create(
         Err(e) => refuse(entry, Refusal::var(&e)),
     };
 
-    if let Some(target) = &entry.koto_leg {
-        let facts = AttachingSession {
-            session_id: name.to_string(),
-            template: Some(caller_identity(template_path, compiled, hash)),
-            variables: compiled.variables.clone(),
-            bindings: resolved.clone(),
-            terminal_state: None,
-            pointer: None,
-        };
-        if let Err(e) = request::init_precheck_leg(target, &facts) {
-            refuse(entry, Refusal::leg(*e));
+    let requested_by = match &entry.koto_leg {
+        Some(target) => {
+            let facts = AttachingSession {
+                session_id: name.to_string(),
+                template: Some(caller_identity(template_path, compiled, hash)),
+                variables: compiled.variables.clone(),
+                bindings: resolved.clone(),
+                terminal_state: None,
+                pointer: None,
+            };
+            match request::init_precheck_leg(target, &facts) {
+                Ok(precheck) => Some(precheck.requested_by),
+                Err(e) => refuse(entry, Refusal::leg(*e)),
+            }
         }
-    }
+        None => None,
+    };
 
     // ---- writes from here on ----
 
@@ -697,6 +705,15 @@ fn create(
                 refuse(entry, Refusal::leg(*e));
             }
         });
+
+    // The links come last, into this session only: `--dispatched-by`, and a
+    // leg-bound session's requester once the leg is its own.
+    if let Some(dispatcher) = args.dispatched_by {
+        crate::cli::session::record_dispatched_by(backend, name, dispatcher);
+    }
+    if let (Some(_), Some(requested_by)) = (&leg, &requested_by) {
+        crate::cli::session::record_requester_link(backend, name, requested_by);
+    }
 
     let (_, events) = backend
         .read_events(name)
@@ -838,13 +855,15 @@ fn attach(
         Err(e) => refuse(entry, Refusal::var(&e)),
     };
 
-    if let Some(target) = &entry.koto_leg {
-        if let Err(e) = request::init_precheck_leg(target, &facts) {
-            refuse(entry, Refusal::leg(*e));
-        }
-    }
+    let requested_by = match &entry.koto_leg {
+        Some(target) => match request::init_precheck_leg(target, &facts) {
+            Ok(precheck) => Some(precheck.requested_by),
+            Err(e) => refuse(entry, Refusal::leg(*e)),
+        },
+        None => None,
+    };
 
-    // ---- writes from here on: leg bind, then rebind ----
+    // ---- writes from here on: leg bind, then rebind, then links ----
 
     let leg = match &entry.koto_leg {
         Some(target) => match request::init_attach_leg(target, facts, &session_dir) {
@@ -864,6 +883,13 @@ fn attach(
             }),
             3,
         );
+    }
+
+    if let Some(dispatcher) = args.dispatched_by {
+        crate::cli::session::record_dispatched_by(backend, name, dispatcher);
+    }
+    if let (Some(_), Some(requested_by)) = (&leg, &requested_by) {
+        crate::cli::session::record_requester_link(backend, name, requested_by);
     }
 
     let mut out = serde_json::json!({
