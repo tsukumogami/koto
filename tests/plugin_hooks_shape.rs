@@ -7,12 +7,14 @@
 //! root-level `hooks.json` with the command entries directly under each event,
 //! which Claude Code never read, so none of its hooks ran.
 //!
-//! The file now registers no hook. The /workflows SessionStart script
+//! The file now registers no hook; its empty `hooks` object is where a later
+//! SessionStart group goes. The /workflows SessionStart script
 //! (`hooks/session-start-workflows.sh`) and the Stop reminder
 //! (`hooks/stop-workflows.sh`) stay on disk and stay off: registering them
 //! would run a command at every session start and every turn end for every
-//! koto-skills user. This test fails if either is registered, so turning one
-//! on means changing this test too.
+//! koto-skills user. The test fails on any `Stop` event and on any command
+//! naming either script, so turning one on by those names means changing this
+//! test too. It matches names, not behaviour: a renamed copy would pass.
 
 use serde_json::Value;
 use std::path::Path;
@@ -42,7 +44,8 @@ fn check_hooks_text(text: &str) -> Result<(), Vec<String>> {
     let mut problems = Vec::new();
     for (event, groups) in events {
         if event == "Stop" {
-            problems.push("registers a `Stop` event; the Stop reminder stays off".to_string());
+            problems
+                .push("registers a `Stop` event; the plugin runs nothing at turn end".to_string());
         }
         let Some(groups) = groups.as_array() else {
             problems.push(format!("`{event}` must map to a list of matcher groups"));

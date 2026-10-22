@@ -78,9 +78,9 @@ jobs:
           # Run the script and capture output.
           OUTPUT=$(bash plugins/koto-skills/hooks/stop-workflows.sh 2>/dev/null || true)
           if echo "$OUTPUT" | grep -q 'Active koto workflow detected'; then
-            echo "PASS: hook produced reminder with active workflow"
+            echo "PASS: Stop reminder script produced reminder with active workflow"
           else
-            echo "::error::Hook did not produce expected reminder text"
+            echo "::error::Stop reminder script did not produce expected reminder text"
             echo "Got: '$OUTPUT'"
             exit 1
           fi
@@ -96,9 +96,9 @@ jobs:
 
           OUTPUT=$(bash plugins/koto-skills/hooks/stop-workflows.sh 2>/dev/null || true)
           if [ -z "$OUTPUT" ]; then
-            echo "PASS: hook is silent with no active workflows"
+            echo "PASS: Stop reminder script is silent with no active workflows"
           else
-            echo "::error::Hook produced unexpected output when no workflows are active"
+            echo "::error::Stop reminder script produced unexpected output when no workflows are active"
             echo "Got: '$OUTPUT'"
             exit 1
           fi
