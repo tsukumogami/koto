@@ -27,14 +27,20 @@
 #
 # Two kinds of line are let through on purpose:
 #   - `koto request ...`: the request verbs read --with-data only as inline
-#     JSON, so there is no file form to show.
+#     JSON (src/cli/request.rs parses it with parse_json_flag and never
+#     resolves an `@` path), so there is no file form to show. Drop this
+#     exemption, and the notes saying so in koto-user's SKILL.md and
+#     command-reference.md, once those verbs read `@<file>` (koto#404).
 #   - `"invocation": "koto ..."`: a response example quoting the retry
-#     command koto itself prints in `reserved_actions`. The skill text around
-#     it tells the agent to submit that payload from a file.
+#     command koto itself prints in `reserved_actions` (src/cli/retry.rs).
+#     The skill text around it tells the agent to submit that payload from a
+#     file (koto#405).
 #
 # Not seen, and left to review: a command split over lines with `\` where
-# `koto` and `--with-data` land on different lines, and inline JSON handed to
-# koto through a variable set on an earlier line.
+# `koto` and `--with-data` land on different lines, inline JSON handed to
+# koto through a variable set on an earlier line, and an inline `koto next`
+# on a line that also names `koto request` (the exemption covers the whole
+# line).
 #
 # Usage:
 #   scripts/check-inline-evidence.sh            the repository's own tree
@@ -42,6 +48,10 @@
 #
 # Each site is printed as path:line: text. Exit 0 when there is none, 1 when
 # there is one or more, 2 on a usage error or when the scan itself failed.
+# On the repository's own tree a missing plugins/ or an empty file list is a
+# failed scan (exit 2), so moving the plugin can't make the check pass having
+# read nothing; under a ROOT given as an argument it is a clean exit 0, which
+# the fixture tests rely on.
 
 set -uo pipefail
 
@@ -55,6 +65,8 @@ if [ "$#" -gt 1 ]; then
   echo "usage: check-inline-evidence.sh [ROOT]" >&2
   exit 2
 fi
+OWN_TREE=1
+[ "$#" -eq 1 ] && OWN_TREE=0
 ROOT="${1:-$SCRIPT_DIR/..}"
 if [ ! -d "$ROOT" ]; then
   echo "check-inline-evidence.sh: no such directory: $ROOT" >&2
@@ -62,13 +74,23 @@ if [ ! -d "$ROOT" ]; then
 fi
 ROOT="$(cd "$ROOT" && pwd)"
 
-[ -d "$ROOT/plugins" ] || exit 0
+# nothing_to_scan <what>: a failed scan on the repository's own tree, a clean
+# pass under a fixture ROOT (see the header).
+nothing_to_scan() {
+  if [ "$OWN_TREE" -eq 1 ]; then
+    echo "check-inline-evidence.sh: $1 under $ROOT; nothing was scanned" >&2
+    exit 2
+  fi
+  exit 0
+}
+
+[ -d "$ROOT/plugins" ] || nothing_to_scan "no plugins/ directory"
 
 if ! LIST=$(find "$ROOT/plugins" -type f \( -name '*.md' -o -name '*.mdc' \) -not -path '*/evals/*' | LC_ALL=C sort); then
   echo "check-inline-evidence.sh: listing $ROOT/plugins failed" >&2
   exit 2
 fi
-[ -n "$LIST" ] || exit 0
+[ -n "$LIST" ] || nothing_to_scan "no .md or .mdc files in plugins/"
 
 # The single quote reaches awk as a variable, so the program needs no escape
 # for it that one awk reads and another doesn't.

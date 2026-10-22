@@ -129,6 +129,14 @@ else
   fail "expected both sites reported, got exit $RC: [$OUT]"
 fi
 
+# Run on its own tree (no ROOT argument), a copy of the check that finds no
+# plugins/ beside it has scanned nothing, which is a failed scan, not a pass.
+mkdir -p "$WORKDIR/moved/scripts"
+cp "$CHECK" "$WORKDIR/moved/scripts/check-inline-evidence.sh"
+bash "$WORKDIR/moved/scripts/check-inline-evidence.sh" >/dev/null 2>&1
+RC=$?
+if [ "$RC" -eq 2 ]; then pass "its own tree with no plugins/ exits 2"; else fail "its own tree with no plugins/ exited $RC, expected 2"; fi
+
 # A root that isn't a directory, or more than one argument, is a usage error.
 bash "$CHECK" "$WORKDIR/no-such-dir" >/dev/null 2>&1
 RC=$?
