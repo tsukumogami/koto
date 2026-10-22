@@ -86,6 +86,10 @@ pub trait ContextStore: Send + Sync {
     /// event is the caller's job, because only the caller knows whether the
     /// write is one the log records (a transition's assignment is recorded by
     /// the `transitioned` event itself).
+    ///
+    /// The agent writer is refused any key under the reserved `koto/` prefix
+    /// ([`crate::session::links::check_writer_key`]); an implementation that
+    /// overrides this method makes the same check before it writes.
     fn add_with_writer(
         &self,
         session: &str,
@@ -93,7 +97,7 @@ pub trait ContextStore: Send + Sync {
         content: &[u8],
         writer: &str,
     ) -> anyhow::Result<()> {
-        let _ = writer;
+        crate::session::links::check_writer_key(key, writer)?;
         self.add(session, key, content)
     }
 
@@ -121,6 +125,14 @@ pub trait ContextStore: Send + Sync {
 
     /// Remove a key and its content from the store.
     fn remove(&self, session: &str, key: &str) -> anyhow::Result<()>;
+
+    /// [`remove`](Self::remove) on behalf of `writer`. The agent writer is
+    /// refused any key under the reserved `koto/` prefix, before anything is
+    /// removed ([`crate::session::links::check_writer_key`]).
+    fn remove_with_writer(&self, session: &str, key: &str, writer: &str) -> anyhow::Result<()> {
+        crate::session::links::check_writer_key(key, writer)?;
+        self.remove(session, key)
+    }
 
     /// List all keys, optionally filtered by prefix.
     fn list_keys(&self, session: &str, prefix: Option<&str>) -> anyhow::Result<Vec<String>>;

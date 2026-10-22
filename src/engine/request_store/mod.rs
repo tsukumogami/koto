@@ -77,6 +77,7 @@ use crate::engine::types::{
 
 pub use attach::{
     attach_leg, check_session_against_leg, precheck_attach, AttachLeg, AttachingSession,
+    PrecheckAttach,
 };
 pub use view::{LegCounts, LegView, ProgressEntry, RequestView};
 

@@ -263,6 +263,14 @@ Reinitialize the workflow to pick up the new template.
 
 Pick a session that has started. For a batch child, wait until its `outcome` is `running`, or pass the input through the task entry's `vars`.
 
+**Reserved key (exit code 2)** -- the key's first component is `koto`, in any case. That area holds koto's own records about the session, such as dispatched-by links, and only koto writes it. Nothing is written or removed:
+
+```json
+{"error":"context key 'koto/links/dispatched-by/a' is under the reserved prefix 'koto/': only koto writes keys there, so `koto context add` and `koto context remove` refuse them","command":"context add"}
+```
+
+Pick a key outside `koto/`. To record a dispatcher, run `koto session link`.
+
 **Corrupt state file (exit code 3)** -- same as `next` above, including a log with no header. Nothing is written.
 
 ---

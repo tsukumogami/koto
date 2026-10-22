@@ -173,6 +173,14 @@ pub enum Command {
         #[arg(long)]
         intent: Option<String>,
 
+        /// Record that session NAME dispatched this one: a dispatched-by
+        /// link in the new, attached or replacement session's own context,
+        /// as `koto session link` writes. A name that fails the
+        /// session-name rule, or is the session's own, exits 2 before
+        /// anything is written.
+        #[arg(long = "dispatched-by", value_name = "NAME")]
+        dispatched_by: Option<String>,
+
         /// Directory this session's commands run in (its execution
         /// anchor). Defaults to the directory `koto init` is run in,
         /// or to the parent session's anchor when `--parent` is given.
@@ -633,6 +641,24 @@ pub enum SessionCommand {
         intent: String,
     },
 
+    /// Record that another session dispatched this one.
+    ///
+    /// Writes a dispatched-by link, `koto/links/dispatched-by/<NAME>`, into
+    /// SESSION's own context and nowhere else: the dispatcher is not
+    /// written, and need not exist. Meant to be run by the session's own
+    /// driver when a dispatch had no request leg to record it. Recording a
+    /// link the session already holds changes nothing and exits 0. A
+    /// dispatcher name that fails the session-name rule, or names SESSION
+    /// itself, exits 2 and writes nothing.
+    Link {
+        /// The session to record the link in
+        session: String,
+
+        /// Name of the session that dispatched SESSION
+        #[arg(long = "dispatched-by", value_name = "NAME")]
+        dispatched_by: String,
+    },
+
     /// Move a session's execution anchor to another directory.
     ///
     /// The anchor is the directory every tick of a session runs its
@@ -940,6 +966,19 @@ fn load_compiled_template(path: &str) -> anyhow::Result<CompiledTemplate> {
         .map_err(|e| anyhow::anyhow!("failed to read template {}: {}", path, e))?;
     serde_json::from_str(&content)
         .map_err(|e| anyhow::anyhow!("failed to parse template {}: {}", path, e))
+}
+
+/// The exit code of a failed `koto context add` or `koto context remove`:
+/// 2 for a key in the reserved `koto/` area, which the caller must not
+/// name, and 3 for anything else.
+fn context_write_exit_code(e: &anyhow::Error) -> i32 {
+    if e.downcast_ref::<crate::session::links::ReservedKeyError>()
+        .is_some()
+    {
+        EXIT_CALLER_ERROR
+    } else {
+        EXIT_INFRASTRUCTURE
+    }
 }
 
 /// Print a JSON error and exit with the given code.
@@ -1403,12 +1442,25 @@ pub fn run(app: App) -> Result<()> {
             koto_leg,
             parent,
             intent,
+            dispatched_by,
             execution_dir,
             legacy_environment,
         } => {
             // Entry-flag usage errors come first, before any IO: they are
             // caller mistakes, and there is no leg yet to record them on.
             let entry_flags_used = attach_live || replace_terminal || koto_leg.is_some();
+            if let Some(dispatcher) = &dispatched_by {
+                use crate::session::links::{validate_peer, LinkKind};
+                if let Err(e) = validate_peer(LinkKind::DispatchedBy, dispatcher) {
+                    init_entry::usage_error(format!("--dispatched-by: {e}"));
+                }
+                if dispatcher == &name {
+                    init_entry::usage_error(format!(
+                        "--dispatched-by: session '{name}' can't be recorded as dispatched by \
+                         itself"
+                    ));
+                }
+            }
             if vars_file.is_some() && !vars.is_empty() {
                 init_entry::usage_error("--vars-file and --var are mutually exclusive: pass one");
             }
@@ -1508,7 +1560,14 @@ pub fn run(app: App) -> Result<()> {
                     intent.as_deref(),
                     execution_dir.as_deref(),
                     legacy_environment,
-                )
+                )?;
+                // The inline path's helper sees the store only as a
+                // `SessionBackend`, so `--dispatched-by` is recorded here,
+                // once the session exists.
+                if let Some(dispatcher) = &dispatched_by {
+                    session::record_dispatched_by(&backend, &name, dispatcher);
+                }
+                Ok(())
             } else {
                 let template = template.unwrap_or_else(|| {
                     exit_with_error_code(
@@ -1527,6 +1586,7 @@ pub fn run(app: App) -> Result<()> {
                             template: &template,
                             vars: &vars,
                             intent: intent.as_deref(),
+                            dispatched_by: dispatched_by.as_deref(),
                             execution_dir: execution_dir.as_deref(),
                             legacy_environment,
                         },
@@ -1542,6 +1602,7 @@ pub fn run(app: App) -> Result<()> {
                     intent.as_deref(),
                     execution_dir.as_deref(),
                     legacy_environment,
+                    dispatched_by.as_deref(),
                 )
             }
         }
@@ -1745,6 +1806,10 @@ pub fn run(app: App) -> Result<()> {
                     );
                     Ok(())
                 }
+                SessionCommand::Link {
+                    session,
+                    dispatched_by,
+                } => session::handle_link(&backend, &session, &dispatched_by),
                 SessionCommand::Rebind { name, to } => {
                     session::handle_rebind(&backend, &name, to.as_deref())
                 }
@@ -1822,7 +1887,7 @@ pub fn run(app: App) -> Result<()> {
                                 "error": e.to_string(),
                                 "command": "context add"
                             }),
-                            EXIT_INFRASTRUCTURE,
+                            context_write_exit_code(&e),
                         );
                     }
                     Ok(())
@@ -1890,7 +1955,7 @@ pub fn run(app: App) -> Result<()> {
                                 "error": e.to_string(),
                                 "command": "context remove"
                             }),
-                            EXIT_INFRASTRUCTURE,
+                            context_write_exit_code(&e),
                         );
                     }
                     Ok(())
@@ -2310,6 +2375,7 @@ fn handle_init(
     intent: Option<&str>,
     execution_dir: Option<&Path>,
     legacy_environment: bool,
+    dispatched_by: Option<&str>,
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation.
     if let Err(msg) = crate::discover::validate_workflow_name(name) {
@@ -2441,6 +2507,12 @@ fn handle_init(
         }
     } else {
         record_default_intent(backend, name);
+    }
+
+    // `--dispatched-by`, validated before anything was written: a link in
+    // the new session only.
+    if let Some(dispatcher) = dispatched_by {
+        session::record_dispatched_by(backend, name, dispatcher);
     }
 
     // Recover the initial state by reading back the header/events we
@@ -8599,6 +8671,7 @@ Done.
             None,
             None,
             false,
+            None,
         )
         .expect("init should succeed");
 
@@ -8629,6 +8702,7 @@ Done.
             None,
             None,
             false,
+            None,
         )
         .expect("init should succeed");
 
@@ -8715,6 +8789,7 @@ Done.
             None,
             None,
             false,
+            None,
         )
         .expect("init should succeed");
         std::fs::remove_dir_all(&tpl_subdir).unwrap();

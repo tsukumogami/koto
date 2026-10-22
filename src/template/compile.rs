@@ -3384,6 +3384,27 @@ Done.
     }
 
     #[test]
+    fn template_keys_under_the_reserved_prefix_are_refused() {
+        for key in ["koto/links/dispatched-by/x", "KOTO/notes", "koto"] {
+            let src = assignment_template(
+                &format!("    clear_on_entry: [\"{key}\"]\n"),
+                "      - target: done",
+            );
+            let err = compile_src(&src).unwrap_err().to_string();
+            assert!(err.contains("reserved prefix 'koto/'"), "{key}: {err}");
+
+            let src = assignment_template(
+                "",
+                &format!(
+                    "      - target: done\n        context_assignments:\n          \"{key}\": x"
+                ),
+            );
+            let err = compile_src(&src).unwrap_err().to_string();
+            assert!(err.contains("reserved prefix 'koto/'"), "{key}: {err}");
+        }
+    }
+
+    #[test]
     fn clear_on_entry_refuses_an_empty_list() {
         let src = assignment_template("    clear_on_entry: []\n", "      - target: done");
         let err = compile_src(&src).unwrap_err().to_string();

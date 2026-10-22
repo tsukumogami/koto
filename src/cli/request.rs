@@ -1523,7 +1523,9 @@ fn write_session_pointer(
 ///
 /// Every check runs before any write; the store re-runs the ones that
 /// read the request inside its lock. The pointer is written after the
-/// event, overwriting a released one.
+/// event, overwriting a released one. Last, a root session attaching
+/// itself gets a dispatched-by link naming the request's `requested_by`;
+/// an attach whose `--issued-by` names another issuer writes no link.
 fn attach(
     id: &str,
     leg: &str,
@@ -1546,6 +1548,7 @@ fn attach(
 
     let root = koto_root()?;
     let facts = attaching_session(&session, &session_dir, &header)?;
+    let self_run = issued_by.as_deref().is_none_or(|issuer| issuer == session);
     let timestamp = now_iso8601();
     let outcome = request_store::attach_leg(
         &root,
@@ -1562,6 +1565,22 @@ fn attach(
     write_session_pointer(&id, leg, &session, &session_dir, timestamp, "attach");
 
     let view = request_store::read_view(&root, &id).map_err(map_store_error)?;
+
+    // A session attaching itself records who requested it. An attach whose
+    // issuer names some other session is that session acting on this one,
+    // and writes nothing into it.
+    if self_run {
+        match super::build_backend() {
+            Ok(backend) => {
+                super::session::record_requester_link(&backend, &session, &view.header.requested_by)
+            }
+            Err(e) => eprintln!(
+                "warning: could not open the session store to record who dispatched \
+                 '{session}': {e}"
+            ),
+        }
+    }
+
     render(&view, Some(outcome.written))
 }
 
@@ -1690,11 +1709,12 @@ impl InitLegRefusal {
 }
 
 /// Run every leg check `attach` would run for `session`, writing
-/// nothing. `Ok(true)` means the leg is already bound to this session.
+/// nothing. The answer says whether the leg is already bound to this
+/// session, and carries the request's `requested_by`.
 pub(crate) fn init_precheck_leg(
     target: &InitLegTarget,
     session: &request_store::AttachingSession,
-) -> Result<bool, Box<InitLegRefusal>> {
+) -> Result<request_store::PrecheckAttach, Box<InitLegRefusal>> {
     let root = koto_root().map_err(InitLegRefusal::from_error)?;
     request_store::precheck_attach(
         &root,

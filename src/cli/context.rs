@@ -35,6 +35,10 @@ pub fn handle_add(
     // copy holds writes the bucket doesn't have yet.)
     backend.read_header(session)?;
 
+    // A reserved key is refused by the store itself; checking here as well
+    // refuses it before stdin is read, rather than after.
+    crate::session::links::check_writer_key(key, WRITER_AGENT)?;
+
     let content = match from_file {
         Some(path) => {
             fs::read(path).map_err(|e| anyhow::anyhow!("failed to read file '{}': {}", path, e))?
@@ -239,7 +243,7 @@ pub fn handle_remove(
     // changes, so a refused removal leaves the store as it was.
     backend.read_header(session)?;
 
-    store.remove(session, key)?;
+    store.remove_with_writer(session, key, WRITER_AGENT)?;
 
     let event = EventPayload::ContextRemoved {
         key: key.to_string(),

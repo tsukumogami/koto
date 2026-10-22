@@ -261,22 +261,36 @@ pub fn attach_leg(
     )
 }
 
+/// What [`precheck_attach`] learned about an admitted attach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrecheckAttach {
+    /// The leg is already bound to this session: the attach would be a
+    /// no-op.
+    pub already_bound: bool,
+    /// The request's `requested_by`, which never changes after create, so
+    /// a caller can act on it once the attach lands.
+    pub requested_by: String,
+}
+
 /// Run every admission check [`attach_leg`] runs, against an unlocked
 /// read of the request, writing nothing.
 ///
-/// Returns `true` when the leg is already bound to this session (the
-/// attach would be a no-op). Used by `koto init --koto-leg`, which must
-/// know an attach would be admitted before it creates, replaces or
-/// rebinds anything; [`attach_leg`] re-runs the same checks under the
-/// lock, so a write that raced this read is still refused there.
+/// Used by `koto init --koto-leg`, which must know an attach would be
+/// admitted before it creates, replaces or rebinds anything;
+/// [`attach_leg`] re-runs the same checks under the lock, so a write that
+/// raced this read is still refused there.
 pub fn precheck_attach(
     root: &Path,
     request_id: &ValidatedRequestId,
     attach: &AttachLeg,
-) -> Result<bool, RequestStoreError> {
+) -> Result<PrecheckAttach, RequestStoreError> {
     validate_leg_name(&attach.leg_name)?;
     let view = read_view(root, request_id)?;
-    Ok(admit(root, &view, attach)?.is_none())
+    let already_bound = admit(root, &view, attach)?.is_none();
+    Ok(PrecheckAttach {
+        already_bound,
+        requested_by: view.header.requested_by.clone(),
+    })
 }
 
 /// The admission decision shared by [`attach_leg`] (under the lock) and

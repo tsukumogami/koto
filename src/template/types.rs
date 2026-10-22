@@ -2127,6 +2127,17 @@ impl CompiledTemplate {
                     state_name, key, e
                 ));
             }
+            if crate::session::links::is_reserved_key(key) {
+                return Err(format!(
+                    "state {:?}: clear_on_entry key {:?} is under the reserved prefix '{}', \
+                     which only koto writes\n  \
+                     remedy: list keys outside '{}'",
+                    state_name,
+                    key,
+                    crate::session::links::RESERVED_PREFIX,
+                    crate::session::links::RESERVED_PREFIX
+                ));
+            }
             if !seen.insert(key.as_str()) {
                 return Err(format!(
                     "state {:?}: clear_on_entry lists key {:?} more than once",

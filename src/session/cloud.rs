@@ -2210,7 +2210,8 @@ impl SessionBackend for CloudBackend {
 impl CloudBackend {
     /// Write locally (recording `writer` when given), then push the key. A
     /// host-local key is written locally only: it has nothing to push and
-    /// joins no batch.
+    /// joins no batch. The agent writer is refused the reserved `koto/` area
+    /// before anything is recorded, written or pushed.
     fn add_as(
         &self,
         session: &str,
@@ -2218,6 +2219,9 @@ impl CloudBackend {
         content: &[u8],
         writer: Option<&str>,
     ) -> anyhow::Result<()> {
+        if let Some(writer) = writer {
+            crate::session::links::check_writer_key(key, writer)?;
+        }
         self.check_not_migrated(session)?;
         let write = || match writer {
             Some(w) => self.local.add_with_writer(session, key, content, w),

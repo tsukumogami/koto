@@ -3,6 +3,7 @@ pub mod cloud;
 pub mod context;
 pub mod context_log;
 pub mod finished;
+pub mod links;
 pub mod local;
 pub mod recover;
 pub mod sync;
