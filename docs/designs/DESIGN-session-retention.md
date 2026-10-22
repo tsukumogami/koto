@@ -67,8 +67,8 @@ they don't: `plugins/koto-skills/hooks.json` sits at the plugin root in a
 flat shape Claude Code doesn't read), an anchor identity that survives
 resume, compaction and `/clear` (R6), a way to learn whether niwa will
 observe the session's deletion (R9), a close that never writes into the
-anchor (R10), and an idle close and backstop that koto computes when it
-reads (R11, R12).
+anchor (R10), an idle close koto computes when it reads (R11), and an
+observed anchor that never closes on idleness alone (R12).
 
 **Six removal points decide alone.** The terminal tick (`terminal_retention`
 and step 6 of `finish_terminal_tick` in `src/cli/mod.rs`), the parent sweep
@@ -166,7 +166,9 @@ branches, can) is refused and no link is written.
 The anchor's observed marker is `koto/anchor/observed` in the anchor:
 `{"v":1,"key":"<niwa reap key>","at":...}`. An observed close lives in a
 close session of its own, named `<anchor>-closed`, opened already finished
-and holding `koto/links/closes/<anchor>` and `koto/anchor-close`:
+(koto stages it under a temporary name and renames it into place, so no
+reader sees a partial one) and holding `koto/links/closes/<anchor>` and
+`koto/anchor-close`:
 `{"v":1,"anchor":"<name>","anchor_session_id":"<id>","kind":"observed",
 "key":"<niwa reap key>","at":"<rfc3339>"}`. A close record whose
 `anchor_session_id` differs from the anchor's current header id doesn't
@@ -215,9 +217,11 @@ Key assumptions (each with a fallback; the hand checks are listed under
 Implementation Approach):
 
 - Plugin hooks get `CLAUDE_ENV_FILE` in the per-index layout above. If not,
-  the hook also emits `additionalContext` carrying the export, as the
-  /workflows hook does today, and sessions it can't reach fall back to the
-  koto-level reading.
+  the hook also emits `additionalContext` carrying the single export line
+  for `KOTO_ANCHOR` and nothing else, as the /workflows hook does today, and
+  sessions it can't reach fall back to the koto-level reading.
+- Resume keeps the harness session id. Checked by hand; if a resumed
+  session gets a new id, the fallback under Identity finds the predecessor.
 - `/clear` gives a new `session_id` and no previous id. If wrong, the same
   anchor name is simply reused.
 - The hook can compute a stable process token `<host>:<pid>:<epoch-start>`
@@ -227,8 +231,9 @@ Implementation Approach):
 - A watcher the hook detaches (`setsid` or `nohup`, all descriptors
   redirected) outlives the hook. If not, the carrier becomes a second
   SessionStart entry with `"async": true`.
-- niwa's from-hook writes `export NIWA_REAP_KEY=<value>` as a plain line in
-  its own env file (Decision 7 pins it).
+- niwa's from-hook writes `export NIWA_REAP_KEY='<value>'` as a plain,
+  single-quoted line in its own env file (Decision 7 pins it); the watcher
+  strips the quotes.
 - A `niwa dispatch` worker has the `--settings` environment in its process
   environment before plugin hooks run.
 
@@ -246,7 +251,19 @@ successor holds a dispatched-by link to the closed one. Whether the anchor
 is observed-closed is answered by one shared check, introduced with the
 anchors and used by the engine too: `<anchor>-closed` exists and its record
 passes the validation rules (kind, name, anchor session id, key and
-manifest). `open` refuses a harness id ending in `-closed`.
+manifest). `open` refuses a harness id ending in `-closed`. A migrated
+anchor met at a start is treated like an observed-closed one: a successor
+opens, holding a dispatched-by link to it. A hand-cleaned and reopened
+`anchor-<S>` gets a fresh close session at its next close: the close command
+replaces a close session whose recorded anchor id doesn't match.
+
+**Resume under a new id.** If a `resume` start finds no anchor for its
+session id, `open` looks for a predecessor through hints only: an anchor
+whose `anchor_started` recorded the same transcript path digest, or whose
+harness id equals the stem of the payload's transcript path. On a match it
+opens a successor holding a dispatched-by link to it and copies its observed
+marker; with no match it opens a fresh anchor. The hint join only adds a
+link; it never replaces the name match.
 
 **`/clear`.** The new id gets a new `anchor-<S'>`, linked by dispatched-by
 to its predecessor; two conversations never share an anchor, which keeps
@@ -290,11 +307,23 @@ an anchor by that field alone; the close session's header carries
   own anchor explicitly and never trusts an inherited `KOTO_ANCHOR`, which is
   the dispatcher's); idempotent. `--inherit` copies the marker from the
   predecessor its own `anchor_started` recorded.
-- `close --key=<value>`: records each anchor (`kind: "anchor"`) whose
-  observed marker matches as closed, at the current time, in that anchor's
-  close session, and never writes into the anchor (R10). There is no
-  caller-supplied time. `observe` and `close` refuse an empty or malformed
-  key.
+- `close --key=<value> --harness-session=<id>`: records as closed, at the
+  current time, in each one's close session, the anchor whose
+  `anchor_started` recorded that harness id and the successors reached from
+  it through the predecessor chain (anchors whose `anchor_started` names a
+  `predecessor` after `/clear`, compaction or a resume under a new id), each
+  only when its observed marker matches the key. It never writes into an
+  anchor (R10). A child anchor carrying the same key, which records a
+  dispatcher rather than a predecessor, is never matched, and neither is a
+  successor opened because its predecessor already read closed. An anchor
+  that already has a valid close session is an idempotent success, so a
+  repeated or concurrent close changes nothing and exits 0. The close
+  session is staged under a reserved `.koto-staging-` prefix that listing,
+  prune and the manifest ignore and that the next close sweeps, then
+  renamed into place; a rename that finds a valid close session already
+  there counts as success, and replacing a stale one is a single rename
+  over it. There is no caller-supplied time. `observe` and `close` refuse an
+  empty or malformed key or harness id.
 
 **Hook.** `plugins/koto-skills/hooks/hooks.json` replaces the root file, in
 the matcher-group shape; one SessionStart group runs the new
@@ -306,34 +335,49 @@ hook is kept. `session-start.sh`:
    fallback for any value that reaches the env file), and give up silently
    unless `session_id` matches `^[A-Za-z0-9_-]{1,128}$`.
 2. Compute the process token.
-3. Keep the inherited values: `disp=${KOTO_ANCHOR:-}` (always the
-   dispatcher's) and `key=${NIWA_REAP_KEY:-}`.
-4. `out=$(env -u KOTO_ANCHOR -u CLAUDE_CODE_SESSION_ID koto session anchor
-   open ... 2>/dev/null) || true`.
+3. Keep the inherited values: the dispatcher is
+   `${KOTO_DISPATCHER_ANCHOR:-${KOTO_ANCHOR:-}}` (a niwa worker gets the
+   first through niwa's pass-through; a `claude -p` child inherits both from
+   its parent's shell), and `key=${NIWA_REAP_KEY:-}`, taken only when no
+   `KOTO_ANCHOR` was inherited: a process launched from an agent session's
+   shell inherits that session's `KOTO_ANCHOR`, and a niwa worker has it
+   removed, so a child never records its parent's reap key even if the
+   key reached it. koto itself never reads `KOTO_DISPATCHER_ANCHOR`.
+4. `out=$(env -u KOTO_ANCHOR -u KOTO_DISPATCHER_ANCHOR -u
+   CLAUDE_CODE_SESSION_ID koto session anchor open ... 2>/dev/null) || true`.
+   Steps 1 to 5 are the hook's synchronous part; a test bounds them well
+   under one second (95th percentile under 300 ms on the CI runner).
 5. When `CLAUDE_ENV_FILE` is a regular file (not a symlink) whose directory
    is named after the payload's session id, replace the block between
    `# >>> koto-skills` and `# <<< koto-skills` through a temporary file in the
-   same directory and `mv`: `export KOTO_ANCHOR='<own>'` (single-quoted, and
-   only after `<own>` matches `^anchor-[A-Za-z0-9_-]+(-s[0-9]+)?$`), or
-   `unset KOTO_ANCHOR` when open printed no valid name, so a failed hook never
-   leaves the dispatcher's anchor in the shells; `unset NIWA_REAP_KEY`; and a
-   final `:`. Otherwise the hook emits the export as `additionalContext`.
+   same directory and `mv`: `export KOTO_ANCHOR='<own>'` and
+   `export KOTO_DISPATCHER_ANCHOR='<own>'` (single-quoted, and only after
+   `<own>` matches `^anchor-[A-Za-z0-9_-]+(-s[0-9]+)?$`), or `unset
+   KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR` when open printed no valid name, so a
+   failed hook never leaves the dispatcher's anchor in the shells;
+   `unset NIWA_REAP_KEY`; and a final `:`. Otherwise the hook emits the
+   single `KOTO_ANCHOR` export line as `additionalContext`.
 6. On `startup` with no key, detach a watcher that, every 2 seconds for 180
    seconds, reads (never sources) the sibling `sessionstart-hook-*.sh` files
-   for an `export NIWA_REAP_KEY=` line, accepts the value only when it
-   matches `^[A-Za-z0-9_-]{1,128}$`, and runs `koto session anchor observe
+   for an `export NIWA_REAP_KEY=` line, strips its single quotes, accepts
+   the value only when it then matches `^[A-Za-z0-9_-]{1,128}$`, and runs
+   `koto session anchor observe
    --anchor <own> --key=<v>`. On `clear` with `observed=no` and `previous=`
    set, detach a watcher that loops `observe --anchor <own> --inherit` until
    `inherit_until`, never longer than 180 seconds. Watchers run with
-   `KOTO_ANCHOR` unset and exit early when the claude process in the token is
-   gone.
+   `KOTO_ANCHOR` and `KOTO_SESSION_*` unset, fully detached (new session,
+   every descriptor redirected), and exit early when the claude process in
+   the token is gone.
 7. Exit 0.
 
 The common path costs one `ps` and one koto call, about 50 ms. A `claude -p`
-child inherits `KOTO_ANCHOR=<parent's anchor>` and no niwa variable, so its
-own hook records the parent as its dispatcher and is never observed. A
-`niwa dispatch --detach` worker gets `KOTO_ANCHOR` through niwa's declared
-pass-through. The guarded close form a workspace declares as niwa's on-reap
+child inherits its parent's `KOTO_ANCHOR` and `KOTO_DISPATCHER_ANCHOR` and no
+niwa variable, so its own hook records the parent as its dispatcher, replaces
+both in its own shells, and is never observed. A `niwa dispatch --detach`
+worker gets `KOTO_DISPATCHER_ANCHOR` through niwa's declared pass-through,
+and niwa's removal list keeps the dispatcher's `KOTO_ANCHOR` out of its
+launch environment, so a worker with no start hook (a Codex worker) has no
+`KOTO_ANCHOR` and never acts under its dispatcher's anchor. The guarded close form a workspace declares as niwa's on-reap
 command is documented in the koto-user skill and the CLI guide (Decision 7).
 
 #### Alternatives Considered
@@ -405,15 +449,27 @@ liveness inspection only of the component asked about; one `Judge` and one
   event that made the session terminal, or of the trailing cancel, not the
   last event (which reads move). A koto session is alive while running or
   unreadable. A close session is never alive; its stop is its record's `at`.
-  An anchor's last activity is the latest event in it or in any member
-  holding a held-by link to it; its candidate close instants are a valid
-  observed close (final), last activity plus the idle period when it has no
-  marker, and last activity plus the backstop when it has one; it reads
-  closed when any candidate has passed, and its stop is the earliest.
+  An anchor's last activity is the latest event in its own log, where only
+  its agent session writes (start events, `anchor_activity` events, its own
+  read records); events other processes write into members never count, so
+  a bare-shell read, a child's completion or a `koto context add` keeps no
+  anchor open. Its candidate close instants are a valid observed close
+  (final) and, when it has no observed marker (unobserved or imported), last
+  activity plus the idle period. An observed anchor is never closed on
+  idleness: past last activity plus the observed backstop it is reported
+  `stale`, and it reads closed (kind `lineage`) only when every direct
+  neighbour through dispatched-by and held-by links, in either direction
+  (the sessions its own links name and the sessions whose links name it,
+  not their neighbours in turn), is confirmed gone: absent from the store,
+  or an anchor with a valid observed close. Its lineage close instant is
+  the later of its last activity plus the observed backstop and the latest observed-close time among the confirming anchors (a removed peer contributes no time), so it is computed from the store alone. koto's parent-child lineage and `chain/parent`
+  play no part in that test. An anchor reads closed when any candidate has
+  passed, and its stop is the earliest.
 - **Verdict.** `Keep { keepers, retention, unreadable }` or
   `Release { release }`, with `Keeper { name, kind, observed }` and
   `retention = { release: { at, member, close_kind }, passes_at }`;
-  `close_kind` is `terminal`, `cancelled`, `observed`, `idle` or `backstop`.
+  `close_kind` is `terminal`, `cancelled`, `observed`, `idle` or `lineage`,
+  and a keeper anchor past its backstop carries `stale: true`.
   One serializer and one text renderer, so prune and the query print the
   same reason.
 - **Query.** `koto session hierarchy <name> [--json]`: kept or not, keepers
@@ -583,7 +639,7 @@ descendant like a live one.
   link by name that now resolves to the new run also joins the moved one.
   A malformed retention setting at a replace counts as "keep" and moves the
   subtree aside with a warning. A chain child adopted before shirabe's link
-  call (Phase 11) holds only a `chain/parent` name, which carries no session
+  call (Phase 10) holds only a `chain/parent` name, which carries no session
   id, so it follows the name to the new run; that over-retains and nothing
   more. The replace answer gains `moved_to`, and
   `replaced_result` is unchanged.
@@ -622,10 +678,18 @@ In `get` and `exists`, with the reader's anchor taken from `KOTO_ANCHOR`:
 | unset, or names no existing anchor | any | the read session, as today (a known cross-session writer) |
 
 A failure to append to the reader's anchor warns on stderr and never fails
-the read. The event-feed spec gains the optional `session` field. The read
-session's run journal stops counting reads by other agent sessions with no
-code change, because its fold reads only its own log. A read record is
-activity of the reader's anchor and never of the read session.
+the read. The event-feed spec gains the optional `session` field. The
+consumers of `context_read` events are named and each handles the new
+field: the read session's run journal stops counting reads by other agent
+sessions with no code change, because its fold reads only its own log, and
+the run journal's `context_reads` records (`src/run_journal/context_reads.rs`)
+attribute an anchor's read record to the session its `session` field names;
+a session archive that ships logs off the host reads the same field,
+treating it as an untrusted name (no path resolution, control characters
+stripped) and shipping the names a record carries, never context values; and the
+idle computation treats a read record as activity of the reader's anchor,
+never of the read session. The anchorless row stays a known cross-session
+writer, tracked by koto#412.
 
 #### Alternatives Considered
 
@@ -645,9 +709,8 @@ manifest and before it writes the staged manifest, the moved copy's
 `koto/links/held-by/*` keys are settled by the PRD's table, with the
 importing command's `KOTO_ANCHOR` as the importing environment's anchor:
 
-- kept when the named anchor is in the local store, its header's
-  `execution_dir` is the importing command's workspace, and it is open and
-  not migrated;
+- kept when the name resolves in the local store to an anchor that is
+  open and not migrated (its `execution_dir` is a hint only);
 - otherwise rewritten to `koto/links/held-by/<importer's anchor>` with
   `"was"` holding the old name;
 - with no importer anchor, dropped.
@@ -674,55 +737,117 @@ Resolved inline.
 
 #### Chosen: a pass-through list, a reap key, and a bounded on-reap command
 
-- **Pass-through.** `[session.env] passthrough = ["NAME", ...]`, in the
-  agent-neutral table, since Codex workers get it too. At load,
-  niwa refuses a name starting `NIWA_` or `CLAUDE_`,
-  `OTEL_RESOURCE_ATTRIBUTES`, or a duplicate. In `runDispatch`
+- **Pass-through.** `[session.dispatch_env] passthrough = ["NAME", ...]`,
+  a new agent-neutral table beside `[session.env]`, since Codex workers get
+  it too. It is separate because `[session.env]` is written at apply time
+  and this one is read at dispatch, from niwa's environment at that moment.
+  At load, niwa refuses a name starting `NIWA_` or `CLAUDE_`,
+  `OTEL_RESOURCE_ATTRIBUTES`, a duplicate, or a name also declared in
+  `[session.env]` `vars` or `promote`. In `runDispatch`
   (`internal/cli/dispatch.go`), a new launch-settings contributor copies each
   set name from niwa's environment into the one `env` object of the
   `--settings` document, merged with the lineage
   `OTEL_RESOURCE_ATTRIBUTES` (the env value type becomes a small ordered
-  map, a third named exception to the constant-values rule in
+  map, widening the first named exception (the lineage `env` key) to the constant-values rule in
   `dispatch_settings.go`), and into the launched process environment; an
   unset name is skipped. Codex workers get the process environment only.
-  Because the settings document travels on the worker's command line,
-  niwa also refuses names that look like credentials (ending `_KEY`,
-  `_SECRET`, `_TOKEN` or `_PASSWORD`, or starting `AWS_`), and the guide
-  says to declare only the anchor variable.
+  `[session.dispatch_env] unset = ["NAME", ...]` lists names niwa removes from a
+  worker's launch environment, so a value the dispatching shell carries
+  never reaches a worker with no hook to replace it. Because the settings
+  document travels on the worker's command line, niwa also refuses names
+  that look like credentials, matched case-insensitively (ending `_KEY`,
+  `_APIKEY`, `_SECRET`, `_TOKEN`, `_PAT`, `_PASSWORD`, `_PASSWD` or
+  `_CREDENTIALS`, or starting `AWS_`), and koto's guide says to declare only
+  `KOTO_DISPATCHER_ANCHOR` for pass-through and `KOTO_ANCHOR` for removal.
 - **Reap key.** `NIWA_REAP_KEY`: for `niwa dispatch`, the dispatch id, set in
   the settings and process environments before launch; for `niwa instance
   from-hook`, the session id, written as a plain, single-quoted `export
   NIWA_REAP_KEY='<value>'` line to the hook's `CLAUDE_ENV_FILE`. The
   session mapping already holds both values (`DispatchID`, `SessionID`), so
   at reap niwa recomputes the key from the mapping (the dispatch id when
-  present, else the session id) and stores nothing new. niwa sets or passes
-  the variable only when the value matches `^[A-Za-z0-9_-]{1,128}$`. The key is an identifier, not a
-  secret.
-- **On-reap.** `[session.on_reap] command = "<shell>"`, `timeout = "10s"`.
-  niwa runs `sh -c`, from the workspace root (the removed instance is
+  present, else the session id); the only new stored field is the
+  mapping's count of failed on-reap runs, which the ten-run limit reads.
+  niwa sets or passes
+  the variable only when the value matches `^[A-Za-z0-9_-]{1,128}$`. A
+  dispatch sets it even when no lineage value is composed, replaces any
+  `NIWA_REAP_KEY` inherited from niwa's own environment in the worker's
+  process environment (built from `os.Environ` in `dispatch_launcher.go`),
+  and removes an inherited one when it has no valid key. The key is an
+  identifier, not a secret. At reap the recomputed value is checked
+  against the same pattern again, and a mapping whose value fails it is
+  skipped with a warning line rather than handed to the command.
+- **On-reap.** `[session.on_reap] command = "<shell>"`, `timeout = "10s"`,
+  `env = ["NAME", ...]` (its own list, with the same load-time refusals as
+  the pass-through lists; a name may also appear in `[session.dispatch_env]`,
+  since this list reaches only the command's process environment and never a
+  command line, so a variable the close command needs never has
+  to ride on every worker's command line).
+  niwa runs `sh -c`, from the workspace root (the removed instance may be
   gone), with only `PATH`, `HOME`, `NIWA_REAP_KEY`,
-  `NIWA_SESSION_ID` and `NIWA_INSTANCE_PATH`, a per-run timeout and a
+  `NIWA_SESSION_ID`, `NIWA_INSTANCE_PATH` and each name in
+  `[session.on_reap] env` set in niwa's environment (so a variable the close
+  command needs, such as koto's session-store location, reaches it without
+  niwa naming it), a per-run timeout and a
   30-second wall budget per niwa step; a run the budget can't start is
   skipped. The command runs in its own process group, killed whole on
   timeout. A failure, timeout or skip prints one `niwa: warning: on-reap for
   session <id>: <reason>` line, with the reason truncated and stripped of
-  control characters, and is never retried; the step's outcome is
-  unchanged. The command has the trust level of a hook the workspace
+  control characters; niwa keeps that session's mapping, so the next reap
+  that finds the session gone runs the command again, and drops it with a
+  final warning after ten failed runs. A mapping kept because its session
+  was still running, kept by `--keep-session`, or left behind by an instance
+  deleted by hand is reaped the same way once its session is gone; reap
+  walks the stored mappings as well as the instances on disk
+  (`selectReapTargets` walks only the latter today), so a mapping whose
+  instance and session are both gone is still found. The
+  step's outcome is unchanged. The command has the trust level of a hook the workspace
   configuration installs. Call sites: the mapped reap in `reap.go` (with idle-grace
   reclaim and the reaps `dispatch`, `create` and `watch` run first),
   `removeOwningSessions` in destroy when it removes or finds gone a session,
   and `watch`'s discard of a staged review whose session is gone (looking up
   the mapping for the key). Not reset, `--keep-session`, the unmapped
-  backstop or a dispatch rollback.
+  backstop or a dispatch rollback. In destroy the session step runs before
+  the instance directory goes (`destroy_session.go`), and
+  `removeOwningSessions` deletes the mapping right after removing the
+  session today. That changes: destroy runs the command after the session's
+  removal succeeded, from the workspace root whether or not the directory
+  still exists, and deletes the mapping only once the command succeeds, as
+  reap does; a failed run keeps the mapping for the next reap, and a failed
+  session removal runs nothing and keeps the mapping. A reap or destroy that
+  can't read `[session.on_reap]` from the workspace configuration counts
+  each session's run as failed, so its mapping is kept. `niwa watch`'s
+  review launch, which calls the launcher directly with `os.Environ()`
+  rather than going through `runDispatch`, gets the same environment
+  shaping (pass-through, removal list, reap key), because it is built into
+  the launch-request path both use.
 - **Workspace configuration** (dot-niwa) declares koto-skills in
-  `[claude] plugins`, `passthrough = ["KOTO_ANCHOR"]`, and
-  `[session.on_reap] command = "command -v koto >/dev/null 2>&1 || exit 0;
-  exec koto session anchor close --key=\"$NIWA_REAP_KEY\""`.
+  `[claude] plugins`, `[session.dispatch_env] passthrough =
+  ["KOTO_DISPATCHER_ANCHOR"]` and `unset = ["KOTO_ANCHOR"]`, and
+  `[session.on_reap] command = "[ -n \"$NIWA_REAP_KEY\" ] || exit 0;
+  command -v koto >/dev/null 2>&1 || exit 0; koto session anchor close
+  --help >/dev/null 2>&1 || exit 0; exec koto session anchor close
+  --key=\"$NIWA_REAP_KEY\" --harness-session=\"$NIWA_SESSION_ID\""`, so a
+  session with no key, a host with no koto, or an older koto without the
+  verb exits 0 quietly, and the close reaches only the agent session niwa
+  removed (`NIWA_SESSION_ID` is already in the command's environment, so
+  niwa still names no koto). `NIWA_SESSION_ID` is the mapping's
+  `SessionID`, the Claude Code session id the agent session runs under,
+  which is the `session_id` its start hook received and recorded as
+  `harness_session`; for a dispatched worker the reap key is the dispatch id
+  but the session id is still that one. `close` prints `closed=<n>`, so a
+  binding that matched nothing is visible in the command's output, and it
+  still exits 0 then, because a session without the plugin has no anchor
+  and must not count as a failed run.
 
 #### Alternatives Considered
 
 - **A detached on-reap run.** A crash between the reap and the run loses
-  the close silently; the observed backstop already covers a lost close.
+  the close silently, and with no idle backstop for observed anchors a lost
+  close would keep a hierarchy until someone removes it.
+- **Skipping a failed run.** The same: nothing else would close the anchor.
+- **Passing `KOTO_ANCHOR` itself through.** A worker with no start hook
+  would act under its dispatcher's anchor, writing into another agent
+  session's anchor.
 - **A denylist naming `KOTO_SESSION_*`.** niwa would name koto (R29).
 
 ### Decision 8: shirabe's link calls and the reclaimable rule
@@ -733,22 +858,35 @@ Resolved inline.
 
 - **Chain dispatch.** `skill-session.sh adopt`, when one parent matched, runs
   `koto session link <child> --dispatched-by <parent>` after writing
-  `chain/parent`; a failure fails `adopt` (shirabe requires koto), and the
-  script's koto floor rises to the release that ships the verb.
+  `chain/parent`; a failure is retried once, then `adopt` prints
+  `warning=link-failed` and records it in a context key in the child's own
+  session and goes on, as the openers do. The script's koto floor rises to
+  the release that ships the verb. `skill-session.sh open` and `/work-on`'s
+  PLAN-mode opener gain `--dispatched-by <name>` in the same change, with
+  the same retry and record.
 - **`/execute` coordinated children.** The step agent's `koto init` for the
   `/work-on` child gains `--dispatched-by execute-<slug>`. These are root
   sessions opened inside the run's own agent session, so its anchor holds
   them as well; the link keeps them when the run starts from a bare shell.
-- **`/coordinate` message-path workers.** `render-brief.sh` renders
-  `dispatcher_session`; `skill-session.sh open`, `coordinate-open.sh` and
-  `/work-on`'s PLAN-mode opener gain `--dispatched-by <name>`, which links
-  after opening, retries once on failure, then prints
-  `warning=link-failed`, which the worker carries into its result, and goes
-  on; the
-  message-path entry points pass the brief's dispatcher. Re-brief,
-  hand-off and unwatchable paths re-render the brief, so they carry it.
-  Lands with or after the coordinator-record teardown build (shirabe#978 to
-  #986).
+- **`/coordinate` message-path workers.** `coordinate-open.sh` gains
+  `--dispatched-by <name>` too, which links after opening, retries once on
+  failure, then prints `warning=link-failed` and records it in a context key
+  in the worker's own session, and goes on. `render-brief.sh` puts the exact
+  opener invocation, with `--dispatched-by <dispatcher_session>` filled in,
+  into the brief's Goal, so no entry point's skill text passes the flag; the
+  worker's result renderer reads the recorded warning from the worker's
+  session. Re-brief, hand-off and unwatchable paths re-render the brief, so
+  they carry it; after a re-brief, `dispatcher_session` names the
+  coordinator run that rendered the new brief. A recycled coordinator, a new
+  run carrying an earlier run's record, is linked to the old run by
+  `coordinate-open.sh` with a dispatched-by link in the new run's session,
+  and `references/koto-session-retention.md` says so. Lands inside or after
+  the teardown build's brief-renderer, opener and worker-dispatch changes
+  (shirabe#981, #984 and #985), and any `dispatch-worker.sh` change goes in
+  with it.
+- **`/execute`'s rendered command.** Where `/execute` renders the step
+  agent's `koto init` command, `--dispatched-by` goes into that rendered
+  command rather than into prose.
 - **Retire** `skill-session.sh reclaimable`, its tests and the convention's
   reclaimable section; the convention names `koto session hierarchy`.
 - **Guard.** A shirabe test fails when a template's gate or default action,
@@ -776,9 +914,11 @@ when present, marks sessions it will reap; the anchor records that marker.
 Every removal by rule or subtree asks one engine one question: is anything
 in this session's connected hierarchy alive, and if not, has the retention
 passed since the last member stopped? An anchor is alive until niwa's
-on-reap command records its observed close, or, with no observer, until its
-idle period passes since its last activity, with a long backstop for
-observed anchors whose close never lands. Everything the engine needs is in
+on-reap command records its observed close; only an unobserved or imported
+anchor closes after its idle period, counted from activity in its own log.
+An observed anchor whose close never lands is repeated by niwa's next reap,
+reported stale after the observed backstop, and closed without niwa only
+when every session directly linked to it is confirmed gone. Everything the engine needs is in
 sessions' own keys and logs on the local store, so it works with koto alone,
 with no niwa and no cloud. Import carries links verbatim and settles only
 the moved session's own held-by links, so a hierarchy follows a session by
@@ -789,10 +929,12 @@ Three existing koto behaviours still write into a session from another
 session's process and stay outside this build, named so nobody mistakes
 them for part of the rule: a child's terminal tick appending its completion
 to its parent's log (koto#409 tracks replacing it with the parent reading
-its children at its own tick); `koto context add` naming any session; and a
-read with no reader anchor logging into the read session. Under the cloud
+its children at its own tick); `koto context add` naming any session
+(koto#411); and a read with no reader anchor logging into the read session
+(koto#412). Under the cloud
 backend a migrated source refuses all three. Nothing in this design treats
-a completion record as a link or a sign of life.
+a completion record as a link or a sign of life, and none of the three
+counts toward an anchor's activity.
 
 ## Solution Architecture
 
@@ -806,7 +948,7 @@ a completion record as a link or a sign of life.
    koto init / koto next  ─────────────────────────> session B  koto/links/held-by/anchor-S
    dispatch (leg, link verb, inherited variable) ──> session C  koto/links/dispatched-by/B
                                                               
- niwa reap ──> on-reap: koto session anchor close --key K ──> anchor-S-closed
+ niwa reap ──> on-reap: koto session anchor close --key K --harness-session S ──> anchor-S-closed
                                                                 koto/links/closes/anchor-S
 
  removal points ──> hierarchy engine (Graph::scan, Judge) ──> Keep{keepers} | Release
@@ -818,8 +960,8 @@ a completion record as a link or a sign of life.
 reserved prefix and link kinds; `write_link(store, session, kind, peer,
 hints)` through `add_with_writer(WRITER_KOTO)` plus a `context_added` event,
 the pattern `workflows_surface/discover.rs` uses; `read_links` for a
-session. The refusal of `koto/` keys sits in the `Add` and `Remove` arms of
-the context dispatch in `src/cli/mod.rs`.
+session. The refusal of `koto/` keys, case-insensitive, sits in the
+context store's write path, so every caller of `add` and `remove` meets it.
 
 **koto: link writers.**
 - `koto session link <session> --dispatched-by <name>` (`src/cli/session.rs`).
@@ -834,8 +976,14 @@ the context dispatch in `src/cli/mod.rs`.
   `koto/links/held-by/<it>` exists, they write one. When that anchor reads
   closed by an observed close and has a successor, they also write a
   held-by link to the current successor, so a resumed session whose shells
-  still name the old anchor stays held. A value that names no anchor writes
-  nothing. `koto next` on an anchor or close session is refused.
+  still name the old anchor stays held. Each such `koto init` and tick also
+  appends an `anchor_activity` event to that anchor, the agent session's own
+  anchor, at most one per tenth of the idle period (read from the anchor's
+  last event, so the throttle needs no state); this is the only activity the
+  idle computation reads. A value that names no anchor writes nothing. koto
+  reads only `KOTO_ANCHOR` as the caller's anchor, never
+  `KOTO_DISPATCHER_ANCHOR`. `koto next` on an anchor or close session is
+  refused.
 
 **koto: anchors** (`src/session/anchor.rs` and
 `src/cli/session_anchor.rs`, new). Two embedded templates: the anchor's
@@ -889,13 +1037,14 @@ references).
 **niwa** (`internal/config`, `internal/cli/dispatch.go`,
 `dispatch_settings.go`, `instance_from_hook.go`, `reap.go`,
 `destroy_session.go`, `watch.go`, a new `internal/cli/on_reap.go`, and
-`internal/config/session.go` for `[session.env] passthrough` and
+`internal/config/session.go` for `[session.dispatch_env]` and
 `[session.on_reap]`).
 
 **shirabe** (`scripts/skill-session.sh`, `skills/execute/references/
 step-agent-handoff.md`, `skills/coordinate/scripts/render-brief.sh`,
-`coordinate-open.sh`, the message-path entry points' setup steps,
-`references/skill-session-convention.md`, a template guard test).
+`coordinate-open.sh`, `skills/work-on/scripts/work-on-open.sh`,
+`references/skill-session-convention.md`,
+`references/koto-session-retention.md`, a template guard test).
 
 **dot-niwa** (workspace configuration): the three declarations of
 Decision 7.
@@ -947,10 +1096,11 @@ koto init <name> ... [--dispatched-by <name>]
 koto session anchor open --harness-session <id> --source <s> [--process <t>]
                          [--dispatched-by <name>] [--observed-key <v>] [--workspace <dir>]
 koto session anchor observe --anchor <name> (--key=<v> | --inherit)
-koto session anchor close --key=<v>
+koto session anchor close --key=<v> --harness-session=<id>
 koto session hierarchy <name> [--json]
 
 KOTO_ANCHOR                      the running agent session's anchor
+KOTO_DISPATCHER_ANCHOR           the dispatcher's anchor, read only by the start hook
 KOTO_RETENTION_KEEP                default 7d   (retention.keep)
 KOTO_RETENTION_IDLE_PERIOD         default 7d   (retention.idle_period)
 KOTO_RETENTION_OBSERVED_BACKSTOP   default 30d  (retention.observed_backstop)
@@ -984,11 +1134,12 @@ JSON.
 niwa configuration:
 
 ```toml
-[session.env]
-passthrough = ["KOTO_ANCHOR"]
+[session.dispatch_env]
+passthrough = ["KOTO_DISPATCHER_ANCHOR"]
+unset = ["KOTO_ANCHOR"]
 
 [session.on_reap]
-command = "command -v koto >/dev/null 2>&1 || exit 0; exec koto session anchor close --key=\"$NIWA_REAP_KEY\""
+command = "[ -n \"$NIWA_REAP_KEY\" ] || exit 0; command -v koto >/dev/null 2>&1 || exit 0; koto session anchor close --help >/dev/null 2>&1 || exit 0; exec koto session anchor close --key=\"$NIWA_REAP_KEY\" --harness-session=\"$NIWA_SESSION_ID\""
 timeout = "10s"
 ```
 
@@ -997,8 +1148,10 @@ timeout = "10s"
 1. **Start.** The hook computes `anchor-<S>`, runs `anchor open` (link to an
    inherited dispatcher, observed marker from `NIWA_REAP_KEY`, an
    `anchor_started` event), and writes `export KOTO_ANCHOR`,
-   `unset NIWA_REAP_KEY` to its env file.
-2. **Work.** `koto init` and `koto next` add held-by links; dispatches add
+   `export KOTO_DISPATCHER_ANCHOR` and `unset NIWA_REAP_KEY` to its env
+   file.
+2. **Work.** `koto init` and `koto next` add held-by links and throttled
+   `anchor_activity` events in the agent's own anchor; dispatches add
    dispatched-by links in the dispatched session; nothing is written
    elsewhere.
 3. **Read.** `context get/exists` log in the read session only for the
@@ -1007,8 +1160,9 @@ timeout = "10s"
 4. **Terminal.** The tick keeps any session with an edge (`hierarchy`); the
    sweep lists kept children; lone sessions go as today.
 5. **Close.** niwa's reap runs the on-reap command, which writes
-   `anchor-<S>-closed`; with no niwa, the engine reads the anchor closed
-   after its idle period.
+   `anchor-<S>-closed`, and repeats at later reaps until it succeeds; with
+   no niwa, the engine reads an unobserved anchor closed after its idle
+   period.
 6. **Reclaim.** `koto session prune` (or workspace prune, or a re-run)
    removes a hierarchy once nothing is alive and the retention has passed
    since its release instant, anchors before their close sessions.
@@ -1018,8 +1172,8 @@ timeout = "10s"
 ## Implementation Approach
 
 Each phase is one pull request with its tests, in an order where every
-merged state is sound. Phases 1 to 8 are koto, 9 and 10 niwa, 11 and 12
-shirabe, and 13 the workspace configuration.
+merged state is sound. Phases 1 to 8 are koto, 9 niwa, 10 and 11 shirabe,
+and 12 the workspace configuration.
 
 ### Phase 1: koto-skills hooks load
 
@@ -1029,7 +1183,8 @@ Stop hook), delete the root file, point `validate-plugins.yml`'s Stop-hook
 smoke test at the new path, and add a shape check that fails when the file
 is missing or flat. Independent of everything else; today's /workflows hook
 starts working, and the Stop hook still checks `koto workflows`, which no
-anchor reaches yet.
+anchor reaches yet. The changelog says that this turns on the plugin's
+dormant /workflows and Stop hooks for every koto-skills user.
 
 ### Phase 2: dispatched-by links
 
@@ -1042,9 +1197,10 @@ leg-bound and self-attach links. Links are data only; no removal changes.
 The two embedded templates, the header `kind`, `anchor_started`, the
 `koto session anchor open|observe|close` verbs with successors, the `/clear`
 scan (with its 250 ms test) and marker inheritance, close sessions, held-by
-links from `KOTO_ANCHOR` at init and tick (with the successor rule), refusal
-of `koto next` on anchors, and their exclusion from `koto workflows`, the
-/workflows materializer and the dashboard. Depends on Phase 2.
+links and throttled `anchor_activity` events from `KOTO_ANCHOR` at init and
+tick (with the successor rule), the resume fallback, refusal of `koto next`
+on anchors, and their exclusion from `koto workflows`, the /workflows
+materializer and the dashboard. Depends on Phase 2.
 
 ### Phase 4: the engine, settings and the query
 
@@ -1070,7 +1226,8 @@ scope; cleanup and cancel's `live_members`. Depends on Phase 4.
 changelog entry saying end-of-run removal no longer removes a session with a
 link or lineage. It also carries the removal-outcome halves of the
 scenarios Phase 4 checks only as verdicts (Co-parent, No lineage needed,
-Release instant, Absent peer, Backstop, and Single writer over them).
+Release instant, Absent peer, Observed anchors never idle-close, and
+Single writer over them).
 Depends on Phase 5, whose prune those end-to-end scenarios check.
 
 ### Phase 7: reads and import
@@ -1078,56 +1235,74 @@ Depends on Phase 5, whose prune those end-to-end scenarios check.
 The reader-anchor table in `context get/exists` and the feed's `session`
 field; import's held-by settlement, `koto/imported-from`, the dropped
 reserved keys and the anchor marker clear, with the one-host import tests
-under per-command cloud configuration in the environment. Depends on
+under per-command cloud configuration in the environment; the run
+journal's attribution of an anchor's read record to the session it names,
+and the other named read consumers. Depends on
 Phase 6, since the import scenarios run the terminal tick and the prune.
 
 ### Phase 8: the anchor hook
 
 `hooks/session-start.sh` with its watchers, the bash suite on synthetic
-payloads, and the koto-user skill and CLI guide updates (the guarded on-reap
-form, declaring only `KOTO_ANCHOR` for niwa's pass-through, and the
-corrected `workspace prune` text). Depends on Phases 1 and 7, because its
+payloads, a test that bounds the hook's synchronous part, and the docs:
+`docs/guides/cli-usage.md` and the koto-user skill's
+`references/command-reference.md` carry the verbs, settings, the guarded
+on-reap form, the pass-through and removal names, and the corrected
+`workspace prune` text; the koto-user `SKILL.md` gains one line at most (the
+plugin's hook opens the anchor, so don't run anchor verbs, and ask
+`koto session hierarchy` why a session is kept). Depends on Phases 1 and 7, because its
 end-to-end scenarios (First dispatch, Idle close, Bare shell, No niwa) check
 prune and terminal-tick outcomes and reads that leave the read session
 untouched, and its docs describe them. Hand
 checks recorded on the pull request: plugin hooks get `CLAUDE_ENV_FILE` in
 the per-index layout; `/clear` mints a new id; where a resume hook's env
-file points; the detached watcher survives; a dispatched worker sees the
-`--settings` environment at its first hook.
+file points; whether resume keeps the session id; the detached watcher
+survives; a dispatched worker sees the `--settings` environment at its first
+hook.
 
-### Phase 9: niwa pass-through
+### Phase 9: niwa pass-through, reap key and on-reap command
 
-`[session.env] passthrough`, its load-time refusals, and the merged
-settings `env` contributor. `passthrough` doesn't count toward the table's
-`IsEmpty()`, so workspaces that declare only it get no empty env blocks
-from the existing materializers. Independent of koto.
+One pull request, because both pieces write the one `env` entry of the
+launch settings: today that entry is a value type holding only
+`OTEL_RESOURCE_ATTRIBUTES`, set only when a lineage value exists, so two
+parallel changes would clobber each other. This phase turns it into a small
+ordered map that holds the lineage attributes when there are any, the
+declared pass-through names, and `NIWA_REAP_KEY`, which is present even when
+no lineage value is composed. It also adds `[session.dispatch_env]`
+`passthrough` and `unset` with their load-time refusals (read at dispatch
+only, so no apply-time materializer sees them), `NIWA_REAP_KEY` for dispatch
+(replacing or removing an inherited value) and from-hook (recomputed from
+the mapping at reap), `[session.on_reap]`, `on_reap.go` with its per-run
+timeout, process group, step budget, its own `env` list
+and mapping retention, reap's walk over stored mappings, destroy's key read
+before the mapping is deleted, and the call sites. Independent of koto.
 
-### Phase 10: niwa reap key and on-reap command
+### Phase 10: shirabe links for chains and `/execute`, and the rule's retirement
 
-`NIWA_REAP_KEY` for dispatch and from-hook (recomputed from the mapping at
-reap), `[session.on_reap]`, `on_reap.go` with its per-run timeout, process
-group and step budget, and the call sites. Independent of koto.
-
-### Phase 11: shirabe links for chains and `/execute`, and the rule's retirement
-
-`adopt`'s link call, the `/execute` step agent's `--dispatched-by`, retiring
+`adopt`'s link call, `--dispatched-by` on `skill-session.sh open` and the
+`/work-on` PLAN-mode opener, the `/execute` step agent's `--dispatched-by`, retiring
 `reclaimable`, the R32 guard test, and the koto floor bump. Waits for a koto
-release carrying Phases 2 and 4 (the convention names the hierarchy
+release carrying Phases 2, 4 and 5 (the convention names the hierarchy
 query).
 
-### Phase 12: shirabe `/coordinate` message-path links
+### Phase 11: shirabe `/coordinate` message-path links
 
-The brief field, the openers' `--dispatched-by` with its retry and warning.
-Waits for a koto release carrying Phase 2 and for the coordinator-record
-teardown build (shirabe#978 to #986).
+The brief's rendered opener invocation, `coordinate-open.sh`'s
+`--dispatched-by` with its retry and recorded warning, and the recycled
+coordinator's link to its earlier run. Waits for Phase 10 and for the
+teardown build's brief-renderer, opener and worker-dispatch changes
+(shirabe#981, #984 and #985).
 
-### Phase 13: workspace configuration
+### Phase 12: workspace configuration
 
 The dot-niwa declarations of Decision 7. Waits for releases carrying
-Phases 3 to 8 (koto) and 9 and 10 (niwa); its pull request records the
+Phases 3 to 8 (koto) and 9 (niwa); its pull request records the
 end-to-end niwa scenarios run against those releases, including a detached
 dispatch and the child of a reaped worker. Applying it on a host is the
 operator's step.
+
+The critical path is koto's serial chain, Phases 2 to 8, each of whose
+end-to-end checks needs the one before it; the release gates come after it
+and are short by comparison.
 
 ## Security Considerations
 
@@ -1152,8 +1327,13 @@ otherwise. niwa validates and single-quotes the reap key it writes there. The
 watcher reads, never sources, niwa's file and validates the value before
 passing it as `--key=<value>`.
 
-**Cross-anchor writes.** Watchers name their own anchor explicitly and run
-with `KOTO_ANCHOR` unset, because the inherited value is the dispatcher's;
+**Cross-anchor writes.** The dispatcher's anchor reaches a dispatched
+session only as `KOTO_DISPATCHER_ANCHOR`, which koto never treats as the
+caller's anchor, and niwa's removal list keeps `KOTO_ANCHOR` out of a
+worker's launch environment, so a worker with no start hook never writes
+into its dispatcher's anchor. Watchers name their own anchor explicitly and
+run with `KOTO_ANCHOR` unset, because the inherited value is the
+dispatcher's;
 `observe` refuses anything that isn't an anchor. `KOTO_ANCHOR` is otherwise
 an unauthenticated name: koto acts on it only when it names an existing
 anchor. A same-user process that sets it to another agent session's anchor
@@ -1182,14 +1362,18 @@ carry a workspace path, which session headers already carry. A read from
 another agent session is recorded in the reader's anchor with the read
 session and key names. niwa's pass-through puts declared variables on the
 worker's command line, so it refuses names that look like credentials,
-and the guide says to declare only `KOTO_ANCHOR`. The name heuristic can't
+and the guide says to declare only `KOTO_DISPATCHER_ANCHOR`. The name heuristic can't
 catch every secret (a `DATABASE_URL`, say); what keeps credentials out is
 that the workspace owner declares exact names. No shirabe path launches a
 worker from inside a tick (R32).
 
 **Commands run on niwa's behalf.** The on-reap command has the trust level
 of a hook the workspace configuration installs. It runs with a scrubbed
-environment, in its own process group, killed whole at its timeout.
+environment, in its own process group, killed whole at its timeout. The
+close it runs is bound to the removed agent session's id as well as the
+reap key, so a key that leaked to a child, or a repeated close after a
+failure, can't close another agent session's anchor; and a child's hook
+ignores an inherited reap key whenever it also inherited `KOTO_ANCHOR`.
 
 **Plugin and version trust.** Once the plugin's hooks load, a plugin release
 runs code at every session start; workspaces should pin the plugin version.
@@ -1217,8 +1401,12 @@ store shared by mixed koto versions loses the guarantee.
 - Sessions with any edge, every koto parent and batch child included, now
   wait for a prune instead of leaving at their terminal tick, so stores grow
   until someone prunes.
-- A coordinator idle past the idle period with nothing observing its
-  deletion loses its hold (the owner's accepted cost).
+- An unobserved agent session idle past the idle period, or an imported
+  anchor, loses its hold (the owner's idle close covers only these two
+  cases).
+- An observed anchor whose close never lands on a host where niwa was
+  removed keeps its hierarchy until someone removes it; it is reported
+  stale, never closed on idleness.
 - One unreadable header freezes all reclamation until it is removed.
 - A long-lived anchor can make one large component, and a query's cost
   grows with its component.
@@ -1229,6 +1417,8 @@ store shared by mixed koto versions loses the guarantee.
   init or tick, but finished work the agent doesn't touch again is held only
   by the closed anchor's hierarchy. Rare, since it needs a resume after a
   deletion.
+- Every `koto init` and tick under an anchor may append one event to that
+  anchor, throttled to one per tenth of the idle period.
 - Three existing cross-session writers remain.
 - A store shared by an older koto loses the guarantee: the older binary
   ignores links.
@@ -1246,5 +1436,6 @@ store shared by mixed koto versions loses the guarantee.
   identified before any index.
 - Each harness assumption has a fallback that degrades to the koto-level
   reading, never to removal, and the hand checks gate Phase 8's merge.
-- koto#409 tracks the first cross-session writer; the other two are named
-  in the guide.
+- koto#409, koto#411 and koto#412 track the three cross-session writers.
+- Stale observed anchors are named by prune and the hierarchy query, so an
+  operator sees them and can remove them.

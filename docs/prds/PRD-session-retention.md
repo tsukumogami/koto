@@ -93,9 +93,11 @@ The repository owner ruled on the shape of the fix: think of sessions as a
 hierarchy; a session is accessible at least for as long as any session that
 dispatched it or was dispatched by it is still alive. The rule binds agent
 sessions, each carried into koto as an anchor that stays open while the
-agent session exists and closes on an observed deletion or, where nothing
-observes deletion, after a configured idle period; then a configured
-retention runs. koto and the workspace manager (niwa) never require each
+agent session exists and closes when niwa observes the agent session's
+deletion. The owner's idle close covers two cases only: an anchor whose
+deletion nothing observes, such as a plain terminal session's, and an anchor
+imported to another workspace, each closing after a configured idle period.
+After any close, a configured retention runs. koto and the workspace manager (niwa) never require each
 other, and only shirabe may require koto.
 
 ### Terms
@@ -129,14 +131,22 @@ These terms are used from here on with exactly these meanings.
 - **Stop instant**: when a member stopped being alive. For a koto session,
   its terminal or cancel event's timestamp. For an anchor, its close
   instant: the recorded time of an observed close, the last activity plus
-  the idle period for an idle close, or the last activity plus the observed
-  backstop for a backstop close. When more than one applies, the earliest
-  wins. An observed close is final; an idle or backstop close is a reading,
-  so new activity in the anchor or a session it holds makes it read open
-  again.
-- **Last activity** of an anchor: the latest event timestamp in the anchor
-  or in any session that holds a held-by link to it. Reads recorded in other
-  sessions are not activity of the read session.
+  the idle period for an idle close (unobserved and imported anchors only),
+  or, for a lineage close (R12), the later of the last activity plus the
+  observed backstop and the latest observed close among the anchors that
+  confirmed it.
+  When more than one applies, the earliest wins. An observed close is final;
+  an idle or lineage close is a reading, so new activity in the anchor makes
+  it read open again.
+- **Confirmed gone**: a session that has been removed from the store, or an
+  anchor with a valid observed close. Idle alone never confirms anything.
+- **Last activity** of an anchor: the latest event timestamp in the
+  anchor's own log, where only the anchor's own agent session writes: its
+  start events, the activity events koto records there when that agent
+  session opens or ticks a koto session (R4), and the read records of its own
+  reads (R21). Events other processes write into a member (a read with no
+  reader anchor, a child's completion record, a `koto context add` naming the
+  member) never count.
 - **Release instant** of a hierarchy: the latest stop instant among its
   members, once none is alive. Absent and migrated members have none; the
   session being judged is present and always has one.
@@ -163,8 +173,8 @@ These terms are used from here on with exactly these meanings.
   widens the owner's one-hop wording to the whole hierarchy on purpose: a
   coordinator has to reach a grandchild after the middle session finished.
 - An idle, resumable agent session counts as alive: until its deletion is
-  observed where niwa observes it, and until the idle period passes where
-  nothing does.
+  observed where niwa observes it, however long it idles there, and until
+  the idle period passes where nothing observes it or after an import.
 - Every removal koto makes by rule or subtree keeps a session whose
   hierarchy is alive or inside its retention, and says which members keep
   it. A person's explicit removal still removes, and says which live
@@ -248,6 +258,10 @@ names only in passing.
   environment names an anchor, `koto init` records a held-by link to it in
   the new session, and a tick of an existing session under an anchor it holds
   no link to adds one; a tick under an anchor it already holds adds nothing.
+  Each such `koto init` and tick also records an activity event in that
+  anchor, at most one per tenth of the idle period, so the anchor's own log
+  carries its agent session's activity. Only `KOTO_ANCHOR` names the caller's
+  anchor, and only the plugin's start hook sets it in the session's shells.
   An anchor is opened with no anchor named and never holds a held-by link.
 - **R5. Links alone are enough.** Every retention outcome in the acceptance
   criteria holds with no koto lineage and no request store present. Lineage
@@ -275,8 +289,12 @@ names only in passing.
   start event in the anchor. A start fired again by resume or compaction
   reuses the anchor, so an idle-closed anchor reads open again with that
   event. If the anchor has been removed, the start opens it afresh,
-  and if it reads closed by an observed close, the start opens a new anchor
-  that holds a dispatched-by link to the closed one. After `/clear`, the
+  and if it reads closed by an observed close or is migrated, the start
+  opens a new anchor that holds a dispatched-by link to the old one. If a
+  resume arrives under a session id with no anchor, the start looks for its
+  predecessor through hints only (the transcript path and a prior session
+  id) and, when it finds one, opens a successor holding a dispatched-by link
+  to it; with no match it opens a fresh anchor. After `/clear`, the
   anchor the session's
   commands name is the same anchor or one linked to it, so the hierarchy is
   never split. With koto not installed, the hook exits 0 and prints nothing;
@@ -286,23 +304,35 @@ names only in passing.
   for plugin hooks (each event maps to a list of matcher groups, each with a
   `hooks` list of command entries), and the repository's tests fail if the
   file is missing, moves, or breaks that shape.
-- **R8. The anchor records its dispatcher.** When an agent session starts
-  with a dispatcher's anchor named in its environment, its anchor records a
+- **R8. The anchor records its dispatcher.** The dispatcher's anchor
+  reaches a dispatched agent session under a separate variable,
+  `KOTO_DISPATCHER_ANCHOR`, which koto never treats as the caller's anchor:
+  the plugin's start hook exports it, beside `KOTO_ANCHOR`, to the shells a
+  session starts, and niwa's pass-through carries it to a worker. When an
+  agent session starts with a dispatcher named that way (or, for a
+  `claude -p` child, inherited `KOTO_ANCHOR`), its anchor records a
   dispatched-by link to it at open, with no name typed by anyone, and the
-  variable the session's commands then see names the session's own anchor.
+  `KOTO_ANCHOR` the session's commands then see names the session's own
+  anchor. A worker with no start hook, such as a Codex worker, sees no
+  `KOTO_ANCHOR` at all and uses the koto-level reading.
 - **R9. The anchor records whether it is observed.** When niwa's variable
   for a session it will reap is present, the anchor records an observed
   marker: at open for a session `niwa dispatch` launched, and, for a session
   `niwa instance from-hook` set up, within three minutes of the session's
-  start, written by any process the agent session's own start hook began. The plugin removes
+  start, written by any process the agent session's own start hook began,
+  which reads niwa's value with its shell quoting removed. The plugin removes
   niwa's variable from the environment of the shells the session starts, so
   a `claude -p` child launched through the shell is not observed.
 - **R10. An observed anchor closes when niwa observes its deletion.** koto
   provides a close command, and the plugin documents the guarded form a
   workspace declares as niwa's on-reap command. Given niwa's facts about a
-  session niwa removed, it records that each anchor carrying the matching
-  observed marker closed, and when, in a koto session of the close command's
-  own, never in the anchor; anchors with other markers are untouched.
+  session niwa removed (its reap key and its session id), it records that
+  the anchor of that agent session, and the successors that session opened
+  after `/clear`, compaction or a resume, closed, each only when it carries
+  the matching observed marker, and when, in a koto session of the close
+  command's own, never in the anchor. Anchors with other markers, and any
+  other agent session's anchor carrying the same marker (a child launched
+  from the removed session), are untouched.
   Readers honour the record. Running it twice, or for facts that match no
   anchor, changes nothing and exits 0. In its guarded form with koto not
   installed, it exits 0.
@@ -310,11 +340,17 @@ names only in passing.
   no observed marker is closed once the idle period has passed since its last
   activity. koto computes this when it reads the anchor; nothing writes into
   the anchor to close it.
-- **R12. An observed anchor whose close never lands closes after the
-  backstop.** An observed anchor with no close record is closed once the
-  observed backstop has passed since its last activity. This covers a destroy
-  that keeps its session, a failed or skipped close command, an instance
-  deleted by hand, and a host where niwa was removed.
+- **R12. An observed anchor is never closed on idleness alone.** An
+  observed anchor with no close record stays open, however long it idles.
+  Once the observed backstop has passed since its last activity, the
+  hierarchy query and prune report it as stale, naming it, and it closes
+  (a lineage close) only when every session directly linked to it through
+  dispatched-by and held-by links, in either direction, is confirmed gone; koto's
+  parent-child lineage plays no part. Lost closes are niwa's to repeat
+  (R27, R28): a destroy that keeps its session, a failed or skipped close command
+  and an instance deleted by hand are closed by a later reap once the
+  session is gone. A host where niwa was removed before it reaped leaves the
+  anchor open and reported stale until someone removes it.
 - **R13. A session with no anchor uses the koto-level reading.** koto run
   from a bare shell, a harness without the plugin, or a failed hook opens
   sessions with no held-by link. Such a session is alive while its koto
@@ -390,9 +426,12 @@ names only in passing.
   The read session's run journal stops counting reads by other agent
   sessions, which were never part of its own visits; anything that reads
   `context_read` events from session logs finds those reads in the readers'
-  anchors, each naming the session it read. A read record in the reader's
-  anchor is the reader's own activity and extends its anchor's last
-  activity; nothing a reader does extends the read session's.
+  anchors, each naming the session it read: the run journal attributes such
+  a record to the session it names, and a session archive that ships logs off
+  the host does the same. The idle computation is a consumer too: a read
+  record in the reader's anchor is the reader's own activity and extends its
+  anchor's last activity; nothing a reader does extends the read session's.
+  The anchorless row is tracked by koto#412.
 
 ### Import
 
@@ -401,7 +440,7 @@ names only in passing.
 
   | Condition at import time | Result |
   |---|---|
-  | the named anchor is already in the importing workspace, open and not migrated | the link is kept |
+  | an anchor of that name is in the local store, open and not migrated (its workspace path is a hint only) | the link is kept |
   | otherwise, and the importing environment names an anchor | the link is rewritten to that anchor, with the old name kept in the link as a hint |
   | otherwise | the link is dropped |
 
@@ -425,18 +464,25 @@ names only in passing.
 ### niwa
 
 - **R25. niwa passes declared variables through to workers.** The workspace
-  configuration may list variable names that `niwa dispatch` copies from its
+  configuration may list, in a table niwa reads at dispatch rather than at
+  apply, variable names that `niwa dispatch` copies from its
   own environment into a worker's settings environment, the block that
   reaches a worker the agent's daemon starts, merged with the variables niwa
-  already sets there. A name that is unset is skipped. niwa refuses at load a
-  declared name beginning `NIWA_` or `CLAUDE_`, or one niwa sets itself in
-  that block.
+  already sets there. A name that is unset is skipped. The configuration may
+  also list variable names niwa removes from a worker's launch environment,
+  so a value the dispatching shell carries never reaches a worker that has
+  no hook to replace it. niwa refuses at load a declared name beginning
+  `NIWA_` or `CLAUDE_`, one niwa sets itself in that block, one the
+  workspace also declares among the session variables written at apply, or
+  one that looks like a credential.
 - **R26. niwa marks sessions it will reap.** niwa sets one variable of its
   own, under its own name, for every agent session it will reap: in the
   settings environment and the process environment before launch for a
   session `niwa dispatch` launches, and in the session's environment file
   for a session `niwa instance from-hook` sets up. Its value lets niwa's
-  on-reap command identify the session.
+  on-reap command identify the session. A value of that variable inherited
+  from niwa's own environment never reaches a worker: niwa replaces it, or
+  removes it when it has no value of its own to set.
 - **R27. niwa runs a declared on-reap command.** The workspace configuration
   may declare a command niwa runs once for each agent session it removes, or
   finds already removed, at these points: the reap of a session niwa holds a
@@ -445,19 +491,27 @@ names only in passing.
   `niwa destroy`, when it removes the instance's session or finds it gone;
   and `niwa watch`'s discard of a staged review whose session is gone. It
   hands the command, through the environment only, niwa's variable value,
-  the session id and the instance path. The idle-grace reclaim is niwa's
+  the session id, the instance path and the variables the configuration
+  lists for the command. In a destroy it runs the command only once the
+  session's removal succeeded, and forgets the session only once the
+  command succeeded. The idle-grace reclaim is niwa's
   removal of a session idle past niwa's own grace period, which counts as a
   reap. It never runs the command when it
   removes an instance alone: `niwa reset`, `niwa destroy --keep-session`,
   the reap of an instance with no session mapping, and the rollback of a
-  failed dispatch.
+  failed dispatch. A mapping niwa keeps because its session was still
+  running, kept by `--keep-session`, or left behind when an instance was
+  deleted by hand is reaped like any other once its session is gone, also
+  when neither the instance nor the session remains.
 - **R28. A failing on-reap command never fails a niwa step.** Each run is
   bounded by a timeout, 10 seconds unless the configuration sets another,
   and a niwa step's runs together by 30 seconds of wall time; a run that
   fails, times out
-  or can't start, and any run the step's budget skips, is not retried and
-  makes niwa print one warning line on stderr naming the session. The step's
-  own outcome and exit code are unchanged.
+  or can't start, and any run the step's budget skips, makes niwa print one
+  warning line on stderr naming the session, and niwa keeps that session's
+  mapping so the next reap that finds the session gone runs the command
+  again; after ten failed runs niwa drops the mapping with a final warning.
+  The step's own outcome and exit code are unchanged.
 - **R29. niwa names no koto.** niwa's non-test source names no koto
   variable, command or path. Each piece above is generic and inert when koto
   isn't installed; niwa never fails, refuses or degrades because koto is
@@ -468,17 +522,24 @@ names only in passing.
 - **R30. Every shirabe dispatch path that uses no request records a link.**
   The dispatched session records a dispatched-by link to its dispatcher, in
   its own session: a chain child whose chain parent `skill-session.sh adopt`
-  matched, naming that parent; an `/execute` coordinated `/work-on` child,
+  matched, naming that parent; a session opened directly with a named
+  dispatcher, naming it; an `/execute` coordinated `/work-on` child,
   naming the `/execute` run (these children are root sessions opened inside
   the run's own agent session, so its anchor holds them too, and the link
   keeps them when the run starts from a bare shell); and a `/coordinate`
   worker on the message return path, naming the dispatching coordinator. For
-  the last, the brief `/coordinate` renders carries the dispatcher's session
-  name, including for a worker moved to the message path later by a
-  re-brief, a hand-off of execution or a leg found unwatchable, and a failed
-  link call warns and doesn't stop the worker's opener. The `/coordinate`
-  change lands with or after the coordinator-record teardown build
-  (shirabe#978 to #986), which rewrites the same scripts.
+  the last, the brief `/coordinate` renders carries the exact opener
+  invocation with the dispatcher's session name already filled in, so no
+  skill text has to pass it, including for a worker moved to the message
+  path later by a re-brief, a hand-off of execution or a leg found
+  unwatchable; a failed link call is recorded in the worker's own session
+  and printed, the worker's result carries it, and it doesn't stop the
+  worker's opener. A failed link at `adopt` or any other opener is
+  retried once, then recorded the same way, and never stops the opener. A
+  recycled coordinator, a new run carrying an earlier run's record, links
+  the new run to the old one. The `/coordinate`
+  change lands with or after the parts of the coordinator-record teardown
+  build that rewrite the same scripts (shirabe#981, #984 and #985).
 - **R31. shirabe keeps no retention rule of its own.**
   `skill-session.sh reclaimable` and the reclaimable rule in shirabe's
   session convention are removed, and the convention names koto's hierarchy
@@ -633,7 +694,9 @@ S3.
   `plugins/koto-skills/hooks/hooks.json` is missing or isn't in the
   documented matcher-group shape; and in a live Claude Code session with
   koto-skills enabled, checked by hand, the session-start hook runs and an
-  anchor opens for that session.
+  anchor opens for that session. The changelog says that loading the hooks
+  also turns on the plugin's existing /workflows and Stop hooks for every
+  koto-skills user.
 - [ ] **One anchor per agent session.** Run with synthetic hook inputs
   (start, then resume, compact and clear for the same agent session), the
   hook leaves the session's environment file naming the same anchor after
@@ -641,13 +704,30 @@ S3.
   dispatched before it is still kept by the anchor the environment names.
   A resume whose anchor was idle-closed leaves it reading open; one whose
   anchor was removed reopens it under the same name; one whose anchor reads
-  closed by an observed close opens a new anchor holding a dispatched-by
-  link to the old one. A live session confirms the same by hand.
+  closed by an observed close, or is migrated, opens a new anchor holding a
+  dispatched-by link to the old one. A resume under a session id with no
+  anchor, given a transcript path or prior id that names an existing anchor,
+  opens a successor holding a dispatched-by link to it. A live session
+  confirms the same by hand, including whether resume keeps the session id.
 - [ ] **Close records last.** After an observed close, a prune apply inside
   the retention and another after the release leave the anchor reading
   closed with kind `observed` until both are removed together; removing the
   close session alone with `koto session cleanup` makes the anchor read
-  open again until its backstop.
+  open again; a later close command for it writes a fresh close session.
+  The close session is written atomically, so a close interrupted mid-write
+  leaves the anchor reading open and the next close succeeds; two closes run
+  at once both exit 0 and leave one valid close session.
+- [ ] **The close reaches only the removed session.** A `claude -p` child
+  whose anchor carries the same observed marker as its parent stays open
+  when the parent's close runs, also when the close is run again; a
+  successor the parent opened after `/clear` closes with it; a successor
+  opened after the parent's anchor already read closed stays open on a
+  repeated close.
+- [ ] **Hook latency.** The start hook's synchronous part takes under 300 ms
+  at the 95th percentile on the CI runner, and with no usable env file the
+  hook emits the single export line as additional context.
+- [ ] **Reopened anchor.** An anchor removed by hand and reopened under the
+  same name gets a fresh close session at its next close.
 - [ ] **No koto.** With koto absent from the PATH, the session-start hook
   exits 0 with nothing on stderr, and the close command in its guarded form
   exits 0. With a koto stand-in on the PATH that exits 1 for every call,
@@ -661,16 +741,25 @@ S3.
   and changes nothing; an anchor whose marker differs stays open.
 - [ ] **Activity extends the idle period.** An unobserved anchor holds a
   session the agent session ticks every 5 seconds for 30 seconds, with a
-  10-second idle period: the anchor stays open throughout and closes 10
+  10-second idle period: each tick records at most one activity event per
+  second in the anchor, the anchor stays open throughout and closes 10
   seconds after the last tick.
-- [ ] **What isn't activity.** With a 10-second idle period, another agent
-  session reads the anchor and its held session, and ticks a session the
-  anchor doesn't hold, every 3 seconds; the anchor still closes 10 seconds
-  after its own last activity.
-- [ ] **Backstop.** An observed anchor whose close command never runs stays
-  open past the idle period, is closed once the observed backstop has passed
-  since its last activity with kind `backstop`, and the hierarchy it held is
-  removed only after the retention from that close.
+- [ ] **What isn't activity.** With a 10-second idle period, every 3 seconds
+  another agent session reads the anchor and its held session and ticks a
+  session the anchor doesn't hold, a bare shell runs `koto context get` on
+  the held session, a koto child of the held session reaches its terminal
+  step, and `koto context add` from a bare shell writes a key into the held
+  session; the anchor still closes 10 seconds after its own last activity.
+- [ ] **Observed anchors never idle-close.** An observed anchor whose close
+  command never runs stays open past the idle period and past the observed
+  backstop while it holds B, so B is kept; past the backstop the hierarchy
+  query and prune report the anchor as stale. Once every session directly linked
+  to it through dispatched-by and held-by links is confirmed gone (B removed with
+  `koto session cleanup`, its dispatcher's anchor closed by an observed
+  close), it reads closed with kind `lineage`, at the later of its last
+  activity plus the backstop and the dispatcher's observed close, and it is
+  removed only after the retention from that instant. An idle dispatcher's anchor never counts as
+  confirmed gone.
 - [ ] **Anchor kept while resumable.** Overrides the setup. An agent session
   launched by `niwa dispatch` into an ephemeral instance niwa reaps, with
   koto-skills installed and the workspace declaring koto-skills' close
@@ -688,8 +777,9 @@ S3.
 - [ ] **from-hook session.** The same two criteria pass for a session
   `niwa instance from-hook` set up in an ephemeral instance niwa reaps.
 - [ ] **Late observed marker.** Run with synthetic hook inputs, when niwa's
-  variable is written to the session's environment file 30 seconds after
-  the hook starts, the anchor carries the observed marker within three
+  variable is written, single-quoted as niwa writes it, to the session's
+  environment file 30 seconds after the hook starts, the anchor carries the
+  observed marker, holding the unquoted value, within three
   minutes of the start; when it is never written, the anchor carries none,
   and a `claude -p` child's shell sees no niwa variable.
 - [ ] **Reap by create.** The Anchor closed by the reap criterion passes
@@ -721,10 +811,11 @@ S3.
   and names the dispatcher's anchor, and the reviewer reads B's keys from the
   dispatching agent session.
 - [ ] **First dispatch, detached.** With the workspace configuration
-  declaring the anchor variable for niwa to pass through, B is a worker
-  launched by `niwa dispatch --detach`; its anchor records its dispatcher
-  with no name typed, and the prune keeps B and names the dispatcher's
-  anchor.
+  declaring `KOTO_DISPATCHER_ANCHOR` for niwa to pass through and
+  `KOTO_ANCHOR` for niwa to remove, B is a worker launched by
+  `niwa dispatch --detach`; its anchor records its dispatcher with no name
+  typed, its launch environment holds no `KOTO_ANCHOR`, and the prune keeps
+  B and names the dispatcher's anchor.
 - [ ] **Bare shell.** A runs from a bare shell, with no koto-skills and so no
   anchor, and dispatches B. B is kept while A's koto session is open and for
   the retention after A finishes, and is then removed.
@@ -732,6 +823,8 @@ S3.
   dispatch` dispatches B, and B finishes. `niwa destroy --keep-session` on
   the worker's instance runs no on-reap command and leaves the anchor open; a
   prune after the retention from the destroy keeps B and names that anchor.
+  Once the kept session is deleted, the next `niwa reap` runs the on-reap
+  command for it and the anchor reads closed with kind `observed`.
 
 ### Reading
 
@@ -749,7 +842,8 @@ S3.
 - [ ] **Read consumers.** After A (whose anchor doesn't hold B) reads B
   during one of B's visits, B's run journal records no context read for that
   read, and A's anchor's log holds a `context_read` event naming B and the
-  key.
+  key, which the run journal attributes to B, the session the record
+  names.
 
 ### Import
 
@@ -806,18 +900,27 @@ S3.
 - [ ] **Pass-through.** With `FOO` declared and set, a worker launched by
   `niwa dispatch --detach` sees `FOO` in its settings environment next to the
   variables niwa already sets; with `FOO` unset it's absent and the dispatch
-  succeeds; declaring `NIWA_X`, `CLAUDE_X` or a name niwa sets in that block
-  is refused when the configuration loads.
+  succeeds; with `BAR` declared for removal, a worker's launch environment
+  holds no `BAR` even when niwa's own environment has it; declaring
+  `NIWA_X`, `CLAUDE_X`, a name niwa sets in that block, a name also among
+  the session variables written at apply, or a credential-shaped name in any
+  letter case (one test per refused suffix and prefix, `API_TOKEN` and
+  `gh_pat` among them) is refused when the configuration loads.
 - [ ] **Reap variable.** A session `niwa dispatch` launches has niwa's
   variable in both its settings environment and its launch process
   environment before its first command; a session
-  `niwa instance from-hook` sets up has it in its environment file.
+  `niwa instance from-hook` sets up has it in its environment file. A
+  dispatch run from a shell that already carries the variable gives the
+  worker niwa's own value, and none when niwa has no valid value.
 - [ ] **On-reap runs.** With a declared command that records its
   environment, `niwa reap`, the reap run by `niwa dispatch`, by `niwa
   create` and by `niwa watch`, the idle-grace reclaim, `niwa destroy` and
   `niwa watch`'s discard each run it once per removed session with niwa's
-  variable, the session id and the instance path, and nothing else from
-  niwa.
+  variable, the session id, the instance path and the variables listed for
+  the command that are set, and nothing else from niwa. In a destroy the
+  command runs only after the session's removal succeeded, a failed run
+  keeps the mapping for the next reap, and a failed removal runs nothing
+  and keeps the mapping.
 - [ ] **On-reap doesn't run.** `niwa reset`, `niwa destroy --keep-session`,
   the reap of an instance with no session mapping and a failed dispatch's
   rollback each run no on-reap command.
@@ -829,10 +932,16 @@ S3.
   timeout of 2 seconds is honoured. With five sessions removed in one reap
   and a command that sleeps 10 seconds, the reap's on-reap runs end within
   31 seconds of wall time, and each session whose run timed out or was
-  skipped gets one warning line.
+  skipped gets one warning line. A session whose run failed keeps its
+  mapping, the next reap that finds it gone runs the command again, and
+  after ten failed runs niwa drops the mapping with a final warning.
+- [ ] **Kept mappings.** A mapping kept because its session was still
+  running, kept by `--keep-session`, or left behind by an instance deleted
+  by hand, including one whose instance and session are both gone, gets the
+  on-reap command once at the next reap after its session is gone.
 - [ ] **No koto.** On a host with niwa and no koto installed, the reviewer
   runs `niwa dispatch` from a workspace whose configuration installs
-  koto-skills, declares the anchor variable for pass-through and declares
+  koto-skills, declares the dispatcher variable for pass-through and declares
   koto-skills' close command as the on-reap command. The dispatch succeeds,
   the worker runs, its session start shows no failed koto hook, and niwa
   prints no error or warning. Reaping that instance runs the close command,
@@ -855,12 +964,21 @@ S3.
   dispatcher, written in their own session; the brief `/coordinate` renders
   for a message-path worker contains the dispatcher's session name, also
   when a leg-bound worker is moved to the message path by a re-brief, a
-  hand-off of execution or a leg found unwatchable.
-- [ ] **Failed link warns.** With the link command made to fail, a
-  `/coordinate` message-path worker's opener prints a warning naming the
-  dispatcher and carries on to open the worker's session.
+  hand-off of execution or a leg found unwatchable. A recycled
+  coordinator's new run holds a dispatched-by link to the run it carried
+  forward.
+- [ ] **Failed link warns.** With the link command made to fail twice, `adopt`
+  and each opener given a dispatcher print a warning naming the dispatcher,
+  record it in a context key in the opened session, and carry on; a
+  `/coordinate` worker's rendered result carries the warning. A link that
+  fails once and succeeds on retry leaves no warning.
+- [ ] **Invocation in the brief.** The brief `/coordinate` renders for a
+  message-path worker contains the opener invocation with
+  `--dispatched-by <dispatcher>` filled in, and no entry point's skill text
+  adds the flag itself.
 - [ ] **Sequencing.** The `/coordinate` change's pull request merges no
-  earlier than the coordinator-record teardown build (shirabe#978 to #986);
+  earlier than the teardown build's brief-renderer, opener and
+  worker-dispatch changes (shirabe#981, #984 and #985);
   this is checked in the plan's dependencies, not by a test.
 - [ ] **No shirabe retention rule.** `skill-session.sh reclaimable` exits
   as an unknown subcommand, no shirabe script computes whether a session
@@ -910,25 +1028,31 @@ S3.
   `koto context add` naming any session; and a read with no anchor on the
   reader's side logging into the read session (R21). Under the cloud backend
   a migrated source refuses all three. Nothing in this feature treats a
-  child's completion record as a link or a sign of life. koto#409 tracks
-  stopping the first, by having a parent read its children's results at its
-  own tick.
-- A coordinator left idle past the idle period with nothing observing its
-  deletion loses its hold on the sessions it dispatched, even though a person
-  could still resume it. The owner accepted this cost; the 7-day default
-  keeps a weekend away inside it.
+  child's completion record as a link or a sign of life, and none of the
+  three counts as activity. koto#409 tracks the first, koto#411 the second
+  and koto#412 the third.
+- An unobserved agent session (a plain terminal session, or one on a host
+  with no niwa) left idle past the idle period loses its hold on the sessions
+  it dispatched, even though a person could still resume it; so does an
+  anchor imported to another workspace. The owner's idle close covers these
+  two cases only and accepts this cost there; the 7-day default keeps a
+  weekend away inside it. An observed anchor never closes on idleness.
 - A long-lived anchor joins every hierarchy it touched into one, so a
   person's interactive session that runs for days keeps everything it touched
-  until it closes, and a busy held session keeps its anchor's idle clock
-  fresh. The hierarchy query makes this visible.
+  until it closes, and an agent session that keeps working keeps its
+  anchor's idle clock fresh. The hierarchy query makes this visible.
 - A link naming a session on another host counts as a member that isn't
   alive, since nothing here reads another host.
 - Sessions with an edge are no longer removed at their terminal step, so the
   store grows until a prune runs. Callers that already pass `--no-cleanup`,
   which is every shirabe skill, see no difference.
-- A lost observed close can release a hierarchy earlier than a correct close
-  would have, when the agent session stayed resumable for longer than the
-  backstop after its last activity. The backstop is long for that reason.
+- An observed anchor whose close never lands, on a host where niwa was
+  removed before it reaped, stays open and keeps its hierarchy until someone
+  removes it; prune and the hierarchy query report it as stale after the
+  observed backstop. This over-retains rather than release a session that
+  might still be alive.
+- A worker with no start hook (a Codex worker, for one) has no anchor, so
+  its sessions use the koto-level reading.
 
 ## Decisions and Trade-offs
 
@@ -948,19 +1072,26 @@ S3.
 - **Lineage and `chain/parent` count as edges.** They already join sessions
   that prune keeps today, so dropping them would regress; nothing depends on
   them, so import losing lineage costs nothing the links don't carry.
-- **Unobserved anchors close after an idle period; observed ones on the
-  observed deletion, with a longer backstop** (the owner's pick for the idle
-  close). A lease was rejected: an idle session can't renew it. The backstop
-  has to exceed the retention, or a `--keep-session` destroy releases B
-  before a correct close would.
-- **Defaults: retention 7 days, idle period 7 days, backstop 30 days.** An
+- **Unobserved and imported anchors close after an idle period; observed
+  ones only on the observed deletion** (the owner's idle close covers the
+  first two cases only). A lease was rejected: an idle session can't renew
+  it. An idle backstop for observed anchors was rejected: it would close a
+  live agent session idle for longer than the backstop and release its
+  records, which the owner's rule forbids. Past the backstop an observed
+  anchor is only reported as stale, and it closes only when every session
+  directly linked to it is confirmed gone; lost closes are
+  repeated by niwa at its next reap. The backstop must still exceed the
+  retention, so a stale report never comes before a correct close would
+  have released anything.
+- **Defaults: retention 7 days, idle period 7 days, stale report after 30
+  days.** An
   idle period of 24 hours would close a person's own session over a
   weekend, against the owner's ruling that idle and resumable counts as
   alive. All three stay configurable.
 - **An observed close is recorded in the close command's own session.**
   Writing it into the anchor would need the owner's exception to the
-  one-writer rule; the idle close and the backstop cover every case without
-  it.
+  one-writer rule; the idle close, niwa's repeated close and the lineage
+  close cover the cases without it.
 - **The terminal tick keeps every session with an edge** rather than relying
   on every caller's `--no-cleanup`, including koto children while their
   parent runs. Otherwise retention holds only for callers that remember the
@@ -979,13 +1110,26 @@ S3.
 - **koto doesn't warn when a session opens with no anchor.** The bare-shell
   fallback is expected, and a warning on every bare-shell `koto init` would
   be noise.
-- **niwa's pass-through refuses only names niwa and Claude Code own.**
-  Refusing koto's cloud variables would make niwa name koto; the workspace
+- **niwa's pass-through refuses names niwa and Claude Code own and names
+  that look like credentials, and never koto's by name.** Refusing koto's
+  cloud variables by name would make niwa name koto; the workspace
   configuration declares exact names, and koto's guide says to declare only
-  the anchor variable.
-- **A failed on-reap command is skipped, not retried.** The observed
-  backstop already closes an anchor whose close never landed, so a retry
-  queue in niwa would duplicate it.
+  `KOTO_DISPATCHER_ANCHOR`.
+- **The dispatcher's anchor travels under its own name.** Passing
+  `KOTO_ANCHOR` itself would make a worker with no start hook act under its
+  dispatcher's anchor, a write into another agent session's anchor;
+  `KOTO_DISPATCHER_ANCHOR` is read only by the start hook, and niwa's removal
+  list keeps `KOTO_ANCHOR` out of a worker's launch environment.
+- **Activity is recorded in the anchor, not read from held sessions.**
+  Reading the latest event of every held session would count writes the
+  agent session didn't make (an anchorless read, a child's completion, a
+  `koto context add`), so a reader or a child could keep an anchor alive.
+  koto records throttled activity in the anchor instead, from the agent
+  session's own commands.
+- **A failed on-reap command is repeated at the next reap.** With no idle
+  backstop for observed anchors, a lost close has to be repeated: niwa keeps
+  the session's mapping until the command succeeds, up to ten runs. The
+  close command is idempotent, so a repeat is safe.
 - **shirabe's reclaimable rule is retired, not re-pointed.** Nothing calls
   it, and a second answer to "may this go" is the drift the change exists to
   remove.
