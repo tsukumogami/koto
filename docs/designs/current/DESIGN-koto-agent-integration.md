@@ -1,4 +1,5 @@
 ---
+schema: design/v1
 status: Current
 problem: |
   koto v0.1.0 has a working engine, but no AI agent uses it because nothing connects the
@@ -25,7 +26,7 @@ rationale: |
 
 ## Status
 
-**Planned**
+Current
 
 ## Implementation Issues
 
