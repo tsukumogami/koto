@@ -59,19 +59,22 @@ gates below declare.
 
 **Complexity**: simple
 
-**Goal**: Make the koto-skills plugin's hooks load by moving them from `plugins/koto-skills/hooks.json` to `plugins/koto-skills/hooks/hooks.json` in Claude Code's matcher-group shape, with a test that guards the shape.
+**Goal**: Move the koto-skills plugin's hook file from `plugins/koto-skills/hooks.json` to `plugins/koto-skills/hooks/hooks.json` in Claude Code's matcher-group shape, registering no hook yet, with a test that guards the shape. The plugin's existing /workflows and Stop hooks stay unregistered: retention doesn't need them, and registering them would start a command at every session start and every turn end for every koto-skills user. <<ISSUE:8>> registers the one hook this feature needs.
 
 **Acceptance Criteria**:
 
-- [ ] `plugins/koto-skills/hooks/hooks.json` exists and maps each event (`SessionStart`, `Stop`) to a list of matcher groups, each with a `hooks` list of `{"type": "command", "command": ...}` entries.
-- [ ] The SessionStart group still runs `bash "${CLAUDE_PLUGIN_ROOT}/hooks/session-start-workflows.sh"`, and the Stop hook keeps its current command text unchanged.
+- [ ] `plugins/koto-skills/hooks/hooks.json` exists in the matcher-group shape (each event maps to a list of matcher groups, each with a `hooks` list of `{"type": "command", "command": ...}` entries) and registers no event: neither the /workflows SessionStart script nor the Stop command runs once the file loads.
+- [ ] The Stop command moves, text unchanged, into `plugins/koto-skills/hooks/stop-workflows.sh`, kept on disk and unregistered beside the kept, unregistered `hooks/session-start-workflows.sh`.
 - [ ] The root file `plugins/koto-skills/hooks.json` is deleted, and no file in the repository still refers to that path.
-- [ ] `.github/workflows/validate-plugins.yml` reads the Stop hook command from `plugins/koto-skills/hooks/hooks.json` (as `.hooks.Stop[0].hooks[0].command`) in both smoke-test steps, and both steps still pass: reminder text with an active workflow, silence with none.
+- [ ] `.github/workflows/validate-plugins.yml` runs `plugins/koto-skills/hooks/stop-workflows.sh` in both smoke-test steps instead of reading the command from the root file, and both steps still pass: reminder text with an active workflow, silence with none.
+- [ ] The shape test also fails when `hooks/hooks.json` registers a `Stop` event or the /workflows SessionStart script, so a later change can't turn them on without changing the test.
 - [ ] A test in the repository fails when `plugins/koto-skills/hooks/hooks.json` is missing, when it isn't valid JSON, or when it is in the old flat shape (an event whose list entries carry `type`/`command` directly instead of a `hooks` list). Run it with `cargo test`; the test file is named in the PR.
 - [ ] The shape test passes against the new file and fails against the old flat one (confirmed once while writing it).
 - [ ] The koto-skills plugin's documentation or README mentions no stale `hooks.json` path; if the plugin has no such docs, nothing is added.
-- [ ] Changelog: `CHANGELOG.md` gets an entry saying that loading the hooks also turns on the plugin's existing, until now dormant, /workflows and Stop hooks for every koto-skills user.
-- [ ] Must deliver: `plugins/koto-skills/hooks/hooks.json` in matcher-group shape with the SessionStart and Stop groups (required by <<ISSUE:8>>)
+- [ ] Changelog: `CHANGELOG.md` gets an entry saying the hook file moved to the shape Claude Code reads and that it registers no hook, so the existing /workflows and Stop hooks stay off.
+- [ ] **Start of the build.** Work on this issue's pull request starts only after the owner confirms that the prerequisites the owner set for starting it are met; the pull request records the date of that confirmation. The plan checks this; no test does.
+- [ ] **Rollout.** The pull request enables no hook on any host. Any later change that registers a hook from this file, including <<ISSUE:8>>'s, waits for a named go-ahead from the owner and states its hook's synchronous cost, which must stay well under one second.
+- [ ] Must deliver: `plugins/koto-skills/hooks/hooks.json` in matcher-group shape, registering nothing, for <<ISSUE:8>> to add its SessionStart group to (required by <<ISSUE:8>>)
 
 **Dependencies**: None
 
@@ -352,7 +355,7 @@ Import settlement (`src/session/cloud.rs`, `stage_import` and `read_source_manif
 
 **Acceptance Criteria**:
 
-Hook behavior (`plugins/koto-skills/hooks/session-start.sh`, registered in `plugins/koto-skills/hooks/hooks.json` next to the existing workflows script):
+Hook behavior (`plugins/koto-skills/hooks/session-start.sh`, registered as the only hook in `plugins/koto-skills/hooks/hooks.json`'s one SessionStart group; the /workflows and Stop hooks stay unregistered):
 - [ ] The script traps `exit 0`, exits 0 silently when `koto` is not on the PATH, reads `session_id` and `source` with `jq` only (no grep fallback for any value that reaches the env file), and gives up silently unless `session_id` matches `^[A-Za-z0-9_-]{1,128}$`.
 - [ ] It computes the process token `<host>:<pid>:<epoch-start>` by walking up from `$PPID` past shells, with the start time from `/proc/<pid>/stat` or `LC_ALL=C ps -o lstart=`, and passes the token to `koto session anchor open`. When no token can be computed, `/clear` opens an unlinked anchor and the hook still exits 0.
 - [ ] It captures the dispatcher as `${KOTO_DISPATCHER_ANCHOR:-${KOTO_ANCHOR:-}}` (a niwa worker gets the first through niwa's pass-through; a `claude -p` child inherits both from its parent's shell) and `NIWA_REAP_KEY` before calling koto, then calls `koto session anchor open` under `env -u KOTO_ANCHOR -u KOTO_DISPATCHER_ANCHOR -u CLAUDE_CODE_SESSION_ID`, passing the captured dispatcher as `--dispatched-by`, the key as `--observed-key`, and the payload's transcript path for the resume hints.

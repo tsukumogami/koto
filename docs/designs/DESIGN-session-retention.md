@@ -338,8 +338,11 @@ an anchor by that field alone; the close session's header carries
 
 **Hook.** `plugins/koto-skills/hooks/hooks.json` replaces the root file, in
 the matcher-group shape; one SessionStart group runs the new
-`hooks/session-start.sh` next to the existing /workflows script, and the Stop
-hook is kept. `session-start.sh`:
+`hooks/session-start.sh` and nothing else. The existing /workflows script and
+the Stop command stay on disk unregistered: retention needs neither (activity
+comes from `koto init` and `koto next`, not from a turn-end hook), and
+registering them would start a command at every session start and turn end
+for every koto-skills user. `session-start.sh`:
 
 1. `trap 'exit 0' EXIT`; `command -v koto >/dev/null 2>&1 || exit 0`; read
    `session_id` and `source` from the payload with `jq` only (no grep
@@ -1052,8 +1055,9 @@ table of Decision 5.
 project precedence, origins.
 
 **koto-skills** (`plugins/koto-skills/hooks/hooks.json`,
-`hooks/session-start.sh`, kept `hooks/session-start-workflows.sh`, Stop
-hook; `.github/workflows/validate-plugins.yml`; the koto-user skill's
+`hooks/session-start.sh`, the kept and unregistered
+`hooks/session-start-workflows.sh` and `hooks/stop-workflows.sh`;
+`.github/workflows/validate-plugins.yml`; the koto-user skill's
 references).
 
 **niwa** (`internal/config`, `internal/cli/dispatch.go`,
@@ -1204,14 +1208,16 @@ and 12 the workspace configuration.
 
 ### Phase 1: koto-skills hooks load
 
-Move the hooks to `plugins/koto-skills/hooks/hooks.json` in the
-matcher-group shape (SessionStart running today's /workflows script; the
-Stop hook), delete the root file, point `validate-plugins.yml`'s Stop-hook
-smoke test at the new path, and add a shape check that fails when the file
-is missing or flat. Independent of everything else; today's /workflows hook
-starts working, and the Stop hook still checks `koto workflows`, which no
-anchor reaches yet. The changelog says that this turns on the plugin's
-dormant /workflows and Stop hooks for every koto-skills user.
+Move the hook file to `plugins/koto-skills/hooks/hooks.json` in the
+matcher-group shape, registering no hook, delete the root file, move the
+Stop command into an unregistered `hooks/stop-workflows.sh` that
+`validate-plugins.yml`'s smoke test runs, and add a shape check that fails
+when the file is missing, flat, or registers the /workflows or Stop hooks.
+Independent of everything else; nothing starts running, and Phase 8
+registers the anchor hook. The changelog says the file moved and the
+existing hooks stay off. Like Phase 8, it starts only once the owner
+confirms its start prerequisites, and no hook it could register is rolled
+out without the owner's named go-ahead.
 
 ### Phase 2: dispatched-by links
 
@@ -1428,8 +1434,9 @@ store shared by mixed koto versions loses the guarantee.
   caller remembering `--no-cleanup`.
 - Everything works locally with koto alone; niwa adds an earlier, observed
   close, and its pieces are generic and inert without koto.
-- The koto-skills hooks start loading, which also turns on today's
-  /workflows rendering.
+- The koto-skills hook file moves to the shape Claude Code reads, and only
+  the anchor hook is registered; the existing /workflows and Stop hooks
+  stay off.
 - Hierarchies follow a session through import by name.
 
 ### Negative

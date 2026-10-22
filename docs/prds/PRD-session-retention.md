@@ -702,9 +702,9 @@ S3.
   `plugins/koto-skills/hooks/hooks.json` is missing or isn't in the
   documented matcher-group shape; and in a live Claude Code session with
   koto-skills enabled, checked by hand, the session-start hook runs and an
-  anchor opens for that session. The changelog says that loading the hooks
-  also turns on the plugin's existing /workflows and Stop hooks for every
-  koto-skills user.
+  anchor opens for that session. The plugin's existing /workflows and Stop
+  hooks stay unregistered, a test fails if either is registered, and the
+  changelog says they stay off.
 - [ ] **One anchor per agent session.** Run with synthetic hook inputs
   (start, then resume, compact and clear for the same agent session), the
   hook leaves the session's environment file naming the same anchor after
