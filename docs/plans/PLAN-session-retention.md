@@ -72,8 +72,6 @@ gates below declare.
 - [ ] The shape test passes against the new file and fails against the old flat one (confirmed once while writing it).
 - [ ] The koto-skills plugin's documentation or README mentions no stale `hooks.json` path; if the plugin has no such docs, nothing is added.
 - [ ] Changelog: `CHANGELOG.md` gets an entry saying the hook file moved to the shape Claude Code reads and that it registers no hook, so the existing /workflows and Stop hooks stay off.
-- [ ] **Start of the build.** Work on this issue's pull request starts only after the owner confirms that the prerequisites the owner set for starting it are met; the pull request records the date of that confirmation. The plan checks this; no test does.
-- [ ] **Rollout.** The pull request enables no hook on any host. Any later change that registers a hook from this file, including <<ISSUE:8>>'s, waits for a named go-ahead from the owner and states its hook's synchronous cost, which must stay well under one second.
 - [ ] Must deliver: `plugins/koto-skills/hooks/hooks.json` in matcher-group shape, registering nothing, for <<ISSUE:8>> to add its SessionStart group to (required by <<ISSUE:8>>)
 
 **Dependencies**: None

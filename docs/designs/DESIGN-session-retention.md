@@ -1215,9 +1215,7 @@ Stop command into an unregistered `hooks/stop-workflows.sh` that
 when the file is missing, flat, or registers the /workflows or Stop hooks.
 Independent of everything else; nothing starts running, and Phase 8
 registers the anchor hook. The changelog says the file moved and the
-existing hooks stay off. Like Phase 8, it starts only once the owner
-confirms its start prerequisites, and no hook it could register is rolled
-out without the owner's named go-ahead.
+existing hooks stay off.
 
 ### Phase 2: dispatched-by links
 
