@@ -30,6 +30,10 @@ Absorbed [BRIEF-session-retention](docs/briefs/BRIEF-session-retention.md); carr
 
 ## Absorbed Brief
 
+The brief named in Status is folded into this section and its file was
+removed when this PRD absorbed it; this section is the brief's framing, and
+there is no separate file to look for.
+
 The feature was framed before these requirements existed. Agent sessions
 hand work to each other, and whoever sits above or below a finished worker
 needs its koto log and keys afterwards: a coordinator to check or undo what
