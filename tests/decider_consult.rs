@@ -1551,6 +1551,102 @@ fn the_default_budget_is_8192_bytes() {
     }
 }
 
+/// The decider ledger, in the harness's koto home.
+fn ledger_path(h: &Harness) -> std::path::PathBuf {
+    h.home().join(".koto").join("_decider_ledger.jsonl")
+}
+
+/// The run journal, which a store on `KOTO_SESSIONS_BASE` keeps in that
+/// base.
+fn journal_path(h: &Harness) -> std::path::PathBuf {
+    h.dir.join("sessions").join("_run_journal.jsonl")
+}
+
+/// The lines of the JSON-lines file at `path`.
+fn jsonl(path: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn an_input_over_its_budget_is_named_in_the_event_the_ledger_and_the_journal() {
+    let h = Harness::new(&standard("shadow", "shadow"));
+    h.init();
+    h.context_add("outline.md", &"x".repeat(8193));
+    h.stub.push(go());
+    h.next_mode("shadow");
+    assert_eq!(h.stub.request_count(), 0);
+
+    let c = &h.consultations()[0];
+    assert_eq!(c["outcome"], "input_unavailable");
+    assert_eq!(c["reason"], "over_budget");
+    assert_eq!(c["input_label"], "outline_item");
+    assert_eq!(c["input_bytes"], 8193);
+
+    let ledger = jsonl(&ledger_path(&h));
+    let consulted: Vec<&Value> = ledger.iter().filter(|l| l["kind"] == "consulted").collect();
+    assert_eq!(consulted.len(), 1, "{ledger:?}");
+    assert_eq!(consulted[0]["reason"], "over_budget");
+    assert_eq!(consulted[0]["input_label"], "outline_item");
+    assert_eq!(consulted[0]["input_bytes"], 8193);
+
+    let journal = jsonl(&journal_path(&h));
+    let records: Vec<&Value> = journal
+        .iter()
+        .filter(|r| r["kind"] == "decider_consulted")
+        .collect();
+    assert_eq!(records.len(), 1, "{journal:?}");
+    let r = records[0];
+    assert_eq!(r["koto.decider.outcome"], "input_unavailable");
+    assert_eq!(r["koto.decider.reason"], "over_budget");
+    assert_eq!(r["koto.decider.input_label"], "outline_item");
+    assert_eq!(r["koto.decider.input_bytes"], 8193);
+    assert_eq!(r["koto.decider.field"], "verdict");
+    assert_eq!(r["koto.decider.answer"], "no_answer");
+    assert_eq!(r["koto.decider.mode"], "shadow");
+    assert!(r.get("koto.decider.threshold_met").is_none(), "{r}");
+    // The context key (which `context_reads` names on its own records) and
+    // the input's content stay out of the consultation's record.
+    let line = r.to_string();
+    assert!(!line.contains("outline.md"), "{line}");
+    assert!(!line.contains("xxxx"), "{line}");
+    let raw = std::fs::read_to_string(journal_path(&h)).unwrap();
+    assert!(!raw.contains("xxxx"), "the input's content stays out");
+}
+
+#[test]
+fn the_agents_answer_after_a_shadow_consultation_pairs_in_the_journal() {
+    let h = ready(&standard("shadow", "shadow"), vec![go()]);
+    h.next_mode("shadow");
+    assert_eq!(h.stub.request_count(), 1);
+    let out = h.next_with("shadow", r#"{"verdict": "exit"}"#);
+    assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+
+    let journal = jsonl(&journal_path(&h));
+    let consulted: Vec<&Value> = journal
+        .iter()
+        .filter(|r| r["kind"] == "decider_consulted")
+        .collect();
+    let answered: Vec<&Value> = journal
+        .iter()
+        .filter(|r| r["kind"] == "decider_answered")
+        .collect();
+    assert_eq!((consulted.len(), answered.len()), (1, 1), "{journal:?}");
+    let (c, a) = (consulted[0], answered[0]);
+    assert_eq!(c["koto.decider.field"], "verdict");
+    assert_eq!(c["koto.decider.answer"], "proceed");
+    assert_eq!(c["koto.decider.mode"], "shadow");
+    assert_eq!(c["koto.decider.threshold_met"], true);
+    assert_eq!(a["koto.decider.field"], "verdict");
+    assert_eq!(a["koto.decider.agent_answer"], "exit");
+    assert_eq!(a["koto.decider.consulted_seq"], c["koto.seq"]);
+    assert_eq!(a["koto.visit.seq"], c["koto.visit.seq"]);
+    assert_eq!(a["koto.session.id"], c["koto.session.id"]);
+}
+
 #[test]
 fn the_payload_holds_only_the_question_and_its_inputs() {
     let h = ready(&standard("shadow", "shadow"), vec![go()]);

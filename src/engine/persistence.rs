@@ -1395,7 +1395,7 @@ fn opens_window(payload: &EventPayload, current_state: &str, boundary: Boundary)
 }
 
 /// The state a state-entry event enters, or `None` for any other event.
-fn entered_state(payload: &EventPayload) -> Option<&str> {
+pub(crate) fn entered_state(payload: &EventPayload) -> Option<&str> {
     match payload {
         EventPayload::Transitioned { to, .. }
         | EventPayload::DirectedTransition { to, .. }
@@ -1420,7 +1420,7 @@ pub(crate) fn opens_visit(payload: &EventPayload) -> bool {
 /// searched end to end. A line laid out any other way falls back to
 /// searching all of it for an entry's type word. Either way a `true` is only
 /// a candidate: the caller parses the line.
-fn may_be_entry(line: &str) -> bool {
+pub(crate) fn may_be_entry(line: &str) -> bool {
     const ENTRY_TYPES: [&[u8]; 3] = [b"transitioned\"", b"directed_transition\"", b"rewound\""];
     const TYPE_KEY: &[u8] = b"\"type\":\"";
     let bytes = line.as_bytes();

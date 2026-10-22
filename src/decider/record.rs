@@ -52,6 +52,39 @@ impl ConsultationOutcome {
     }
 }
 
+/// Why a declared input stopped an `input_unavailable` consultation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableReason {
+    /// The context key or variable the input reads isn't set.
+    Unset,
+    /// The input is longer than its declared `max_bytes`.
+    OverBudget,
+    /// The context key holds bytes that aren't UTF-8 text.
+    NotText,
+}
+
+impl UnavailableReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UnavailableReason::Unset => "unset",
+            UnavailableReason::OverBudget => "over_budget",
+            UnavailableReason::NotText => "not_text",
+        }
+    }
+}
+
+/// The input that stopped an `input_unavailable` consultation: its declared
+/// label and, when it was read, its size. Never its content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnavailableInput {
+    pub reason: UnavailableReason,
+    /// The input's `label` as the template declares it.
+    pub label: String,
+    /// The input's size in bytes; `None` for an unset input.
+    pub bytes: Option<u64>,
+}
+
 /// One declared field in a consultation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldConsultation {
@@ -165,6 +198,16 @@ pub struct DeciderConsultation {
     /// record; absent on records written before it existed, which read as 0.
     #[serde(default)]
     pub unread_usage_attempts: u32,
+    /// Why the consultation stopped at `input_unavailable`. Absent on every
+    /// other outcome, and on records written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<UnavailableReason>,
+    /// The declared label of the input that stopped it, with `reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_label: Option<String>,
+    /// That input's size in bytes, with `reason`; absent for an unset input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_bytes: Option<u64>,
 }
 
 #[cfg(test)]
@@ -195,7 +238,47 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             unread_usage_attempts: 0,
+            reason: None,
+            input_label: None,
+            input_bytes: None,
         }
+    }
+
+    #[test]
+    fn reason_names() {
+        for (r, n) in [
+            (UnavailableReason::Unset, "unset"),
+            (UnavailableReason::OverBudget, "over_budget"),
+            (UnavailableReason::NotText, "not_text"),
+        ] {
+            assert_eq!(r.as_str(), n);
+            assert_eq!(serde_json::to_string(&r).unwrap(), format!("\"{}\"", n));
+        }
+    }
+
+    #[test]
+    fn an_unavailable_input_round_trips_and_an_old_record_reads_without_one() {
+        let mut c = sample();
+        c.outcome = ConsultationOutcome::InputUnavailable;
+        c.error_class = None;
+        c.reason = Some(UnavailableReason::OverBudget);
+        c.input_label = Some("diff".to_string());
+        c.input_bytes = Some(18_000);
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["reason"], "over_budget");
+        assert_eq!(v["input_label"], "diff");
+        assert_eq!(v["input_bytes"], 18_000);
+        let back: DeciderConsultation = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back, c);
+
+        let mut old = v;
+        for key in ["reason", "input_label", "input_bytes"] {
+            old.as_object_mut().unwrap().remove(key);
+        }
+        let read: DeciderConsultation = serde_json::from_value(old).unwrap();
+        assert_eq!(read.reason, None);
+        assert_eq!(read.input_label, None);
+        assert_eq!(read.input_bytes, None);
     }
 
     #[test]

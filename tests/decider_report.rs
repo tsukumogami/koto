@@ -2077,3 +2077,45 @@ fn a_config_parse_error_never_prints_the_file_content() {
         }
     }
 }
+
+/// The ledger lines from this change on give `input_unavailable` a reason. The
+/// report counts them by it, and a line without one (from an older build)
+/// still counts toward `input_unavailable` but under no reason.
+#[test]
+fn input_unavailable_is_counted_by_reason_when_the_ledger_gives_one() {
+    let h = Harness::new(&standard("shadow", "shadow"));
+    let mut lines = metrics_ledger();
+    for (seq, reason) in [(9, "over_budget"), (10, "over_budget"), (11, "unset")] {
+        let mut v = consulted(Some("s1"), seq, "ha", "input_unavailable", None, false);
+        v["reason"] = json!(reason);
+        v["input_label"] = json!("diff");
+        if reason == "over_budget" {
+            v["input_bytes"] = json!(18_000);
+        }
+        lines.push(v);
+    }
+    write_ledger(&h, &lines);
+    let r = report_json(&h, &[]);
+    assert_eq!(
+        question(&r, "ha")["outcomes"],
+        json!({
+            "applied": 1,
+            "not_applied": 5,
+            "input_unavailable": 4,
+            "error": 1,
+            "input_unavailable_by_reason": {"over_budget": 2, "unset": 1}
+        })
+    );
+    assert!(question(&r, "hb")["outcomes"]
+        .get("input_unavailable_by_reason")
+        .is_none());
+
+    let out = report(&h, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+    let table = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        table.contains("input_unavailable 4 [over_budget 2, unset 1], error 1);"),
+        "{}",
+        table
+    );
+}

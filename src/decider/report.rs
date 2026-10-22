@@ -205,6 +205,12 @@ pub struct Outcomes {
     pub not_applied: u64,
     pub input_unavailable: u64,
     pub error: u64,
+    /// `input_unavailable` consultations by the reason their record gives
+    /// (`unset`, `over_budget` or `not_text`). Records written before the
+    /// reason existed give none and aren't counted here, so a ledger with
+    /// no reasons reports an empty map, left out of the JSON.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub input_unavailable_by_reason: BTreeMap<String, u64>,
 }
 
 /// A confusion matrix: rows are the label (the agent's value, or a
@@ -686,7 +692,15 @@ pub fn analyze(read: &LedgerRead, opts: &ReportOptions) -> LedgerReport {
                     q.applied_bytes += rec.directive_bytes;
                 }
                 ConsultationOutcome::NotApplied => q.outcomes.not_applied += 1,
-                ConsultationOutcome::InputUnavailable => q.outcomes.input_unavailable += 1,
+                ConsultationOutcome::InputUnavailable => {
+                    q.outcomes.input_unavailable += 1;
+                    if let Some(reason) = rec.reason {
+                        *q.outcomes
+                            .input_unavailable_by_reason
+                            .entry(reason.as_str().to_string())
+                            .or_default() += 1;
+                    }
+                }
                 ConsultationOutcome::Error => {
                     q.outcomes.error += 1;
                     let class = rec.error_class.map_or("unknown", |c| c.as_str());
@@ -1528,14 +1542,28 @@ pub fn render_table(report: &Report) -> String {
     for q in &report.questions {
         let _ = writeln!(out, "\nquestion {}.{}", q.state, q.field);
         let _ = writeln!(out, "  declaration hash {}", q.declaration_hash);
+        // The reasons follow the count only when a record gave one, so a
+        // ledger from before them reads exactly as it did.
+        let reasons = if q.outcomes.input_unavailable_by_reason.is_empty() {
+            String::new()
+        } else {
+            let parts: Vec<String> = q
+                .outcomes
+                .input_unavailable_by_reason
+                .iter()
+                .map(|(reason, n)| format!("{} {}", reason, n))
+                .collect();
+            format!(" [{}]", parts.join(", "))
+        };
         let _ = writeln!(
             out,
-            "  consultations {} (applied {}, not_applied {}, input_unavailable {}, error {}); \
+            "  consultations {} (applied {}, not_applied {}, input_unavailable {}{}, error {}); \
              paired {} ({} counted toward eligibility); directed exits {} ({} counted)",
             q.consultations,
             q.outcomes.applied,
             q.outcomes.not_applied,
             q.outcomes.input_unavailable,
+            reasons,
             q.outcomes.error,
             q.paired,
             q.counted_paired,
@@ -1750,6 +1778,9 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 unread_usage_attempts: 0,
+                reason: None,
+                input_label: None,
+                input_bytes: None,
             },
         )
     }

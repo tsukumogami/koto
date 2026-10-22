@@ -68,11 +68,21 @@
 //!   gate's carries the poll's run count and elapsed seconds; a decider
 //!   check's carries the two criterion counts instead.
 //!
-//! Five more are relayed the same way, with the same two sequence
-//! numbers, from decider, override and dispute events:
+//! Eight more are relayed the same way, with the same two sequence
+//! numbers, from decider, evidence, override and dispute events:
 //!
 //! - `decider_consulted`: one per `decider_consulted` event, with the
-//!   provider, model, outcome, token counts and timings.
+//!   provider, model, outcome, token counts and timings, the field count,
+//!   an `input_unavailable` consultation's reason and its input's label
+//!   and size, and, for a consultation of one field, that field's name,
+//!   the decider's answer, its mode and whether it met its threshold.
+//! - `decider_field`: for a consultation of several fields, one per field
+//!   after its `decider_consulted`, with those answer keys and the
+//!   consultation's `koto.seq` as `koto.decider.consulted_seq`.
+//! - `decider_answered`: one per consulted field an agent's
+//!   `evidence_submitted` holds, on a visit whose consultation wasn't
+//!   applied, with the field, the agent's answer (a declared value, or
+//!   `other`) and `koto.decider.consulted_seq` (see `paired`).
 //! - `decider_checked`: one per `decider_checked` event (one criterion of a
 //!   decider check), with the gate as `koto.check`, the criterion's id as
 //!   `koto.rule.id` (digested like a rule id), the mode, outcome, reason,
@@ -81,6 +91,9 @@
 //! - `decider_fallback`: one per `decider_fallback` event (a criterion
 //!   handed to the agent), with the gate as `koto.check`, the criterion's id
 //!   as `koto.rule.id`, the mode, the reason and the slice's size.
+//! - `decider_check_answered`: one per `decider_check_answered` event (the
+//!   agent's answer to a fallback), with the gate, the criterion's id, the
+//!   answer, and the `seq` and reason of the fallback it answers.
 //! - `check_overridden`: one per `gate_override_recorded`, with the state
 //!   and gate only.
 //! - `check_disputed`: one per `finding_disputed`, with the state, the gate
@@ -90,7 +103,10 @@
 //!
 //! None of them copies a probability, hash, threshold, endpoint, rule
 //! reference, rationale, dispute reason, override value or output, and `koto.visit.seq` is
-//! always koto's visit, never the `visit_seq` a decider event carries.
+//! always koto's visit, never the `visit_seq` a decider event carries. An
+//! answer, a field name and an input label are names the template declares
+//! (an agent's value outside them is written `other`) or koto's own words;
+//! nothing the session wrote is copied.
 //!
 //! One more sums a visit's `context_read` events when the visit ends (see
 //! `context_reads`). It carries `koto.seq` (the sequence number of the
@@ -133,7 +149,9 @@
 //!   `workflow_cancelled`, the check kinds for `gate_evaluated` and
 //!   `default_action_executed`, and the decider and override kinds for
 //!   `decider_consulted`, `decider_checked`, `decider_fallback`,
-//!   `gate_override_recorded` and `finding_disputed`.
+//!   `decider_check_answered`, `gate_override_recorded` and
+//!   `finding_disputed`, and `decider_answered` for an agent's
+//!   `evidence_submitted` that answers a consultation.
 //!   A commit that ends a visit (an arrival, a rewind, a cancel, or the
 //!   terminal tick's `request_store.result`) writes the visit's
 //!   `context_reads` just before its own record. Before those, on any
@@ -194,6 +212,7 @@
 mod context_reads;
 mod driver;
 mod fixture;
+mod pairing;
 #[cfg(unix)]
 pub(crate) mod rotate;
 mod run_id;
@@ -315,6 +334,14 @@ impl Record {
     fn flag(mut self, key: &'static str, value: bool) -> Self {
         self.fields.push((key, Value::from(value)));
         self
+    }
+
+    /// Add `key` when `value` is present.
+    fn opt_flag(self, key: &'static str, value: Option<bool>) -> Self {
+        match value {
+            Some(v) => self.flag(key, v),
+            None => self,
+        }
     }
 
     /// Add `key` when `value` is present.
@@ -665,6 +692,7 @@ fn journals(payload: &EventPayload) -> bool {
             | EventPayload::Rewound { .. }
             | EventPayload::WorkflowCancelled { .. }
     ) || relays(payload)
+        || pairs(payload)
 }
 
 /// Whether a payload relays records of its own (see [`relayed`]).
@@ -740,7 +768,9 @@ impl Relay<'_> {
 /// `check_pending` for a pending polling gate; otherwise a
 /// `check_evaluated`, then one `check_rule` per key of the event's
 /// `rule_counts`, in their order, then its `check_finding` records. A
-/// `decider_consulted` or `decider_checked` event writes one record of its
+/// `decider_consulted` event writes one record of its own name, followed by
+/// a `decider_field` per field when it asked about several; a
+/// `decider_checked` or `decider_fallback` event writes one record of its
 /// own name, a `gate_override_recorded` one `check_overridden`, and a
 /// `finding_disputed` one `check_disputed`. Every other payload relays
 /// nothing.
@@ -829,7 +859,7 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
             records.extend(with_findings(relay, state, ACTION_CHECK, check));
             records
         }
-        EventPayload::DeciderConsulted(c) => vec![decider_consulted(relay, c)],
+        EventPayload::DeciderConsulted(c) => decider_consulted(relay, c),
         EventPayload::DeciderChecked(c) => vec![decider_checked(relay, c)],
         EventPayload::DeciderFallback(f) => vec![decider_fallback(relay, f)],
         // The override event doesn't say which rules it moved past; a reader
@@ -855,11 +885,18 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
 }
 
 /// A `decider_consulted` record: the routing decider's provider, model,
-/// outcome, tokens and timings. The event's own `visit_seq` isn't copied:
-/// `koto.visit.seq` comes from `relay`, by koto's visit rule, like every
-/// relayed record's.
-fn decider_consulted(relay: &Relay<'_>, c: &crate::decider::DeciderConsultation) -> Record {
-    relay
+/// outcome, tokens and timings, how many fields it was asked, and, for an
+/// `input_unavailable` consultation, the reason and the input's label and
+/// size. The event's own `visit_seq` isn't copied: `koto.visit.seq` comes
+/// from `relay`, by koto's visit rule, like every relayed record's.
+///
+/// A consultation of one field (every shipped template declares one per
+/// state) carries that field's answer keys itself (see [`with_field`]). One
+/// of several fields carries none, and a `decider_field` record per field
+/// follows it, keyed to it by `koto.decider.consulted_seq`, so the
+/// consultation's tokens and timings are still written once.
+fn decider_consulted(relay: &Relay<'_>, c: &crate::decider::DeciderConsultation) -> Vec<Record> {
+    let consulted = relay
         .record("decider_consulted")
         .name("koto.state", Some(c.state.as_str()))
         .name("koto.decider.provider", Some(c.provider.as_str()))
@@ -877,6 +914,166 @@ fn decider_consulted(relay: &Relay<'_>, c: &crate::decider::DeciderConsultation)
         )
         .int("koto.decider.latency_ms", Some(c.latency_ms))
         .int("koto.decider.directive_bytes", Some(c.directive_bytes))
+        .name("koto.decider.reason", c.reason.map(|r| r.as_str()))
+        .name(
+            "koto.decider.input_label",
+            c.input_label.as_deref().map(name_or_digest).as_deref(),
+        )
+        .int("koto.decider.input_bytes", c.input_bytes)
+        .int("koto.decider.field_count", Some(c.fields.len() as u64));
+    if c.fields.len() == 1 {
+        let (field, fc) = c.fields.iter().next().expect("one field");
+        return vec![with_field(consulted, field, fc)];
+    }
+    let mut records = vec![consulted];
+    for (field, fc) in &c.fields {
+        records.push(with_field(
+            relay
+                .record(DECIDER_FIELD)
+                .name("koto.state", Some(c.state.as_str()))
+                .int(CONSULTED_SEQ_FIELD, Some(relay.seq)),
+            field,
+            fc,
+        ));
+    }
+    records
+}
+
+/// One record per declared field of a consultation of several fields.
+const DECIDER_FIELD: &str = "decider_field";
+/// One record per field an agent answered on a consulted visit (see
+/// [`paired`]).
+const DECIDER_ANSWERED: &str = "decider_answered";
+/// One record per `decider_check_answered` event (see [`paired`]).
+const DECIDER_CHECK_ANSWERED: &str = "decider_check_answered";
+/// On `decider_field` and `decider_answered`: the `koto.seq` of the
+/// `decider_consulted` record the row belongs to.
+const CONSULTED_SEQ_FIELD: &str = "koto.decider.consulted_seq";
+/// The answer a field records when the decider gave none: the consultation
+/// stopped before or at the provider.
+const NO_ANSWER: &str = "no_answer";
+/// The answer written for a value that isn't one of the field's declared
+/// values, so no submitted text reaches the journal.
+const OTHER_ANSWER: &str = "other";
+
+/// `record` with one field's answer keys: the field's name, the decider's
+/// answer, the declared mode for it, and whether it met its threshold.
+///
+/// The answer is the winning declared value when the field qualified (or
+/// would have, in `shadow` or `never`), and otherwise koto's own word for
+/// what happened: `below_threshold`, `escape`, or `no_answer` when the
+/// consultation got no usable answer. The mode is the winner's when it is a
+/// declared value, otherwise the one mode every declared value shares, and
+/// otherwise absent. `koto.decider.threshold_met` is written only for a
+/// field the decider answered. The field and a value are names the template
+/// declares, digested like rule ids when outside the name shape; nothing
+/// the session wrote is copied.
+fn with_field(record: Record, field: &str, fc: &crate::decider::FieldConsultation) -> Record {
+    use crate::decider::FieldOutcome;
+    let declared_winner = fc.winning.as_deref().filter(|w| fc.modes.contains_key(*w));
+    let answer = match fc.outcome {
+        None => NO_ANSWER.to_string(),
+        Some(o @ (FieldOutcome::Escape | FieldOutcome::BelowThreshold)) => o.as_str().to_string(),
+        Some(_) => declared_winner.map_or(OTHER_ANSWER.to_string(), name_or_digest),
+    };
+    let mode = declared_winner
+        .and_then(|w| fc.modes.get(w).copied())
+        .or_else(|| {
+            let mut modes = fc.modes.values();
+            let first = *modes.next()?;
+            modes.all(|m| *m == first).then_some(first)
+        });
+    record
+        .name("koto.decider.field", Some(name_or_digest(field).as_str()))
+        .name("koto.decider.answer", Some(answer.as_str()))
+        .name("koto.decider.mode", mode.map(|m| m.as_str()))
+        .opt_flag(
+            "koto.decider.threshold_met",
+            fc.outcome.is_some().then_some(fc.at_threshold),
+        )
+}
+
+/// Whether a payload writes records that pair it with an earlier event in
+/// its log (see [`paired`]). Evidence the decider itself applied never does.
+fn pairs(payload: &EventPayload) -> bool {
+    match payload {
+        EventPayload::EvidenceSubmitted { source, .. } => {
+            source.as_deref() != Some(crate::engine::decider::DECIDER_SOURCE)
+        }
+        EventPayload::DeciderCheckAnswered(_) => true,
+        _ => false,
+    }
+}
+
+/// The records that pair a committed event with an earlier one in
+/// `prior_log` (the log before it):
+///
+/// - Evidence the agent submitted on a visit whose consultation wasn't
+///   applied writes one `decider_answered` per consulted field it holds:
+///   the visits the ledger's `answered` record pairs. Each carries the
+///   field, the agent's answer and `koto.decider.consulted_seq`, the
+///   consultation's `koto.seq`. The answer is the submitted value only when
+///   it is one of the field's declared values, read from the consultation's
+///   own record of them; any other value is written `other`.
+/// - A `decider_check_answered` event writes a `decider_check_answered`
+///   with the gate, the criterion, the agent's answer, and the `seq` and
+///   reason of the `decider_fallback` it answers, the reason read from that
+///   event.
+///
+/// Every other payload writes nothing, and so does one that finds nothing
+/// to pair with.
+fn paired(payload: &EventPayload, relay: &Relay<'_>, prior_log: &str) -> Vec<Record> {
+    match payload {
+        EventPayload::EvidenceSubmitted { state, fields, .. } => {
+            let Some((consulted_seq, c)) = pairing::consultation(prior_log, state) else {
+                return Vec::new();
+            };
+            if c.outcome == crate::decider::ConsultationOutcome::Applied {
+                return Vec::new();
+            }
+            c.fields
+                .iter()
+                .filter_map(|(field, fc)| {
+                    let answer = agent_answer(fields.get(field)?, fc);
+                    Some(
+                        relay
+                            .record(DECIDER_ANSWERED)
+                            .name("koto.state", Some(state.as_str()))
+                            .name("koto.decider.field", Some(name_or_digest(field).as_str()))
+                            .name("koto.decider.agent_answer", Some(answer.as_str()))
+                            .int(CONSULTED_SEQ_FIELD, Some(consulted_seq)),
+                    )
+                })
+                .collect()
+        }
+        EventPayload::DeciderCheckAnswered(a) => {
+            let reason = pairing::fallback(prior_log, a.fallback_seq).map(|f| f.reason);
+            vec![relay
+                .record(DECIDER_CHECK_ANSWERED)
+                .name("koto.state", Some(a.state.as_str()))
+                .name("koto.check", Some(a.gate.as_str()))
+                .name("koto.rule.id", Some(name_or_digest(&a.rule_id).as_str()))
+                .name("koto.decider.answer", Some(a.answer.as_str()))
+                .name("koto.decider.reason", reason.map(|r| r.as_str()))
+                .int("koto.decider.fallback_seq", Some(a.fallback_seq))]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The answer a `decider_answered` record carries for `submitted`: the
+/// value when it is one of the field's declared values (`"true"` or
+/// `"false"` for a boolean), digested like a rule id when outside the name
+/// shape, and `other` for anything else.
+fn agent_answer(submitted: &Value, fc: &crate::decider::FieldConsultation) -> String {
+    let value = match submitted {
+        Value::String(s) => Some(s.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    };
+    value
+        .filter(|v| fc.modes.contains_key(v))
+        .map_or(OTHER_ANSWER.to_string(), |v| name_or_digest(&v))
 }
 
 /// A `decider_checked` record: one decider-check criterion's verdict, under
@@ -1230,17 +1427,16 @@ pub(crate) fn after_commit(
     // The visit is worked out only here, for a payload that relays records
     // of its own. Apart from the closing commits above, every other commit
     // skips the scan of the log.
-    if relays(payload) {
-        records.extend(relayed(
-            payload,
-            &Relay {
-                session,
-                session_id: &header.session_id,
-                run_id: run_id.as_deref(),
-                seq: commit.seq,
-                visit_seq: commit.visit_seq_for(payload),
-            },
-        ));
+    if relays(payload) || pairs(payload) {
+        let relay = Relay {
+            session,
+            session_id: &header.session_id,
+            run_id: run_id.as_deref(),
+            seq: commit.seq,
+            visit_seq: commit.visit_seq_for(payload),
+        };
+        records.extend(relayed(payload, &relay));
+        records.extend(paired(payload, &relay, &commit.prior_log));
     }
     write(root, &records);
     // The cache moves only after the journal write, so a crash between the

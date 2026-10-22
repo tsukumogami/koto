@@ -509,6 +509,16 @@ events:
       unread_usage_attempts:
         type: integer
         required: false
+      reason:
+        type: string
+        required: false
+        enum: ["unset", "over_budget", "not_text"]
+      input_label:
+        type: string
+        required: false
+      input_bytes:
+        type: integer
+        required: false
 
   decider_checked:
     tier: 2
@@ -1882,6 +1892,9 @@ template declares a `decider` block, and at most once per visit to a state.
 | `input_tokens` | integer | No | Input tokens the provider reported for a billed answer: any 2xx answer, including one koto couldn't use (`outcome` `"error"`). Only the answer's usage counts are read. Absent when no usage could be read, including for a non-2xx status or a transport failure, which aren't billed. Counted as `decider_checked` counts them. |
 | `output_tokens` | integer | No | Output tokens, likewise. |
 | `unread_usage_attempts` | integer | No | Billed answers whose usage couldn't be read (0 or 1, since the routing decider makes one attempt), the size of any remaining undercount. Written on every event; absent only on events from before it existed, which read as 0. |
+| `reason` | string | No | With `"input_unavailable"`: why a declared input stopped the consultation, `"unset"` (its context key or variable isn't set), `"over_budget"` (it's longer than its `max_bytes`) or `"not_text"` (the context key holds bytes that aren't UTF-8 text). Absent on every other outcome, on events from before it existed, and when the request couldn't be built from the declaration, which a compiled template rules out. |
+| `input_label` | string | No | With `reason`: the declared `label` of the input that stopped it, the first in declaration order. |
+| `input_bytes` | integer | No | With `reason` `"over_budget"` or `"not_text"`: that input's size in bytes. |
 
 The event carries no input content and no credentials: inputs appear only as
 `input_sha256`, and the API key, the response body, and error text are never

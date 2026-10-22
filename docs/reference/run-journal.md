@@ -4,7 +4,8 @@ The run journal is a local record of session identity and progress for
 tooling outside koto. koto appends one JSON object per line as sessions
 start, enter states, reach a terminal, are cancelled, or are driven by a new
 Claude Code session, each time koto evaluates one of their checks or
-consults the decider, each time an override or a dispute is recorded, once per state
+consults the decider or the agent answers what the decider was asked, each
+time an override or a dispute is recorded, once per state
 visit for the context keys the visit read, and each time `koto next` or
 `koto status` prints a state's directive. The journal is
 append-only: koto never rewrites or reads back its records, so a
@@ -84,15 +85,18 @@ their digest (see
 | `check_finding` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check.name`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.finding.level`, `koto.finding.count` | Once for each distinct rule id and level among a check evaluation's logged findings, passing or failing, after its `check_rule` records. |
 | `check_pending` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.poll.status`, `koto.poll.evaluations`, `koto.poll.elapsed_secs`, `koto.decider.awaiting_count`, `koto.decider.agent_answered_count` | A polling gate's evaluation is still pending, or a decider check is waiting on the agent. |
 | `check_disputed` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check.name`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.dispute.source` | `koto disputes record` records a dispute of a rule's finding at a gate. |
-| `decider_consulted` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.outcome`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.latency_ms`, `koto.decider.directive_bytes` | koto consults the decider about a state's evidence. |
+| `decider_consulted` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.outcome`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.latency_ms`, `koto.decider.directive_bytes`, `koto.decider.reason`, `koto.decider.input_label`, `koto.decider.input_bytes`, `koto.decider.field_count`, `koto.decider.field`, `koto.decider.answer`, `koto.decider.mode`, `koto.decider.threshold_met` | koto consults the decider about a state's evidence. |
+| `decider_field` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.decider.consulted_seq`, `koto.decider.field`, `koto.decider.answer`, `koto.decider.mode`, `koto.decider.threshold_met` | Once for each field of a consultation that asked about more than one, after its `decider_consulted`. |
+| `decider_answered` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.decider.field`, `koto.decider.agent_answer`, `koto.decider.consulted_seq` | The agent submits evidence for a field the decider was consulted about and didn't decide. |
 | `decider_checked` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.mode`, `koto.decider.outcome`, `koto.decider.reason`, `koto.decider.blocked`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.attempts`, `koto.decider.latency_ms`, `koto.decider.input_bytes` | koto grades one criterion of a decider check. |
 | `decider_fallback` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.mode`, `koto.decider.reason`, `koto.decider.input_bytes` | A decider-check criterion that got no verdict is handed to the agent. |
+| `decider_check_answered` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.answer`, `koto.decider.reason`, `koto.decider.fallback_seq` | `koto decider answer` records the agent's answer to a criterion handed to it. |
 | `check_overridden` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check` | An override is recorded for a gate. |
 | `response` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.response.source`, `koto.response.directive_bytes`, `koto.response.details_bytes` | `koto next` or `koto status` has printed a non-terminal state's directive. |
 | `context_reads` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.context.key`, `koto.context.reader`, `koto.context.access`, `koto.context.overflow`, `koto.context.read_count`, `koto.context.present_count`, `koto.context.first_hash`, `koto.context.last_hash` | A state visit that read context keys ends. |
 
 The first five are the identity kinds. The next five are the check kinds,
-described in [Check records](#check-records), the four after them are the
+described in [Check records](#check-records), the seven after them are the
 decider and override kinds, described in
 [Decider and override records](#decider-and-override-records), `response`
 is described in [Response records](#response-records), and `context_reads`
@@ -329,17 +333,26 @@ literal id of that form can't be told apart from a digest.
 
 koto relays each decider consultation and each recorded override from the
 event the session's log commits for it, after the commit, as it relays
-checks. Like check records, they carry `koto.seq` and `koto.visit.seq` after
+checks. The agent's answers to what the decider was asked are written the
+same way, from the event that records them. Like check records, they carry `koto.seq` and `koto.visit.seq` after
 `koto.run.id`. `koto.visit.seq` is koto's visit, by the rule in
 [Check records](#check-records). A decider event carries a `visit_seq` of
 its own, which isn't copied.
 
 These records copy names, counts and short vocabulary values field by
-field. They never hold a probability, an input or declaration hash, a
-threshold, the endpoint or where it came from, a criterion's rule
-reference, question or descriptions, the slice a decider check sent, a
-routing consultation's per-field detail, an override's rationale, its
-values or the output it moved past.
+field. They never hold a probability or confidence, an input or declaration
+hash, a threshold, the endpoint or where it came from, a criterion's rule
+reference, question or descriptions, an input's or a slice's content, a
+context key, an override's rationale, its values or the output it moved
+past, or anything else the session wrote.
+
+Every answer a record carries (`koto.decider.answer`,
+`koto.decider.agent_answer`) is a value the template declares for the field
+or criterion, or one of koto's own words for what happened; a field name and
+an input label are the template's too. A declared name outside the name
+shape is written as its digest, as a rule id is (see [Rule ids](#rule-ids)).
+An agent's value that isn't one of the field's declared values is written
+`other`, never as submitted.
 
 ### `decider_consulted`
 
@@ -358,6 +371,68 @@ committed `decider_consulted` event.
 | `koto.decider.unread_usage_attempts` | integer | always | Billed answers whose token usage couldn't be read, so an undercount of the two counts above is visible. 0 when the event doesn't log it. |
 | `koto.decider.latency_ms` | integer | always | Wall time of the provider call, in milliseconds. |
 | `koto.decider.directive_bytes` | integer | always | UTF-8 bytes of the directive plus its details (and the recovery pointer a state with details gets) that `koto next` would have returned to the agent for the consulted state, had the routing decider not been consulted; details already delivered in that visit don't count, and an applied consultation spares the agent these bytes. This differs from a `response` record's `koto.response.directive_bytes`, which counts only the printed directive. |
+| `koto.decider.reason` | string | `input_unavailable` | Why a declared input stopped the consultation before anything was sent: `unset` (the context key or variable it reads isn't set), `over_budget` (it is longer than its `max_bytes`) or `not_text` (the context key holds bytes that aren't UTF-8 text). Left out in the one case the request can't be built from the declaration, which a compiled template rules out. |
+| `koto.decider.input_label` | string | with `koto.decider.reason` | The declared `label` of the input that stopped it, the first one in declaration order. Never its context key, a path or its content. |
+| `koto.decider.input_bytes` | integer | `over_budget`, `not_text` | That input's size in bytes. An unset input has none. |
+| `koto.decider.field_count` | integer | always | How many fields the consultation asked about. |
+| `koto.decider.field` | string | one field | The field's name. |
+| `koto.decider.answer` | string | one field | What the decider answered for it: the winning declared value (`"true"` or `"false"` for a boolean) when it met its threshold, whether or not it was applied; `below_threshold` when the winner fell short of its threshold; `escape` when no declared value won (the escape, a tie, or a boolean with neither or both sides at threshold); or `no_answer` when the consultation got no usable answer (`input_unavailable` or `error`). |
+| `koto.decider.mode` | string | one field, when known | The declared mode for that answer, after the user's and project's modes: the winner's (`shadow`, `auto` or `never`) when it is a declared value, below threshold included; otherwise the mode every declared value of the field shares, and left out when they differ. |
+| `koto.decider.threshold_met` | boolean | one field, when answered | Whether the winner met its threshold. Left out with `no_answer`. |
+
+The answer keys describe one field. A consultation of one field, which is
+every shipped template's case, carries them itself. A consultation of
+several carries none of them: one [`decider_field`](#decider_field) record
+per field follows it instead, so the consultation's tokens and timings are
+still written once.
+
+### `decider_field`
+
+One record per field of a consultation that asked about more than one, in
+field-name order, right after its `decider_consulted`.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.state` | string | always | The consulted state. |
+| `koto.decider.consulted_seq` | integer | always | The `koto.seq` of the `decider_consulted` record it belongs to, which is also its own `koto.seq`. |
+| `koto.decider.field` | string | always | The field's name. |
+| `koto.decider.answer` | string | always | As on `decider_consulted`. |
+| `koto.decider.mode` | string | when known | As on `decider_consulted`. |
+| `koto.decider.threshold_met` | boolean | when answered | As on `decider_consulted`. |
+
+### `decider_answered`
+
+One record per consulted field the agent answers: a committed
+`evidence_submitted` from the agent that holds a field the visit's
+consultation asked about, when that consultation wasn't `applied`. These
+are the visits the decider ledger pairs (see
+[Joining a consultation's answers](#joining-a-consultations-answers)). The
+agent's answer is never known when the decider is consulted, since koto
+doesn't consult once the agent's evidence holds a declared field, so it
+always comes in this later record.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.state` | string | always | The state the evidence was submitted on. |
+| `koto.decider.field` | string | always | The field's name. |
+| `koto.decider.agent_answer` | string | always | The agent's value when it is one of the field's declared values (`"true"` or `"false"` for a boolean), otherwise `other`. |
+| `koto.decider.consulted_seq` | integer | always | The `koto.seq` of the `decider_consulted` record this answer pairs with. |
+
+### Joining a consultation's answers
+
+A `decider_answered` pairs with the `decider_consulted` that has the same
+`koto.session.id` and a `koto.seq` equal to its
+`koto.decider.consulted_seq`. The pair is the consultation of the
+decider's own visit: a transition from the state to itself begins a new
+one, so an answer after a self-loop pairs only with a consultation made
+after it, even though both share one `koto.visit.seq`. With the
+consultation's `koto.decider.answer` (or its `decider_field` records'), the
+pairs give agreement, coverage and the below-threshold rate per field, as
+`koto decider report` computes them from the ledger.
+
+A consultation the decider applied has no `decider_answered`: its answer
+was submitted as the evidence. A visit the agent leaves with `koto next
+--to` before answering has none either.
 
 ### `decider_checked`
 
@@ -422,13 +497,32 @@ A criterion still waiting is evaluated again on every `koto next`, and each
 evaluation that hands it over again writes another record. So the number of
 records is the number of times the agent was asked; the number of distinct
 fallbacks is the number of distinct `koto.session.id`, `koto.visit.seq`,
-`koto.check` and `koto.rule.id` groups. The agent's answer is not relayed:
-a gate it decided has `koto.decider.agent_answered_count` above 0, and an
-answered `fail` in veto mode is one of its gate's error rules, with a
-`check_rule` under the criterion's `koto.rule.id`.
+`koto.check` and `koto.rule.id` groups. The agent's answer is the
+[`decider_check_answered`](#decider_check_answered) record that names the
+fallback's `koto.seq`; a gate it decided has
+`koto.decider.agent_answered_count` above 0, and an answered `fail` in veto
+mode is one of its gate's error rules, with a `check_rule` under the
+criterion's `koto.rule.id`.
 
 The record never holds the slice, its hash, the criterion's question or
 descriptions, or anything the agent wrote.
+
+### `decider_check_answered`
+
+One record per committed `decider_check_answered` event: the agent's answer
+to a criterion handed to it, recorded with `koto decider answer`.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.state` | string | always | The state the check belongs to. |
+| `koto.check` | string | always | The decider check's gate name. |
+| `koto.rule.id` | string | always | The criterion's id, or its digest (see [Rule ids](#rule-ids)). |
+| `koto.decider.answer` | string | always | The agent's answer: `pass`, `fail` or `unclear`. |
+| `koto.decider.reason` | string | when the log holds the fallback | Why the criterion fell back, from the `decider_fallback` it answers, with the same values. |
+| `koto.decider.fallback_seq` | integer | always | The `koto.seq` of the `decider_fallback` record it answers. |
+
+When the decider later grades the same slice of the same criterion, that
+`decider_checked` and this record together say whether the two agreed.
 
 ### `check_overridden`
 
@@ -461,6 +555,9 @@ join finds the evaluation before the transition.
 
 - A decider-check verdict koto reuses within a visit, which appends no
   `decider_checked`.
+- Evidence the decider applied, evidence on a visit with no consultation or
+  an `applied` one, and evidence holding none of the consulted fields,
+  which write no `decider_answered`.
 - Events committed by a koto that predates these records.
 
 ### Example

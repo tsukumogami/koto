@@ -37,7 +37,7 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 
 use crate::decider::ledger::{append_or_warn, LedgerRecord};
-use crate::decider::record::ConsultationOutcome;
+use crate::decider::record::{ConsultationOutcome, UnavailableInput, UnavailableReason};
 use crate::decider::request::{build_request, AssembledInputs, DeclaredField};
 use crate::decider::types::{Decider, LabelledInput, SettingOrigin};
 use crate::engine::decider::{
@@ -95,14 +95,6 @@ pub fn try_decider_lock(session_dir: &Path) -> Option<LockHold> {
 pub fn try_decider_lock(_session_dir: &Path) -> Option<LockHold> {
     let _ = OpenOptions::new;
     None
-}
-
-/// Why an input couldn't be assembled. Never carries input content.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum InputUnavailable {
-    Unset,
-    OverBudget,
-    NotText,
 }
 
 pub struct CliDeciderPort<'a> {
@@ -218,7 +210,7 @@ impl<'a> CliDeciderPort<'a> {
         fields: &[DeclaredField<'_>],
         events: &[Event],
         reads: &mut Vec<ContextReadRecord>,
-    ) -> Result<AssembledInputs, InputUnavailable> {
+    ) -> Result<AssembledInputs, UnavailableInput> {
         let bindings = bindings_from_events(events);
         let mut out = AssembledInputs::new();
         for field in fields {
@@ -227,21 +219,38 @@ impl<'a> CliDeciderPort<'a> {
                     continue;
                 }
                 let budget = input.max_bytes as usize;
+                // The declared label and the size, never the content.
+                let unavailable = |reason, bytes: Option<usize>| UnavailableInput {
+                    reason,
+                    label: input.label.clone(),
+                    bytes: bytes.map(|b| b as u64),
+                };
                 let content = match &input.source {
                     DeciderInputSource::Context(raw_key) => {
                         let key = (self.render)(raw_key);
                         let fetched = self.context_store.get(&self.session, &key);
                         reads.extend(ContextReadRecord::content(&key, fetched.as_deref().ok()));
-                        let bytes = fetched.map_err(|_| InputUnavailable::Unset)?;
+                        let bytes =
+                            fetched.map_err(|_| unavailable(UnavailableReason::Unset, None))?;
                         if bytes.len() > budget {
-                            return Err(InputUnavailable::OverBudget);
+                            return Err(unavailable(
+                                UnavailableReason::OverBudget,
+                                Some(bytes.len()),
+                            ));
                         }
-                        String::from_utf8(bytes).map_err(|_| InputUnavailable::NotText)?
+                        let len = bytes.len();
+                        String::from_utf8(bytes)
+                            .map_err(|_| unavailable(UnavailableReason::NotText, Some(len)))?
                     }
                     DeciderInputSource::Var(name) => {
-                        let value = bindings.get(name).ok_or(InputUnavailable::Unset)?;
+                        let value = bindings
+                            .get(name)
+                            .ok_or_else(|| unavailable(UnavailableReason::Unset, None))?;
                         if value.len() > budget {
-                            return Err(InputUnavailable::OverBudget);
+                            return Err(unavailable(
+                                UnavailableReason::OverBudget,
+                                Some(value.len()),
+                            ));
                         }
                         value.clone()
                     }
@@ -419,19 +428,23 @@ impl DeciderPort for CliDeciderPort<'_> {
             .into_iter()
             .map(|r| r.into_event(READER_DECIDER, req.state, None))
             .collect();
-        let request = assembled
-            .ok()
-            .and_then(|inputs| build_request(req.fields, inputs.as_map()).ok());
-        let Some(request) = request else {
-            return self.consulted(
-                start.seq,
-                None,
-                0,
-                directive_bytes,
-                ConsultResult::InputUnavailable,
-                false,
-                guard,
-            );
+        let request = match assembled {
+            Err(input) => Err(Some(input)),
+            Ok(inputs) => build_request(req.fields, inputs.as_map()).map_err(|_| None),
+        };
+        let request = match request {
+            Ok(request) => request,
+            Err(input) => {
+                return self.consulted(
+                    start.seq,
+                    None,
+                    0,
+                    directive_bytes,
+                    ConsultResult::InputUnavailable(input),
+                    false,
+                    guard,
+                );
+            }
         };
         let sha = input_sha256(&request.inputs);
 
@@ -733,6 +746,99 @@ d
         assert_eq!(sent[0].inputs, vec![li("plan_path", "docs/plan.md")]);
     }
 
+    /// [`TPL`] with its one input replaced by `input`, and a gate on
+    /// `notes.md`, which a context input must have. The port is called
+    /// directly, so the gate never runs.
+    fn compiled_with_input(input: &str) -> CompiledTemplate {
+        let src = TPL
+            .replace("- {var: PLAN_DOC, label: plan_path}", input)
+            .replace(
+                "  review:\n    accepts:",
+                "  review:\n    gates:\n      notes:\n        type: context-exists\n        key: notes.md\n    accepts:",
+            );
+        assert!(src.contains(input) && src.contains("key: notes.md"));
+        let mut f = tempfile::Builder::new().suffix(".md").tempfile().unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+        // Not strict: the gate routes nothing.
+        crate::template::compile::compile(f.path(), false).unwrap()
+    }
+
+    /// The input that stopped a consultation of `tpl`, after `setup` has
+    /// had the session; asserts nothing reached the decider.
+    fn unavailable(
+        tpl: &CompiledTemplate,
+        setup: impl FnOnce(&LocalBackend),
+    ) -> Option<UnavailableInput> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = session(tmp.path(), "sess-uuid-1");
+        setup(&backend);
+        let decider = Arc::new(ScriptedDecider::new());
+        let mut p = port(&backend, &decider);
+        let ConsultReply::Consulted(c) = consult(&mut p, tpl) else {
+            panic!("expected a consultation");
+        };
+        assert!(decider.requests().is_empty());
+        match c.result {
+            ConsultResult::InputUnavailable(input) => input,
+            other => panic!("expected input_unavailable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_unset_context_input_names_its_label_and_no_size() {
+        let tpl = compiled_with_input("- {context: notes.md, label: notes}");
+        let input = unavailable(&tpl, |_| {});
+        assert_eq!(
+            input,
+            Some(UnavailableInput {
+                reason: UnavailableReason::Unset,
+                label: "notes".to_string(),
+                bytes: None,
+            })
+        );
+    }
+
+    #[test]
+    fn an_input_over_its_budget_names_its_label_and_size() {
+        // PLAN_DOC is `docs/plan.md`, 12 bytes, against a budget of 4.
+        let tpl = compiled_with_input("- {var: PLAN_DOC, label: plan_path, max_bytes: 4}");
+        let input = unavailable(&tpl, |_| {});
+        assert_eq!(
+            input,
+            Some(UnavailableInput {
+                reason: UnavailableReason::OverBudget,
+                label: "plan_path".to_string(),
+                bytes: Some(12),
+            })
+        );
+        let tpl = compiled_with_input("- {context: notes.md, label: notes, max_bytes: 4}");
+        let input = unavailable(&tpl, |b| b.add("wf", "notes.md", b"twelve bytes").unwrap());
+        assert_eq!(
+            input,
+            Some(UnavailableInput {
+                reason: UnavailableReason::OverBudget,
+                label: "notes".to_string(),
+                bytes: Some(12),
+            })
+        );
+    }
+
+    #[test]
+    fn a_context_input_that_is_not_text_names_its_label_and_size() {
+        let tpl = compiled_with_input("- {context: notes.md, label: notes}");
+        let input = unavailable(&tpl, |b| {
+            b.add("wf", "notes.md", &[0xff, 0xfe, 0x00]).unwrap()
+        });
+        assert_eq!(
+            input,
+            Some(UnavailableInput {
+                reason: UnavailableReason::NotText,
+                label: "notes".to_string(),
+                bytes: Some(3),
+            })
+        );
+    }
+
     #[test]
     fn an_empty_header_session_id_is_none() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -802,6 +908,9 @@ d
                     input_tokens: None,
                     output_tokens: None,
                     unread_usage_attempts: 0,
+                    reason: None,
+                    input_label: None,
+                    input_bytes: None,
                 }),
                 "2026-01-01T00:00:01Z",
             )
@@ -938,6 +1047,9 @@ d
             input_tokens: None,
             output_tokens: None,
             unread_usage_attempts: 0,
+            reason: None,
+            input_label: None,
+            input_bytes: None,
         })
     }
 
