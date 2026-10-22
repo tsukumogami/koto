@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 problem: |
   koto removes finished sessions at six points without asking whether a
   related session is alive, knows nothing about agent sessions, and keeps no
@@ -37,7 +37,7 @@ upstream: docs/prds/PRD-session-retention.md
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
@@ -1068,7 +1068,10 @@ scope; cleanup and cancel's `live_members`. Depends on Phase 4.
 `kept_children`, the replace's subtree move-aside with `moved_to`, its
 `replace_held_live` refusal and its move-back on failure, and the
 changelog entry saying end-of-run removal no longer removes a session with a
-link or lineage. Depends on Phase 4.
+link or lineage. It also carries the removal-outcome halves of the
+scenarios Phase 4 checks only as verdicts (Co-parent, No lineage needed,
+Release instant, Absent peer, Backstop, and Single writer over them).
+Depends on Phase 5, whose prune those end-to-end scenarios check.
 
 ### Phase 7: reads and import
 
@@ -1076,15 +1079,17 @@ The reader-anchor table in `context get/exists` and the feed's `session`
 field; import's held-by settlement, `koto/imported-from`, the dropped
 reserved keys and the anchor marker clear, with the one-host import tests
 under per-command cloud configuration in the environment. Depends on
-Phase 4.
+Phase 6, since the import scenarios run the terminal tick and the prune.
 
 ### Phase 8: the anchor hook
 
 `hooks/session-start.sh` with its watchers, the bash suite on synthetic
 payloads, and the koto-user skill and CLI guide updates (the guarded on-reap
 form, declaring only `KOTO_ANCHOR` for niwa's pass-through, and the
-corrected `workspace prune` text). Depends on Phases 1 and 3; it can merge
-before 4 to 7, since an anchor nothing honours yet changes no removal. Hand
+corrected `workspace prune` text). Depends on Phases 1 and 7, because its
+end-to-end scenarios (First dispatch, Idle close, Bare shell, No niwa) check
+prune and terminal-tick outcomes and reads that leave the read session
+untouched, and its docs describe them. Hand
 checks recorded on the pull request: plugin hooks get `CLAUDE_ENV_FILE` in
 the per-index layout; `/clear` mints a new id; where a resume hook's env
 file points; the detached watcher survives; a dispatched worker sees the
@@ -1119,7 +1124,9 @@ teardown build (shirabe#978 to #986).
 ### Phase 13: workspace configuration
 
 The dot-niwa declarations of Decision 7. Waits for releases carrying
-Phases 3 and 8 (koto) and 9 and 10 (niwa); applying it on a host is the
+Phases 3 to 8 (koto) and 9 and 10 (niwa); its pull request records the
+end-to-end niwa scenarios run against those releases, including a detached
+dispatch and the child of a reaped worker. Applying it on a host is the
 operator's step.
 
 ## Security Considerations
