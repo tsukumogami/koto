@@ -81,7 +81,7 @@ After init, follow the koto execution loop:
 
 1. Run `koto next` to get the current state's response
 2. Check the `action` field to determine what's needed:
-   - `evidence_required` -- the state needs you to submit data. Do the work, then call `koto next --with-data '{"field": "value"}'`
+   - `evidence_required` -- the state needs you to submit data. Do the work, write the evidence (`{"field": "value"}`) to a file outside the work tree, then call `koto next <session-name> --with-data @<file>`. Pass evidence as a file rather than inline JSON: some harnesses refuse a quoted JSON argument after a token-stripping prefix such as `env -u GH_TOKEN`, and koto reads the same JSON from the file
    - `gate_blocked` -- a precondition hasn't been met. Read `blocking_conditions` for what's failing, fix it, then call `koto next` again. A state's `default_action` that failed arrives here too, under the reserved name `__action__` -- see below
    - `confirm` -- a state's `default_action` ran successfully and wants confirmation before the workflow advances. Read `directive` and `action_output` (`command`, `exit_code`, `stdout`, `stderr`), then confirm with the evidence the state's `expects` asks for, or submit evidence that redirects
    - `done` -- the workflow finished

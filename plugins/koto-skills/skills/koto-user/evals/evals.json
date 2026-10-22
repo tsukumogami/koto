@@ -18,10 +18,11 @@
       "id": 2,
       "name": "evidence-submission-enum-field",
       "prompt": "I'm running a koto workflow called 'deploy-staging'. `koto next deploy-staging` returned:\n```json\n{\"action\":\"evidence_required\",\"directive\":\"Run the smoke tests against the staging environment and report whether they passed.\",\"expects\":{\"fields\":{\"smoke_test_result\":{\"type\":\"enum\",\"required\":true,\"values\":[\"passed\",\"failed\",\"partial\"]}}},\"blocking_conditions\":[],\"advanced\":true}\n```\nThe smoke tests all passed. What command do I run to submit that result and advance the workflow?",
-      "expected_output": "Agent produces the exact command: `koto next deploy-staging --with-data '{\"smoke_test_result\": \"passed\"}'` -- correct field name, correct value from the enum, correct session name.",
+      "expected_output": "Agent writes `{\"smoke_test_result\": \"passed\"}` to a file and gives the exact command `koto next deploy-staging --with-data @<file>` -- correct field name, correct value from the enum, correct session name, evidence passed from a file rather than as inline JSON.",
       "files": [],
       "assertions": [
         "Response includes `koto next deploy-staging --with-data` (correct subcommand and session name)",
+        "Response passes the evidence from a file (`--with-data @<file>`, with the JSON written to that file) rather than as an inline JSON argument",
         "Response uses the exact field name `smoke_test_result` (taken directly from expects.fields, not guessed)",
         "Response uses the value `passed` (one of the valid enum values, matching the scenario)",
         "Response does NOT use incorrect field names like `result`, `test_result`, `status`, or `outcome`"
@@ -120,7 +121,7 @@
       "id": 10,
       "name": "bound-leg-resolves-by-promotion",
       "prompt": "I'm a dispatched subagent driving the koto session 'review-443'. `koto next review-443` returned:\n```json\n{\"action\":\"evidence_required\",\"state\":\"review\",\"directive\":\"Review the PR and record your verdict.\",\"expects\":{\"fields\":{\"verdict\":{\"type\":\"enum\",\"required\":true,\"values\":[\"approve\",\"reject\"]}}},\"blocking_conditions\":[],\"leg\":{\"request_id\":\"req-9f1c2b7a-4d3e-4c5f-8a1b-2c3d4e5f6071\",\"leg_name\":\"review\"},\"advanced\":true}\n```\nI've finished the review and I'm approving. Should I run `koto request resolve req-9f1c2b7a-4d3e-4c5f-8a1b-2c3d4e5f6071 review --with-data '{\"status\":\"success\",\"summary\":\"approved\"}'` to report my verdict on the leg, and then finish my workflow?",
-      "expected_output": "Agent says no: the leg is bound to this session, so its result is promoted automatically from the session's terminal tick. The agent submits its evidence with `koto next review-443 --with-data '{\"verdict\": \"approve\"}'` and drives the workflow to terminal; koto writes the result onto the leg. An explicit resolve on a bound leg is rejected (`explicit_resolve_on_bound_leg`) and would block the real result.",
+      "expected_output": "Agent says no: the leg is bound to this session, so its result is promoted automatically from the session's terminal tick. The agent writes `{\"verdict\": \"approve\"}` to a file, submits it with `koto next review-443 --with-data @<file>`, and drives the workflow to terminal; koto writes the result onto the leg. An explicit resolve on a bound leg is rejected (`explicit_resolve_on_bound_leg`) and would block the real result.",
       "files": [],
       "assertions": [
         "Response tells the agent NOT to call `koto request resolve` on its own bound leg",
@@ -172,7 +173,7 @@
       "id": 14,
       "name": "declared-field-value-descriptions-submit",
       "prompt": "I'm running a koto workflow called 'triage-812'. `koto next triage-812` returned:\n```json\n{\"action\":\"evidence_required\",\"state\":\"classify\",\"directive\":\"Read issue 812 and classify it.\",\"advanced\":true,\"expects\":{\"fields\":{\"kind\":{\"type\":\"enum\",\"required\":true,\"values\":[\"bug\",\"feature\",\"chore\"],\"description\":\"What kind of change does this issue ask for?\",\"value_descriptions\":{\"bug\":\"Reports behavior that differs from what's documented or intended.\",\"feature\":\"Asks for behavior that doesn't exist yet.\",\"chore\":\"Maintenance with no user-visible change, such as dependencies, CI, or refactoring.\"}}}},\"blocking_conditions\":[],\"error\":null}\n```\nIssue 812 says: \"The docs say `sync --force` overwrites local changes, but it exits with an error instead.\" A teammate told me this template's decider has an escape value called `unclear`, and since I'm not 100% sure I'd rather submit `unclear`. What should I submit?",
-      "expected_output": "Agent reads `value_descriptions`, matches the issue (documented behavior that doesn't happen) to `bug`, and gives `koto next triage-812 --with-data '{\"kind\": \"bug\"}'`. It explains that `unclear` is the decider's escape, which is not in `values` and is not a valid submission (koto rejects it like any unknown value), so the agent must submit one of `bug`, `feature`, or `chore`.",
+      "expected_output": "Agent reads `value_descriptions`, matches the issue (documented behavior that doesn't happen) to `bug`, and submits `{\"kind\": \"bug\"}` from a file with `koto next triage-812 --with-data @<file>`. It explains that `unclear` is the decider's escape, which is not in `values` and is not a valid submission (koto rejects it like any unknown value), so the agent must submit one of `bug`, `feature`, or `chore`.",
       "files": [],
       "assertions": [
         "Response gives the command `koto next triage-812 --with-data` with the field `kind` set to `bug`",

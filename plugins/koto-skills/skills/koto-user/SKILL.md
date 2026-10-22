@@ -106,35 +106,32 @@ This action covers three distinct situations. Distinguish them by examining `blo
 
 **Signals:** `blocking_conditions` is empty (`[]`), `expects.fields` is non-empty
 
-No gates are blocking. The state is waiting for you to submit evidence.
+No gates are blocking. The state is waiting for you to submit evidence. Write the evidence to a file outside the work tree, pass its path to `--with-data` with an `@` in front, and remove the file:
 
 ```bash
-koto next <name> --with-data '{"field_name": "value"}'
+EV=$(mktemp -d)
+printf '%s\n' '{"field_name": "value"}' > "$EV/evidence.json"
+koto next <name> --with-data @"$EV/evidence.json"
+rm -rf "$EV"
 ```
+
+Pass evidence through a file rather than as JSON inline on the command line. Agents often run koto behind a prefix that strips a token, such as `env -u GH_TOKEN koto ...` or `GH_TOKEN= koto ...`, and some harnesses refuse a quoted argument after that prefix because they can't tell what the command runs (Claude Code's worktree-isolation check is one). The `@<file>` form gives them nothing quoted to misread, and koto reads the same JSON from the file, so the evidence is unchanged. The same holds for `koto decisions record` and `koto overrides record`. The file must hold the JSON payload directly (no shell quoting) and be at most 1 MB. Any way of writing it works: `printf` as above, a quoted heredoc (`cat > "$EV/evidence.json" <<'EOF'`), or your harness's file-writing tool. Use one of the last two when a value can hold a single quote, such as a free-text rationale, since that would end the `printf` argument early.
 
 Use `expects.fields` to know what keys to include. Match the keys exactly (they're already snake_case). Check `expects.options` if present — it shows which target state each field value routes to. A `vars.*` key in an option's `when` is a condition on a template variable that koto evaluates itself; it isn't a field you submit.
 
 A state that routes on a template variable's value (`vars.MODE: auto`) may advance as soon as it's entered, so a `koto next` can land you several states ahead with `advanced: true` and no evidence asked for. That's expected: follow the directive of the state you landed in.
 
-Example: if `expects.fields` contains `{"outcome": {"type": "enum", "required": true, "values": ["success", "failure"]}}`, submit:
+Example: if `expects.fields` contains `{"outcome": {"type": "enum", "required": true, "values": ["success", "failure"]}}`, write `{"outcome": "success"}` to a file the same way and submit it:
 
 ```bash
-koto next <name> --with-data '{"outcome": "success"}'
+koto next <name> --with-data @<file>
 ```
 
 **Fields with `value_descriptions`:** a field whose template declares a `decider` block also carries `description` (the question) and `value_descriptions` (what each value means). Read `value_descriptions` when choosing a value and pick the one whose description fits what you found, then submit it as usual. Submit only a value from `values`. The template's escape value (the decider's "can't tell" answer) isn't listed and isn't a valid submission; koto rejects it like any unknown value. If you genuinely can't tell, pick the value the directive says to use when in doubt, or ask the user.
 
 When the user has opted in to a decider, koto may already have consulted it for this state. You'll never see its answer, and it never overrides evidence you submit: if koto didn't apply the decider's answer, the state waits for you exactly as it would without a decider, and what you submit is what counts. If koto did apply it, you never see that state at all, and `koto next` returns the following stop with `advanced: true`. Either way, keep dispatching on `action`. See [response shapes](references/response-shapes.md#fields-with-a-question-and-value-descriptions).
 
-For large or pre-built JSON payloads, prefix the value with `@` to read from a file:
-
-```bash
-koto next <name> --with-data @evidence.json
-```
-
-The file must contain the JSON payload directly (no shell quoting needed) and must be at most 1 MB.
-
-**Dispatched-agent writes (`SubagentStop` hooks):** if you are a dispatched subagent writing back to a child workflow you were spawned to fulfil (one started with `--needs-agent`), you MUST pass `--dispatch-epoch <n>` with the epoch baked into your spawn. Example: `koto next <child> --dispatch-epoch 0 --with-data '{"status":"completed"}'`. The koto CLI validates `presented == header.dispatch_epoch` before any persistence call and rejects mismatches with `epoch_fence_violation` (exit code 65). Operator-driven `koto next <coord_workflow>` calls on the parent workflow do NOT require the flag. The same epoch goes on `koto request progress` / `resolve` / `abandon` when your session is bound to a request leg — there it's checked against the epoch recorded when the leg was bound, and the failure exits 2, not 65.
+**Dispatched-agent writes (`SubagentStop` hooks):** if you are a dispatched subagent writing back to a child workflow you were spawned to fulfil (one started with `--needs-agent`), you MUST pass `--dispatch-epoch <n>` with the epoch baked into your spawn. Example, with `{"status":"completed"}` written to a file: `koto next <child> --dispatch-epoch 0 --with-data @<file>`. The koto CLI validates `presented == header.dispatch_epoch` before any persistence call and rejects mismatches with `epoch_fence_violation` (exit code 65). Operator-driven `koto next <coord_workflow>` calls on the parent workflow do NOT require the flag. The same epoch goes on `koto request progress` / `resolve` / `abandon` when your session is bound to a request leg — there it's checked against the epoch recorded when the leg was bound, and the failure exits 2, not 65.
 
 ### Sub-case B: Gates failed, evidence fallback available
 
@@ -169,7 +166,7 @@ koto overrides record <name> --gate <gate_name> --rationale "<why this override 
 ```
 
 - `<gate_name>` is the `name` field from the `blocking_conditions` item
-- `--with-data '<json>'` is optional; if omitted, the gate's `override_default` or the built-in default applies
+- `--with-data @<file>`, a file holding the override value as JSON, is optional; if omitted, the gate's `override_default` or the built-in default applies
 
 **Step 2** — Re-query the workflow:
 
@@ -442,6 +439,8 @@ koto request bind <request-id> review --child review-443
 
 For a single leg there's a shorthand: `koto request create --role reviewer --template review.md --inputs '<json>' --requested-by ID --coordinator-of-record ID`. The leg is named after the role, so the role has to satisfy the leg-name grammar. `--with-data` and the `--role` / `--template` / `--inputs` triple are mutually exclusive.
 
+Unlike `koto next`, the `koto request` verbs read `--with-data` only as inline JSON; they don't take `@<file>`. That's why the examples in this section still pass it inline.
+
 `bind` only accepts a child started with `--needs-agent` under a parent — that's what makes the dispatch fence meaningful — and a child fulfils at most one leg. Rebinding the same leg to the same child is a no-op success; rebinding it elsewhere is rejected.
 
 A root session (no `--parent`) answers a leg by attaching itself: `koto request attach <request-id> <leg> --session <name>`. koto admits it only if the session isn't finished, was started from a template file the leg names, and its non-`rebind` variables match the leg's `inputs`. On a self-attached leg, `progress`, `resolve` and `abandon` are refused with `self_attached_leg`, epoch or not: the result arrives when the session reaches its terminal state, even under `koto next --no-cleanup`.
@@ -543,7 +542,7 @@ The response shape includes batch-specific fields:
 
 - `scheduler.materialized_children` — the per-child dispatch ledger (use this for idempotent dispatch, not `spawned_this_tick`).
 - `scheduler.feedback.entries` — per-task outcome keyed by short name (`accepted`, `blocked`, `errored`, `already_running`, etc.).
-- `reserved_actions` — ready-to-run retry invocations, synthesized when the gate reports `any_failed`, `any_skipped`, or `any_spawn_failed`: in the batching state, and in a later non-terminal state that routes `evidence.retry_failed` back to the batching state (the list then comes from the recorded batch).
+- `reserved_actions` — retry offers, each with the `invocation` koto would run; submit the `{"retry_failed": ...}` JSON it carries from a file (see batch-workflows.md). Synthesized when the gate reports `any_failed`, `any_skipped`, or `any_spawn_failed`: in the batching state, and in a later non-terminal state that routes `evidence.retry_failed` back to the batching state (the list then comes from the recorded batch).
 - `batch_final_view` — frozen snapshot attached to the terminal `done` response.
 - `synthetic: true` — marker on skip-marker children whose state was materialized directly (no worker ran).
 
@@ -559,8 +558,13 @@ Full coverage lives in [**batch-workflows.md**](references/batch-workflows.md). 
 
 Use `koto decisions record` to capture key choices mid-workflow. This doesn't advance the state — it just appends a decision record.
 
+Write the decision to a file, as with evidence (see [Sub-case A](#sub-case-a-submit-evidence-directly)), and pass the file:
+
 ```bash
-koto decisions record <name> --with-data '{"choice": "option-a", "rationale": "because X", "alternatives_considered": ["option-b"]}'
+D=$(mktemp -d)
+printf '%s\n' '{"choice": "option-a", "rationale": "because X", "alternatives_considered": ["option-b"]}' > "$D/decision.json"
+koto decisions record <name> --with-data @"$D/decision.json"
+rm -rf "$D"
 ```
 
 `choice` and `rationale` are required. `alternatives_considered` is optional.

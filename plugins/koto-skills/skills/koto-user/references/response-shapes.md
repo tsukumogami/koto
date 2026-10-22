@@ -131,9 +131,12 @@ are blocking.
 - `details` is omitted once it's already been delivered since you last arrived at
   this phase, unless `--full` is passed.
 
-Submit evidence with:
+Submit evidence by writing it to a file and passing the file (the skill's "Sub-case A" says why):
 ```
-koto next my-workflow --with-data '{"outcome": "approve"}'
+EV=$(mktemp -d)
+printf '%s\n' '{"outcome": "approve"}' > "$EV/evidence.json"
+koto next my-workflow --with-data @"$EV/evidence.json"
+rm -rf "$EV"
 ```
 
 ### Fields with a question and value descriptions

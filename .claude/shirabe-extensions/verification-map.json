@@ -9,6 +9,7 @@
     "doc-names": {"run": ["cargo", "test", "--locked", "--test", "doc_names"], "timeout_secs": 3600},
     "shipped-spec": {"run": ["cargo", "test", "--locked", "--lib", "shipped_spec"], "timeout_secs": 3600},
     "evals-exist": {"run": ["bash", "scripts/check-evals-exist.sh"]},
+    "inline-evidence": {"run": ["bash", "scripts/check-inline-evidence_test.sh"]},
     "run-evals-test": {"run": ["bash", "scripts/run-evals_test.sh"]}
   },
   "entries": [
@@ -17,8 +18,8 @@
       "commands": ["cargo-test", "stability-tests", "fmt", "clippy", "decider-purity"]
     },
     {
-      "paths": ["plugins/**", ".claude-plugin/**", "scripts/check-evals-exist.sh"],
-      "commands": ["doc-names", "evals-exist"]
+      "paths": ["plugins/**", ".claude-plugin/**", "scripts/check-evals-exist.sh", "scripts/check-inline-evidence.sh", "scripts/check-inline-evidence_test.sh"],
+      "commands": ["doc-names", "evals-exist", "inline-evidence"]
     },
     {
       "paths": ["docs/**"],

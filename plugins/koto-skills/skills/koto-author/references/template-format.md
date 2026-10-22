@@ -957,7 +957,7 @@ gates:
 
 When `koto overrides record` runs, the value to inject is resolved in this order:
 
-1. `--with-data <json>` supplied on the command line (highest priority)
+1. `--with-data @<file>` (or the JSON inline) supplied on the command line (highest priority)
 2. `override_default` declared on the gate
 3. Built-in default for the gate type (lowest priority)
 
@@ -983,9 +983,13 @@ When a gate is blocking and can't be resolved normally, an operator can record a
 # Override a gate using the built-in or declared default
 koto overrides record <session-name> --gate <gate-name> --rationale "<reason why>"
 
-# Override with an explicit value (takes priority over override_default and built-in)
+# Override with an explicit value (takes priority over override_default and built-in),
+# written to a file rather than passed inline
+OV=$(mktemp -d)
+printf '%s\n' '{"exit_code": 0, "error": ""}' > "$OV/override.json"
 koto overrides record <session-name> --gate <gate-name> --rationale "<reason why>" \
-  --with-data '{"exit_code": 0, "error": ""}'
+  --with-data @"$OV/override.json"
+rm -rf "$OV"
 
 # List all overrides recorded in the session
 koto overrides list <session-name>

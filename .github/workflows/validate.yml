@@ -541,6 +541,18 @@ jobs:
       - name: Check that an injected forge reference fails it
         run: scripts/check-poll-forge-neutral.sh --self-test
 
+  inline-evidence:
+    # The koto-skills plugin shows evidence passed as --with-data @<file>, never
+    # as inline JSON, which harnesses refuse after a token-stripping prefix.
+    # The test runs the check on the tree first, then on its fixtures.
+    name: Inline Evidence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check no skill passes koto evidence inline
+        run: bash scripts/check-inline-evidence_test.sh
+
   audit:
     name: Audit
     runs-on: ubuntu-latest
@@ -633,7 +645,7 @@ jobs:
 
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, stability-tests, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, poll-forge-neutral, audit, tsuku-distributed-install, cloud-integration]
+    needs: [check-artifacts, unit-tests, stability-tests, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, poll-forge-neutral, inline-evidence, audit, tsuku-distributed-install, cloud-integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -652,6 +664,7 @@ jobs:
              [ "${{ needs.value-routing-compat-v0-14-1.result }}" = "failure" ] || \
              [ "${{ needs.check-lifecycle-compat-v0-14-1.result }}" = "failure" ] || \
              [ "${{ needs.poll-forge-neutral.result }}" = "failure" ] || \
+             [ "${{ needs.inline-evidence.result }}" = "failure" ] || \
              [ "${{ needs.audit.result }}" = "failure" ] || \
              [ "${{ needs.cloud-integration.result }}" = "failure" ] || \
              [ "${{ needs.tsuku-distributed-install.result }}" = "failure" ]; then
