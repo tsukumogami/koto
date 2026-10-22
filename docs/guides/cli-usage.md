@@ -107,14 +107,14 @@ Without `--attach-live` or `--replace-terminal`, an existing session still gets 
 Returns the directive for the current state. This is the main agent-facing command -- it tells the agent what to do next, what evidence to submit, and whether any gates are blocking.
 
 ```bash
-koto next <name> [--with-data <json>] [--to <target>] [--no-cleanup]
+koto next <name> [--with-data @<file>] [--to <target>] [--no-cleanup]
 ```
 
 **Positional argument:**
 - `<name>` -- Workflow name.
 
 **Optional flags:**
-- `--with-data <json>` -- Submit evidence as a JSON object, validated against the state's `accepts` schema. On success, appends an `evidence_submitted` event and sets `advanced: true` in the response.
+- `--with-data @<file>` -- Submit evidence as a JSON object read from `<file>` (or given inline; see below), validated against the state's `accepts` schema. On success, appends an `evidence_submitted` event and sets `advanced: true` in the response.
 - `--to <target>` -- Directed transition to a named state. The target must be a valid transition from the current state. Appends a `directed_transition` event, then dispatches on the new state. Gates are skipped, except a non-overridable gate the edge to the target depends on; see [Directed transitions and non-overridable gates](#directed-transitions-and-non-overridable-gates).
 
 The `--with-data` and `--to` flags are mutually exclusive. Passing both produces a `precondition_failed` error with exit code 2. The `--with-data` payload is capped at 1 MB.
@@ -134,14 +134,14 @@ An edge depends on a gate the way `koto next` would route it:
 
 When several edges lead to the target, `--to` is refused only if every one is blocked. A gate that reads a `capture_stdout_as` value this run hasn't produced can't be evaluated, so `--to` refuses with `capture_unset`. Overridable gates are never evaluated on this path.
 
-The `--with-data` value can be either inline JSON or a file reference. Prefix a path with `@` to read the payload from disk — useful for batch task lists and any payload large enough to be awkward on the command line:
+The `--with-data` value can be a file reference or inline JSON. Prefix a path with `@` to read the payload from disk. Prefer the file form: agents often run koto behind a prefix that strips a token (`env -u GH_TOKEN koto ...`), and some agent harnesses refuse a quoted JSON argument after that prefix because they can't tell what the command runs. The file gives them nothing quoted to misread, and koto reads the same JSON from it. It also suits batch task lists and any payload large enough to be awkward on the command line:
 
 ```bash
-# Inline JSON
-koto next task-42 --with-data '{"decision":"proceed"}'
-
-# Read from file
+# Read from a file (preferred)
 koto next coord --with-data @tasks.json
+
+# Inline JSON, also accepted
+koto next task-42 --with-data '{"decision":"proceed"}'
 ```
 
 The 1 MB cap applies to both forms (file size is checked before reading). Use `@-` is **not** supported; only file paths are accepted after `@`.
@@ -1386,6 +1386,7 @@ The standard loop for an AI agent dispatches on the `action` field:
 ```bash
 # Initialize from a template
 koto init task-42 --template workflow.md
+EV=$(mktemp -d)
 
 # Main loop
 while true; do
@@ -1404,8 +1405,9 @@ while true; do
     "evidence_required")
       # Check .blocking_conditions first -- fix if non-empty
       # Do the work described in .directive
-      # Submit evidence matching .expects schema
-      result=$(koto next task-42 --with-data '{"decision": "proceed"}')
+      # Submit evidence matching .expects schema, from a file
+      printf '%s\n' '{"decision": "proceed"}' > "$EV/evidence.json"
+      result=$(koto next task-42 --with-data @"$EV/evidence.json")
       ;;
     "integration"|"integration_unavailable")
       # Review .integration output (or proceed manually if unavailable)
@@ -1414,10 +1416,12 @@ while true; do
     "confirm")
       # Review .action_output
       # Submit evidence if the state accepts it
-      result=$(koto next task-42 --with-data '{"status": "accepted"}')
+      printf '%s\n' '{"status": "accepted"}' > "$EV/evidence.json"
+      result=$(koto next task-42 --with-data @"$EV/evidence.json")
       ;;
   esac
 done
+rm -rf "$EV"
 ```
 
 Use `--to` for directed transitions when the agent needs to jump to a specific state:

@@ -153,7 +153,7 @@ Once a skill is installed, the agent follows a simple cycle:
 1. `koto init` -- start the workflow from a template
 2. `koto next` -- get the current directive and `expects` schema
 3. Execute the work described in the directive
-4. `koto next --with-data '{...}'` -- submit evidence matching the schema, or `koto next --to <state>` for a directed transition
+4. `koto next --with-data @<file>` -- submit evidence matching the schema, written to a file first, or `koto next --to <state>` for a directed transition
 5. Repeat from step 2 until `action` is `"done"`
 
 The plugin includes a Stop hook that detects active workflows when a session ends, so the agent can resume where it left off.
