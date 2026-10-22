@@ -102,9 +102,20 @@ array is non-empty, fix those conditions before submitting evidence.
 
 ### 4. Submit evidence
 
+Write the evidence to a file outside the work tree and pass its path with `@`:
+
 ```bash
-koto next <session> --with-data '{"mode": "issue_backed", "issue_number": "42"}'
+EV=$(mktemp -d)
+printf '%s\n' '{"mode": "issue_backed", "issue_number": "42"}' > "$EV/evidence.json"
+koto next <session> --with-data @"$EV/evidence.json"
+rm -rf "$EV"
 ```
+
+Pass evidence as a file, not as an inline JSON argument. Commands often run koto
+behind a prefix that strips a token (`env -u GH_TOKEN koto ...`), and some agent
+harnesses refuse a quoted argument after that prefix because they can't tell what
+the command runs. koto reads the same JSON from the file, so the evidence is
+unchanged. The same goes for `koto decisions record` and `koto overrides record`.
 
 The engine evaluates evidence, routes to the matching target state, and continues
 advancing. The response shows the new state with `advanced: true`.
@@ -134,6 +145,7 @@ The workflow is finished. Report completion to the user.
 ```bash
 # Initialize
 koto init task-42 --template .koto/templates/work-on.md --var ISSUE_NUMBER=42
+EV=$(mktemp -d)
 
 # Main loop
 while true; do
@@ -151,8 +163,9 @@ while true; do
     "evidence_required")
       # Check .blocking_conditions first -- fix if non-empty
       # Then do the work described in .directive
-      # Submit evidence matching .expects schema
-      result=$(koto next task-42 --with-data '{"decision": "proceed"}')
+      # Submit evidence matching .expects schema, from a file
+      printf '%s\n' '{"decision": "proceed"}' > "$EV/evidence.json"
+      result=$(koto next task-42 --with-data @"$EV/evidence.json")
       ;;
     "integration"|"integration_unavailable")
       # Review .integration output (or proceed manually if unavailable)
@@ -163,6 +176,7 @@ while true; do
       ;;
   esac
 done
+rm -rf "$EV"
 ```
 
 ## The details Field

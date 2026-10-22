@@ -193,9 +193,16 @@ Two kinds of state carry it:
 | `label` | Short human-readable label. |
 | `description` | One-line summary. |
 | `applies_to` | Short task names to retry: children whose outcome is `failure`, `skipped`, or `spawn_failed`. In a state reached after the batch, only those that have a session on disk. |
-| `invocation` | POSIX-safe ready-to-run command string. Copy and run as-is. |
+| `invocation` | POSIX-safe ready-to-run command string. It carries the `retry_failed` object as inline JSON; submit that object from a file, as below. |
 
-The `retry_failed` key is reserved evidence: it isn't validated against the state's `accepts` fields and isn't part of `expects.fields`, although the state still has to accept evidence at all for `--with-data` to be taken. Read `reserved_actions` and submit the `invocation` directly; don't try to cram `retry_failed` into a normal evidence submission alongside other keys.
+The `retry_failed` key is reserved evidence: it isn't validated against the state's `accepts` fields and isn't part of `expects.fields`, although the state still has to accept evidence at all for `--with-data` to be taken. Read `reserved_actions` and submit the `retry_failed` object its `invocation` carries, on its own: write it to a file and pass `--with-data @<file>`, as with any evidence (the skill's "Sub-case A" says why). It's the same JSON the invocation would have sent, so the retry is the same. Don't try to cram `retry_failed` into a normal evidence submission alongside other keys.
+
+```bash
+EV=$(mktemp -d)
+printf '%s\n' '{"retry_failed":{"children":["task-2"]}}' > "$EV/retry.json"
+koto next coord --with-data @"$EV/retry.json"
+rm -rf "$EV"
+```
 
 ## `retry_failed` mechanics
 

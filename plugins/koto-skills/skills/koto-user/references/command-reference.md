@@ -100,7 +100,7 @@ Initializes a new workflow. Provide the definition one of two ways:
 
 ```
 koto next <name>
-koto next <name> --with-data '<json>'
+koto next <name> --with-data @<file>
 koto next <name> --to <state>
 koto next <name> [--no-cleanup] [--full]
 ```
@@ -109,7 +109,7 @@ Gets the current state directive. Submits evidence when `--with-data` is provide
 
 | Flag | Description |
 |---|---|
-| `--with-data <json>` | Submit evidence as a JSON object. Must conform to the state's `accepts` schema. Max 1 MB. The `"gates"` key is reserved and rejected. Mutually exclusive with `--to`. Prefix with `@` to read the payload from a file (e.g. `--with-data @evidence.json`); the file is also capped at 1 MB. |
+| `--with-data @<file>` | Submit evidence as a JSON object, read from `<file>`. Must conform to the state's `accepts` schema. Max 1 MB. The `"gates"` key is reserved and rejected. Mutually exclusive with `--to`. The value may also be the JSON itself, inline (`'<json>'`), but write it to a file and pass `@<file>`: some harnesses refuse a quoted argument after a token-stripping prefix such as `env -u GH_TOKEN` (see the skill's "Sub-case A"). |
 | `--to <state>` | Force a directed transition to a named state. Must be a valid transition target from the current state. Skips gates, except an `overridable: false` gate the edge to the target depends on: if that gate's result doesn't satisfy the edge, the call exits 1 with `gate_blocked` naming it and records nothing. Mutually exclusive with `--with-data`. |
 | `--no-cleanup` | Keep the session after it reaches a terminal state. A terminal declared `failure: true` is always kept anyway. The result still reaches the parent and any bound leg; the response's `retention` field says whether the session was kept and why. |
 | `--full` | Always include the `details` field, even if it was already delivered since you last arrived at the state. By default `details` is omitted once delivered, until the workflow arrives at the state again — from a different state, or via `koto rewind`. A self-transition is a lap rather than an arrival and does not bring it back; a tick that leaves and comes back through another state does. |
@@ -481,7 +481,7 @@ Every subcommand except `list` and `watch` prints the same object:
 
 ### create
 
-`--with-data` takes `{"legs":[{"name","role","template","inputs"}],"inputs":{...}}`; the per-leg `inputs` is that leg's own ask, the top-level `inputs` is context shared by the whole request. Unknown keys are rejected. The flat `--role` / `--template` / `--inputs` triple is the one-leg shorthand and names the leg after the role; it is mutually exclusive with `--with-data`, and all three are required together.
+`--with-data` takes `{"legs":[{"name","role","template","inputs"}],"inputs":{...}}` as inline JSON (the `koto request` verbs don't read `@<file>`); the per-leg `inputs` is that leg's own ask, the top-level `inputs` is context shared by the whole request. Unknown keys are rejected. The flat `--role` / `--template` / `--inputs` triple is the one-leg shorthand and names the leg after the role; it is mutually exclusive with `--with-data`, and all three are required together.
 
 `--requested-by` and `--coordinator-of-record` are both required. Attribution, not authorization — anything running as the same user can read any request it can name.
 
@@ -526,7 +526,7 @@ All three take `--dispatch-epoch`, validated against the epoch recorded on the l
 ## koto overrides record
 
 ```
-koto overrides record <name> --gate <gate> --rationale <text> [--with-data '<json>']
+koto overrides record <name> --gate <gate> --rationale <text> [--with-data @<file>]
 ```
 
 Records an override for a blocked gate so that the next `koto next` call treats the gate as passed.
@@ -536,7 +536,7 @@ Records an override for a blocked gate so that the next `koto next` call treats 
 | `<name>` | Yes | Workflow name |
 | `--gate <gate>` | Yes | Name of the gate to override. Must exist in the current template state. |
 | `--rationale <text>` | Yes | Explanation for why the override is appropriate. Max 1 MB. |
-| `--with-data '<json>'` | No | Override value to substitute as gate output. If omitted, falls back to the gate's `override_default` value, then to the built-in default for the gate type. Fails if no default is available. Supports the `@file` prefix to read the value from a file (e.g. `--with-data @override.json`), with the same 1 MB cap as `koto next`. |
+| `--with-data @<file>` | No | Override value to substitute as gate output, read as JSON from `<file>`, with the same 1 MB cap as `koto next`. If omitted, falls back to the gate's `override_default` value, then to the built-in default for the gate type. Fails if no default is available. The value may also be the JSON itself, inline (`'<json>'`); the file form is the one to use, for the reason under `koto next`. |
 
 **Override value resolution order:**
 1. `--with-data` value
@@ -631,17 +631,17 @@ Lists all override history for a workflow across all states.
 ## koto decisions record
 
 ```
-koto decisions record <name> --with-data '<json>'
+koto decisions record <name> --with-data @<file>
 ```
 
 Records a structured decision without advancing state.
 
-The `--with-data` JSON must be an object with:
+The `--with-data` JSON, read from `<file>` with the same 1 MB cap as `koto next`, must be an object with:
 - `choice` (string, required)
 - `rationale` (string, required)
 - `alternatives_considered` (array of strings, optional)
 
-Supports the `@file` prefix to read the payload from a file (e.g. `--with-data @decision.json`), with the same 1 MB cap as `koto next`.
+The value may also be the JSON itself, inline (`'<json>'`); the file form is the one to use, for the reason under `koto next`.
 
 **Success output:**
 ```json

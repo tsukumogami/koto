@@ -20,9 +20,11 @@ default list and passes the gate without the checks this file names for them: ru
 
 - `src/**`, `tests/**`, `test/functional/fixtures/**`, `benches/**`, `koto-stability-tests/**`,
   `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `CLAUDE.md` -> every default command below
-- `plugins/**`, `.claude-plugin/**`, `scripts/check-evals-exist.sh` -> all of:
-  - `cargo test --test doc_names` (the only test that reads `plugins/`)
+- `plugins/**`, `.claude-plugin/**`, `scripts/check-evals-exist.sh`, `scripts/check-inline-evidence.sh`,
+  `scripts/check-inline-evidence_test.sh` -> all of:
+  - `cargo test --test doc_names` (the only Rust test that reads `plugins/`)
   - `bash scripts/check-evals-exist.sh`
+  - `bash scripts/check-inline-evidence_test.sh` (`validate.yml`'s `inline-evidence` job)
   - `for d in $(find plugins/*/skills/*/ -maxdepth 0 -type d 2>/dev/null); do test ! -f "$d/hooks.json" || exit 1; done`
   - `P=plugins/koto-skills/.claude-plugin/plugin.json && test -f "$P" && jq -e ".name and (.name | length > 0)" "$P" >/dev/null && jq -e ".version and (.version | length > 0)" "$P" >/dev/null && jq -e ".skills and (.skills | length > 0)" "$P" >/dev/null`
   - `M=.claude-plugin/marketplace.json && test -f "$M" && jq -e ".name and (.name | length > 0)" "$M" >/dev/null && jq -e ".owner and (.owner | length > 0)" "$M" >/dev/null && jq -e ".plugins and (.plugins | length > 0)" "$M" >/dev/null`
@@ -67,8 +69,8 @@ default list and passes the gate without the checks this file names for them: ru
   in the next entry until someone checks its `on:` block against this rule and adds it here. The
   check script itself is under `scripts/**`, so a change to it stays with a person too.
 - `.github/**` (except `.github/pull_request_template.md` and the two workflows in the previous
-  entry); `install.sh`; `scripts/**` (except `scripts/check-evals-exist.sh` and the three
-  run-evals files above); `.release/**`; `.goreleaser.yaml`; `.cargo/**`;
+  entry); `install.sh`; `scripts/**` (except `scripts/check-evals-exist.sh`, the two inline-evidence files and the
+  three run-evals files above); `.release/**`; `.goreleaser.yaml`; `.cargo/**`;
   `plugins/koto-skills/hooks/*.sh`; `.claude/settings.json` -> no local check exists. Still run
   every other selected command; if one fails the outcome is failed, otherwise it is cannot-verify:
   no command here checks what these files do and most are not read by PR CI either, so the run
