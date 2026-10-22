@@ -16,7 +16,8 @@ goals: |
   that and says why it keeps what it keeps. It works on one machine with koto
   alone, survives `koto session import`, and the small workspace-manager and
   skill pieces stay inert where their tool is absent.
-upstream: docs/briefs/BRIEF-session-retention.md
+absorbed:
+  - docs/briefs/BRIEF-session-retention.md
 ---
 
 # PRD: Session retention across the dispatch hierarchy
@@ -24,6 +25,29 @@ upstream: docs/briefs/BRIEF-session-retention.md
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-session-retention](docs/briefs/BRIEF-session-retention.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+The feature was framed before these requirements existed. Agent sessions
+hand work to each other, and whoever sits above or below a finished worker
+needs its koto log and keys afterwards: a coordinator to check or undo what
+it decided, a person to see why, a worker to re-read its dispatcher's
+record. koto removed finished sessions at several points without asking who
+still needed them, the relations it could follow did not survive an import,
+and an idle but resumable agent session, or a person's own session with no
+koto run, looked to koto as already gone. The framed outcome: a session
+stays readable for as long as any session in its dispatch hierarchy is
+alive, an idle resumable agent session counting as alive; koto says why it
+keeps what it keeps and what a person's explicit removal broke; and it all
+works on one machine with koto alone and after an import. The framing set
+the boundary these requirements and Out of Scope operationalize: koto-owned
+links each session keeps about itself, an anchor per agent session closed
+by an observed deletion or an idle period, one rule at every removal by rule
+or subtree, reads that leave the read session unchanged, and only the small
+generic workspace-manager and skill pieces outside koto; no decision
+records, no authority, no cloud turned on, and no other harnesses.
 
 ## Problem Statement
 
