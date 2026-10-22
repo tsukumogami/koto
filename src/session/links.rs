@@ -12,6 +12,14 @@
 //! store's own write path for the agent writer, so it holds for every caller
 //! of the store and not only for the two CLI arms. koto's own writer, and a
 //! cloud pull replaying keys the remote already holds, are not affected.
+//!
+//! A template's own writes (`context_assignments`, `clear_on_entry`) are
+//! refused when the template is compiled rather than here: a refusal at the
+//! store would land mid-transition, after the `transitioned` event that
+//! records the assignment, and every later read would retry the write. The
+//! writer-less `ContextStore::add` and `remove` are store primitives for
+//! koto's own callers and tests; agent-facing writes go through the
+//! `*_with_writer` forms.
 
 use std::path::Path;
 
@@ -235,11 +243,18 @@ impl LinkWrite {
 ///
 /// A peer that fails [`validate_peer`], or that is the session itself, is
 /// refused with an [`InvalidPeerError`] before anything is read or written,
-/// and a session that doesn't exist is refused too. A link that is already
-/// there is left alone, body included, so recording it again leaves every
-/// file of the session byte-identical. Otherwise the key is written with
-/// writer `koto`, and a `context_added` event naming that writer is appended
-/// to the session's log, best-effort, as for koto's other own keys.
+/// and a session that doesn't exist is refused too. A self-link says nothing
+/// (a session is always in its own hierarchy) and would give every reader
+/// that follows links an edge back to where it started. A link that is
+/// already there is left alone, body included, so recording it again leaves
+/// every file of the session byte-identical. Otherwise the key is written
+/// with writer `koto`, and a `context_added` event naming that writer is
+/// appended to the session's log, best-effort, as for koto's other own keys.
+///
+/// The presence check and the write aren't one atomic step: two writers
+/// racing on the same new link both write it, the later body (and its `at`)
+/// wins and the log gets two `context_added` events. Either body names the
+/// same peer, so the link means the same thing.
 pub fn write_link<S>(
     store: &S,
     session: &str,
@@ -282,6 +297,11 @@ where
 
 /// The links `session` holds, in key order. A key in the links area whose
 /// kind koto doesn't know, or whose shape isn't `<kind>/<peer>`, is skipped.
+///
+/// This reads through the context store and trusts what it finds, which
+/// suits showing a session's links. It is not the reader a retention
+/// decision needs: that one must refuse symlinks, keep unknown kinds and
+/// versions as edges, and treat anything unreadable as a reason to keep.
 pub fn read_links(store: &dyn ContextStore, session: &str) -> anyhow::Result<Vec<Link>> {
     let mut links = Vec::new();
     for key in store.list_keys(session, Some(LINKS_PREFIX))? {

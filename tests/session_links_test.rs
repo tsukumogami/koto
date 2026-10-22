@@ -426,6 +426,29 @@ fn init_dispatched_by_with_entry_flags_and_from_stdin_records_the_link() {
         assert_eq!(code, 0, "{stdout}\n{stderr}");
     });
     assert!(link(dir, "w3", "dispatcher").is_some());
+
+    // The entry-flag path, replacing a finished session: the replacement
+    // carries the link.
+    init(dir, "w4", &[]);
+    run_ok(
+        dir,
+        &[
+            "next",
+            "w4",
+            "--with-data",
+            r#"{"status":"done"}"#,
+            "--no-cleanup",
+        ],
+    );
+    single_writer(dir, "w4", || {
+        let out = init(
+            dir,
+            "w4",
+            &["--replace-terminal", "--dispatched-by", "dispatcher"],
+        );
+        assert_eq!(out["outcome"], "replaced", "{out}");
+    });
+    assert!(link(dir, "w4", "dispatcher").is_some());
 }
 
 #[test]

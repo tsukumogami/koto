@@ -1568,7 +1568,11 @@ fn attach(
 
     // A session attaching itself records who requested it. An attach whose
     // issuer names some other session is that session acting on this one,
-    // and writes nothing into it.
+    // and writes nothing into it. `--issued-by` is the caller's own claim,
+    // not an authenticated identity, so this is a convention that keeps an
+    // honest runner from writing into a session it doesn't drive, not access
+    // control. A dispatched child never gets here: it is bound through
+    // `bind_dispatched` above, where its parent lineage already relates it.
     if self_run {
         match super::build_backend() {
             Ok(backend) => {
