@@ -322,7 +322,7 @@ Multiple surfaces expose batch state. Use the right one for the question you're 
 | "How is a bound leg going before it finishes?" | `koto request get <request-id>` — `legs[*].progress` and `legs[*].disposition`. This is the only place mid-flight progress exists. |
 | "I restarted, or I'm not the session holding the gate — where's the result?" | `koto request get <request-id>` — `legs[*].result`. Same envelope the directive carried, promoted from the child's terminal tick. |
 | "What reason should I render for a failed child?" | `children[*].reason` with `reason_source` as the provenance tag: in `blocking_conditions[0].output` while the parent waits in the batching state, and in `batch_final_view` (the terminal response, or `koto context get <parent> batch_final_view`) once the tick that completed the batch has moved the parent on. |
-| "Which children are eligible for retry, and how do I invoke it?" | `reserved_actions[0].applies_to` and `reserved_actions[0].invocation`. |
+| "Which children are eligible for retry, and how do I invoke it?" | `reserved_actions[0].applies_to`, and the `retry_failed` object in `reserved_actions[0].invocation`, submitted from a file (see "`reserved_actions`: the retry-discovery surface"). |
 | "Is this the final batch outcome?" | `batch_final_view` on the terminal `done` response (its counts, booleans and `children[]`), or `koto context get <parent> batch_final_view` from a later non-terminal state. |
 | "Are there children on disk I forgot about?" | `scheduler.feedback.orphan_candidates`. |
 | "Is this child itself a sub-batch coordinator?" | `materialized_children[*].role == "coordinator"` with `subbatch_status` for inner-batch counts. |
