@@ -1391,7 +1391,10 @@ pub(crate) fn after_commit(
     let reads = context_reads::closes_visit(payload)
         .then(|| commit.prior_visit_seq())
         .flatten()
-        .and_then(|visit| Some((visit, context_reads::fold(&commit.prior_log, visit)?)));
+        .and_then(|visit| {
+            let fold = context_reads::fold_with_spool(&commit.prior_log, visit, &session_dir)?;
+            Some((visit, fold))
+        });
     if new_driver.is_none() && reads.is_none() && !journals(payload) {
         return;
     }

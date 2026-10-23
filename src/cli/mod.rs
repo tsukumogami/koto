@@ -1718,6 +1718,9 @@ pub fn run(app: App) -> Result<()> {
             // `KOTO_ANCHOR` unset this reads nothing at all.
             if crate::engine::reentrancy::enclosing_tick().is_none() {
                 session_anchor::hold_from_env(backend, &name, "next");
+                // A new id for this tick, which its commands' reads of other
+                // sessions are fresh for (`crate::session::sync_stamp`).
+                backend.begin_tick(&name);
             }
             let context_store: &dyn ContextStore = backend;
             let result = handle_next(

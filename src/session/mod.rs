@@ -9,8 +9,10 @@ pub mod hierarchy;
 pub mod inventory;
 pub mod links;
 pub mod local;
+pub mod read_spool;
 pub mod recover;
 pub mod sync;
+pub mod sync_stamp;
 pub mod validate;
 pub mod version;
 
@@ -642,6 +644,15 @@ impl Backend {
     /// `crate::engine::template_source_status`.
     pub fn is_cloud(&self) -> bool {
         matches!(self, Backend::Cloud(_))
+    }
+
+    /// Start a tick of `id`: give it a new id, the window a cloud read made
+    /// by its commands treats a session it already checked as fresh in
+    /// (`sync_stamp`). The local backend asks no bucket and keeps none.
+    pub fn begin_tick(&self, id: &str) {
+        if let Backend::Cloud(b) = self {
+            b.begin_tick(id);
+        }
     }
 
     /// Push the writes the commands of a tick on `id` deferred

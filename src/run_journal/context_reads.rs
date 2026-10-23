@@ -7,13 +7,16 @@
 //! out of the log bytes the commit already read under its lock and writes
 //! one record per distinct (key, reader, access) tuple, in first-read
 //! order. Nothing is kept between processes, because the session's log
-//! already holds every read of the visit and the event that opened it.
+//! already holds the event that opened the visit and every read its own tick
+//! made, and the read spool beside it (`crate::session::read_spool`) holds
+//! the reads this host made from anywhere else.
 //!
 //! The fold holds at most [`MAX_TUPLES`] tuples and one overflow counter,
 //! however long the visit is, and parses only the lines whose type word is
 //! `context_read`.
 
 use std::borrow::Cow;
+use std::path::Path;
 
 use serde::Deserialize;
 
@@ -60,6 +63,7 @@ pub(super) fn closes_visit(payload: &EventPayload) -> bool {
 /// the session's log as it stood before the commit that closes the visit.
 /// `None` when the visit logged no read, or when its reads were already
 /// written, so the caller can skip everything else a record needs.
+#[cfg(test)]
 pub(super) fn fold(log: &str, visit_seq: u64) -> Option<Fold> {
     let window = window(log, visit_seq)?;
     let mut fold = Fold::default();
@@ -71,6 +75,48 @@ pub(super) fn fold(log: &str, visit_seq: u64) -> Option<Fold> {
         }
     }
     (!fold.is_empty()).then_some(fold)
+}
+
+/// [`fold`], with the visit's reads this host spooled beside the session
+/// (`crate::session::read_spool`, read through its one reader) folded in
+/// too: the reads made by anything but the session's own tick, which the
+/// cloud backend keeps out of the log. A spooled read belongs to the visit
+/// when it was made at or after the event the window starts from. Log and
+/// spool reads are folded in time order, so first-read order holds across
+/// both.
+pub(super) fn fold_with_spool(log: &str, visit_seq: u64, session_dir: &Path) -> Option<Fold> {
+    let (opening, window) = window_from(log, visit_seq)?;
+    let since = line_timestamp(opening).unwrap_or_default();
+    let spooled = crate::session::read_spool::read(session_dir, since);
+    let mut lines: Vec<(&str, &str)> = window
+        .lines()
+        .filter(|line| head(line).is_some_and(|(_, kind)| kind == CONTEXT_READ))
+        .map(|line| (line_timestamp(line).unwrap_or_default(), line))
+        .collect();
+    lines.extend(
+        spooled
+            .iter()
+            .map(|line| (line_timestamp(line).unwrap_or_default(), line.as_str())),
+    );
+    // Stable, so reads at the same instant keep log-then-spool order.
+    lines.sort_by(|a, b| a.0.cmp(b.0));
+    let mut fold = Fold::default();
+    for (_, line) in lines {
+        if let Ok(read) = serde_json::from_str::<ReadLine<'_>>(line) {
+            fold.add(&read.payload);
+        }
+    }
+    (!fold.is_empty()).then_some(fold)
+}
+
+/// A line's `timestamp`, read from its text without parsing the rest.
+fn line_timestamp(line: &str) -> Option<&str> {
+    const KEY: &str = "\"timestamp\":\"";
+    // Spelled as an escape, as in `head`.
+    const QUOTE: char = '\x22';
+    let start = line.find(KEY)? + KEY.len();
+    let rest = &line[start..];
+    Some(&rest[..rest.find(QUOTE)?])
 }
 
 /// [`fold`], as the `context_reads` records of the commit `relay`
@@ -98,18 +144,26 @@ pub(super) fn records(log: &str, visit_seq: u64, relay: &Relay<'_>) -> Vec<Recor
 /// at `visit_seq`, or earlier at the last line that opens a visit by
 /// itself (a state entry other than a self-transition), so the window
 /// never reaches back past an arrival whatever `visit_seq` says.
+#[cfg(test)]
 fn window(log: &str, visit_seq: u64) -> Option<&str> {
+    window_from(log, visit_seq).map(|(_, window)| window)
+}
+
+/// [`window`], with the line it starts after.
+fn window_from(log: &str, visit_seq: u64) -> Option<(&str, &str)> {
     for line in log.lines().rev() {
         let Some((seq, kind)) = head(line) else {
             continue;
         };
         if seq <= visit_seq {
-            return Some(after(log, line));
+            return Some((line, after(log, line)));
         }
         match kind.as_ref() {
-            SESSION_IMPORTED => return Some(after(log, line)),
+            SESSION_IMPORTED => return Some((line, after(log, line))),
             REQUEST_STORE_RESULT | WORKFLOW_CANCELLED => return None,
-            k if ENTRY_TYPES.contains(&k) && opens_a_visit(line) => return Some(after(log, line)),
+            k if ENTRY_TYPES.contains(&k) && opens_a_visit(line) => {
+                return Some((line, after(log, line)))
+            }
             _ => {}
         }
     }

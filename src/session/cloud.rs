@@ -30,6 +30,7 @@ use crate::session::batch::{self, BatchLock, Journal, Pending};
 use crate::session::context::{is_host_local_key, ContextStore};
 use crate::session::local::{repo_id, LocalBackend};
 use crate::session::sync::{self, ManifestCache};
+use crate::session::sync_stamp::{self, Stamp};
 use crate::session::{
     state_file_name, SessionBackend, SessionError, SessionInfo, SessionLock, SessionMigrated,
 };
@@ -198,6 +199,12 @@ pub struct CloudBackend {
     /// commands write to, and a second pull would only fetch what it pushed.
     /// Boxed for the same reason as `local_migration_checks`.
     pulled: Box<Mutex<HashSet<String>>>,
+    /// Per-process answers of [`CloudBackend::probe`], by session id: one
+    /// listing of the session's prefix, which the migration check, the
+    /// state pull and the manifest fetch all read
+    /// (`crate::session::sync_stamp`). Boxed for the same reason as
+    /// `local_migration_checks`.
+    probes: Box<Mutex<HashMap<String, sync_stamp::Probe>>>,
 }
 
 impl CloudBackend {
@@ -230,6 +237,7 @@ impl CloudBackend {
             migration_checks: Mutex::new(HashMap::new()),
             local_migration_checks: Box::new(Mutex::new(HashMap::new())),
             pulled: Box::new(Mutex::new(HashSet::new())),
+            probes: Box::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -290,7 +298,15 @@ impl CloudBackend {
         let answer = match checks.get(id) {
             Some(answer) => answer.clone(),
             None => {
-                let answer = match self.read_migration_marker_of(id) {
+                // A tick that already checked `id` saw no marker; otherwise
+                // the session's probe says, in the listing the state pull
+                // and the manifest read take their ETags from.
+                let checked = if self.tick_fresh(id, self.stamp(id).as_ref()) {
+                    Ok(None)
+                } else {
+                    self.probed_migration_marker(id)
+                };
+                let answer = match checked {
                     Ok(answer) => answer,
                     Err(e) => {
                         eprintln!(
@@ -308,6 +324,19 @@ impl CloudBackend {
             Some(migrated) => Err(anyhow::Error::new(migrated)),
             None => Ok(()),
         }
+    }
+
+    /// [`CloudBackend::read_migration_marker_of`] through the session's
+    /// probe: the marker's body is fetched only when the listing shows it.
+    fn probed_migration_marker(&self, id: &str) -> anyhow::Result<Option<SessionMigrated>> {
+        if !self.probe(id)?.marker {
+            return Ok(None);
+        }
+        Ok(match self.fetch_object(&self.marker_key(id)) {
+            Ok(Some(bytes)) => Some(migrated_from_marker(id, &bytes)),
+            Ok(None) => None,
+            Err(_) => Some(migrated_from_marker(id, b"")),
+        })
     }
 
     /// Ask the bucket, uncached, whether `id` carries a migration marker.
@@ -397,6 +426,218 @@ impl CloudBackend {
     /// S3 key of a session's migration marker under this backend's prefix.
     fn marker_key(&self, id: &str) -> String {
         format!("{}{}", self.session_prefix(id), MIGRATED_MARKER)
+    }
+
+    // -----------------------------------------------------------------
+    // Freshness (koto#428): see `crate::session::sync_stamp`.
+    // -----------------------------------------------------------------
+
+    /// S3 key of a session's context manifest.
+    fn manifest_key(&self, id: &str) -> String {
+        format!("{}ctx/manifest.json", self.session_prefix(id))
+    }
+
+    /// One listing of `id`'s prefix: whether the migration marker is there,
+    /// and the bucket's ETags for the state file and the manifest. Asked
+    /// once per session per process; [`CloudBackend::forget_probe`] drops
+    /// the answer after this process writes the session.
+    ///
+    /// An object listed without an ETag reads as present with an empty one,
+    /// which no stamp matches, so it is always fetched.
+    fn probe(&self, id: &str) -> anyhow::Result<sync_stamp::Probe> {
+        if let Some(probe) = self
+            .probes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+        {
+            return Ok(probe.clone());
+        }
+        let prefix = self.session_prefix(id);
+        let results = self
+            .bucket
+            .list(prefix.clone(), None)
+            .map_err(|e| anyhow::anyhow!("listing {} failed: {}", prefix, e))?;
+        let (marker, state, manifest) = (
+            self.marker_key(id),
+            self.state_key(id),
+            self.manifest_key(id),
+        );
+        let mut probe = sync_stamp::Probe::default();
+        for obj in results.iter().flat_map(|page| page.contents.iter()) {
+            let etag = || {
+                Some(
+                    obj.e_tag
+                        .as_deref()
+                        .map(sync_stamp::normalize_etag)
+                        .unwrap_or_default(),
+                )
+            };
+            if obj.key == marker {
+                probe.marker = true;
+            } else if obj.key == state {
+                probe.state_etag = etag();
+            } else if obj.key == manifest {
+                probe.manifest_etag = etag();
+            }
+        }
+        self.probes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), probe.clone());
+        Ok(probe)
+    }
+
+    /// Start a tick of `id`: write the id its commands read as the current
+    /// tick ([`CloudBackend::current_tick`]).
+    pub fn begin_tick(&self, id: &str) {
+        sync_stamp::begin_tick(&self.local.session_dir(id));
+    }
+
+    /// Drop this process's probe of `id`, after a write that changed what
+    /// the bucket holds for it.
+    fn forget_probe(&self, id: &str) {
+        self.probes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+    }
+
+    /// `id`'s stamp, when it is for `id`'s state key.
+    fn stamp(&self, id: &str) -> Option<Stamp> {
+        Stamp::load(&self.local.session_dir(id)).filter(|s| s.state_key == self.state_key(id))
+    }
+
+    /// The id of the tick this process runs under, read from the ticked
+    /// session's directory; `None` outside a tick.
+    fn current_tick(&self) -> Option<String> {
+        let tick = reentrancy::enclosing_tick()?;
+        sync_stamp::tick_id(&self.local.session_dir(&tick))
+    }
+
+    /// Whether the current tick already checked `id` against the bucket and
+    /// its local state file is still the bytes it checked: the tick is the
+    /// freshness window, so no request is made.
+    fn tick_fresh(&self, id: &str, stamp: Option<&Stamp>) -> bool {
+        let Some(stamp) = stamp else {
+            return false;
+        };
+        let Some(tick) = self.current_tick() else {
+            return false;
+        };
+        if stamp.verified_tick.as_deref() != Some(tick.as_str()) {
+            return false;
+        }
+        let path = self.local.session_dir(id).join(state_file_name(id));
+        std::fs::read(path).is_ok_and(|bytes| stamp.matches(&bytes))
+    }
+
+    /// Stamp `id` with the current tick, after a probe found its local copy
+    /// current.
+    fn mark_verified(&self, id: &str, mut stamp: Stamp) {
+        stamp.verified_tick = self.current_tick();
+        stamp.save(&self.local.session_dir(id));
+    }
+
+    /// Stamp `id` as holding `bytes`, which the bucket holds under `etag`:
+    /// after a pull or a push of its state file.
+    fn record_synced(&self, id: &str, etag: Option<&str>, bytes: &[u8]) {
+        let dir = self.local.session_dir(id);
+        let previous = self.stamp(id);
+        let stamp = match etag.filter(|e| !e.is_empty()) {
+            Some(etag) => {
+                let mut stamp =
+                    Stamp::for_bytes(previous.as_ref(), &self.state_key(id), etag, bytes);
+                stamp.verified_tick = self.current_tick();
+                stamp
+            }
+            // No ETag to compare with: drop the stamp, so the next read
+            // fetches the state file.
+            None => Stamp {
+                state_key: self.state_key(id),
+                manifest_etag: previous.and_then(|p| p.manifest_etag),
+                ..Stamp::default()
+            },
+        };
+        stamp.save(&dir);
+    }
+
+    /// PUT `id`'s state file and stamp what went up.
+    fn put_state(&self, id: &str, data: &[u8]) -> anyhow::Result<()> {
+        let key = self.state_key(id);
+        let response = self
+            .bucket
+            .put_object(&key, data)
+            .with_context(|| format!("S3 PUT failed for key: {}", key))?;
+        self.forget_probe(id);
+        self.record_synced(id, response_etag(&response).as_deref(), data);
+        Ok(())
+    }
+
+    /// Put the remote manifest of `id` in this process's manifest cache
+    /// before a context read consults it, from the copy cached beside the
+    /// session when the bucket's manifest is still the one cached, so a
+    /// read whose local copy is current fetches no manifest. Inside a tick
+    /// that already checked `id`, the cached copy is used without asking
+    /// the bucket. When the bucket has no manifest, an empty one is cached,
+    /// so the read asks for nothing more. Anything that fails here leaves
+    /// the cache empty, and the read fetches the manifest as it always has.
+    fn prime_manifest(&self, id: &str) {
+        if self.manifest_cache.get(id).is_some() {
+            return;
+        }
+        let dir = self.local.session_dir(id);
+        let stamp = self.stamp(id);
+        let cached = |etag: &str| -> Option<crate::session::context::Manifest> {
+            if etag.is_empty() || stamp.as_ref()?.manifest_etag.as_deref() != Some(etag) {
+                return None;
+            }
+            let mut manifest: crate::session::context::Manifest =
+                serde_json::from_slice(&sync_stamp::load_manifest(&dir)?).ok()?;
+            manifest.drop_host_local();
+            Some(manifest)
+        };
+        if self.tick_fresh(id, stamp.as_ref()) {
+            if let Some(etag) = stamp.as_ref().and_then(|s| s.manifest_etag.clone()) {
+                if let Some(manifest) = cached(&etag) {
+                    self.manifest_cache.set(id, manifest);
+                    return;
+                }
+            }
+        }
+        let Ok(probe) = self.probe(id) else {
+            return;
+        };
+        let Some(etag) = probe.manifest_etag else {
+            self.manifest_cache
+                .set(id, crate::session::context::Manifest::default());
+            return;
+        };
+        if let Some(manifest) = cached(&etag) {
+            self.manifest_cache.set(id, manifest);
+            return;
+        }
+        let Ok(response) = self.bucket.get_object(self.manifest_key(id)) else {
+            return;
+        };
+        if response.status_code() != 200 {
+            return;
+        }
+        let Ok(mut manifest) =
+            serde_json::from_slice::<crate::session::context::Manifest>(response.bytes())
+        else {
+            return;
+        };
+        sync_stamp::save_manifest(&dir, response.bytes());
+        let mut stamp = stamp.unwrap_or_else(|| Stamp {
+            state_key: self.state_key(id),
+            ..Stamp::default()
+        });
+        // The listing's ETag, which the next probe is compared with.
+        stamp.manifest_etag = Some(etag);
+        stamp.save(&dir);
+        manifest.drop_host_local();
+        self.manifest_cache.set(id, manifest);
     }
 
     /// Whether an object exists, asked by listing with its key as the
@@ -512,8 +753,7 @@ impl CloudBackend {
         }
         let data = std::fs::read(&state_path)
             .with_context(|| format!("reading local state file: {}", state_path.display()))?;
-        let key = self.state_key(id);
-        self.put_object(&key, &data)
+        self.put_state(id, &data)
     }
 
     /// S3 key of a session's compiled template.
@@ -615,13 +855,42 @@ impl CloudBackend {
         if own_tick && !self.mark_pulled(id) {
             return Ok(());
         }
+        // The state file is fetched only when the bucket's copy moved since
+        // this host last pulled or pushed it, or the local file is no longer
+        // what it pulled or pushed (`crate::session::sync_stamp`). Inside a
+        // tick that already checked `id`, the bucket isn't asked at all.
+        let stamp = self.stamp(id);
+        if self.tick_fresh(id, stamp.as_ref()) {
+            return Ok(());
+        }
+        let remote_etag = match self.probe(id) {
+            Ok(probe) => match probe.state_etag {
+                Some(etag) => etag,
+                None => return Ok(()), // Not in the bucket: use local.
+            },
+            Err(e) => {
+                eprintln!("warning: cloud sync pull failed: {}", e);
+                return Ok(());
+            }
+        };
+        let state_path = self.local.session_dir(id).join(state_file_name(id));
+        if let Some(stamp) = stamp {
+            if !remote_etag.is_empty()
+                && stamp.state_etag.as_deref() == Some(remote_etag.as_str())
+                && std::fs::read(&state_path).is_ok_and(|local| stamp.matches(&local))
+            {
+                self.mark_verified(id, stamp);
+                return Ok(());
+            }
+        }
         let key = self.state_key(id);
         match self.bucket.get_object(&key) {
             Ok(response) if response.status_code() == 200 => {
-                let state_path = self.local.session_dir(id).join(state_file_name(id));
                 refuse_cross_import_pull(id, &state_path, response.bytes())?;
                 if let Err(e) = std::fs::write(&state_path, response.bytes()) {
                     eprintln!("warning: cloud sync: failed to write pulled state: {}", e);
+                } else {
+                    self.record_synced(id, Some(&remote_etag), response.bytes());
                 }
             }
             Ok(_) => {} // Not found or other status, use local
@@ -1227,6 +1496,12 @@ impl CloudBackend {
         reentrancy::runs_inside_tick_of(id)
     }
 
+    /// Whether this process is `id`'s own tick or a command it runs: the
+    /// tick marker names `id`.
+    fn is_own_tick(&self, id: &str) -> bool {
+        reentrancy::enclosing_tick().as_deref() == Some(id)
+    }
+
     /// Record that this process pulled `id`; false when it already had.
     fn mark_pulled(&self, id: &str) -> bool {
         self.pulled
@@ -1444,7 +1719,7 @@ impl CloudBackend {
         if state_path.exists() {
             let data = std::fs::read(&state_path)
                 .with_context(|| format!("reading local state file: {}", state_path.display()))?;
-            self.put_object(&self.state_key(id), &data)?;
+            self.put_state(id, &data)?;
         }
         local.last_sync_base = local.version;
         local.save(&version_path)?;
@@ -1459,6 +1734,7 @@ impl CloudBackend {
             Ok(())
         });
         self.manifest_cache.invalidate();
+        self.forget_probe(id);
         // The batch stays open until its marker is gone: with the journal
         // closed, nothing would come back to delete a marker left behind,
         // and every import would refuse the session for good. The next
@@ -1756,8 +2032,7 @@ impl CloudBackend {
         let path = self.local.session_dir(id).join(state_file_name(id));
         let data = std::fs::read(&path)
             .with_context(|| format!("reading local state file: {}", path.display()))?;
-        let key = self.state_key(id);
-        self.put_object(&key, &data)
+        self.put_state(id, &data)
     }
 
     /// Return true if cloud sync is available for callers that want to
@@ -2003,6 +2278,20 @@ impl SessionBackend for CloudBackend {
         timestamp: &str,
     ) -> anyhow::Result<()> {
         self.local_guard(id)?;
+        // A read of `id` by anything but its own tick is kept on this host,
+        // in the read spool, and never written into `id`'s log or pushed:
+        // the reader must not become a writer of a session it only read.
+        if matches!(
+            payload,
+            crate::engine::types::EventPayload::ContextRead { .. }
+        ) && !self.is_own_tick(id)
+        {
+            return crate::session::read_spool::append(
+                &self.local.session_dir(id),
+                timestamp,
+                payload,
+            );
+        }
         if self.defers(id) {
             if let Some((_journal, _lock)) = self.open_batch(id)? {
                 return self.local.append_event(id, payload, timestamp);
@@ -2322,6 +2611,7 @@ impl CloudBackend {
             key,
             &self.manifest_cache,
         );
+        self.forget_probe(session);
 
         // Update last_sync_base after successful push.
         self.finalize_version_after_push(session);
@@ -2371,6 +2661,7 @@ impl ContextStore for CloudBackend {
         {
             return None;
         }
+        self.prime_manifest(session);
         sync::remote_key_meta(
             &self.bucket,
             &self.prefix,
@@ -2394,6 +2685,7 @@ impl ContextStore for CloudBackend {
         // Pull from remote if a newer version exists. A pull that wrote the
         // local store is a write like any other, so it is logged -- before
         // the read the caller is about to log, which it produced.
+        self.prime_manifest(session);
         let pulled = sync::pull_context_if_newer(
             &self.local,
             &self.bucket,
@@ -2436,6 +2728,7 @@ impl ContextStore for CloudBackend {
             return false;
         }
         // Fall back to checking remote manifest.
+        self.prime_manifest(session);
         sync::remote_key_exists(
             &self.bucket,
             &self.prefix,
@@ -2493,6 +2786,7 @@ impl ContextStore for CloudBackend {
             key,
             &self.manifest_cache,
         );
+        self.forget_probe(session);
 
         self.finalize_version_after_push(session);
 
@@ -2505,6 +2799,7 @@ impl ContextStore for CloudBackend {
         let pending = self.pending_keys(session).unwrap_or_default();
         // Merge in remote-only keys, leaving out those an open batch
         // removed here.
+        self.prime_manifest(session);
         if let Some(remote_keys) = sync::remote_list_keys(
             &self.bucket,
             &self.prefix,
@@ -3805,6 +4100,16 @@ fn is_not_found(e: &S3Error) -> bool {
     matches!(e, S3Error::HttpFailWithBody(404, _))
 }
 
+/// A response's `ETag` header, without its quotes; `None` when it has none.
+fn response_etag(response: &s3::request::ResponseData) -> Option<String> {
+    response
+        .headers()
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
+        .map(|(_, value)| sync_stamp::normalize_etag(value))
+        .filter(|etag| !etag.is_empty())
+}
+
 /// How many of a flush's independent requests (one per context key) are in
 /// flight at once. Each waits a full round trip, so a batch of many keys
 /// would otherwise cost the flush that many round trips in a row.
@@ -3990,19 +4295,52 @@ pub(crate) mod test_support {
 
     /// A ListObjectsV2 body naming `keys`, as rust-s3 parses it.
     pub(crate) fn list_body(keys: &[String]) -> Vec<u8> {
+        let tagged: Vec<(String, String)> =
+            keys.iter().map(|k| (k.clone(), String::new())).collect();
+        list_body_tagged(&tagged)
+    }
+
+    /// [`list_body`] with each key's ETag; an empty one is left out.
+    pub(crate) fn list_body_tagged(keys: &[(String, String)]) -> Vec<u8> {
         let mut xml = String::from(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>\
              <Name>test-bucket</Name><IsTruncated>false</IsTruncated>",
         );
-        for key in keys {
+        for (key, etag) in keys {
+            let etag = if etag.is_empty() {
+                String::new()
+            } else {
+                format!("<ETag>\"{}\"</ETag>", etag)
+            };
             xml.push_str(&format!(
                 "<Contents><Key>{}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified>\
-                 <Size>1</Size></Contents>",
-                key
+                 {}<Size>1</Size></Contents>",
+                key, etag
             ));
         }
         xml.push_str("</ListBucketResult>");
         xml.into_bytes()
+    }
+
+    /// The ETag the endpoint gives `bytes`: a hash of the content, so a
+    /// changed object gets a new one.
+    pub(crate) fn etag_of(bytes: &[u8]) -> String {
+        crate::session::sync_stamp::sha256_hex(bytes)[..16].to_string()
+    }
+
+    /// The key a stored object answers a listing of `prefix` with, when it
+    /// falls under it. Objects are stored under the end of their path:
+    /// a seeded `/wf/koto-wf.state.jsonl`, or a PUT's whole
+    /// `/test-bucket/<key>`. The stored name is lined up with the end of
+    /// `/test-bucket/<prefix>` at the longest overlap, and what follows the
+    /// overlap is the rest of the key.
+    pub(crate) fn listed_key(prefix: &str, name: &str) -> Option<String> {
+        let full = format!("/test-bucket/{}", prefix);
+        (1..=name.len())
+            .rev()
+            .filter(|&j| name.is_char_boundary(j))
+            .find(|&j| full.ends_with(&name[..j]))
+            .map(|j| format!("{}{}", prefix, &name[j..]))
     }
 
     /// The `prefix` of a ListObjectsV2 request target, or `None` when the
@@ -4027,10 +4365,12 @@ pub(crate) mod test_support {
     /// Serve `objects` from memory on a `127.0.0.1` port.
     ///
     /// A GET for a path ending in an object's name answers its bytes, and
-    /// any other GET answers 404. A listing whose prefix names an object
-    /// (it ends in a seeded name, or a stored path ends in it) answers that
-    /// one key, and any other listing answers none: that is how the
-    /// migration-marker check before every pull sees "no marker". A PUT
+    /// any other GET answers 404. A listing answers every stored object that
+    /// falls under its prefix ([`listed_key`]): a listing of a session's
+    /// prefix (the probe every read makes first) sees the objects seeded for
+    /// it, and a listing of an object's whole key sees that object alone.
+    /// Each listed object, each GET and each PUT's reply carries an ETag
+    /// that hashes the content ([`etag_of`]). A PUT
     /// stores its body under its path, replacing whatever a GET of that
     /// path answered before, so a pull after a push reads back what was
     /// pushed. Every other request gets an empty 200. Each request is
@@ -4073,39 +4413,47 @@ pub(crate) mod test_support {
                 let target = parts.next().unwrap_or("");
                 let path = target.split('?').next().unwrap_or("").to_string();
                 let listing = listing_prefix(target);
+                let mut etag = None;
                 let (status, payload): (&str, Vec<u8>) = match (method.as_str(), listing) {
                     (_, Some(prefix)) => {
-                        let keys: Vec<String> = objects
+                        let mut keys: Vec<(String, String)> = objects
                             .iter()
-                            .filter(|(name, _)| {
-                                prefix.ends_with(name.as_str())
-                                    || name.ends_with(&format!("/{prefix}"))
+                            .filter_map(|(name, bytes)| {
+                                Some((listed_key(&prefix, name)?, etag_of(bytes)))
                             })
-                            .map(|_| prefix.clone())
                             .collect();
-                        ("200 OK", list_body(&keys))
+                        keys.sort();
+                        keys.dedup_by(|a, b| a.0 == b.0);
+                        ("200 OK", list_body_tagged(&keys))
                     }
                     ("GET", None) => match objects
                         .iter()
                         .find(|(name, _)| path.ends_with(name.as_str()))
                     {
-                        Some((_, bytes)) => ("200 OK", bytes.clone()),
+                        Some((_, bytes)) => {
+                            etag = Some(etag_of(bytes));
+                            ("200 OK", bytes.clone())
+                        }
                         None => ("404 Not Found", Vec::new()),
                     },
                     ("PUT", None) => {
                         objects.retain(|(name, _)| !path.ends_with(name.as_str()));
                         objects.push((path.clone(), body.clone()));
+                        etag = Some(etag_of(&body));
                         ("200 OK", Vec::new())
                     }
                     _ => ("200 OK", Vec::new()),
                 };
+                let etag = etag
+                    .map(|e| format!("ETag: \"{}\"\r\n", e))
+                    .unwrap_or_default();
                 recorded
                     .lock()
                     .unwrap()
                     .push(Request { method, path, body });
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status}\r\n{etag}Content-Length: {}\r\nConnection: close\r\n\r\n",
                     payload.len()
                 );
                 let _ = stream.write_all(&payload);
@@ -5088,8 +5436,9 @@ mod tests {
             .expect("the rewrite pushed the state file");
         assert_eq!(header_of(&pushed).execution_dir, Some(anchor.clone()));
 
-        // The next read pulls the remote copy over the local one; the
-        // rewrite has to survive that.
+        // The next read finds the bucket holding what the rewrite pushed
+        // (koto#428): it lists the session's prefix and fetches nothing,
+        // and the rewrite survives.
         assert_eq!(
             backend.read_header("wf").unwrap().execution_dir,
             Some(anchor)
@@ -5100,8 +5449,8 @@ mod tests {
                 last.method.as_str(),
                 last.path.ends_with(&state_key_suffix("wf"))
             ),
-            ("GET", true),
-            "the read pulled the state file"
+            ("GET", false),
+            "the read made no GET of the state file it pushed"
         );
     }
 
@@ -5235,7 +5584,12 @@ mod tests {
                     }
                 }
                 let target = request_line.split_whitespace().nth(1).unwrap_or("");
+                // A listing of the session's prefix (the probe) or of the
+                // marker's own key shows the marker.
                 let body = match listing_prefix(target) {
+                    Some(prefix) if prefix.ends_with('/') => {
+                        list_body(&[format!("{prefix}{MIGRATED_MARKER}")])
+                    }
                     Some(prefix) => list_body(&[prefix]),
                     None => marker_bytes("wf", "/srv/ws-b"),
                 };
