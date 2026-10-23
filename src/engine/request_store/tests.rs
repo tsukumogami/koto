@@ -1243,6 +1243,44 @@ fn a_torn_tail_is_repaired_before_the_next_append() {
     assert_eq!(repaired.lines().count(), 4, "header plus three events");
 }
 
+/// koto#419: complete events merged onto the last line are not a torn tail.
+/// The repair leaves them, where truncating would drop both results, and the
+/// reader sees both.
+#[test]
+fn a_merged_last_line_is_not_truncated_as_a_torn_tail() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let id = seed(root);
+    resolve(root, &id, "reviewer-a", "a");
+    resolve(root, &id, "reviewer-b", "b");
+
+    let path = log_path(root, &id);
+    let content = std::fs::read_to_string(&path).expect("read");
+    let body = content.strip_suffix('\n').expect("terminated");
+    let cut = body.rfind('\n').expect("two event lines");
+    let merged = format!("{}{}\n", &body[..cut], &body[cut + 1..]);
+    std::fs::write(&path, &merged).expect("write merged tail");
+
+    assert!(
+        !repair_torn_tail(&path).expect("repair"),
+        "nothing truncated"
+    );
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), merged);
+
+    let view = read_view(root, &id).expect("the log must still read");
+    assert_eq!(view.revision, 3);
+    for (leg, summary) in [("reviewer-a", "a"), ("reviewer-b", "b")] {
+        assert_eq!(
+            view.leg(leg)
+                .expect("leg")
+                .result
+                .as_ref()
+                .map(|r| r.summary.as_str()),
+            Some(summary)
+        );
+    }
+}
+
 #[test]
 fn repairing_a_log_that_needs_nothing_changes_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");

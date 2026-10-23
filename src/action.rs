@@ -633,8 +633,9 @@ mod tests {
     }
 
     /// The wait reports a missing group as gone at once, and gives up at its
-    /// bound on a group that stays: here a killed child this test hasn't
-    /// reaped yet, which stays in its group until it is.
+    /// bound on a group that stays. Here that is a child of this test in its
+    /// own group: the wait's own SIGKILL kills it, but this test hasn't reaped
+    /// it, so it stays in the group as a zombie until the `wait` below.
     #[test]
     fn group_exit_wait_reports_what_it_saw() {
         // No process group has this id on Linux or macOS.

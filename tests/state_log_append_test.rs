@@ -112,15 +112,22 @@ fn setup(dir: &Path) {
 /// One writer of each kind, by index: a context write (small event), a
 /// context read (small event, written by a reader), and a decision (an event
 /// of more than 20 KB).
-fn writer(dir: &Path, i: usize) -> Child {
+fn writer(dir: &Path, i: usize) -> StdCommand {
     let key = format!("k{i}");
     let args: Vec<&str> = match i % 3 {
         0 => vec!["context", "add", "s", &key, "--from-file", "note.txt"],
         1 => vec!["context", "get", "s", "note"],
         _ => vec!["decisions", "record", "s", "--with-data", "@decision.json"],
     };
-    koto(dir).args(&args).spawn().unwrap()
+    let mut cmd = koto(dir);
+    cmd.args(&args);
+    cmd
 }
+
+/// Under coverage, an instrumented koto writes its profile on exit, and one
+/// SIGKILLed while writing it leaves a corrupt file that fails the whole
+/// report's merge. A process this file may kill sends its profile nowhere.
+const NO_PROFILE: (&str, &str) = ("LLVM_PROFILE_FILE", "/dev/null");
 
 /// What each line after the header holds: the number of JSON values on it,
 /// or `None` when it doesn't parse through to its end.
@@ -180,7 +187,9 @@ fn parallel_writers_of_different_sizes_never_share_a_line() {
     let before = assert_one_event_per_line(&log_path(dir));
 
     for _ in 0..ROUNDS {
-        let children: Vec<Child> = (0..WRITERS).map(|i| writer(dir, i)).collect();
+        let children: Vec<Child> = (0..WRITERS)
+            .map(|i| writer(dir, i).spawn().unwrap())
+            .collect();
         for child in children {
             let out = child.wait_with_output().unwrap();
             assert!(
@@ -205,8 +214,9 @@ fn parallel_writers_of_different_sizes_never_share_a_line() {
 }
 
 /// Writers killed at staggered moments, many of them partway through their
-/// run, never leave a line holding two events, and the session takes writes
-/// afterwards.
+/// run, never leave a line holding two events. Unless a kill cut the last
+/// line short, which ends the test (a truncated tail behaves as it always
+/// has), the session then takes a write.
 #[test]
 fn writers_killed_mid_append_never_merge_two_events() {
     const WRITERS: usize = 45;
@@ -215,7 +225,14 @@ fn writers_killed_mid_append_never_merge_two_events() {
     setup(dir);
 
     for round in 0..4u64 {
-        let mut children: Vec<Child> = (0..WRITERS).map(|i| writer(dir, i)).collect();
+        let mut children: Vec<Child> = (0..WRITERS)
+            .map(|i| {
+                writer(dir, i)
+                    .env(NO_PROFILE.0, NO_PROFILE.1)
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
         for (i, child) in children.iter_mut().enumerate() {
             // Staggered kills spread over the writers' run: some before
             // they open the log, some while they hold the lock, some after.
@@ -265,7 +282,7 @@ fn an_event_left_without_its_newline_still_gets_a_line_of_its_own() {
     let content = std::fs::read_to_string(&log).unwrap();
     std::fs::write(&log, content.strip_suffix('\n').unwrap()).unwrap();
 
-    let children: Vec<Child> = (0..20).map(|i| writer(dir, i)).collect();
+    let children: Vec<Child> = (0..20).map(|i| writer(dir, i).spawn().unwrap()).collect();
     for child in children {
         let out = child.wait_with_output().unwrap();
         assert!(
@@ -382,6 +399,8 @@ fn a_timed_out_commands_children_never_write_after_it_returns() {
                 sessions_base(dir).to_string_lossy().into_owned(),
             ),
             ("HOME".to_string(), dir.to_string_lossy().into_owned()),
+            // The timeout kills these writers wherever they are.
+            (NO_PROFILE.0.to_string(), NO_PROFILE.1.to_string()),
         ],
         Redactor::empty(),
     );

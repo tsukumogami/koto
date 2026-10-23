@@ -1199,13 +1199,17 @@ fn acquire_request_lock(
 /// Truncate a partial final line so a later append cannot concatenate
 /// onto it.
 ///
-/// An unbuffered `writeln!` can issue the payload and the newline as
-/// separate writes, so a crash mid-append leaves a line with no
-/// terminator. The reader recovers that only while it is the *final*
-/// line — once an append lands after it, it becomes a non-final
+/// A crash mid-append can leave a line with no terminator (appends were
+/// once two writes, a line and then its newline, and a large write can
+/// still be cut short). The reader recovers that only while it is the
+/// *final* line — once an append lands after it, it becomes a non-final
 /// malformed line and the log is permanently unreadable. Called with
 /// the lock held, which is what makes the read-check-truncate sequence
 /// safe.
+///
+/// A final line holding complete events merged with no newline between
+/// them is left alone: truncating it would drop them all, and the append
+/// that follows splits it into one line per event (koto#419).
 ///
 /// Returns whether anything was truncated.
 fn repair_torn_tail(path: &Path) -> Result<bool, RequestStoreError> {
@@ -1233,9 +1237,7 @@ fn repair_torn_tail(path: &Path) -> Result<bool, RequestStoreError> {
     if terminated && parses {
         return Ok(false);
     }
-    // Complete events merged onto one line are not a torn tail: truncating
-    // would drop them all. The append that follows splits the line into one
-    // line per event (koto#419).
+    // Merged complete events: left for the append to split (see above).
     if std::str::from_utf8(&content).is_ok_and(crate::engine::persistence::last_line_would_split) {
         return Ok(false);
     }

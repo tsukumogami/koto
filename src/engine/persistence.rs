@@ -168,7 +168,9 @@ pub(crate) struct CommitInfo {
     /// The committed event's `seq`.
     pub seq: u64,
     /// The log as it stood before this event: the bytes the append read to
-    /// find the next `seq`, moved rather than copied.
+    /// find the next `seq`, moved rather than copied. When the append split
+    /// a merged last line first, these are the split bytes, so every event
+    /// in them has a line of its own.
     pub prior_log: String,
 }
 
@@ -217,7 +219,7 @@ fn append_event_reading<H: LogHeader>(
     // Held from reading the last seq until the line is synced, so two
     // processes appending at once can't both take the same seq.
     let _append_lock = AppendLock::acquire(path);
-    let tail = read_for_append::<H>(path)?;
+    let tail = prepare_append::<H>(path)?;
 
     let event = Event {
         seq: tail.next_seq,
@@ -417,14 +419,15 @@ pub fn append_event_idempotent_in<H: LogHeader>(
     // after the scan would let an idempotent hit report success on a log no
     // reader can parse. The scan below reads the bytes this read returns,
     // under the lock taken above.
-    let tail = read_for_append::<H>(path)?;
+    let tail = prepare_append::<H>(path)?;
     let next_seq = tail.next_seq;
 
     // Scan for a prior event with the same hash. A malformed line in the
     // middle of the log is skipped, the way `read_events` skips it. A
-    // malformed *final* line is already fatal by this point: the read above
-    // parses it to work out the next seq. Callers that expect a torn tail
-    // repair it before appending, as the request store does. Line 1 is the
+    // malformed *final* line has been dealt with by this point: the read
+    // above split it if it held merged events, and failed otherwise, since
+    // it parses that line to work out the next seq. Callers that expect a
+    // torn tail repair it before appending, as the request store does. Line 1 is the
     // header, checked above, so events start at line 2 (1-indexed).
     for line in tail.content.lines().skip(1) {
         let trimmed = line.trim();
@@ -564,7 +567,7 @@ fn acquire_state_flock(path: &Path) -> anyhow::Result<std::fs::File> {
     );
     // Open without `create`: a log is created when its session is created,
     // and a lock open that created the file would leave an empty log behind
-    // for the header check in `read_for_append` to refuse.
+    // for the header check in `prepare_append` to refuse.
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -733,8 +736,9 @@ struct AppendTail {
     unterminated: bool,
 }
 
-/// The seq the next event appended to `path` gets, refusing a log that has
-/// no header, with the bytes it read.
+/// Read the log at `path` for an append: the seq the next event gets and the
+/// bytes read, refusing a log that has no header. Usually only a read, but it
+/// can write: see the split below. The caller must hold the append lock.
 ///
 /// The file must exist and its first line must parse as an `H`. Checking
 /// the header, rather than skipping line 1 unseen, is what stops an append
@@ -750,10 +754,12 @@ struct AppendTail {
 /// A last line that doesn't parse fails the append, as a truncated one
 /// always has, with one exception: a line holding two or more well-formed
 /// events written with no newline between them (koto#419), whose seqs follow
-/// the line before. That line is split into one line per event, with the log
-/// as it was kept beside it, and the append goes on (see
-/// [`split_merged_last_line`]).
-fn read_for_append<H: LogHeader>(path: &Path) -> anyhow::Result<AppendTail> {
+/// the line before (the one case where that line's seq is read too). That
+/// line is split on disk into one line per event, with the log as it was
+/// kept beside it, and the append goes on (see [`split_merged_last_line`]).
+/// Merged events whose seqs don't follow, or whose line before can't be
+/// read, are refused and left as they are.
+fn prepare_append<H: LogHeader>(path: &Path) -> anyhow::Result<AppendTail> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -788,7 +794,7 @@ fn read_for_append<H: LogHeader>(path: &Path) -> anyhow::Result<AppendTail> {
     parse_header::<H>(first_line)?;
 
     let unterminated = !content.ends_with('\n');
-    let Some(last) = last_event_lines(&content) else {
+    let Some(last) = last_event_line(&content) else {
         return Ok(AppendTail {
             next_seq: 1,
             content,
@@ -812,7 +818,8 @@ fn read_for_append<H: LogHeader>(path: &Path) -> anyhow::Result<AppendTail> {
         SplitOutcome::DoesNotFollow(seqs) => {
             return Err(EngineError::StateFileCorrupted(format!(
                 "line {} of {} holds {} events written with no newline between them (seq {}), \
-                 and their seqs don't follow the line before it, so nothing was appended. \
+                 and their seqs don't follow the line before it (or that line can't be \
+                 read), so nothing was appended. \
                  Back up the log, then put each of those events on a line of its own",
                 last.line_number,
                 path.display(),
@@ -846,7 +853,7 @@ struct LastEventLine<'a> {
 
 /// Find the last non-empty event line of `content`, or `None` when the log
 /// holds only its header.
-fn last_event_lines(content: &str) -> Option<LastEventLine<'_>> {
+fn last_event_line(content: &str) -> Option<LastEventLine<'_>> {
     let mut last: Option<LastEventLine<'_>> = None;
     let mut offset = 0;
     for (i, segment) in content.split_inclusive('\n').enumerate() {
@@ -918,7 +925,7 @@ fn split_last_line<'a>(last: &LastEventLine<'a>) -> SplitOutcome<'a> {
 /// Whether the last line of `content` (a whole log) holds merged events an
 /// append would split, so a repair that drops a torn tail must keep it.
 pub(crate) fn last_line_would_split(content: &str) -> bool {
-    last_event_lines(content)
+    last_event_line(content)
         .is_some_and(|last| matches!(split_last_line(&last), SplitOutcome::Split(_)))
 }
 
@@ -1139,8 +1146,10 @@ pub fn read_events(path: &Path) -> anyhow::Result<(StateFileHeader, Vec<Event>)>
 
 /// Whether a recovered truncated final line is announced on stderr.
 ///
-/// A session log has one writer, so a truncated tail there means a
-/// crash and is worth a warning. A request log is multi-writer and is
+/// A session log has several writers (a tick, `koto context` readers, a
+/// command's own `koto` calls), but each append is one write under the
+/// append lock, so a reader rarely meets a torn tail there: one means a
+/// writer died partway and is worth a warning. A request log is multi-writer and is
 /// read lock-free on a two-second poll, so a reader racing a
 /// concurrent append hits the same condition legitimately — warning
 /// would turn normal operation into a stderr stream
