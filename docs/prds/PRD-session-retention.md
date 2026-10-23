@@ -437,7 +437,9 @@ names only in passing.
   build changes none. The idle computation is a consumer too: a read
   record in the reader's anchor is the reader's own activity and extends its
   anchor's last activity; nothing a reader does extends the read session's.
-  The anchorless row is tracked by koto#412.
+  A read with no reader anchor is recorded in a spool on the reading host,
+  never in the read session and never sent off the host; it feeds the run
+  journal only and counts as no session's activity.
 
 ### Import
 
@@ -1030,15 +1032,15 @@ S3.
 
 ## Known Limitations
 
-- **Known cross-session writers.** Three existing koto behaviours write
+- **Known cross-session writers.** Two existing koto behaviours write
   into a session from another session's process and are left as they are:
-  a child's terminal tick appending its completion to its parent's log;
-  `koto context add` naming any session; and a read with no anchor on the
-  reader's side logging into the read session (R21). Under the cloud backend
-  a migrated source refuses all three. Nothing in this feature treats a
-  child's completion record as a link or a sign of life, and none of the
-  three counts as activity. koto#409 tracks the first, koto#411 the second
-  and koto#412 the third.
+  a child's terminal tick appending its completion to its parent's log, and
+  `koto context add` naming any session. Under the cloud backend a migrated
+  source refuses both. Nothing in this feature treats a child's completion
+  record as a link or a sign of life, and neither counts as activity.
+  koto#409 tracks the first and koto#411 the second. A third, a read with
+  no anchor on the reader's side, no longer writes into the read session:
+  it goes to the reading host's spool (R21), which closes koto#412.
 - An unobserved agent session (a plain terminal session, or one on a host
   with no niwa) left idle past the idle period loses its hold on the sessions
   it dispatched, even though a person could still resume it; so does an
