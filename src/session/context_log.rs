@@ -120,6 +120,24 @@ impl ContextReadRecord {
     /// The `context_read` event for this read by `reader` in `state`,
     /// naming `gate` when a gate performed it.
     pub fn into_event(self, reader: &str, state: &str, gate: Option<&str>) -> EventPayload {
+        self.event(reader, state, gate, None)
+    }
+
+    /// The `context_read` event the reader's anchor records for this read
+    /// of `session` by `reader`: [`Self::into_event`], with `state` the
+    /// read session's state, plus the `session` field naming the session
+    /// read.
+    pub fn into_anchor_event(self, reader: &str, state: &str, session: &str) -> EventPayload {
+        self.event(reader, state, None, Some(session))
+    }
+
+    fn event(
+        self,
+        reader: &str,
+        state: &str,
+        gate: Option<&str>,
+        session: Option<&str>,
+    ) -> EventPayload {
         EventPayload::ContextRead {
             key: self.key,
             reader: reader.to_string(),
@@ -135,6 +153,7 @@ impl ContextReadRecord {
                 .to_string(),
             ),
             gate: gate.map(str::to_string),
+            session: session.map(str::to_string),
         }
     }
 }

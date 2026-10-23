@@ -1347,6 +1347,7 @@ fn a_batch_with_no_identity_record_is_not_flushed() {
             hash: None,
             access: None,
             gate: Some("lint".into()),
+            session: None,
         },
     );
     assert_eq!(batches_for_test(), (1, 0), "a context read writes nothing");
@@ -3704,6 +3705,7 @@ fn read_of(
         hash: content.map(|c| crate::cache::sha256_hex(c.as_bytes())),
         access: Some(access.into()),
         gate: (reader == "gate").then(|| "g".to_string()),
+        session: None,
     }
 }
 
@@ -5056,4 +5058,119 @@ fn finding_and_dispute_records_fit_the_line_cap_at_the_longest_names() {
     assert_eq!(c[101]["koto.dispute.source"], level.as_str());
     assert_eq!(c[101]["koto.check.name"], gate.as_str());
     assert_eq!(c[101]["koto.attempt"], u64::MAX);
+}
+
+/// A read the reader's anchor recorded for another session (a
+/// `context_read` carrying `session`) writes one `context_reads` record when
+/// the anchor commits it, attributed to the session it names, with the
+/// anchor as `koto.context.read_by` and no sequence numbers. The session
+/// read's own visit fold never counts it: its log holds no such event, and
+/// an anchor's fold skips one.
+#[test]
+fn an_anchors_read_record_is_journaled_against_the_session_it_names() {
+    let f = Fixture::new();
+    f.init("b", header("b", "b-id", None), Some("work"));
+    f.init(
+        "anchor-r",
+        anchor_header("anchor-r", "anchor-id"),
+        Some("open"),
+    );
+    let b_dir = f.backend.session_dir("b");
+    let sidecar_before = std::fs::read(b_dir.join("run-journal.json")).ok();
+
+    commit_as(&f, None, "b", &gate_read("work", "own", Some("x")));
+    let mut other = cli_read("work", "notes.md", Some("v"));
+    if let EventPayload::ContextRead { session, .. } = &mut other {
+        *session = Some("b".to_string());
+    }
+    commit_as(&f, None, "anchor-r", &other);
+    let mut absent = cli_read("work", "gone", None);
+    if let EventPayload::ContextRead {
+        session, access, ..
+    } = &mut absent
+    {
+        *session = Some("b".to_string());
+        *access = Some("presence".to_string());
+    }
+    commit_as(&f, None, "anchor-r", &absent);
+    // An anchor that moves on folds none of the reads it recorded for b.
+    commit_as(&f, None, "anchor-r", &transitioned(Some("open"), "later"));
+    commit_as(&f, None, "b", &transitioned(Some("work"), "next"));
+
+    let j = f.journal();
+    let reads: Vec<&serde_json::Value> =
+        j.iter().filter(|r| r["kind"] == "context_reads").collect();
+    assert_eq!(reads.len(), 3, "{j:?}");
+
+    let anchored = reads[0];
+    assert_eq!(anchored["session"], "b");
+    assert_eq!(anchored["koto.session.id"], "b-id");
+    assert_eq!(anchored["koto.run.id"], "b-id");
+    assert_eq!(anchored["koto.context.read_by"], "anchor-r");
+    assert_eq!(anchored["koto.state"], "work");
+    assert_eq!(anchored["koto.context.key"], "notes.md");
+    assert_eq!(anchored["koto.context.reader"], "cli");
+    assert_eq!(anchored["koto.context.access"], "content");
+    assert_eq!(anchored["koto.context.read_count"], 1);
+    assert_eq!(anchored["koto.context.present_count"], 1);
+    assert_eq!(anchored["koto.context.first_hash"], hash_of("v"));
+    assert_eq!(anchored["koto.context.last_hash"], hash_of("v"));
+    assert!(anchored.get("koto.seq").is_none(), "{anchored}");
+    assert!(anchored.get("koto.visit.seq").is_none(), "{anchored}");
+
+    let missing = reads[1];
+    assert_eq!(missing["session"], "b");
+    assert_eq!(missing["koto.context.key"], "gone");
+    assert_eq!(missing["koto.context.access"], "presence");
+    assert_eq!(missing["koto.context.present_count"], 0);
+    assert!(
+        missing.get("koto.context.first_hash").is_none(),
+        "{missing}"
+    );
+
+    // b's own visit fold: only its own read, never the anchor's.
+    let own = reads[2];
+    assert_eq!(own["session"], "b");
+    assert_eq!(own["koto.context.key"], "own");
+    assert!(own.get("koto.context.read_by").is_none(), "{own}");
+    assert!(j
+        .iter()
+        .all(|r| !(r["session"] == "anchor-r" && r["kind"] == "context_reads")));
+
+    // Journaling the anchor's read wrote nothing of b's.
+    if let Some(before) = sidecar_before {
+        assert_eq!(
+            std::fs::read(b_dir.join("run-journal.json")).unwrap(),
+            before
+        );
+    }
+}
+
+fn anchor_header(workflow: &str, session_id: &str) -> StateFileHeader {
+    let mut h = header(workflow, session_id, None);
+    h.kind = Some(crate::engine::types::SessionKind::ANCHOR.to_string());
+    h
+}
+
+/// A `context_read` carrying `session` in a log that isn't an anchor's is
+/// not a read record: koto writes the field only into a reader's anchor, so
+/// nothing is journaled against the session it names.
+#[test]
+fn a_session_field_outside_an_anchor_is_not_journaled() {
+    let f = Fixture::new();
+    f.init("b", header("b", "b-id", None), Some("work"));
+    f.init("c", header("c", "c-id", None), Some("work"));
+    let mut forged = cli_read("work", "notes.md", Some("v"));
+    if let EventPayload::ContextRead { session, .. } = &mut forged {
+        *session = Some("b".to_string());
+    }
+    commit_as(&f, None, "c", &forged);
+    commit_as(&f, None, "c", &transitioned(Some("work"), "next"));
+
+    let j = f.journal();
+    assert!(
+        j.iter()
+            .all(|r| !(r["kind"] == "context_reads" && r["session"] == "b")),
+        "{j:?}"
+    );
 }
