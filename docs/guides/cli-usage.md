@@ -708,7 +708,7 @@ A hierarchy is every session joined to `<name>` through a link (`koto/links/disp
 The hierarchy is kept while any member is alive:
 
 - A koto session is alive while it runs, and while its log can't be read.
-- An anchor with no observed marker (one never observed, or an imported one) closes once `retention.idle_period` has passed since its last activity. Activity is what its own agent session writes to it: its `anchor_started` events, the `anchor_activity` events `init` and `next` record, its own read records, and, for an anchor copied in by `koto session import`, the `session_imported` event the import appended. A read of the anchor or of a session it holds from anywhere else, a child's completion record, or a `koto context add` from a bare shell never counts.
+- An anchor with no observed marker (one never observed, or an imported one) closes once `retention.idle_period` has passed since its last activity. Activity is what its own agent session writes to it: its `anchor_started` events, the `anchor_activity` events `init` and `next` record, the read records it logs of other sessions, and, for an anchor copied in by `koto session import`, the `session_imported` event the import appended. A read of the anchor or of a session it holds from anywhere else, a child's completion record, or a `koto context add` from a bare shell never counts.
 - An observed anchor closes only through a valid observed close (`koto session anchor close`); nothing else closes it. Past `retention.stale_after` since its last activity it is reported `stale`, with the command that closes it by hand, `koto session anchor close --key='<marker>' --harness-session='<id>'`, its own values filled in. The command is printed only when both values match `^[A-Za-z0-9_-]{1,128}$`; otherwise the anchor is listed as stale with a malformed marker and no command. A stale report closes nothing.
 - An anchor's close session is never alive; it stops at its record's time.
 
@@ -906,11 +906,11 @@ Exits non-zero if the session or key doesn't exist.
 | `KOTO_ANCHOR` | The read is logged in |
 |---|---|
 | any, when the command runs inside `<name>`'s own tick (a gate script or default action reading its own session) | `<name>`'s own log |
-| names an existing anchor that is `<name>`, or that `<name>` holds through `koto/links/held-by/<anchor>` | `<name>`'s own log, as before |
+| names an existing anchor that is `<name>`, or that holds `<name>` (`<name>` carries `koto/links/held-by/<anchor>`) | `<name>`'s own log, as before |
 | names an existing anchor otherwise (a read from another agent session) | that anchor's log, with a `session` field naming `<name>`; `<name>`'s files stay byte-identical |
 | unset, or names no anchor in the local store | this host's read spool, `context-reads.jsonl` beside `<name>`'s local copy; `<name>`'s log and other files stay byte-identical |
 
-The table holds under both backends. The last row used to write into the session read, which made a read from a bare shell a cross-session writer (koto#412); now it writes only the spool, which never leaves the host (the cloud backend never uploads it), counts as no session's activity, and is read back only by the run journal when it sums the visit the read fell in. A read logged in the reader's anchor counts as that anchor's activity for its idle close, never as activity of `<name>` or of an anchor holding it. An append that fails warns on stderr and never fails the read. `koto context list`, `koto status`, `koto session list`, `koto session hierarchy` and a prune preview log no read anywhere. The [session-feed contract](../reference/session-feed.md#reads-from-another-agent-session) has the event's fields and its consumers.
+The table holds under both backends. Under the cloud backend the read may also refresh this host's sync cache beside `<name>`'s local copy (`cloud-sync.json`, `cloud-manifest.json`), which records what the host last pulled and is never pushed; "byte-identical" covers `<name>`'s log, its context and every object in the bucket. The last row used to write into the session read, which made a read from a bare shell a cross-session writer (koto#412); now it writes only the spool, which never leaves the host (the cloud backend never uploads it), counts as no session's activity, and is read back only by the run journal when it sums the visit the read fell in. A read logged in the reader's anchor counts as that anchor's activity for its idle close, never as activity of `<name>` or of an anchor holding it. An append that fails warns on stderr and never fails the read. `koto context list`, `koto status`, `koto session list`, `koto session hierarchy` and a prune preview log no read anywhere. The [session-feed contract](../reference/session-feed.md#reads-from-another-agent-session) has the event's fields and its consumers.
 
 #### context exists
 
@@ -924,7 +924,7 @@ koto context exists <name> <key>
 - `<name>` -- Workflow/session name.
 - `<key>` -- Content key.
 
-Exits 0 if the key exists and 1 if it doesn't, printing nothing either way. This is the CLI equivalent of the `context-exists` gate type in templates. The read is logged as [context get](#context-get)'s is: in `<name>`'s log, or in the reader's anchor when `KOTO_ANCHOR` names an anchor that doesn't hold `<name>`.
+Exits 0 if the key exists and 1 if it doesn't, printing nothing either way. This is the CLI equivalent of the `context-exists` gate type in templates. The read is logged exactly as [context get](#context-get)'s is (see the table there): in `<name>`'s log, in the reader's anchor when `KOTO_ANCHOR` names an anchor that doesn't hold `<name>`, or, when `KOTO_ANCHOR` is unset or names no anchor, in this host's read spool, leaving `<name>` byte-identical.
 
 Exits 2 when the argument is not a usable context key -- see "What a content key may hold" above -- and prints a JSON error naming the offending character and the component it sits in:
 

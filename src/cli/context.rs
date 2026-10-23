@@ -125,12 +125,14 @@ pub fn reader_anchor() -> Option<String> {
 /// | Reader anchor | Logged in |
 /// |---|---|
 /// | any, from a command `session`'s own tick runs (a gate script's read) | the session read |
-/// | names an existing anchor that is `session`, or that `session` holds through `koto/links/held-by/<anchor>` | the session read |
+/// | names an existing anchor that is `session`, or that holds `session` (`session` carries `koto/links/held-by/<anchor>`) | the session read |
 /// | names an existing anchor otherwise | the reader's anchor |
 /// | unset, or names no existing anchor | [`ReadLogTarget::Anchorless`] |
 ///
-/// Nothing here writes, and the read session's header and manifest are read
-/// in place.
+/// Nothing here writes to a session's log or context, and the read
+/// session's header and manifest are read in place. Under the cloud backend
+/// the held-by check may refresh the host-local sync cache beside the read
+/// session, which is never pushed.
 pub fn read_log_target(
     store: &dyn ContextStore,
     backend: &dyn SessionBackend,

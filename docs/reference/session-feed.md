@@ -1388,7 +1388,7 @@ environment:
 | Reader's anchor | Where the `context_read` goes |
 |---|---|
 | Any, when the command runs inside the read session's own tick (a gate script or default action reading its own session) | The session read, as above. |
-| Names an existing anchor that is the session read, or that the session read holds through `koto/links/held-by/<anchor>` | The session read, as above. |
+| Names an existing anchor that is the session read, or that holds the session read (the session read carries `koto/links/held-by/<anchor>`) | The session read, as above. |
 | Names an existing anchor otherwise | The reader's anchor, with `session` naming the session read. The session read stays byte-identical. |
 | Unset, or names no anchor in the local store | No log: the reading host's read spool, `context-reads.jsonl` beside the read session's local copy. The session read stays byte-identical. |
 
