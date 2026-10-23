@@ -115,6 +115,7 @@ mod tests {
             hash: Some("ab".repeat(32)),
             access: None,
             gate: None,
+            session: None,
         }
     }
 

@@ -901,6 +901,16 @@ koto context get <name> <key> --to-file <path>
 
 Exits non-zero if the session or key doesn't exist.
 
+**Where the read is logged.** `koto context get` and `koto context exists` each log the read as a `context_read` event (key name and value hash, never the value). Where it goes depends on `KOTO_ANCHOR`, the running agent session's anchor (see [session anchor](#session-anchor)):
+
+| `KOTO_ANCHOR` | The read is logged in |
+|---|---|
+| names an existing anchor that is `<name>`, or that `<name>` holds through `koto/links/held-by/<anchor>` | `<name>`'s own log, as before |
+| names an existing anchor otherwise (a read from another agent session) | that anchor's log, with a `session` field naming `<name>`; `<name>`'s files stay byte-identical |
+| unset, or names no anchor in the local store | `<name>`'s own log, as before |
+
+The last row still writes into the session read from a shell with no anchor, a known cross-session writer (koto#412). The table applies under the local backend; under the cloud backend every `context get` and `context exists` read is still logged in `<name>`'s own log. A read logged in the reader's anchor counts as that anchor's activity for its idle close, never as activity of `<name>` or of an anchor holding it. An append that fails warns on stderr and never fails the read. `koto context list`, `koto status`, `koto session list`, `koto session hierarchy` and a prune preview log no read anywhere. The [session-feed contract](../reference/session-feed.md#reads-from-another-agent-session) has the event's fields and its consumers.
+
 #### context exists
 
 Checks whether a content key exists for a session. Produces no output.
@@ -913,7 +923,7 @@ koto context exists <name> <key>
 - `<name>` -- Workflow/session name.
 - `<key>` -- Content key.
 
-Exits 0 if the key exists and 1 if it doesn't, printing nothing either way. This is the CLI equivalent of the `context-exists` gate type in templates.
+Exits 0 if the key exists and 1 if it doesn't, printing nothing either way. This is the CLI equivalent of the `context-exists` gate type in templates. The read is logged as [context get](#context-get)'s is: in `<name>`'s log, or in the reader's anchor when `KOTO_ANCHOR` names an anchor that doesn't hold `<name>`.
 
 Exits 2 when the argument is not a usable context key -- see "What a content key may hold" above -- and prints a JSON error naming the offending character and the component it sits in:
 

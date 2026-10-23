@@ -259,6 +259,9 @@ events:
       gate:
         type: string
         required: false
+      session:
+        type: string
+        required: false
 
   instructions_delivered:
     tier: 2
@@ -1356,6 +1359,7 @@ nothing else in the feed depends on it.
 | `hash` | string | No | Lowercase hex SHA-256 of the key's content, 64 characters. Present exactly when `present` is `true`. |
 | `access` | string | No | `content` for a read that fetched the content, `presence` for one that only asked whether the key exists. An open vocabulary. koto writes it on every read it logs; absence (possible only on events koto didn't write) means `content`. |
 | `gate` | string | No | The gate's name, when `reader` is `gate`. Absent otherwise. |
+| `session` | string | No | The session read, on a read recorded in the reader's anchor rather than in the session it read (see [Reads from another agent session](#reads-from-another-agent-session)). Absent on a read logged in the session it read; `state` then names that session's state at the read. |
 
 | `reader` | Reads it covers |
 |----------|-----------------|
@@ -1374,6 +1378,42 @@ record, so it logs nothing rather than a `present: true` event without `hash`.
 A read that can't be appended (a full disk, an unwritable log) produces a
 warning on stderr and never fails the command that performed it, so the feed
 can hold fewer reads than koto performed.
+
+##### Reads from another agent session
+
+`koto context get` and `koto context exists` decide where their read goes
+by the reader's anchor, the session `KOTO_ANCHOR` names in the command's
+environment:
+
+| Reader's anchor | Where the `context_read` goes |
+|---|---|
+| Names an existing anchor that is the session read, or that the session read holds through `koto/links/held-by/<anchor>` | The session read, as above. |
+| Names an existing anchor otherwise | The reader's anchor, with `session` naming the session read. The session read stays byte-identical. |
+| Unset, or names no anchor in the local store | The session read, as above. |
+
+The last row is a known cross-session writer, tracked by koto#412: a read
+from a shell with no anchor still appends to the session it read. The table
+applies under the local backend; under the cloud backend every such read is
+still logged in the session it read. A gate,
+result-map or decider read always logs in the session it belongs to, since
+it runs inside that session's own tick.
+
+A read recorded in the reader's anchor counts as that anchor's activity
+when koto judges whether the anchor is idle, and never as activity of the
+session read or of any anchor holding it. An append to the reader's anchor
+that fails warns on stderr and never fails the read.
+
+Its consumers handle the `session` field this way:
+
+- The session read's own run-journal fold reads only that session's log,
+  so it doesn't count a read another agent session made. When the anchor
+  commits the read, the run journal writes one `context_reads` record
+  attributed to the session `session` names, with `koto.context.read_by`
+  naming the anchor (see `docs/reference/run-journal.md`).
+- Read records carry context key names and value hashes, so they stay on
+  the host, with one exception: the user's own koto cloud backend, which
+  they enabled, syncs the anchor's log to their own bucket like any other
+  session. Every other shipper keeps `context_read` events local.
 
 ---
 
