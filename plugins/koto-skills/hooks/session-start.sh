@@ -51,6 +51,9 @@ BLOCK_BEGIN='# >>> koto-skills'
 BLOCK_END='# <<< koto-skills'
 WATCH_INTERVAL=2
 WATCH_LIMIT=180
+# Seconds one koto call may take before it is killed, so a koto that stalls
+# (a slow cloud store, say) can't hold up the session's start.
+KOTO_LIMIT=5
 
 # Runs koto the way every call in this hook runs it, the open and the
 # watchers alike: with no anchor variable, so nothing acts under an
@@ -58,13 +61,32 @@ WATCH_LIMIT=180
 # /workflows entry for the anchor; and with no KOTO_SESSION_* variable, so
 # the store is the one koto's config files name. The watchers must write to
 # the store the open created the anchor in, so they share this environment.
+# The call is killed after KOTO_LIMIT seconds; its output is then whatever it
+# printed, which for an open is no valid `anchor=` line.
 koto_clean() {
-  local unsets=() v
+  local unsets=() v cmd dog status
   for v in $(compgen -v KOTO_SESSION_); do
     unsets+=(-u "$v")
   done
   env -u KOTO_ANCHOR -u KOTO_DISPATCHER_ANCHOR -u CLAUDE_CODE_SESSION_ID \
-    "${unsets[@]}" koto "$@"
+    "${unsets[@]}" koto "$@" &
+  cmd=$!
+  # A watchdog in plain shell: macOS has no `timeout` command. It checks
+  # every second, so it outlives a koto that finishes by at most a second.
+  (
+    i=0
+    while [ "$i" -lt "$KOTO_LIMIT" ]; do
+      sleep 1
+      kill -0 "$cmd" || exit 0
+      i=$((i + 1))
+    done
+    kill "$cmd"
+  ) </dev/null >/dev/null 2>&1 &
+  dog=$!
+  wait "$cmd"
+  status=$?
+  kill "$dog"
+  return "$status"
 }
 
 # Whether the process in the token is still running; true with no pid.

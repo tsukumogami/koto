@@ -477,6 +477,20 @@ test_no_koto() {
   check "exit 0 when koto fails" [ "$(rc_of "$p")" = 0 ]
   check "a failed open unsets both variables" grep -qx 'unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR' "$e"
   check "a failed open never leaves the dispatcher's anchor" sh -c '! grep -q anchor-dispatcher "$1"' sh "$e"
+
+  # A koto that stalls is killed after the hook's limit.
+  mkdir -p "$T/hang"
+  printf '#!/bin/sh\necho $$ >"%s/hang.pid"\nexec sleep 60\n' "$T" >"$T/hang/koto"
+  chmod +x "$T/hang/koto"
+  e="$(envfile K3)"
+  p="$(payload K3 startup)"
+  PATH="$T/hang:$PATH" KOTO_ANCHOR=anchor-dispatcher KOTO_DISPATCHER_ANCHOR=anchor-dispatcher hook "$p" "$e"
+  local ms
+  ms="$(cat "$p.ms")"
+  check "a stalled koto is cut off within the limit (${ms} ms)" [ "$ms" -lt 10000 ]
+  check "exit 0 when koto stalls" [ "$(rc_of "$p")" = 0 ]
+  check "a stalled open unsets both variables" grep -qx 'unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR' "$e"
+  check "the stalled koto is gone" sh -c '! kill -0 "$(cat "$1")" 2>/dev/null' sh "$T/hang.pid"
 }
 
 # ===== The observed marker =====
