@@ -50,7 +50,7 @@ mod tests;
 
 use std::path::Path;
 
-pub use facts::{ImportedFrom, LinkFact, SessionFacts};
+pub use facts::{ImportedFrom, LinkFact, SessionFacts, IMPORTED_FROM_KEY};
 pub use graph::{Edge, Graph, Scope, Via};
 pub use judge::{
     CloseKind, Judge, Judgment, Keeper, Member, MemberKind, ReleaseInstant, Retention, Unreadable,

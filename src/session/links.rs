@@ -212,6 +212,8 @@ impl LinkHints {
 }
 
 /// A link's value. `session_id` and `workspace` are `null` when unknown.
+/// `was` is present only on a held-by link `koto session import` rewrote to
+/// the importing agent session's anchor: the anchor it named before.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkBody {
     pub v: u32,
@@ -219,6 +221,8 @@ pub struct LinkBody {
     pub session_id: Option<String>,
     pub workspace: Option<String>,
     pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub was: Option<String>,
 }
 
 /// One link a session holds.
@@ -296,6 +300,7 @@ where
         session_id: hints.session_id.clone(),
         workspace: hints.workspace.clone(),
         at: crate::engine::types::now_iso8601(),
+        was: None,
     };
     let content = serde_json::to_vec(&body)?;
     store.add_with_writer(session, &key, &content, WRITER_KOTO)?;

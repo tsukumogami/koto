@@ -907,6 +907,9 @@ pub fn handle_import(
     let anchor = std::fs::canonicalize(&cwd)
         .with_context(|| format!("cannot resolve the current directory {}", cwd.display()))?;
 
+    // The importing agent session's anchor, which a held-by link whose
+    // anchor isn't open here is rewritten to.
+    let importer_anchor = crate::session::anchor::anchor_from_env();
     let request = ImportRequest {
         name: &name,
         target: &target,
@@ -914,6 +917,7 @@ pub fn handle_import(
         anchor: &anchor,
         trust_template,
         explicit_as: as_name.is_some(),
+        importer_anchor: importer_anchor.as_deref(),
     };
     let outcome = match cloud.import_session(&request) {
         Ok(outcome) => outcome,

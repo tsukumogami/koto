@@ -1841,6 +1841,21 @@ source's remote object; this one records where they came from.
 
 A log imported more than once carries one of these per import, oldest first.
 
+The import also settles the copy's reserved `koto/` context keys, which the
+log doesn't record: it leaves behind the source's observed marker
+(`koto/anchor/observed`), close record (`koto/anchor-close`),
+`koto/links/closes/*` links and `koto/imported-from`; drops any link whose
+key or body is malformed, with a warning on stderr; keeps each
+`koto/links/held-by/<anchor>` whose anchor resolves on the importing host to
+an open, unmigrated anchor, rewrites the others to the importing command's
+`KOTO_ANCHOR` with `"was"` naming the old anchor, or drops them when the
+import runs with no anchor; and writes `koto/imported-from`
+(`{"from_session", "from_session_id"}`, the same values this event carries).
+It refuses an anchor's close session as a source. For an imported anchor,
+this event is its last activity until its own agent session writes again,
+and with its observed marker gone, the anchor closes once the idle period
+has passed since it.
+
 ---
 
 #### `environment_adopted`
