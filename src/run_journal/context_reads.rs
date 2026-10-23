@@ -7,9 +7,10 @@
 //! out of the log bytes the commit already read under its lock and writes
 //! one record per distinct (key, reader, access) tuple, in first-read
 //! order. Nothing is kept between processes, because the session's log
-//! already holds the event that opened the visit and every read its own tick
-//! made, and the read spool beside it (`crate::session::read_spool`) holds
-//! the reads this host made from anywhere else.
+//! already holds the event that opened the visit and every own read (its
+//! tick's, and its own agent session's), and the read spool beside it
+//! (`crate::session::read_spool`) holds the reads this host made with no
+//! reader's anchor, under either backend.
 //!
 //! The fold holds at most [`MAX_TUPLES`] tuples and one overflow counter,
 //! however long the visit is, and parses only the lines whose type word is
@@ -18,8 +19,8 @@
 //! A read from another agent session is logged in the reader's anchor, not
 //! in the session it read, with a `session` field naming that session
 //! (DESIGN-session-retention.md, Decision 5). The read session's fold never
-//! sees it, since it reads only that session's own log, and the anchor's
-//! fold skips it. [`anchor_read`] journals it instead, when the anchor
+//! sees it, since neither that session's log nor its spool holds it, and the
+//! anchor's fold skips it. [`anchor_read`] journals it instead, when the anchor
 //! commits it: one `context_reads` record attributed to the session the
 //! `session` field names, so the read shows up against that session.
 
@@ -75,26 +76,19 @@ pub(super) fn closes_visit(payload: &EventPayload) -> bool {
 #[cfg(test)]
 pub(super) fn fold(log: &str, visit_seq: u64) -> Option<Fold> {
     let window = window(log, visit_seq)?;
-    let mut fold = Fold::default();
-    for line in window.lines() {
-        if head(line).is_some_and(|(_, kind)| kind == CONTEXT_READ) {
-            if let Ok(read) = serde_json::from_str::<ReadLine<'_>>(line) {
-                // A read an anchor recorded for another session belongs to
-                // that session, and was journaled against it when the
-                // anchor committed it (see [`anchor_read`]).
-                if read.payload.session.is_none() {
-                    fold.add(&read.payload);
-                }
-            }
-        }
-    }
-    (!fold.is_empty()).then_some(fold)
+    fold_reads(
+        window
+            .lines()
+            .filter(|line| head(line).is_some_and(|(_, kind)| kind == CONTEXT_READ)),
+    )
 }
 
 /// [`fold`], with the visit's reads this host spooled beside the session
 /// (`crate::session::read_spool`, read through its one reader) folded in
-/// too: the reads made by anything but the session's own tick, which the
-/// cloud backend keeps out of the log. A spooled read belongs to the visit
+/// too: the reads made with no reader's anchor, which both backends keep
+/// out of the log (and, under the cloud backend, any other read made outside
+/// the session's own tick by a caller that doesn't route its reads). A
+/// spooled read belongs to the visit
 /// when it was made at or after the event the window starts from. Log and
 /// spool reads are folded in time order, so first-read order holds across
 /// both.
@@ -114,11 +108,17 @@ pub(super) fn fold_with_spool(log: &str, visit_seq: u64, session_dir: &Path) -> 
     );
     // Stable, so reads at the same instant keep log-then-spool order.
     lines.sort_by(|a, b| a.0.cmp(b.0));
+    fold_reads(lines.into_iter().map(|(_, line)| line))
+}
+
+/// Fold `context_read` lines, in the order given, into one visit's
+/// [`Fold`]; `None` when none counted. A read an anchor recorded for another
+/// session (one carrying `session`) is skipped: it was journaled against
+/// that session when the anchor committed it (see [`anchor_read`]).
+fn fold_reads<'a>(lines: impl Iterator<Item = &'a str>) -> Option<Fold> {
     let mut fold = Fold::default();
-    for (_, line) in lines {
+    for line in lines {
         if let Ok(read) = serde_json::from_str::<ReadLine<'_>>(line) {
-            // As in [`fold`]: a read an anchor recorded for another session
-            // was journaled against that session (see [`anchor_read`]).
             if read.payload.session.is_none() {
                 fold.add(&read.payload);
             }

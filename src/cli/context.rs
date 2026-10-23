@@ -177,11 +177,12 @@ fn log_cli_read(
     let state = derive_state_from_log(events).unwrap_or_default();
     match read_log_target(store, backend, session, reader_anchor) {
         ReadLogTarget::Session => {
-            context_log::append_to_session_best_effort(
-                backend,
-                session,
-                &read.into_event(READER_CLI, &state, None),
-            );
+            // An own read: into the session's log on every backend, which
+            // `append_own_read` tells the cloud backend so it doesn't spool
+            // a read made outside the session's tick.
+            context_log::append_best_effort(&read.into_event(READER_CLI, &state, None), |p| {
+                backend.append_own_read(session, p, &crate::engine::types::now_iso8601())
+            });
         }
         ReadLogTarget::Anchor(anchor) => {
             context_log::append_to_session_best_effort(

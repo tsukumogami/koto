@@ -353,6 +353,25 @@ pub trait SessionBackend: Send + Sync {
     fn append_event(&self, id: &str, payload: &EventPayload, timestamp: &str)
         -> anyhow::Result<()>;
 
+    /// Append a `context_read` that its reader already judged to be `id`'s
+    /// own (`crate::cli::context::read_log_target` answered `Session`: the
+    /// reader's anchor is `id` or holds it, or the read ran in `id`'s own
+    /// tick) to `id`'s log.
+    ///
+    /// [`SessionBackend::append_event`] on the cloud backend keeps a read
+    /// made outside `id`'s own tick out of the log, in the read spool, since
+    /// it can't tell an own read from another reader's; the reader can, so it
+    /// says so here and the read goes into the log like any other event.
+    /// Every other backend appends as `append_event` does.
+    fn append_own_read(
+        &self,
+        id: &str,
+        payload: &EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        self.append_event(id, payload, timestamp)
+    }
+
     /// Atomically create a session's state file with the given header and
     /// initial events.
     ///
@@ -798,6 +817,18 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.append_event(id, payload, timestamp),
             Backend::Cloud(b) => b.append_event(id, payload, timestamp),
+        }
+    }
+
+    fn append_own_read(
+        &self,
+        id: &str,
+        payload: &EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.append_own_read(id, payload, timestamp),
+            Backend::Cloud(b) => b.append_own_read(id, payload, timestamp),
         }
     }
 

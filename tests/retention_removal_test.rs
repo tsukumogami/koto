@@ -1167,7 +1167,22 @@ fn under_the_cloud_backend_reads_of_another_session_leave_it_byte_identical() {
     let s3 = FakeS3::start(BUCKET);
     let env = Env::cloud(&s3);
     env.init("a");
-    env.dispatched("b", "a");
+    // b's own agent session: its anchor holds b.
+    let out = env.run(
+        &[
+            "session",
+            "anchor",
+            "open",
+            "--harness-session",
+            "ownb",
+            "--source",
+            "startup",
+        ],
+        &[],
+    );
+    assert!(out.status.success(), "anchor open: {out:?}");
+    let own = [("KOTO_ANCHOR", "anchor-ownb")];
+    env.init_with("b", &["--dispatched-by", "a"], &own);
     env.add_key("b", "notes/b", "b's notes");
     let v = env.tick("b", false);
     assert_eq!(retention(&v), (true, Some("hierarchy".to_string())));
@@ -1188,6 +1203,19 @@ fn under_the_cloud_backend_reads_of_another_session_leave_it_byte_identical() {
         objects("b").iter().all(|(k, _)| !k.ends_with(SPOOL)),
         "the spool reached the bucket"
     );
+
+    // An own read, from b's own agent session outside any tick, goes into
+    // b's log under the cloud backend too, not to the spool.
+    let spooled = env.spooled("b").len();
+    let events = env.events_text("b").len();
+    let out = env.run(&["context", "get", "b", "notes/b"], &own);
+    assert!(out.status.success(), "own read: {out:?}");
+    let added = &env.events_text("b")[events..];
+    assert_eq!(added.len(), 1, "{added:?}");
+    let read: Value = serde_json::from_str(&added[0]).unwrap();
+    assert_eq!(read["type"], "context_read");
+    assert!(read["payload"].get("session").is_none());
+    assert_eq!(env.spooled("b").len(), spooled, "an own read was spooled");
 }
 
 #[test]

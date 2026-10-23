@@ -1,15 +1,21 @@
-//! Reads of a session made by anything but that session's own tick, kept on
-//! this host and never in the session's log (koto#428).
+//! Reads of a session made with no reader's anchor, kept on this host and
+//! never in the session's log (koto#428, DESIGN-session-retention.md
+//! Decision 5).
 //!
 //! A `koto context get` or `exists` logs its read as a `context_read`, so a
 //! visit's reads can be folded into the run journal when the visit closes.
-//! Logged into the read session's own log, a read from another session's
-//! tick, or from outside any tick, makes the reader a writer of that
-//! session: on the cloud backend a push of its whole state file for every
-//! read, from a host that may not own the session (koto#412, koto#410). So
-//! the cloud backend appends such a read here instead, beside the session in
-//! the local store, and never pushes it. A session's own tick still logs its
-//! reads in the log, as before.
+//! Logged into the read session's own log, a read from a shell with no
+//! anchor makes the reader a writer of that session: on the cloud backend a
+//! push of its whole state file for every read, from a host that may not own
+//! the session (koto#412, koto#410). So such a read is appended here instead,
+//! beside the session in the local store, under either backend, and never
+//! pushed. There are two writers: `koto context get` and `exists` spool an
+//! anchorless read themselves (`crate::cli::context`), on both backends, and
+//! the cloud backend's `append_event` spools any other `context_read` made
+//! outside the session's own tick, as a backstop for a caller that doesn't
+//! route its reads. An own read (the reader's anchor is the session or holds
+//! it, or the read ran in its own tick) still goes into the log, and so does
+//! a read another agent session's anchor records of it, in that anchor's log.
 //!
 //! The spool is `context-reads.jsonl` in the session's local directory: one
 //! line per read, `{"timestamp": ..., "type": "context_read", "payload":

@@ -1548,6 +1548,25 @@ impl CloudBackend {
         reentrancy::enclosing_tick().as_deref() == Some(id)
     }
 
+    /// Append `payload` to `id`'s log locally, then push the state file;
+    /// inside a tick on `id`, the append joins the tick's batch instead and
+    /// the tick pushes it. The caller has run `local_guard`.
+    fn append_logged(
+        &self,
+        id: &str,
+        payload: &crate::engine::types::EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        if self.defers(id) {
+            if let Some((_journal, _lock)) = self.open_batch(id)? {
+                return self.local.append_event(id, payload, timestamp);
+            }
+        }
+        self.local.append_event(id, payload, timestamp)?;
+        self.sync_push_state(id);
+        Ok(())
+    }
+
     /// Record that this process pulled `id`; false when it already had.
     fn mark_pulled(&self, id: &str) -> bool {
         self.pulled
@@ -2362,9 +2381,13 @@ impl SessionBackend for CloudBackend {
         // A read of `id` by anything but its own tick is kept on this host,
         // in the read spool, and never written into `id`'s log or pushed:
         // the reader must not become a writer of a session it only read.
-        // A read an anchor records of another session (it names that
-        // session in `session`) is the anchor's own write, and goes into the
-        // anchor's log like any other.
+        // This is the backstop for a caller that doesn't route its reads.
+        // `koto context get` and `exists` do: they spool an anchorless read
+        // themselves, send an own read through `append_own_read`, which
+        // skips this, and write a read from another agent session into the
+        // reader's anchor, carrying the session it read in `session`. That
+        // one is the anchor's own write and goes into its log like any
+        // other.
         if matches!(
             payload,
             crate::engine::types::EventPayload::ContextRead { session: None, .. }
@@ -2376,14 +2399,19 @@ impl SessionBackend for CloudBackend {
                 payload,
             );
         }
-        if self.defers(id) {
-            if let Some((_journal, _lock)) = self.open_batch(id)? {
-                return self.local.append_event(id, payload, timestamp);
-            }
-        }
-        self.local.append_event(id, payload, timestamp)?;
-        self.sync_push_state(id);
-        Ok(())
+        self.append_logged(id, payload, timestamp)
+    }
+
+    /// The read is `id`'s own, as its reader judged: into the log and
+    /// pushed, like any event, with no spool backstop.
+    fn append_own_read(
+        &self,
+        id: &str,
+        payload: &crate::engine::types::EventPayload,
+        timestamp: &str,
+    ) -> anyhow::Result<()> {
+        self.local_guard(id)?;
+        self.append_logged(id, payload, timestamp)
     }
 
     fn read_events(
