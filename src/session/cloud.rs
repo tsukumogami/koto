@@ -2359,14 +2359,11 @@ impl SessionBackend for CloudBackend {
         timestamp: &str,
     ) -> anyhow::Result<()> {
         self.local_guard(id)?;
-        // A read of `id` by anything but its own tick is kept on this host,
-        // in the read spool, and never written into `id`'s log or pushed:
-        // the reader must not become a writer of a session it only read.
-        if matches!(
-            payload,
-            crate::engine::types::EventPayload::ContextRead { .. }
-        ) && !self.is_own_tick(id)
-        {
+        // A read of `id` by anything but its own tick, and the pull of a
+        // changed key that read made, are kept on this host, in the read
+        // spool, and never written into `id`'s log or pushed: the reader
+        // must not become a writer of a session it only read.
+        if crate::session::read_spool::spooled(payload) && !self.is_own_tick(id) {
             return crate::session::read_spool::append(
                 &self.local.session_dir(id),
                 timestamp,
@@ -2764,8 +2761,10 @@ impl ContextStore for CloudBackend {
             return self.local.get(session, key);
         }
         // Pull from remote if a newer version exists. A pull that wrote the
-        // local store is a write like any other, so it is logged -- before
-        // the read the caller is about to log, which it produced.
+        // local store is logged as a `sync` write -- before the read the
+        // caller is about to log, which it produced. From anything but the
+        // session's own tick, `append_event` spools it beside the read
+        // instead, so only this host's mirror of the key changes.
         self.prime_manifest(session);
         let pulled = sync::pull_context_if_newer(
             &self.local,
@@ -5430,7 +5429,7 @@ mod tests {
         ));
     }
 
-    // -- A cloud pull is a logged write with writer `sync` --
+    // -- A cloud pull is a recorded write with writer `sync` --
 
     #[test]
     fn a_pull_records_writer_sync_in_the_store_and_the_log() {
@@ -5473,26 +5472,52 @@ mod tests {
 
         let local_meta = backend.local.meta("wf", "notes.md").unwrap();
         assert_eq!(local_meta.writer.as_deref(), Some("sync"));
+
+        // The read is made outside any tick of `wf`, so its pull is spooled
+        // beside the session, as the read is, and the log is left alone
+        // (koto#431).
         let (_, events) = backend.local.read_events("wf").unwrap();
-        let pulls: Vec<_> = events
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::ContextAdded {
-                    key, hash, writer, ..
-                } if key == "notes.md" => Some((hash.clone(), writer.clone())),
-                _ => None,
-            })
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.payload, EventPayload::ContextAdded { .. })),
+            "the pull is not in the read session's log"
+        );
+        let spool_lines = || {
+            std::fs::read_to_string(
+                backend
+                    .local
+                    .session_dir("wf")
+                    .join(crate::session::read_spool::SPOOL_FILE),
+            )
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .collect::<Vec<_>>()
+        };
+        let pulls: Vec<_> = spool_lines()
+            .into_iter()
+            .filter(|l| l["type"] == "context_added")
+            .map(|l| (l["payload"]["hash"].clone(), l["payload"]["writer"].clone()))
             .collect();
         assert_eq!(
             pulls,
-            vec![(sha256_hex(&content), Some("sync".to_string()))],
-            "one context_added with writer sync for the pull"
+            vec![(sha256_hex(&content).into(), "sync".into())],
+            "one spooled context_added with writer sync for the pull"
         );
 
-        // A second read finds the hashes equal: no pull, no second event.
+        // A second read finds the hashes equal: no pull, nothing logged or
+        // spooled for one.
         backend.get("wf", "notes.md").unwrap();
         let (_, again) = backend.local.read_events("wf").unwrap();
         assert_eq!(again.len(), events.len());
+        assert_eq!(
+            spool_lines()
+                .iter()
+                .filter(|l| l["type"] == "context_added")
+                .count(),
+            1
+        );
     }
 
     // -- A header rewrite reaches the remote copy (koto#310) --
