@@ -490,7 +490,14 @@ impl CloudBackend {
 
     /// Start a tick of `id`: write the id its commands read as the current
     /// tick ([`CloudBackend::current_tick`]).
+    ///
+    /// Nothing is written when [`CloudBackend::local_guard`] refuses `id`:
+    /// the tick it would start is refused before it runs, and a refused
+    /// command leaves the session's directory as it found it.
     pub fn begin_tick(&self, id: &str) {
+        if self.local_guard(id).is_err() {
+            return;
+        }
         sync_stamp::begin_tick(&self.local.session_dir(id));
     }
 
