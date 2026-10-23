@@ -520,6 +520,19 @@ impl CloudBackend {
             .remove(id);
     }
 
+    /// After this host pushed `id`'s manifest: drop the probe, and forget the
+    /// manifest cached beside the session, so no later read, in this process
+    /// or another command of the same tick, takes the manifest from before
+    /// the push. The next read fetches the manifest again.
+    fn forget_remote_manifest(&self, id: &str) {
+        self.forget_probe(id);
+        if let Some(mut stamp) = self.stamp(id) {
+            if stamp.manifest_etag.take().is_some() {
+                stamp.save(&self.local.session_dir(id));
+            }
+        }
+    }
+
     /// `id`'s stamp, when it is for `id`'s state key.
     fn stamp(&self, id: &str) -> Option<Stamp> {
         Stamp::load(&self.local.session_dir(id)).filter(|s| s.state_key == self.state_key(id))
@@ -1756,7 +1769,7 @@ impl CloudBackend {
             Ok(())
         });
         self.manifest_cache.invalidate();
-        self.forget_probe(id);
+        self.forget_remote_manifest(id);
         // The batch stays open until its marker is gone: with the journal
         // closed, nothing would come back to delete a marker left behind,
         // and every import would refuse the session for good. The next
@@ -2090,7 +2103,9 @@ impl CloudBackend {
         // manifest read once, and a context key goes up unless the bucket
         // both holds its object and names it in the manifest with this
         // host's hash: this is a repair, so an object the manifest names but
-        // the bucket lost goes up too. The keys go in parallel; then the
+        // the bucket lost goes up too. (An object whose bytes changed while
+        // the manifest kept this host's hash is not compared and not sent.)
+        // The keys go in parallel; then the
         // manifest, the state file and `version.json`, in the order the
         // batch flush uses. Host-local keys stay on this host, and files in
         // `ctx/` the manifest doesn't name (its lock) are not context. A key
@@ -2144,7 +2159,7 @@ impl CloudBackend {
             }
         }
         self.manifest_cache.invalidate();
-        self.forget_probe(id);
+        self.forget_remote_manifest(id);
 
         // The state file directly, not through `sync_push_state`, which
         // would flush an open batch and refuse on the very conflict this
@@ -2662,7 +2677,7 @@ impl CloudBackend {
             key,
             &self.manifest_cache,
         );
-        self.forget_probe(session);
+        self.forget_remote_manifest(session);
 
         // Update last_sync_base after successful push.
         self.finalize_version_after_push(session);
@@ -2837,7 +2852,7 @@ impl ContextStore for CloudBackend {
             key,
             &self.manifest_cache,
         );
-        self.forget_probe(session);
+        self.forget_remote_manifest(session);
 
         self.finalize_version_after_push(session);
 

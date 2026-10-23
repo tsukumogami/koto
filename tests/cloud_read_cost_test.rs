@@ -312,7 +312,9 @@ fn a_read_after_another_host_wrote_fetches_what_changed() {
     }
     // The pull wrote the local store, which is logged as a `context_added`
     // by `sync` and pushed with the state file, as before this change; the
-    // read itself is spooled. Nothing else is written.
+    // read itself is spooled. Nothing else is written. That push is a write
+    // to a session this host only read, which koto#431 removes; this pins
+    // today's behaviour until then.
     let puts: Vec<&String> = reqs.iter().filter(|r| r.starts_with("PUT")).collect();
     assert_eq!(
         puts,
@@ -481,4 +483,27 @@ fn resolve_keep_local_uploads_a_four_megabyte_session_in_one_pass() {
             "missing PUT {rest}: {reqs:?}"
         );
     }
+}
+
+/// A key this host removes from another session inside a tick is gone for
+/// the tick's later reads: the push forgets the manifest cached beside the
+/// session, so the tick's freshness never answers from the manifest before
+/// the removal.
+#[test]
+fn a_removal_inside_a_tick_is_seen_by_the_ticks_later_reads() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    worker_with_a_key(&h);
+    let script = format!(
+        "set -e\n\
+         koto context get {WORKER} k.md > /dev/null\n\
+         koto context remove {WORKER} k.md\n\
+         if koto context exists {WORKER} k.md; then echo stale > stale.txt; fi"
+    );
+    h.init(HUB, &script);
+    h.ok(&["next", HUB]);
+    assert!(
+        !h.ws.join("stale.txt").exists(),
+        "a read after the removal in the same tick still found the key"
+    );
 }

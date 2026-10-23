@@ -359,14 +359,18 @@ fn cleanup_and_a_terminal_tick_leave_the_marker_in_place() {
 
     // A terminal tick on a session whose marker check can't get an answer
     // (the listing of the session's prefix, which the check reads, fails):
-    // the check fails open with a warning, and the tick reaches the
-    // terminal state. Its cleanup lists the same prefix, so it can delete
-    // nothing here, and the marker is still there afterwards.
+    // the check fails open with a warning, the tick reaches the terminal
+    // state, and its cleanup, whose own listing of the session works,
+    // deletes the session's objects but not the marker. The cleanup lists
+    // the same prefix the check does, so only the checks' listings fail:
+    // each of the three ticks lists once for its check (a failed listing
+    // isn't asked again in that process), and rust-s3 retries a failed
+    // request once, so six requests fail and the cleanup's is answered.
     start_session(&a, "ticked");
     let ticked = session_prefix(&a, "ticked");
     let marker = format!("{}migrated.json", ticked);
     s3.put(&marker, br#"{"schema":1}"#);
-    s3.fail("LIST", &ticked, 500);
+    s3.fail_times("LIST", &ticked, 500, 6);
     for args in [
         vec!["next", "ticked"],
         vec!["next", "ticked", "--with-data", r#"{"choice":"go"}"#],
@@ -381,9 +385,10 @@ fn cleanup_and_a_terminal_tick_leave_the_marker_in_place() {
             run.describe()
         );
     }
-    assert!(
-        s3.keys_under(&ticked).contains(&marker),
-        "the terminal tick's cleanup must keep the marker"
+    assert_eq!(
+        s3.keys_under(&ticked),
+        vec![marker.clone()],
+        "the terminal tick's cleanup must keep only the marker"
     );
     assert!(!a.session_dir("ticked").exists());
 }
