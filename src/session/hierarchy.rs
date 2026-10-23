@@ -67,21 +67,30 @@ pub const FUTURE_TOLERANCE: std::time::Duration = std::time::Duration::from_secs
 
 /// The session a `parent_workflow` value is lineage to.
 ///
-/// A value that names a session (`exists`) is lineage to it. One that
-/// doesn't, and splits at its last `~` into `<p>` and a run of digits, is
-/// lineage to `<p>`: a batch rewind leaves its relocated children pointing
-/// at an epoch-branch name that was never created. Anything else is the
-/// value itself, which then names no session.
+/// This is koto's one lineage rule. The graph scan, [`edge_of`], the
+/// descendant walk that the parent sweep and the same-name replace share,
+/// and the superseded-branch listing of `koto status` all call it. A value
+/// that names a session (`exists`) is lineage to it. One that doesn't, and
+/// splits at its last `~` into `<p>` and a run of digits, is lineage to
+/// `<p>`: a batch rewind leaves its relocated children pointing at an
+/// epoch-branch name that was never created. Anything else is the value
+/// itself, which then names no session.
 pub fn lineage_target(parent_workflow: &str, exists: impl Fn(&str) -> bool) -> String {
     if exists(parent_workflow) {
         return parent_workflow.to_string();
     }
-    if let Some((p, epoch)) = parent_workflow.rsplit_once('~') {
-        if !p.is_empty() && !epoch.is_empty() && epoch.bytes().all(|b| b.is_ascii_digit()) {
-            return p.to_string();
-        }
+    match epoch_branch_of(parent_workflow) {
+        Some(p) => p.to_string(),
+        None => parent_workflow.to_string(),
     }
-    parent_workflow.to_string()
+}
+
+/// The `<p>` of an epoch-branch name `<p>~<digits>`, or `None` for a name
+/// of any other shape. Whether such a name is lineage to `<p>` also depends
+/// on it naming no session; see [`lineage_target`].
+pub fn epoch_branch_of(name: &str) -> Option<&str> {
+    let (p, epoch) = name.rsplit_once('~')?;
+    (!p.is_empty() && !epoch.is_empty() && epoch.bytes().all(|b| b.is_ascii_digit())).then_some(p)
 }
 
 /// Whether the `chain/parent` of the session in `dir` names one of
@@ -110,11 +119,14 @@ fn chain_parent_names(dir: &Path, probes: &[&str]) -> bool {
 /// can't read, the sessions directory included, answers "edge", which keeps
 /// the session.
 ///
-/// It probes by name only. A link whose session-id hint names this session
-/// under another name (a predecessor moved aside), or a link body of a
-/// version this koto doesn't know that names it, joins it in [`Graph::scan`]
-/// but not here; finding those would mean reading every link body in the
-/// store on every terminal tick.
+/// It finds everything [`Graph::scan`] would join the session through, so
+/// a tick never removes a session a prune would keep. Besides the names it
+/// probes, it reads each link body in the store (at most 4 KiB each, in the
+/// same pass): a link whose session-id hint carries this session's id under
+/// another name (a predecessor the same-name replace moved aside to
+/// `<name>_r<N>`, a descendant renamed with it), and a link body of a
+/// version this koto doesn't know whose `session` names it, both join it in
+/// the graph, so both count here.
 pub fn edge_of(base: &Path, name: &str) -> bool {
     let own = SessionFacts::read(base, name);
     if !own.problems.is_empty() || !own.store_problems.is_empty() {
@@ -164,10 +176,34 @@ pub fn edge_of(base: &Path, name: &str) -> bool {
         };
         for kind in kinds {
             let Ok(kind) = kind else { return true };
-            for probe in &probes {
-                match std::fs::symlink_metadata(kind.path().join(probe)) {
-                    Ok(_) => return true,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            let files = match std::fs::read_dir(kind.path()) {
+                Ok(files) => files,
+                // A stray file at the kind level holds no links.
+                Err(_) if kind.file_type().is_ok_and(|t| !t.is_dir()) => continue,
+                Err(_) => return true,
+            };
+            for file in files {
+                let Ok(file) = file else { return true };
+                // A file under a probed name counts whatever it holds, as
+                // it did before bodies were read: the graph joins a listed
+                // key even when its body is malformed.
+                if file
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|p| probes.contains(&p))
+                {
+                    return true;
+                }
+                match facts::link_file_names(&file.path()) {
+                    Ok(Some((session, session_id))) => {
+                        if session.as_deref().is_some_and(|s| probes.contains(&s)) {
+                            return true;
+                        }
+                        if own.session_id.is_some() && session_id == own.session_id {
+                            return true;
+                        }
+                    }
+                    Ok(None) => {}
                     Err(_) => return true,
                 }
             }

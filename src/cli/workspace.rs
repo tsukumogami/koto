@@ -39,6 +39,7 @@ use crate::session::{validate::validate_session_id, SessionBackend, SessionInfo}
 use crate::template::types::CompiledTemplate;
 
 use super::exit_with_error_code;
+use super::next_types::KeptChild;
 
 /// Outcome of the terminal-state gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -584,22 +585,129 @@ fn derive_terminal_status(
 /// session under a parent that still exists, reachable by the next prune
 /// from the same root.
 fn collect_descendants(root: &str, sessions: &[SessionInfo]) -> Vec<String> {
-    let mut descendants = Vec::new();
-    // A `parent_workflow` cycle (A -> B -> A) is constructible by removing a
-    // parent and re-creating it under its own former child; the visited set
-    // is what ends the walk instead of looping forever.
-    let mut visited: HashSet<String> = HashSet::from([root.to_string()]);
-    let mut frontier: Vec<String> = vec![root.to_string()];
-    while let Some(parent) = frontier.pop() {
-        for s in sessions {
-            if s.parent_workflow.as_deref() == Some(parent.as_str()) && visited.insert(s.id.clone())
-            {
-                descendants.push(s.id.clone());
-                frontier.push(s.id.clone());
-            }
+    struct Collect(Vec<String>);
+    impl DescendantVisitor for Collect {
+        fn enter(&mut self, child: &str, _parent: &str) -> bool {
+            self.0.push(child.to_string());
+            true
         }
     }
-    descendants
+    let mut collect = Collect(Vec::new());
+    LineageTree::from_sessions(sessions).walk(root, &mut collect);
+    collect.0
+}
+
+// ===========================================================
+// The descendant walk
+// ===========================================================
+
+/// Deeper than any real fan-out; only a corrupted header graph reaches it.
+pub(crate) const MAX_WALK_DEPTH: usize = 1000;
+
+/// Where a [`LineageTree::walk`] stopped short of a branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkLimit {
+    /// The child was already walked: a `parent_workflow` cycle (A -> B ->
+    /// A), constructible by removing a parent and re-creating it under its
+    /// own former child.
+    Cycle,
+    /// The session's children are deeper than [`MAX_WALK_DEPTH`].
+    Depth,
+}
+
+/// What a [`LineageTree::walk`] does at each descendant.
+pub(crate) trait DescendantVisitor {
+    /// Called before `child`'s own children are walked. `false` skips the
+    /// child and everything under it, and the walk counts it as not
+    /// cleared.
+    fn enter(&mut self, child: &str, parent: &str) -> bool;
+
+    /// Called once everything under `child` was walked; `below_cleared`
+    /// says whether every child under it was cleared. Returns whether
+    /// `child` itself is cleared. The default clears whatever its subtree
+    /// says.
+    fn leave(&mut self, _child: &str, below_cleared: bool) -> bool {
+        below_cleared
+    }
+
+    /// Called where the walk stops short: a child already walked, or a
+    /// session whose children are too deep. Either counts as not cleared.
+    fn limit(&mut self, _at: &str, _why: WalkLimit) {}
+}
+
+/// The store's koto lineage: each session's children, by the one lineage
+/// rule ([`hierarchy::lineage_target`]), so a child whose `parent_workflow`
+/// is an epoch-branch name nothing holds (`<p>~<digits>`) is a child of
+/// `<p>`, whatever the names.
+///
+/// The parent sweep, the same-name replace's move-aside, the listing of a
+/// kept parent's children and `koto workspace prune`'s subtree all walk it
+/// through [`LineageTree::walk`], the one guarded walk: a visited set ends
+/// a `parent_workflow` cycle, and a depth cap ends a corrupted chain.
+pub(crate) struct LineageTree {
+    children: HashMap<String, Vec<String>>,
+}
+
+impl LineageTree {
+    pub(crate) fn from_sessions(sessions: &[SessionInfo]) -> Self {
+        let names: HashSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        for s in sessions {
+            if let Some(pw) = s.parent_workflow.as_deref() {
+                let parent = hierarchy::lineage_target(pw, |n| names.contains(n));
+                if parent != s.id {
+                    children.entry(parent).or_default().push(s.id.clone());
+                }
+            }
+        }
+        LineageTree { children }
+    }
+
+    /// The direct children of `id`.
+    pub(crate) fn children(&self, id: &str) -> &[String] {
+        self.children.get(id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Walk every descendant of `root`, each after its parent, depth first.
+    /// Returns whether every one was cleared (see [`DescendantVisitor`]).
+    pub(crate) fn walk(&self, root: &str, visitor: &mut dyn DescendantVisitor) -> bool {
+        let mut visited: HashSet<String> = HashSet::from([root.to_string()]);
+        self.walk_from(root, visitor, &mut visited, 0)
+    }
+
+    fn walk_from(
+        &self,
+        id: &str,
+        visitor: &mut dyn DescendantVisitor,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) -> bool {
+        let kids = self.children(id);
+        if kids.is_empty() {
+            return true;
+        }
+        if depth >= MAX_WALK_DEPTH {
+            visitor.limit(id, WalkLimit::Depth);
+            return false;
+        }
+        let mut all = true;
+        for child in kids {
+            if !visited.insert(child.clone()) {
+                visitor.limit(child, WalkLimit::Cycle);
+                all = false;
+                continue;
+            }
+            if !visitor.enter(child, id) {
+                all = false;
+                continue;
+            }
+            let below = self.walk_from(child, visitor, visited, depth + 1);
+            if !visitor.leave(child, below) {
+                all = false;
+            }
+        }
+        all
+    }
 }
 
 // ===========================================================
@@ -609,34 +717,22 @@ fn collect_descendants(root: &str, sessions: &[SessionInfo]) -> Vec<String> {
 /// Remove `name`'s terminal descendants, if `name` can have children at all.
 ///
 /// Called just before koto removes a session at its own terminal, so a child
-/// kept on disk (a failure terminal, or `--no-cleanup`) doesn't outlive the
-/// parent that koto removed (koto issue 240). A session can have children
+/// kept on disk doesn't outlive the parent that koto removed (koto issue
+/// 240). Since the tick keeps every session with an edge, and a child's
+/// lineage is one, a parent with a child is kept at its terminal and never
+/// reaches this: the call stays as the safety net it always was, for a
+/// child the tick's edge test could not see. A session can have children
 /// when its template declares a `materialize_children` hook, which is how
 /// koto recognises a coordinator, or when its own log holds a
 /// `ChildCompleted` from a child created with `koto init --parent`. A leaf
 /// session, which is most terminal ticks, never lists sessions.
-///
-/// One case falls outside both triggers: a parent without a batch hook on
-/// whose log no `ChildCompleted` landed (every child's notice failed to
-/// write). That child is left
-/// behind, visible in `koto workflows --orphaned`.
 pub(crate) fn sweep_if_parent(
     backend: &dyn SessionBackend,
     context_store: &dyn crate::session::context::ContextStore,
     name: &str,
     compiled: &CompiledTemplate,
 ) {
-    let declares_children = compiled
-        .states
-        .values()
-        .any(|s| s.materialize_children.is_some());
-    let had_children = declares_children
-        || backend.read_events(name).is_ok_and(|(_, events)| {
-            events
-                .iter()
-                .any(|e| matches!(e.payload, EventPayload::ChildCompleted { .. }))
-        });
-    if had_children {
+    if may_have_children(backend, name, compiled) {
         sweep_terminal_descendants(backend, context_store, name);
     }
 }
@@ -672,71 +768,149 @@ pub(crate) fn sweep_terminal_descendants(
             return;
         }
     };
-    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
-    for s in &sessions {
-        if let Some(p) = s.parent_workflow.as_deref() {
-            children.entry(p).or_default().push(s.id.as_str());
-        }
-    }
-    let mut visited: HashSet<String> = HashSet::from([parent.to_string()]);
-    sweep_children(backend, context_store, parent, &children, &mut visited, 0);
+    let mut sweep = Sweep {
+        backend,
+        context_store,
+    };
+    LineageTree::from_sessions(&sessions).walk(parent, &mut sweep);
 }
 
-/// Deeper than any real fan-out; only a corrupted header graph reaches it.
-const MAX_SWEEP_DEPTH: usize = 1000;
+/// The sweep's half of the shared walk: it skips a branch it can't clear
+/// (a live child, one waiting on its leg, one it can't read, a cycle or a
+/// chain too deep), and removes a child only once everything under it went.
+struct Sweep<'a> {
+    backend: &'a dyn SessionBackend,
+    context_store: &'a dyn crate::session::context::ContextStore,
+}
 
-/// Sweep the children of `id`. Returns true when every child was removed.
-fn sweep_children(
-    backend: &dyn SessionBackend,
-    context_store: &dyn crate::session::context::ContextStore,
-    id: &str,
-    children: &HashMap<&str, Vec<&str>>,
-    visited: &mut HashSet<String>,
-    depth: usize,
-) -> bool {
-    let Some(kids) = children.get(id) else {
-        return true;
-    };
-    if depth >= MAX_SWEEP_DEPTH {
-        return false;
+impl DescendantVisitor for Sweep<'_> {
+    fn enter(&mut self, child: &str, _parent: &str) -> bool {
+        is_terminal_session(self.backend, child) && !awaits_leg_promotion(self.backend, child)
     }
-    let mut all_removed = true;
-    for &child in kids {
-        if !visited.insert(child.to_string()) {
-            // A cycle back into the part of the tree already walked.
-            all_removed = false;
-            continue;
-        }
-        if !is_terminal_session(backend, child) || awaits_leg_promotion(backend, child) {
-            all_removed = false;
-            continue;
-        }
-        if !sweep_children(backend, context_store, child, children, visited, depth + 1) {
-            all_removed = false;
-            continue;
-        }
+
+    fn leave(&mut self, child: &str, below_cleared: bool) -> bool {
+        let backend = self.backend;
         // Read it again: something may have rewound it since the walk began.
-        if !is_terminal_session(backend, child) {
-            all_removed = false;
-            continue;
+        if !below_cleared || !is_terminal_session(backend, child) {
+            return false;
         }
         // Its finished record first, so `koto status` can answer for it once
         // it is gone.
         #[cfg(unix)]
-        if let Some(record) = super::finished_record_for_child(backend, context_store, child) {
+        if let Some(record) = super::finished_record_for_child(backend, self.context_store, child) {
             super::write_finished_record(backend, &record);
         }
         match backend.cleanup(child) {
-            Ok(()) => {}
+            Ok(()) => true,
             Err(e) => {
                 eprintln!("warning: could not remove kept session {child}: {e}");
                 #[cfg(unix)]
                 super::forget_finished_record(backend, child);
-                all_removed = false;
+                false
             }
         }
     }
-    all_removed
+}
+
+/// The terminal descendants of `parent`, each with the edges that keep it,
+/// for the `kept_children` field of a kept parent's terminal tick.
+///
+/// A parent with children always has an edge, so the tick keeps it, and its
+/// children with it: they have lineage to it. The sweep that would have
+/// removed them at the parent's removal removes nothing; this lists what it
+/// would have walked instead (the same walk, which doesn't descend into a
+/// live child), so `koto session prune` can be pointed at it later. Only a
+/// session that can have children lists anything: one whose template
+/// declares a batch hook, or whose log holds a `ChildCompleted`.
+pub(crate) fn kept_children(
+    backend: &dyn SessionBackend,
+    name: &str,
+    compiled: &CompiledTemplate,
+) -> Vec<KeptChild> {
+    if !may_have_children(backend, name, compiled) {
+        return Vec::new();
+    }
+    let Ok(sessions) = backend.list() else {
+        return Vec::new();
+    };
+    struct List<'a> {
+        backend: &'a dyn SessionBackend,
+        out: Vec<String>,
+    }
+    impl DescendantVisitor for List<'_> {
+        fn enter(&mut self, child: &str, _parent: &str) -> bool {
+            if !is_terminal_session(self.backend, child) {
+                return false;
+            }
+            self.out.push(child.to_string());
+            true
+        }
+    }
+    let mut list = List {
+        backend,
+        out: Vec::new(),
+    };
+    LineageTree::from_sessions(&sessions).walk(name, &mut list);
+    let base = backend
+        .session_dir(name)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    list.out
+        .into_iter()
+        .map(|child| {
+            let facts = hierarchy::SessionFacts::read(&base, &child);
+            let mut via: Vec<String> = facts
+                .links
+                .iter()
+                .map(|l| {
+                    format!(
+                        "its {} link names {}",
+                        hierarchy::sanitize(&l.kind),
+                        hierarchy::sanitize(&l.peer)
+                    )
+                })
+                .collect();
+            if let Some(pw) = &facts.parent_workflow {
+                via.push(format!(
+                    "its parent_workflow names {}",
+                    hierarchy::sanitize(pw)
+                ));
+            }
+            if let Some(p) = &facts.chain_parent {
+                via.push(format!("its chain/parent names {}", hierarchy::sanitize(p)));
+            }
+            KeptChild {
+                reason: super::next_types::RetentionReason::Hierarchy.as_str(),
+                detail: format!(
+                    "kept with its hierarchy ({}); koto session prune removes it once the \
+                     hierarchy is released",
+                    via.join("; ")
+                ),
+                name: child,
+            }
+        })
+        .collect()
+}
+
+/// Whether `name` can have koto children: its template declares a batch
+/// hook, which is how koto recognises a coordinator, or its own log holds a
+/// `ChildCompleted` from a child created with `koto init --parent`. A leaf
+/// session, which is most terminal ticks, never lists sessions.
+fn may_have_children(
+    backend: &dyn SessionBackend,
+    name: &str,
+    compiled: &CompiledTemplate,
+) -> bool {
+    compiled
+        .states
+        .values()
+        .any(|s| s.materialize_children.is_some())
+        || backend.read_events(name).is_ok_and(|(_, events)| {
+            events
+                .iter()
+                .any(|e| matches!(e.payload, EventPayload::ChildCompleted { .. }))
+        })
 }
 
 /// True when `id` is bound to a request leg that is still open, so its
@@ -746,7 +920,7 @@ fn sweep_children(
 /// unreadable, or whose leg is resolved or abandoned is not pending (the
 /// tick would give up too); an I/O error, which the tick would retry, keeps
 /// the session.
-fn awaits_leg_promotion(backend: &dyn SessionBackend, id: &str) -> bool {
+pub(crate) fn awaits_leg_promotion(backend: &dyn SessionBackend, id: &str) -> bool {
     use crate::engine::request_store::{self, RequestStoreError, ValidatedRequestId};
     use crate::engine::types::{LegDisposition, RequestState};
 
@@ -778,7 +952,7 @@ fn awaits_leg_promotion(backend: &dyn SessionBackend, id: &str) -> bool {
 /// sweep leaves the session alone. This is deliberately the opposite of
 /// `non_terminal_sessions`, which only warns before an operator-confirmed
 /// prune and so treats an unreadable session as nothing to warn about.
-fn is_terminal_session(backend: &dyn SessionBackend, id: &str) -> bool {
+pub(crate) fn is_terminal_session(backend: &dyn SessionBackend, id: &str) -> bool {
     let Ok((header, events)) = backend.read_events(id) else {
         return false;
     };
@@ -1170,6 +1344,105 @@ mod tests {
         assert!(descendants.contains(&"grandchild".to_string()));
         assert!(!descendants.contains(&"unrelated".to_string()));
         assert!(!descendants.contains(&"root".to_string()));
+    }
+
+    fn walk_info(id: &str, parent: Option<&str>) -> SessionInfo {
+        SessionInfo {
+            id: id.to_string(),
+            created_at: "t".to_string(),
+            template_hash: "h".to_string(),
+            parent_workflow: parent.map(str::to_string),
+            template_source_status: None,
+            execution_dir: None,
+            session_id: None,
+            kind: None,
+        }
+    }
+
+    /// Records what the walk does, and skips the children it is told to.
+    #[derive(Default)]
+    struct Trace {
+        entered: Vec<String>,
+        left: Vec<(String, bool)>,
+        limits: Vec<(String, WalkLimit)>,
+        skip: Vec<&'static str>,
+    }
+
+    impl DescendantVisitor for Trace {
+        fn enter(&mut self, child: &str, _parent: &str) -> bool {
+            self.entered.push(child.to_string());
+            !self.skip.contains(&child)
+        }
+        fn leave(&mut self, child: &str, below_cleared: bool) -> bool {
+            self.left.push((child.to_string(), below_cleared));
+            below_cleared
+        }
+        fn limit(&mut self, at: &str, why: WalkLimit) {
+            self.limits.push((at.to_string(), why));
+        }
+    }
+
+    /// The walk follows the one lineage rule: a `parent_workflow` naming an
+    /// epoch branch nothing holds is a child of the branch's base, whatever
+    /// the names; one naming a session that exists is that session's.
+    #[test]
+    fn the_walk_follows_the_lineage_rule_through_epoch_branches() {
+        let sessions = vec![
+            walk_info("p", None),
+            walk_info("p~1.a", Some("p~1")),
+            walk_info("helper", Some("p")),
+            walk_info("q~2", None),
+            walk_info("q~2.b", Some("q~2")),
+            walk_info("q", None),
+        ];
+        let tree = LineageTree::from_sessions(&sessions);
+        let mut trace = Trace::default();
+        assert!(tree.walk("p", &mut trace));
+        assert_eq!(trace.entered, vec!["p~1.a", "helper"]);
+        // `q~2` is a session, so its child is its own, not `q`'s.
+        assert!(tree.children("q").is_empty());
+        assert_eq!(tree.children("q~2"), ["q~2.b".to_string()]);
+    }
+
+    /// A skipped child is not descended into and clears nothing above it; a
+    /// cycle and a chain past the depth cap are reported and stop the walk
+    /// there, never looping.
+    #[test]
+    fn the_walk_is_guarded_by_a_visited_set_and_a_depth_cap() {
+        let sessions = vec![
+            walk_info("r", Some("b")),
+            walk_info("a", Some("r")),
+            walk_info("a.x", Some("a")),
+            walk_info("b", Some("r")),
+        ];
+        let tree = LineageTree::from_sessions(&sessions);
+        let mut trace = Trace {
+            skip: vec!["a"],
+            ..Trace::default()
+        };
+        assert!(!tree.walk("r", &mut trace));
+        assert!(
+            !trace.entered.contains(&"a.x".to_string()),
+            "{:?}",
+            trace.entered
+        );
+        assert_eq!(trace.limits, vec![("r".to_string(), WalkLimit::Cycle)]);
+        assert!(
+            trace.left.contains(&("b".to_string(), false)),
+            "{:?}",
+            trace.left
+        );
+
+        let deep: Vec<SessionInfo> = (0..=MAX_WALK_DEPTH + 1)
+            .map(|i| {
+                let parent = (i > 0).then(|| format!("d{}", i - 1));
+                walk_info(&format!("d{i}"), parent.as_deref())
+            })
+            .collect();
+        let mut trace = Trace::default();
+        assert!(!LineageTree::from_sessions(&deep).walk("d0", &mut trace));
+        assert_eq!(trace.entered.len(), MAX_WALK_DEPTH);
+        assert!(matches!(trace.limits.as_slice(), [(_, WalkLimit::Depth)]));
     }
 
     #[test]

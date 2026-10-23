@@ -508,6 +508,57 @@ pub trait SessionBackend: Send + Sync {
     /// permitted in minor releases.
     fn relocate(&self, from: &str, to: &str) -> anyhow::Result<()>;
 
+    /// # Stability: additive-only
+    ///
+    /// Whether the store's remote half holds nothing at all under `id`'s
+    /// prefix, a migration marker included, asked by a checked listing of
+    /// that prefix ending in `/` (so `x_r1` doesn't match `x_r10`). `Err`
+    /// means the listing failed and nothing can be said. The local store is
+    /// the caller's to check.
+    ///
+    /// The default, for a backend with no remote half, is `Ok(true)`.
+    fn remote_prefix_free(&self, _id: &str) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    /// # Stability: additive-only
+    ///
+    /// [`relocate`](Self::relocate) that fails rather than warns: the local
+    /// session is renamed (with the header identity `relocate` writes), and
+    /// a remote half gets a copy of every object under the new prefix,
+    /// keeping the old ones, failing on any object it couldn't copy. The
+    /// state log, whose object name embeds the session name, and a
+    /// migration marker are not copied; the caller pushes the log under the
+    /// new name with [`ensure_pushed`](Self::ensure_pushed).
+    ///
+    /// The default, for a backend with no remote half, is `relocate`.
+    fn relocate_checked(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.relocate(from, to)
+    }
+
+    /// # Stability: additive-only
+    ///
+    /// Rename a session in the local store only, touching no remote copy:
+    /// how a move that failed partway is undone, while the old remote
+    /// prefix still holds everything. The header identity is written as
+    /// `relocate` writes it; the caller restores the rest.
+    ///
+    /// The default, for a backend with no remote half, is `relocate`.
+    fn relocate_local_only(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.relocate(from, to)
+    }
+
+    /// # Stability: additive-only
+    ///
+    /// Delete every object under `id`'s remote prefix except a migration
+    /// marker, failing (after trying the rest) when the listing or any
+    /// delete fails. The local copy is untouched.
+    ///
+    /// The default, for a backend with no remote half, does nothing.
+    fn delete_remote_checked(&self, _id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Acquire a non-blocking advisory `flock(LOCK_EX | LOCK_NB)` on
     /// the session's state file.
     ///
@@ -786,6 +837,34 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.relocate(from, to),
             Backend::Cloud(b) => b.relocate(from, to),
+        }
+    }
+
+    fn remote_prefix_free(&self, id: &str) -> anyhow::Result<bool> {
+        match self {
+            Backend::Local(b) => b.remote_prefix_free(id),
+            Backend::Cloud(b) => b.remote_prefix_free(id),
+        }
+    }
+
+    fn relocate_checked(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.relocate_checked(from, to),
+            Backend::Cloud(b) => b.relocate_checked(from, to),
+        }
+    }
+
+    fn relocate_local_only(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.relocate_local_only(from, to),
+            Backend::Cloud(b) => b.relocate_local_only(from, to),
+        }
+    }
+
+    fn delete_remote_checked(&self, id: &str) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(b) => b.delete_remote_checked(id),
+            Backend::Cloud(b) => b.delete_remote_checked(id),
         }
     }
 

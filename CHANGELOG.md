@@ -324,6 +324,23 @@ to `0.9.x`).
 
 ### Changed
 
+- **End-of-run removal no longer removes a session with a link or
+  lineage.** The tick that lands a session in a terminal state now keeps
+  it, with or without `--no-cleanup`, when it has a link of its own, a
+  `parent_workflow`, a `chain/parent`, or another session naming it
+  (`"retention": {"retained": true, "reason": "hierarchy"}`), and `koto
+  session prune` reclaims it once its hierarchy is released past
+  `retention.keep`. A lone session is still removed at its success
+  terminal, and the check reads no retention setting, so no tick fails on
+  one. A parent kept this way keeps its terminal children too: the sweep
+  that removed them removes nothing, and the response lists them in
+  `kept_children`, each with the links and lineage that keep it.
+  `koto init --replace-terminal` on a finished session whose hierarchy the
+  rule keeps moves it and its koto subtree aside to `<name>_r<N>` instead
+  of deleting them, and its answer gains `moved_to`; a released one is
+  replaced as before. A live descendant refuses the replace with the new
+  `replace_held_live`, and a move that fails partway is undone and refused
+  with `replace_failed`.
 - **Both prunes apply the hierarchy retention rule.** `koto session prune`
   judges every session with the engine behind `koto session hierarchy`:
   rule `a` is now "alive" (a running or unreadable session, or an open

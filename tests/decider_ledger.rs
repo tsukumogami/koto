@@ -800,8 +800,12 @@ fn child_records_survive_child_cleanup() {
         &["next", "parent", "--with-data", &finalize.to_string()],
     );
     assert_eq!(json_out(&out)["state"], "summarize", "{}", describe(&out));
-    assert!(!sessions.join("parent.A").exists());
-    assert!(!sessions.join("parent.B").exists());
+    // The children have lineage to the parent, so their terminal ticks kept
+    // them with its hierarchy; remove them by hand.
+    for child in ["parent.A", "parent.B"] {
+        run("off", &["session", "cleanup", child]);
+        assert!(!sessions.join(child).exists());
+    }
 
     let lines = ledger(&h);
     let consulted = of_kind(&lines, "consulted");

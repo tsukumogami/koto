@@ -57,6 +57,13 @@ The `error` text for duplicate and unknown keys, and for an allowlist failure, i
 | `template_mismatch` | `--attach-live` found a session built from another template file. | `recorded`, `requested` |
 | `origin_mismatch` | `--attach-live` found a session from another worktree or session store, or one with no origin record. | `recorded`, `requested` |
 | `var_mismatch` | An explicitly passed non-`rebind` variable differs from the session's recorded value. | `var`, `recorded`, `requested` |
+| `replace_held_live` | `--replace-terminal` found a finished session the retention rule keeps, so it would move aside, but a descendant in its subtree is still running, waits to promote its result to a request leg, or can't be read. | `live` |
+
+`--replace-terminal` can also fail after its checks, with exit 1:
+
+| Code | Meaning | Extra fields |
+|------|---------|--------------|
+| `replace_failed` | The finished session couldn't be replaced: removing a released one failed, or moving a kept one aside failed partway (a rename, a header rewrite, or under the cloud backend a copy, a push or a name check). A failed move is undone first, with the original headers restored, so nothing is replaced. When even the undo fails, `stranded` lists the renames left in place, as `{"from", "to"}`; those sessions stay readable under their new names. | `stranded` (only when an undo failed) |
 
 Under `--koto-leg`, the leg checks `koto request attach` makes refuse with the same codes as that verb (`request_closed`, `leg_abandoned`, `input_mismatch`, and the rest in [Request errors](#request-errors)), in this flat `init` envelope with an optional `details` list; a lost bind race can also end in `lock_contention` (exit 1). On the entry-flag path a template that doesn't resolve or compile carries its kind as a code too (`template_not_found`, `template_compile_failed`, exit 1).
 

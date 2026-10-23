@@ -513,8 +513,15 @@ agents encounter today for any state that uses `integration:`.
 - `retention` says what koto does with the session after this tick:
   `{"retained": false}` (the session is removed), `{"retained": true, "reason":
   "failure_terminal"}` (the terminal is declared `failure: true`, so the session is
-  always kept), or `{"retained": true, "reason": "no_cleanup"}` (kept because the
-  tick passed `--no-cleanup`). A kept session can still be read with `koto status`
+  always kept), `{"retained": true, "reason": "hierarchy"}` (the session has a
+  link or lineage: a dispatcher, a koto parent, a `chain/parent`, or another
+  session naming it; kept with or without `--no-cleanup` until `koto session
+  prune` finds its hierarchy released), or `{"retained": true, "reason":
+  "no_cleanup"}` (a lone session kept because the tick passed `--no-cleanup`). A
+  parent kept for `hierarchy` also carries `kept_children`, beside `retention`:
+  each terminal child it would once have removed, as `{"name", "reason",
+  "detail"}`, with `detail` naming the links and lineage that keep it. The field
+  is absent when there is none. A kept session can still be read with `koto status`
   and `koto context get`, rewound with `koto rewind`, and retried by its parent's
   `retry_failed`; ticking it again returns `done` with the same `result`. Keeping a
   session never withholds its result: the parent's gate and a bound request leg get

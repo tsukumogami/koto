@@ -826,7 +826,8 @@ fn removing_sessions_never_changes_lines_already_written() {
     assert_eq!(started.len(), 2);
     assert_eq!(started[1]["koto.session.id"], new_id.as_str());
 
-    // A parent sweep: a removed parent takes its kept children with it.
+    // A parent sweep: a replace of a released parent takes its kept
+    // children with it.
     let parent = env.template("parent.md", BATCH_PARENT);
     env.template("child.md", BATCH_CHILD);
     env.init("p", &parent);
@@ -840,19 +841,34 @@ fn removing_sessions_never_changes_lines_already_written() {
         r#"{"marker": "done"}"#,
     ]);
     assert!(env.session_dir("p.k").exists());
-    let before = env.raw_journal();
     let finalize = serde_json::json!({
         "tasks": [{"name": "k", "waits_on": [], "vars": {}}],
         "finalize": "yes",
     });
+    // The parent has a child, so its terminal keeps it, and the child.
     env.ok(&["next", "p", "--with-data", &finalize.to_string()]);
-    assert!(!env.session_dir("p").exists());
+    assert!(env.session_dir("p").exists() && env.session_dir("p.k").exists());
+    assert_eq!(kinds(&env.records("p")).last(), Some(&"terminal"));
+    std::thread::sleep(std::time::Duration::from_millis(1300));
+    let before = env.raw_journal();
+    let mut cmd = env.cmd(None);
+    cmd.env("KOTO_RETENTION_KEEP", "1s");
+    let out = Env::run(
+        cmd,
+        &[
+            "init",
+            "p",
+            "--template",
+            parent.to_str().unwrap(),
+            "--replace-terminal",
+        ],
+    );
+    assert!(out.ok, "{}\n{}", out.stdout, out.stderr);
     assert!(
         !env.session_dir("p.k").exists(),
         "the sweep removed the child"
     );
     assert_kept(&before, "parent sweep");
-    assert_eq!(kinds(&env.records("p")).last(), Some(&"terminal"));
 }
 
 // ----- Ids across a hierarchy -----
