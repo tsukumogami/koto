@@ -416,11 +416,6 @@ impl Components {
             .flatten()
             .map(String::as_str)
     }
-
-    /// Every component's representative.
-    pub fn roots(&self) -> impl Iterator<Item = &str> {
-        self.members.keys().map(String::as_str)
-    }
 }
 
 /// Union-find over node indices, with path halving and union by size.

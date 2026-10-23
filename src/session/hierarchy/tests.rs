@@ -1074,6 +1074,22 @@ fn edge_of_finds_own_and_inbound_edges() {
     s.key("cc", "chain/parent", b"cp");
     assert!(edge_of(&s.base, "cp"));
     assert!(!edge_of(&s.base, "lone"));
+    // A link of a kind this koto doesn't know still counts.
+    s.finished("odd", 1);
+    s.finished("watcher", 1);
+    s.key(
+        "watcher",
+        "koto/links/watched-by/odd",
+        br#"{"v":1,"session":"odd"}"#,
+    );
+    assert!(edge_of(&s.base, "odd"));
+    // A copy counts records naming the session it was imported from.
+    s.finished("src", 1);
+    s.finished("src-copy", 1);
+    import(&s, "src-copy", "src", 5);
+    s.finished("disp", 1);
+    s.link("disp", "dispatched-by", "src");
+    assert!(edge_of(&s.base, "src-copy"));
     // Anything unreadable answers "edge".
     std::fs::write(s.log("cc"), "garbage\n").unwrap();
     assert!(edge_of(&s.base, "lone"));
@@ -1395,6 +1411,15 @@ fn the_two_level_verdict_equals_a_full_read_reference() {
             let (kept, members) = &answers[name];
             assert_eq!(&present, members, "round {round}, {name}: members");
             assert_eq!(j.verdict.is_kept(), *kept, "round {round}, {name}: {j:?}");
+            // The terminal tick's probe never answers "no edge" for a session
+            // the graph joins to anything by name (session-id hints are the
+            // documented exception, and these stores write none).
+            let joined = graph.edges().iter().any(|e| {
+                !matches!(e.via, Via::SessionIdHint(_)) && (e.holder == name || e.target == name)
+            });
+            if joined {
+                assert!(edge_of(&s.base, name), "round {round}, {name}: edge_of");
+            }
         }
     }
 }

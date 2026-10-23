@@ -690,7 +690,7 @@ A hierarchy is every session joined to `<name>` through a link (`koto/links/disp
 The hierarchy is kept while any member is alive:
 
 - A koto session is alive while it runs, and while its log can't be read.
-- An anchor with no observed marker (one never observed, or an imported one) closes once `retention.idle_period` has passed since its last activity. Activity is what its own agent session writes to it: its `anchor_started` events, the `anchor_activity` events `init` and `next` record, and its own read records. A read of the anchor or of a session it holds from anywhere else, a child's completion record, or a `koto context add` from a bare shell never counts.
+- An anchor with no observed marker (one never observed, or an imported one) closes once `retention.idle_period` has passed since its last activity. Activity is what its own agent session writes to it: its `anchor_started` events, the `anchor_activity` events `init` and `next` record, its own read records, and, for an anchor copied in by `koto session import`, the `session_imported` event the import appended. A read of the anchor or of a session it holds from anywhere else, a child's completion record, or a `koto context add` from a bare shell never counts.
 - An observed anchor closes only through a valid observed close (`koto session anchor close`); nothing else closes it. Past `retention.stale_after` since its last activity it is reported `stale`, with the command that closes it by hand, `koto session anchor close --key='<marker>' --harness-session='<id>'`, its own values filled in. The command is printed only when both values match `^[A-Za-z0-9_-]{1,128}$`; otherwise the anchor is listed as stale with a malformed marker and no command. A stale report closes nothing.
 - An anchor's close session is never alive; it stops at its record's time.
 
@@ -719,7 +719,7 @@ The text form says kept or released and why, then lists the keepers (a stale anc
 }
 ```
 
-When nothing is alive, `keepers` is empty and `retention` is `{"release": {"at", "member", "close_kind"}, "passes_at"}`, with `close_kind` one of `terminal`, `cancelled`, `observed` or `idle`; `kept` stays `true` until `passes_at`.
+When nothing is alive, `keepers` is empty and `retention` is `{"release": {"at", "member", "close_kind"}, "passes_at"}`, with `close_kind` one of `terminal`, `cancelled`, `observed` or `idle`; `kept` stays `true` until `passes_at`. A stale keeper whose marker or harness session id fails the pattern carries `"malformed_marker": true` and no `close_command`.
 
 The command reads the local sessions directory directly and writes nothing; under the cloud backend it lists and reads no session through the bucket. A malformed retention setting, a malformed name, or a name with no session exits 2; a sessions directory that can't be listed exits 3. koto assumes `~/.koto` is private to its user: anyone who can write the store can forge the records this command reads.
 

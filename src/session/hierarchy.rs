@@ -82,15 +82,37 @@ pub fn lineage_target(parent_workflow: &str, exists: impl Fn(&str) -> bool) -> S
     parent_workflow.to_string()
 }
 
+/// Whether the `chain/parent` of the session in `dir` names one of
+/// `probes`. A malformed value names no session for the graph, but one that
+/// is a probed name with whitespace around it was meant as that one, so the
+/// tick keeps the session.
+fn chain_parent_names(dir: &Path, probes: &[&str]) -> bool {
+    match facts::read_chain_parent(dir) {
+        facts::ChainParent::Names(p) => probes.contains(&p.as_str()),
+        facts::ChainParent::Malformed(_) => {
+            probes.iter().any(|p| facts::chain_parent_mentions(dir, p))
+        }
+        facts::ChainParent::Absent => false,
+    }
+}
+
 /// Whether session `name` under `base` has any edge at all: a link of its
 /// own, a `parent_workflow`, a `chain/parent`, or another session naming it
 /// through lineage, a link or a `chain/parent`.
 ///
 /// The terminal tick's test, so it reads no settings and judges no
 /// retention: it checks the session's own facts first, then makes one pass
-/// over the store that stops at the first inbound hit. Anything it can't
-/// read, the sessions directory included, answers "edge", which keeps the
-/// session.
+/// over the store that stops at the first inbound hit. A copy that
+/// `koto session import` made also counts records naming the session it was
+/// copied from, since the graph resolves those to the copy. Anything it
+/// can't read, the sessions directory included, answers "edge", which keeps
+/// the session.
+///
+/// It probes by name only. A link whose session-id hint names this session
+/// under another name (a predecessor moved aside), or a link body of a
+/// version this koto doesn't know that names it, joins it in [`Graph::scan`]
+/// but not here; finding those would mean reading every link body in the
+/// store on every terminal tick.
 pub fn edge_of(base: &Path, name: &str) -> bool {
     let own = SessionFacts::read(base, name);
     if !own.problems.is_empty() || !own.store_problems.is_empty() {
@@ -104,6 +126,10 @@ pub fn edge_of(base: &Path, name: &str) -> bool {
         Err(_) => return true,
     };
     let exists = |n: &str| names.binary_search_by(|x| x.as_str().cmp(n)).is_ok();
+    let mut probes = vec![name];
+    if let Some(from) = &own.imported_from {
+        probes.push(from.from_session.as_str());
+    }
     for other in &names {
         if other == name {
             continue;
@@ -112,30 +138,40 @@ pub fn edge_of(base: &Path, name: &str) -> bool {
         match facts::read_header_line(&dir, other) {
             Ok(header) => {
                 if let Some(pw) = header.parent_workflow.as_deref() {
-                    if lineage_target(pw, exists) == name {
+                    if probes.contains(&lineage_target(pw, exists).as_str()) {
                         return true;
                     }
                 }
             }
             Err(_) => return true,
         }
+        // Every kind directory, known or not: the graph counts a link of a
+        // kind this koto doesn't know as an edge too.
         let links = dir.join("ctx").join("koto").join("links");
-        for kind in crate::session::links::LinkKind::ALL {
-            match std::fs::symlink_metadata(links.join(kind.as_str()).join(name)) {
-                Ok(_) => return true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return true,
+        let kinds = match std::fs::read_dir(&links) {
+            Ok(kinds) => kinds,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // No links, but it may still name this one through its
+                // chain/parent.
+                if chain_parent_names(&dir, &probes) {
+                    return true;
+                }
+                continue;
+            }
+            Err(_) => return true,
+        };
+        for kind in kinds {
+            let Ok(kind) = kind else { return true };
+            for probe in &probes {
+                match std::fs::symlink_metadata(kind.path().join(probe)) {
+                    Ok(_) => return true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return true,
+                }
             }
         }
-        match facts::read_chain_parent(&dir) {
-            facts::ChainParent::Names(p) if p == name => return true,
-            // A malformed value names no session for the graph either, but
-            // one that is the name with whitespace around it was meant as
-            // this one, so the tick keeps the session.
-            facts::ChainParent::Malformed(_) if facts::chain_parent_mentions(&dir, name) => {
-                return true
-            }
-            _ => {}
+        if chain_parent_names(&dir, &probes) {
+            return true;
         }
     }
     false

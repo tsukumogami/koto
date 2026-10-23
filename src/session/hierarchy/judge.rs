@@ -50,7 +50,9 @@ impl MemberKind {
     }
 }
 
-/// How a member stopped.
+/// How a member stopped. The variant order is load-bearing: an anchor
+/// whose observed and idle closes fall at the same instant stops as
+/// `Observed` (see [`Judge`]'s anchor inspection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloseKind {
@@ -213,11 +215,6 @@ impl<'g> Judge<'g> {
             states: HashMap::new(),
             components: HashMap::new(),
         }
-    }
-
-    /// The settings this judge applies.
-    pub fn settings(&self) -> &RetentionSettings {
-        &self.settings
     }
 
     /// The members of `name`'s hierarchy under `scope`, present ones first
@@ -563,6 +560,10 @@ impl<'g> Judge<'g> {
         if !state.observed {
             candidates.push((last + self.settings.idle_period.value, CloseKind::Idle));
         }
+        // The earliest candidate that has passed is the stop. On a tie the
+        // kind breaks it by `CloseKind`'s order, so an observed close wins
+        // over an idle one at the same instant: the record is the stronger
+        // statement of why the anchor closed.
         let closed = candidates
             .iter()
             .filter(|(at, _)| *at <= self.now)
