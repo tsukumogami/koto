@@ -2833,6 +2833,9 @@ pub enum ImportErrorCode {
     SourceMigrated,
     /// The source is a child session, which isn't imported on its own.
     SourceIsChild,
+    /// The source is an anchor's close session (`kind: "anchor-close"`),
+    /// which records a close on its own host and is never imported.
+    SourceIsAnchorClose,
     /// The name is taken on this machine or under this workspace's prefix.
     NameTaken,
     /// This machine's template cache has no usable compiled template with
@@ -2871,6 +2874,7 @@ impl ImportErrorCode {
             ImportErrorCode::SourceNotFound => "import_source_not_found",
             ImportErrorCode::SourceMigrated => "import_source_migrated",
             ImportErrorCode::SourceIsChild => "import_source_is_child",
+            ImportErrorCode::SourceIsAnchorClose => "import_source_is_anchor_close",
             ImportErrorCode::NameTaken => "import_name_taken",
             ImportErrorCode::TemplateUnavailable => "import_template_unavailable",
             ImportErrorCode::SourceUnreadable => "import_source_unreadable",
@@ -2890,6 +2894,7 @@ impl ImportErrorCode {
             | ImportErrorCode::SourceNotFound
             | ImportErrorCode::SourceMigrated
             | ImportErrorCode::SourceIsChild
+            | ImportErrorCode::SourceIsAnchorClose
             | ImportErrorCode::NameTaken
             | ImportErrorCode::TemplateUnavailable
             | ImportErrorCode::SourceRunning
@@ -2965,6 +2970,11 @@ pub struct ImportRequest<'a> {
     /// `--as` was given. A same-host takeover of the source's own copy runs
     /// only without it; with it the import behaves as it always has.
     pub explicit_as: bool,
+    /// The importing command's `KOTO_ANCHOR`: the anchor a held-by link
+    /// whose anchor isn't open here is rewritten to (Decision 6 of
+    /// DESIGN-session-retention.md). `None`, or a name that is no anchor
+    /// here, drops such a link instead.
+    pub importer_anchor: Option<&'a str>,
 }
 
 /// What a completed import did.
@@ -3343,18 +3353,13 @@ impl CloudBackend {
                     TemplateOrigin::Unchanged,
                 ),
                 ExistingTarget::Free => {
+                    // The manifest first: it refuses a close session as a
+                    // source before the template is looked for.
+                    let manifest = self.read_source_manifest(&source)?;
                     let template = self.import_template(req, &source)?;
-                    let (manifest, manifest_bytes) = self.read_source_manifest(&source)?;
                     let machine_id = import_machine_id()?;
-                    let (mut staging, session_id) = self.stage_import(
-                        req,
-                        &source,
-                        &template,
-                        &manifest,
-                        manifest_bytes.as_deref(),
-                        &machine_id,
-                        None,
-                    )?;
+                    let (mut staging, session_id, manifest) =
+                        self.stage_import(req, &source, &template, manifest, &machine_id, None)?;
                     let pushed = self.push_staged(req.target, &staging.dir, &source, &manifest)?;
                     self.move_into_place(req.target, &mut staging, &pushed)?;
                     // The session is in place: journal it as a new run, with
@@ -3379,7 +3384,7 @@ impl CloudBackend {
                     } else {
                         TemplateOrigin::LocalCache
                     };
-                    (session_id, machine_id, manifest.keys.len(), origin)
+                    (session_id, machine_id, carried_key_count(&manifest), origin)
                 }
             };
 
@@ -3405,7 +3410,7 @@ impl CloudBackend {
             .read_manifest(target)
             .map(|mut m| {
                 m.drop_host_local();
-                m.keys.len()
+                carried_key_count(&m)
             })
             .map_err(|e| {
                 ImportError::new(
@@ -3648,42 +3653,73 @@ impl CloudBackend {
         }
 
         let template_file = crate::cache::cache_dir().join(format!("{}.json", hash));
-        std::fs::read(&template_file)
+        let cached = std::fs::read(&template_file)
             .map_err(|_| "it is not there".to_string())
-            .and_then(usable)
-            .map_err(|why| {
-                let source_file = source
-                    .log
-                    .header
-                    .template_source_file
-                    .as_deref()
-                    .map(|f| format!(" ({})", f))
-                    .unwrap_or_default();
-                ImportError::new(
-                    TemplateUnavailable,
-                    format!(
-                        "this machine has no usable compiled template with hash {} at {}: {}; \
+            .and_then(usable);
+        // An anchor's template is embedded in koto and never reaches the
+        // cache: this build's copy serves when its hash is the anchor's.
+        let cached = match cached {
+            Err(why)
+                if source.log.header.session_kind()
+                    == crate::engine::types::SessionKind::Anchor =>
+            {
+                crate::session::anchor::compiled_anchor_template()
+                    .map_err(|e| e.to_string())
+                    .and_then(usable)
+                    .map_err(|_| why)
+            }
+            other => other,
+        };
+        cached.map_err(|why| {
+            let source_file = source
+                .log
+                .header
+                .template_source_file
+                .as_deref()
+                .map(|f| format!(" ({})", f))
+                .unwrap_or_default();
+            ImportError::new(
+                TemplateUnavailable,
+                format!(
+                    "this machine has no usable compiled template with hash {} at {}: {}; \
                          run `koto template compile` here on the session's template{} from a \
                          checkout that matches it, then import again",
-                        hash,
-                        template_file.display(),
-                        why,
-                        source_file
-                    ),
-                )
-            })
+                    hash,
+                    template_file.display(),
+                    why,
+                    source_file
+                ),
+            )
+        })
     }
 
-    /// The source's context manifest without its host-local keys, with
-    /// every key name checked before any key is fetched, and its bytes when
-    /// the source has one (re-serialized when a host-local key was dropped).
+    /// The source's context manifest without the keys the import leaves
+    /// behind, with every key name checked before any key is fetched.
+    ///
+    /// It refuses a source whose header has `kind: "anchor-close"`: a close
+    /// session records a close on its own host, and a copy elsewhere could
+    /// only close an anchor early. The bucket is untrusted for the reserved
+    /// area, so besides the host-local keys it drops the observed marker,
+    /// any close record, every `koto/links/closes/*` link and any
+    /// `koto/imported-from` (see [`crate::session::import_links`]).
     fn read_source_manifest(
         &self,
         source: &ImportSource,
-    ) -> Result<(crate::session::context::Manifest, Option<Vec<u8>>), ImportError> {
+    ) -> Result<crate::session::context::Manifest, ImportError> {
         use crate::session::context::Manifest;
         use crate::session::validate::validate_context_key;
 
+        if source.log.header.session_kind() == crate::engine::types::SessionKind::AnchorClose {
+            return Err(ImportError::new(
+                ImportErrorCode::SourceIsAnchorClose,
+                format!(
+                    "session '{}' in workspace {} is an anchor's close session (its header has \
+                     kind \"anchor-close\"); a close session records a close on its own host and \
+                     is never imported",
+                    source.name, source.workspace
+                ),
+            ));
+        }
         let bytes = self
             .get_object_if_present(&source.key("ctx/manifest.json"))
             .map_err(|e| source.unreadable("the context manifest", &e))?;
@@ -3695,37 +3731,41 @@ impl CloudBackend {
         // An older koto listed host-local keys, often without their
         // objects. They describe the source's host, so the import leaves
         // them behind and the new session resolves its own.
-        let bytes = if manifest.drop_host_local() {
-            Some(serde_json::to_vec_pretty(&manifest).expect("Manifest serialize is infallible"))
-        } else {
-            bytes
-        };
+        manifest.drop_host_local();
+        crate::session::import_links::drop_from_manifest(&mut manifest);
         for key in manifest.keys.keys() {
             validate_context_key(key)
                 .map_err(|e| source.unreadable(&format!("context key {:?}", key), &e))?;
         }
-        Ok((manifest, bytes))
+        Ok(manifest)
     }
 
     /// Build the target in `<sessions>/.import-<target>-<random>/`, created
     /// exclusively with mode 0700: the state log, the context keys (each
     /// checked against the manifest), the manifest, the compiled template
     /// and a fresh version record. Returns the staging directory, removed
-    /// when dropped, and the target's new `session_id`.
+    /// when dropped, the target's new `session_id`, and the manifest the
+    /// copy holds.
+    ///
+    /// After every key is checked against the source's manifest and before
+    /// the staged manifest is written, the copy's reserved area is settled
+    /// (see [`crate::session::import_links`]): each link body is validated,
+    /// the `koto/links/held-by/*` links are kept, rewritten to
+    /// `req.importer_anchor` or dropped, and `koto/imported-from` is
+    /// written. The manifest is then serialised from what the copy holds, so
+    /// the push and any later verification see the changed keys.
     ///
     /// A source with no manifest gets an empty one, so every imported
     /// session has a `ctx/` manifest.
-    #[allow(clippy::too_many_arguments)]
     fn stage_import(
         &self,
         req: &ImportRequest<'_>,
         source: &ImportSource,
         template: &[u8],
-        manifest: &crate::session::context::Manifest,
-        manifest_bytes: Option<&[u8]>,
+        mut manifest: crate::session::context::Manifest,
         machine_id: &str,
         into: Option<(&Path, Option<&str>)>,
-    ) -> Result<(Staging, String), ImportError> {
+    ) -> Result<(Staging, String, crate::session::context::Manifest), ImportError> {
         use crate::engine::types::{
             generate_session_id, now_iso8601, Event, EventPayload, SessionOrigin,
         };
@@ -3778,15 +3818,17 @@ impl CloudBackend {
             }
             std::fs::write(&path, &bytes).map_err(|e| write_failed(&path, &e))?;
         }
-        let empty;
-        let manifest_bytes = match manifest_bytes {
-            Some(bytes) => bytes,
-            None => {
-                empty =
-                    serde_json::to_vec_pretty(manifest).expect("Manifest serialize is infallible");
-                &empty
-            }
-        };
+        crate::session::import_links::Settlement {
+            local_base: base,
+            importer_anchor: req.importer_anchor,
+            target,
+            from_session: &source.name,
+            from_session_id: &source.log.header.session_id,
+        }
+        .apply(&ctx_dir, &mut manifest)
+        .map_err(|e| write_failed(&ctx_dir, &e))?;
+        let manifest_bytes =
+            serde_json::to_vec_pretty(&manifest).expect("Manifest serialize is infallible");
         let path = ctx_dir.join("manifest.json");
         std::fs::write(&path, manifest_bytes).map_err(|e| write_failed(&path, &e))?;
 
@@ -3847,7 +3889,7 @@ impl CloudBackend {
                 .map_err(|e| write_failed(&path, &e))?;
         }
 
-        Ok((staging, session_id))
+        Ok((staging, session_id, manifest))
     }
 
     /// Push the staged target under this workspace's prefix with the strict
@@ -4033,6 +4075,17 @@ impl CloudBackend {
         self.put_object(&key, &bytes)
             .map_err(|e| unmarked(&format!("{:#}", e)))
     }
+}
+
+/// The import output's `keys`: the context keys the copy holds, leaving out
+/// the `koto/imported-from` record the import itself writes, so the count
+/// is of what came across.
+fn carried_key_count(manifest: &crate::session::context::Manifest) -> usize {
+    manifest
+        .keys
+        .keys()
+        .filter(|k| k.as_str() != crate::session::import_links::IMPORTED_FROM_KEY)
+        .count()
 }
 
 /// This machine's id, for the `session_imported` event, the target's

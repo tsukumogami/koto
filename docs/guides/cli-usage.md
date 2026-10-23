@@ -853,6 +853,8 @@ The two meet when a context gate's `key` resolves a `{{KEY}}` reference. `key: "
 
 Keys under `koto/` belong to koto, which writes its own records about a session there, such as the dispatched-by links [`koto session link`](#session-link) records. `koto context add` and `koto context remove` refuse any key whose first component is `koto`, compared case-insensitively (`KOTO/...` too), with exit 2 and an error naming the prefix, and change nothing. The refusal sits in the context store itself, so no other path for agent writes gets around it. `koto context get`, `exists` and `list` read the area like any other key.
 
+`koto session import` treats the bucket as untrusted for this area. It leaves behind the observed marker (`koto/anchor/observed`), any close record (`koto/anchor-close`), every `koto/links/closes/*` link and any `koto/imported-from`, and refuses an anchor's close session as a source (`import_source_is_anchor_close`, exit 2). It validates every link it keeps, dropping a malformed one with a warning on stderr. Each `koto/links/held-by/<anchor>` is kept when the name resolves here to an open, unmigrated anchor (the anchor's recorded workspace is only a hint), rewritten to `koto/links/held-by/<importer's anchor>` with `"was"` holding the old name when the import runs with `KOTO_ANCHOR` naming an anchor here, and dropped otherwise. Every copy gets `koto/imported-from` (`{"from_session", "from_session_id"}`). The [cloud sync guide](cloud-sync-setup.md#what-the-import-settles-in-kotos-own-keys) has the details.
+
 #### context add
 
 Submits content to the store for a given session and key. Reads from stdin by default.
