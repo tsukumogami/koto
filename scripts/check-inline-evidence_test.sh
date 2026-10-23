@@ -92,6 +92,12 @@ refused shell-loop-line "$S/SKILL.md" \
   "      result=\$(koto next task-42 --with-data '{\"decision\": \"proceed\"}')"
 refused cursor-rule plugins/p/.cursor/rules/koto.mdc \
   "koto next <session> --with-data '{\"mode\": \"issue_backed\"}'"
+refused request-resolve "$S/SKILL.md" \
+  "koto request resolve <request-id> <leg> --with-data '{\"status\":\"success\"}'"
+refused request-create "$S/references/r.md" \
+  "koto request create --with-data '{\"legs\":[]}' --requested-by a --coordinator-of-record a"
+refused next-beside-request "$S/SKILL.md" \
+  "koto request get <id>; koto next s --with-data '{\"k\": \"v\"}'"
 
 allowed file-form "$S/SKILL.md" \
   'koto next <name> --with-data @"$EV/evidence.json"'
@@ -101,8 +107,8 @@ allowed prose-mention "$S/SKILL.md" \
   'Call `koto next <name>` without `--with-data` to re-read the schema.'
 allowed json-written-to-file "$S/SKILL.md" \
   "printf '%s\\n' '{\"field_name\": \"value\"}' > \"\$EV/evidence.json\""
-allowed request-verb "$S/SKILL.md" \
-  "koto request resolve <request-id> <leg> --with-data '{\"status\":\"success\"}'"
+allowed request-file-form "$S/SKILL.md" \
+  'koto request resolve <request-id> <leg> --with-data @<file>'
 allowed reserved-action-invocation "$S/references/r.md" \
   "      \"invocation\": \"koto next 'coord' --with-data '{\\\"retry_failed\\\":{}}'\""
 allowed not-koto "$S/SKILL.md" \

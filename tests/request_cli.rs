@@ -373,6 +373,197 @@ fn the_two_create_forms_are_mutually_exclusive_and_one_is_required() {
     assert_eq!(error, "invalid_submission");
 }
 
+// ===== JSON flags read from @<file> =====
+//
+// Every JSON flag in the group takes `@<path>` as `koto next --with-data`
+// does, so a caller behind a token-stripping prefix has nothing quoted to
+// pass (koto#404). Inline JSON keeps working beside it.
+
+/// Write `contents` to `<dir>/payloads/<name>` and return the `@<path>`
+/// argument naming it.
+fn payload_file(dir: &Path, name: &str, contents: &str) -> String {
+    let payloads = dir.join("payloads");
+    std::fs::create_dir_all(&payloads).unwrap();
+    let path = payloads.join(name);
+    std::fs::write(&path, contents).unwrap();
+    format!("@{}", path.display())
+}
+
+#[test]
+fn create_reads_the_full_form_from_an_at_file() {
+    let tmp = TempDir::new().unwrap();
+    let arg = payload_file(tmp.path(), "create.json", TWO_LEGS);
+    let from_file = run_ok(
+        tmp.path(),
+        &[
+            "request",
+            "create",
+            "--with-data",
+            &arg,
+            "--requested-by",
+            "coord-a",
+            "--coordinator-of-record",
+            "coord-a",
+        ],
+    );
+    let inline = run_ok(
+        tmp.path(),
+        &["request", "get", &create(tmp.path(), TWO_LEGS)],
+    );
+
+    assert_eq!(from_file["leg_counts"]["total"], 2);
+    assert_eq!(from_file["inputs"], inline["inputs"]);
+    assert_eq!(from_file["legs"], inline["legs"]);
+}
+
+#[test]
+fn create_reads_the_shorthand_inputs_from_an_at_file() {
+    let tmp = TempDir::new().unwrap();
+    let arg = payload_file(tmp.path(), "inputs.json", r#"{"pr":7,"note":"@literal"}"#);
+    let envelope = run_ok(
+        tmp.path(),
+        &[
+            "request",
+            "create",
+            "--role",
+            "security",
+            "--template",
+            "review",
+            "--inputs",
+            &arg,
+            "--requested-by",
+            "coord-a",
+            "--coordinator-of-record",
+            "coord-a",
+        ],
+    );
+    let inputs = &envelope["legs"]["security"]["declaration"]["inputs"];
+    assert_eq!(inputs["pr"], 7);
+    assert_eq!(inputs["note"], "@literal");
+}
+
+#[test]
+fn progress_and_resolve_read_with_data_from_an_at_file() {
+    let tmp = TempDir::new().unwrap();
+    let id = create(tmp.path(), TWO_LEGS);
+
+    let progress = payload_file(tmp.path(), "progress.json", r#"{"note":"halfway"}"#);
+    let envelope = run_ok(
+        tmp.path(),
+        &[
+            "request",
+            "progress",
+            &id,
+            "reviewer-a",
+            "--with-data",
+            &progress,
+        ],
+    );
+    assert_eq!(envelope["written"], true);
+    assert_eq!(
+        envelope["legs"]["reviewer-a"]["progress"][0]["content"]["note"],
+        "halfway"
+    );
+
+    let result = payload_file(
+        tmp.path(),
+        "result.json",
+        r#"{"status":"success","summary":"done","payload":{"files":3}}"#,
+    );
+    let envelope = run_ok(
+        tmp.path(),
+        &[
+            "request",
+            "resolve",
+            &id,
+            "reviewer-a",
+            "--with-data",
+            &result,
+        ],
+    );
+    let leg = &envelope["legs"]["reviewer-a"];
+    assert_eq!(leg["disposition"], "resolved");
+    assert_eq!(leg["result"]["summary"], "done");
+    assert_eq!(leg["result"]["payload"]["files"], 3);
+}
+
+#[test]
+fn an_at_file_that_cannot_be_read_is_refused_and_writes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let id = create(tmp.path(), TWO_LEGS);
+    let missing = format!("@{}", tmp.path().join("payloads/missing.json").display());
+    let oversized = payload_file(tmp.path(), "big.json", &" ".repeat(1_048_577));
+    let empty = payload_file(tmp.path(), "empty.json", "");
+    let before = workspace_snapshot(tmp.path());
+
+    for arg in [missing.as_str(), oversized.as_str(), empty.as_str(), "@"] {
+        for args in [
+            vec!["request", "progress", &id, "reviewer-a", "--with-data", arg],
+            vec!["request", "resolve", &id, "reviewer-a", "--with-data", arg],
+            vec![
+                "request",
+                "create",
+                "--with-data",
+                arg,
+                "--requested-by",
+                "coord-a",
+                "--coordinator-of-record",
+                "coord-a",
+            ],
+            vec![
+                "request",
+                "create",
+                "--role",
+                "security",
+                "--template",
+                "review",
+                "--inputs",
+                arg,
+                "--requested-by",
+                "coord-a",
+                "--coordinator-of-record",
+                "coord-a",
+            ],
+        ] {
+            let (code, error) = run_err(tmp.path(), &args);
+            assert_eq!(code, 2, "{args:?}");
+            assert_eq!(error, "invalid_submission", "{args:?}");
+        }
+    }
+    assert_eq!(
+        workspace_snapshot(tmp.path()),
+        before,
+        "a refused @<file> must not touch the request store"
+    );
+}
+
+#[test]
+fn an_oversized_at_file_carries_koto_nexts_message() {
+    let tmp = TempDir::new().unwrap();
+    let id = create(tmp.path(), TWO_LEGS);
+    let oversized = payload_file(tmp.path(), "big.json", &" ".repeat(1_048_577));
+    let (code, stdout, _) = run(
+        tmp.path(),
+        &[
+            "request",
+            "progress",
+            &id,
+            "reviewer-a",
+            "--with-data",
+            &oversized,
+        ],
+    );
+    assert_eq!(code, 2);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        json["error"]["message"],
+        format!(
+            "--with-data: file '{}' is 1048577 bytes, exceeds maximum of 1048576 bytes",
+            oversized.trim_start_matches('@')
+        )
+    );
+}
+
 #[test]
 fn the_envelope_carries_the_five_contract_fields() {
     let tmp = TempDir::new().unwrap();

@@ -411,7 +411,7 @@ The key is absent when the session isn't bound to a leg. It never carries `dispa
 Twelve subcommands over the request store — the durable record of what a coordinator asked for and what came back. See the skill's "Requests and legs" section for when to use it; this section is the flag surface.
 
 ```
-koto request create   [--with-data '{"legs":[…],"inputs":{…}}' | --role R --template T --inputs J]
+koto request create   [--with-data @<file> | --role R --template T --inputs @<file>]
                       --requested-by ID --coordinator-of-record ID
 koto request bind     <request-id> <leg> --child SESSION_ID [--dispatch-epoch N] [--issued-by ID]
 koto request attach   <request-id> <leg> --session SESSION_ID [--issued-by ID]
@@ -420,12 +420,14 @@ koto request wait     <request-id> (--leg NAME | --all-legs | --closed | --resol
                       --timeout-secs N [--interval-secs N]
 koto request watch    --session SESSION_ID --timeout-secs N [--since CURSOR]
 koto request list     [--requested-by ID | --coordinator-of-record ID] [--state open|closed] [--unresolved-legs]
-koto request progress <request-id> <leg> --with-data J [--dispatch-epoch N] [--issued-by ID]
-koto request resolve  <request-id> <leg> --with-data J [--dispatch-epoch N] [--issued-by ID]
+koto request progress <request-id> <leg> --with-data @<file> [--dispatch-epoch N] [--issued-by ID]
+koto request resolve  <request-id> <leg> --with-data @<file> [--dispatch-epoch N] [--issued-by ID]
 koto request abandon  <request-id> <leg> --rationale TEXT [--dispatch-epoch N] [--issued-by ID]
 koto request abandon-request <request-id> --rationale TEXT [--issued-by ID]
 koto request close    <request-id> [--issued-by ID]
 ```
+
+Every JSON flag in the group (`--with-data` on `create`, `progress` and `resolve`, and `create`'s `--inputs`) reads `@<file>` as `koto next --with-data` does: the JSON comes from the file, capped at 1 MB, and a missing, unreadable or oversized file is `invalid_submission` (exit 2) with `koto next`'s message. An inline JSON value still works.
 
 `--cli-contract MAJOR.MINOR` is accepted on every subcommand and validated before any I/O, so a mismatch has no side effect. This build serves `1.2`; an older minor is served, a newer minor or a different major is refused.
 
@@ -489,7 +491,7 @@ Every subcommand except `list` and `watch` prints the same object:
 
 ### create
 
-`--with-data` takes `{"legs":[{"name","role","template","inputs"}],"inputs":{...}}` as inline JSON (the `koto request` verbs don't read `@<file>`); the per-leg `inputs` is that leg's own ask, the top-level `inputs` is context shared by the whole request. Unknown keys are rejected. The flat `--role` / `--template` / `--inputs` triple is the one-leg shorthand and names the leg after the role; it is mutually exclusive with `--with-data`, and all three are required together.
+`--with-data` takes `{"legs":[{"name","role","template","inputs"}],"inputs":{...}}`, from a file as `@<file>` or inline; the per-leg `inputs` is that leg's own ask, the top-level `inputs` is context shared by the whole request. Unknown keys are rejected. The flat `--role` / `--template` / `--inputs` triple is the one-leg shorthand and names the leg after the role; it is mutually exclusive with `--with-data`, and all three are required together.
 
 `--requested-by` and `--coordinator-of-record` are both required. Attribution, not authorization — anything running as the same user can read any request it can name.
 
