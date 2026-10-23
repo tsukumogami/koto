@@ -22,7 +22,7 @@ default list and passes the gate without the checks this file names for them: ru
   `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `CLAUDE.md` -> every default command below
 - `plugins/**`, `.claude-plugin/**`, `scripts/check-evals-exist.sh`, `scripts/check-inline-evidence.sh`,
   `scripts/check-inline-evidence_test.sh` -> all of:
-  - `cargo test --test doc_names` (the only Rust test that reads `plugins/`)
+  - `cargo test --test doc_names --test plugin_hooks_shape` (the two Rust tests that read `plugins/`)
   - `bash scripts/check-evals-exist.sh`
   - `bash scripts/check-inline-evidence_test.sh` (`validate.yml`'s `inline-evidence` job)
   - `for d in $(find plugins/*/skills/*/ -maxdepth 0 -type d 2>/dev/null); do test ! -f "$d/hooks.json" || exit 1; done`
@@ -72,7 +72,7 @@ default list and passes the gate without the checks this file names for them: ru
 - `.github/**` (except `.github/pull_request_template.md` and the two workflows in the previous
   entry); `install.sh`; `scripts/**` (except `scripts/check-evals-exist.sh`, the two inline-evidence files and the
   three run-evals files above); `.release/**`; `.goreleaser.yaml`; `.cargo/**`;
-  `plugins/koto-skills/hooks/*.sh`; `.claude/settings.json` -> no local check exists. Still run
+  `plugins/koto-skills/hooks/*.sh` (except `session-start.sh`, which the session-start suite in the `plugins/**` entry runs); `.claude/settings.json` -> no local check exists. Still run
   every other selected command; if one fails the outcome is failed, otherwise it is cannot-verify:
   no command here checks what these files do and most are not read by PR CI either, so the run
   stops for a person to check them. (shirabe's schema has no form for such an entry yet:

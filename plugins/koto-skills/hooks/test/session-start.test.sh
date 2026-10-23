@@ -296,8 +296,14 @@ hash_dir() {
     xargs -0 shasum -a 256 | shasum -a 256
 }
 
+# Whether a watcher for an anchor is running. pgrep runs in this shell, not
+# under `sh -c`, so the pattern can't match the command that searches for it.
 watchers_for() {
   pgrep -f "session-start.sh --watch-[a-z]* $1( |\$)" >/dev/null
+}
+
+no_watchers_for() {
+  ! watchers_for "$1"
 }
 
 # ===== The env file block =====
@@ -504,7 +510,7 @@ test_late_marker() {
   check "a child's shell sees no niwa variable ($seen)" [ "$seen" = unset ]
   agent_stop
   sleep 5
-  check "the watcher exits once the agent process is gone" sh -c '! pgrep -f "watch-key anchor-L2 " >/dev/null'
+  check "the watcher exits once the agent process is gone" no_watchers_for anchor-L2
 }
 
 test_inherited_key() {
@@ -517,7 +523,7 @@ test_inherited_key() {
   p="$(payload C1 startup)"
   agent_hook "$p" "$e"
   check "a child of an agent session gets no marker" sh -c '! koto context list anchor-C1 --prefix koto/anchor/ | grep -q observed'
-  check "and starts no watcher" sh -c '! pgrep -f "watch-key anchor-C1 " >/dev/null'
+  check "and starts no watcher" no_watchers_for anchor-C1
   check "it records its parent as dispatcher" has_key anchor-C1 koto/links/dispatched-by/anchor-P1
   check "its shells name its own anchor" [ "$(anchor_in "$e")" = anchor-C1 ]
   agent_stop
@@ -663,6 +669,13 @@ test_injection() {
   check "bad ids open no anchor" [ -z "$(anchors)" ]
   check "nothing in an id ran" [ ! -e "$T/pwned" ]
   check "nothing in an id ran in the working directory" [ ! -e "$T/work/pwned" ]
+
+  # Values that start with a dash are values, not flags.
+  e="$(envfile -lead)"
+  p="$(payload -lead startup -transcript.jsonl)"
+  NIWA_REAP_KEY=-key hook "$p" "$e"
+  check "an id starting with a dash opens its anchor" [ "$(anchor_in "$e")" = anchor--lead ]
+  check "a key starting with a dash is recorded" observed anchor--lead
 
   # A watcher reads its siblings and never sources them, and writes only
   # into the anchor it names.

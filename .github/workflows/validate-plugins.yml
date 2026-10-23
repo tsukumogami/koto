@@ -7,6 +7,11 @@ on:
     paths:
       - 'plugins/**'
       - '.claude-plugin/**'
+      # The anchor verbs the session-start hook calls, so a change to their
+      # output runs the hook suite.
+      - 'src/session/anchor.rs'
+      - 'src/session/anchor/**'
+      - 'src/cli/session_anchor.rs'
 
 jobs:
   template-compilation:

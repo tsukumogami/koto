@@ -16,22 +16,31 @@
 #      reap key (`NIWA_REAP_KEY`): a process launched from another agent
 #      session's shell carries that session's `KOTO_ANCHOR`, and its parent's
 #      key must not mark it;
-#   4. runs `koto session anchor open` with those, under an environment that
-#      names no anchor;
-#   5. writes `export KOTO_ANCHOR` and `export KOTO_DISPATCHER_ANCHOR`, both
-#      naming its own anchor, into its block of `CLAUDE_ENV_FILE`, or emits
-#      the `KOTO_ANCHOR` export line as additionalContext when that file
-#      can't be written safely;
-#   6. detaches a watcher when niwa's key may still arrive (startup, or a
-#      resume that opened a successor) or when a /clear's predecessor may
-#      still gain its marker.
+#   4. runs `koto session anchor open` with those (see koto_clean for its
+#      environment);
+#   5. replaces its block of `CLAUDE_ENV_FILE`, which Claude Code sources
+#      before every shell command, when that file can be written safely:
+#      `export KOTO_ANCHOR` and `export KOTO_DISPATCHER_ANCHOR`, both naming
+#      its own anchor, or `unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR` when the
+#      open failed, so the shells never keep the dispatcher's anchor; then
+#      `unset NIWA_REAP_KEY`, since the key is this hook's to record and must
+#      not reach a child, and `:`, because each env file is one link of an
+#      `&&` chain and must end with status 0. When the file can't be written
+#      safely it returns the `KOTO_ANCHOR` export line as additionalContext
+#      instead; a failure writing it leaves the file as it was;
+#   6. detaches a watcher, unless it inherited a `KOTO_ANCHOR` or already
+#      has a key: on a startup or a resume that opened a successor, with an
+#      env file directory to read, one that waits for niwa's key; after a
+#      /clear that found a predecessor with no marker yet, one that copies
+#      the marker.
 #
 # Steps 1 to 5 are the synchronous part, bounded by
 # `hooks/test/session-start.test.sh`. The hook always exits 0 and prints
 # nothing on stderr: without koto or jq it does nothing.
 #
 # The watchers run this same script with a `--watch-key` or
-# `--watch-inherit` argument.
+# `--watch-inherit` argument. Both stop after WATCH_LIMIT seconds; the
+# inherit watcher stops earlier, at the `inherit_until` koto gave it.
 
 trap 'exit 0' EXIT
 exec 2>/dev/null
@@ -43,14 +52,19 @@ BLOCK_END='# <<< koto-skills'
 WATCH_INTERVAL=2
 WATCH_LIMIT=180
 
-# Runs koto with no anchor variable and no KOTO_SESSION_* variable, so a
-# watcher never acts under an inherited anchor.
+# Runs koto the way every call in this hook runs it, the open and the
+# watchers alike: with no anchor variable, so nothing acts under an
+# inherited anchor; with no CLAUDE_CODE_SESSION_ID, so koto renders no
+# /workflows entry for the anchor; and with no KOTO_SESSION_* variable, so
+# the store is the one koto's config files name. The watchers must write to
+# the store the open created the anchor in, so they share this environment.
 koto_clean() {
   local unsets=() v
   for v in $(compgen -v KOTO_SESSION_); do
     unsets+=(-u "$v")
   done
-  env -u KOTO_ANCHOR -u KOTO_DISPATCHER_ANCHOR "${unsets[@]}" koto "$@"
+  env -u KOTO_ANCHOR -u KOTO_DISPATCHER_ANCHOR -u CLAUDE_CODE_SESSION_ID \
+    "${unsets[@]}" koto "$@"
 }
 
 # Whether the process in the token is still running; true with no pid.
@@ -76,7 +90,7 @@ watch_key() {
         v="${v#\'}"
         v="${v%\'}"
         [[ "$v" =~ $NAME_RE ]] || continue
-        out="$(koto_clean session anchor observe --anchor "$anchor" --key="$v")"
+        out="$(koto_clean session anchor observe "--anchor=$anchor" "--key=$v")"
         case "$out" in
           *observed=yes*) return 0 ;;
         esac
@@ -108,7 +122,7 @@ watch_inherit() {
   fi
   while [ "$(date +%s)" -lt "$limit" ]; do
     agent_alive "$pid" || return 0
-    out="$(koto_clean session anchor observe --anchor "$anchor" --inherit)"
+    out="$(koto_clean session anchor observe "--anchor=$anchor" --inherit)"
     case "$out" in
       *observed=yes*) return 0 ;;
     esac
@@ -133,7 +147,7 @@ command -v jq >/dev/null || exit 0
 payload="$(cat)"
 {
   IFS= read -r -d '' session_id
-  IFS= read -r -d '' source
+  IFS= read -r -d '' start_source
   IFS= read -r -d '' transcript_path
   IFS= read -r -d '' payload_cwd
 } < <(printf '%s' "$payload" | jq -j '
@@ -141,9 +155,9 @@ payload="$(cat)"
   | (if type == "string" then . else "" end) + "\u0000"')
 
 [[ "$session_id" =~ $NAME_RE ]] || exit 0
-case "$source" in
+case "$start_source" in
   startup | resume | compact | clear) ;;
-  *) source=other ;;
+  *) start_source=other ;;
 esac
 
 # Prints "<ppid> <epoch-start> <command name>" for a pid.
@@ -209,14 +223,16 @@ if [ -z "$inherited_anchor" ]; then
   [[ "$key" =~ $NAME_RE ]] || key=""
 fi
 
-args=(session anchor open --harness-session "$session_id" --source "$source")
-[ -n "$token" ] && args+=(--process "$token")
-[ -n "$dispatcher" ] && args+=(--dispatched-by "$dispatcher")
-[ -n "$key" ] && args+=(--observed-key "$key")
-[ -n "$transcript_path" ] && args+=(--transcript-path "$transcript_path")
-[ -n "$payload_cwd" ] && [ -d "$payload_cwd" ] && args+=(--workspace "$payload_cwd")
+# Every value goes in `--flag=value` form, so one that starts with `-` is
+# never read as a flag.
+args=(session anchor open "--harness-session=$session_id" "--source=$start_source")
+[ -n "$token" ] && args+=("--process=$token")
+[ -n "$dispatcher" ] && args+=("--dispatched-by=$dispatcher")
+[ -n "$key" ] && args+=("--observed-key=$key")
+[ -n "$transcript_path" ] && args+=("--transcript-path=$transcript_path")
+[ -n "$payload_cwd" ] && [ -d "$payload_cwd" ] && args+=("--workspace=$payload_cwd")
 
-out="$(env -u KOTO_ANCHOR -u KOTO_DISPATCHER_ANCHOR -u CLAUDE_CODE_SESSION_ID koto "${args[@]}")"
+out="$(koto_clean "${args[@]}")"
 
 anchor=""
 opened=""
@@ -296,11 +312,11 @@ detach() {
 }
 
 if [ -z "$inherited_anchor" ] && [ -z "$key" ] && [ -n "$env_dir" ]; then
-  if [ "$source" = startup ] || { [ "$source" = resume ] && [ "$opened" = successor ]; }; then
+  if [ "$start_source" = startup ] || { [ "$start_source" = resume ] && [ "$opened" = successor ]; }; then
     detach --watch-key "$anchor" "$env_dir" "$agent_pid"
   fi
 fi
-if [ "$source" = clear ] && [ "$observed" = no ] && [ -n "$previous" ]; then
+if [ "$start_source" = clear ] && [ "$observed" = no ] && [ -n "$previous" ]; then
   detach --watch-inherit "$anchor" "$inherit_until" "$agent_pid"
 fi
 
