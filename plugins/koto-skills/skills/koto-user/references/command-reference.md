@@ -233,8 +233,16 @@ Marks a workflow as cancelled, preventing any further advancement.
 
 **Success output:**
 ```json
-{"name": "my-workflow", "state": "current_state", "cancelled": true, "cleaned_up": false}
+{"name": "my-workflow", "state": "current_state", "cancelled": true, "cleaned_up": false, "children": []}
 ```
+
+With `--cleanup`:
+```json
+{"name": "worker", "state": "work", "cancelled": true, "cleaned_up": true, "children": [],
+ "live_members": [{"name": "coord", "kind": "koto_session", "observed": false}]}
+```
+
+`children` lists the session's direct koto children with their states, as `koto session cleanup` reports them.
 
 **Flags:**
 - `--cleanup` — also remove the session directory after writing the cancel event. `cleaned_up: true` in the response. Use this when you want to reuse the workflow name immediately (e.g., restart during development). Without `--cleanup`, the session stays on disk so the history remains auditable. With it, the response also carries `live_members`, as `koto session cleanup` does: every other live member of the session's hierarchy, which the removal leaves without it.
@@ -749,9 +757,11 @@ Removes the entire session directory for the named workflow. Idempotent — succ
  "live_members": [{"name": "coord", "kind": "koto_session", "observed": false}]}
 ```
 
+`children` lists the session's direct koto children (sessions created with `--parent <name>`), each as `{"name", "state"}`, read just before the removal. The cleanup leaves them in place, so a non-empty list names the sessions now pointing at a parent that is gone; `[]` means it had none.
+
 The removal goes ahead even when the retention rule would keep the session. `live_members` names every other live member of its hierarchy (`kind` is `koto_session` or `anchor`; `observed` says whether an anchor is observed), judged just before the removal, and a non-empty list also prints a warning on stderr. It is empty when nothing else in the hierarchy is alive, and never names the removed session. If the store can't be read, the session is still removed and `live_members_error` says why. Before removing a finished session whose dispatcher still runs, `koto session hierarchy <name>` shows what keeps it.
 
-`koto next` removes a session at its terminal state unless the terminal is declared `failure: true`, the session has a link or lineage, or the tick passed `--no-cleanup` (the response's `retention` field says which). Use this command to remove a kept session once its record is no longer needed, or after an abandoned workflow. It removes only the named session: a kept parent's kept children are left, listed by `koto workflows --orphaned`. A parent that `koto init --attach-live --replace-terminal` replaces once its hierarchy is released takes its terminal descendants with it, and `koto workspace prune --root` removes the members of a finished tree that the retention rule releases (the root judged with every edge, each descendant without the root's lineage to its children), listing the rest with reasons. To remove many finished sessions at once, use `koto session prune`.
+`koto next` removes a session at its terminal state unless the terminal is declared `failure: true`, the session has a link or lineage, or the tick passed `--no-cleanup` (the response's `retention` field says which). Use this command to remove a kept session once its record is no longer needed, or after an abandoned workflow. It removes only the named session: a kept parent's kept children are left, listed by `koto workflows --orphaned`. A parent that `koto init --attach-live --replace-terminal` replaces once its hierarchy is released takes its terminal descendants with it, and `koto workspace prune --root` removes the members of a finished tree that the retention rule releases, listing the rest with reasons: a child whose own dispatcher is still running stays, with everything under it, even though the root finished. To remove many finished sessions at once, use `koto session prune`.
 
 ---
 
@@ -766,7 +776,7 @@ koto session prune --migrated-from <workspace> [--source-retired] [--apply [--pl
 
 Previews, then removes, finished sessions as a set. Without `--apply` it removes nothing and prints `{"mode": "preview", "plan": "<token>", "remove": [...], "kept": [...], "stale_anchors": [...]}`: the sessions it would remove (the `session list --state` fields plus `kind`, `stopped_at`, and `session_kind` for an anchor or close session), and every session it keeps with a `rule` letter and a `detail`. `--older-than` takes a whole number and `s`, `m`, `h` or `d`, and measures from the stop instant the retention engine reports for each session (its terminal transition or trailing cancel), not its last event.
 
-Every session is judged by the retention rule `koto session hierarchy` applies. A session is kept when it is alive (`a`: running, unreadable, or an open anchor), its hierarchy is kept (`h`: another member is alive, `retention.keep` hasn't passed since the hierarchy's release instant, or something in it can't be read), its `chain/parent` isn't exactly one session name (`d`), it is bound to a request leg still waiting or unreadable (`e`), its name starts with `coordinate-` (`f`), or, under the cloud backend, its remote copy may be newer (`g`). Rule `h`'s `detail` is the rendered verdict (the live members keeping it, or the release instant and when the retention passes), and the entry carries a `hierarchy` object equal to `koto session hierarchy <name> --json`. Filters narrow the candidates only: a finished session whose dispatcher runs elsewhere stays kept, naming it, whatever the filters select. A close session goes only with its anchor.
+Every session is judged by the retention rule `koto session hierarchy` applies. A session is kept when it is alive (`a`: running, unreadable, or an open anchor), its hierarchy is kept (`h`: another member is alive, `retention.keep` hasn't passed since the hierarchy's release instant, or something in it can't be read), its `chain/parent` isn't exactly one session name (`d`), it is bound to a request leg still waiting or unreadable (`e`), its name starts with `coordinate-` (`f`), or, under the cloud backend, its remote copy may be newer (`g`). Letters `b` and `c` are retired: what they kept is folded into `h`, so no entry carries them. Rule `h`'s `detail` is the rendered verdict (the live members keeping it, or the release instant and when the retention passes), and the entry carries a `hierarchy` object equal to `koto session hierarchy <name> --json`. Filters narrow the candidates only: a finished session whose dispatcher runs elsewhere stays kept, naming it, whatever the filters select. A close session goes only with its anchor.
 
 A stale observed anchor (past `retention.stale_after` since its last activity) keeps what it holds and is listed under `stale_anchors` with its `close_command`, `koto session anchor close --key='<marker>' --harness-session='<id>'` with the real values filled in. The prune closes nothing; run that command once the agent session is gone, and a later prune removes what the anchor held.
 
