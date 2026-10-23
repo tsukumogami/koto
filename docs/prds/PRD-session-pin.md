@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   koto keeps a finished session only while something live in its hierarchy
   holds it, plus a retention period, then removes it at the next cleanup,
@@ -25,7 +25,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-session-pin](docs/briefs/BRIEF-session-pin.md); carried in Absorbed Brief.
 
