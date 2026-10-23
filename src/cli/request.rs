@@ -454,8 +454,8 @@ pub enum RequestCommand {
     /// Create a request and print its generated identifier.
     Create {
         /// The full form: `{"legs":[{"name","role","template",
-        /// "inputs"}],"inputs":{...}}`. Mutually exclusive with the
-        /// flat triple.
+        /// "inputs"}],"inputs":{...}}`, inline or as `@<path>` to read
+        /// it from a file. Mutually exclusive with the flat triple.
         #[arg(long, value_name = "JSON")]
         with_data: Option<String>,
 
@@ -469,7 +469,8 @@ pub enum RequestCommand {
         #[arg(long, value_name = "TEMPLATE")]
         template: Option<String>,
 
-        /// One-leg shorthand: the leg's own ask, as JSON.
+        /// One-leg shorthand: the leg's own ask, as JSON, inline or as
+        /// `@<path>` to read it from a file.
         #[arg(long, value_name = "JSON")]
         inputs: Option<String>,
 
@@ -596,7 +597,8 @@ pub enum RequestCommand {
     Progress {
         request_id: String,
         leg: String,
-        /// A JSON object of caller-supplied content.
+        /// A JSON object of caller-supplied content, inline or as
+        /// `@<path>` to read it from a file.
         #[arg(long, value_name = "JSON")]
         with_data: String,
         /// The epoch this writer was dispatched with. Required when
@@ -614,7 +616,8 @@ pub enum RequestCommand {
         leg: String,
         /// The result envelope:
         /// `{"status":"success|failure|skipped","summary":"...",
-        /// "payload":{...}}`.
+        /// "payload":{...}}`, inline or as `@<path>` to read it from a
+        /// file.
         #[arg(long, value_name = "JSON")]
         with_data: String,
         #[arg(long, value_name = "N")]
@@ -858,10 +861,21 @@ fn json_max_depth(value: &serde_json::Value) -> usize {
 
 /// Parse a JSON flag value under the size and depth caps.
 ///
-/// The size check is on the raw string so the parser is never handed
-/// more than the cap; the depth check runs on the parsed value, which
-/// the size cap has already bounded.
+/// A value starting with `@` names a file to read the JSON from, as on
+/// `koto next --with-data`: the read goes through the same resolver, so
+/// a missing, unreadable, empty-path or oversized file is refused with
+/// `koto next`'s message, as `invalid_submission`. Inline JSON can't
+/// start with `@`, so the prefix never changes what an inline value
+/// means.
+///
+/// The size check is on the resolved string so the parser is never
+/// handed more than the cap; the depth check runs on the parsed value,
+/// which the size cap has already bounded.
 fn parse_json_flag(flag: &str, raw: &str) -> Result<serde_json::Value, RequestError> {
+    let raw = &crate::cli::resolve_json_flag_source(flag, raw).map_err(|e| {
+        RequestError::new(RequestErrorCode::InvalidSubmission, e.message)
+            .with_detail(flag, "cannot read the @<file> payload")
+    })?;
     if raw.len() > MAX_JSON_FLAG_BYTES {
         return Err(RequestError::new(
             RequestErrorCode::BoundExceeded,
@@ -2689,6 +2703,95 @@ mod tests {
     fn a_non_object_progress_payload_is_rejected() {
         let err = parse_object_flag("--with-data", "[1,2,3]").expect_err("must be refused");
         assert_eq!(err.code, RequestErrorCode::InvalidSubmission);
+    }
+
+    // -- JSON flags read from @<file> --
+
+    fn json_file(contents: &[u8]) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.json");
+        std::fs::write(&path, contents).unwrap();
+        let arg = format!("@{}", path.display());
+        (dir, arg)
+    }
+
+    #[test]
+    fn a_json_flag_reads_its_value_from_an_at_file() {
+        let (_dir, arg) = json_file(br#"{"status":"success","summary":"from a file"}"#);
+        for flag in ["--with-data", "--inputs"] {
+            let value = parse_json_flag(flag, &arg).expect("the file's JSON");
+            assert_eq!(value["summary"], "from a file", "{flag}");
+        }
+    }
+
+    #[test]
+    fn an_at_file_and_the_same_json_inline_parse_alike() {
+        let inline = r#"{"note":"@not-a-path","n":[1,2]}"#;
+        let (_dir, arg) = json_file(inline.as_bytes());
+        assert_eq!(
+            parse_json_flag("--with-data", &arg).unwrap(),
+            parse_json_flag("--with-data", inline).unwrap()
+        );
+        // A string value starting with `@` inside inline JSON is data,
+        // not a path: only a leading `@` on the whole value is.
+        assert_eq!(
+            parse_json_flag("--with-data", inline).unwrap()["note"],
+            "@not-a-path"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_at_file_is_an_invalid_submission_naming_the_flag() {
+        for (flag, arg) in [
+            ("--with-data", "@/nonexistent/koto-404.json"),
+            ("--inputs", "@/nonexistent/koto-404.json"),
+            ("--with-data", "@"),
+        ] {
+            let err = parse_json_flag(flag, arg).expect_err("must be refused");
+            assert_eq!(
+                err.code,
+                RequestErrorCode::InvalidSubmission,
+                "{flag} {arg}"
+            );
+            assert_eq!(err.code.exit_code(), 2);
+            assert!(err.message.starts_with(flag), "{}", err.message);
+            assert_eq!(err.details[0].field, flag);
+        }
+    }
+
+    #[test]
+    fn an_oversized_at_file_is_refused_with_koto_nexts_message() {
+        let (_dir, arg) = json_file(&vec![b' '; MAX_JSON_FLAG_BYTES + 1]);
+        let err = parse_json_flag("--with-data", &arg).expect_err("must be refused");
+        assert_eq!(err.code, RequestErrorCode::InvalidSubmission);
+        let path = arg.trim_start_matches('@');
+        assert_eq!(
+            err.message,
+            format!(
+                "--with-data: file '{path}' is {} bytes, exceeds maximum of {MAX_JSON_FLAG_BYTES} bytes",
+                MAX_JSON_FLAG_BYTES + 1
+            )
+        );
+    }
+
+    #[test]
+    fn an_empty_at_file_is_not_valid_json() {
+        let (_dir, arg) = json_file(b"");
+        let err = parse_json_flag("--with-data", &arg).expect_err("must be refused");
+        assert_eq!(err.code, RequestErrorCode::InvalidSubmission);
+        assert!(
+            err.message.starts_with("--with-data is not valid JSON"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn a_non_object_progress_payload_from_a_file_is_rejected() {
+        let (_dir, arg) = json_file(b"[1,2,3]");
+        let err = parse_object_flag("--with-data", &arg).expect_err("must be refused");
+        assert_eq!(err.code, RequestErrorCode::InvalidSubmission);
+        assert_eq!(err.message, "--with-data must be a JSON object");
     }
 
     // -- the fence --

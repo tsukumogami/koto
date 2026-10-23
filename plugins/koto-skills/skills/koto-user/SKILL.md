@@ -423,9 +423,11 @@ A request is a durable answer slot. `koto request create` records what you're as
 A request is a container, not a spawner — `koto request create` starts no sessions. A fan-out is three steps:
 
 ```bash
-# 1. Declare what you're asking for. Prints the generated request id.
+# 1. Declare what you're asking for, with
+#    {"legs":[{"name":"review","role":"reviewer","template":"review.md","inputs":{"pr":443}}],"inputs":{"repo":"koto"}}
+#    written to a file. Prints the generated request id.
 koto request create \
-  --with-data '{"legs":[{"name":"review","role":"reviewer","template":"review.md","inputs":{"pr":443}}],"inputs":{"repo":"koto"}}' \
+  --with-data @<file> \
   --requested-by <your-session-id> \
   --coordinator-of-record <coordinator-id>
 
@@ -437,9 +439,9 @@ koto session start review-443 --parent <your-session-id> --needs-agent \
 koto request bind <request-id> review --child review-443
 ```
 
-For a single leg there's a shorthand: `koto request create --role reviewer --template review.md --inputs '<json>' --requested-by ID --coordinator-of-record ID`. The leg is named after the role, so the role has to satisfy the leg-name grammar. `--with-data` and the `--role` / `--template` / `--inputs` triple are mutually exclusive.
+For a single leg there's a shorthand: `koto request create --role reviewer --template review.md --inputs @<file> --requested-by ID --coordinator-of-record ID`, with the leg's inputs as a JSON object in the file. The leg is named after the role, so the role has to satisfy the leg-name grammar. `--with-data` and the `--role` / `--template` / `--inputs` triple are mutually exclusive.
 
-Unlike `koto next`, the `koto request` verbs read `--with-data` only as inline JSON; they don't take `@<file>`. That's why the examples in this section still pass it inline.
+The `koto request` verbs read `--with-data` (and `create`'s `--inputs`) the way `koto next` does: `@<file>` reads the JSON from the file, under the same 1 MB cap and with the same errors, and an inline value still works. Write the payload to a file, as the examples in this section do.
 
 `bind` only accepts a child started with `--needs-agent` under a parent — that's what makes the dispatch fence meaningful — and a child fulfils at most one leg. Rebinding the same leg to the same child is a no-op success; rebinding it elsewhere is rejected.
 
@@ -460,8 +462,10 @@ The request view is for the four things your own directive can't give you:
 
 ### Reporting progress on a leg you're filling
 
+With `{"note":"parser rewritten, tests next"}` written to a file:
+
 ```bash
-koto request progress <request-id> <leg> --with-data '{"note":"parser rewritten, tests next"}' --dispatch-epoch <n>
+koto request progress <request-id> <leg> --with-data @<file> --dispatch-epoch <n>
 ```
 
 `koto session update --intent` is one sentence about what your whole workflow is for and each write replaces the last; a leg progress append is one entry about what you just finished for the request someone asked you to fill, and every entry is kept in order.
@@ -474,8 +478,10 @@ Progress goes on the request, not on your own session log, and it never advances
 
 One sentence to hold: if something else is doing the work, let it report; if nothing is, report it yourself.
 
+With `{"status":"success","summary":"...","payload":{}}` written to a file:
+
 ```bash
-koto request resolve <request-id> <leg> --with-data '{"status":"success","summary":"...","payload":{}}'
+koto request resolve <request-id> <leg> --with-data @<file>
 ```
 
 `status` is `success`, `failure`, or `skipped` — the same envelope a child's terminal tick produces.

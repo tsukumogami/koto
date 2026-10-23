@@ -25,22 +25,15 @@
 # the Cursor rule), outside evals/, whose fixtures are data. docs/ and the
 # README are not; no skill loads them.
 #
-# Two kinds of line are let through on purpose:
-#   - `koto request ...`: the request verbs read --with-data only as inline
-#     JSON (src/cli/request.rs parses it with parse_json_flag and never
-#     resolves an `@` path), so there is no file form to show. Drop this
-#     exemption, and the notes saying so in koto-user's SKILL.md and
-#     command-reference.md, once those verbs read `@<file>` (koto#404).
-#   - `"invocation": "koto ..."`: a response example quoting the retry
-#     command koto itself prints in `reserved_actions` (src/cli/retry.rs).
-#     The skill text around it tells the agent to submit that payload from a
-#     file (koto#405).
+# One kind of line is let through on purpose: `"invocation": "koto ..."`, a
+# response example quoting the retry command koto itself prints in
+# `reserved_actions` (src/cli/retry.rs). The skill text around it tells the
+# agent to submit that payload from a file (koto#405). `koto request` lines
+# get no exemption: its verbs read `@<file>` like `koto next` (koto#404).
 #
 # Not seen, and left to review: a command split over lines with `\` where
-# `koto` and `--with-data` land on different lines, inline JSON handed to
-# koto through a variable set on an earlier line, and an inline `koto next`
-# on a line that also names `koto request` (the exemption covers the whole
-# line).
+# `koto` and `--with-data` land on different lines, and inline JSON handed to
+# koto through a variable set on an earlier line.
 #
 # Usage:
 #   scripts/check-inline-evidence.sh            the repository's own tree
@@ -97,7 +90,6 @@ fi
 if ! SITES=$(printf '%s\n' "$LIST" | tr '\n' '\0' | xargs -0 awk -v q="'" '
   BEGIN { inline = "--with-data([ \t]+|=)[" q "\"$]" }
   /(^|[^A-Za-z0-9_-])koto[ \t]/ && $0 ~ inline {
-    if ($0 ~ /(^|[^A-Za-z0-9_-])koto[ \t]+request[ \t]/) next
     if ($0 ~ /"invocation":[ \t]*"koto[ \t]/) next
     line = $0
     sub(/^[ \t]+/, "", line)

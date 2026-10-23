@@ -1275,44 +1275,69 @@ fn evidence_has_reserved_gates_key(data: &serde_json::Value) -> bool {
 pub(super) fn resolve_with_data_source(
     raw: &str,
 ) -> Result<String, crate::cli::next_types::NextError> {
+    resolve_json_flag_source("--with-data", raw)
+}
+
+/// Resolve any JSON flag that accepts the `@<path>` form, naming `flag`
+/// in its errors. [`resolve_with_data_source`] is this for `--with-data`;
+/// `koto request` also uses it for `--inputs`.
+///
+/// The read stops one byte past `MAX_WITH_DATA_BYTES` whatever the
+/// file's metadata says, so a file that grows after the size check, or
+/// one that reports no size (a device such as `/dev/zero`), still can't
+/// make koto read more than the cap.
+pub(super) fn resolve_json_flag_source(
+    flag: &str,
+    raw: &str,
+) -> Result<String, crate::cli::next_types::NextError> {
     use crate::cli::next_types::{NextError, NextErrorCode};
+    use std::io::Read as _;
 
     let Some(path_str) = raw.strip_prefix('@') else {
         // No prefix: caller will parse `raw` directly as inline JSON.
         return Ok(raw.to_string());
     };
 
+    let invalid = |message: String| NextError {
+        code: NextErrorCode::InvalidSubmission,
+        message,
+        details: vec![],
+    };
+
     if path_str.is_empty() {
-        return Err(NextError {
-            code: NextErrorCode::InvalidSubmission,
-            message: "--with-data @ requires a file path after '@'".to_string(),
-            details: vec![],
-        });
+        return Err(invalid(format!("{flag} @ requires a file path after '@'")));
     }
 
     let path = std::path::Path::new(path_str);
-    let metadata = std::fs::metadata(path).map_err(|e| NextError {
-        code: NextErrorCode::InvalidSubmission,
-        message: format!("--with-data: cannot read file '{}': {}", path_str, e),
-        details: vec![],
-    })?;
+    let cannot_read =
+        |e: std::io::Error| invalid(format!("{flag}: cannot read file '{path_str}': {e}"));
+    let metadata = std::fs::metadata(path).map_err(cannot_read)?;
 
     let actual_bytes = metadata.len();
     if actual_bytes > MAX_WITH_DATA_BYTES as u64 {
-        return Err(NextError {
-            code: NextErrorCode::InvalidSubmission,
-            message: format!(
-                "--with-data: file '{}' is {} bytes, exceeds maximum of {} bytes",
-                path_str, actual_bytes, MAX_WITH_DATA_BYTES
-            ),
-            details: vec![],
-        });
+        return Err(invalid(format!(
+            "{flag}: file '{path_str}' is {actual_bytes} bytes, exceeds maximum of {MAX_WITH_DATA_BYTES} bytes"
+        )));
     }
 
-    std::fs::read_to_string(path).map_err(|e| NextError {
-        code: NextErrorCode::InvalidSubmission,
-        message: format!("--with-data: cannot read file '{}': {}", path_str, e),
-        details: vec![],
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| {
+            f.take(MAX_WITH_DATA_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(cannot_read)?;
+    if bytes.len() > MAX_WITH_DATA_BYTES {
+        return Err(invalid(format!(
+            "{flag}: file '{path_str}' exceeds maximum of {MAX_WITH_DATA_BYTES} bytes"
+        )));
+    }
+    // The same text `read_to_string` gives, so the message is unchanged.
+    String::from_utf8(bytes).map_err(|_| {
+        cannot_read(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        ))
     })
 }
 
@@ -9098,6 +9123,91 @@ Done.
             err.message.contains("file path"),
             "error should mention missing file path: {}",
             err.message
+        );
+    }
+
+    #[test]
+    fn resolve_with_data_source_messages_are_unchanged() {
+        // `koto next` callers match on these texts; the flag-generic
+        // resolver must keep them byte for byte for `--with-data`.
+        let err = resolve_with_data_source("@").unwrap_err();
+        assert_eq!(err.message, "--with-data @ requires a file path after '@'");
+
+        let err = resolve_with_data_source("@/nonexistent/koto-404.json").unwrap_err();
+        assert!(
+            err.message
+                .starts_with("--with-data: cannot read file '/nonexistent/koto-404.json': "),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn resolve_json_flag_source_names_the_flag_it_reads() {
+        let err = resolve_json_flag_source("--inputs", "@").unwrap_err();
+        assert_eq!(err.message, "--inputs @ requires a file path after '@'");
+
+        let err = resolve_json_flag_source("--inputs", "@/nonexistent/koto-404.json").unwrap_err();
+        assert!(
+            err.message.starts_with("--inputs: cannot read file "),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn resolve_with_data_source_empty_file_reads_as_empty() {
+        // An empty file is not a read error; the caller's JSON parse
+        // rejects it, as it would an empty inline value.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.json");
+        std::fs::write(&path, b"").unwrap();
+        let arg = format!("@{}", path.display());
+        assert_eq!(resolve_with_data_source(&arg).unwrap(), "");
+    }
+
+    #[test]
+    fn resolve_with_data_source_non_utf8_file_errors() {
+        use crate::cli::next_types::NextErrorCode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary.json");
+        std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        let arg = format!("@{}", path.display());
+        let err = resolve_with_data_source(&arg).unwrap_err();
+        assert_eq!(err.code, NextErrorCode::InvalidSubmission);
+        assert!(
+            err.message.ends_with("stream did not contain valid UTF-8"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_with_data_source_stops_reading_at_the_cap() {
+        use crate::cli::next_types::NextErrorCode;
+
+        // A device reports no size, so only the bounded read stands
+        // between it and reading without end.
+        let err = resolve_with_data_source("@/dev/zero").unwrap_err();
+        assert_eq!(err.code, NextErrorCode::InvalidSubmission);
+        assert_eq!(
+            err.message,
+            "--with-data: file '/dev/zero' exceeds maximum of 1048576 bytes"
+        );
+    }
+
+    #[test]
+    fn resolve_with_data_source_accepts_a_file_at_exactly_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("at-cap.json");
+        let body = format!("\"{}\"", "a".repeat(MAX_WITH_DATA_BYTES - 2));
+        std::fs::write(&path, &body).unwrap();
+        let arg = format!("@{}", path.display());
+        assert_eq!(
+            resolve_with_data_source(&arg).unwrap().len(),
+            MAX_WITH_DATA_BYTES
         );
     }
 
