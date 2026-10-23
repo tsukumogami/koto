@@ -740,6 +740,11 @@ pub(crate) fn sweep_if_parent(
 /// Remove every descendant of `parent` that stands in a terminal state and
 /// has nothing live under it, deepest first.
 ///
+/// Two callers remain: the same-name replace of a predecessor the retention
+/// rule released, and [`sweep_if_parent`], the terminal tick's safety net.
+/// A parent's own terminal tick keeps it and its children (they have
+/// lineage), so the tick lists them in `kept_children` instead of sweeping.
+///
 /// The removal is implicit -- nobody named these sessions -- so every rule
 /// fails toward keeping:
 ///

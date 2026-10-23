@@ -127,6 +127,12 @@ fn chain_parent_names(dir: &Path, probes: &[&str]) -> bool {
 /// `<name>_r<N>`, a descendant renamed with it), and a link body of a
 /// version this koto doesn't know whose `session` names it, both join it in
 /// the graph, so both count here.
+///
+/// These join rules repeat `Graph::build_edges`'s by design, so the tick
+/// reads no more than it must. A change to either side must keep `edge_of`
+/// a superset of the graph's joins; the property tests
+/// `the_two_level_verdict_equals_a_full_read_reference` and
+/// `edge_of_never_misses_an_edge_the_graph_joins_hints_included` check it.
 pub fn edge_of(base: &Path, name: &str) -> bool {
     let own = SessionFacts::read(base, name);
     if !own.problems.is_empty() || !own.store_problems.is_empty() {

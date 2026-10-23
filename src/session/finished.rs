@@ -1,7 +1,8 @@
 //! Finished records: what a session that koto removed itself ended as.
 //!
-//! koto removes a session at its terminal tick (and a parent removes its
-//! kept terminal children), which used to leave `koto status` answering
+//! koto removes a lone session at its terminal tick (and a replace of a
+//! released parent removes its kept terminal children), which used to
+//! leave `koto status` answering
 //! `not found` for a run that finished. Just before that removal koto writes
 //! one record per name to `<sessions base>/.finished/<name>.json`, so the
 //! status of a removed session can still be read.

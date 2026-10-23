@@ -234,6 +234,8 @@ impl Graph {
         migrated
     }
 
+    /// The join rules. `super::edge_of` repeats them for the terminal tick
+    /// and must stay a superset of what is joined here; see its doc.
     fn build_edges(&mut self) {
         let mut by_id: HashMap<&str, Vec<&str>> = HashMap::new();
         for f in self.facts.values() {

@@ -101,6 +101,12 @@ fn renamed_as(session: &str, name: &str, moved_to: &str) -> Option<String> {
     (rest.starts_with('.') || rest.starts_with('~')).then(|| format!("{moved_to}{rest}"))
 }
 
+/// Whether `session` is `name` or sits under it by name (`name.<rest>` or
+/// `name~<rest>`): exactly the sessions a move of `name` renames.
+fn is_under(session: &str, name: &str) -> bool {
+    renamed_as(session, name, name).is_some()
+}
+
 /// Whether descendant `id` holds the move: running, waiting to promote its
 /// result to a leg, or unreadable (which reads as not terminal).
 fn holds_the_move(backend: &dyn SessionBackend, id: &str) -> bool {
@@ -161,7 +167,7 @@ pub(crate) fn move_aside(backend: &dyn SessionBackend, name: &str) -> Result<Mov
     for n in &local {
         if n != name
             && !listed.contains(n.as_str())
-            && renamed_as(n, name, name).is_some()
+            && is_under(n, name)
             && backend
                 .session_dir(n)
                 .join(crate::session::state_file_name(n))
@@ -342,7 +348,7 @@ fn pick_name(
             .iter()
             .copied()
             .chain(local.iter().map(String::as_str))
-            .any(|s| renamed_as(s, &moved_to, &moved_to).is_some());
+            .any(|s| is_under(s, &moved_to));
         if occupied {
             continue;
         }

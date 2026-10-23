@@ -469,9 +469,10 @@ fn skips_a_descendant_whose_template_is_missing() {
 #[test]
 fn stops_on_a_parent_cycle() {
     // a -> b -> a: remove `a`, then re-create it under its former child.
-    // The sweep is driven through the replace path: a terminal tick would not
-    // sweep here (`a` has no batch hook and no reported child), and the walk
-    // is the same function either way.
+    // The replace walks `a`'s descendants with the shared guarded walk. `a`
+    // finished just now, so its hierarchy is kept and the replace moves the
+    // subtree aside; the walk's visited set has to end the cycle for the
+    // move to finish.
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     init_root(dir, "a", CHILD);
@@ -482,8 +483,8 @@ fn stops_on_a_parent_cycle() {
     run_ok(dir, &["init", "a", "--template", &t, "--parent", "b"]);
     done_kept(dir, "a");
 
-    // Replacing the finished `a` sweeps its descendants and must terminate.
-    run_ok(
+    // Replacing the finished `a` walks its descendants and must terminate.
+    let resp = run_ok(
         dir,
         &[
             "init",
@@ -494,7 +495,8 @@ fn stops_on_a_parent_cycle() {
             "--replace-terminal",
         ],
     );
-    assert!(exists(dir, "a"));
+    assert_eq!(resp["moved_to"], "a_r1", "{resp}");
+    assert!(exists(dir, "a") && exists(dir, "a_r1"));
     assert!(exists(dir, "b"), "a session in a cycle is not removed");
 }
 

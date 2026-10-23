@@ -917,8 +917,9 @@ they're made durable with it.
 
 No session-lifecycle command deletes or rewrites the journal:
 `koto session cleanup`, `koto cancel --cleanup`, the removal of a session
-at its terminal tick, a parent's sweep of its children,
-`koto init --replace-terminal` and `koto session import` all leave existing
+at its terminal tick, `koto init --replace-terminal` (whether it removes
+the old run and its children or moves them aside), the prunes and
+`koto session import` all leave existing
 lines byte-identical. The journal grows by a few hundred bytes per state
 entered, per check evaluation, decider call, override, dispute and printed
 directive, by up to 50 more lines for a check that reports many error

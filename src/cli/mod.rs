@@ -3605,7 +3605,9 @@ fn finish_terminal_tick(
         );
         #[cfg(test)]
         finished_record_hooks::before_removal(name);
-        // A parent koto removes takes its kept terminal descendants with it.
+        // Only a session `edge_of` found no edge for gets here, and a parent
+        // with a child has lineage, so this finds nothing in practice. It
+        // stays as the safety net `sweep_if_parent` describes.
         workspace::sweep_if_parent(backend, context_store, name, compiled);
         if let Err(e) = backend.cleanup(name) {
             eprintln!("warning: session cleanup failed: {}", e);
