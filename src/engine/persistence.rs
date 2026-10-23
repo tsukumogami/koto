@@ -100,9 +100,10 @@ pub fn append_header_line<H: Serialize>(path: &Path, header: &H) -> anyhow::Resu
         .open(path)
         .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
 
-    let line = serialize_header_line(header)?;
+    let mut line = serialize_header_line(header)?;
+    line.push('\n');
 
-    writeln!(file, "{}", line)
+    file.write_all(line.as_bytes())
         .map_err(|e| anyhow::anyhow!("failed to write header to {}: {}", path.display(), e))?;
 
     file.sync_data()
@@ -216,15 +217,39 @@ fn append_event_reading<H: LogHeader>(
     // Held from reading the last seq until the line is synced, so two
     // processes appending at once can't both take the same seq.
     let _append_lock = AppendLock::acquire(path);
-    let (next_seq, prior_log) = read_for_append::<H>(path)?;
+    let tail = read_for_append::<H>(path)?;
 
     let event = Event {
-        seq: next_seq,
+        seq: tail.next_seq,
         timestamp: timestamp.to_string(),
         event_type: payload.type_name().to_string(),
         payload: payload.clone(),
         idempotency_hash: None,
     };
+    write_event_line(path, &event, tail.unterminated)?;
+
+    Ok((tail.next_seq, tail.content))
+}
+
+/// Append `event` to the log at `path` as one line, in one write, and sync it.
+///
+/// The line and its newline go out in a single `write_all` of one buffer.
+/// Written as two writes (`writeln!` on an unbuffered file issues the line and
+/// the `\n` separately), a writer killed between them -- a timed-out action's
+/// process group gets SIGKILL -- leaves a line with no terminator, and the next
+/// append lands on the same line (koto#419). `unterminated` is the log's own
+/// last line lacking its newline, from a writer that died that way before this
+/// fix: the buffer then starts with the missing `\n`, so this event still gets
+/// a line of its own.
+fn write_event_line(path: &Path, event: &Event, unterminated: bool) -> anyhow::Result<()> {
+    let line = serde_json::to_string(event)
+        .map_err(|e| anyhow::anyhow!("failed to serialize event: {}", e))?;
+    let mut buf = String::with_capacity(line.len() + 2);
+    if unterminated {
+        buf.push('\n');
+    }
+    buf.push_str(&line);
+    buf.push('\n');
 
     // No `create`: if the log disappeared since it was read, the open fails
     // rather than starting a new, headerless one.
@@ -232,17 +257,11 @@ fn append_event_reading<H: LogHeader>(
         .append(true)
         .open(path)
         .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
-
-    let line = serde_json::to_string(&event)
-        .map_err(|e| anyhow::anyhow!("failed to serialize event: {}", e))?;
-
-    writeln!(file, "{}", line)
+    file.write_all(buf.as_bytes())
         .map_err(|e| anyhow::anyhow!("failed to write event to {}: {}", path.display(), e))?;
-
     file.sync_data()
         .map_err(|e| anyhow::anyhow!("failed to sync state file {}: {}", path.display(), e))?;
-
-    Ok((next_seq, prior_log))
+    Ok(())
 }
 
 /// Outcome of an idempotent append.
@@ -396,19 +415,18 @@ pub fn append_event_idempotent_in<H: LogHeader>(
     // Check the header first, so a log that is missing, empty or headerless
     // is refused whether or not the scan below finds a prior event. Doing it
     // after the scan would let an idempotent hit report success on a log no
-    // reader can parse. This reads the whole file and the scan below reads it
-    // again; both reads happen under the lock taken above.
-    let next_seq = next_seq_after_header::<H>(path)?;
+    // reader can parse. The scan below reads the bytes this read returns,
+    // under the lock taken above.
+    let tail = read_for_append::<H>(path)?;
+    let next_seq = tail.next_seq;
 
     // Scan for a prior event with the same hash. A malformed line in the
     // middle of the log is skipped, the way `read_events` skips it. A
-    // malformed *final* line is already fatal by this point: the header
-    // check above parses it to work out the next seq. Callers that expect a
-    // torn tail repair it before appending, as the request store does. Line
-    // 1 is the header, checked above, so events start at line 2 (1-indexed).
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("failed to read state file {}: {}", path.display(), e))?;
-    for line in content.lines().skip(1) {
+    // malformed *final* line is already fatal by this point: the read above
+    // parses it to work out the next seq. Callers that expect a torn tail
+    // repair it before appending, as the request store does. Line 1 is the
+    // header, checked above, so events start at line 2 (1-indexed).
+    for line in tail.content.lines().skip(1) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -450,17 +468,7 @@ pub fn append_event_idempotent_in<H: LogHeader>(
         payload: payload.clone(),
         idempotency_hash: Some(h.to_string()),
     };
-
-    let mut file = OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
-    let line = serde_json::to_string(&event)
-        .map_err(|e| anyhow::anyhow!("failed to serialize event: {}", e))?;
-    writeln!(file, "{}", line)
-        .map_err(|e| anyhow::anyhow!("failed to write event to {}: {}", path.display(), e))?;
-    file.sync_data()
-        .map_err(|e| anyhow::anyhow!("failed to sync state file {}: {}", path.display(), e))?;
+    write_event_line(path, &event, tail.unterminated)?;
 
     Ok(AppendOutcome::Written { seq: next_seq })
 }
@@ -480,7 +488,10 @@ pub const APPEND_LOCK_FILE: &str = "append.lock";
 ///
 /// Where the lock can't be had -- no `flock` on this platform, a directory
 /// the sidecar can't be created in, a filesystem that refuses the call --
-/// the append proceeds unlocked, as appends did before the lock existed.
+/// the append proceeds unlocked, as appends did before the lock existed. A
+/// wait the kernel cuts short with `EINTR` is not one of those: a signal
+/// arriving while another process holds the lock retries the wait, so a
+/// signal can't let an append through unlocked.
 struct AppendLock {
     #[cfg(unix)]
     _file: Option<std::fs::File>,
@@ -503,12 +514,16 @@ impl AppendLock {
             Ok(f) => f,
             Err(_) => return AppendLock { _file: None },
         };
-        // SAFETY: `fd` is borrowed from `file`, which outlives the call.
-        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if ret != 0 {
-            return AppendLock { _file: None };
+        loop {
+            // SAFETY: `fd` is borrowed from `file`, which outlives the call.
+            let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if ret == 0 {
+                return AppendLock { _file: Some(file) };
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return AppendLock { _file: None };
+            }
         }
-        AppendLock { _file: Some(file) }
     }
 
     #[cfg(not(unix))]
@@ -549,7 +564,7 @@ fn acquire_state_flock(path: &Path) -> anyhow::Result<std::fs::File> {
     );
     // Open without `create`: a log is created when its session is created,
     // and a lock open that created the file would leave an empty log behind
-    // for the header check in `next_seq_after_header` to refuse.
+    // for the header check in `read_for_append` to refuse.
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -562,15 +577,21 @@ fn acquire_state_flock(path: &Path) -> anyhow::Result<std::fs::File> {
             )
         })?;
     let fd = file.as_raw_fd();
-    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
-    if ret != 0 {
-        return Err(anyhow::anyhow!(
-            "failed to acquire flock on {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
+    loop {
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if ret == 0 {
+            return Ok(file);
+        }
+        // A signal during the wait is not a failure to lock: wait again.
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(anyhow::anyhow!(
+                "failed to acquire flock on {}: {}",
+                path.display(),
+                err
+            ));
+        }
     }
-    Ok(file)
 }
 
 #[cfg(not(unix))]
@@ -698,8 +719,22 @@ fn fsync_log_file(path: &Path) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// What an append needs to know about the log it is about to extend, read
+/// under the append lock.
+struct AppendTail {
+    /// The seq the appended event takes.
+    next_seq: u64,
+    /// The log's bytes as the append found them, or as the split of a merged
+    /// last line left them.
+    content: String,
+    /// The log's last line has no newline: a complete event from a writer
+    /// that died between writing a line and its `\n`, before appends became
+    /// one write. The append supplies the newline first.
+    unterminated: bool,
+}
+
 /// The seq the next event appended to `path` gets, refusing a log that has
-/// no header.
+/// no header, with the bytes it read.
 ///
 /// The file must exist and its first line must parse as an `H`. Checking
 /// the header, rather than skipping line 1 unseen, is what stops an append
@@ -711,12 +746,14 @@ fn fsync_log_file(path: &Path) -> std::io::Result<()> {
 /// Reads only the last non-empty line's seq, since in a valid file seq
 /// equals line index. This avoids silently masking corruption where events
 /// appear out of order.
-fn next_seq_after_header<H: LogHeader>(path: &Path) -> anyhow::Result<u64> {
-    read_for_append::<H>(path).map(|(seq, _)| seq)
-}
-
-/// [`next_seq_after_header`], also handing back the bytes it read.
-fn read_for_append<H: LogHeader>(path: &Path) -> anyhow::Result<(u64, String)> {
+///
+/// A last line that doesn't parse fails the append, as a truncated one
+/// always has, with one exception: a line holding two or more well-formed
+/// events written with no newline between them (koto#419), whose seqs follow
+/// the line before. That line is split into one line per event, with the log
+/// as it was kept beside it, and the append goes on (see
+/// [`split_merged_last_line`]).
+fn read_for_append<H: LogHeader>(path: &Path) -> anyhow::Result<AppendTail> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -750,15 +787,268 @@ fn read_for_append<H: LogHeader>(path: &Path) -> anyhow::Result<(u64, String)> {
     }
     parse_header::<H>(first_line)?;
 
-    let next = match lines.rev().find(|l| !l.trim().is_empty()) {
-        None => 1,
-        Some(line) => {
-            let val: serde_json::Value = serde_json::from_str(line.trim())
-                .map_err(|e| anyhow::anyhow!("failed to parse last event line: {}", e))?;
-            val.get("seq").and_then(|s| s.as_u64()).unwrap_or(0) + 1
-        }
+    let unterminated = !content.ends_with('\n');
+    let Some(last) = last_event_lines(&content) else {
+        return Ok(AppendTail {
+            next_seq: 1,
+            content,
+            unterminated,
+        });
     };
-    Ok((next, content))
+    let err = match serde_json::from_str::<serde_json::Value>(last.text.trim()) {
+        Ok(val) => {
+            return Ok(AppendTail {
+                next_seq: val.get("seq").and_then(|s| s.as_u64()).unwrap_or(0) + 1,
+                content,
+                unterminated,
+            })
+        }
+        Err(e) => e,
+    };
+    let pieces = match split_last_line(&last) {
+        SplitOutcome::NotMerged => {
+            return Err(anyhow::anyhow!("failed to parse last event line: {}", err));
+        }
+        SplitOutcome::DoesNotFollow(seqs) => {
+            return Err(EngineError::StateFileCorrupted(format!(
+                "line {} of {} holds {} events written with no newline between them (seq {}), \
+                 and their seqs don't follow the line before it, so nothing was appended. \
+                 Back up the log, then put each of those events on a line of its own",
+                last.line_number,
+                path.display(),
+                seqs.len(),
+                join_seqs(&seqs)
+            ))
+            .into());
+        }
+        SplitOutcome::Split(pieces) => pieces,
+    };
+    let next_seq = pieces[pieces.len() - 1].1.seq + 1;
+    let content = split_merged_last_line(path, &content, last.offset, last.line_number, &pieces)?;
+    Ok(AppendTail {
+        next_seq,
+        content,
+        unterminated: false,
+    })
+}
+
+/// The last non-empty line after a log's header, with where it starts.
+struct LastEventLine<'a> {
+    /// The line, without its newline.
+    text: &'a str,
+    /// Byte offset of the line's start in the log.
+    offset: usize,
+    /// 1-indexed line number; the header is line 1.
+    line_number: usize,
+    /// The non-empty line before it, when that is an event line too.
+    previous: Option<&'a str>,
+}
+
+/// Find the last non-empty event line of `content`, or `None` when the log
+/// holds only its header.
+fn last_event_lines(content: &str) -> Option<LastEventLine<'_>> {
+    let mut last: Option<LastEventLine<'_>> = None;
+    let mut offset = 0;
+    for (i, segment) in content.split_inclusive('\n').enumerate() {
+        let start = offset;
+        offset += segment.len();
+        let text = segment.strip_suffix('\n').unwrap_or(segment);
+        if i == 0 || text.trim().is_empty() {
+            continue;
+        }
+        last = Some(LastEventLine {
+            text,
+            offset: start,
+            line_number: i + 1,
+            previous: last.map(|l| l.text),
+        });
+    }
+    last
+}
+
+/// The events `line` holds when it is two or more well-formed events written
+/// one after another with no newline between them, each with its own text;
+/// `None` for anything else.
+///
+/// A line cut short partway through an event -- the torn tail of a crash --
+/// is `None`: its last piece doesn't parse. So is a line holding one event,
+/// which isn't merged.
+pub(crate) fn split_concatenated(line: &str) -> Option<Vec<(&str, Event)>> {
+    let mut stream = serde_json::Deserializer::from_str(line).into_iter::<Event>();
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    while let Some(next) = stream.next() {
+        let event = next.ok()?;
+        let end = stream.byte_offset();
+        pieces.push((line[start..end].trim(), event));
+        start = end;
+    }
+    (pieces.len() >= 2).then_some(pieces)
+}
+
+/// What a log's last line is, to an append that couldn't parse it.
+enum SplitOutcome<'a> {
+    /// Not well-formed events merged together: a truncated line, or
+    /// anything else that isn't an event.
+    NotMerged,
+    /// Merged events whose seqs continue the log: split them.
+    Split(Vec<(&'a str, Event)>),
+    /// Merged events whose seqs don't continue the line before: leave them.
+    DoesNotFollow(Vec<u64>),
+}
+
+fn split_last_line<'a>(last: &LastEventLine<'a>) -> SplitOutcome<'a> {
+    let Some(pieces) = split_concatenated(last.text.trim()) else {
+        return SplitOutcome::NotMerged;
+    };
+    let seqs: Vec<u64> = pieces.iter().map(|(_, e)| e.seq).collect();
+    let previous_seq = match last.previous {
+        None => Some(0),
+        Some(prev) => serde_json::from_str::<serde_json::Value>(prev.trim())
+            .ok()
+            .and_then(|v| v.get("seq").and_then(|s| s.as_u64())),
+    };
+    if previous_seq.is_some_and(|prev| consecutive_from(&seqs, prev + 1)) {
+        SplitOutcome::Split(pieces)
+    } else {
+        SplitOutcome::DoesNotFollow(seqs)
+    }
+}
+
+/// Whether the last line of `content` (a whole log) holds merged events an
+/// append would split, so a repair that drops a torn tail must keep it.
+pub(crate) fn last_line_would_split(content: &str) -> bool {
+    last_event_lines(content)
+        .is_some_and(|last| matches!(split_last_line(&last), SplitOutcome::Split(_)))
+}
+
+/// Whether `seqs` runs `first, first + 1, ...` with no gap.
+fn consecutive_from(seqs: &[u64], first: u64) -> bool {
+    seqs.iter()
+        .enumerate()
+        .all(|(i, seq)| first.checked_add(i as u64) == Some(*seq))
+}
+
+fn join_seqs(seqs: &[u64]) -> String {
+    seqs.iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Split the merged last line of the log at `path`, which starts at byte
+/// `offset` of `content` and holds `pieces`, into one line per event, and
+/// return the log's new bytes.
+///
+/// The log as it was goes first to a backup beside it, named after the
+/// log and the first merged seq (`<log>.seq<N>-merged.bak`), so the repair
+/// can be checked or undone by hand. The split log then replaces the log in
+/// one rename, so a reader sees the merged log or the split one, never part
+/// of either. Each event keeps the exact text it was written with. The
+/// caller holds the append lock, so no other append runs in between; what
+/// was done is announced on stderr.
+fn split_merged_last_line(
+    path: &Path,
+    content: &str,
+    offset: usize,
+    line_number: usize,
+    pieces: &[(&str, Event)],
+) -> anyhow::Result<String> {
+    let mut split = String::with_capacity(content.len() + pieces.len());
+    split.push_str(&content[..offset]);
+    for (text, _) in pieces {
+        split.push_str(text);
+        split.push('\n');
+    }
+
+    let first_seq = pieces[0].1.seq;
+    let backup = write_backup(path, content, first_seq)?;
+    replace_file(path, &split)?;
+    let seqs: Vec<u64> = pieces.iter().map(|(_, e)| e.seq).collect();
+    eprintln!(
+        "warning: line {} of {} held {} events written with no newline between them (seq {}); \
+         split it into one line per event. The log as it was is kept at {}",
+        line_number,
+        path.display(),
+        pieces.len(),
+        join_seqs(&seqs),
+        backup.display()
+    );
+    Ok(split)
+}
+
+/// Write `content` to a new file beside `log`, named for `first_seq`, and
+/// sync it. Never overwrites: a name already taken gets a numeric suffix.
+fn write_backup(log: &Path, content: &str, first_seq: u64) -> anyhow::Result<std::path::PathBuf> {
+    let name = log
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("state.jsonl");
+    for n in 0..100u32 {
+        let suffix = if n == 0 {
+            String::new()
+        } else {
+            format!(".{n}")
+        };
+        let backup = log.with_file_name(format!("{name}.seq{first_seq}-merged{suffix}.bak"));
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = match opts.open(&backup) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to create backup {} before splitting a merged line: {}",
+                    backup.display(),
+                    e
+                ))
+            }
+        };
+        file.write_all(content.as_bytes())
+            .and_then(|()| file.sync_data())
+            .map_err(|e| anyhow::anyhow!("failed to write backup {}: {}", backup.display(), e))?;
+        return Ok(backup);
+    }
+    Err(anyhow::anyhow!(
+        "no free backup name beside {} for seq {}",
+        log.display(),
+        first_seq
+    ))
+}
+
+/// Replace the file at `path` with `content` in one rename, keeping mode
+/// 0600, and sync it and its directory.
+fn replace_file(path: &Path, content: &str) -> anyhow::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("state file {} has no parent", path.display()))?;
+    let tmp = tempfile::Builder::new()
+        .prefix(".split-")
+        .suffix(".tmp")
+        .tempfile_in(dir)
+        .map_err(|e| anyhow::anyhow!("failed to create a temp file in {}: {}", dir.display(), e))?;
+    {
+        let mut file = tmp.as_file();
+        file.write_all(content.as_bytes())
+            .and_then(|()| file.sync_data())
+            .map_err(|e| anyhow::anyhow!("failed to write {}: {}", tmp.path().display(), e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| anyhow::anyhow!("failed to set mode on {}: {}", tmp.path().display(), e),
+            )?;
+        }
+    }
+    tmp.persist(path)
+        .map_err(|e| anyhow::anyhow!("failed to replace {}: {}", path.display(), e.error))?;
+    fsync_parent_dir(path);
+    Ok(())
 }
 
 /// Read the header line from a state file.
@@ -845,6 +1135,8 @@ fn header_parse_failure(first_line: &str, err: &serde_json::Error) -> String {
 /// - A gap in a non-final line produces a `state_file_corrupted` error
 /// - A malformed final line is recovered: events up to last valid are returned
 ///   with a warning to stderr
+/// - A final line holding well-formed events with no newline between them,
+///   whose seqs continue the log, is read as those events, with a warning
 pub fn read_events(path: &Path) -> anyhow::Result<(StateFileHeader, Vec<Event>)> {
     read_log(path)
 }
@@ -929,6 +1221,27 @@ fn read_log_inner<H: LogHeader>(
             }
             Err(e) => {
                 if is_last_line {
+                    // Well-formed events merged onto one line by a writer
+                    // that never wrote its newline (koto#419): read them
+                    // as the events they are. The next append splits the
+                    // line on disk.
+                    if let Some(pieces) = split_concatenated(trimmed) {
+                        let seqs: Vec<u64> = pieces.iter().map(|(_, e)| e.seq).collect();
+                        if consecutive_from(&seqs, expected_seq) {
+                            if report == TailReport::Warn {
+                                eprintln!(
+                                    "warning: final line in {} holds {} events written with no \
+                                     newline between them (seq {}), reading them as separate \
+                                     events; the next write to the session splits the line",
+                                    path.display(),
+                                    seqs.len(),
+                                    join_seqs(&seqs)
+                                );
+                            }
+                            events.extend(pieces.into_iter().map(|(_, event)| event));
+                            break;
+                        }
+                    }
                     // Truncated final line: recoverable. Return what we
                     // have, announcing it only when the caller asked.
                     if report == TailReport::Warn {
@@ -3797,5 +4110,282 @@ mod tests {
         // count — because the call's existing contract focuses on
         // durability, not append-vs-overwrite semantics.
         assert!(content.contains("\"workflow\":\"test-wf\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Merged and unterminated last lines (koto#419)
+    // -----------------------------------------------------------------------
+
+    fn intent(seq: u64, text: &str) -> Event {
+        make_event(
+            seq,
+            EventPayload::IntentUpdated {
+                intent: text.to_string(),
+            },
+        )
+    }
+
+    fn line(event: &Event) -> String {
+        serde_json::to_string(event).unwrap()
+    }
+
+    /// A log holding the header, `events` one per line, and then `tail`
+    /// written verbatim.
+    fn log_with_tail(dir: &Path, events: &[Event], tail: &str) -> std::path::PathBuf {
+        let path = write_state_file(dir, "tail", &make_header(), events);
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str(tail);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn backups(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut found: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "bak"))
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Every line after the header must hold exactly one event, seqs 1..=n.
+    fn assert_one_event_per_line(path: &Path) -> Vec<Event> {
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(content.ends_with('\n'), "log must end in a newline");
+        let events: Vec<Event> = content
+            .lines()
+            .skip(1)
+            .map(|l| {
+                serde_json::from_str(l)
+                    .unwrap_or_else(|e| panic!("line {l:?} is not one event: {e}"))
+            })
+            .collect();
+        let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, (1..=events.len() as u64).collect::<Vec<_>>());
+        events
+    }
+
+    #[test]
+    fn append_writes_one_line_and_leaves_a_well_formed_log_byte_for_byte() {
+        let dir = TempDir::new().unwrap();
+        let path = write_state_file(dir.path(), "wf", &make_header(), &[intent(1, "a")]);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let seq = append_event(
+            &path,
+            &EventPayload::IntentUpdated {
+                intent: "b".to_string(),
+            },
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(seq, 2);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, format!("{before}{}\n", line(&intent(2, "b"))));
+        assert!(backups(dir.path()).is_empty());
+    }
+
+    /// The precursor of a merge: a writer died after writing an event and
+    /// before its newline. The next append supplies the newline instead of
+    /// starting on the same line.
+    #[test]
+    fn append_after_an_unterminated_complete_event_starts_a_new_line() {
+        let dir = TempDir::new().unwrap();
+        let path = log_with_tail(dir.path(), &[intent(1, "a")], &line(&intent(2, "b")));
+        let seq = append_event(
+            &path,
+            &EventPayload::IntentUpdated {
+                intent: "c".to_string(),
+            },
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(seq, 3);
+        let events = assert_one_event_per_line(&path);
+        assert_eq!(events.len(), 3);
+    }
+
+    /// koto#419 as seen: two complete events on the last line with no
+    /// newline between them refused every later write. The append now
+    /// splits them, keeps the log as it was in a backup, and goes on.
+    #[test]
+    fn append_splits_a_merged_last_line_and_keeps_a_backup() {
+        let dir = TempDir::new().unwrap();
+        let big = "x".repeat(10_000);
+        let merged = format!(
+            "{}{}{}\n",
+            line(&intent(3, "small")),
+            line(&intent(4, &big)),
+            line(&intent(5, "medium sized intent"))
+        );
+        let path = log_with_tail(dir.path(), &[intent(1, "a"), intent(2, "b")], &merged);
+        let original = std::fs::read_to_string(&path).unwrap();
+
+        let seq = append_event(
+            &path,
+            &EventPayload::IntentUpdated {
+                intent: "after".to_string(),
+            },
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(seq, 6);
+        let events = assert_one_event_per_line(&path);
+        assert_eq!(events.len(), 6);
+        match &events[3].payload {
+            EventPayload::IntentUpdated { intent } => assert_eq!(intent, &big),
+            other => panic!("unexpected payload {other:?}"),
+        }
+
+        let backups = backups(dir.path());
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert!(
+            backups[0]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with(".seq3-merged.bak"),
+            "{backups:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for p in [&path, &backups[0]] {
+                let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{}", p.display());
+            }
+        }
+        // No temp file is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// The merged line without its own newline, and as the log's only
+    /// event line, splits the same way; the idempotent path splits too.
+    #[test]
+    fn idempotent_append_splits_an_unterminated_merged_first_event_line() {
+        let dir = TempDir::new().unwrap();
+        let merged = format!("{}{}", line(&intent(1, "a")), line(&intent(2, "b")));
+        let path = log_with_tail(dir.path(), &[], &merged);
+        let outcome = append_event_idempotent(
+            &path,
+            &EventPayload::IntentUpdated {
+                intent: "c".to_string(),
+            },
+            "2026-01-01T00:00:00Z",
+            "s",
+            Some("hash-c"),
+        )
+        .unwrap();
+        assert_eq!(outcome, AppendOutcome::Written { seq: 3 });
+        assert_eq!(assert_one_event_per_line(&path).len(), 3);
+        assert_eq!(backups(dir.path()).len(), 1);
+    }
+
+    /// A genuinely truncated last line behaves as it always has: the
+    /// append is refused with the same message and nothing is touched.
+    #[test]
+    fn append_still_refuses_a_truncated_last_line_and_touches_nothing() {
+        let dir = TempDir::new().unwrap();
+        let full = line(&intent(2, "b"));
+        for tail in [
+            format!("{}\n", &full[..full.len() / 2]),
+            full[..full.len() - 1].to_string(),
+            // A complete event followed by the start of another.
+            format!("{}{}\n", full, &full[..10]),
+        ] {
+            let path = log_with_tail(dir.path(), &[intent(1, "a")], &tail);
+            let before = std::fs::read_to_string(&path).unwrap();
+            let err = append_event(
+                &path,
+                &EventPayload::IntentUpdated {
+                    intent: "c".to_string(),
+                },
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .starts_with("failed to parse last event line: "),
+                "{err}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert!(backups(dir.path()).is_empty());
+        }
+    }
+
+    /// Merged events whose seqs don't continue the log are left alone, and
+    /// the refusal names the line and how to repair it.
+    #[test]
+    fn append_refuses_merged_events_that_do_not_follow_and_names_the_line() {
+        let dir = TempDir::new().unwrap();
+        let merged = format!("{}{}\n", line(&intent(5, "x")), line(&intent(6, "y")));
+        let path = log_with_tail(dir.path(), &[intent(1, "a"), intent(2, "b")], &merged);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let err = append_event(
+            &path,
+            &EventPayload::IntentUpdated {
+                intent: "c".to_string(),
+            },
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("line 4 of "), "{msg}");
+        assert!(msg.contains("seq 5, 6"), "{msg}");
+        assert!(
+            msg.contains("put each of those events on a line of its own"),
+            "{msg}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(backups(dir.path()).is_empty());
+    }
+
+    /// A reader sees a merged final line as the events it holds, instead of
+    /// dropping both as a torn tail; a torn tail is still dropped.
+    #[test]
+    fn reader_reads_a_merged_final_line_as_its_events() {
+        let dir = TempDir::new().unwrap();
+        let merged = format!("{}{}\n", line(&intent(2, "b")), line(&intent(3, "c")));
+        let path = log_with_tail(dir.path(), &[intent(1, "a")], &merged);
+        let (_, events) = read_events(&path).unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        let full = line(&intent(2, "b"));
+        let path = log_with_tail(dir.path(), &[intent(1, "a")], &full[..full.len() - 3]);
+        let (_, events) = read_events(&path).unwrap();
+        assert_eq!(events.len(), 1);
+
+        // Merged events that don't continue the log are a torn tail to the
+        // reader, as before.
+        let merged = format!("{}{}\n", line(&intent(7, "b")), line(&intent(8, "c")));
+        let path = log_with_tail(dir.path(), &[intent(1, "a")], &merged);
+        let (_, events) = read_events(&path).unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn split_concatenated_takes_only_whole_events() {
+        let a = line(&intent(1, "a"));
+        let b = line(&intent(2, "b"));
+        let merged = format!("{a}{b}");
+        let pieces = split_concatenated(&merged).unwrap();
+        assert_eq!(
+            pieces.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            vec![a.as_str(), b.as_str()]
+        );
+        assert!(split_concatenated(&a).is_none(), "one event is not merged");
+        assert!(split_concatenated(&format!("{a}{}", &b[..5])).is_none());
+        assert!(split_concatenated(&format!("{a}{{\"x\":1}}")).is_none());
+        assert!(split_concatenated("").is_none());
     }
 }

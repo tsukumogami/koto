@@ -323,6 +323,43 @@ fn append_note(mut stderr: RedactedText, note: String) -> RedactedText {
     }
 }
 
+/// How long a killed command's process group gets to be gone before koto
+/// goes on without it.
+const GROUP_EXIT_WAIT: Duration = Duration::from_secs(5);
+
+/// Wait until no process is left in the process group `pgid`, killing
+/// whatever is still there with SIGKILL on each look, for at most `limit`.
+/// Returns whether the group was gone in time.
+///
+/// SIGKILL is delivered asynchronously: when `killpg` returns, a member can
+/// still be running, and one that was mid-`fork` can leave a new child in the
+/// group that the first signal never reached. koto writes the action's result
+/// to the session log right after this, so a member still alive then could
+/// append to the same log after koto has moved on (koto#419). Looking again,
+/// and signalling again, until `killpg(pgid, 0)` reports no such group closes
+/// that window. A zombie still counts as present until it is reaped, which
+/// happens as soon as it is orphaned to init; the bound keeps a host that
+/// never reaps from holding the tick.
+fn wait_for_group_exit(pgid: i32, limit: Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        // SAFETY: signal 0 only checks that the group exists.
+        if unsafe { libc::killpg(pgid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        // SAFETY: SIGKILL to the group the command was started in.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Milliseconds since `started`, saturating.
 pub fn elapsed_ms(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -334,7 +371,10 @@ pub fn elapsed_ms(started: std::time::Instant) -> u64 {
 /// environment `env` describes and standard input at end of file. A missing
 /// `/bin/sh` is reported as a spawn failure; there is no fallback to a `PATH`
 /// search. If `timeout_secs` is 0,
-/// a default of 30 seconds is used. On timeout the entire process group is killed.
+/// a default of 30 seconds is used. On timeout the entire process group is
+/// killed, and this returns only once the group is gone (or
+/// [`GROUP_EXIT_WAIT`] has passed, which the note then says), so nothing
+/// the command started is still running when the caller records its result.
 ///
 /// Both pipes are drained on their own threads for the whole life of the
 /// child, so a command emitting more than the kernel pipe buffer never
@@ -410,15 +450,23 @@ pub fn run_shell_command(
         )),
         Err(e) => Some(format!("error waiting for command: {}", e)),
     };
-    if note.is_some() {
-        let pid = child.id() as i32;
+    let note = note.map(|note| {
+        let pgid = child.id() as i32;
         // SAFETY: killpg sends SIGKILL to the process group we created.
         unsafe {
-            libc::killpg(pid, libc::SIGKILL);
+            libc::killpg(pgid, libc::SIGKILL);
         }
         // Reap the child so we don't leave a zombie.
         let _ = child.wait();
-    }
+        if wait_for_group_exit(pgid, GROUP_EXIT_WAIT) {
+            note
+        } else {
+            format!(
+                "{note}; its process group was still present {} seconds after the kill",
+                GROUP_EXIT_WAIT.as_secs()
+            )
+        }
+    });
     let duration_ms = elapsed_ms(started);
 
     // Redact once, after both readers finish and before anything decodes,
@@ -528,6 +576,79 @@ mod tests {
         assert_eq!(out.stdout.trim(), "partial");
         assert!(out.stderr.contains("noticed"));
         assert!(out.stderr.contains("timed out"));
+    }
+
+    /// koto#419: a timed-out command's background children are in its
+    /// process group, and none of them is left running, or writing, once
+    /// the runner returns. The command records its process group id, starts
+    /// two writers in the background that append a line every few
+    /// milliseconds (one through a nested subshell, a grandchild), and then
+    /// outlives its timeout.
+    #[test]
+    fn timeout_leaves_nothing_from_the_group_running() {
+        let dir = tmp_dir();
+        let out = run_shell_command(
+            "echo $$ > pgid; \
+             ( while :; do echo a >> appends; sleep 0.002; done ) & \
+             sh -c '( while :; do echo b >> appends; sleep 0.002; done ) & wait' & \
+             sleep 60",
+            dir.path(),
+            1,
+            &CommandEnv::inherit(),
+        );
+        assert_eq!(out.failure_kind, Some(FailureKind::TimedOut));
+        assert!(
+            out.stderr.ends_with("command timed out after 1 seconds"),
+            "{}",
+            out.stderr
+        );
+
+        let pgid: i32 = std::fs::read_to_string(dir.path().join("pgid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only asks whether the group exists.
+        let ret = unsafe { libc::killpg(pgid, 0) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert!(
+            ret != 0 && errno == Some(libc::ESRCH),
+            "the group must be gone when the runner returns (ret {ret}, errno {errno:?})"
+        );
+
+        let appends = dir.path().join("appends");
+        let before = std::fs::read_to_string(&appends).unwrap();
+        assert!(before.contains('a') && before.contains('b'), "{before:?}");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            std::fs::read_to_string(&appends).unwrap(),
+            before,
+            "nothing the command started may write after the runner returns"
+        );
+    }
+
+    /// The wait reports a missing group as gone at once, and gives up at its
+    /// bound on a group that stays: here a killed child this test hasn't
+    /// reaped yet, which stays in its group until it is.
+    #[test]
+    fn group_exit_wait_reports_what_it_saw() {
+        // No process group has this id on Linux or macOS.
+        assert!(wait_for_group_exit(i32::MAX - 1, Duration::from_millis(50)));
+
+        let mut cmd = Command::new(SHELL);
+        cmd.args(["-c", "sleep 60"]);
+        // SAFETY: setpgid(0, 0) in the child before exec, as the runner does.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+        let mut sleeper = cmd.spawn().unwrap();
+        let pgid = sleeper.id() as i32;
+        assert!(!wait_for_group_exit(pgid, Duration::from_millis(100)));
+        let _ = sleeper.wait();
+        assert!(wait_for_group_exit(pgid, Duration::from_secs(5)));
     }
 
     #[test]

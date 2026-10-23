@@ -1233,6 +1233,12 @@ fn repair_torn_tail(path: &Path) -> Result<bool, RequestStoreError> {
     if terminated && parses {
         return Ok(false);
     }
+    // Complete events merged onto one line are not a torn tail: truncating
+    // would drop them all. The append that follows splits the line into one
+    // line per event (koto#419).
+    if std::str::from_utf8(&content).is_ok_and(crate::engine::persistence::last_line_would_split) {
+        return Ok(false);
+    }
 
     let keep = content.len() - last.len();
     let file = std::fs::OpenOptions::new()
