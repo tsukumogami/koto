@@ -670,13 +670,21 @@ journal lines off the host; a tool that does must leave out every
 
 ### Reads from another agent session
 
+A `koto context get` or `koto context exists` with no reader's anchor
+(`KOTO_ANCHOR` unset, or naming no anchor here) goes to this host's read
+spool beside the session read, not to its log. A visit's sum reads the
+session's log and its spool together, merged by timestamp: a spooled read
+made at or after the event the visit's window starts from counts in that
+visit, in first-read order with the log's reads. The spool is never sent
+anywhere and holds only reads made on this host.
+
 A `koto context get` or `koto context exists` run from another agent
 session (one whose `KOTO_ANCHOR` names an anchor that doesn't hold the
 session read) is logged in the reader's anchor, not in the session it read
 (see the [session-feed contract](session-feed.md#reads-from-another-agent-session)).
-The session read's own visits never count it, since its log holds no event
-for it. When the anchor commits the read, koto writes one `context_reads`
-record for it, attributed to the session read:
+The session read's own visits never count it, since neither its log nor its
+spool holds it. When the anchor commits the read, koto writes one
+`context_reads` record for it, attributed to the session read:
 
 - `session`, `koto.session.id` and `koto.run.id` are the session read's,
   taken from its header and its cached run id without writing anything of

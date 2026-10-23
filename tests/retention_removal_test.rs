@@ -15,7 +15,9 @@
 //! hierarchy`, `koto context list`), and, in Finished child, Finished parent
 //! and Grandchild, with `koto context get` and `koto context exists` from
 //! another agent session, whose read records go to that session's anchor
-//! (`Env::read_from_another_agent_session`).
+//! (`Env::read_from_another_agent_session`), and from a shell with no
+//! anchor, whose reads go to the host-local read spool
+//! (`Env::read_with_no_anchor`).
 //!
 //! The workspace-prune steps of these scenarios live here rather than in
 //! `tests/cli_workspace_prune.rs` because they need the same single-writer
@@ -67,6 +69,12 @@ Done.
 "#;
 
 const BUCKET: &str = "koto-retention-removal";
+
+/// The host-local read spool beside a session's local copy. It holds reads
+/// of the session made with no reader's anchor and is never the session's
+/// state, so the single-writer hashes leave it out and the read steps check
+/// it on their own.
+const SPOOL: &str = "context-reads.jsonl";
 
 /// A one-second retention, so a test can wait it out.
 const FAST: [(&str, &str); 3] = [
@@ -272,6 +280,7 @@ impl Env {
         let env = [("KOTO_ANCHOR", READER)];
         for (verb, access) in [("get", "content"), ("exists", "presence")] {
             let before = self.events_text(READER).len();
+            let spooled = self.spooled(name).len();
             self.step(&[READER], None, &[], || {
                 let out = self.run(&["context", verb, name, key], &env);
                 assert!(out.status.success(), "context {verb} {name} {key}: {out:?}");
@@ -285,7 +294,42 @@ impl Env {
             assert_eq!(added[0]["payload"]["session"], name);
             assert_eq!(added[0]["payload"]["key"], key);
             assert_eq!(added[0]["payload"]["access"], access);
+            assert_eq!(
+                self.spooled(name).len(),
+                spooled,
+                "an anchored read spooled"
+            );
         }
+    }
+
+    /// Read `key` of `name` with no reader's anchor, as a bare shell would:
+    /// `koto context get` and `koto context exists` are each a single-writer
+    /// step in which no session's files change (the read spool aside), and
+    /// each adds one read to the spool beside `name`.
+    fn read_with_no_anchor(&self, name: &str, key: &str) {
+        for (verb, access) in [("get", "content"), ("exists", "presence")] {
+            let before = self.spooled(name).len();
+            self.step(&[], None, &[], || {
+                let out = self.run(&["context", verb, name, key], &[]);
+                assert!(out.status.success(), "context {verb} {name} {key}: {out:?}");
+            });
+            let spooled = self.spooled(name);
+            assert_eq!(spooled.len(), before + 1, "{spooled:#?}");
+            let last = &spooled[before];
+            assert_eq!(last["type"], "context_read");
+            assert_eq!(last["payload"]["key"], key);
+            assert_eq!(last["payload"]["access"], access);
+            assert!(last["payload"].get("session").is_none());
+        }
+    }
+
+    /// The lines of the read spool beside `name`.
+    fn spooled(&self, name: &str) -> Vec<Value> {
+        std::fs::read_to_string(self.sessions().join(name).join(SPOOL))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
     }
 
     /// The keys `name` holds, read with a command that records no read.
@@ -379,7 +423,7 @@ impl Env {
                     .any(|c| p.file_name().is_some_and(|f| f == *c));
                 if meta.is_dir() {
                     stack.push(p);
-                } else if meta.is_file() && !cache {
+                } else if meta.is_file() && !cache && !p.ends_with(SPOOL) {
                     let digest = Sha256::digest(std::fs::read(&p).unwrap());
                     out.insert(
                         p.strip_prefix(&root).unwrap().to_path_buf(),
@@ -625,6 +669,7 @@ fn a_finished_parent_is_kept_and_lists_its_terminal_children() {
     let h = env.hierarchy("c", &[]);
     assert!(listed(&h, "members").contains(&"a".to_string()), "{h:#}");
     env.read_from_another_agent_session("a", "notes/a");
+    env.read_with_no_anchor("a", "notes/a");
 
     // The prunes name c as why a and b are kept.
     for args in [&[][..], &["--apply", "--all"][..]] {
@@ -689,6 +734,7 @@ fn finished_child(no_request_store: bool) {
     let h = env.hierarchy("a", &[]);
     assert!(listed(&h, "members").contains(&"b".to_string()), "{h:#}");
     env.read_from_another_agent_session("b", "notes/b");
+    env.read_with_no_anchor("b", "notes/b");
     assert!(env.exists("x"));
 }
 
@@ -723,6 +769,7 @@ fn grandchild(no_request_store: bool) {
     }
     assert!(env.exists("b") && env.exists("c"));
     env.read_from_another_agent_session("c", "notes/c");
+    env.read_with_no_anchor("c", "notes/c");
 }
 
 #[test]
@@ -1108,6 +1155,39 @@ fn a_released_replace_still_sweeps_the_predecessors_children() {
 
 fn object_key(env: &Env, name: &str, file: &str) -> String {
     format!("{}/{}/{}", env.prefix(), name, file)
+}
+
+/// The cross-session read steps under the cloud backend: a finished child
+/// read from another agent session, with the reader's anchor named and with
+/// none, keeps its files and its objects in the bucket as they were; the
+/// anchored read goes into the reader's anchor and the anchorless one into
+/// the spool on this host.
+#[test]
+fn under_the_cloud_backend_reads_of_another_session_leave_it_byte_identical() {
+    let s3 = FakeS3::start(BUCKET);
+    let env = Env::cloud(&s3);
+    env.init("a");
+    env.dispatched("b", "a");
+    env.add_key("b", "notes/b", "b's notes");
+    let v = env.tick("b", false);
+    assert_eq!(retention(&v), (true, Some("hierarchy".to_string())));
+    let objects = |name: &str| -> Vec<(String, Vec<u8>)> {
+        s3.keys_under(&format!("{}/{name}/", env.prefix()))
+            .into_iter()
+            .map(|k| {
+                let v = s3.object(&k).unwrap();
+                (k, v)
+            })
+            .collect()
+    };
+    let before = objects("b");
+    env.read_from_another_agent_session("b", "notes/b");
+    env.read_with_no_anchor("b", "notes/b");
+    assert_eq!(objects("b"), before, "b's objects in the bucket changed");
+    assert!(
+        objects("b").iter().all(|(k, _)| !k.ends_with(SPOOL)),
+        "the spool reached the bucket"
+    );
 }
 
 #[test]

@@ -50,6 +50,10 @@ fn koto_cmd(dir: &Path) -> Command {
     ] {
         cmd.env_remove(var);
     }
+    // By default a command runs as the agent session that owns the sessions
+    // `init` starts, so a `koto context get` is an own read, logged in the
+    // session read. A test that wants another reader names it per command.
+    cmd.env("KOTO_ANCHOR", OWN_ANCHOR);
     // A gate script shells out to this build's `koto`.
     cmd.env(
         "PATH",
@@ -77,7 +81,27 @@ fn run_ok(dir: &Path, args: &[&str]) -> std::process::Output {
     out
 }
 
+/// The anchor of the agent session that owns every session [`init`] starts.
+const OWN_ANCHOR: &str = "anchor-own";
+
+/// Start `name` from `template` under [`OWN_ANCHOR`], opened first, so the
+/// session holds `koto/links/held-by/anchor-own` and the harness's reads of
+/// it are its own agent session's.
 fn init(dir: &Path, name: &str, template: &str) {
+    if !sessions_base(dir).join(OWN_ANCHOR).exists() {
+        run_ok(
+            dir,
+            &[
+                "session",
+                "anchor",
+                "open",
+                "--harness-session",
+                "own",
+                "--source",
+                "startup",
+            ],
+        );
+    }
     let src = dir.join(format!("{name}.md"));
     std::fs::write(&src, template).unwrap();
     run_ok(dir, &["init", name, "--template", src.to_str().unwrap()]);
@@ -539,16 +563,26 @@ fn writers_are_recorded_in_the_log_and_the_manifest() {
         manifest_writer(dir, "w", "slot").as_deref(),
         Some("transition")
     );
+    // (The held-by link `init` records under the harness's anchor is koto's
+    // own write, under `koto/`, and isn't one of these.)
+    let own_key = |e: &Value| {
+        e["payload"]["key"]
+            .as_str()
+            .is_some_and(|k| k.starts_with("koto/"))
+    };
     assert!(events(dir, "w")
         .iter()
-        .all(|e| e["type"] != "context_added"));
+        .all(|e| e["type"] != "context_added" || own_key(e)));
 
     // koto context add and remove: agent.
     add(dir, "w", "extra", "agent text");
     assert_eq!(manifest_writer(dir, "w", "extra").as_deref(), Some("agent"));
     run_ok(dir, &["context", "remove", "w", "extra"]);
     let evs = events(dir, "w");
-    let added = evs.iter().find(|e| e["type"] == "context_added").unwrap();
+    let added = evs
+        .iter()
+        .find(|e| e["type"] == "context_added" && !own_key(e))
+        .unwrap();
     assert_eq!(added["payload"]["writer"], "agent");
     let removed = evs.iter().find(|e| e["type"] == "context_removed").unwrap();
     assert_eq!(removed["payload"]["writer"], "agent");
@@ -1028,42 +1062,128 @@ fn an_own_read_still_logs_in_the_session_read_including_a_gate_read() {
     );
 }
 
+/// The read spool's file name beside a session.
+const SPOOL: &str = "context-reads.jsonl";
+
+/// `name`'s file hashes but its read spool's.
+fn without_spool(hashes: Hashes) -> Hashes {
+    hashes
+        .into_iter()
+        .filter(|(p, _)| !p.ends_with(SPOOL))
+        .collect()
+}
+
+/// The reads spooled beside `name`, as (key, access, session), from the
+/// spool's lines.
+fn spooled_rows(dir: &Path, name: &str) -> Vec<(String, String, Option<String>)> {
+    std::fs::read_to_string(sessions_base(dir).join(name).join(SPOOL))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            let v: Value = serde_json::from_str(l).unwrap();
+            assert_eq!(v["type"], "context_read", "{l}");
+            assert!(v["timestamp"].is_string(), "{l}");
+            let p = &v["payload"];
+            (
+                p["key"].as_str().unwrap().to_string(),
+                p["access"].as_str().unwrap_or("content").to_string(),
+                p["session"].as_str().map(str::to_string),
+            )
+        })
+        .collect()
+}
+
 #[test]
-fn with_no_reader_anchor_a_read_logs_in_the_session_read_as_before() {
+fn with_no_reader_anchor_a_read_goes_to_the_spool_and_the_session_stays_byte_identical() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     two_agent_sessions(dir);
-    let anchors = (
-        session_hashes(dir, "anchor-H"),
-        session_hashes(dir, "anchor-R"),
-    );
+    let before = store_hashes(dir);
     run_env_ok(dir, &["context", "get", "s", "note"], &[]);
     run_env_ok(
         dir,
         &["context", "get", "s", "note"],
         &[("KOTO_ANCHOR", "anchor-nobody")],
     );
-    // An ordinary session's name is no anchor either.
+    // An ordinary session's name is no anchor either, the read one included.
     run_env_ok(
         dir,
         &["context", "exists", "s", "note"],
         &[("KOTO_ANCHOR", "s")],
     );
+    // Nothing of s changed but its spool, and no anchor changed at all.
+    let after = store_hashes(dir);
+    for (name, hashes) in &before {
+        assert_eq!(
+            without_spool(after[name].clone()),
+            without_spool(hashes.clone()),
+            "{name} changed"
+        );
+    }
+    for anchor in ["anchor-H", "anchor-R"] {
+        assert_eq!(after[anchor], before[anchor], "{anchor} changed");
+    }
+    assert!(read_rows(dir, "s").is_empty(), "a read reached s's log");
     assert_eq!(
-        read_rows(dir, "s"),
+        spooled_rows(dir, "s"),
         vec![
             ("note".into(), "content".into(), None),
             ("note".into(), "content".into(), None),
             ("note".into(), "presence".into(), None),
         ]
     );
-    assert_eq!(
-        (
-            session_hashes(dir, "anchor-H"),
-            session_hashes(dir, "anchor-R")
-        ),
-        anchors
-    );
+}
+
+/// Spooled reads are journal input only: an anchorless read of the session
+/// an anchor holds, of the anchor itself and of another anchor moves no
+/// anchor's last activity. With a two second idle period, each anchor
+/// idles out exactly two seconds after its own last event.
+#[test]
+fn a_spooled_read_counts_as_no_sessions_activity() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    two_agent_sessions(dir);
+    let last_of = |name: &str| {
+        millis(
+            events(dir, name).last().unwrap()["timestamp"]
+                .as_str()
+                .unwrap(),
+        )
+    };
+    let lasts = [
+        ("anchor-H", last_of("anchor-H")),
+        ("anchor-R", last_of("anchor-R")),
+    ];
+    sleep_until(lasts[1].1 + 800);
+    for (name, key) in [
+        ("s", "note"),
+        ("anchor-H", "nothing"),
+        ("anchor-R", "nothing"),
+    ] {
+        let _ = run_env(dir, &["context", "get", name, key], &[]);
+        let _ = run_env(dir, &["context", "exists", name, key], &[]);
+    }
+    assert_eq!(spooled_rows(dir, "anchor-H").len(), 2);
+    assert_eq!(spooled_rows(dir, "anchor-R").len(), 2);
+    assert_eq!(spooled_rows(dir, "s").len(), 2);
+    for (name, last) in lasts {
+        assert_eq!(last_of(name), last, "{name}'s log moved");
+    }
+
+    sleep_until(lasts[1].1 + 2300);
+    let idle = [("KOTO_RETENTION_IDLE_PERIOD", "2s")];
+    for (name, last) in lasts {
+        let out = run_env_ok(dir, &["session", "hierarchy", name, "--json"], &idle);
+        let h: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let m = member(&h, name);
+        assert_eq!(m["alive"], false, "{h:#}");
+        assert_eq!(m["close_kind"], "idle");
+        assert_eq!(
+            millis(m["stopped_at"].as_str().unwrap()),
+            last + 2000,
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -1226,7 +1346,9 @@ fn a_read_record_is_activity_of_the_readers_anchor_and_never_of_the_holder() {
 /// The run journal: a read from another agent session during one of s's
 /// visits adds no context read to s's visit, and is journaled against s,
 /// with the reader's anchor as `koto.context.read_by`, when the anchor
-/// records it.
+/// records it. An anchorless read in the same visit is spooled, and s's
+/// visit sum reads it through the spool, merged by time with the gates'
+/// reads from the log.
 #[test]
 fn the_run_journal_attributes_an_anchors_read_record_to_the_session_it_names() {
     let tmp = TempDir::new().unwrap();
@@ -1236,6 +1358,11 @@ fn the_run_journal_attributes_an_anchors_read_record_to_the_session_it_names() {
         dir,
         &["context", "get", "s", "note"],
         &[("KOTO_ANCHOR", "anchor-R")],
+    );
+    run_env_ok(dir, &["context", "exists", "s", "note"], &[]);
+    assert_eq!(
+        spooled_rows(dir, "s"),
+        vec![("note".into(), "presence".into(), None)]
     );
     // s's check visit ends: its gates pass and it moves to `work`.
     let v = next(dir, "s", None);
@@ -1265,10 +1392,15 @@ fn the_run_journal_attributes_an_anchors_read_record_to_the_session_it_names() {
     assert_eq!(r["koto.session.id"], header["session_id"]);
     assert!(r.get("koto.seq").is_none());
 
-    // s's own fold of the check visit holds its gates' reads and no cli read.
-    assert!(!fold.is_empty());
+    // s's own sum of the check visit: the spooled anchorless read first (it
+    // came before the tick), then its gates' reads from the log, and never
+    // the read the anchor recorded.
+    assert!(fold.len() >= 2, "{fold:#?}");
+    assert_eq!(fold[0]["koto.context.reader"], "cli", "{fold:#?}");
+    assert_eq!(fold[0]["koto.context.access"], "presence");
+    assert_eq!(fold[0]["koto.context.read_count"], 1);
     assert!(
-        fold.iter().all(|r| r["koto.context.reader"] == "gate"),
+        fold[1..].iter().all(|r| r["koto.context.reader"] == "gate"),
         "{fold:#?}"
     );
     // The anchor's log holds the read, naming s and the key.
