@@ -2378,19 +2378,20 @@ impl SessionBackend for CloudBackend {
         timestamp: &str,
     ) -> anyhow::Result<()> {
         self.local_guard(id)?;
-        // A read of `id` by anything but its own tick, and the pull of a
-        // changed key that read made, are kept on this host, in the read
-        // spool, and never written into `id`'s log or pushed: the reader
-        // must not become a writer of a session it only read. Nothing that
-        // decides from the log misses the pull: clear-on-entry already
+        // An anchorless read of `id` by anything but its own tick, and the
+        // pull of a changed key such a read made, are kept on this host, in
+        // the read spool, and never written into `id`'s log or pushed: the
+        // reader must not become a writer of a session it only read. Nothing
+        // that decides from the log misses the pull: clear-on-entry already
         // passes over `sync` writes (`crate::engine::clear_on_entry`).
-        // This is the backstop for a caller that doesn't route its reads.
-        // `koto context get` and `exists` do: they spool an anchorless read
-        // themselves, send an own read through `append_own_read`, which
-        // skips this, and write a read from another agent session into the
-        // reader's anchor, carrying the session it read in `session`. That
-        // one is the anchor's own write and goes into its log like any
-        // other, which `read_spool::spooled` leaves out.
+        //
+        // For reads this is the backstop for a caller that doesn't route
+        // them. `koto context get` and `exists` do: they spool an anchorless
+        // read themselves, send an own read through `append_own_read`,
+        // which skips this, and write a read from another agent session into
+        // the reader's anchor, carrying the session it read in `session`.
+        // That one is the anchor's own write and goes into its log like any
+        // other; `read_spool::spooled` is false for it.
         if crate::session::read_spool::spooled(payload) && !self.is_own_tick(id) {
             return crate::session::read_spool::append(
                 &self.local.session_dir(id),

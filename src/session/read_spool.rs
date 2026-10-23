@@ -11,9 +11,9 @@
 //! beside the session in the local store, under either backend, and never
 //! pushed. There are two writers: `koto context get` and `exists` spool an
 //! anchorless read themselves (`src/cli/context.rs`), on both backends, and
-//! the cloud backend's `append_event` spools any other `context_read` made
-//! outside the session's own tick, as a backstop for a caller that doesn't
-//! route its reads. An own read (the reader's anchor is the session or holds
+//! the cloud backend's `append_event` spools any other anchorless
+//! `context_read` made outside the session's own tick, as a backstop for a
+//! caller that doesn't route its reads. An own read (the reader's anchor is the session or holds
 //! it, or the read ran in its own tick) still goes into the log, and so does
 //! a read another agent session's anchor records of it, in that anchor's log.
 //!
@@ -38,9 +38,9 @@
 //!
 //! [`read`] is its one reader of reads and [`append`] its one writer
 //! function, which two production call sites use: the read routing of
-//! `koto context get` and `koto context exists` for an anchorless read on the
-//! local backend, and the cloud backend's read path in
-//! `crate::session::cloud`. Whatever consumes these reads (today the run
+//! `koto context get` and `koto context exists` for an anchorless read, on
+//! either backend, and the cloud backend's `append_event` in
+//! `crate::session::cloud`, for reads and pulls. Whatever consumes these reads (today the run
 //! journal's visit fold, `crate::run_journal`) goes through `read`, so the
 //! spool can move or change shape by changing these two functions and both
 //! call sites.
