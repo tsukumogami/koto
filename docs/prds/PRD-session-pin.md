@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 problem: |
   koto keeps a finished session only while something live in its hierarchy
   holds it, plus a retention period, then removes it at the next cleanup,
@@ -24,7 +24,7 @@ source_issue: 441
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
