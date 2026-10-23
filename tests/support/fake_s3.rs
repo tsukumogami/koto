@@ -63,6 +63,9 @@ struct Fault {
     /// Store a PUT's body before answering with the failure, as an
     /// endpoint that wrote the object and lost the reply would.
     store: bool,
+    /// How many more matching requests fail, after which the fault is
+    /// dropped; `None` fails every one.
+    remaining: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +188,19 @@ impl FakeS3 {
             key: key.to_string(),
             status,
             store: false,
+            remaining: None,
+        });
+    }
+
+    /// [`FakeS3::fail`] for the next `times` matching requests only; the
+    /// ones after them are answered as usual.
+    pub fn fail_times(&self, method: &str, key: &str, status: u16, times: u32) {
+        lock(&self.state).faults.push(Fault {
+            method: method.to_string(),
+            key: key.to_string(),
+            status,
+            store: false,
+            remaining: Some(times),
         });
     }
 
@@ -196,6 +212,7 @@ impl FakeS3 {
             key: key.to_string(),
             status,
             store: true,
+            remaining: None,
         });
     }
 
@@ -443,12 +460,19 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
     } else {
         (req.method.clone(), key.clone())
     };
-    if let Some(fault) = st
+    if let Some(at) = st
         .faults
         .iter()
-        .find(|f| f.method == fault_method && f.key == fault_key)
-        .cloned()
+        .position(|f| f.method == fault_method && f.key == fault_key)
     {
+        let fault = st.faults[at].clone();
+        if let Some(left) = fault.remaining {
+            if left <= 1 {
+                st.faults.remove(at);
+            } else {
+                st.faults[at].remaining = Some(left - 1);
+            }
+        }
         if fault.store {
             st.objects.insert(key.clone(), req.body.clone());
         }
