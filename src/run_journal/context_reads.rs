@@ -555,6 +555,7 @@ mod tests {
             hash: Some("cd".repeat(32)),
             access: None,
             gate: None,
+            session: None,
         };
         let spool = |at: &str, key: &str| {
             crate::session::read_spool::append(dir.path(), at, &spooled(key)).unwrap()
