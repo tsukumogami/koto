@@ -786,7 +786,14 @@ fn removing_sessions_never_changes_lines_already_written() {
         r#"{"go": "yes"}"#,
     ]);
     let before = env.raw_journal();
-    env.ok(&["workspace", "prune", "--root", "c", "--yes"]);
+    // The prune removes `c` once the retention rule releases it: wait out a
+    // one-second retention.
+    std::thread::sleep(std::time::Duration::from_millis(1300));
+    let mut cmd = env.cmd(None);
+    cmd.env("KOTO_RETENTION_KEEP", "1s")
+        .env("KOTO_RETENTION_STALE_AFTER", "1h");
+    let out = Env::run(cmd, &["workspace", "prune", "--root", "c", "--yes"]);
+    assert!(out.ok, "{}\n{}", out.stdout, out.stderr);
     assert!(!env.session_dir("c").exists());
     assert_eq!(env.raw_journal(), before, "workspace prune");
 

@@ -3,27 +3,34 @@
 //! Without `--apply` the verb prints what it would remove, what it keeps and
 //! why, and a plan token, and stores the would-remove list under
 //! `<sessions base>/.prune-plans/<token>.json`. `--apply --plan <token>`
-//! recomputes the set and removes it only when the token still matches.
-//! `--apply` alone (with `--execution-dir`, `--older-than` or `--all`)
-//! removes the recomputed set. Both modes run the same rules.
+//! works the set out again and refuses when it would remove anything the
+//! plan didn't name; what the plan named and the rules now keep is skipped
+//! and listed. `--apply` alone (with `--execution-dir`, `--older-than` or
+//! `--all`) removes the set it works out now. Both modes run the same rules.
 //!
-//! The rules judge every local session that passes the filters, in order,
-//! and the first that applies keeps it:
+//! Every session is judged by the retention engine
+//! ([`crate::session::hierarchy`]) over one scan of the store, with one set
+//! of retention settings and one `now`. The rules judge every local session
+//! that passes the filters, in order, and the first that applies keeps it:
 //!
-//! - a: the session is running or unreadable.
-//! - b: a running or unreadable session references it, or some session's
-//!   header can't be read (it may reference any session).
-//! - c: it references a running or unreadable session.
+//! - a: the session is alive by the engine: a koto session that runs or
+//!   can't be read, or an anchor that is open.
+//! - h: its hierarchy is kept: a live member, the retention not yet passed
+//!   since the hierarchy's release instant, or something unreadable. The
+//!   detail is the rendered verdict, and the entry carries the JSON
+//!   `koto session hierarchy` prints as `hierarchy`. A close session whose
+//!   anchor stays in the store is kept by h too: it goes only with its
+//!   anchor.
 //! - d: its `chain/parent` context key is malformed.
 //! - e: it is bound to a request leg that is still waiting, or whose
 //!   pointer or request can't be read.
 //! - f: it is a coordinator's session (`coordinate-`).
 //! - g: under the cloud backend, its remote copy may be newer.
 //!
-//! A reference is the header's `parent_workflow` or the `chain/parent`
-//! context key, read from the local session directory. A name with no
-//! session behind it protects nothing. Everything here reads the local
-//! store, except rule g and the removal of a session's remote copy.
+//! The filters narrow which sessions are candidates, never which count as
+//! members of a hierarchy, and `--older-than` measures a session's age from
+//! the stop instant the engine reports for it. Everything here reads the
+//! local store, except rule g and the removal of a session's remote copy.
 //!
 //! `--migrated-from <workspace>` switches to marker mode (see [`markers`]),
 //! which removes migration markers and the old copies beside them from the
@@ -31,7 +38,7 @@
 
 mod markers;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -46,8 +53,12 @@ use crate::cli::session_inventory::{
 };
 use crate::session::cloud::RemoteCopy;
 use crate::session::finished::{self, FinishedRecord};
+use crate::session::hierarchy::{
+    self, Graph, Judge, Judgment, MemberKind, RetentionSettings, Scope, Verdict as Hierarchy,
+};
+use crate::session::links::LinkKind;
 use crate::session::validate::validate_session_id;
-use crate::session::{state_file_name, Backend, SessionBackend, SessionError};
+use crate::session::{Backend, SessionBackend, SessionError, SessionLock};
 
 /// The directory under the sessions base where previews store their plans.
 pub const PLANS_DIR: &str = ".prune-plans";
@@ -59,7 +70,7 @@ const PLAN_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// uses it.
 const EXIT_PLAN_REFUSED: i32 = 4;
 
-/// The exit code when a removal failed.
+/// The exit code when a removal failed, or the store couldn't be judged.
 const EXIT_REMOVAL_FAILED: i32 = 3;
 
 /// The kinds of entry the would-remove list holds.
@@ -102,6 +113,13 @@ pub struct RemoveEntry {
     pub finished_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_dir: Option<PathBuf>,
+    /// `anchor` or `anchor_close` for a session that isn't a workflow
+    /// session; absent for one that is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_kind: Option<String>,
+    /// When the session stopped, as the retention engine reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_at: Option<String>,
 }
 
 impl RemoveEntry {
@@ -127,6 +145,14 @@ impl RemoveEntry {
     fn brief(&self) -> serde_json::Value {
         json!({"kind": self.kind, "name": self.name, "session_id": self.session_id})
     }
+
+    fn is_close_session(&self) -> bool {
+        self.session_kind.as_deref() == Some(MemberKind::AnchorClose.as_str())
+    }
+
+    fn is_anchor(&self) -> bool {
+        self.session_kind.as_deref() == Some(MemberKind::Anchor.as_str())
+    }
 }
 
 /// One session a rule keeps.
@@ -135,6 +161,10 @@ pub struct KeptEntry {
     pub name: String,
     pub rule: char,
     pub detail: String,
+    /// For rules a and h: the JSON `koto session hierarchy <name> --json`
+    /// prints for the same judgment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hierarchy: Option<serde_json::Value>,
 }
 
 /// The `mode` a session-mode stored plan records. Marker plans record
@@ -185,43 +215,25 @@ struct Session {
     chain_parent: ChainParent,
 }
 
-impl Session {
-    /// The sessions this one references, each once.
-    fn references(&self, own: &str) -> BTreeSet<String> {
-        let mut refs = BTreeSet::new();
-        if let Some(parent) = self.header.as_ref().and_then(|h| h.parent_workflow.clone()) {
-            refs.insert(parent);
-        }
-        if let ChainParent::Names(parent) = &self.chain_parent {
-            refs.insert(parent.clone());
-        }
-        refs.remove(own);
-        refs
-    }
-}
-
-/// Every local session, read once.
+/// Every local session the graph scan found, inspected once, and the
+/// finished records.
 struct Inventory {
     base: PathBuf,
     sessions: BTreeMap<String, Session>,
-    /// For each name, the sessions that reference it.
-    referencers: HashMap<String, BTreeSet<String>>,
-    /// Sessions whose header couldn't be read, so what they reference is
-    /// unknown (see [`Facts::headerless`]).
-    headerless: BTreeSet<String>,
     /// The finished records of sessions koto removed itself.
     records: Vec<FinishedRecord>,
 }
 
 impl Inventory {
-    fn read(base: &Path) -> Result<Self> {
+    fn read(graph: &Graph) -> Self {
+        let base = graph.base().to_path_buf();
         let mut cache = TemplateCache::new();
         let mut sessions = BTreeMap::new();
-        for name in session_names(base)? {
-            let (seen, header) = inspect_full(base, &name, &mut cache);
-            let chain_parent = read_chain_parent(&base.join(&name));
+        for name in graph.names() {
+            let (seen, header) = inspect_full(&base, name, &mut cache);
+            let chain_parent = read_chain_parent(&base.join(name));
             sessions.insert(
-                name,
+                name.to_string(),
                 Session {
                     seen,
                     header,
@@ -229,62 +241,18 @@ impl Inventory {
                 },
             );
         }
-        let mut referencers: HashMap<String, BTreeSet<String>> = HashMap::new();
-        for (name, s) in &sessions {
-            for target in s.references(name) {
-                referencers.entry(target).or_default().insert(name.clone());
-            }
-        }
-        let headerless = sessions
-            .iter()
-            .filter(|(_, s)| s.header.is_none())
-            .map(|(name, _)| name.clone())
-            .collect();
         // A records directory that can't be read leaves the records out; the
         // sessions are judged all the same.
-        let records = finished::list(base).unwrap_or_else(|e| {
+        let records = finished::list(&base).unwrap_or_else(|e| {
             eprintln!("warning: finished records can't be read: {e:#}");
             Vec::new()
         });
-        Ok(Inventory {
-            base: base.to_path_buf(),
+        Inventory {
+            base,
             sessions,
-            referencers,
-            headerless,
             records,
-        })
-    }
-}
-
-/// The names of every local session under `base`: each directory entry
-/// whose name is a valid session id and that holds `koto-<name>.state.jsonl`.
-/// A symlinked session directory is listed, and `inspect` reports it
-/// unreadable. Dot-directories, such as the stored plans, are never sessions.
-fn session_names(base: &Path) -> Result<Vec<String>> {
-    let entries = match std::fs::read_dir(base) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("failed to read {}", base.display())),
-    };
-    let mut names = Vec::new();
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if name.starts_with('.') || validate_session_id(&name).is_err() {
-            continue;
-        }
-        if session_exists(base, &name) {
-            names.push(name);
         }
     }
-    names.sort();
-    Ok(names)
-}
-
-/// Whether `base/<name>` holds the session's state file.
-fn session_exists(base: &Path, name: &str) -> bool {
-    base.join(name).join(state_file_name(name)).exists()
 }
 
 /// Read `chain/parent` from a session directory's local context. It is
@@ -316,77 +284,85 @@ fn read_chain_parent(session_dir: &Path) -> ChainParent {
     ChainParent::Names(text)
 }
 
-/// How a referenced or referencing session stands, for rules b and c:
-/// `Some` when it may be running (running or unreadable), `None` when it is
-/// finished or doesn't exist.
-fn may_run(status: Option<SessionStatus>) -> Option<&'static str> {
-    match status {
-        Some(SessionStatus::Running) => Some("running"),
-        Some(SessionStatus::Unreadable) => Some("unreadable"),
-        _ => None,
+/// What one prune run judges with: one scan of the store, one set of
+/// retention settings and one `now`.
+struct Engine<'g> {
+    graph: &'g Graph,
+    settings: RetentionSettings,
+    now: SystemTime,
+}
+
+impl Engine<'_> {
+    /// A judge over this run's scan. A fresh one reads every member it is
+    /// asked about again.
+    fn judge(&self) -> Judge<'_> {
+        Judge::new(self.graph, self.settings.clone(), self.now)
     }
 }
 
-/// Everything a rule reads about one session.
-struct Facts<'a> {
-    name: &'a str,
-    status: SessionStatus,
-    chain_parent: &'a ChainParent,
-    references: BTreeSet<String>,
-    referencers: BTreeSet<String>,
-    /// Other sessions whose header couldn't be read. Any of them may name
-    /// this one as its `parent_workflow`, and nothing else can say which
-    /// (the execution directory is in the header too), so each counts as an
-    /// unreadable referencer of every session.
-    headerless: BTreeSet<String>,
-}
-
-/// The first rule that keeps a session, with its detail. `status_of`
-/// answers for another session by name (`None` when there is none).
+/// The first rule that keeps session `name`, given its hierarchy's
+/// judgment.
 fn first_rule(
-    facts: &Facts<'_>,
+    name: &str,
+    session: &Session,
+    judgment: &Judgment,
+    settings: &RetentionSettings,
     base: &Path,
     backend: &Backend,
-    status_of: &mut dyn FnMut(&str) -> Option<SessionStatus>,
+) -> Option<KeptEntry> {
+    if let Hierarchy::Keep { keepers, .. } = &judgment.verdict {
+        let hierarchy = Some(hierarchy::to_json(judgment, settings));
+        if let Some(own) = keepers.iter().find(|k| k.name == name) {
+            let detail = match own.kind {
+                MemberKind::KotoSession if session.seen.status == SessionStatus::Running => {
+                    "the session is running".to_string()
+                }
+                MemberKind::KotoSession => "the session can't be read".to_string(),
+                _ => hierarchy::keeper_line(own),
+            };
+            return Some(KeptEntry {
+                name: name.to_string(),
+                rule: 'a',
+                detail,
+                hierarchy,
+            });
+        }
+        return Some(KeptEntry {
+            name: name.to_string(),
+            rule: 'h',
+            detail: hierarchy::reason_text(&judgment.verdict),
+            hierarchy,
+        });
+    }
+    later_rule(name, &session.chain_parent, base, backend).map(|(rule, detail)| KeptEntry {
+        name: name.to_string(),
+        rule,
+        detail,
+        hierarchy: None,
+    })
+}
+
+/// Rules d to g: what keeps a session whose hierarchy is released.
+fn later_rule(
+    name: &str,
+    chain_parent: &ChainParent,
+    base: &Path,
+    backend: &Backend,
 ) -> Option<(char, String)> {
-    match facts.status {
-        SessionStatus::Running => return Some(('a', "the session is running".to_string())),
-        SessionStatus::Unreadable => return Some(('a', "the session can't be read".to_string())),
-        SessionStatus::Terminal | SessionStatus::Cancelled => {}
-    }
-    for referencer in &facts.referencers {
-        if let Some(how) = may_run(status_of(referencer)) {
-            return Some(('b', format!("referenced by {how} session '{referencer}'")));
-        }
-    }
-    if let Some(other) = facts.headerless.iter().next() {
-        return Some((
-            'b',
-            format!(
-                "session '{other}' has a header that can't be read, so it may reference this \
-                 one; inspect or remove it to let the prune go on"
-            ),
-        ));
-    }
-    for target in &facts.references {
-        if let Some(how) = may_run(status_of(target)) {
-            return Some(('c', format!("references {how} session '{target}'")));
-        }
-    }
-    if let ChainParent::Malformed(why) = facts.chain_parent {
+    if let ChainParent::Malformed(why) = chain_parent {
         return Some((
             'd',
             format!("its chain/parent context key is malformed: {why}"),
         ));
     }
-    if let Some(detail) = leg_keeps(&base.join(facts.name)) {
+    if let Some(detail) = leg_keeps(&base.join(name)) {
         return Some(('e', detail));
     }
-    if facts.name.starts_with("coordinate-") {
+    if name.starts_with("coordinate-") {
         return Some(('f', "a coordinator's session".to_string()));
     }
     if let Backend::Cloud(cloud) = backend {
-        match cloud.remote_copy_check(facts.name) {
+        match cloud.remote_copy_check(name) {
             RemoteCopy::Safe => {}
             RemoteCopy::NotSafe(detail) => return Some(('g', detail)),
             RemoteCopy::Unreadable(why) => {
@@ -444,87 +420,100 @@ fn leg_keeps(session_dir: &Path) -> Option<String> {
     None
 }
 
-/// The filters a session must pass to be judged at all.
+/// The filters a session must pass to be a candidate at all. They never
+/// change which sessions count as members of a hierarchy.
 struct Filters {
     execution_dir: Option<PathBuf>,
     older_than: Option<Duration>,
 }
 
 impl Filters {
-    fn pass(&self, session: &Session, now: SystemTime) -> bool {
-        self.pass_fields(
-            session
-                .header
-                .as_ref()
-                .and_then(|h| h.execution_dir.as_deref()),
-            session.seen.finished_at.as_deref(),
-            now,
-        )
+    fn pass_dir(&self, execution_dir: Option<&Path>) -> bool {
+        match &self.execution_dir {
+            Some(filter) => execution_dir.is_some_and(|dir| under_dir(dir, filter)),
+            None => true,
+        }
     }
 
-    /// The filters over an execution directory and a finish time, which a
-    /// session and a finished record both carry.
-    fn pass_fields(
-        &self,
-        execution_dir: Option<&Path>,
-        finished_at: Option<&str>,
-        now: SystemTime,
-    ) -> bool {
-        if let Some(filter) = &self.execution_dir {
-            if !execution_dir.is_some_and(|dir| under_dir(dir, filter)) {
-                return false;
-            }
-        }
-        if let Some(min_age) = self.older_than {
-            let finished = finished_at.and_then(crate::engine::wake::parse_rfc3339_millis);
-            let Some(finished) = finished else {
-                return false;
-            };
-            match now.duration_since(finished) {
-                Ok(age) if age >= min_age => {}
-                _ => return false,
-            }
-        }
-        true
+    /// Whether something that stopped (or, for a finished record, finished)
+    /// at `at` is old enough. Nothing that hasn't stopped is.
+    fn pass_age(&self, at: Option<&str>, now: SystemTime) -> bool {
+        let Some(min_age) = self.older_than else {
+            return true;
+        };
+        let Some(at) = at.and_then(crate::engine::wake::parse_rfc3339_millis) else {
+            return false;
+        };
+        now.duration_since(at).is_ok_and(|age| age >= min_age)
     }
 }
 
-/// The verdict over a whole inventory: what would go, and what stays.
+/// The verdict over a whole store: what would go, and what stays.
 struct Verdict {
     remove: Vec<RemoveEntry>,
     kept: Vec<KeptEntry>,
+    /// Every stale anchor a judgment named as a keeper, by name, as the
+    /// query lists it (with its close command when one can be built).
+    stale: BTreeMap<String, serde_json::Value>,
     token: String,
 }
 
-fn judge(inv: &Inventory, filters: &Filters, backend: &Backend) -> Verdict {
-    let now = SystemTime::now();
-    let empty = BTreeSet::new();
+fn judge(inv: &Inventory, engine: &Engine<'_>, filters: &Filters, backend: &Backend) -> Verdict {
+    let mut judge = engine.judge();
     let mut remove = Vec::new();
     let mut kept = Vec::new();
+    let mut stale = BTreeMap::new();
+    let mut hierarchies = BTreeMap::new();
     for (name, session) in &inv.sessions {
-        if !filters.pass(session, now) {
+        let execution_dir = session
+            .header
+            .as_ref()
+            .and_then(|h| h.execution_dir.as_deref());
+        if !filters.pass_dir(execution_dir) {
             continue;
         }
-        let facts = Facts {
-            name,
-            status: session.seen.status,
-            chain_parent: &session.chain_parent,
-            references: session.references(name),
-            referencers: inv.referencers.get(name).unwrap_or(&empty).clone(),
-            headerless: inv
-                .headerless
-                .iter()
-                .filter(|h| *h != name)
-                .cloned()
-                .collect(),
+        let judgment = match judge.judge(name, &Scope::Whole) {
+            Ok(j) => j,
+            Err(e) => {
+                kept.push(KeptEntry {
+                    name: name.clone(),
+                    rule: 'h',
+                    detail: format!("kept: its hierarchy can't be judged: {e:#}"),
+                    hierarchy: None,
+                });
+                continue;
+            }
         };
-        let mut status_of = |other: &str| inv.sessions.get(other).map(|s| s.seen.status);
-        match first_rule(&facts, &inv.base, backend, &mut status_of) {
-            Some((rule, detail)) => kept.push(KeptEntry {
-                name: name.clone(),
-                rule,
-                detail,
-            }),
+        let member = judgment.members.iter().find(|m| &m.name == name);
+        let stopped_at = member.and_then(|m| m.stopped_at.clone());
+        if !filters.pass_age(stopped_at.as_deref(), engine.now) {
+            continue;
+        }
+        if let Hierarchy::Keep { keepers, .. } = &judgment.verdict {
+            for k in keepers.iter().filter(|k| k.stale) {
+                stale
+                    .entry(k.name.clone())
+                    .or_insert_with(|| hierarchy::keeper_json(k));
+            }
+        }
+        // A released close session may still be kept below for its anchor;
+        // its entry carries the judgment then.
+        if member.is_some_and(|m| m.kind == MemberKind::AnchorClose) && !judgment.verdict.is_kept()
+        {
+            hierarchies.insert(
+                name.clone(),
+                hierarchy::to_json(&judgment, &engine.settings),
+            );
+        }
+        match first_rule(
+            name,
+            session,
+            &judgment,
+            &engine.settings,
+            &inv.base,
+            backend,
+        ) {
+            Some(entry) => kept.push(entry),
             None => remove.push(RemoveEntry {
                 kind: KIND_SESSION.to_string(),
                 name: name.clone(),
@@ -537,18 +526,45 @@ fn judge(inv: &Inventory, filters: &Filters, backend: &Backend) -> Verdict {
                     .header
                     .as_ref()
                     .and_then(|h| h.execution_dir.clone()),
+                session_kind: member
+                    .map(|m| m.kind)
+                    .filter(|k| *k != MemberKind::KotoSession)
+                    .map(|k| k.as_str().to_string()),
+                stopped_at,
             }),
         }
     }
+    // A close session goes only with its anchor: one whose anchor stays in
+    // the store (kept, or left out by a filter) is kept with it, or the
+    // anchor would read open again.
+    let removing: BTreeSet<String> = remove.iter().map(|e| e.name.clone()).collect();
+    remove.retain(|e| {
+        if !e.is_close_session() {
+            return true;
+        }
+        match closed_anchor(engine.graph, &e.name) {
+            Some(anchor) if engine.graph.contains(&anchor) && !removing.contains(&anchor) => {
+                kept.push(KeptEntry {
+                    name: e.name.clone(),
+                    rule: 'h',
+                    detail: format!(
+                        "kept: a close session goes only with its anchor, and {} stays",
+                        hierarchy::sanitize(&anchor)
+                    ),
+                    hierarchy: hierarchies.get(&e.name).cloned(),
+                });
+                false
+            }
+            _ => true,
+        }
+    });
     // Finished records have no rules: koto writes one only when it removes a
     // session itself, after the session's parent had its result, so nothing
     // still needs a record to learn how a session ended.
     for record in &inv.records {
-        if !filters.pass_fields(
-            record.execution_dir.as_deref(),
-            Some(record.finished_at.as_str()),
-            now,
-        ) {
+        if !filters.pass_dir(record.execution_dir.as_deref())
+            || !filters.pass_age(Some(record.finished_at.as_str()), engine.now)
+        {
             continue;
         }
         remove.push(RemoveEntry {
@@ -564,14 +580,27 @@ fn judge(inv: &Inventory, filters: &Filters, backend: &Backend) -> Verdict {
             failure: record.failure,
             finished_at: Some(record.finished_at.clone()),
             execution_dir: record.execution_dir.clone(),
+            session_kind: None,
+            stopped_at: None,
         });
     }
     let token = plan_token(&remove);
     Verdict {
         remove,
         kept,
+        stale,
         token,
     }
+}
+
+/// The anchor close session `name` closes: the peer of its `closes` link.
+fn closed_anchor(graph: &Graph, name: &str) -> Option<String> {
+    graph.facts(name).and_then(|f| {
+        f.links
+            .iter()
+            .find(|l| l.kind == LinkKind::Closes.as_str())
+            .map(|l| l.peer.clone())
+    })
 }
 
 /// The first 32 hex digits of SHA-256 over the sorted token lines.
@@ -677,8 +706,37 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
         older_than,
     };
 
-    let inv = Inventory::read(&base)?;
-    let verdict = judge(&inv, &filters, backend);
+    let settings = RetentionSettings::load().unwrap_or_else(|e| {
+        exit_with_error_code(
+            json!({"error": {
+                "code": "invalid_retention_setting",
+                "message": format!("{e:#}; nothing was judged or removed"),
+            }}),
+            2,
+        )
+    });
+    // One scan for the whole run, preview or apply. A store that can't be
+    // listed can't be judged, so nothing is removed.
+    let graph = Graph::scan(&base).unwrap_or_else(|e| {
+        exit_with_error_code(
+            json!({"error": {
+                "code": "prune_scan_failed",
+                "message": format!(
+                    "the sessions directory can't be read, so nothing was judged or \
+                     removed: {e:#}"
+                ),
+            }}),
+            EXIT_REMOVAL_FAILED,
+        )
+    });
+    let engine = Engine {
+        graph: &graph,
+        settings,
+        now: SystemTime::now(),
+    };
+    let inv = Inventory::read(&graph);
+    let mut verdict = judge(&inv, &engine, &filters, backend);
+    let stale: Vec<_> = verdict.stale.values().cloned().collect();
 
     if !args.apply {
         store_plan(&base, &verdict, &plan_filters)?;
@@ -689,21 +747,26 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
                 "plan": verdict.token,
                 "remove": verdict.remove,
                 "kept": verdict.kept,
+                "stale_anchors": stale,
             }))?
         );
         return Ok(());
     }
 
+    let mut outcome = Outcome::default();
     if let (Some(token), Some(stored)) = (args.plan, &stored) {
-        if verdict.token != token {
-            let now: BTreeSet<_> = verdict.remove.iter().map(RemoveEntry::key).collect();
-            let then: BTreeSet<_> = stored.remove.iter().map(RemoveEntry::key).collect();
-            let added: Vec<_> = verdict
-                .remove
-                .iter()
-                .filter(|e| !then.contains(&e.key()))
-                .map(RemoveEntry::brief)
-                .collect();
+        let named: BTreeSet<_> = stored.remove.iter().map(RemoveEntry::key).collect();
+        let now: BTreeSet<_> = verdict.remove.iter().map(RemoveEntry::key).collect();
+        // Refused only when the fresh judgment would remove something the
+        // plan didn't name; one that only keeps more than the plan goes on,
+        // and lists what it now keeps as skipped.
+        let added: Vec<_> = verdict
+            .remove
+            .iter()
+            .filter(|e| !named.contains(&e.key()))
+            .map(RemoveEntry::brief)
+            .collect();
+        if !added.is_empty() {
             let dropped: Vec<_> = stored
                 .remove
                 .iter()
@@ -714,8 +777,8 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
                 json!({"error": {
                     "code": "prune_plan_stale",
                     "message": format!(
-                        "the sessions plan {token} would remove have changed since the \
-                         preview; nothing was removed"
+                        "the prune would now remove sessions plan {token} didn't name; \
+                         nothing was removed"
                     ),
                     "plan": token,
                     "current": verdict.token,
@@ -725,17 +788,17 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
                 EXIT_PLAN_REFUSED,
             );
         }
-    }
-
-    // With a plan the two lists are equal here (the tokens matched), so this
-    // changes nothing; it keeps "never remove what the preview didn't name"
-    // from resting on the hash alone.
-    let mut verdict = verdict;
-    if let Some(stored) = &stored {
-        let named: BTreeSet<_> = stored.remove.iter().map(RemoveEntry::key).collect();
+        for entry in stored.remove.iter().filter(|e| !now.contains(&e.key())) {
+            outcome.skipped.push(json!({
+                "name": entry.name,
+                "reason": no_longer_removed(entry, &verdict, &graph),
+            }));
+        }
+        // Never remove what the preview didn't name, whatever the hash says.
         verdict.remove.retain(|e| named.contains(&e.key()));
     }
-    let outcome = apply(backend, &inv, &verdict);
+
+    apply(backend, &inv, &engine, &verdict, &mut outcome);
     if let Some(token) = args.plan {
         if outcome.failed.is_empty() {
             remove_plan(&base, token);
@@ -750,12 +813,29 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
             "skipped": outcome.skipped,
             "kept": verdict.kept,
             "failed": outcome.failed,
+            "stale_anchors": stale,
         }))?
     );
     if !outcome.failed.is_empty() {
         std::process::exit(EXIT_REMOVAL_FAILED);
     }
     Ok(())
+}
+
+/// Why an entry a plan named isn't removed now.
+fn no_longer_removed(entry: &RemoveEntry, verdict: &Verdict, graph: &Graph) -> String {
+    if entry.kind == KIND_SESSION {
+        if let Some(k) = verdict.kept.iter().find(|k| k.name == entry.name) {
+            return format!("now kept by rule {}: {}", k.rule, k.detail);
+        }
+        if !graph.contains(&entry.name) {
+            return "the session is already gone".to_string();
+        }
+        return "a different session now has this name, or it no longer passes the plan's \
+                filters"
+            .to_string();
+    }
+    "the record is gone or was replaced since the preview".to_string()
 }
 
 #[derive(Default)]
@@ -765,36 +845,123 @@ struct Outcome {
     failed: Vec<serde_json::Value>,
 }
 
-/// Remove the verdict's sessions, children before their parents, each
-/// under its state lock after checking again that it may go.
-fn apply(backend: &Backend, inv: &Inventory, verdict: &Verdict) -> Outcome {
-    let mut order: Vec<&RemoveEntry> = verdict.remove.iter().collect();
+/// Remove the verdict's entries: sessions one hierarchy at a time, each
+/// hierarchy judged again as a unit just before its members go, then the
+/// finished records.
+fn apply(
+    backend: &Backend,
+    inv: &Inventory,
+    engine: &Engine<'_>,
+    verdict: &Verdict,
+    outcome: &mut Outcome,
+) {
+    let mut grouping = engine.judge();
+    let mut components: BTreeMap<String, Vec<&RemoveEntry>> = BTreeMap::new();
+    let mut others = Vec::new();
+    for entry in &verdict.remove {
+        if entry.kind != KIND_SESSION {
+            others.push(entry);
+            continue;
+        }
+        let key = grouping
+            .component(&entry.name, &Scope::Whole)
+            .and_then(|(present, _)| present.into_iter().next())
+            .unwrap_or_else(|| entry.name.clone());
+        components.entry(key).or_default().push(entry);
+    }
+    for entries in components.values() {
+        apply_component(backend, inv, engine, entries, outcome);
+    }
+    for entry in others {
+        // Everything below a session entry removes a session directory.
+        // Another kind of entry needs its own removal, never that one.
+        let result = if entry.kind == KIND_RECORD {
+            remove_record(&inv.base, entry)
+        } else {
+            Err(Refusal::Skipped(format!(
+                "this koto can't remove a {:?} entry",
+                entry.kind
+            )))
+        };
+        record_result(outcome, entry, result);
+    }
+}
+
+fn record_result(
+    outcome: &mut Outcome,
+    entry: &RemoveEntry,
+    result: std::result::Result<(), Refusal>,
+) {
+    match result {
+        Ok(()) => outcome.removed.push(entry.clone()),
+        Err(Refusal::Skipped(reason)) => outcome
+            .skipped
+            .push(json!({"name": entry.name, "reason": reason})),
+        Err(Refusal::Failed(error)) => outcome
+            .failed
+            .push(json!({"name": entry.name, "error": error})),
+    }
+}
+
+/// Remove the entries of one hierarchy. Every member is locked first, so
+/// no koto command ticks one while it is judged; then the hierarchy is
+/// judged again as a unit, reading each member afresh, and only a released
+/// hierarchy loses members. Children go before their parents, anchors
+/// before their close sessions, and a close session whose anchor is still
+/// there afterwards stays.
+fn apply_component(
+    backend: &Backend,
+    inv: &Inventory,
+    engine: &Engine<'_>,
+    entries: &[&RemoveEntry],
+    outcome: &mut Outcome,
+) {
+    let mut order = entries.to_vec();
     order.sort_by(|a, b| {
-        depth(inv, &b.name)
-            .cmp(&depth(inv, &a.name))
+        a.is_close_session()
+            .cmp(&b.is_close_session())
+            .then_with(|| depth(inv, &b.name).cmp(&depth(inv, &a.name)))
+            .then_with(|| b.is_anchor().cmp(&a.is_anchor()))
             .then_with(|| a.name.cmp(&b.name))
     });
-    let mut outcome = Outcome::default();
-    let mut cache = TemplateCache::new();
+    let mut locked: Vec<(&RemoveEntry, SessionLock)> = Vec::new();
     for entry in order {
-        match remove_one(backend, inv, entry, &mut cache) {
-            Ok(()) => outcome.removed.push(entry.clone()),
-            Err(Refusal::Skipped(reason)) => outcome
-                .skipped
-                .push(json!({"name": entry.name, "reason": reason})),
-            Err(Refusal::Failed(error)) => outcome
-                .failed
-                .push(json!({"name": entry.name, "error": error})),
+        match lock(backend, &entry.name) {
+            Ok(lock) => locked.push((entry, lock)),
+            Err(refusal) => record_result(outcome, entry, Err(refusal)),
         }
     }
-    outcome
+    let Some((first, _)) = locked.first() else {
+        return;
+    };
+    let mut judge = engine.judge();
+    let reason = match judge.judge(&first.name, &Scope::Whole) {
+        Ok(j) if !j.verdict.is_kept() => None,
+        Ok(j) => Some(format!(
+            "now kept by rule h: {}",
+            hierarchy::reason_text(&j.verdict)
+        )),
+        Err(e) => Some(format!("its hierarchy can't be judged again: {e:#}")),
+    };
+    if let Some(reason) = reason {
+        for (entry, _) in &locked {
+            record_result(outcome, entry, Err(Refusal::Skipped(reason.clone())));
+        }
+        return;
+    }
+    let mut removed = BTreeSet::new();
+    let mut cache = TemplateCache::new();
+    for (entry, _lock) in &locked {
+        let result = remove_member(backend, inv, engine.graph, entry, &removed, &mut cache);
+        if result.is_ok() {
+            removed.insert(entry.name.clone());
+        }
+        record_result(outcome, entry, result);
+    }
 }
 
 /// How many `parent_workflow` links lie above `name` in the inventory.
-/// Removal goes deepest first so a koto child goes before its parent. A
-/// `chain/parent` link isn't ordered: such a parent is kept by rule b for as
-/// long as the session naming it runs, and both being finished means
-/// neither needs the other.
+/// Removal goes deepest first so a koto child goes before its parent.
 fn depth(inv: &Inventory, name: &str) -> usize {
     let mut seen = BTreeSet::new();
     let mut current = name.to_string();
@@ -817,90 +984,68 @@ enum Refusal {
     Failed(String),
 }
 
-fn remove_one(
+fn lock(backend: &Backend, name: &str) -> std::result::Result<SessionLock, Refusal> {
+    match backend.lock_state_file(name) {
+        Ok(lock) => Ok(lock),
+        Err(SessionError::Locked { .. }) => Err(Refusal::Skipped(
+            "another koto process holds the session's lock".to_string(),
+        )),
+        Err(SessionError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(Refusal::Skipped("the session is already gone".to_string()))
+        }
+        Err(e) => Err(Refusal::Skipped(format!(
+            "the session can't be locked: {e}"
+        ))),
+    }
+}
+
+/// Remove one member of a hierarchy just judged released, under its lock,
+/// after checking it is still the session the judgment saw and still
+/// stopped.
+fn remove_member(
     backend: &Backend,
     inv: &Inventory,
+    graph: &Graph,
     entry: &RemoveEntry,
+    removed: &BTreeSet<String>,
     cache: &mut TemplateCache,
 ) -> std::result::Result<(), Refusal> {
-    // Everything below removes a session directory. Another kind of entry
-    // needs its own removal, never this one.
-    if entry.kind == KIND_RECORD {
-        return remove_record(&inv.base, entry);
-    }
-    if entry.kind != KIND_SESSION {
-        return Err(Refusal::Skipped(format!(
-            "this koto can't remove a {:?} entry",
-            entry.kind
-        )));
-    }
     let base = &inv.base;
     let name = entry.name.as_str();
-    let _lock = match backend.lock_state_file(name) {
-        Ok(lock) => lock,
-        Err(SessionError::Locked { .. }) => {
-            return Err(Refusal::Skipped(
-                "another koto process holds the session's lock".to_string(),
-            ))
-        }
-        Err(SessionError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(Refusal::Skipped("the session is already gone".to_string()))
-        }
-        Err(e) => {
-            return Err(Refusal::Skipped(format!(
-                "the session can't be locked: {e}"
-            )))
-        }
-    };
-
     let (seen, header) = inspect_full(base, name, cache);
-    if !matches!(
-        seen.status,
-        SessionStatus::Terminal | SessionStatus::Cancelled
-    ) {
-        return Err(Refusal::Skipped(format!(
-            "the session is no longer finished (now {})",
-            status_word(seen.status)
-        )));
-    }
     let session_id = header.as_ref().and_then(|h| h.session_id.clone());
     if session_id != entry.session_id {
         return Err(Refusal::Skipped(
             "a different session now has this name".to_string(),
         ));
     }
-    let fresh = Session {
-        seen,
-        header,
-        chain_parent: read_chain_parent(&base.join(name)),
-    };
-    let facts = Facts {
-        name,
-        status: fresh.seen.status,
-        chain_parent: &fresh.chain_parent,
-        references: fresh.references(name),
-        // Referencers as the judgment found them, each re-inspected now. A
-        // session created since that names this one isn't seen: the design
-        // accepts that window rather than re-reading the whole store per
-        // removal.
-        referencers: inv.referencers.get(name).cloned().unwrap_or_default(),
-        // The judgment's header-less sessions that are still there and still
-        // header-less now.
-        headerless: inv
-            .headerless
-            .iter()
-            .filter(|h| h.as_str() != name && session_exists(base, h))
-            .filter(|h| inspect_full(base, h, cache).1.is_none())
-            .cloned()
-            .collect(),
-    };
-    let mut status_of = |other: &str| -> Option<SessionStatus> {
-        if !session_exists(base, other) {
-            return None;
+    // An anchor never reaches a terminal state; the hierarchy's judgment,
+    // made just now under the lock, is what says it is closed.
+    if entry.session_kind.is_none()
+        && !matches!(
+            seen.status,
+            SessionStatus::Terminal | SessionStatus::Cancelled
+        )
+    {
+        return Err(Refusal::Skipped(format!(
+            "the session is no longer finished (now {})",
+            status_word(seen.status)
+        )));
+    }
+    if entry.is_close_session() {
+        if let Some(anchor) = closed_anchor(graph, name) {
+            if base.join(&anchor).exists() && !removed.contains(&anchor) {
+                return Err(Refusal::Skipped(format!(
+                    "its anchor {} is still there, and a close session goes only after its \
+                     anchor",
+                    hierarchy::sanitize(&anchor)
+                )));
+            }
         }
-        Some(inspect_full(base, other, cache).0.status)
-    };
-    if let Some((rule, detail)) = first_rule(&facts, base, backend, &mut status_of) {
+    }
+    if let Some((rule, detail)) =
+        later_rule(name, &read_chain_parent(&base.join(name)), base, backend)
+    {
         return Err(Refusal::Skipped(format!(
             "now kept by rule {rule}: {detail}"
         )));
@@ -1077,6 +1222,7 @@ fn remove_plan_file(base: &Path, file_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::state_file_name;
 
     #[test]
     fn ages_parse_whole_units_only() {
@@ -1117,7 +1263,41 @@ mod tests {
             failure: false,
             finished_at: None,
             execution_dir: None,
+            session_kind: None,
+            stopped_at: None,
         }
+    }
+
+    /// Settings with a one-second retention: the fixtures stopped days ago.
+    fn engine(graph: &Graph) -> Engine<'_> {
+        Engine {
+            graph,
+            settings: RetentionSettings::from_durations(
+                Duration::from_secs(1),
+                Duration::from_secs(3600),
+                Duration::from_secs(7200),
+            ),
+            now: SystemTime::now(),
+        }
+    }
+
+    fn no_filters() -> Filters {
+        Filters {
+            execution_dir: None,
+            older_than: None,
+        }
+    }
+
+    fn local(base: &Path) -> Backend {
+        Backend::Local(crate::session::local::LocalBackend::with_base_dir(
+            base.to_path_buf(),
+        ))
+    }
+
+    fn applied(backend: &Backend, inv: &Inventory, engine: &Engine<'_>, v: &Verdict) -> Outcome {
+        let mut outcome = Outcome::default();
+        apply(backend, inv, engine, v, &mut outcome);
+        outcome
     }
 
     #[test]
@@ -1194,6 +1374,19 @@ mod tests {
         }
     }
 
+    fn reasons(outcome: &Outcome) -> BTreeMap<String, String> {
+        outcome
+            .skipped
+            .iter()
+            .map(|s| {
+                (
+                    s["name"].as_str().unwrap().to_string(),
+                    s["reason"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn a_session_rewound_recreated_or_locked_since_the_judgment_is_skipped() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1201,15 +1394,11 @@ mod tests {
         for name in ["rewound", "recreated", "locked", "plain"] {
             store.finished(name, &format!("id-{name}"));
         }
-        let backend = Backend::Local(crate::session::local::LocalBackend::with_base_dir(
-            store.base.clone(),
-        ));
-        let inv = Inventory::read(&store.base).unwrap();
-        let filters = Filters {
-            execution_dir: None,
-            older_than: None,
-        };
-        let verdict = judge(&inv, &filters, &backend);
+        let backend = local(&store.base);
+        let graph = Graph::scan(&store.base).unwrap();
+        let engine = engine(&graph);
+        let inv = Inventory::read(&graph);
+        let verdict = judge(&inv, &engine, &no_filters(), &backend);
         let names: Vec<_> = verdict.remove.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["locked", "plain", "recreated", "rewound"]);
 
@@ -1224,22 +1413,15 @@ mod tests {
         store.finished("recreated", "id-recreated-2");
         let _held = backend.lock_state_file("locked").unwrap();
 
-        let outcome = apply(&backend, &inv, &verdict);
+        let outcome = applied(&backend, &inv, &engine, &verdict);
         let removed: Vec<_> = outcome.removed.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(removed, vec!["plain"]);
         assert!(outcome.failed.is_empty());
-        let skipped: BTreeMap<String, String> = outcome
-            .skipped
-            .iter()
-            .map(|s| {
-                (
-                    s["name"].as_str().unwrap().to_string(),
-                    s["reason"].as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
+        let skipped = reasons(&outcome);
+        // The rewound session runs again, so its hierarchy is judged kept.
         assert!(
-            skipped["rewound"].contains("no longer finished"),
+            skipped["rewound"].contains("now kept by rule h")
+                && skipped["rewound"].contains("alive"),
             "{skipped:?}"
         );
         assert!(
@@ -1254,44 +1436,39 @@ mod tests {
     }
 
     #[test]
-    fn a_session_newly_referenced_by_a_running_one_is_skipped() {
+    fn a_hierarchy_with_a_member_running_again_is_skipped_whole() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::new(tmp.path());
         store.finished("parent", "id-parent");
         store.finished("child", "id-child");
-        let backend = Backend::Local(crate::session::local::LocalBackend::with_base_dir(
-            store.base.clone(),
-        ));
-        // The child already names the parent, and is finished at judgment.
+        let backend = local(&store.base);
+        // The child names the parent, and both are finished at judgment.
         std::fs::create_dir_all(store.base.join("child/ctx/chain")).unwrap();
         std::fs::write(store.base.join("child/ctx/chain/parent"), "parent").unwrap();
-        let inv = Inventory::read(&store.base).unwrap();
-        let filters = Filters {
-            execution_dir: None,
-            older_than: None,
-        };
-        let verdict = judge(&inv, &filters, &backend);
+        let graph = Graph::scan(&store.base).unwrap();
+        let engine = engine(&graph);
+        let inv = Inventory::read(&graph);
+        let verdict = judge(&inv, &engine, &no_filters(), &backend);
         assert_eq!(verdict.remove.len(), 2);
 
-        // The child is rewound before the removal reaches the parent. The
-        // child goes first only when it is deeper by `parent_workflow`, which
-        // it isn't here, so the parent's re-check sees a running referencer.
+        // The child is rewound before the apply: the hierarchy is judged
+        // again as a unit, so neither member goes.
         store.append(
             "child",
             json!({"seq": 4, "timestamp": "2026-10-12T00:00:02.000Z", "type": "rewound",
                    "payload": {"from": "done", "to": "start"}}),
         );
-        let outcome = apply(&backend, &inv, &verdict);
-        let skipped: Vec<_> = outcome
-            .skipped
-            .iter()
-            .map(|s| s["name"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(skipped, vec!["child".to_string(), "parent".to_string()]);
-        assert!(outcome.skipped[1]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("rule b"));
+        let outcome = applied(&backend, &inv, &engine, &verdict);
+        assert!(outcome.removed.is_empty());
+        let skipped = reasons(&outcome);
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        for name in ["child", "parent"] {
+            assert!(
+                skipped[name].contains("now kept by rule h") && skipped[name].contains("child"),
+                "{skipped:?}"
+            );
+            assert!(store.base.join(name).is_dir());
+        }
     }
 
     #[test]
@@ -1320,15 +1497,11 @@ mod tests {
             },
         )
         .unwrap();
-        let backend = Backend::Local(crate::session::local::LocalBackend::with_base_dir(
-            store.base.clone(),
-        ));
-        let inv = Inventory::read(&store.base).unwrap();
-        let filters = Filters {
-            execution_dir: None,
-            older_than: None,
-        };
-        let verdict = judge(&inv, &filters, &backend);
+        let backend = local(&store.base);
+        let graph = Graph::scan(&store.base).unwrap();
+        let engine = engine(&graph);
+        let inv = Inventory::read(&graph);
+        let verdict = judge(&inv, &engine, &no_filters(), &backend);
         let kinds: Vec<_> = verdict
             .remove
             .iter()
@@ -1338,7 +1511,7 @@ mod tests {
 
         // Another session of the name finished and was removed since.
         finished::write(&store.base, &record("2026-10-12T01:00:00.000Z")).unwrap();
-        let outcome = apply(&backend, &inv, &verdict);
+        let outcome = applied(&backend, &inv, &engine, &verdict);
         let removed: Vec<_> = outcome.removed.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(removed, vec!["other"]);
         assert_eq!(outcome.skipped.len(), 1);
@@ -1373,18 +1546,19 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::new(tmp.path());
         store.finished("both", "id-both");
-        let backend = Backend::Local(crate::session::local::LocalBackend::with_base_dir(
-            store.base.clone(),
-        ));
-        let inv = Inventory::read(&store.base).unwrap();
+        let backend = local(&store.base);
+        let graph = Graph::scan(&store.base).unwrap();
+        let engine = engine(&graph);
+        let inv = Inventory::read(&graph);
         let mut record = entry("both", "id-both");
         record.kind = "record".to_string();
         let verdict = Verdict {
             remove: vec![record],
             kept: Vec::new(),
+            stale: BTreeMap::new(),
             token: String::new(),
         };
-        let outcome = apply(&backend, &inv, &verdict);
+        let outcome = applied(&backend, &inv, &engine, &verdict);
         assert!(outcome.removed.is_empty());
         assert_eq!(outcome.skipped.len(), 1);
         assert!(store.base.join("both").is_dir());

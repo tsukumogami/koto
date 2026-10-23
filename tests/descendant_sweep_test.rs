@@ -464,7 +464,20 @@ fn prune_and_session_cleanup_reclaim_retained_sessions() {
         fail(dir, root);
     }
 
-    run_ok(dir, &["workspace", "prune", "--root", "r1", "--yes"]);
+    // The prune removes a tree once the retention rule releases it: wait
+    // out a one-second retention.
+    std::thread::sleep(std::time::Duration::from_millis(1300));
+    let out = koto_cmd(dir)
+        .env("KOTO_RETENTION_KEEP", "1s")
+        .env("KOTO_RETENTION_STALE_AFTER", "1h")
+        .args(["workspace", "prune", "--root", "r1", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(!exists(dir, "r1") && !exists(dir, "r1.a") && !exists(dir, "r1.b"));
     assert!(exists(dir, "r2") && exists(dir, "r2.a") && exists(dir, "r2.b"));
 

@@ -550,7 +550,10 @@ pub enum SessionCommand {
         #[arg(long)]
         state: bool,
     },
-    /// Remove a session directory (idempotent)
+    /// Remove a session directory (idempotent).
+    ///
+    /// Removes the session even when the retention rule would keep it, and
+    /// names every other live member of its hierarchy in `live_members`.
     Cleanup {
         /// Session name
         name: String,
@@ -559,17 +562,20 @@ pub enum SessionCommand {
     ///
     /// Without `--apply`, prints the sessions it would remove, the sessions
     /// it keeps with the rule that keeps each, and a plan token, and changes
-    /// nothing but its stored plan. `--apply --plan <token>` removes exactly
-    /// that preview's sessions, or nothing (exit 4) when the set has changed
-    /// since. `--apply` without `--plan` removes the set it computes now, and
-    /// needs `--execution-dir`, `--older-than` or `--all`.
+    /// nothing but its stored plan. `--apply --plan <token>` removes only
+    /// sessions that preview named, or nothing (exit 4) when it would now
+    /// remove one the preview didn't name; one the rules now keep is skipped
+    /// and listed. `--apply` without `--plan` removes the set it computes now,
+    /// and needs `--execution-dir`, `--older-than` or `--all`.
     ///
-    /// A session is kept when it is running or unreadable (rule a), a running
-    /// session references it (b), it references a running session (c), its
-    /// `chain/parent` context key is malformed (d), it is bound to a request
-    /// leg still waiting (e), it is a coordinator's session (f), or, under the
-    /// cloud backend, its remote copy may be newer (g). A failed removal
-    /// exits 3.
+    /// A session is kept when it is alive (rule a: running, unreadable, or an
+    /// open anchor), its hierarchy is kept by the retention rule (h: a live
+    /// member, the retention not yet passed, or something unreadable; see
+    /// `koto session hierarchy`), its `chain/parent` context key is malformed
+    /// (d), it is bound to a request leg still waiting (e), it is a
+    /// coordinator's session (f), or, under the cloud backend, its remote
+    /// copy may be newer (g). A failed removal, or a sessions directory that
+    /// can't be read, exits 3; a malformed retention setting exits 2.
     ///
     /// `--migrated-from <workspace-path>` (cloud backend only) previews and
     /// removes instead the migration markers `koto session import` left
@@ -581,12 +587,13 @@ pub enum SessionCommand {
     /// marker last.
     Prune {
         /// Only sessions whose execution directory is this directory or lies
-        /// under it. A session outside the filter still protects the sessions
-        /// it references.
+        /// under it. Filters narrow the candidates only: a session outside
+        /// the filter still counts as a member of its hierarchy.
         #[arg(long = "execution-dir", value_name = "DIR")]
         execution_dir: Option<String>,
 
-        /// Only sessions whose last event is at least this old: a whole
+        /// Only sessions that stopped at least this long ago, measured from
+        /// the stop instant the retention engine reports for each: a whole
         /// number and a unit, `s`, `m`, `h` or `d` (for example `30d`).
         #[arg(long = "older-than", value_name = "AGE")]
         older_than: Option<String>,
@@ -1705,7 +1712,7 @@ pub fn run(app: App) -> Result<()> {
         }
         Command::Cancel { name, cleanup } => {
             let backend = build_backend()?;
-            handle_cancel(&backend, &name, cleanup)
+            handle_cancel(&backend, backend.local_base_dir(), &name, cleanup)
         }
         Command::Rewind { name, rationale } => {
             let backend = build_backend()?;
@@ -1799,15 +1806,20 @@ pub fn run(app: App) -> Result<()> {
                 SessionCommand::Cleanup { name } => {
                     // Query children before cleanup so the parent is still visible.
                     let children = query_children(&backend, &name);
+                    // And judge the hierarchy while the session is still in it.
+                    let live = session::live_members(backend.local_base_dir(), &name);
                     session::handle_cleanup(&backend, &name)?;
-                    println!(
-                        "{}",
-                        serde_json::to_string(&serde_json::json!({
-                            "name": name,
-                            "cleaned_up": true,
-                            "children": children
-                        }))?
-                    );
+                    session::warn_live_members(&name, &live);
+                    let mut out = serde_json::json!({
+                        "name": name,
+                        "cleaned_up": true,
+                        "children": children,
+                        "live_members": live.members,
+                    });
+                    if let Some(e) = live.error {
+                        out["live_members_error"] = serde_json::json!(e);
+                    }
+                    println!("{}", serde_json::to_string(&out)?);
                     Ok(())
                 }
                 #[cfg(unix)]
@@ -8167,8 +8179,16 @@ fn query_children(backend: &dyn SessionBackend, parent_name: &str) -> Vec<serde_
 /// Appends a `WorkflowCancelled` event to the event log. Rejects double-cancel
 /// and cancel of already-terminal workflows. When `cleanup` is true, also
 /// removes the session directory after the event is written so the name can
-/// be reused without a separate `koto session cleanup` call.
-fn handle_cancel(backend: &dyn SessionBackend, name: &str, cleanup: bool) -> Result<()> {
+/// be reused without a separate `koto session cleanup` call; the output then
+/// names, under `live_members`, every other live member of its hierarchy in
+/// the local store `sessions_base`, judged after the cancel and before the
+/// removal.
+fn handle_cancel(
+    backend: &dyn SessionBackend,
+    sessions_base: &std::path::Path,
+    name: &str,
+    cleanup: bool,
+) -> Result<()> {
     if !backend.exists(name) {
         exit_with_error(serde_json::json!({
             "error": format!("workflow '{}' not found", name),
@@ -8271,6 +8291,7 @@ fn handle_cancel(backend: &dyn SessionBackend, name: &str, cleanup: bool) -> Res
     // Capture children before cleanup — once the session is removed the
     // relationship disappears from the backend listing. We still report
     // them so the caller has the same visibility regardless of --cleanup.
+    let live = cleanup.then(|| session::live_members(sessions_base, name));
     let cleaned = if cleanup {
         match backend.cleanup(name) {
             Ok(()) => {
@@ -8296,16 +8317,21 @@ fn handle_cancel(backend: &dyn SessionBackend, name: &str, cleanup: bool) -> Res
         false
     };
 
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "name": name,
-            "state": current_state,
-            "cancelled": true,
-            "cleaned_up": cleaned,
-            "children": children
-        }))?
-    );
+    let mut out = serde_json::json!({
+        "name": name,
+        "state": current_state,
+        "cancelled": true,
+        "cleaned_up": cleaned,
+        "children": children
+    });
+    if let Some(live) = live {
+        session::warn_live_members(name, &live);
+        out["live_members"] = serde_json::json!(live.members);
+        if let Some(e) = live.error {
+            out["live_members_error"] = serde_json::json!(e);
+        }
+    }
+    println!("{}", serde_json::to_string(&out)?);
     Ok(())
 }
 

@@ -324,6 +324,26 @@ to `0.9.x`).
 
 ### Changed
 
+- **Both prunes apply the hierarchy retention rule.** `koto session prune`
+  judges every session with the engine behind `koto session hierarchy`:
+  rule `a` is now "alive" (a running or unreadable session, or an open
+  anchor), and rules `b` and `c` are replaced by rule `h`, which keeps a
+  session whose hierarchy has a live member, is inside `retention.keep`
+  since its release instant, or holds something unreadable; its entry
+  carries the hierarchy's JSON. A finished session is no longer removed the
+  moment it stops: its hierarchy goes whole, once the retention has passed.
+  Filters narrow the candidates only, `--older-than` measures from the stop
+  instant instead of the last event, apply re-judges each hierarchy under
+  its members' locks, and `--apply --plan` refuses only when it would
+  remove something the plan didn't name (what it now keeps is skipped and
+  listed). `koto workspace prune --root` removes only the subtree members
+  the rule releases and lists the rest with reasons; `--force` passes the
+  terminal-state gate but never the rule. Both prunes list stale observed
+  anchors with their close commands, refuse a malformed retention setting
+  (exit 2) and remove nothing when the store can't be read (exit 3).
+  `koto session cleanup` and `koto cancel --cleanup` still remove, and now
+  name the other live members of the hierarchy in `live_members`, with a
+  warning on stderr.
 - **`koto status` answers for a session koto removed.** koto removes a
   session at its success terminal (unless the tick passed `--no-cleanup`),
   and a parent removes its kept terminal children. Before either removal
