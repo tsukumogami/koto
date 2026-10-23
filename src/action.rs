@@ -352,6 +352,11 @@ fn wait_for_group_exit(pgid: i32, limit: Duration) -> bool {
         if std::time::Instant::now() >= deadline {
             return false;
         }
+        // The look above just saw the group. For this kill to reach someone
+        // else's, its last member would have to exit and a new process
+        // would have to lead a group under the same id in the microseconds
+        // between the two calls, which takes the kernel's pids wrapping all
+        // the way round.
         // SAFETY: SIGKILL to the group the command was started in.
         unsafe {
             libc::killpg(pgid, libc::SIGKILL);

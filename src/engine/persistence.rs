@@ -942,11 +942,18 @@ fn join_seqs(seqs: &[u64]) -> String {
 ///
 /// The log as it was goes first to a backup beside it, named after the
 /// log and the first merged seq (`<log>.seq<N>-merged.bak`), so the repair
-/// can be checked or undone by hand. The split log then replaces the log in
-/// one rename, so a reader sees the merged log or the split one, never part
-/// of either. Each event keeps the exact text it was written with. The
-/// caller holds the append lock, so no other append runs in between; what
-/// was done is announced on stderr.
+/// can be checked or undone by hand. Each event keeps the exact text it was
+/// written with. The caller holds the append lock, so no other append runs
+/// in between; what was done is announced on stderr.
+///
+/// The split is written over the merged line in place, not by renaming a
+/// new file over the log. A `koto next` holds `lock_state_file`'s `flock` on
+/// the log's own inode for its whole tick, and a rename would leave that
+/// lock on an orphaned inode while the next tick locked the new file at
+/// once. Everything before the merged line is untouched, and the new tail is
+/// written in one write. A lock-free reader that lands in the middle of it
+/// sees a final line it can't parse and recovers the way it does from any
+/// torn tail; a crash in the middle leaves the backup to restore from.
 fn split_merged_last_line(
     path: &Path,
     content: &str,
@@ -954,16 +961,18 @@ fn split_merged_last_line(
     line_number: usize,
     pieces: &[(&str, Event)],
 ) -> anyhow::Result<String> {
-    let mut split = String::with_capacity(content.len() + pieces.len());
-    split.push_str(&content[..offset]);
+    let mut tail = String::with_capacity(content.len() - offset + pieces.len());
     for (text, _) in pieces {
-        split.push_str(text);
-        split.push('\n');
+        tail.push_str(text);
+        tail.push('\n');
     }
 
     let first_seq = pieces[0].1.seq;
     let backup = write_backup(path, content, first_seq)?;
-    replace_file(path, &split)?;
+    rewrite_tail(path, offset, &tail)?;
+    let mut split = String::with_capacity(offset + tail.len());
+    split.push_str(&content[..offset]);
+    split.push_str(&tail);
     let seqs: Vec<u64> = pieces.iter().map(|(_, e)| e.seq).collect();
     eprintln!(
         "warning: line {} of {} held {} events written with no newline between them (seq {}); \
@@ -1021,34 +1030,21 @@ fn write_backup(log: &Path, content: &str, first_seq: u64) -> anyhow::Result<std
     ))
 }
 
-/// Replace the file at `path` with `content` in one rename, keeping mode
-/// 0600, and sync it and its directory.
-fn replace_file(path: &Path, content: &str) -> anyhow::Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("state file {} has no parent", path.display()))?;
-    let tmp = tempfile::Builder::new()
-        .prefix(".split-")
-        .suffix(".tmp")
-        .tempfile_in(dir)
-        .map_err(|e| anyhow::anyhow!("failed to create a temp file in {}: {}", dir.display(), e))?;
-    {
-        let mut file = tmp.as_file();
-        file.write_all(content.as_bytes())
-            .and_then(|()| file.sync_data())
-            .map_err(|e| anyhow::anyhow!("failed to write {}: {}", tmp.path().display(), e))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600)).map_err(
-                |e| anyhow::anyhow!("failed to set mode on {}: {}", tmp.path().display(), e),
-            )?;
-        }
-    }
-    tmp.persist(path)
-        .map_err(|e| anyhow::anyhow!("failed to replace {}: {}", path.display(), e.error))?;
-    fsync_parent_dir(path);
-    Ok(())
+/// Write `tail` over the file at `path` from byte `offset` on, in one write,
+/// cut the file to end where `tail` does, and sync it. The file keeps its
+/// inode, mode and every byte before `offset`.
+fn rewrite_tail(path: &Path, offset: usize, tail: &str) -> anyhow::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("failed to open state file {}: {}", path.display(), e))?;
+    let end = (offset + tail.len()) as u64;
+    file.seek(SeekFrom::Start(offset as u64))
+        .and_then(|_| file.write_all(tail.as_bytes()))
+        .and_then(|()| file.set_len(end))
+        .and_then(|()| file.sync_data())
+        .map_err(|e| anyhow::anyhow!("failed to split the last line of {}: {}", path.display(), e))
 }
 
 /// Read the header line from a state file.
@@ -4220,6 +4216,11 @@ mod tests {
         );
         let path = log_with_tail(dir.path(), &[intent(1, "a"), intent(2, "b")], &merged);
         let original = std::fs::read_to_string(&path).unwrap();
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&path).unwrap().ino()
+        };
 
         let seq = append_event(
             &path,
@@ -4251,19 +4252,34 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), original);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            for p in [&path, &backups[0]] {
-                let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-                assert_eq!(mode, 0o600, "{}", p.display());
-            }
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let mode = std::fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            // Split in place: a tick's `flock` on the log's inode still holds.
+            assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
         }
-        // No temp file is left behind.
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .filter(|n| n.ends_with(".tmp"))
-            .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
+        // Everything before the merged line is byte-for-byte what it was.
+        let prefix = &original[..original.len() - merged.len()];
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with(prefix));
+    }
+
+    /// A merged line followed by blank lines splits too, and the log ends
+    /// right after the split events and the new one.
+    #[test]
+    fn split_drops_blank_lines_after_a_merged_last_line() {
+        let dir = TempDir::new().unwrap();
+        let merged = format!("{}{}\n\n\n", line(&intent(2, "b")), line(&intent(3, "c")));
+        let path = log_with_tail(dir.path(), &[intent(1, "a")], &merged);
+        append_event(
+            &path,
+            &EventPayload::IntentUpdated {
+                intent: "d".to_string(),
+            },
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(assert_one_event_per_line(&path).len(), 4);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("\n\n"));
     }
 
     /// The merged line without its own newline, and as the log's only

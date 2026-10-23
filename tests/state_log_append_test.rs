@@ -252,6 +252,32 @@ fn writers_killed_mid_append_never_merge_two_events() {
     assert!(events.iter().any(|e| e["payload"]["key"] == "after"));
 }
 
+/// The state a writer killed between its line and its newline leaves, which
+/// is how the merge in koto#419 began: the log ends in a complete event with
+/// no newline. Twenty writers then append at once. The first of them must
+/// start a new line rather than continue that one.
+#[test]
+fn an_event_left_without_its_newline_still_gets_a_line_of_its_own() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    setup(dir);
+    let log = log_path(dir);
+    let content = std::fs::read_to_string(&log).unwrap();
+    std::fs::write(&log, content.strip_suffix('\n').unwrap()).unwrap();
+
+    let children: Vec<Child> = (0..20).map(|i| writer(dir, i)).collect();
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "a writer failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let events = assert_one_event_per_line(&log);
+    assert_eq!(events.len(), content.lines().count() - 1 + 20);
+}
+
 /// The log as koto#419 found it: the last line holds a complete event
 /// followed by another, with no newline between them. A write to the
 /// session used to fail with `persistence_error`; now it splits the line,
