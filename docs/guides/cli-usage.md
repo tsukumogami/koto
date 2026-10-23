@@ -48,6 +48,9 @@ koto init <name> --template <path>
 **Dispatcher:**
 - `--dispatched-by <name>` -- Record that session `<name>` dispatched this one: a dispatched-by link in the new (or attached, or replacement) session's own context, the same link [`koto session link`](#session-link) writes. Nothing is written into `<name>`, which need not exist. A name that fails the session-name rule, or that is the session's own, exits 2 with `invalid_usage` before anything is created. A link that can't be written after the session was created prints a warning on stderr and leaves the session in place; `koto session link` records it later. Works with every init path, `--from-stdin` and `--parent` included.
 
+**Agent-session anchor:**
+- `KOTO_ANCHOR` -- When this variable names an anchor (see [session anchor](#session-anchor)) other than the session being created, init writes a held-by link, `koto/links/held-by/<anchor>`, into the new session's context, unless it already holds one, and appends an `anchor_activity` event to that anchor. When the anchor reads closed by an observed close and its family has a later anchor (`<anchor>-s2` and so on), the session also gets a held-by link to that one, and the activity goes there. Activity is throttled: at most one event per tenth of the idle period (`KOTO_RETENTION_IDLE_PERIOD`, default `7d`), judged from the anchor's last event. A variable that is unset, empty, or names no anchor does nothing and prints nothing. koto reads only `KOTO_ANCHOR`, never `KOTO_DISPATCHER_ANCHOR`. No other session is written.
+
 **Output (JSON):**
 
 ```json
@@ -121,6 +124,8 @@ koto next <name> [--with-data @<file>] [--to <target>] [--no-cleanup]
 - `--to <target>` -- Directed transition to a named state. The target must be a valid transition from the current state. Appends a `directed_transition` event, then dispatches on the new state. Gates are skipped, except a non-overridable gate the edge to the target depends on; see [Directed transitions and non-overridable gates](#directed-transitions-and-non-overridable-gates).
 
 The `--with-data` and `--to` flags are mutually exclusive. Passing both produces a `precondition_failed` error with exit code 2. The `--with-data` payload is capped at 1 MB.
+
+**Agent-session anchor.** `koto next` reads `KOTO_ANCHOR` the way [init](#init) does: a held-by link to the named anchor in the ticked session when it has none, the same successor rule, and a throttled `anchor_activity` event in the anchor. A second tick under the same anchor adds no link; a tick under another anchor adds a second one. A nested tick writes nothing. `koto next` on an anchor or an anchor's close session is refused with `precondition_failed` (exit 2) and changes nothing.
 
 **Advisories.** A check that passes while printing `warning` findings doesn't block, but its warnings still reach you: the response carries a top-level `advisories` list with one entry per such check this call evaluated, as `{"state": ..., "gate": ..., "findings": [...]}` (`gate` is `__action__` for a default action), at most 100 findings in all; when that cap leaves warnings out, the response also carries `advisories_truncated: true` (absent otherwise). A response with none has no `advisories` key. `--to` and `koto status` never carry it. To say a warning is wrong, use [`koto disputes record`](#disputes-record).
 
@@ -453,7 +458,7 @@ koto workflows
 [{"name":"my-workflow","created_at":"2026-03-15T10:00:00Z","template_hash":"a1b2c3..."},{"name":"task-42","created_at":"2026-03-15T11:30:00Z","template_hash":"d4e5f6..."}]
 ```
 
-Each object contains the workflow name, creation timestamp, and template hash read from the state file header. Returns an empty array `[]` when no workflows are found.
+Each object contains the workflow name, creation timestamp, and template hash read from the state file header. Returns an empty array `[]` when no workflows are found. Anchors and anchor close sessions (see [session anchor](#session-anchor)) are not workflows and never appear here; `koto session list` shows them.
 
 ### status
 
@@ -542,6 +547,8 @@ Each row also carries `template_source_status`, describing whether the directory
 
 Every row also carries `execution_dir`, the directory the session's ticks run in, and `session_id`, both from the session's header. Either is `null` when the header doesn't record it, and both are `null` on a remote-only placeholder row.
 
+A row for a session koto keeps for its own bookkeeping also carries `kind`: `anchor` for an agent session's anchor and `anchor-close` for an anchor's close session (see [session anchor](#session-anchor)). Ordinary sessions have no `kind`.
+
 **Optional flags:**
 - `--state` -- Add where each session stands: `state` (the current state's name), `status` (`running`, `terminal`, `cancelled` or `unreadable`), `failure` (`true` for a terminal declared `failure: true`) and `finished_at` (the time of the last event in its log, which for a finished session is when it finished). This reads every session's log, where the plain listing reads only headers. A session is `cancelled` when its log records a cancellation that no later transition or rewind follows, and `unreadable` when its log or template can't be read; `state` is `null` for an unreadable session. All four are `null` on a remote-only placeholder row.
 - `--execution-dir <dir>` -- List only the sessions whose execution directory is `<dir>` or lies under it, compared by whole path components: `/work/a` matches `/work/a` and `/work/a/b`, not `/work/ab`. `<dir>` is resolved (symlinks included) when it exists on this machine and compared as given otherwise, and a trailing slash makes no difference; `/` matches every session that records an execution directory, and a session that records none matches no filter. Implies `--state`, and the output becomes an object:
@@ -629,6 +636,46 @@ The link's value is one JSON object:
 `session_id` and `workspace` are hints taken from the dispatcher's header when it is in the local store, and `null` when it isn't. The key is written with writer `koto`, and a `context_added` event naming that writer goes into the session's log.
 
 Prints `{"name", "kind", "peer", "written"}`. Recording a link the session already holds changes nothing, prints `"written": false` and exits 0. A dispatcher name that fails the session-name rule (`~` included), makes a key longer than 255 characters, or is `<session>` itself, exits 2 and writes nothing, as does a session that doesn't exist. A failed write exits 3.
+
+#### session anchor
+
+Opens, observes and closes the anchor koto keeps for one agent session. An agent session's start hook opens it and exports its name as `KOTO_ANCHOR`, so every `koto init` and `koto next` the session runs records a held-by link to it (see [init](#init)). Anchors are sessions whose header has `kind: "anchor"`, made from a one-state template embedded in koto that never finishes; `koto next` refuses them, and `koto workflows`, the dashboard and the native `/workflows` file leave them out.
+
+The three verbs print `key=value` lines on stdout. A refusal (a malformed id, key or name, or a name held by a session that isn't an anchor) prints `{"error", "command"}` and exits 2; any other failure exits 3. A failed `open` prints no `anchor=` line.
+
+```bash
+koto session anchor open --harness-session <id> --source <startup|resume|compact|clear|other> \
+  [--process <token>] [--dispatched-by <name>] [--observed-key <key>] \
+  [--workspace <dir>] [--transcript-path <path>]
+koto session anchor observe --anchor <name> (--key=<key> | --inherit)
+koto session anchor close --key=<key> --harness-session=<id>
+```
+
+**open.** The anchor for harness session `<id>` is `anchor-<id>`. `<id>` must match `^[A-Za-z0-9_-]{1,128}$` and may not end in `-closed` or `-s<n>`. Runs under the anchor's lock and never reads `KOTO_ANCHOR`, so an anchor never holds a held-by link. Every call appends an `anchor_started` event recording the source, the harness id, a SHA-256 prefix of `--process` and of `--transcript-path` (never the token or the path), the workspace (`--workspace`, or the current directory), and the predecessor, reason and dispatcher when there are any.
+
+- A first open creates the anchor (`opened=new`). A repeat continues it (`continued`), opening no second anchor; an idle anchor reads open again once that event lands. An anchor that was removed is created again under its name (`reopened`); koto knows it existed when its close session or a successor is still there, or when the start is a `compact`, or a `resume` whose transcript path's stem is the harness id.
+- An anchor that reads closed by an observed close stays closed: the open creates the next free successor, `anchor-<id>-s2`, `-s3` and so on, holding a dispatched-by link to the one before it (`successor`). The family's current anchor is the highest suffix contiguous from `-s2` whose link names the one before. A migrated anchor (one whose log records an import) gets a successor the same way.
+- `--source clear` (a `/clear` gives the agent session a new id) looks for the anchor the same process ran before: among `anchor-*` sessions whose log changed since the start time in the token `<host>:<pid>:<epoch-start>`, newest first, the first whose `anchor_started` carries the token's digest. On a match the new anchor holds a dispatched-by link to it and copies its observed marker, and the output adds `previous=<name>` and `inherit_until=<rfc3339>`, three minutes on. No match opens an unlinked anchor.
+- `--source resume` with no anchor of its own looks for a predecessor through hints only: an anchor whose `anchor_started` recorded the same transcript path digest, or else the current anchor of the family whose harness id is the transcript path's stem. On a match the new anchor holds a dispatched-by link to it; it never copies the predecessor's marker. No match opens a fresh anchor. The hint never replaces the name match.
+- `--dispatched-by` is written as a dispatched-by link only when the open creates an anchor; on a continue it goes into the event alone. `--observed-key` is written as the observed marker, `koto/anchor/observed`, only when the anchor has none.
+
+Prints `anchor=<name>`, `opened=new|continued|reopened|successor` and `observed=yes|no`, plus `previous=` and `inherit_until=` after a `clear` that found its predecessor.
+
+**observe.** Writes an observed marker into the named anchor and nowhere else: `--key` writes the key given, `--inherit` copies the marker of the predecessor the anchor's own `anchor_started` recorded (nothing when that one has none yet). The anchor must have `kind: "anchor"`; an anchor that already holds a marker keeps it, so a repeat changes nothing. A key that doesn't match `^[A-Za-z0-9_-]{1,128}$` is refused. Prints `anchor=<name>` and `observed=yes|no`.
+
+**close.** Records as closed, at the current time, the anchor `anchor-<id>` whose `anchor_started` recorded that harness id, and the anchors that succeeded it after a `/clear` or a resume under a new id, each only when its observed marker equals the key. A child anchor that records the session as its dispatcher, and a successor opened because its predecessor already read closed, are never matched. Each record is a separate close session, `<anchor>-closed`, with `kind: "anchor-close"`, a terminal initial state, and the context keys `koto/links/closes/<anchor>` and `koto/anchor-close` (`{"v":1,"anchor","anchor_session_id","kind":"observed","key","at"}`). The anchor itself is never written. Prints `closed=<n>`, the number of anchors this call recorded; run again, or with a key or harness id that matches no anchor, it prints `closed=0`, changes nothing and exits 0. There is no caller-supplied time.
+
+A close session counts only when its header has `kind: "anchor-close"`, its name is `<anchor>-closed`, the manifest lists its record, the record's `anchor_session_id` is the anchor's header id and its key is the anchor's marker. So a close left for an earlier anchor of the same name doesn't close a reopened one; the next close replaces it.
+
+The close session is written whole under a reserved `.koto-staging-` entry in the sessions directory and renamed into place, so no reader sees a partial one; replacing a stale one is a single exchange of the two directories. Listing, prune and every other walk of the store ignore staging entries. A later close sweeps an entry once it is older than 10 minutes, and never a fresher one, which may be a close in progress; an entry dated in the future is reset to now so it is swept in time. A staged entry that is gone at rename time fails the run (exit 3) and leaves no close session; running the close again completes it. Two closes at once both exit 0 and leave one valid close session.
+
+The guarded form a workspace runs when an agent session is reaped:
+
+```bash
+[ -n "$NIWA_REAP_KEY" ] || exit 0; command -v koto >/dev/null 2>&1 || exit 0
+koto session anchor close --help >/dev/null 2>&1 || exit 0
+exec koto session anchor close --key="$NIWA_REAP_KEY" --harness-session="$NIWA_SESSION_ID"
+```
 
 #### session cleanup
 

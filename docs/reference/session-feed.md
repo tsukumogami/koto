@@ -46,6 +46,9 @@ header:
     command_environment:
       type: object
       required: false
+    kind:
+      type: string
+      required: false
 
 events:
   workflow_initialized:
@@ -681,6 +684,48 @@ events:
         type: integer
         required: false
 
+  anchor_started:
+    tier: 3
+    fields:
+      source:
+        type: string
+        required: true
+      harness_session:
+        type: string
+        required: true
+      opened:
+        type: string
+        required: true
+        enum: ["new", "continued", "reopened", "successor"]
+      process:
+        type: string
+        required: false
+      workspace:
+        type: string
+        required: false
+      transcript:
+        type: string
+        required: false
+      predecessor:
+        type: string
+        required: false
+      reason:
+        type: string
+        required: false
+      dispatched_by:
+        type: string
+        required: false
+
+  anchor_activity:
+    tier: 3
+    fields:
+      session:
+        type: string
+        required: true
+      command:
+        type: string
+        required: true
+
   scheduler_ran:
     tier: 3
     fields:
@@ -758,6 +803,7 @@ version signal.
 | `template_source_file` | string | No | File name (no directory) of the source template `koto init` compiled the session from, such as `work-on.md`. Together with `template_hash` it is the session's template identity, which `koto request attach` compares against the template a request leg names. Absent for `--from-stdin` sessions and older files; a leg attach refuses such a session rather than guessing. |
 | `origin` | object | No | Where the session was started: `anchor` (the canonical execution anchor at creation) and `store` (`kind`, `"local"` or `"cloud"`, and `base`, the canonical sessions directory). Written by `koto init` and every child spawn. `koto init --attach-live` compares it against the caller's own record and refuses a same-named session from another worktree or store. Absent on older files; nothing backfills it, and `--attach-live` refuses such a session. |
 | `command_environment` | object | No | The environment record the session's commands run with: the recorded `PATH`, `HOME` and `XDG_CONFIG_HOME`, the default list of names read live, and the legacy flag. Described below. |
+| `kind` | string | No | What koto keeps the session for when it isn't a workflow: `anchor` for an agent session's anchor, `anchor-close` for the close session that records an anchor's agent session ended. Absent on ordinary sessions and older files. A reader that meets a value it doesn't know treats the session as ordinary. See [Anchors](#anchors). |
 | `execution_dir` | string | No | The session's execution anchor: the canonical absolute directory its ticks run gates and actions in. Recorded at `koto init` time from the process working directory, or from `--execution-dir`. A child copies its parent's value. Absent on files written before the field existed and on sessions created through `koto session start`; the first tick of such a session adopts the directory it is ticked from, writes it here, and records an `execution_anchor_adopted` event. Once recorded, `koto session rebind` is the only thing that changes it, and it records an `execution_anchor_rebound` event when it does. |
 
 `execution_dir` is where a session's commands *start*, not a boundary on what
@@ -2143,6 +2189,80 @@ are suppressed to prevent log bloat.
 | `state` | string | Yes | State the scheduler ran against. |
 | `tick_summary` | object | Yes | Per-tick outcome counts: `spawned_count` (integer), `errored_count` (integer), `skipped_count` (integer), `reclassified` (boolean). |
 | `timestamp` | string | Yes | RFC 3339 UTC timestamp. Matches the outer envelope `timestamp`. |
+
+---
+
+#### `anchor_started`
+
+Appended to an anchor (a session whose header has `kind: "anchor"`) by every
+`koto session anchor open`, whether the call created the anchor or continued
+it. A created anchor carries it among its initial events.
+
+```json
+{
+  "type": "anchor_started",
+  "payload": {
+    "source": "clear",
+    "harness_session": "5f0c2a9e-0d7b-4c1e-9a52-3b8d1e7f6a40",
+    "opened": "successor",
+    "process": "9c1f0e4b7a2d3c5e8f6a1b2c3d4e5f60",
+    "workspace": "/home/user/src/koto",
+    "predecessor": "anchor-1b7e4f3a-2c9d-4e8a-b6f1-0d3c5a7e9b21",
+    "reason": "clear"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `source` | string | Yes | What started the agent session: `startup`, `resume`, `compact`, `clear` or `other`. |
+| `harness_session` | string | Yes | The harness session id the anchor was opened for. |
+| `opened` | string | Yes | What the open did: `new`, `continued`, `reopened` (a removed anchor created again under its name) or `successor`. |
+| `process` | string | No | A SHA-256 prefix (32 hex characters) of the agent process's token, `<host>:<pid>:<epoch-start>`. The token itself, with its host name and pid, is never stored. |
+| `workspace` | string | No | The agent session's workspace directory. |
+| `transcript` | string | No | A SHA-256 prefix of the harness's transcript path, never the path. |
+| `predecessor` | string | No | For a successor, the anchor it succeeds. |
+| `reason` | string | No | Why a successor was opened: `closed` (its predecessor read closed), `migrated`, `resume` (a resume under a new id, matched through a hint) or `clear`. |
+| `dispatched_by` | string | No | The dispatcher the caller inherited, when it named one. Recorded on every call; the dispatched-by link itself is written only when the anchor is created. |
+
+---
+
+#### `anchor_activity`
+
+Appended to the running agent session's anchor by a `koto init` or `koto
+next` run with `KOTO_ANCHOR` naming it, at most once per tenth of the idle
+period: the throttle reads the anchor's last event and keeps no other state.
+
+```json
+{
+  "type": "anchor_activity",
+  "payload": {
+    "session": "issue_42",
+    "command": "next"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session` | string | Yes | The session the command opened or ticked. |
+| `command` | string | Yes | `init` or `next`. |
+
+### Anchors
+
+An anchor is the session koto keeps for one agent session, named
+`anchor-<harness session id>`, with successors `anchor-<id>-s2`, `-s3` and
+so on. Its embedded one-state template never finishes. Its context holds
+`koto/anchor/observed`, the observed marker
+(`{"v":1,"key":"<reap key>","at":"<rfc3339>"}`), and dispatched-by links.
+When the agent session is observed to end, `koto session anchor close`
+writes a separate close session, `<anchor>-closed`, with `kind:
+"anchor-close"` and a terminal initial state; its context holds
+`koto/links/closes/<anchor>` and `koto/anchor-close`
+(`{"v":1,"anchor","anchor_session_id","kind":"observed","key","at"}`). The
+anchor itself is never written by a close. Anchors and close sessions are
+left out of `koto workflows`, the dashboard and the native `/workflows`
+file.
 
 ---
 

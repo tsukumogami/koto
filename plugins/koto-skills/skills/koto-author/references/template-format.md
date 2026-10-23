@@ -1327,7 +1327,7 @@ transitions:
       ci_exit: "${gates.ci.exit_code}"
 ```
 
-Compile-time rules: keys must be usable context keys, outside the reserved `koto/` area that only koto writes; values must be strings (numbers and booleans are written as text, mappings and lists are errors); `${evidence.<field>}` must name an `accepts` field of the source state; `${gates.<gate>...}` must name a gate on the source state; `{{VAR}}` must be a declared variable or capture; any other `${...}` (for example `${context.key}`) is an error.
+Compile-time rules: keys must be usable context keys, outside the reserved `koto/` area (a first component of `koto`, in any case) that only koto writes; values must be strings (numbers and booleans are written as text, mappings and lists are errors); `${evidence.<field>}` must name an `accepts` field of the source state; `${gates.<gate>...}` must name a gate on the source state; `{{VAR}}` must be a declared variable or capture; any other `${...}` (for example `${context.key}`) is an error.
 
 Runtime rules: only the edge that fires writes. It writes on every kind of transition: evidence-resolved, gate-resolved auto-advance, and `skip_if`. An evidence field not submitted, or a gate path absent from that tick's output, resolves to `""` and the transition still happens. Evidence belongs to the state it was submitted to: when a submission moves the session into a state that auto-advances in the same tick, `${evidence.<field>}` on that state's outgoing edge resolves to `""` even though the field was in the submission, and it overwrites any value an earlier edge stored under the key. Put the assignment on the edge out of the state that takes the evidence. A gate path walks any nesting (`${gates.leg.payload.pr}`). Values are stored as resolved and never expanded again. A later write to the same key replaces the earlier one. The values are recorded on the `transitioned` event, and a failed store write is restored from the log on the next `koto context get`, `koto context exists`, or context gate.
 
@@ -1356,7 +1356,8 @@ Declare a key on the state whose re-entry makes it stale, typically the state
 a retry loop returns to, even when a later state's gate reads it; don't list a
 key the state reads as input from before it was entered. Compile-time rules:
 literal keys only (no `{{VAR}}`), each a usable context key outside the
-reserved `koto/` area, no duplicates, not
+reserved `koto/` area (a first component of `koto`, in any case), no
+duplicates, not
 on a terminal state, not an empty list, and not a key any transition writes
 through `context_assignments`.
 

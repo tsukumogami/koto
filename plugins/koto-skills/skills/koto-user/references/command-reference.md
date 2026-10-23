@@ -26,6 +26,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session recover` | Operator — one-time migration recovery |
 | `koto session rebind` | Runner — after a checkout moves |
 | `koto session link` | Runner — the dispatched session's own driver, after a dispatch with no request leg |
+| `koto session anchor open/observe/close` | Hooks and operators — an agent session's start hook, its watcher, and a workspace's reap command |
 | `koto session import` | Runner — cloud backend only, after a session moves to another host or workspace |
 | `koto session resolve` | Runner — cloud backend only |
 | `koto status` | Runner — primary |
@@ -76,6 +77,8 @@ Initializes a new workflow. Provide the definition one of two ways:
 | `--koto-leg <request-id>:<leg>` | No | Attach the resulting session to a request leg in the same call, with every `koto request attach` check. Any refusal is recorded on an open, unbound leg as `result_source: refused`. Once bound, the session gets a dispatched-by link naming the request's `requested_by` (none when that name can't be a link's peer). |
 | `--dispatched-by <name>` | No | Record that session `<name>` dispatched this one: a dispatched-by link in this session's own context, as `koto session link` writes. `<name>` isn't written and need not exist. A name failing the session-name rule, or naming the session itself, exits 2 (`invalid_usage`) before anything is created. |
 
+**`KOTO_ANCHOR`.** When it names an agent-session anchor other than the session being created, init writes a held-by link, `koto/links/held-by/<anchor>`, into the new session (once), plus a throttled `anchor_activity` event in that anchor; when the anchor reads closed and has a successor (`<anchor>-s2`, ...), a second held-by link to the successor too. Unset, empty, or naming no anchor: nothing happens and nothing is printed. `KOTO_DISPATCHER_ANCHOR` is never read. See `koto session anchor` below.
+
 **Entry flags.** With `--vars-file` or any entry flag, the output adds `"outcome": "created" | "attached" | "replaced"` (plus `rebound` on an attach, `replaced_state`/`replaced_result` on a replace, and `leg` under `--koto-leg`). Every check runs before any write, so a refusal changes nothing, and rebind variables are re-applied only after the leg bind succeeds. Without `--attach-live`/`--replace-terminal` an existing name is still "already exists" (exit 1). The entry flags are rejected with `--from-stdin` and `--parent`. Branch on `code`, never on the message.
 
 **Success output:**
@@ -108,6 +111,8 @@ koto next <name> [--no-cleanup] [--full]
 ```
 
 Gets the current state directive. Submits evidence when `--with-data` is provided. Forces a directed transition when `--to` is provided.
+
+Under `KOTO_ANCHOR`, a tick records a held-by link and a throttled `anchor_activity` event exactly as `koto init` does; a second tick under the same anchor adds no link, a tick under another anchor adds a second. `koto next` on an anchor or an anchor's close session (`kind` in `koto session list`) is refused with `precondition_failed`, exit 2, and changes nothing.
 
 | Flag | Description |
 |---|---|
@@ -296,7 +301,7 @@ Flags are mutually exclusive. When none are provided, all workflows are listed.
 ]
 ```
 
-The `parent_workflow` field is `null` for parentless workflows and a string with the parent's name for children. Returns `[]` when no workflows exist or no workflows match the filter. The `name` field is the workflow identifier (not `id` — that field name appears only in `koto session list`).
+The `parent_workflow` field is `null` for parentless workflows and a string with the parent's name for children. Returns `[]` when no workflows exist or no workflows match the filter. Agent-session anchors and their close sessions are never listed here; `koto session list` shows them with their `kind`. The `name` field is the workflow identifier (not `id` — that field name appears only in `koto session list`).
 
 ---
 
@@ -722,7 +727,7 @@ Lists all sessions as a JSON array, sorted alphabetically by `id`.
 ]
 ```
 
-Note: this command uses `id` where `koto workflows` uses `name`. Both refer to the same session identifier. Returns `[]` when no sessions exist.
+Note: this command uses `id` where `koto workflows` uses `name`. Both refer to the same session identifier. Returns `[]` when no sessions exist. A session koto keeps for itself carries `kind`: `"anchor"` (an agent session's anchor) or `"anchor-close"` (the record that one ended); ordinary sessions have no `kind`.
 
 - `--state` adds `state`, `status` (`running`, `terminal`, `cancelled` or `unreadable`), `failure` and `finished_at` to each row.
 - `--execution-dir <dir>` keeps only sessions whose `execution_dir` is `<dir>` or lies under it (whole path components, so `/work/a` doesn't match `/work/ab`), implies `--state`, and prints `{"sessions": [...], "excluded_remote_only": N}`. Use it to find the sessions a piece of work left in a directory and which of them are finished.
@@ -849,6 +854,30 @@ The link's value is `{"v":1,"session":"<name>","session_id":"<id or null>","work
 
 ---
 
+## koto session anchor
+
+```
+koto session anchor open --harness-session <id> --source <startup|resume|compact|clear|other> [--process <token>] [--dispatched-by <name>] [--observed-key <key>] [--workspace <dir>] [--transcript-path <path>]
+koto session anchor observe --anchor <name> (--key=<key> | --inherit)
+koto session anchor close --key=<key> --harness-session=<id>
+```
+
+An anchor is the session koto keeps for one agent session (`kind: "anchor"`), so that what the agent session opens or ticks under `KOTO_ANCHOR` can name it in a held-by link. You rarely run these by hand: the start hook runs `open` and `observe`, and a workspace's reap command runs `close`. All three print `key=value` lines; a refusal prints `{"error", "command"}` and exits 2, any other failure exits 3, and a failed `open` prints no `anchor=` line. Ids and keys must match `^[A-Za-z0-9_-]{1,128}$`.
+
+- **open** creates or continues `anchor-<id>` under its lock and never reads `KOTO_ANCHOR`. Prints `anchor=<name>`, `opened=new|continued|reopened|successor`, `observed=yes|no`, and after a `clear` that found the anchor its process ran before, `previous=<name>` and `inherit_until=<rfc3339>`. An anchor that reads closed (or was migrated) gets a successor `anchor-<id>-s2`, `-s3`, ... linked to it. A `resume` with no anchor of its own links to a predecessor found through the transcript path, without copying its marker. `--dispatched-by` becomes a link only when an anchor is created; `--observed-key` becomes the marker only when there is none. Each call appends an `anchor_started` event holding digests of the process token and transcript path, never the values.
+- **observe** writes the observed marker into the named anchor only: `--key` the key given, `--inherit` the marker of the predecessor its `anchor_started` recorded. A marker already there is kept. Prints `anchor=<name>` and `observed=yes|no`.
+- **close** records `anchor-<id>`, and the anchors that succeeded it after a `/clear` or a resume, each only when its marker equals the key, in a separate close session `<anchor>-closed` (`kind: "anchor-close"`, already finished). It never writes an anchor. Prints `closed=<n>`; a repeat, or nothing matching, prints `closed=0` and exits 0. A child anchor dispatched by the session, or a successor opened because its predecessor was already closed, stays open.
+
+A workspace's guarded reap form:
+
+```bash
+[ -n "$NIWA_REAP_KEY" ] || exit 0; command -v koto >/dev/null 2>&1 || exit 0
+koto session anchor close --help >/dev/null 2>&1 || exit 0
+exec koto session anchor close --key="$NIWA_REAP_KEY" --harness-session="$NIWA_SESSION_ID"
+```
+
+---
+
 ## koto session import (cloud backend only)
 
 ```
@@ -966,7 +995,7 @@ Stores content under `<key>` in the session's context store. When `--from-file` 
 
 Keys are hierarchical path strings (e.g., `scope.md`, `research/r1/lead.md`). Keys must not start with `.` or contain `..`.
 
-**Keys under `koto/` are reserved.** koto writes its own records there (the dispatched-by links of `koto session link`). `context add` and `context remove` refuse any key whose first component is `koto`, in any case (`KOTO/...` too), with exit 2 and an error naming the prefix, and change nothing. `context get`, `exists` and `list` read them like any other key.
+**Keys under `koto/` are reserved.** koto writes its own records there (the dispatched-by links of `koto session link`, the held-by links `KOTO_ANCHOR` records, and an anchor's observed marker). `context add` and `context remove` refuse any key whose first component is `koto`, in any case (`KOTO/...` too), with exit 2 and an error naming the prefix, and change nothing. `context get`, `exists` and `list` read them like any other key.
 
 No stdout on success. Exit 2 with `workflow '<session>' not found` if the session has no state log, and nothing is stored. That covers a name that was never initialized, a session that finished and was cleaned up, a child moved by its parent's `koto rewind`, and a batch child that is still `pending` or `blocked`. To give a batch child input before it starts, put it in the task entry's `vars`, or store it on the parent and read it from the child with `koto context get <parent> <key>`. Exit 3 on infrastructure errors, including a state log that exists but has no header.
 

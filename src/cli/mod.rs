@@ -19,6 +19,7 @@ pub mod overrides;
 pub mod request;
 pub mod retry;
 pub mod session;
+pub mod session_anchor;
 pub(crate) mod session_inventory;
 #[cfg(unix)]
 pub(crate) mod session_prune;
@@ -657,6 +658,18 @@ pub enum SessionCommand {
         /// Name of the session that dispatched SESSION
         #[arg(long = "dispatched-by", value_name = "NAME")]
         dispatched_by: String,
+    },
+
+    /// Open, observe and close agent-session anchors.
+    ///
+    /// An anchor is the session koto keeps for one agent session, so that
+    /// the sessions it opens or ticks can name it (`KOTO_ANCHOR`) and stay
+    /// kept while it is alive. Anchors and their close sessions never show
+    /// in `koto workflows`; `koto session list` shows them with their
+    /// `kind`. Each verb prints `key=value` lines.
+    Anchor {
+        #[command(subcommand)]
+        action: session_anchor::AnchorCommand,
     },
 
     /// Move a session's execution anchor to another directory.
@@ -1567,6 +1580,7 @@ pub fn run(app: App) -> Result<()> {
                 if let Some(dispatcher) = &dispatched_by {
                     session::record_dispatched_by(&backend, &name, dispatcher);
                 }
+                session_anchor::hold_from_env(&backend, &name, "init");
                 Ok(())
             } else {
                 let template = template.unwrap_or_else(|| {
@@ -1578,8 +1592,8 @@ pub fn run(app: App) -> Result<()> {
                         2,
                     )
                 });
-                if parent.is_none() && (entry_flags_used || vars_file.is_some()) {
-                    return init_entry::run(
+                let result = if parent.is_none() && (entry_flags_used || vars_file.is_some()) {
+                    init_entry::run(
                         &backend,
                         &init_entry::InitArgs {
                             name: &name,
@@ -1591,19 +1605,27 @@ pub fn run(app: App) -> Result<()> {
                             legacy_environment,
                         },
                         &entry,
-                    );
+                    )
+                } else {
+                    handle_init(
+                        &backend,
+                        &name,
+                        &template,
+                        &vars,
+                        parent.as_deref(),
+                        intent.as_deref(),
+                        execution_dir.as_deref(),
+                        legacy_environment,
+                        dispatched_by.as_deref(),
+                    )
+                };
+                // The agent session that ran this init holds the session
+                // it opened: a held-by link to `KOTO_ANCHOR`, when that
+                // names an anchor.
+                if result.is_ok() {
+                    session_anchor::hold_from_env(&backend, &name, "init");
                 }
-                handle_init(
-                    &backend,
-                    &name,
-                    &template,
-                    &vars,
-                    parent.as_deref(),
-                    intent.as_deref(),
-                    execution_dir.as_deref(),
-                    legacy_environment,
-                    dispatched_by.as_deref(),
-                )
+                result
             }
         }
         Command::Next {
@@ -1629,6 +1651,15 @@ pub fn run(app: App) -> Result<()> {
                     );
                 }
             }));
+            // The running agent session holds what it ticks: a held-by
+            // link to `KOTO_ANCHOR`, when that names an anchor. Not from a
+            // nested tick, which `handle_next` refuses before it touches
+            // anything, and not on an anchor or close session, which it
+            // refuses too (`anchor::hold` writes nothing into one). With
+            // `KOTO_ANCHOR` unset this reads nothing at all.
+            if crate::engine::reentrancy::enclosing_tick().is_none() {
+                session_anchor::hold_from_env(backend, &name, "next");
+            }
             let context_store: &dyn ContextStore = backend;
             let result = handle_next(
                 backend,
@@ -1810,6 +1841,7 @@ pub fn run(app: App) -> Result<()> {
                     session,
                     dispatched_by,
                 } => session::handle_link(&backend, &session, &dispatched_by),
+                SessionCommand::Anchor { action } => session_anchor::handle(&backend, action),
                 SessionCommand::Rebind { name, to } => {
                     session::handle_rebind(&backend, &name, to.as_deref())
                 }
@@ -4386,6 +4418,44 @@ fn handle_next(
         exit_with_error_code(json, err.code.exit_code());
     }
     reentrancy::mark_tick(&name);
+
+    // An anchor or an anchor's close session is koto's own record of an
+    // agent session, not a workflow: nothing ticks it. Refused before the
+    // startup passes below, so the refusal writes nothing anywhere. The
+    // header is read from the local file, so the check adds no request to
+    // a cloud backend's tick.
+    let local_header = crate::discover::validate_workflow_name(&name)
+        .ok()
+        .and_then(|_| {
+            crate::engine::persistence::read_header(
+                &backend
+                    .session_dir(&name)
+                    .join(crate::session::state_file_name(&name)),
+            )
+            .ok()
+        });
+    if let Some(header) = local_header {
+        let kind = header.session_kind();
+        if kind.is_koto_owned() {
+            let what = match kind {
+                crate::engine::types::SessionKind::AnchorClose => "an anchor's close session",
+                _ => "an agent session's anchor",
+            };
+            let err = NextError {
+                code: NextErrorCode::PreconditionFailed,
+                message: format!(
+                    "session '{}' is {} (kind \"{}\"), which koto keeps for its own \
+                     bookkeeping; `koto next` doesn't tick it",
+                    name,
+                    what,
+                    header.kind.as_deref().unwrap_or_default()
+                ),
+                details: vec![],
+            };
+            let json = serde_json::json!({"error": err});
+            exit_with_error_code(json, err.code.exit_code());
+        }
+    }
 
     // Resolve request-store operator config through the full 5-level
     // cascade, applying the per-tick `--redelegation-cap` CLI flag (if
@@ -8501,6 +8571,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -9193,6 +9264,7 @@ Done.
                     deadline: None,
                     retry_count: None,
                     agent_config: None,
+                    kind: None,
                     root_session_id: None,
                     parent_session_id: None,
                     respawn_generation: None,

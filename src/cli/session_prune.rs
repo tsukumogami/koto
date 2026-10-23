@@ -598,23 +598,8 @@ fn is_token(token: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Parse `--older-than`: a whole number followed by `s`, `m`, `h` or `d`.
-fn parse_age(arg: &str) -> Option<Duration> {
-    let unit = arg.chars().last()?;
-    let digits = &arg[..arg.len() - unit.len_utf8()];
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let n: u64 = digits.parse().ok()?;
-    let secs = match unit {
-        's' => n,
-        'm' => n.checked_mul(60)?,
-        'h' => n.checked_mul(3600)?,
-        'd' => n.checked_mul(86_400)?,
-        _ => return None,
-    };
-    Some(Duration::from_secs(secs))
-}
+// `--older-than`: a whole number followed by `s`, `m`, `h` or `d`.
+use crate::session::duration::parse_age;
 
 fn plan_unknown(token: &str) -> ! {
     exit_with_error_code(

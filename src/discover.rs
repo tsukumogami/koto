@@ -93,6 +93,9 @@ pub fn find_workflows_with_metadata(
     let sessions = backend.list()?;
     let results = sessions
         .into_iter()
+        // Anchors and their close sessions are koto's records of agent
+        // sessions, not workflows; `koto session list` shows them.
+        .filter(|info| !info.session_kind().is_koto_owned())
         .map(|info| WorkflowMetadata {
             name: info.id,
             created_at: info.created_at,
@@ -146,6 +149,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -183,6 +187,37 @@ mod tests {
         let results = find_workflows_with_metadata(&backend).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "good");
+    }
+
+    #[test]
+    fn metadata_leaves_out_anchors_and_close_sessions_but_not_unknown_kinds() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(dir.path().to_path_buf());
+        write_session_state(dir.path(), "wf", "hash-wf");
+        for (name, kind) in [
+            ("anchor-h1", "anchor"),
+            ("anchor-h1-closed", "anchor-close"),
+            ("later", "some-future-kind"),
+        ] {
+            let session_dir = dir.path().join(name);
+            std::fs::create_dir_all(&session_dir).unwrap();
+            let header = serde_json::json!({
+                "schema_version": 1, "workflow": name, "template_hash": "h",
+                "created_at": "2026-03-15T10:00:00Z", "kind": kind,
+            });
+            std::fs::write(
+                session_dir.join(state_file_name(name)),
+                format!("{header}\n"),
+            )
+            .unwrap();
+        }
+        assert_eq!(backend.list().unwrap().len(), 4);
+        let names: Vec<String> = find_workflows_with_metadata(&backend)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, vec!["later".to_string(), "wf".to_string()]);
     }
 
     #[test]
@@ -351,6 +386,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,

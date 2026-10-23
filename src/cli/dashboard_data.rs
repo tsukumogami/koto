@@ -308,6 +308,10 @@ pub fn scan_sessions(backend: &dyn SessionBackend) -> Result<Vec<(String, PathBu
         if info.id.contains('~') {
             continue;
         }
+        // Anchors and close sessions are not workflows.
+        if info.session_kind().is_koto_owned() {
+            continue;
+        }
         let dir = backend.session_dir(&info.id);
         let state_path = dir.join(state_file_name(&info.id));
         result.push((info.id, state_path));
@@ -582,6 +586,7 @@ fn make_empty_header() -> StateFileHeader {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        kind: None,
         root_session_id: None,
         parent_session_id: None,
     }
@@ -989,6 +994,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
         }
@@ -1053,6 +1059,31 @@ mod tests {
         let result = scan_sessions(&backend).unwrap();
         assert_eq!(result.len(), 1, "epoch-branched session should be filtered");
         assert_eq!(result[0].0, "my-session");
+    }
+
+    #[test]
+    fn scan_sessions_leaves_out_anchors_and_close_sessions() {
+        use crate::session::anchor::{self, OpenRequest, Source};
+        let dir = TempDir::new().unwrap();
+        let backend = LocalBackend::with_base_dir(dir.path().to_path_buf());
+        backend.create("my-session").unwrap();
+        write_minimal_state_file(&dir.path().join("my-session"), "my-session");
+        let req = OpenRequest {
+            harness_session: "h1".to_string(),
+            source: Source::Startup,
+            process: None,
+            dispatched_by: None,
+            observed_key: Some("k1".to_string()),
+            workspace: None,
+            transcript_path: None,
+        };
+        anchor::open(&backend, &req).unwrap();
+        anchor::close(&backend, "k1", "h1").unwrap();
+        assert_eq!(backend.list().unwrap().len(), 3);
+
+        let result = scan_sessions(&backend).unwrap();
+        let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["my-session"]);
     }
 
     #[test]
@@ -1734,6 +1765,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,

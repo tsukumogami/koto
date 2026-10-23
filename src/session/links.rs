@@ -53,16 +53,24 @@ pub const MAX_LINK_BODY_BYTES: usize = 4 * 1024;
 pub enum LinkKind {
     /// The peer dispatched the session holding the link.
     DispatchedBy,
+    /// The peer is the anchor of an agent session that opened or ticked
+    /// the session holding the link.
+    HeldBy,
+    /// The peer is the anchor the session holding the link closes; only a
+    /// close session holds one.
+    Closes,
 }
 
 impl LinkKind {
     /// Every kind koto knows.
-    pub const ALL: [LinkKind; 1] = [LinkKind::DispatchedBy];
+    pub const ALL: [LinkKind; 3] = [LinkKind::DispatchedBy, LinkKind::HeldBy, LinkKind::Closes];
 
     /// The kind's key component, as it appears in `koto/links/<kind>/`.
     pub const fn as_str(self) -> &'static str {
         match self {
             LinkKind::DispatchedBy => "dispatched-by",
+            LinkKind::HeldBy => "held-by",
+            LinkKind::Closes => "closes",
         }
     }
 
@@ -394,7 +402,13 @@ mod tests {
             LinkKind::parse("dispatched-by"),
             Some(LinkKind::DispatchedBy)
         );
-        assert_eq!(LinkKind::parse("held-by"), None);
+        assert_eq!(LinkKind::parse("held-by"), Some(LinkKind::HeldBy));
+        assert_eq!(LinkKind::parse("closes"), Some(LinkKind::Closes));
+        assert_eq!(
+            link_key(LinkKind::HeldBy, "anchor-1"),
+            "koto/links/held-by/anchor-1"
+        );
+        assert_eq!(LinkKind::parse("read-by"), None);
     }
 
     #[test]
@@ -588,7 +602,7 @@ mod tests {
     fn read_links_skips_unknown_kinds_and_unparseable_bodies() {
         let (_tmp, b) = backend();
         make_session(&b, "s", "sid", None);
-        b.add_with_writer("s", "koto/links/held-by/anchor-1", b"{}", WRITER_KOTO)
+        b.add_with_writer("s", "koto/links/read-by/anchor-1", b"{}", WRITER_KOTO)
             .unwrap();
         b.add_with_writer("s", "koto/links/dispatched-by/p", b"not json", WRITER_KOTO)
             .unwrap();

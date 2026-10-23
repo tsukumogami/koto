@@ -712,6 +712,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -780,6 +781,7 @@ mod tests {
             template_source_status: None,
             execution_dir: None,
             session_id: None,
+            kind: None,
         };
         // Listed out of order on purpose.
         let sessions = vec![
@@ -805,6 +807,7 @@ mod tests {
                 template_source_status: None,
                 execution_dir: None,
                 session_id: None,
+                kind: None,
             },
             SessionInfo {
                 id: "child-a".to_string(),
@@ -814,6 +817,7 @@ mod tests {
                 template_source_status: None,
                 execution_dir: None,
                 session_id: None,
+                kind: None,
             },
             SessionInfo {
                 id: "child-b".to_string(),
@@ -823,6 +827,7 @@ mod tests {
                 template_source_status: None,
                 execution_dir: None,
                 session_id: None,
+                kind: None,
             },
             SessionInfo {
                 id: "grandchild".to_string(),
@@ -832,6 +837,7 @@ mod tests {
                 template_source_status: None,
                 execution_dir: None,
                 session_id: None,
+                kind: None,
             },
             SessionInfo {
                 id: "unrelated".to_string(),
@@ -841,6 +847,7 @@ mod tests {
                 template_source_status: None,
                 execution_dir: None,
                 session_id: None,
+                kind: None,
             },
         ];
 
@@ -863,6 +870,7 @@ mod tests {
             template_source_status: None,
             execution_dir: None,
             session_id: None,
+            kind: None,
         }];
         let descendants = collect_descendants("lonely", &sessions);
         assert!(descendants.is_empty());
