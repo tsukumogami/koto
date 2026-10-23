@@ -103,6 +103,14 @@ jobs:
             exit 1
           fi
 
+      # Copied into .claude/shirabe-extensions/work-on.md (the /work-on verification map), with any deliberate differences noted there; change both together.
+      - name: Test the session-start anchor hook
+        run: |
+          # The suite enforces the 300 ms bound on the hook's synchronous
+          # part because CI is set here.
+          export PATH="$PWD/target/release:$PATH"
+          bash plugins/koto-skills/hooks/test/session-start.test.sh
+
   schema-validation:
     name: Schema Validation
     if: ${{ github.event.pull_request.draft != true }}
