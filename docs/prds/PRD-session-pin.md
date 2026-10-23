@@ -16,8 +16,9 @@ goals: |
   releases it, and an agent session releases one only when it was handed
   koto's release authority. Sessions nobody pinned keep exactly today's
   behaviour, and all of it works with koto and no niwa.
-upstream: docs/briefs/BRIEF-session-pin.md
 source_issue: 441
+absorbed:
+  - docs/briefs/BRIEF-session-pin.md
 ---
 
 # PRD: Pin a finished session so no removal rule takes it
@@ -25,6 +26,42 @@ source_issue: 441
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-session-pin](docs/briefs/BRIEF-session-pin.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+The brief named in Status is folded into this section and its file was
+removed when this PRD absorbed it; this section is the brief's framing, and
+there is no separate file to look for.
+
+The feature was framed before these requirements existed, from an issue
+asking for a way to keep a finished session. Session retention keeps a
+finished session only while a member of its hierarchy is alive, and then for
+the retention period. That covers the sessions a live coordinator still
+reads; it doesn't cover a session that is the record of finished work and
+matters after the whole hierarchy is gone, such as one a reviewer reaches
+from a merged pull request weeks later, and under the cloud backend its
+removal reaches every host sharing the bucket. The framed outcome: whoever
+knows a finished session matters marks it to be kept with a reason and stops
+worrying about it; no removal koto applies takes it on any host sharing the
+store; each removal that passes it over says why; the mark comes off only
+when someone allowed to release it does so, never by idle time, staleness or
+another rule; a mark koto can't read keeps its session; sessions nobody
+marked are untouched; and it works with koto and no niwa. The framing's four
+journeys (keeping the record of finished work, an operator's prune on a
+second host, releasing a record nobody needs, and a mark that can't be read)
+are the User Stories below. Its boundary put in: the mark, its release, every
+removal by rule or subtree plus `koto session cleanup`, reasons where keepers
+are named today, the cloud backend including anchors held on one host's local
+store, failing toward keeping, and release authority handed to the session
+the way its anchor name is. It put out: release by any rule, changes for
+unmarked sessions, an automatic pruner, host-level stores, defining the
+authority itself, enforcement stronger than today's, any dependency between
+koto and niwa, and removals inside a run koto is still driving. It left three
+questions to these requirements: who may release a mark and how that
+authority reaches koto, whether a mark covers one session or a hierarchy, and
+whether setting one needs authority; Decisions and Trade-offs settles each.
 
 ## Problem Statement
 
