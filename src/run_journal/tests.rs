@@ -5072,7 +5072,7 @@ fn an_anchors_read_record_is_journaled_against_the_session_it_names() {
     f.init("b", header("b", "b-id", None), Some("work"));
     f.init(
         "anchor-r",
-        header("anchor-r", "anchor-id", None),
+        anchor_header("anchor-r", "anchor-id"),
         Some("open"),
     );
     let b_dir = f.backend.session_dir("b");
@@ -5144,4 +5144,33 @@ fn an_anchors_read_record_is_journaled_against_the_session_it_names() {
             before
         );
     }
+}
+
+fn anchor_header(workflow: &str, session_id: &str) -> StateFileHeader {
+    let mut h = header(workflow, session_id, None);
+    h.kind = Some(crate::engine::types::SessionKind::ANCHOR.to_string());
+    h
+}
+
+/// A `context_read` carrying `session` in a log that isn't an anchor's is
+/// not a read record: koto writes the field only into a reader's anchor, so
+/// nothing is journaled against the session it names.
+#[test]
+fn a_session_field_outside_an_anchor_is_not_journaled() {
+    let f = Fixture::new();
+    f.init("b", header("b", "b-id", None), Some("work"));
+    f.init("c", header("c", "c-id", None), Some("work"));
+    let mut forged = cli_read("work", "notes.md", Some("v"));
+    if let EventPayload::ContextRead { session, .. } = &mut forged {
+        *session = Some("b".to_string());
+    }
+    commit_as(&f, None, "c", &forged);
+    commit_as(&f, None, "c", &transitioned(Some("work"), "next"));
+
+    let j = f.journal();
+    assert!(
+        j.iter()
+            .all(|r| !(r["kind"] == "context_reads" && r["session"] == "b")),
+        "{j:?}"
+    );
 }

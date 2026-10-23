@@ -139,8 +139,11 @@ fn line_timestamp(line: &str) -> Option<&str> {
 
 /// The `context_reads` record of a read the reader's anchor `anchor`
 /// recorded for another session: a committed `context_read` whose
-/// `session` names the session read. `None` for any other payload, and for
-/// a `session` that isn't a session name.
+/// `session` names the session read. `None` for any other payload, for a
+/// `session` that isn't a session name, and when `anchor` isn't an anchor in
+/// the local store: only koto writes `session`, and only into a reader's
+/// anchor, so the field in any other log (one pulled from a bucket someone
+/// else can write, say) is not a read record.
 ///
 /// The record is attributed to the session read: its `session`,
 /// `koto.session.id` and `koto.run.id` are that session's, read from its
@@ -169,6 +172,9 @@ pub(super) fn anchor_read(
         return None;
     };
     crate::session::validate::validate_session_id(read).ok()?;
+    if !crate::session::anchor::is_anchor(backend, anchor) {
+        return None;
+    }
     let dir = backend.session_dir(read);
     let header =
         crate::engine::persistence::read_header(&dir.join(crate::session::state_file_name(read)))
