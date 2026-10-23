@@ -1387,33 +1387,41 @@ environment:
 
 | Reader's anchor | Where the `context_read` goes |
 |---|---|
+| Any, when the command runs inside the read session's own tick (a gate script or default action reading its own session) | The session read, as above. |
 | Names an existing anchor that is the session read, or that the session read holds through `koto/links/held-by/<anchor>` | The session read, as above. |
 | Names an existing anchor otherwise | The reader's anchor, with `session` naming the session read. The session read stays byte-identical. |
-| Unset, or names no anchor in the local store | The session read, as above. |
+| Unset, or names no anchor in the local store | No log: the reading host's read spool, `context-reads.jsonl` beside the read session's local copy. The session read stays byte-identical. |
 
-The last row is a known cross-session writer, tracked by koto#412: a read
-from a shell with no anchor still appends to the session it read. The table
-applies under the local backend; under the cloud backend every such read is
-still logged in the session it read. A gate,
-result-map or decider read always logs in the session it belongs to, since
-it runs inside that session's own tick.
+The table holds under both backends. The last row closes the cross-session
+writer koto#412 tracked, where a read from a shell with no anchor appended
+to the session it read. A spooled read is the same `context_read` payload,
+with no `session` field, on a line of its own with its `timestamp`; the spool
+isn't part of the feed, and koto reads it back only through its one reader,
+for the run journal. Under the cloud backend, a read the session's own tick
+didn't make is spooled the same way, and so is an own read made outside its
+tick. A gate, result-map or decider read always logs in the session it
+belongs to, since it runs inside that session's own tick.
 
 A read recorded in the reader's anchor counts as that anchor's activity
 when koto judges whether the anchor is idle, and never as activity of the
-session read or of any anchor holding it. An append to the reader's anchor
-that fails warns on stderr and never fails the read.
+session read or of any anchor holding it. A spooled read counts as no
+session's activity. An append to the reader's anchor or to the spool that
+fails warns on stderr and never fails the read.
 
-Its consumers handle the `session` field this way:
+The consumers handle these reads this way:
 
-- The session read's own run-journal fold reads only that session's log,
-  so it doesn't count a read another agent session made. When the anchor
-  commits the read, the run journal writes one `context_reads` record
+- The session read's own run-journal fold reads that session's log and its
+  spool, merged by timestamp, so a spooled read shows up in the visit it
+  fell in. A read in another agent session's anchor isn't in either: when
+  the anchor commits it, the run journal writes one `context_reads` record
   attributed to the session `session` names, with `koto.context.read_by`
   naming the anchor (see `docs/reference/run-journal.md`).
 - Read records carry context key names and value hashes, so they stay on
   the host, with one exception: the user's own koto cloud backend, which
   they enabled, syncs the anchor's log to their own bucket like any other
-  session. Every other shipper keeps `context_read` events local.
+  session. Every other shipper keeps `context_read` events local. Spooled
+  reads never leave the host under either backend: no backend uploads the
+  spool.
 
 ---
 

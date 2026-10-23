@@ -2281,9 +2281,12 @@ impl SessionBackend for CloudBackend {
         // A read of `id` by anything but its own tick is kept on this host,
         // in the read spool, and never written into `id`'s log or pushed:
         // the reader must not become a writer of a session it only read.
+        // A read an anchor records of another session (it names that
+        // session in `session`) is the anchor's own write, and goes into the
+        // anchor's log like any other.
         if matches!(
             payload,
-            crate::engine::types::EventPayload::ContextRead { .. }
+            crate::engine::types::EventPayload::ContextRead { session: None, .. }
         ) && !self.is_own_tick(id)
         {
             return crate::session::read_spool::append(

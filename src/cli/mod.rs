@@ -2002,7 +2002,7 @@ pub fn run(app: App) -> Result<()> {
                     let events = context::restore_assigned(store, &backend, &session, &key);
                     // The reader's anchor decides where the read is logged
                     // (DESIGN-session-retention.md, Decision 5).
-                    let reader_anchor = context::reader_anchor(backend.is_cloud());
+                    let reader_anchor = context::reader_anchor();
                     if let Err(e) = context::handle_get(
                         store,
                         &backend,
@@ -2028,7 +2028,7 @@ pub fn run(app: App) -> Result<()> {
                     // unaffected; exit 2 is "not a key at all", which koto
                     // already uses for input the caller must fix.
                     let events = context::restore_assigned(store, &backend, &session, &key);
-                    let reader_anchor = context::reader_anchor(backend.is_cloud());
+                    let reader_anchor = context::reader_anchor();
                     match context::handle_exists(
                         store,
                         &backend,

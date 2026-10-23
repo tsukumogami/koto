@@ -905,11 +905,12 @@ Exits non-zero if the session or key doesn't exist.
 
 | `KOTO_ANCHOR` | The read is logged in |
 |---|---|
+| any, when the command runs inside `<name>`'s own tick (a gate script or default action reading its own session) | `<name>`'s own log |
 | names an existing anchor that is `<name>`, or that `<name>` holds through `koto/links/held-by/<anchor>` | `<name>`'s own log, as before |
 | names an existing anchor otherwise (a read from another agent session) | that anchor's log, with a `session` field naming `<name>`; `<name>`'s files stay byte-identical |
-| unset, or names no anchor in the local store | `<name>`'s own log, as before |
+| unset, or names no anchor in the local store | this host's read spool, `context-reads.jsonl` beside `<name>`'s local copy; `<name>`'s log and other files stay byte-identical |
 
-The last row still writes into the session read from a shell with no anchor, a known cross-session writer (koto#412). The table applies under the local backend; under the cloud backend every `context get` and `context exists` read is still logged in `<name>`'s own log. A read logged in the reader's anchor counts as that anchor's activity for its idle close, never as activity of `<name>` or of an anchor holding it. An append that fails warns on stderr and never fails the read. `koto context list`, `koto status`, `koto session list`, `koto session hierarchy` and a prune preview log no read anywhere. The [session-feed contract](../reference/session-feed.md#reads-from-another-agent-session) has the event's fields and its consumers.
+The table holds under both backends. The last row used to write into the session read, which made a read from a bare shell a cross-session writer (koto#412); now it writes only the spool, which never leaves the host (the cloud backend never uploads it), counts as no session's activity, and is read back only by the run journal when it sums the visit the read fell in. A read logged in the reader's anchor counts as that anchor's activity for its idle close, never as activity of `<name>` or of an anchor holding it. An append that fails warns on stderr and never fails the read. `koto context list`, `koto status`, `koto session list`, `koto session hierarchy` and a prune preview log no read anywhere. The [session-feed contract](../reference/session-feed.md#reads-from-another-agent-session) has the event's fields and its consumers.
 
 #### context exists
 

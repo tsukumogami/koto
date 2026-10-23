@@ -114,17 +114,8 @@ pub enum ReadLogTarget {
 }
 
 /// The reader's anchor `koto context get` and `exists` log by: the
-/// `KOTO_ANCHOR` the command runs with, on the local backend.
-///
-/// On the cloud backend it is `None` for now, so every read there takes the
-/// anchorless row. The cloud read path is being reworked to record reads of
-/// another session on the reading host; once that lands, it hooks in here,
-/// passing the same anchor to [`read_log_target`] and recording through
-/// [`log_cli_read`].
-pub fn reader_anchor(is_cloud: bool) -> Option<String> {
-    if is_cloud {
-        return None;
-    }
+/// `KOTO_ANCHOR` the command runs with, on either backend.
+pub fn reader_anchor() -> Option<String> {
     crate::session::anchor::anchor_from_env()
 }
 
@@ -133,6 +124,7 @@ pub fn reader_anchor(is_cloud: bool) -> Option<String> {
 ///
 /// | Reader anchor | Logged in |
 /// |---|---|
+/// | any, from a command `session`'s own tick runs (a gate script's read) | the session read |
 /// | names an existing anchor that is `session`, or that `session` holds through `koto/links/held-by/<anchor>` | the session read |
 /// | names an existing anchor otherwise | the reader's anchor |
 /// | unset, or names no existing anchor | [`ReadLogTarget::Anchorless`] |
@@ -147,6 +139,9 @@ pub fn read_log_target(
 ) -> ReadLogTarget {
     use crate::session::links::{link_key, LinkKind};
 
+    if crate::engine::reentrancy::enclosing_tick().as_deref() == Some(session) {
+        return ReadLogTarget::Session;
+    }
     let Some(anchor) = reader_anchor else {
         return ReadLogTarget::Anchorless;
     };
@@ -202,16 +197,20 @@ fn log_cli_read(
 }
 
 /// Record a read of `session` made with no reader's anchor: the one place
-/// the anchorless row is written.
+/// the anchorless row is written, on either backend.
 ///
-/// Today it appends to the read session's own log, as koto always has, which
-/// makes a read from a bare shell a known cross-session writer (koto#412).
-/// It is meant to move to the reading host's read spool, a file beside the
-/// read session that never leaves the host and is read back through
-/// `session::read_spool::read`, once that reader lands; this function is
-/// where its writer plugs in.
+/// It goes into the reading host's read spool beside the session's local
+/// copy ([`crate::session::read_spool`]), never into the session's log, so
+/// a read from a bare shell writes nothing of the session it read
+/// (koto#412). The spool never leaves the host, counts as no session's
+/// activity, and is read back only through `read_spool::read`, which the
+/// run journal's visit fold uses. Best-effort: a spool that can't be
+/// appended to warns on stderr and the read goes on.
 fn record_anchorless_read(backend: &dyn SessionBackend, session: &str, payload: &EventPayload) {
-    context_log::append_to_session_best_effort(backend, session, payload);
+    let dir = backend.session_dir(session);
+    context_log::append_best_effort(payload, |p| {
+        crate::session::read_spool::append(&dir, &crate::engine::types::now_iso8601(), p)
+    });
 }
 
 /// Retrieve stored content and write it to stdout.
@@ -390,6 +389,15 @@ mod tests {
         backend
     }
 
+    /// The payloads of the reads spooled beside `name`, through the spool's
+    /// one reader.
+    fn spooled(backend: &LocalBackend, name: &str) -> Vec<serde_json::Value> {
+        crate::session::read_spool::read(&backend.session_dir(name), "")
+            .iter()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["payload"].clone())
+            .collect()
+    }
+
     fn event_types(backend: &LocalBackend) -> Vec<String> {
         let (_, events) = backend.read_events("s").unwrap();
         events.into_iter().map(|e| e.event_type).collect()
@@ -419,37 +427,31 @@ mod tests {
             handle_exists(&backend, &backend, events.as_deref(), None, "s", "k"),
             KeyPresence::Present
         ));
-        let (_, events) = backend.read_events("s").unwrap();
-        let reads: Vec<_> = events
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::ContextRead {
-                    reader,
-                    state,
-                    access,
-                    hash,
-                    ..
-                } => Some((
-                    reader.as_str(),
-                    state.as_str(),
-                    access.clone(),
-                    hash.clone(),
-                )),
-                _ => None,
+        // With no reader's anchor both reads go to the spool, none to the log.
+        assert_eq!(event_types(&backend), vec!["transitioned"]);
+        let reads: Vec<_> = spooled(&backend, "s")
+            .into_iter()
+            .map(|r| {
+                (
+                    r["reader"].as_str().unwrap().to_string(),
+                    r["state"].as_str().unwrap().to_string(),
+                    r["access"].as_str().map(str::to_string),
+                    r["hash"].as_str().map(str::to_string),
+                )
             })
             .collect();
         assert_eq!(
             reads,
             vec![
                 (
-                    "cli",
-                    "work",
+                    "cli".to_string(),
+                    "work".to_string(),
                     Some("content".to_string()),
                     Some(sha256_hex(b"v"))
                 ),
                 (
-                    "cli",
-                    "work",
+                    "cli".to_string(),
+                    "work".to_string(),
                     Some("presence".to_string()),
                     Some(sha256_hex(b"v"))
                 ),
@@ -719,7 +721,8 @@ mod tests {
 
     /// With no reader anchor, or a name that is no anchor here (absent, or
     /// an ordinary session, the read session included), the read takes the
-    /// anchorless row, which still logs in the session read.
+    /// anchorless row: the read goes to the spool beside the session and the
+    /// session's own files stay byte-identical.
     #[test]
     fn no_reader_anchor_takes_the_anchorless_row() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -740,10 +743,23 @@ mod tests {
                 "{anchor:?}"
             );
         }
+        let spool = crate::session::read_spool::SPOOL_FILE;
+        let own_files = |d: &std::path::Path| -> Vec<(std::path::PathBuf, Vec<u8>)> {
+            files(&d.join("s"))
+                .into_iter()
+                .filter(|(p, _)| !p.ends_with(spool))
+                .collect()
+        };
+        let before = own_files(dir.path());
         read_both(&backend, dir.path(), None);
         read_both(&backend, dir.path(), Some("no-such-anchor"));
-        assert_eq!(reads_in(&backend, "s").len(), 4);
-        assert!(reads_in(&backend, "s").iter().all(|r| r.3.is_none()));
+        assert_eq!(own_files(dir.path()), before);
+        assert!(reads_in(&backend, "s").is_empty());
+        let spooled = spooled(&backend, "s");
+        assert_eq!(spooled.len(), 4);
+        assert!(spooled
+            .iter()
+            .all(|r| r["key"] == "k" && r.get("session").is_none()));
     }
 
     /// An append to the reader's anchor that fails warns on stderr and the
