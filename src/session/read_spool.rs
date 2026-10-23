@@ -17,10 +17,17 @@
 //! read. It is host-local: nothing uploads it, and a read made on another
 //! host isn't in it.
 //!
-//! [`read`] is its one reader. Whatever consumes these reads (today the
-//! run journal's visit fold, `crate::run_journal`) goes through it, so the
-//! spool can move (to the reader's own side, as the session-retention work
-//! plans) by changing this module alone.
+//! [`read`] is its one reader and [`append`] its one writer (called from
+//! `crate::session::cloud`). Whatever consumes these reads (today the run
+//! journal's visit fold, `crate::run_journal`) goes through `read`, so the
+//! spool can move to the reader's own side, as the session-retention work
+//! plans, by changing these two functions and the writer's one call site.
+//! A line names no session: the spool's place beside the session says
+//! which, so a move that keeps reads elsewhere adds the session to the
+//! line and to `read`'s arguments.
+//!
+//! The spool is not pruned: every read stays until the session's local
+//! directory is removed, and each visit close reads the file whole.
 
 use std::io::Write;
 use std::path::Path;

@@ -59,7 +59,9 @@ pub struct Stamp {
     /// The bucket's ETag for the manifest cached in [`MANIFEST_FILE`].
     #[serde(default)]
     pub manifest_etag: Option<String>,
-    /// The tick that last probed the session, by its [`TICK_FILE`] id.
+    /// The tick, by its [`TICK_FILE`] id, in which this host last knew the
+    /// bucket to hold the stamped bytes: after a probe found them current,
+    /// a pull fetched them, or this host's own push sent them.
     #[serde(default)]
     pub verified_tick: Option<String>,
 }

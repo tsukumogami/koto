@@ -273,13 +273,24 @@ impl CloudBackend {
 
     /// Refuse when `id` was imported into another workspace.
     ///
-    /// The first time a process asks about `id`, lists the bucket with
-    /// `<prefix>/<id>/migrated.json` as the prefix and remembers the
-    /// answer. The listing answers 200 whether or not the marker is there,
-    /// so the common case, a session that was never migrated, costs one
-    /// request and no retry (a GET of a missing object is a 404, which
+    /// The first time a process asks about `id`, the answer comes from the
+    /// session's probe ([`CloudBackend::probe`]): one listing of
+    /// `<prefix>/<id>/`, which the state pull and the manifest read share,
+    /// so the check adds no request of its own. The listing answers 200
+    /// whether or not the marker is there, so a session that was never
+    /// migrated costs no retry (a GET of a missing object is a 404, which
     /// rust-s3 retries after a one-second sleep). Only when the listing
-    /// shows the marker is its body fetched.
+    /// shows the marker is its body fetched. The answer is remembered for
+    /// the process.
+    ///
+    /// Inside a tick that already checked `id` (its stamp names the tick,
+    /// and the local state file is still the stamped bytes), the bucket
+    /// isn't asked again: the marker was absent when the tick checked, and
+    /// an import another host makes later in the tick is refused at the
+    /// tick's push, which asks the bucket uncached before it writes
+    /// ([`CloudBackend::flush_pending`]). The stamp is also written by this
+    /// host's own push of `id`, after which the bucket holds what this host
+    /// wrote.
     ///
     /// A marker returns [`SessionMigrated`] naming the session it was
     /// imported as and that session's workspace. A listing that fails means
@@ -2089,7 +2100,9 @@ impl CloudBackend {
         self.s3_session_exists(id)
     }
 
-    /// Force-upload the entire local session directory to S3.
+    /// Force-upload the local session to S3: every context key the bucket
+    /// doesn't already hold as this host has it, then the manifest, the
+    /// state file and `version.json` (`koto session resolve --keep local`).
     fn force_push_session(&self, id: &str) -> anyhow::Result<()> {
         let session_dir = self.local.session_dir(id);
         if !session_dir.exists() {
@@ -2113,6 +2126,8 @@ impl CloudBackend {
         // rather than send a manifest naming it; a failed upload is a
         // warning, as every push here always was. When the listing or the
         // manifest can't be read, every key goes up.
+        // A fresh probe and manifest, not this process's cached ones: the
+        // comparison below decides what is skipped.
         self.manifest_cache.invalidate();
         self.forget_probe(id);
         self.prime_manifest(id);
