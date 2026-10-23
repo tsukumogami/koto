@@ -19,8 +19,27 @@ to `0.9.x`).
   session's own log should read the run journal's `context_reads` records,
   which fold in spooled reads, or the spool through
   `koto::session::read_spool::read`.
+- **The koto-skills plugin now registers a SessionStart hook.**
+  `hooks/session-start.sh` runs at every agent session start, resume,
+  compaction and `/clear`. With a koto older than the anchor verbs it opens
+  no anchor, and its block in `CLAUDE_ENV_FILE` unsets `KOTO_ANCHOR` and
+  `KOTO_DISPATCHER_ANCHOR`. Without koto or `jq` it does nothing. It always
+  exits 0.
 
 ### Added
+
+- **Each agent session with the koto-skills plugin opens its own anchor.**
+  The plugin's start hook runs `koto session anchor open` for
+  `anchor-<session id>`, linked to the anchor it inherited, and exports
+  `KOTO_ANCHOR` and `KOTO_DISPATCHER_ANCHOR`, both naming that anchor, into
+  the session's shells through its block of `CLAUDE_ENV_FILE`. It falls back
+  to the `KOTO_ANCHOR` export line as `additionalContext` when that file
+  can't be written safely. A detached watcher records niwa's reap key as the
+  observed marker when it appears in the session's env files, and copies a
+  `/clear` predecessor's marker. So the runs an agent session starts,
+  dispatches or reads stay readable while it lives, without the agent naming
+  an anchor. A test bounds the hook's synchronous part (the open and the env
+  file write) at a 95th percentile under 300 ms.
 
 - **The run journal carries what a routing decider answered, and what the
   agent answered for the same field.** `decider_consulted` now records the
