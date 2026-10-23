@@ -173,9 +173,9 @@ A kept session stays until one of these removes it:
 
 - it is retried or rewound and then reaches a success terminal without `--no-cleanup`, and is removed on that tick;
 - koto removes its parent at the parent's own terminal, or `koto init --attach-live --replace-terminal` replaces the parent; either removes the parent's terminal descendants first, including children kept with `--no-cleanup`. (On the terminal tick this runs only for a parent whose template has a batch hook or whose log holds a `ChildCompleted`; a hook-less parent that never received a child's notice leaves that child for `koto workflows --orphaned`.) It never removes a descendant that is still running, one with anything running under it, one it can't read, or one whose request leg still waits for its result. A parent that is itself kept keeps its children;
-- `koto workspace prune --root <root>` removes a finished root and everything under it;
-- `koto session prune` removes finished sessions as a previewed set, keeping any that something still needs (see [session prune](#session-prune));
-- `koto session cleanup <name>` removes one session.
+- `koto workspace prune --root <root>` removes the members of a finished root's subtree that the retention rule releases (see [workspace prune](#workspace-prune));
+- `koto session prune` removes finished sessions as a previewed set, keeping any whose hierarchy the retention rule keeps or that something else still needs (see [session prune](#session-prune));
+- `koto session cleanup <name>` removes one session, and names any live member of its hierarchy the removal broke.
 
 A kept session costs its directory on disk, typically tens of kilobytes. Under a root that is itself kept, which is how skills that pass `--no-cleanup` on every tick run, kept children stay until the root is pruned.
 
@@ -731,7 +731,16 @@ Removes a session directory and all its contents. Idempotent -- succeeds even if
 koto session cleanup <name>
 ```
 
-Produces no output on success. When it removes a session, it also deletes a finished record a crash left under the name; on a name koto already removed itself it removes nothing, and the record stays the `koto status` answer. This is the manual equivalent of the removal `koto next` performs at a terminal state, and the way to remove a session koto kept: one at a failure terminal, or one ticked with `--no-cleanup`. It removes only the named session; a kept parent's kept children are left for `koto workflows --orphaned` and `koto workspace prune`.
+When it removes a session, it also deletes a finished record a crash left under the name; on a name koto already removed itself it removes nothing, and the record stays the `koto status` answer. This is the manual equivalent of the removal `koto next` performs at a terminal state, and the way to remove a session koto kept: one at a failure terminal, or one ticked with `--no-cleanup`. It removes only the named session; a kept parent's kept children are left for `koto workflows --orphaned` and `koto workspace prune`.
+
+An explicit removal still removes when the retention rule would keep the session, and says what it broke. Just before removing, it judges the session's hierarchy (see [session hierarchy](#session-hierarchy)) and lists every other live member under `live_members`, each with its `kind` (`koto_session` or `anchor`) and, for an anchor, whether it is `observed`. The removed session itself is never named, and a session nothing alive keeps gets an empty list, including one kept only because its retention hasn't passed. A non-empty list also prints a warning on stderr. When the sessions directory can't be read, the session is still removed, the list is empty, and `live_members_error` says why. A malformed retention setting falls back to the defaults here, with a warning, so it never blocks a removal.
+
+```json
+{"name": "worker", "cleaned_up": true, "children": [],
+ "live_members": [{"name": "coord", "kind": "koto_session", "observed": false}]}
+```
+
+`koto cancel --cleanup <name>` does the same after appending the cancel: its output gains `live_members` (and `live_members_error` when the judgment failed), naming every other live member of the cancelled session's hierarchy, such as a dispatcher that is still running. A `koto cancel` without `--cleanup` removes nothing and carries neither field.
 
 #### session prune
 
@@ -744,28 +753,29 @@ koto session prune --apply (--execution-dir <dir> | --older-than <age> | --all).
 koto session prune --migrated-from <workspace> [--source-retired] [--apply [--plan <token>]]
 ```
 
-Without `--apply` nothing is removed. The command prints the finished sessions and finished records it would remove, every session it keeps with the rule that keeps it, and a plan token, and stores the would-remove list as `.prune-plans/<token>.json` under the sessions directory (a private file in a private directory; a preview removes stored plans older than a day).
+Without `--apply` nothing is removed. The command prints the finished sessions and finished records it would remove, every session it keeps with the rule that keeps it, the stale anchors it found, and a plan token, and stores the would-remove list as `.prune-plans/<token>.json` under the sessions directory (a private file in a private directory; a preview removes stored plans older than a day).
 
 **Optional flags:**
 - `--execution-dir <dir>` -- Only sessions whose execution directory is `<dir>` or lies under it, matched the way [session list](#session-list) matches it.
-- `--older-than <age>` -- Only sessions whose last event is at least `<age>` old: a whole number and a unit, `s`, `m`, `h` or `d`, such as `30d`. A session whose last event's time can't be read is left out.
-- `--all` -- No filter: every finished session is judged. A preview without filters already covers them all; `--all` is what an `--apply` without `--plan` names when no other filter is given.
+- `--older-than <age>` -- Only sessions that stopped at least `<age>` ago: a whole number and a unit, `s`, `m`, `h` or `d`, such as `30d`. The age is measured from the stop instant the retention engine reports for the session (the transition into its terminal state, its trailing cancel, or an anchor's close), not from its last event, which a later read or context write moves. A session that hasn't stopped is left out.
+- `--all` -- No filter: every session is judged. A preview without filters already covers them all; `--all` is what an `--apply` without `--plan` names when no other filter is given.
 - `--apply` -- Remove instead of previewing.
-- `--plan <token>` -- With `--apply`, remove exactly the sessions the preview that printed `<token>` listed.
+- `--plan <token>` -- With `--apply`, remove only sessions the preview that printed `<token>` listed.
 
-The filters choose which sessions are judged, not which sessions count as references: a session left out by a filter still protects the sessions it references. A session is kept, and listed under `kept` with the first rule that applies, when:
+Every session is judged by the retention rule over one scan of the store, with one set of [retention settings](#config-keys-reference) and one `now`: the same judgment [`koto session hierarchy`](#session-hierarchy) prints. The filters narrow which sessions are candidates, never which sessions count as members of a hierarchy: a finished session dispatched by a session that is alive in another execution directory is kept, and named, whatever the filters select. A candidate is kept, and listed under `kept` with the first rule that applies, when:
 
 | Rule | Keeps a session that |
 |------|----------------------|
-| `a` | is running, or can't be read (its header, log or template is unreadable, or its directory is a symlink) |
-| `b` | a running or unreadable session references, or any finished session while some session's header can't be read (it could name any session as its parent; the reason names it, so you can inspect or remove it) |
-| `c` | references a running or unreadable session |
+| `a` | is alive: a koto session that runs, or can't be read (its header, log or template is unreadable, or its directory is a symlink), or an anchor that is open |
+| `h` | belongs to a hierarchy the retention rule keeps: another member is alive, `retention.keep` hasn't passed since the hierarchy's release instant, or something in it can't be read (a malformed link, close record or `chain/parent`, an unreadable log, a timestamp more than five minutes in the future, or any session's header, which could name any other) |
 | `d` | has a `chain/parent` context key that isn't exactly one session name |
 | `e` | is bound to a request leg that is still waiting, or whose leg pointer or request can't be read |
 | `f` | is a coordinator's session (its name starts with `coordinate-`) |
 | `g` | under the cloud backend, has a remote copy that may be newer: a pushed log longer than the local one, a `version.json` ahead of or diverged from the local one, or a remote copy that can't be checked |
 
-A session references the session its header's `parent_workflow` names and the one its `chain/parent` context key names. A reference to a name with no session protects nothing, and a request that no longer exists releases a session bound to it. Everything the rules read is on this host (the sessions directory, and the request store for rule e) except rule g. Without a remote `version.json`, rule g compares only the pushed log's length, so a remote log that diverged without growing longer than the local one isn't caught.
+Rule `h` replaced the earlier rules `b` and `c`, which looked one reference away: it keeps the whole hierarchy, joined through links, `parent_workflow` and `chain/parent`. Its `detail` is the rendered verdict: the live members keeping it, each with its kind and whether an anchor is observed; or the release instant, the member and close kind it came from, and when the retention passes; or what can't be read. The entry also carries a `hierarchy` object, the JSON `koto session hierarchy <name> --json` prints for the same judgment. Rule `a` carries it too. Since the engine taints a hierarchy whose `chain/parent` is malformed, rule `h` usually keeps such a session before `d` is reached. A close session whose anchor stays in the store (kept, or left out by a filter) is kept by `h`: a close session goes only with its anchor, which would otherwise read open again. A request that no longer exists releases a session bound to it. Everything the rules read is on this host (the sessions directory, and the request store for rule e) except rule g. Without a remote `version.json`, rule g compares only the pushed log's length, so a remote log that diverged without growing longer than the local one isn't caught.
+
+**Stale anchors.** An observed anchor past `retention.stale_after` since its last activity keeps what it holds, and the prune closes nothing. Each one any judgment names is listed under `stale_anchors`, with the `close_command` that closes it by hand, `koto session anchor close --key='<marker>' --harness-session='<id>'`, its real values filled in, the same command `koto session hierarchy` prints; the anchor's own rule `a` detail carries it too. Run it once the agent session is gone, and a prune after the retention removes what the anchor held. An anchor whose marker or harness session id doesn't match `^[A-Za-z0-9_-]{1,128}$` is listed with `malformed_marker` and no command.
 
 **Finished records.** The would-remove list also holds the finished records koto wrote for sessions it removed itself (see [status](#status)), as `"kind": "record"` entries beside the `"kind": "session"` ones. A record carries the removed session's `session_id`, `state`, `status` (`terminal` or `cancelled`), `failure`, `finished_at` and `execution_dir`, and `--execution-dir` and `--older-than` match it by those last two. No rule keeps a record: koto writes one only once the session's parent already had its result, so nothing still needs it. Removing a record makes `koto status` answer `not found` for the name. Applying reads each record again and skips one rewritten since the preview (another session of the name finished and was removed in between).
 
@@ -778,27 +788,33 @@ A session references the session its header's `parent_workflow` names and the on
   "remove": [
     {"kind": "session", "name": "review-12", "session_id": "<session-id>",
      "status": "terminal", "state": "done", "failure": false,
-     "finished_at": "2026-10-11T23:50:02.410Z", "execution_dir": "/work/project"}
+     "finished_at": "2026-10-11T23:50:02.410Z", "execution_dir": "/work/project",
+     "stopped_at": "2026-10-11T23:50:01.902Z"}
   ],
   "kept": [
-    {"name": "plan-7", "rule": "b", "detail": "referenced by running session 'plan-7.task-2'"}
-  ]
+    {"name": "plan-7", "rule": "h",
+     "detail": "kept: alive in its hierarchy: plan-7.task-2 (koto_session)",
+     "hierarchy": {"session": "plan-7", "kept": true, "keepers": [...], "...": "..."}}
+  ],
+  "stale_anchors": []
 }
 ```
 
+A removable anchor or close session also carries `session_kind` (`anchor` or `anchor_close`).
+
 The token is the first 32 hex digits of a SHA-256 over the would-remove list's kinds, names and session ids, so it changes when a session joins or leaves the list, or a removed name is taken by a new session, and not when anything outside the list changes.
 
-**Applying.** `--apply --plan <token>` works the set out again, with the filters the preview ran with (the stored plan records them, and passing a filter alongside `--plan` is an error), and removes it only when its token is still `<token>`. Otherwise it removes nothing, exits 4 with `prune_plan_stale`, and lists under `added` and `dropped` how the set changed. A token with no stored plan (it expired, was applied, or was previewed on another host) also exits 4, with `prune_plan_unknown`. `--apply` without `--plan` removes the set it works out now, in one step with no preview anyone read, and needs `--execution-dir`, `--older-than` or `--all` so that a bare `--apply` can't empty the store by mistake. It is the form for scheduled runs; the rules apply to it all the same, but only `--plan` guarantees that what goes is what someone saw.
+**Applying.** Every apply takes one fresh scan of the store and judges it again. `--apply --plan <token>` does so with the filters the preview ran with (the stored plan records them, and passing a filter alongside `--plan` is an error). It refuses when the fresh judgment would remove anything the plan didn't name: it removes nothing, exits 4 with `prune_plan_stale`, and lists under `added` and `dropped` how the set changed. A fresh judgment that only keeps more than the plan isn't a refusal: what the plan named and the rules now keep (a session that gained a live member since the preview, say) goes to `skipped` with its reason, and the rest is removed, exit 0. A token with no stored plan (it expired, was applied, or was previewed on another host) also exits 4, with `prune_plan_unknown`. `--apply` without `--plan` removes the set it works out now, in one step with no preview anyone read, and needs `--execution-dir`, `--older-than` or `--all` so that a bare `--apply` can't empty the store by mistake. It is the form for scheduled runs; the rules apply to it all the same, but only `--plan` guarantees that nothing goes that someone didn't see.
 
-Sessions are removed children first. Each is locked, read again, and judged again against the sessions it references and the referencing sessions the judgment found (a session created after the judgment that names it isn't seen); one that another koto process holds, one that is no longer finished (rewound, say), one replaced by a new session under the same name, and one a rule now keeps go to `skipped` with the reason. Under the cloud backend a session's remote copy is deleted before its local directory, apart from a migration marker, so a failure leaves the local copy for a later prune to retry. The remote delete isn't conditional: a push from another host that lands between rule g's check and the delete is lost with it; that window can't close without conditional deletes. The prune never touches the run journal.
+Sessions are removed one hierarchy at a time. Every member to be removed is locked first, then the hierarchy is judged again as a unit, reading each member afresh; a hierarchy the rule now keeps loses nothing, and its members go to `skipped` with the reason. Then each member is checked under its lock: one replaced by a new session under the same name, a koto session that is no longer finished (rewound, say), and one rules d to g now keep are skipped, as is one another koto process holds. Children go before their parents and anchors before their close sessions, and a close session whose anchor is still there (skipped, say) is skipped too, so no apply removes a close session while its anchor remains. A session created after the apply's own scan that links to a member isn't seen. Under the cloud backend a session's remote copy is deleted before its local directory, apart from a migration marker, so a failure leaves the local copy for a later prune to retry. The remote delete isn't conditional: a push from another host that lands between rule g's check and the delete is lost with it; that window can't close without conditional deletes. The prune never touches the run journal, and writes nothing into any session it doesn't remove.
 
-**Apply output (JSON):** `{"mode": "apply", "plan": ..., "removed": [...], "skipped": [{"name", "reason"}], "kept": [...], "failed": [{"name", "error"}]}`.
+**Apply output (JSON):** `{"mode": "apply", "plan": ..., "removed": [...], "skipped": [{"name", "reason"}], "kept": [...], "failed": [{"name", "error"}], "stale_anchors": [...]}`.
 
 | Exit code | Meaning |
 |-----------|---------|
 | 0 | Previewed, or applied with nothing failed (skipped sessions included) |
-| 2 | `invalid_arguments`: a malformed token or age, `--plan` without `--apply` or with a filter, or `--apply` with nothing naming the set |
-| 3 | A session couldn't be removed; it is listed under `failed` |
+| 2 | `invalid_arguments`: a malformed token or age, `--plan` without `--apply` or with a filter, or `--apply` with nothing naming the set; or `invalid_retention_setting`: a retention setting is malformed, and the message names it. Nothing was judged or removed |
+| 3 | A session couldn't be removed; it is listed under `failed`. Or `prune_scan_failed`: the sessions directory can't be listed, so nothing was judged or removed, in preview and in apply |
 | 4 | `prune_plan_stale` or `prune_plan_unknown`; nothing was removed |
 
 **Migration markers.** `--migrated-from <workspace>` judges the migration markers `koto session import` left under that workspace's bucket prefix instead of local sessions; it needs the cloud backend (under the local backend it exits 2) and takes none of `--execution-dir`, `--older-than` or `--all`. `<workspace>` is the old workspace's absolute path as it was on its own host. Each marker is listed with `name`, `target` (`session`, `session_id`, `workspace`, `prefix`), `migrated_at`, `age_days`, `target_status` (`present`, `replaced`, `migrated`, `absent`, `unverified` or `unknown`), `removable`, `reason`, `detail` and, when the old copy could be listed and its log read, `objects` (how many objects its removal deletes, the marker included), under `remove` or `kept`. A target is `present` only when its state file names the marker's session id and its whole log reads with no error and begins with every event of the old copy's log, unchanged; a truncated, corrupt, shorter or differing log is `unverified`. A marker is removable only when its target is `present` and it is at least `session.cloud.marker_retain_days` days old (default 30; 0 makes every such marker removable at once), or `--source-retired` was given; anything else is kept, and a marker that can't be read is kept as `unreadable`. The token covers each removable marker's name and `migrated_at`, and the stored plan (`.prune-plans/markers-<prefix>-<token>.json`) records the workspace and `--source-retired`, so `--apply --plan <token>` takes `--migrated-from` with the same workspace and no `--source-retired`. Apply reads and judges each marker again, then deletes everything under the old session's prefix, the marker last (nothing locks the bucket between the two); a delete that fails leaves the marker, lists the entry under `failed` and exits 3, and a re-run finishes it. Nothing local is removed, so remove the old host's local copy (`koto session cleanup <name>` there) or retire the host first: with the marker gone, that copy would sync back as a live session. The [cloud sync guide](cloud-sync-setup.md#removing-the-old-copy-and-its-marker) has the full rule.
@@ -1359,7 +1375,9 @@ koto version
 
 ### workspace prune
 
-Reclaims a workspace tree rooted at a terminal session. The verb reads the root header, verifies the workflow has reached a terminal state (`completed` or `abandoned`), walks descendants via the session backend's `list()` filtered by `parent_workflow`, and removes the directories after operator confirmation, deepest first and the root last. It is how sessions koto kept (failure terminals, `--no-cleanup`) under a kept root are reclaimed. Only the root's state is gated: descendants are removed whatever their state, and the preview names any that aren't terminal.
+Reclaims a workspace tree rooted at a terminal session. The verb reads the root header, verifies the workflow has reached a terminal state (`completed` or `abandoned`), walks descendants via the session backend's `list()` filtered by `parent_workflow`, judges each member of that subtree by the retention rule (see [session hierarchy](#session-hierarchy)), and after operator confirmation removes the members the rule releases, deepest first and the root last. It is how sessions koto kept (failure terminals, `--no-cleanup`) under a kept root are reclaimed.
+
+**Subtree scope.** The root is judged with every edge. Each descendant is judged with only the lineage between the root and its direct children dropped, so naming the root lets you dissolve its subtree: a child whose own hierarchy (its descendants, and anything linked to them) is released past `retention.keep` goes, while a child with a live dispatcher stays, and so does a grandchild under it. The root goes only when its whole hierarchy is released, which includes every child, so no kept child is left naming a removed parent. Members the rule keeps are listed with their reasons; nothing outside the subtree is removed. Before anything is removed, every released member is locked and judged again, and one now kept, held by another process, or replaced under its name is skipped, as is any member with a skipped one below it. A stale observed anchor that keeps a member is listed with its close command, as `koto session prune` lists it; the prune closes nothing. A malformed retention setting is refused (exit 2) and a sessions directory that can't be listed exits 3; neither removes anything.
 
 ```bash
 koto workspace prune --root <session-id> [--dry-run] [--yes] [--force]
@@ -1369,26 +1387,36 @@ koto workspace prune --root <session-id> [--dry-run] [--yes] [--force]
 - `--root <session-id>` -- Root session id of the tree to prune. Must be a valid session id (the same allowlist `session start` enforces).
 
 **Optional:**
-- `--dry-run` -- Print the descendant set and exit 0 without reclaiming. Useful for inspecting what would be removed before committing.
+- `--dry-run` -- Print what would be removed, in order, and what is kept and why, then exit 0 without reclaiming.
 - `--yes` -- Skip the interactive confirmation prompt. Required for cron-friendly invocation.
-- `--force` -- Bypass the terminal-state safety gate. Allows pruning a tree whose root has NOT reached a terminal state. **Dangerous: a force-prune of a tree that still has a coordinator holding a claim corrupts that coordinator's view of the workspace.** Combining `--yes` with `--force` adds a second confirmation prompt that requires typing the literal string `force-prune` to proceed.
+- `--force` -- Bypass the terminal-state safety gate. Allows judging a tree whose root has NOT reached a terminal state. It never overrides the retention rule: a live root, and every member whose hierarchy has a live member, stays. Combining `--yes` with `--force` adds a second confirmation prompt that requires typing the literal string `force-prune` to proceed.
 
 **Symlink refusal:** the verb `lstat()`s the root before any directory traversal. A root that is a symlink (pointing inside or outside `~/.koto/`) is rejected categorically with exit code 2 — this is a workspace-escape mitigation.
 
 **Terminal-state safety gate:** without `--force`, the verb refuses to prune a tree whose root has not reached `completed` or `abandoned`. The error names the current state so the operator can decide whether to wait or force.
 
-**JSON output (success):**
+**JSON output (success):** printed last, after the preview text.
 
 ```json
 {
   "name": "my-workflow",
-  "pruned": true,
-  "descendants_removed": 3,
+  "pruned": false,
+  "descendants_removed": 2,
+  "removed": ["my-workflow.task-2", "my-workflow.task-3"],
+  "kept": [
+    {"name": "my-workflow.task-1", "reason": "kept: alive in its hierarchy: coord (koto_session)",
+     "hierarchy": {"session": "my-workflow.task-1", "kept": true, "...": "..."}},
+    {"name": "my-workflow", "reason": "kept: alive in its hierarchy: coord (koto_session)",
+     "hierarchy": {"session": "my-workflow", "kept": true, "...": "..."}}
+  ],
+  "skipped": [],
+  "failed": [],
+  "stale_anchors": [],
   "cursors_gc": 1
 }
 ```
 
-`cursors_gc` is the count of stale `~/.koto/coordinators/<id>/scan_cursor.toml` files reclaimed as part of the prune run. See `docs/workspace-layout.md` for the full derived-file catalog and the prune-cadence sizing guide.
+`pruned` says whether the root itself was removed, and `descendants_removed` counts the descendants that were. Each `kept` entry's `reason` is the rendered verdict and its `hierarchy` the JSON `koto session hierarchy` prints for the same judgment (for a descendant, judged without the root's lineage to its children). `skipped` lists members the second judgment or a check under the lock held back, and `failed` members whose removal failed, which exits 3 after the output. `stale_anchors` lists each stale observed anchor with its `close_command`. `cursors_gc` is the count of stale `~/.koto/coordinators/<id>/scan_cursor.toml` files reclaimed as part of the prune run. See `docs/workspace-layout.md` for the full derived-file catalog and the prune-cadence sizing guide.
 
 **Cron-friendly invocation:**
 

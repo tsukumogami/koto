@@ -56,7 +56,9 @@ pub use judge::{
     CloseKind, Judge, Judgment, Keeper, Member, MemberKind, ReleaseInstant, Retention, Unreadable,
     Verdict,
 };
-pub use render::{close_command, reason_text, render_text, sanitize, to_json};
+pub use render::{
+    close_command, keeper_json, keeper_line, reason_text, render_text, sanitize, to_json,
+};
 pub use settings::{RetentionSettings, Setting, SettingError};
 
 /// How far ahead of `now` a timestamp read from disk may be before it

@@ -73,12 +73,14 @@ A kept session is removed later by:
   one with anything running under it, one it can't read, or one whose
   request leg still waits for its result; on the terminal tick only a
   parent with a batch hook or a `ChildCompleted` in its log is swept);
-- `koto workspace prune --root <root>` on the finished root above it;
+- `koto workspace prune --root <root>` on the finished root above it,
+  once the retention rule releases it;
 - `koto session prune`, which removes finished sessions as a previewed
-  set and keeps any a running session references, any that reference
-  a running session, and the other protected cases its guide entry
+  set and keeps any whose hierarchy has a live member or is still
+  inside `retention.keep`, and the other protected cases its guide entry
   lists;
-- `koto session cleanup <name>`.
+- `koto session cleanup <name>`, which removes it whatever the rule says
+  and names the live members of its hierarchy it leaves behind.
 
 `sessions/.prune-plans/` holds the would-remove list of each `koto
 session prune` preview, one `<token>.json` per plan, so that `koto
@@ -427,13 +429,15 @@ koto workspace prune --root <session-id>
 - Stale claim sidecars whose `claimed_at` exceeds
   `request_store.stale_claim_timeout_seconds`.
 
-The verb does NOT delete session directories under
-`~/.koto/sessions/`. Session cleanup is the
-operator-driven `koto session cleanup <session-id>` path for one
-session, and `koto session prune` for finished sessions as a set:
+Of the session directories under `~/.koto/sessions/`, the verb removes
+only members of the named root's subtree that the retention rule
+releases, and lists the rest with their reasons. Otherwise session
+cleanup is the operator-driven `koto session cleanup <session-id>` path
+for one session, and `koto session prune` for finished sessions as a
+set:
 
 ```bash
-# Preview, then remove exactly what the preview listed
+# Preview, then remove only what the preview listed
 koto session prune --older-than 30d
 koto session prune --apply --plan <token>
 
