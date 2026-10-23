@@ -958,10 +958,14 @@ Three existing koto behaviours still write into a session from another
 session's process and stay outside this build, named so nobody mistakes
 them for part of the rule: a child's terminal tick appending its completion
 to its parent's log (koto#409 tracks replacing it with the parent reading
-its children at its own tick); and `koto context add` naming any session
-(koto#411). A read with no reader anchor no longer logs into the read
-session: it goes to the reading host's spool (koto#412 closed). Under the cloud
-backend a migrated source refuses both. Nothing in this design treats
+its children at its own tick); `koto context add` naming any session
+(koto#411); and, on the cloud backend, a read that finds a changed key and
+downloads it logs a `context_added` by `sync` into the read session's log
+and pushes that session's state (koto#431). Retention counts only an
+anchor's own log, so that sync write never counts as activity. A read with
+no reader anchor no longer logs into the read session: it goes to the
+reading host's spool (koto#412 closed). Under the cloud
+backend a migrated source refuses the first two. Nothing in this design treats
 a completion record as a link or a sign of life, neither counts toward an
 anchor's activity, and neither does a spooled read.
 
@@ -1466,7 +1470,7 @@ store shared by mixed koto versions loses the guarantee.
   deletion.
 - Every `koto init` and tick under an anchor may append one event to that
   anchor, throttled to one per tenth of the idle period.
-- Two existing cross-session writers remain.
+- Three existing cross-session writers remain.
 - A store shared by an older koto loses the guarantee: the older binary
   ignores links.
 
@@ -1483,7 +1487,8 @@ store shared by mixed koto versions loses the guarantee.
   identified before any index.
 - Each harness assumption has a fallback that degrades to the koto-level
   reading, never to removal, and the hand checks gate Phase 8's merge.
-- koto#409 and koto#411 track the two remaining cross-session writers;
+- koto#409, koto#411 and koto#431 track the three remaining cross-session
+  writers;
   anchorless reads go to a host-local spool, closing koto#412.
 - Past the stale threshold (`retention.stale_after`, 30 days by default),
   prune and the hierarchy query name each stale observed anchor with the

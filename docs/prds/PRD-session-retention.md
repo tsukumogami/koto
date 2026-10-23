@@ -1032,13 +1032,15 @@ S3.
 
 ## Known Limitations
 
-- **Known cross-session writers.** Two existing koto behaviours write
+- **Known cross-session writers.** Three existing koto behaviours write
   into a session from another session's process and are left as they are:
-  a child's terminal tick appending its completion to its parent's log, and
-  `koto context add` naming any session. Under the cloud backend a migrated
-  source refuses both. Nothing in this feature treats a child's completion
-  record as a link or a sign of life, and neither counts as activity.
-  koto#409 tracks the first and koto#411 the second. A third, a read with
+  a child's terminal tick appending its completion to its parent's log;
+  `koto context add` naming any session; and, on the cloud backend, a read that finds a changed key and downloads it logs a `context_added` by `sync` into the read session's log and pushes that session's state (koto#431).
+  Under the cloud backend a migrated source refuses the first two. Nothing
+  in this feature treats a child's completion record as a link or a sign of
+  life, and none of the three counts as activity: retention counts only an
+  anchor's own log, so the sync write never extends an anchor's life.
+  koto#409 tracks the first, koto#411 the second and koto#431 the third. A third, a read with
   no anchor on the reader's side, no longer writes into the read session:
   it goes to the reading host's spool (R21), which closes koto#412.
 - An unobserved agent session (a plain terminal session, or one on a host
