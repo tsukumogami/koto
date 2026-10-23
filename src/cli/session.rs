@@ -907,6 +907,9 @@ pub fn handle_import(
     let anchor = std::fs::canonicalize(&cwd)
         .with_context(|| format!("cannot resolve the current directory {}", cwd.display()))?;
 
+    // The importing agent session's anchor, which a held-by link whose
+    // anchor isn't open here is rewritten to.
+    let importer_anchor = crate::session::anchor::anchor_from_env();
     let request = ImportRequest {
         name: &name,
         target: &target,
@@ -914,6 +917,7 @@ pub fn handle_import(
         anchor: &anchor,
         trust_template,
         explicit_as: as_name.is_some(),
+        importer_anchor: importer_anchor.as_deref(),
     };
     let outcome = match cloud.import_session(&request) {
         Ok(outcome) => outcome,
@@ -1208,7 +1212,11 @@ pub fn handle_resolve(
     // pushes to S3 first; only after that succeeds do we enumerate
     // children and apply the policy. This preserves Decision 12 Q6:
     // children never appear "ahead" of the parent log on S3.
+    // The parent leg's time is reported: on a large session it is the one
+    // that moves every object (koto#428).
+    let started = std::time::Instant::now();
     cloud.resolve_conflict(name, keep)?;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
 
     let children_result = apply_children_policy(cloud, backend, name, children);
 
@@ -1221,6 +1229,7 @@ pub fn handle_resolve(
         "children_policy": children_policy_label(children),
         "sync_status": sync_status,
         "machine_id": machine_id,
+        "elapsed_ms": elapsed_ms,
         "children": children_result,
     });
 

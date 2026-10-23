@@ -380,6 +380,14 @@ impl<'g> Judge<'g> {
         })
     }
 
+    /// Whether session `name` is in the store and alive, by the same full
+    /// inspection a judgment makes of it (an anchor: no close of it has
+    /// passed). A migrated session is never alive; one that can't be read
+    /// is, as everywhere else.
+    pub fn is_alive(&mut self, name: &str) -> bool {
+        self.graph.contains(name) && self.state_of(name).alive
+    }
+
     /// The edges inside the component that touch `name`.
     fn joined_by(&self, name: &str, scope: &Scope, in_component: &BTreeSet<&str>) -> Vec<Edge> {
         let keep = |e: &&Edge| match scope {

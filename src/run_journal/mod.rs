@@ -117,6 +117,12 @@
 //!   and last present hashes; past 50 tuples, one overflow record sums the
 //!   rest. A key outside the name shape is written as its digest.
 //!
+//! A read from another agent session, which the reader's anchor records
+//! with a `session` field naming the session read, writes its own
+//! `context_reads` record when the anchor commits it: attributed to the
+//! session read, with `koto.context.read_by` naming the anchor and no
+//! `koto.seq` or `koto.visit.seq` (see `context_reads::anchor_read`).
+//!
 //! And one relays no event: `response`, written after `koto next` or
 //! `koto status` prints a non-terminal state's directive, with the byte
 //! lengths of the printed `directive` and `details` (never their text).
@@ -154,7 +160,9 @@
 //!   `evidence_submitted` that answers a consultation.
 //!   A commit that ends a visit (an arrival, a rewind, a cancel, or the
 //!   terminal tick's `request_store.result`) writes the visit's
-//!   `context_reads` just before its own record. Before those, on any
+//!   `context_reads` just before its own record. A `context_read` an
+//!   anchor commits for another session writes that read's
+//!   `context_reads`, attributed to the session read. Before those, on any
 //!   committed payload, it writes `driver_seen` when the process's driver
 //!   (`CLAUDE_CODE_SESSION_ID`, when id-shaped) differs from the one the
 //!   session's sidecar caches, or the sidecar caches none, and then caches
@@ -1391,8 +1399,14 @@ pub(crate) fn after_commit(
     let reads = context_reads::closes_visit(payload)
         .then(|| commit.prior_visit_seq())
         .flatten()
-        .and_then(|visit| Some((visit, context_reads::fold(&commit.prior_log, visit)?)));
-    if new_driver.is_none() && reads.is_none() && !journals(payload) {
+        .and_then(|visit| {
+            let fold = context_reads::fold_with_spool(&commit.prior_log, visit, &session_dir)?;
+            Some((visit, fold))
+        });
+    // A read a reader's anchor recorded for another session, journaled
+    // against the session it read.
+    let anchor_read = context_reads::anchor_read(backend, session, payload);
+    if new_driver.is_none() && reads.is_none() && anchor_read.is_none() && !journals(payload) {
         return;
     }
     let header = match header_of(commit, backend, session) {
@@ -1431,6 +1445,7 @@ pub(crate) fn after_commit(
         }));
     }
     records.extend(record_for(payload, session, &header, run_id.as_deref()));
+    records.extend(anchor_read);
     // The visit is worked out only here, for a payload that relays records
     // of its own. Apart from the closing commits above, every other commit
     // skips the scan of the log.

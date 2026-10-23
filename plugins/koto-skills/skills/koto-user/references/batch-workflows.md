@@ -242,9 +242,12 @@ koto session resolve <parent> --children=auto
   "name": "<parent>",
   "sync_status": "fresh",
   "machine_id": "machine-abc123",
+  "elapsed_ms": 412,
   "children": [ ... ]
 }
 ```
+
+`elapsed_ms` is how long the parent's resolution took.
 
 `sync_status` values (as reported by `koto session resolve`):
 

@@ -1718,6 +1718,9 @@ pub fn run(app: App) -> Result<()> {
             // `KOTO_ANCHOR` unset this reads nothing at all.
             if crate::engine::reentrancy::enclosing_tick().is_none() {
                 session_anchor::hold_from_env(backend, &name, "next");
+                // A new id for this tick, which its commands' reads of other
+                // sessions are fresh for (`crate::session::sync_stamp`).
+                backend.begin_tick(&name);
             }
             let context_store: &dyn ContextStore = backend;
             let result = handle_next(
@@ -1997,10 +2000,14 @@ pub fn run(app: App) -> Result<()> {
                     to_file,
                 } => {
                     let events = context::restore_assigned(store, &backend, &session, &key);
+                    // The reader's anchor decides where the read is logged
+                    // (DESIGN-session-retention.md, Decision 5).
+                    let reader_anchor = context::reader_anchor();
                     if let Err(e) = context::handle_get(
                         store,
                         &backend,
                         events.as_deref(),
+                        reader_anchor.as_deref(),
                         &session,
                         &key,
                         to_file.as_deref(),
@@ -2021,8 +2028,15 @@ pub fn run(app: App) -> Result<()> {
                     // unaffected; exit 2 is "not a key at all", which koto
                     // already uses for input the caller must fix.
                     let events = context::restore_assigned(store, &backend, &session, &key);
-                    match context::handle_exists(store, &backend, events.as_deref(), &session, &key)
-                    {
+                    let reader_anchor = context::reader_anchor();
+                    match context::handle_exists(
+                        store,
+                        &backend,
+                        events.as_deref(),
+                        reader_anchor.as_deref(),
+                        &session,
+                        &key,
+                    ) {
                         context::KeyPresence::Present => std::process::exit(0),
                         context::KeyPresence::Absent => std::process::exit(1),
                         context::KeyPresence::Unusable(reason) => {

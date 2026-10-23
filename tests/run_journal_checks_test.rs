@@ -3673,11 +3673,15 @@ fn context_reads_are_written_once_per_visit_before_the_record_that_ends_it() {
     let c = env.context_records("ctx");
     let visit = |v: u64| -> Vec<&Value> { c.iter().filter(|r| r["koto.visit.seq"] == v).collect() };
     // The first visit: the gates' two keys and the `context get`, in the
-    // order they were first read.
+    // order they were first read. The `context get` ran from a shell with no
+    // reader's anchor, so it is in the host's read spool rather than the
+    // log; it came after both keys' first reads.
     let one = visit(first);
+    let mut expected = first_reads(&log, first, left);
+    expected.push(("plan".into(), "cli".into(), "content".into()));
     assert_eq!(
         one.iter().map(|r| tuple_of(r)).collect::<Vec<_>>(),
-        first_reads(&log, first, left)
+        expected
     );
     assert_eq!(one.len(), 3, "{one:?}");
     let note = one

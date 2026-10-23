@@ -63,6 +63,8 @@ struct Fault {
     /// Store a PUT's body before answering with the failure, as an
     /// endpoint that wrote the object and lost the reply would.
     store: bool,
+    /// How many more matching requests fail; `None` fails them all.
+    remaining: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +187,20 @@ impl FakeS3 {
             key: key.to_string(),
             status,
             store: false,
+            remaining: None,
+        });
+    }
+
+    /// [`FakeS3::fail`] for the next `times` matching requests only; the
+    /// ones after are answered normally. rust-s3 retries a failed request
+    /// once, so one failed call by koto is two failed requests here.
+    pub fn fail_times(&self, method: &str, key: &str, status: u16, times: usize) {
+        lock(&self.state).faults.push(Fault {
+            method: method.to_string(),
+            key: key.to_string(),
+            status,
+            store: false,
+            remaining: Some(times),
         });
     }
 
@@ -196,6 +212,7 @@ impl FakeS3 {
             key: key.to_string(),
             status,
             store: true,
+            remaining: None,
         });
     }
 
@@ -321,6 +338,18 @@ struct Reply {
     body: Vec<u8>,
 }
 
+/// An object's ETag, quoted as S3 sends it: a hash of its content (64-bit
+/// FNV-1a, which needs no dependency), so a changed object gets a new one
+/// in a listing, a GET, a HEAD and a PUT's reply alike.
+fn etag(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("\"{:016x}-{}\"", hash, bytes.len())
+}
+
 impl Reply {
     fn ok(body: Vec<u8>) -> Self {
         Reply {
@@ -431,12 +460,19 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
     } else {
         (req.method.clone(), key.clone())
     };
-    if let Some(fault) = st
+    if let Some(at) = st
         .faults
         .iter()
-        .find(|f| f.method == fault_method && f.key == fault_key)
-        .cloned()
+        .position(|f| f.method == fault_method && f.key == fault_key)
     {
+        let fault = st.faults[at].clone();
+        if let Some(n) = fault.remaining {
+            if n <= 1 {
+                st.faults.remove(at);
+            } else {
+                st.faults[at].remaining = Some(n - 1);
+            }
+        }
         if fault.store {
             st.objects.insert(key.clone(), req.body.clone());
         }
@@ -451,11 +487,19 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
 
     match req.method.as_str() {
         "GET" => match st.objects.get(&key) {
-            Some(bytes) => Reply::ok(bytes.clone()),
+            Some(bytes) => Reply {
+                status: 200,
+                headers: vec![("ETag", etag(bytes))],
+                body: bytes.clone(),
+            },
             None => Reply::error(404, "NoSuchKey", "The specified key does not exist."),
         },
         "HEAD" => match st.objects.get(&key) {
-            Some(_) => Reply::ok(Vec::new()),
+            Some(bytes) => Reply {
+                status: 200,
+                headers: vec![("ETag", etag(bytes))],
+                body: Vec::new(),
+            },
             None => Reply {
                 status: 404,
                 headers: Vec::new(),
@@ -463,10 +507,11 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
             },
         },
         "PUT" => {
+            let tag = etag(&req.body);
             st.objects.insert(key, req.body.clone());
             Reply {
                 status: 200,
-                headers: vec![("ETag", "\"fake-etag\"".to_string())],
+                headers: vec![("ETag", tag)],
                 body: Vec::new(),
             }
         }
@@ -503,7 +548,7 @@ fn list_xml(
                     common.push(rolled);
                 }
             }
-            None => contents.push((key.clone(), bytes.len())),
+            None => contents.push((key.clone(), bytes.len(), etag(bytes))),
         }
     }
 
@@ -520,12 +565,13 @@ fn list_xml(
         "<KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>",
         contents.len() + common.len()
     ));
-    for (key, size) in &contents {
+    for (key, size, tag) in &contents {
         xml.push_str(&format!(
             "<Contents><Key>{}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified>\
-             <ETag>\"fake-etag\"</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass>\
+             <ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass>\
              </Contents>",
             xml_escape(key),
+            xml_escape(tag),
             size
         ));
     }

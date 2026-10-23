@@ -62,15 +62,14 @@ fn describe(r: &fake_s3::Request) -> String {
 }
 
 /// The marker check costs `koto status` on a session that was never
-/// migrated exactly one request beyond what it made before the check
-/// existed, and no retry sleep. The baseline, `before_the_check`, is the
-/// list of requests `koto status` made before the marker check existed
-/// (measured with the check switched off): the GET that pulls the state
-/// file, and the listing of this workspace's sessions it scans for
-/// superseded branches. The test asserts the exact list: the marker
-/// listing, then the baseline, nothing else. The check lists for the
-/// marker, which answers 200 whether or not it is there, where a GET of a
-/// missing marker would be a 404 that rust-s3 retries after a second.
+/// migrated no request of its own, and no retry sleep. One listing of the
+/// session's prefix answers both the marker check and the state pull
+/// (koto#428): the marker isn't listed, and the state file's ETag is the
+/// one `init` pushed, so nothing is fetched. The listing of this
+/// workspace's sessions, which `status` scans for superseded branches,
+/// follows. The test asserts the exact list. The check lists, which answers
+/// 200 whether or not the marker is there, where a GET of a missing marker
+/// would be a 404 that rust-s3 retries after a second.
 #[test]
 fn the_marker_check_adds_one_request_and_no_retry_to_status() {
     let s3 = FakeS3::start(BUCKET);
@@ -88,17 +87,13 @@ fn the_marker_check_adds_one_request_and_no_retry_to_status() {
     let session = session_prefix(&a, name);
     let requests = s3.requests();
     let seen: Vec<String> = requests.iter().map(describe).collect();
-    let before_the_check = vec![
-        // The state pull ...
-        format!("GET {}koto-{}.state.jsonl", session, name),
+    let expected = vec![
+        // The marker check and the state pull, in one listing ...
+        format!("LIST {}", session),
         // ... and the session listing behind `superseded_branches`.
         format!("LIST {}/", a.prefix()),
     ];
-    // The marker check: the one added request.
-    let mut expected = vec![format!("LIST {}migrated.json", session)];
-    expected.extend(before_the_check);
     assert_eq!(seen, expected, "koto status made {:?}", seen);
-    assert_eq!(seen.len(), 3, "exactly one request over the baseline's two");
     let check = requests[1].at.duration_since(requests[0].at);
     assert!(
         check < std::time::Duration::from_millis(500),
@@ -172,6 +167,8 @@ fn carrier_moves_a_session_from_a_to_b_to_c() {
     for key in carrier.key_hashes.keys() {
         expected.push(format!("{}ctx/{}", b_session, key));
     }
+    // The record of where the copy came from, which every import writes.
+    expected.push(format!("{}ctx/koto/imported-from", b_session));
     expected.sort();
     ensure(
         step,
@@ -365,15 +362,19 @@ fn cleanup_and_a_terminal_tick_leave_the_marker_in_place() {
     );
 
     // A terminal tick on a session whose marker check can't get an answer
-    // (the listing for the marker fails): the check fails open with a
-    // warning, the tick reaches the terminal state, and its cleanup, whose
-    // own listing of the session works, deletes the session's objects but
-    // not the marker.
+    // (the listing of the session's prefix, which the check reads, fails):
+    // the check fails open with a warning, the tick reaches the terminal
+    // state, and its cleanup, whose own listing of the session works,
+    // deletes the session's objects but not the marker. The cleanup lists
+    // the same prefix the check does, so only the checks' listings fail:
+    // each of the three ticks lists once for its check (a failed listing
+    // isn't asked again in that process), and rust-s3 retries a failed
+    // request once, so six requests fail and the cleanup's is answered.
     start_session(&a, "ticked");
     let ticked = session_prefix(&a, "ticked");
     let marker = format!("{}migrated.json", ticked);
     s3.put(&marker, br#"{"schema":1}"#);
-    s3.fail("LIST", &marker, 500);
+    s3.fail_times("LIST", &ticked, 500, 6);
     for args in [
         vec!["next", "ticked"],
         vec!["next", "ticked", "--with-data", r#"{"choice":"go"}"#],
@@ -837,10 +838,11 @@ fn import_refuses_a_source_log_it_cannot_carry() {
     );
 }
 
-/// A session that never stored a key imports, and its target has an empty
-/// manifest, here and in the bucket.
+/// A session that never stored a key imports, and its target's manifest
+/// lists only the `koto/imported-from` record the import writes, here and
+/// in the bucket.
 #[test]
-fn a_source_with_no_context_keys_imports_with_an_empty_manifest() {
+fn a_source_with_no_context_keys_imports_with_only_its_import_record() {
     let s3 = FakeS3::start(BUCKET);
     let root = tempfile::TempDir::new().unwrap();
     let cloud = cloud(&s3);
@@ -859,18 +861,19 @@ fn a_source_with_no_context_keys_imports_with_an_empty_manifest() {
     let run = import(&b, "bare", &a, &[]);
     assert!(run.ok(), "import: {}", run.describe());
     assert_eq!(run.json["keys"], 0, "{}", run.describe());
-    let empty = serde_json::json!({"keys": {}});
-    assert_eq!(b.manifest("bare"), empty);
+    let manifest = b.manifest("bare");
+    let keys: Vec<&String> = manifest["keys"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["koto/imported-from"]);
     let pushed = s3
         .object(&format!("{}ctx/manifest.json", session_prefix(&b, "bare")))
-        .expect("the empty manifest is pushed");
+        .expect("the manifest is pushed");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&pushed).unwrap(),
-        empty
+        manifest
     );
     let run = b.koto(&["context", "list", "bare"]);
     assert!(run.ok(), "context list: {}", run.describe());
-    assert_eq!(run.json, serde_json::json!([]));
+    assert_eq!(run.json, serde_json::json!(["koto/imported-from"]));
 }
 
 /// A PUT that fails part way through the push: the import takes back
@@ -886,7 +889,8 @@ fn a_failed_push_takes_back_exactly_what_it_pushed() {
     start_session(&a, "wf");
     compile(&b);
 
-    // The state file, the template and notes.md go up before the manifest.
+    // The state file, the template, notes.md and the import's own
+    // `koto/imported-from` go up before the manifest.
     let target = session_prefix(&b, "wf");
     let manifest = format!("{}ctx/manifest.json", target);
     s3.fail("PUT", &manifest, 500);
@@ -910,6 +914,7 @@ fn a_failed_push_takes_back_exactly_what_it_pushed() {
         format!("{}koto-wf.state.jsonl", target),
         format!("{}template.json", target),
         format!("{}ctx/notes.md", target),
+        format!("{}ctx/koto/imported-from", target),
     ]
     .into_iter()
     .collect();
@@ -950,9 +955,10 @@ fn an_unmarked_import_keeps_its_target_and_a_rerun_only_marks() {
     );
     assert_eq!(staging_dirs(&b), Vec::<String>::new());
     let target = holdings(&s3, &b, "wf");
+    // State file, template, notes.md, koto/imported-from, manifest, version.
     assert_eq!(
         target.1.len(),
-        5,
+        6,
         "the target in the bucket: {:?}",
         target.1
     );
@@ -1303,9 +1309,11 @@ fn a_migrated_source_refuses_context_commands_and_rebind() {
     assert_eq!(all_writes(&s3), Vec::<(String, String)>::new());
 }
 
-/// `koto next` on a session that was never migrated makes exactly one
-/// request more than it did before the marker check existed, the listing
-/// for the marker; the local backend makes none at all.
+/// `koto next` on a session that was never migrated makes no request for
+/// the marker check of its own: one listing of the session's prefix answers
+/// it and the tick's pull of its own session, which fetches nothing when the
+/// state file is the one this host pushed (koto#428). The local backend
+/// makes no request at all.
 #[test]
 fn the_marker_check_adds_one_request_to_next_and_none_on_the_local_backend() {
     let s3 = FakeS3::start(BUCKET);
@@ -1320,16 +1328,12 @@ fn the_marker_check_adds_one_request_to_next_and_none_on_the_local_backend() {
     let session = session_prefix(&a, "plain");
     let seen: Vec<String> = s3.requests().iter().map(describe).collect();
     let state = format!("{}koto-plain.state.jsonl", session);
-    let get = format!("GET {}", state);
     let put = format!("PUT {}", state);
-    // The requests `koto next` makes without the marker check: one pull of
-    // the state file (a tick pulls its own session once, koto#376) and the
-    // pushes of the events the tick appends.
-    let before_the_check = vec![get, put.clone(), put.clone(), put];
-    // The marker check: the one added request, answered once for the
-    // whole tick though the gate reads a context key.
-    let mut expected = vec![format!("LIST {}migrated.json", session)];
-    expected.extend(before_the_check);
+    // One listing of the session's prefix, for the marker check and the
+    // tick's pull of its own session alike, answered once for the whole
+    // tick though the gate reads a context key; then the pushes of the
+    // events the tick appends.
+    let expected = vec![format!("LIST {}", session), put.clone(), put.clone(), put];
     assert_eq!(seen, expected, "koto next made {:?}", seen);
 
     // The local backend, with the same cloud settings still in the config,
@@ -1502,7 +1506,8 @@ fn import_requests_grow_by_one_get_and_one_put_per_key() {
                 .count()
         };
         assert_eq!(per_key("GET", &a), n, "GETs of {name}'s keys");
-        assert_eq!(per_key("PUT", &b), n, "PUTs of {name}'s keys");
+        // The source's keys, plus the `koto/imported-from` the import writes.
+        assert_eq!(per_key("PUT", &b), n + 1, "PUTs of {name}'s keys");
         totals.push(requests.len());
     }
     assert_eq!(
@@ -1685,7 +1690,7 @@ fn every_context_store_method_refuses_a_migrated_session() {
     assert_eq!(
         seen,
         vec![
-            "LIST pfx/wf/migrated.json".to_string(),
+            "LIST pfx/wf/".to_string(),
             "GET pfx/wf/migrated.json".to_string(),
         ]
     );
