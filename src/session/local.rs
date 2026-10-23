@@ -196,6 +196,7 @@ impl SessionBackend for LocalBackend {
         Some(crate::engine::types::SessionStoreIdentity {
             kind: "local".to_string(),
             base: fs::canonicalize(&self.base_dir).unwrap_or_else(|_| self.base_dir.clone()),
+            bucket: None,
         })
     }
 
