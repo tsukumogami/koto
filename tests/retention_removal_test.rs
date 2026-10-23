@@ -13,6 +13,11 @@
 //! parent's log may grow by `child_completed` events and nothing else.
 //! Other sessions are read with commands that record no read (`koto session
 //! hierarchy`, `koto context list`).
+//!
+//! The workspace-prune steps of these scenarios live here rather than in
+//! `tests/cli_workspace_prune.rs` because they need the same single-writer
+//! harness as every other step of the scenario; that file covers the
+//! subtree walk and the verb's own flags.
 
 #![cfg(unix)]
 
@@ -593,8 +598,10 @@ fn finished_child(no_request_store: bool) {
 
     let v = env.step(&["b"], Some("x"), &[], || env.tick("b", false));
     assert_eq!(retention(&v), (true, Some("hierarchy".to_string())));
-    // x's terminal step, where the parent sweep runs.
-    let v = env.step(&["x"], None, &[], || env.tick("x", false));
+    // x's terminal step, where the parent sweep runs. With --no-cleanup, as
+    // the workspace prune below expects of its root: the edge comes first,
+    // so the reason is still hierarchy.
+    let v = env.step(&["x"], None, &[], || env.tick("x", true));
     assert_eq!(retention(&v), (true, Some("hierarchy".to_string())));
     let kept = v["kept_children"].as_array().unwrap();
     assert_eq!(kept.len(), 1, "{v:#}");

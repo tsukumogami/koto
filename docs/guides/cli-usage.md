@@ -173,7 +173,7 @@ Then koto decides whether to keep the session, and says so in the response's `re
 | `{"retained": true, "reason": "no_cleanup"}` | Any other terminal, ticked with `--no-cleanup`. |
 | `{"retained": false}` | Any other terminal, ticked without the flag. koto removes the session directory after the response. |
 
-The `hierarchy` check reads the local sessions directory in one pass that stops at the first session naming this one, and reads no retention setting, so a malformed setting never fails a tick and a lone session is removed as it always was. Anything it can't read counts as an edge and keeps the session.
+The `hierarchy` check reads the local sessions directory in one pass that stops at the first session naming this one, and reads no retention setting, so a malformed setting never fails a tick and a lone session is removed as it always was. The pass reads each session's header line and each link body (at most 4 KiB apiece), because a link can name a session by the id it recorded rather than by its name, as it does once a re-run moves its peer aside; `koto session prune` counts that link, so the tick does too, and never removes what a prune would keep. Anything it can't read counts as an edge and keeps the session.
 
 A parent with children always has an edge, so it is kept at its own terminal, and its children with it. The sweep that would have removed its terminal children removes nothing; the response lists them instead, beside `retention`, in `kept_children`:
 
@@ -184,9 +184,9 @@ A parent with children always has an edge, so it is kept at its own terminal, an
 ]
 ```
 
-It walks the parent's koto descendants the way the sweep does, without going below a child that is still running, and appears only on a parent's terminal tick that keeps it for `hierarchy` (one whose template has a batch hook or whose log holds a `ChildCompleted`) and has a terminal child.
+It walks the parent's koto descendants the way the sweep does, without going below a child that is still running, and appears only on a parent's terminal tick that keeps it for `hierarchy` (one whose template has a batch hook or whose log holds a `ChildCompleted`) and has a terminal child. `detail` names the links and lineage that keep each child, so the listing says which sessions a later prune will wait on.
 
-`retained: false` is koto's intent for the tick. If the parent's log or the request store can't be written, koto keeps the session so the next tick can retry, and says so on stderr.
+`retained: false` is koto's intent for the tick. If the parent's log or the request store can't be written, koto keeps the session so the next tick can retry, and says so on stderr. A kept child's later tick re-sends its `ChildCompleted` only when the parent holds none for the child's current arrival, so a notice whose write failed still arrives, and a repeat tick otherwise writes nothing.
 
 A kept session stays until one of these removes it:
 
