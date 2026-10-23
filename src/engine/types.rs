@@ -218,8 +218,9 @@ fn default_schema_version() -> u32 {
 /// A session's origin record: where it was started and which store holds
 /// it (`StateFileHeader.origin`).
 ///
-/// Compared field-for-field by `koto init --attach-live`. Both paths are
-/// canonical (`fs::canonicalize` output) so two spellings of one
+/// Compared by `koto init --attach-live`, which also adopts a session the
+/// local store started into the cloud store at the same base. Both paths
+/// are canonical (`fs::canonicalize` output) so two spellings of one
 /// directory compare equal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionOrigin {
@@ -239,6 +240,10 @@ pub struct SessionStoreIdentity {
     /// The directory sessions are stored under (`~/.koto/sessions`, or
     /// `KOTO_SESSIONS_BASE`), canonicalized.
     pub base: PathBuf,
+    /// The cloud store's bucket. `None` for the local store, and for a
+    /// cloud origin recorded before koto named the bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
 }
 
 /// The environment a session's commands run with

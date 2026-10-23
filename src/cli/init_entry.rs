@@ -410,12 +410,47 @@ fn caller_origin(backend: &Backend, execution_dir: Option<&Path>) -> Option<Sess
 }
 
 fn describe_origin(origin: &SessionOrigin) -> String {
+    let bucket = origin
+        .store
+        .bucket
+        .as_ref()
+        .map(|b| format!(", bucket {b}"))
+        .unwrap_or_default();
     format!(
-        "{} ({} store {})",
+        "{} ({} store {}{bucket})",
         origin.anchor.display(),
         origin.store.kind,
         origin.store.base.display()
     )
+}
+
+/// How a session's recorded origin relates to the caller's, when they
+/// don't refuse.
+#[derive(Debug, PartialEq, Eq)]
+enum OriginMatch {
+    /// The caller's own origin.
+    Same,
+    /// Started by the local store in the sessions directory the caller's
+    /// cloud backend keeps its local copy in, from the same anchor: the
+    /// same session, which the host's switch to the cloud backend left in
+    /// a store kind its record doesn't name. Attaching uploads it and
+    /// records the caller's origin.
+    LocalIntoCloud,
+}
+
+/// Whether `recorded` is `caller`'s origin. A recorded cloud origin with
+/// no bucket predates koto naming it, and matches the caller's bucket.
+fn origin_match(recorded: &SessionOrigin, caller: &SessionOrigin) -> Option<OriginMatch> {
+    if recorded.anchor != caller.anchor || recorded.store.base != caller.store.base {
+        return None;
+    }
+    match (recorded.store.kind.as_str(), caller.store.kind.as_str()) {
+        (r, c) if r == c => (recorded.store.bucket.is_none()
+            || recorded.store.bucket == caller.store.bucket)
+            .then_some(OriginMatch::Same),
+        ("local", "cloud") => Some(OriginMatch::LocalIntoCloud),
+        _ => None,
+    }
 }
 
 /// Refuse a session whose origin record is missing or isn't the caller's.
@@ -423,7 +458,7 @@ fn check_origin(
     name: &str,
     recorded: Option<&SessionOrigin>,
     caller: Option<&SessionOrigin>,
-) -> std::result::Result<(), Box<Refusal>> {
+) -> std::result::Result<OriginMatch, Box<Refusal>> {
     let Some(recorded) = recorded else {
         return Err(Box::new(
             Refusal::new(
@@ -440,8 +475,8 @@ fn check_origin(
             .with_record("", caller.map(describe_origin).unwrap_or_default()),
         ));
     };
-    if Some(recorded) == caller {
-        return Ok(());
+    if let Some(found) = caller.and_then(|caller| origin_match(recorded, caller)) {
+        return Ok(found);
     }
     let requested = caller
         .map(describe_origin)
@@ -860,6 +895,44 @@ fn bind_created(
     request::init_attach_leg(target, facts, &session_dir)
 }
 
+/// Move a session the local store started into the caller's cloud store:
+/// upload the whole local copy, then record the caller's origin, so the
+/// adoption happens once and later attaches compare cloud to cloud. The
+/// origin is rewritten only after the bucket holds the session; a failed
+/// upload refuses and leaves the record local.
+fn adopt_into_cloud(
+    backend: &Backend,
+    entry: &EntryFlags,
+    name: &str,
+    caller: Option<SessionOrigin>,
+) {
+    let fail = |e: anyhow::Error| -> ! {
+        refuse(
+            entry,
+            Refusal::new(
+                Some("persistence_error"),
+                format!(
+                    "session '{name}' was started by the local store and couldn't be moved \
+                     into the cloud store: {e:#}"
+                ),
+                3,
+            ),
+        )
+    };
+    let Backend::Cloud(cloud) = backend else {
+        unreachable!("only a cloud caller adopts a local session")
+    };
+    if let Err(e) = cloud.adopt_local_copy(name) {
+        fail(e);
+    }
+    if let Err(e) = backend.rewrite_header(name, &|mut h| {
+        h.origin = caller.clone();
+        h
+    }) {
+        fail(e);
+    }
+}
+
 /// Attach to a live session: template, origin and fixed variables
 /// checked, then the leg bound, then the rebind variables re-applied.
 fn attach(
@@ -929,13 +1002,11 @@ fn attach(
         );
     }
 
-    if let Err(r) = check_origin(
-        name,
-        existing.header.origin.as_ref(),
-        caller_origin(backend, args.execution_dir).as_ref(),
-    ) {
-        refuse(entry, *r);
-    }
+    let caller = caller_origin(backend, args.execution_dir);
+    let origin = match check_origin(name, existing.header.origin.as_ref(), caller.as_ref()) {
+        Ok(found) => found,
+        Err(r) => refuse(entry, *r),
+    };
 
     // Drift in the fixed environment values is reported, never refused
     // (DESIGN-koto-fixed-environment.md, R14): attach writes no record, and
@@ -970,7 +1041,11 @@ fn attach(
         None => None,
     };
 
-    // ---- writes from here on: leg bind, then rebind, then links ----
+    // ---- writes from here on: adoption, leg bind, then rebind, then links ----
+
+    if origin == OriginMatch::LocalIntoCloud {
+        adopt_into_cloud(backend, entry, name, caller);
+    }
 
     let leg = match &entry.koto_leg {
         Some(target) => match request::init_attach_leg(target, facts, &session_dir) {
@@ -1100,6 +1175,7 @@ mod tests {
             store: crate::engine::types::SessionStoreIdentity {
                 kind: "local".into(),
                 base: "/s".into(),
+                bucket: None,
             },
         };
         let r = check_origin("s", None, Some(&caller)).err().unwrap();
@@ -1115,6 +1191,75 @@ mod tests {
             .unwrap();
         let msg = r.body["error"].as_str().unwrap();
         assert!(!msg.contains("no origin record"), "{msg}");
-        assert!(check_origin("s", Some(&caller), Some(&caller)).is_ok());
+        assert_eq!(
+            check_origin("s", Some(&caller), Some(&caller)).ok(),
+            Some(OriginMatch::Same)
+        );
+    }
+
+    fn origin(kind: &str, anchor: &str, base: &str, bucket: Option<&str>) -> SessionOrigin {
+        SessionOrigin {
+            anchor: anchor.into(),
+            store: crate::engine::types::SessionStoreIdentity {
+                kind: kind.into(),
+                base: base.into(),
+                bucket: bucket.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn a_local_session_is_adopted_by_a_cloud_caller_over_the_same_directory() {
+        let local = origin("local", "/w", "/s", None);
+        let cloud = origin("cloud", "/w", "/s", Some("b"));
+        assert_eq!(
+            origin_match(&local, &cloud),
+            Some(OriginMatch::LocalIntoCloud)
+        );
+        // Another anchor or another sessions directory is another session.
+        assert_eq!(
+            origin_match(&local, &origin("cloud", "/x", "/s", Some("b"))),
+            None
+        );
+        assert_eq!(
+            origin_match(&local, &origin("cloud", "/w", "/t", Some("b"))),
+            None
+        );
+        // Never the other way: a cloud session's newest copy may be only in
+        // the bucket.
+        assert_eq!(origin_match(&cloud, &local), None);
+    }
+
+    #[test]
+    fn a_cloud_session_matches_only_its_own_bucket() {
+        let recorded = origin("cloud", "/w", "/s", Some("b"));
+        assert_eq!(
+            origin_match(&recorded, &origin("cloud", "/w", "/s", Some("b"))),
+            Some(OriginMatch::Same)
+        );
+        assert_eq!(
+            origin_match(&recorded, &origin("cloud", "/w", "/s", Some("other"))),
+            None
+        );
+        // Recorded before koto named the bucket: kind and base decide.
+        assert_eq!(
+            origin_match(
+                &origin("cloud", "/w", "/s", None),
+                &origin("cloud", "/w", "/s", Some("other"))
+            ),
+            Some(OriginMatch::Same)
+        );
+    }
+
+    #[test]
+    fn a_bucket_is_named_in_the_mismatch() {
+        let recorded = origin("cloud", "/w", "/s", Some("b"));
+        let caller = origin("cloud", "/w", "/s", Some("other"));
+        let r = check_origin("s", Some(&recorded), Some(&caller))
+            .err()
+            .unwrap();
+        let msg = r.body["error"].as_str().unwrap();
+        assert!(msg.contains("bucket b"), "{msg}");
+        assert!(msg.contains("bucket other"), "{msg}");
     }
 }
