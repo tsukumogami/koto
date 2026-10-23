@@ -106,17 +106,25 @@ There are no sync commands. These commands read or write the session's copy in t
 - `koto context add`, `koto context get`, `koto context list`, `koto context exists`, `koto context remove`
 - `koto session list`, `koto session rebind`, `koto session cleanup`, `koto session resolve`, `koto session import`
 
-That list isn't exhaustive: any command that reads a session's state through the cloud backend pulls it from the bucket first. If the bucket is unreachable, a command keeps working on the local copy and prints a warning to stderr.
+That list isn't exhaustive: any command that reads a session's state through the cloud backend checks it against the bucket first. If the bucket is unreachable, a command keeps working on the local copy and prints a warning to stderr.
+
+### What a read costs
+
+A read checks a session with one listing of its objects in the bucket, which says whether it was imported elsewhere and whether its state file and its context manifest changed since this host last pulled or pushed them. Only what changed is downloaded, so a read whose local copy is current costs that one request. Inside a tick, a session the tick's commands already checked isn't checked again: the tick is the window a command relies on, so its later reads of that session make no request. A change another host makes during the tick is read by the next tick.
+
+koto keeps what it last knew of the bucket's copy in host-local files beside the session in the local store (`cloud-sync.json`, `cloud-manifest.json`, `cloud-tick.id`). Nothing uploads them.
+
+A `koto context get` or `koto context exists` records the read for the run journal. A read made by the session's own tick goes into its log, as before. A read made from anywhere else, another session's tick or your shell, goes into `context-reads.jsonl` beside the session on this host and is never pushed, so reading a session never writes to it.
 
 ### Commands a `koto next` runs
 
 A `koto context` call made from a template's command (a default action or a gate) works on the session that `koto next` is advancing, and it doesn't push to the bucket itself. It writes the local copy and leaves the push to the tick, which pushes everything its commands wrote once, before it returns. A call costs a request or two instead of a full round of pulls and pushes, so an action can make many of them inside its time limit.
 
-Two checks still run on every call: whether the session was imported elsewhere, which refuses, and on the first write of the tick, whether another host's writes conflict with this one's, which also refuses. The tick checks both again before it pushes. The tick's own session is pulled from the bucket once, when the tick starts, not again by each command.
+Two checks still run: whether the session was imported elsewhere, which refuses, once per tick, and on the first write of the tick, whether another host's writes conflict with this one's, which also refuses. The tick checks both again before it pushes. The tick's own session is pulled from the bucket once, when the tick starts, not again by each command.
 
 While the tick's commands have writes it hasn't pushed, the bucket holds a `batch-open.json` object beside the session's state file, and `koto session import` refuses the session (`import_source_unpushed`). A tick that was killed before it pushed leaves the writes on its host. The next koto command on the session there, `koto status <name>` for instance, pushes them and removes the object. The same command removes an object left by a `koto context` call killed while it was putting the object in the bucket, before it had written anything.
 
-A `koto context` call for any other session, or made outside a tick, pushes at once, as before.
+A `koto context add` or `koto context remove` for any other session, or made outside a tick, pushes at once, as before.
 
 ### Where a session lives in the bucket
 
@@ -183,7 +191,7 @@ On success it prints one JSON object:
 |-------|---------|
 | `name` | The session's name here (the `--as` name when given) |
 | `from.workspace`, `from.session` | Where it came from |
-| `keys` | How many context keys came across |
+| `keys` | How many context keys came across, after the keys the import leaves behind (see "What the import settles in koto's own keys" below); the `koto/imported-from` record the import writes isn't counted |
 | `template` | Where the compiled template came from: `local-cache`, `bucket` (under `--trust-template`), or `unchanged` when a re-run found the session already built |
 | `marked` | The source now carries its migration marker |
 
@@ -191,7 +199,22 @@ The new session holds the source's events plus a `session_imported` event, every
 
 One key is the exception. `workflows/publish-location`, the Claude Code `/workflows` folder koto renders the session into, names a folder on the host that wrote it, so it never goes to the bucket and the import doesn't carry it. A manifest pushed by koto 0.19.0 or earlier can list it without its object; the import skips that entry too. On its first commit on the new host, the session publishes its own location from `KOTO_WORKFLOWS_DIR` or the Claude Code session there.
 
-A child session isn't imported on its own, and importing a parent doesn't bring its children: the import copies only the named session's own objects.
+A child session isn't imported on its own, and importing a parent doesn't bring its children: the import copies only the named session's own objects. Neither is an anchor's close session (a session whose header has `kind: "anchor-close"`): the import refuses one with `import_source_is_anchor_close`.
+
+### What the import settles in koto's own keys
+
+The keys under `koto/` are koto's records about the session (see "The reserved `koto/` area" in the [CLI usage guide](cli-usage.md#the-reserved-koto-area)). The import treats the bucket as untrusted for them:
+
+- It leaves behind the observed marker (`koto/anchor/observed`), any close record (`koto/anchor-close`), every `koto/links/closes/*` link and any `koto/imported-from` the source carried. An imported anchor therefore has no observed marker: it closes once `retention.idle_period` has passed since its last activity, which is the `session_imported` event the import appends.
+- It checks every link it keeps (`koto/links/<kind>/<peer>`): a known kind, a session name as the peer, and a body of at most 4 KiB naming that same peer. A link that fails is dropped, with a warning on stderr naming the key and why.
+- It settles each `koto/links/held-by/<anchor>` link by the anchor it names, using the `KOTO_ANCHOR` the import runs with as the importing agent session's anchor. The link is kept when that name resolves in this host's store to an anchor that is open and not migrated; the anchor's recorded workspace is a hint only and never decides it. Otherwise it is rewritten to `koto/links/held-by/<your anchor>`, its body carrying `"was"` with the old name, or, when the import runs with no anchor (or `KOTO_ANCHOR` names no anchor here), dropped. Dispatched-by links are carried unchanged.
+- It writes `koto/imported-from`, `{"from_session": "<source name>", "from_session_id": "<source id>"}`, into every copy, replacing anything the source held there. That record is what lets the retention rule treat the source as migrated and resolve links naming it to the copy.
+
+The copy's manifest is written from what it then holds, so later verification sees the changed keys. The source gets nothing beyond the migration marker.
+
+An anchor's template is embedded in koto and never reaches the template cache, so an anchor imports with this build's embedded template when its hash matches, with no `koto template compile` first.
+
+So import an anchor before the sessions it holds when you move them together: a session imported after its anchor, while that anchor is still open, keeps its held-by link naming it. Import from your own agent session's shell (with `KOTO_ANCHOR` set) to have that session hold what you import, or from a bare shell to let the retention rule release a finished session once `retention.keep` has passed since it finished.
 
 ### What happens to the old copy
 
@@ -266,6 +289,7 @@ A refusal or failure prints `{"error": {"code": "...", "message": "..."}}`. Exit
 | `import_source_not_found` | 2 | The source workspace's prefix holds no state file for that name, or `--from` isn't absolute | Check the session name and pass the source workspace's canonical absolute path as it is on its own host; check both hosts use the same bucket |
 | `import_source_migrated` | 2 | The source already carries a migration marker | Continue the session where the message says it went, or import from that workspace instead |
 | `import_source_is_child` | 2 | The named session is a child of another session | Import the session at the top of its tree |
+| `import_source_is_anchor_close` | 2 | The named session is an anchor's close session (`kind: "anchor-close"`), which records a close on its own host | Import the anchor or the sessions it holds instead; a close session is never imported |
 | `import_name_taken` | 2 | A different session already has the name here or under this workspace's prefix | Pass `--as <new-name>`, or remove the session holding the name if it isn't wanted |
 | `import_template_unavailable` | 2 | No usable compiled template with the session's hash: none in this host's cache, or under `--trust-template` none in the bucket or one that doesn't match | Run `koto template compile` here on the session's template from a matching checkout, then import again without `--trust-template` |
 | `import_source_unreadable` | 1 | A source object couldn't be fetched, or failed validation (for example, a state log this koto can't carry intact) | If the bucket was unreachable, run it again; if the message names a validation failure, the source needs repair on its host |
@@ -289,6 +313,8 @@ Resolve by picking a side:
 koto session resolve <name> --keep local   # force-upload your version
 koto session resolve <name> --keep remote  # download the bucket's version
 ```
+
+`--keep local` uploads in one pass: it reads the bucket's manifest once and uploads only the context keys whose content the bucket doesn't already hold, several at a time, then the manifest, the state file and the version. The response's `elapsed_ms` says how long the session took.
 
 ## Config reference
 

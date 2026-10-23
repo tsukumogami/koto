@@ -259,6 +259,9 @@ events:
       gate:
         type: string
         required: false
+      session:
+        type: string
+        required: false
 
   instructions_delivered:
     tier: 2
@@ -1328,6 +1331,12 @@ Records one read of a context key. It never carries the key's content or
 size; a present key's `hash` is what joins the read to the write that
 produced it.
 
+Anchorless context reads are no longer written to the read session's log:
+a `koto context get` or `exists` with no reader anchor goes to the
+host-local read spool beside the session (see the table below), which the
+run journal's `context_reads` records fold in and
+`koto::session::read_spool::read` reads back.
+
 This is the highest-volume event this feature adds, one per logged read. A consumer
 that doesn't need context lineage can skip it like any Tier 2 event, and
 nothing else in the feed depends on it.
@@ -1356,6 +1365,7 @@ nothing else in the feed depends on it.
 | `hash` | string | No | Lowercase hex SHA-256 of the key's content, 64 characters. Present exactly when `present` is `true`. |
 | `access` | string | No | `content` for a read that fetched the content, `presence` for one that only asked whether the key exists. An open vocabulary. koto writes it on every read it logs; absence (possible only on events koto didn't write) means `content`. |
 | `gate` | string | No | The gate's name, when `reader` is `gate`. Absent otherwise. |
+| `session` | string | No | The session read, on a read recorded in the reader's anchor rather than in the session it read (see [Reads from another agent session](#reads-from-another-agent-session)). Absent on a read logged in the session it read; `state` then names that session's state at the read. |
 
 | `reader` | Reads it covers |
 |----------|-----------------|
@@ -1374,6 +1384,51 @@ record, so it logs nothing rather than a `present: true` event without `hash`.
 A read that can't be appended (a full disk, an unwritable log) produces a
 warning on stderr and never fails the command that performed it, so the feed
 can hold fewer reads than koto performed.
+
+##### Reads from another agent session
+
+`koto context get` and `koto context exists` decide where their read goes
+by the reader's anchor, the session `KOTO_ANCHOR` names in the command's
+environment:
+
+| Reader's anchor | Where the `context_read` goes |
+|---|---|
+| Any, when the command runs inside the read session's own tick (a gate script or default action reading its own session) | The session read, as above. |
+| Names an existing anchor that is the session read, or that holds the session read (the session read carries `koto/links/held-by/<anchor>`) | The session read, as above. |
+| Names an existing anchor otherwise | The reader's anchor, with `session` naming the session read. The session read stays byte-identical. |
+| Unset, or names no anchor in the local store | No log: the reading host's read spool, `context-reads.jsonl` beside the read session's local copy. The session read stays byte-identical. |
+
+The table holds under both backends. The last row closes the cross-session
+writer koto#412 tracked, where a read from a shell with no anchor appended
+to the session it read. A spooled read is the same `context_read` payload,
+with no `session` field, on a line of its own with its `timestamp`; the spool
+isn't part of the feed, and koto reads it back only through its one reader,
+for the run journal. Under the cloud backend, a `context_read` some other
+caller appends outside the session's own tick is spooled the same way;
+`koto context get` and `exists` route their reads as the table says on
+both backends. A gate, result-map or decider read always logs in the session it
+belongs to, since it runs inside that session's own tick.
+
+A read recorded in the reader's anchor counts as that anchor's activity
+when koto judges whether the anchor is idle, and never as activity of the
+session read or of any anchor holding it. A spooled read counts as no
+session's activity. An append to the reader's anchor or to the spool that
+fails warns on stderr and never fails the read.
+
+The consumers handle these reads this way:
+
+- The session read's own run-journal fold reads that session's log and its
+  spool, merged by timestamp, so a spooled read shows up in the visit it
+  fell in. A read in another agent session's anchor isn't in either: when
+  the anchor commits it, the run journal writes one `context_reads` record
+  attributed to the session `session` names, with `koto.context.read_by`
+  naming the anchor (see `docs/reference/run-journal.md`).
+- Read records carry context key names and value hashes, so they stay on
+  the host, with one exception: the user's own koto cloud backend, which
+  they enabled, syncs the anchor's log to their own bucket like any other
+  session. Every other shipper keeps `context_read` events local. Spooled
+  reads never leave the host under either backend: no backend uploads the
+  spool.
 
 ---
 
@@ -1840,6 +1895,21 @@ source's remote object; this one records where they came from.
 | `machine_id` | string | Yes | The importing machine's id, from koto's user config. |
 
 A log imported more than once carries one of these per import, oldest first.
+
+The import also settles the copy's reserved `koto/` context keys, which the
+log doesn't record: it leaves behind the source's observed marker
+(`koto/anchor/observed`), close record (`koto/anchor-close`),
+`koto/links/closes/*` links and `koto/imported-from`; drops any link whose
+key or body is malformed, with a warning on stderr; keeps each
+`koto/links/held-by/<anchor>` whose anchor resolves on the importing host to
+an open, unmigrated anchor, rewrites the others to the importing command's
+`KOTO_ANCHOR` with `"was"` naming the old anchor, or drops them when the
+import runs with no anchor; and writes `koto/imported-from`
+(`{"from_session", "from_session_id"}`, the same values this event carries).
+It refuses an anchor's close session as a source. For an imported anchor,
+this event is its last activity until its own agent session writes again,
+and with its observed marker gone, the anchor closes once the idle period
+has passed since it.
 
 ---
 

@@ -64,6 +64,11 @@ Fields:
 - `duplicate_var` — the same key was passed twice. Carries `var`.
 - `unknown_var` — the template doesn't declare the key. Carries `var`.
 
+`koto init --replace-terminal` adds two codes of its own when it can't replace a finished session:
+
+- `replace_held_live` (exit 2) — the finished session is still kept by the retention rule, so it would be moved aside, but a session under it is still running, waits to promote its result to a request leg, or can't be read. Carries `live`, naming them. Nothing changed; finish or cancel those first.
+- `replace_failed` (exit 1) — removing or moving aside the finished session failed partway. koto undid the move, so nothing was replaced; when even the undo failed, `stranded` lists the renames left in place, which stay readable under their new names.
+
 ---
 
 ## NextErrorCode table

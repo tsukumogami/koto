@@ -205,7 +205,11 @@ impl Host {
             .env("HOME", &self.home)
             .env("XDG_CACHE_HOME", &self.cache)
             .env_remove("XDG_CONFIG_HOME")
-            .env_remove("KOTO_SESSIONS_BASE");
+            .env_remove("KOTO_SESSIONS_BASE")
+            // An import settles held-by links by the importing command's
+            // anchor; the carrier imports from a bare shell.
+            .env_remove("KOTO_ANCHOR")
+            .env_remove("KOTO_DISPATCHER_ANCHOR");
         if let Some((key, secret)) = &self.credentials {
             cmd.env("AWS_ACCESS_KEY_ID", key)
                 .env("AWS_SECRET_ACCESS_KEY", secret);
@@ -544,6 +548,31 @@ impl<'a> Carrier<'a> {
             step,
             sha256_hex(&bytes) == self.template_hash(),
             format!("{} doesn't hold the compiled template", template.display()),
+        );
+
+        // The copy records what it was copied from, replacing any record
+        // the source held, and its manifest lists the record as written.
+        let key = "koto/imported-from";
+        let record =
+            std::fs::read(to.session_dir(&self.name).join("ctx").join(key)).unwrap_or_default();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&record).unwrap_or(serde_json::Value::Null);
+        ensure(
+            step,
+            parsed
+                == serde_json::json!({
+                    "from_session": self.name,
+                    "from_session_id": source_header["session_id"],
+                }),
+            format!("{}'s {} is {}", to.label, key, parsed),
+        );
+        let meta = &to.manifest(&self.name)["keys"][key];
+        ensure(
+            step,
+            meta["hash"] == sha256_hex(&record).as_str()
+                && meta["size"] == record.len()
+                && meta["writer"] == "koto",
+            format!("{}'s manifest records {} as {}", to.label, key, meta),
         );
     }
 

@@ -105,7 +105,7 @@ impl CloudBackend {
         // The probe comes first: taking the locks creates `ctx/manifest.lock`,
         // which must never happen through a symlink at the name.
         self.probe_exchange(&base, &holder)?;
-        let (manifest, manifest_bytes) = self.read_source_manifest(source)?;
+        let manifest = self.read_source_manifest(source)?;
         let locks = self.lock_source_copy(name)?;
         let verified = self.verify_source_copy(name, source, &manifest)?;
         if reuse_session_id.is_none() {
@@ -123,12 +123,11 @@ impl CloudBackend {
             name,
             crate::engine::types::generate_session_id()
         ));
-        let (mut staging, session_id) = self.stage_import(
+        let (mut staging, session_id, carried) = self.stage_import(
             req,
             source,
             &template,
-            &manifest,
-            manifest_bytes.as_deref(),
+            manifest.clone(),
             &machine_id,
             Some((&scratch, reuse_session_id)),
         )?;
@@ -146,7 +145,7 @@ impl CloudBackend {
         staging.dir = pending.clone();
 
         // 3. Push.
-        let pushed = self.push_staged(name, &staging.dir, source, &manifest)?;
+        let pushed = self.push_staged(name, &staging.dir, source, &carried)?;
         crash_at("after-push");
 
         // 4. Re-check under the locks, then mark. A definite marker failure
@@ -213,7 +212,7 @@ impl CloudBackend {
             name: name.to_string(),
             from_workspace: source.workspace.clone(),
             from_session: source.name.clone(),
-            keys: manifest.keys.len(),
+            keys: super::carried_key_count(&carried),
             template: if req.trust_template {
                 TemplateOrigin::Bucket
             } else {
@@ -301,7 +300,7 @@ impl CloudBackend {
         if old.header.session_id != source.log.header.session_id {
             return false;
         }
-        let Ok((remote_manifest, _)) = self.read_source_manifest(source) else {
+        let Ok(remote_manifest) = self.read_source_manifest(source) else {
             return false;
         };
         let old_manifest: crate::session::context::Manifest =
@@ -673,7 +672,9 @@ impl CloudBackend {
 /// local log is longer, or differs at a `seq` both hold), or the local
 /// manifest holds a key the bucket's lacks, or one whose hash differs and
 /// whose `created_at` is later. Host-local keys never reach the bucket, so
-/// they never count.
+/// they never count, and neither do the reserved keys an import leaves
+/// behind, which `remote_manifest` (read by `read_source_manifest`) no
+/// longer lists.
 fn local_ahead_of(
     local: &SourceLog,
     remote: &SourceLog,
@@ -695,7 +696,9 @@ fn local_ahead_of(
         return Some(format!("a different event at seq {}", i + 1));
     }
     for (key, meta) in &local_manifest.keys {
-        if crate::session::context::is_host_local_key(key) {
+        if crate::session::context::is_host_local_key(key)
+            || crate::session::import_links::dropped_on_import(key)
+        {
             continue;
         }
         match remote_manifest.keys.get(key) {

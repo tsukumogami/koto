@@ -953,11 +953,13 @@ Creates a new local session from the copy another workspace pushed to the bucket
 |---|---|
 | `name` | The new session's name here (`--as` when given). |
 | `from.workspace`, `from.session` | The source workspace and session name. |
-| `keys` | How many context keys came across. |
+| `keys` | How many context keys came across, not counting the `koto/imported-from` record the import writes. |
 | `template` | Where the compiled template came from: `local-cache`, `bucket` (under `--trust-template`), or `unchanged` when a re-run found the session already built here and took none. |
 | `marked` | Always `true` on success: the source carries a `migrated.json` marker. |
 
 The new session holds the source's events plus a `session_imported` event, every context key except `workflows/publish-location`, and the compiled template, and is pushed under this workspace's prefix before the marker is written. From then on the old copy refuses with `session_migrated` (see `error-handling.md#session_migrated`). The import writes nothing else under the source's prefix and deletes nothing; the source's objects stay in the bucket until a `koto session cleanup` in the source workspace, which keeps `migrated.json`. A child session is refused on its own, and importing a parent doesn't bring its children.
+
+**koto's own keys.** Import an anchor before the sessions it holds. The import treats the bucket as untrusted for the reserved `koto/` area. It leaves behind the observed marker (`koto/anchor/observed`), any close record (`koto/anchor-close`), every `koto/links/closes/*` link and any `koto/imported-from` the source held, and drops any link whose key or body is malformed, with a warning on stderr. Each `koto/links/held-by/<anchor>` is kept when that anchor is open and not migrated in this host's store (its recorded workspace doesn't matter); otherwise it is rewritten to `koto/links/held-by/<your anchor>`, carrying `"was"` with the old name, when you import with `KOTO_ANCHOR` naming an anchor here, and dropped when you don't. Dispatched-by links are carried unchanged. Every copy gets `koto/imported-from` (`{"from_session","from_session_id"}`). Import from your agent session's shell to have it hold what you move. An anchor's close session is refused as a source; an anchor imports with this build's embedded template when the cache has none.
 
 `workflows/publish-location` names a `/workflows` folder on the source's host, so it never leaves that host: the cloud backend doesn't upload it, and the import leaves it behind even when a manifest an older koto pushed lists it. The new session publishes its own location on its first commit here, from `KOTO_WORKFLOWS_DIR` or this host's Claude Code session, like any session.
 
@@ -971,6 +973,7 @@ The new session holds the source's events plus a `session_imported` event, every
 | `import_source_not_found` | 2 | No state file for that name under the source workspace's prefix, or `--from` isn't absolute. | Check the name, and pass the canonical absolute path the source host used; check both hosts use the same bucket. |
 | `import_source_migrated` | 2 | The source was already imported somewhere. | Continue it where the message says, or import from that workspace. |
 | `import_source_is_child` | 2 | The named session is a child. | Import the root of its tree. |
+| `import_source_is_anchor_close` | 2 | The named session is an anchor's close session (`kind: "anchor-close"`). | Don't import it; import the anchor or the sessions it holds. |
 | `import_name_taken` | 2 | A different session holds the name here or under this workspace's prefix. | Re-run with `--as <new-name>`. |
 | `import_template_unavailable` | 2 | No usable compiled template with the session's hash (in the cache, or under `--trust-template` in the bucket). | Run `koto template compile` on the session's template here, then import again without `--trust-template`. |
 | `import_source_unreadable` | 1 | A source object couldn't be fetched or failed validation. | Retry if the bucket was unreachable; otherwise report the message. |
@@ -1100,6 +1103,8 @@ Retrieves stored content and writes it to stdout, or to `--to-file` if specified
 
 Exit 3 if the key does not exist or an I/O error occurs.
 
+**Where the read is recorded.** `get` and `exists` each log one `context_read` (key name and value hash, never the value). When `KOTO_ANCHOR` names an anchor other than `<session>` and other than one that holds it (through `koto/links/held-by/<anchor>`), which is a read from another agent session, the record goes into that anchor's log with a `session` field naming `<session>`, and `<session>`'s files stay byte-identical. Your own session's reads still log in `<session>`. A read with no anchor (unset, or naming no anchor here) goes to this host's read spool beside `<session>`'s local copy, which never leaves the host and counts as no session's activity, so `<session>`'s files stay byte-identical then too. Under the cloud backend that means an anchorless read now writes nothing to the read session; before, every read was also a write to the bucket. One exception remains: when a transition assigned a key and that store write was lost, the read first restores the assigned value into `<session>` (koto#436). A record that can't be appended prints a warning and the read still answers. `koto context list` and `koto status` record no read anywhere.
+
 ---
 
 ## koto context exists
@@ -1108,7 +1113,7 @@ Exit 3 if the key does not exist or an I/O error occurs.
 koto context exists <session> <key>
 ```
 
-Checks whether a key exists in the session's context store.
+Checks whether a key exists in the session's context store. The read is recorded as `koto context get`'s is (see above).
 
 **Exit-code contract:**
 - Exit 0 — key is present

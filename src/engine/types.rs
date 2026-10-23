@@ -1110,6 +1110,12 @@ pub enum EventPayload {
         /// The gate's name when `reader` is `gate`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         gate: Option<String>,
+        /// The session read, on a read recorded in the reader's anchor
+        /// rather than in the session it read (a `koto context get` or
+        /// `koto context exists` from another agent session). Absent on a
+        /// read logged in the session it read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
     },
     WorkflowCancelled {
         state: String,
@@ -2158,6 +2164,7 @@ impl<'de> Deserialize<'de> for Event {
                     hash: p.hash,
                     access: p.access,
                     gate: p.gate,
+                    session: lenient_string(p.session),
                 }
             }
             "workflow_cancelled" => {
@@ -2567,6 +2574,10 @@ struct ContextReadPayload {
     access: Option<String>,
     #[serde(default)]
     gate: Option<String>,
+    /// Read leniently: a value that isn't a string reads as absent rather
+    /// than failing the whole log.
+    #[serde(default)]
+    session: Option<serde_json::Value>,
 }
 
 /// A string field read leniently: anything but a string reads as absent
