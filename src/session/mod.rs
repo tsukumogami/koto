@@ -354,7 +354,7 @@ pub trait SessionBackend: Send + Sync {
         -> anyhow::Result<()>;
 
     /// Append a `context_read` that its reader already judged to be `id`'s
-    /// own (`crate::cli::context::read_log_target` answered `Session`: the
+    /// own (the CLI's `read_log_target` answered `Session`: the
     /// reader's anchor is `id` or holds it, or the read ran in `id`'s own
     /// tick) to `id`'s log.
     ///

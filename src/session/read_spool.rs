@@ -10,7 +10,7 @@
 //! the session (koto#412, koto#410). So such a read is appended here instead,
 //! beside the session in the local store, under either backend, and never
 //! pushed. There are two writers: `koto context get` and `exists` spool an
-//! anchorless read themselves (`crate::cli::context`), on both backends, and
+//! anchorless read themselves (`src/cli/context.rs`), on both backends, and
 //! the cloud backend's `append_event` spools any other `context_read` made
 //! outside the session's own tick, as a backstop for a caller that doesn't
 //! route its reads. An own read (the reader's anchor is the session or holds
