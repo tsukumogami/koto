@@ -1397,9 +1397,10 @@ writer koto#412 tracked, where a read from a shell with no anchor appended
 to the session it read. A spooled read is the same `context_read` payload,
 with no `session` field, on a line of its own with its `timestamp`; the spool
 isn't part of the feed, and koto reads it back only through its one reader,
-for the run journal. Under the cloud backend, a read the session's own tick
-didn't make is spooled the same way, and so is an own read made outside its
-tick. A gate, result-map or decider read always logs in the session it
+for the run journal. Under the cloud backend, a `context_read` some other
+caller appends outside the session's own tick is spooled the same way;
+`koto context get` and `exists` route their reads as the table says on
+both backends. A gate, result-map or decider read always logs in the session it
 belongs to, since it runs inside that session's own tick.
 
 A read recorded in the reader's anchor counts as that anchor's activity
