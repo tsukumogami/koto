@@ -151,6 +151,10 @@ impl SessionBackend for LocalBackend {
                 Some(n) => n.to_string(),
                 None => continue,
             };
+            // A close session being staged is not a session yet.
+            if dir_name.starts_with(crate::session::anchor::STAGING_PREFIX) {
+                continue;
+            }
 
             let state_path = entry.path().join(state_file_name(&dir_name));
             if !state_path.exists() {
@@ -170,6 +174,7 @@ impl SessionBackend for LocalBackend {
                         template_source_status,
                         execution_dir: header.execution_dir,
                         session_id,
+                        kind: header.kind,
                     });
                 }
                 Err(_) => {
@@ -1170,6 +1175,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -1212,6 +1218,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -1825,6 +1832,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -1932,6 +1940,7 @@ mod tests {
                     deadline: None,
                     retry_count: None,
                     agent_config: None,
+                    kind: None,
                     root_session_id: None,
                     parent_session_id: None,
                     respawn_generation: None,
@@ -2459,6 +2468,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -2636,6 +2646,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,

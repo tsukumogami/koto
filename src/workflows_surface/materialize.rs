@@ -102,6 +102,15 @@ fn try_materialize(
     store: &dyn ContextStore,
     session_id: &str,
 ) -> anyhow::Result<()> {
+    // An anchor or an anchor's close session is not a workflow, and
+    // resolving a target could publish a location into it.
+    if backend
+        .read_header(session_id)
+        .is_ok_and(|h| h.session_kind().is_koto_owned())
+    {
+        return Ok(());
+    }
+
     // Render gate: resolve the target directory, or return writing nothing.
     let dir = match resolve_target_dir(backend, store, session_id) {
         Some(d) => d,

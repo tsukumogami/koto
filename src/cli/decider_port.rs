@@ -612,6 +612,7 @@ d
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,

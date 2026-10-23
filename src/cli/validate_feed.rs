@@ -376,6 +376,20 @@ Body text.
         assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
     }
 
+    /// An anchor's log, as `koto session anchor open` and a held tick write
+    /// it, validates clean against the shipped contract.
+    #[test]
+    fn shipped_spec_accepts_an_anchor_log() {
+        let log = write_temp(&format!(
+            "{}\n{}\n{}\n",
+            r#"{"schema_version":1,"workflow":"anchor-h1","template_hash":"h","created_at":"2024-01-01T00:00:00Z","kind":"anchor"}"#,
+            r#"{"seq":3,"timestamp":"2024-01-01T00:00:00Z","type":"anchor_started","payload":{"source":"clear","harness_session":"h1","opened":"successor","process":"ab","predecessor":"anchor-h0","reason":"clear"}}"#,
+            r#"{"seq":4,"timestamp":"2024-01-01T00:00:01Z","type":"anchor_activity","payload":{"session":"wf","command":"next"}}"#,
+        ));
+        let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+        assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
+    }
+
     /// Acceptance alone would prove nothing: the validator skips event types it
     /// does not recognize, so an unregistered event passes silently. Feeding a
     /// malformed instance of each new event is what shows the contract declares
@@ -414,6 +428,14 @@ Body text.
             (
                 "finding_disputed",
                 r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"finding_disputed","payload":{"state":"review"}}"#,
+            ),
+            (
+                "anchor_started",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"anchor_started","payload":{"source":"startup"}}"#,
+            ),
+            (
+                "anchor_activity",
+                r#"{"seq":1,"timestamp":"2024-01-01T00:00:00Z","type":"anchor_activity","payload":{"session":"wf"}}"#,
             ),
         ] {
             let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), malformed));

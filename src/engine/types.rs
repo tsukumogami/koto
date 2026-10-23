@@ -516,6 +516,59 @@ pub struct StateFileHeader {
     /// Reserved: opaque agent configuration blob (forward-compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_config: Option<serde_json::Value>,
+
+    /// What koto keeps this session for, when it isn't an ordinary
+    /// workflow: `anchor` for an agent session's anchor, `anchor-close` for
+    /// the record that closes one (DESIGN-session-retention.md, Decision 2).
+    /// Read it through [`SessionKind::of`].
+    ///
+    /// Parsed as a plain string, so a kind this build doesn't know reads as
+    /// an ordinary session rather than an unreadable header. Additive field:
+    /// omitted when `None`, defaults to `None` on old state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+/// What a session's header says it is, from [`StateFileHeader::kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    /// A workflow: no `kind`, or one this build doesn't know.
+    Ordinary,
+    /// An agent session's anchor (`kind: "anchor"`).
+    Anchor,
+    /// The record that closes an anchor (`kind: "anchor-close"`).
+    AnchorClose,
+}
+
+impl SessionKind {
+    /// The header value of an anchor.
+    pub const ANCHOR: &'static str = "anchor";
+    /// The header value of an anchor's close session.
+    pub const ANCHOR_CLOSE: &'static str = "anchor-close";
+
+    /// The kind a header's `kind` field names. An unknown value is
+    /// [`SessionKind::Ordinary`].
+    pub fn of(kind: Option<&str>) -> Self {
+        match kind {
+            Some(Self::ANCHOR) => SessionKind::Anchor,
+            Some(Self::ANCHOR_CLOSE) => SessionKind::AnchorClose,
+            _ => SessionKind::Ordinary,
+        }
+    }
+
+    /// Whether koto keeps this session for its own bookkeeping rather than
+    /// as a workflow: anchors and close sessions, which no workflow view
+    /// lists and `koto next` refuses.
+    pub fn is_koto_owned(self) -> bool {
+        self != SessionKind::Ordinary
+    }
+}
+
+impl StateFileHeader {
+    /// What this header says the session is.
+    pub fn session_kind(&self) -> SessionKind {
+        SessionKind::of(self.kind.as_deref())
+    }
 }
 
 /// Claim record written by the coordinator that picks up an agent
@@ -787,6 +840,58 @@ pub struct FindingDispute {
     /// same rule as `attempt`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visit_attempt: Option<u64>,
+}
+
+/// The event type every `koto session anchor open` appends to its anchor.
+pub const ANCHOR_STARTED: &str = "anchor_started";
+
+/// The event type a `koto init` or `koto next` under `KOTO_ANCHOR` appends
+/// to that anchor.
+pub const ANCHOR_ACTIVITY: &str = "anchor_activity";
+
+/// The payload of an [`ANCHOR_STARTED`] event: one start of an agent
+/// session against its anchor (DESIGN-session-retention.md, Decision 2).
+///
+/// `process` and `transcript` are digests (a SHA-256 prefix), never the
+/// token or the path in clear text, since the event may sync off the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorStarted {
+    /// The harness's start source: `startup`, `resume`, `compact`, `clear`
+    /// or `other`.
+    pub source: String,
+    /// The harness session id the anchor was opened for.
+    pub harness_session: String,
+    /// What the open did: `new`, `continued`, `reopened` or `successor`.
+    pub opened: String,
+    /// A SHA-256 prefix of the process token, when one was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
+    /// The workspace directory the agent session runs in, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// A SHA-256 prefix of the harness's transcript path, when one was
+    /// given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
+    /// The anchor this one succeeds, for a successor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor: Option<String>,
+    /// Why a successor was opened: `closed`, `migrated`, `resume` or
+    /// `clear`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The dispatcher the caller inherited, when it named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_by: Option<String>,
+}
+
+/// The payload of an [`ANCHOR_ACTIVITY`] event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorActivity {
+    /// The session the command opened or ticked.
+    pub session: String,
+    /// The command: `init` or `next`.
+    pub command: String,
 }
 
 /// The leading bytes of a failed command gate's streams, as
@@ -1462,6 +1567,16 @@ pub enum EventPayload {
     /// Additive: an older build lands it in `Unknown`, and a payload this
     /// build can't parse does the same rather than failing the read.
     FindingDisputed(FindingDispute),
+    /// One `koto session anchor open` call against an anchor
+    /// (DESIGN-session-retention.md, Decision 2): every call appends one,
+    /// whether it created the anchor or continued it. Additive: an older
+    /// build lands it in `Unknown`, and a payload this build can't parse
+    /// does the same rather than failing the read.
+    AnchorStarted(AnchorStarted),
+    /// A `koto init` or `koto next` ran under this anchor (`KOTO_ANCHOR`),
+    /// recorded at most once per tenth of the idle period. Additive, and
+    /// degrades like `anchor_started`.
+    AnchorActivity(AnchorActivity),
     InstructionsDelivered {
         /// The phase whose instructions the response carried.
         state: String,
@@ -1820,6 +1935,8 @@ impl EventPayload {
             EventPayload::DeciderFallback(_) => "decider_fallback",
             EventPayload::DeciderCheckAnswered(_) => "decider_check_answered",
             EventPayload::FindingDisputed(_) => FINDING_DISPUTED,
+            EventPayload::AnchorStarted(_) => ANCHOR_STARTED,
+            EventPayload::AnchorActivity(_) => ANCHOR_ACTIVITY,
             EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
             EventPayload::Unknown { .. } => "unknown",
         }
@@ -2308,6 +2425,22 @@ impl<'de> Deserialize<'de> for Event {
                     },
                 }
             }
+            ANCHOR_STARTED => match serde_json::from_value::<AnchorStarted>(payload_val.clone()) {
+                Ok(a) => EventPayload::AnchorStarted(a),
+                Err(_) => EventPayload::Unknown {
+                    type_name: event_type.clone(),
+                    raw_payload: payload_val.clone(),
+                },
+            },
+            ANCHOR_ACTIVITY => {
+                match serde_json::from_value::<AnchorActivity>(payload_val.clone()) {
+                    Ok(a) => EventPayload::AnchorActivity(a),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
             "instructions_delivered" => {
                 let p: InstructionsDeliveredPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
@@ -2780,6 +2913,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -2816,6 +2950,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -2864,6 +2999,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -2905,6 +3041,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -2944,6 +3081,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -3912,6 +4050,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,

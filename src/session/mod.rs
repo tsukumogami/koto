@@ -1,7 +1,9 @@
+pub mod anchor;
 pub mod batch;
 pub mod cloud;
 pub mod context;
 pub mod context_log;
+pub mod duration;
 pub mod finished;
 pub mod links;
 pub mod local;
@@ -221,6 +223,19 @@ pub struct SessionInfo {
     /// The header's `session_id`. `None` for a header written before the
     /// field existed, and for remote-only placeholder rows.
     pub session_id: Option<String>,
+
+    /// The header's `kind` (`anchor`, `anchor-close`), omitted for an
+    /// ordinary session. `koto session list` shows it; the workflow views
+    /// leave out every session that carries a kind koto knows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+impl SessionInfo {
+    /// What the session's header says it is.
+    pub fn session_kind(&self) -> crate::engine::types::SessionKind {
+        crate::engine::types::SessionKind::of(self.kind.as_deref())
+    }
 }
 
 /// Return the state file name for a given session ID.

@@ -58,6 +58,7 @@ fn state_file_header_resolves_and_constructs() {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        kind: None,
         root_session_id: None,
         parent_session_id: None,
     };
@@ -220,6 +221,7 @@ fn path_buf_used_for_template_source_dir_field() {
         deadline: None,
         retry_count: None,
         agent_config: None,
+        kind: None,
         root_session_id: None,
         parent_session_id: None,
     };

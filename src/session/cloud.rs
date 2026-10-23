@@ -1925,6 +1925,7 @@ fn placeholder_session_info(id: String) -> SessionInfo {
         template_source_status: None,
         execution_dir: None,
         session_id: None,
+        kind: None,
     }
 }
 
@@ -4112,6 +4113,7 @@ pub(crate) mod test_support {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -4191,6 +4193,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -4299,6 +4302,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -4357,6 +4361,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,
@@ -4418,6 +4423,7 @@ mod tests {
             deadline: None,
             retry_count: None,
             agent_config: None,
+            kind: None,
             root_session_id: None,
             parent_session_id: None,
             respawn_generation: None,

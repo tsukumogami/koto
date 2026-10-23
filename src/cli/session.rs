@@ -347,6 +347,7 @@ pub fn handle_start(
         deadline: None,
         retry_count: None,
         agent_config: None,
+        kind: None,
         root_session_id,
         parent_session_id,
         respawn_generation: None,
