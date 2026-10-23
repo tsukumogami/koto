@@ -324,9 +324,16 @@ impl Env {
             for e in entries.flatten() {
                 let p = e.path();
                 let meta = std::fs::symlink_metadata(&p).unwrap();
+                // The cloud backend's host-local record of what it last saw
+                // in the bucket (`koto::session::sync_stamp`) is a cache a
+                // read may refresh, not the session's content.
+                use koto::session::sync_stamp::{MANIFEST_FILE, STAMP_FILE, TICK_FILE};
+                let cache = [STAMP_FILE, MANIFEST_FILE, TICK_FILE]
+                    .iter()
+                    .any(|c| p.file_name().is_some_and(|f| f == *c));
                 if meta.is_dir() {
                     stack.push(p);
-                } else if meta.is_file() {
+                } else if meta.is_file() && !cache {
                     let digest = Sha256::digest(std::fs::read(&p).unwrap());
                     out.insert(
                         p.strip_prefix(&root).unwrap().to_path_buf(),
