@@ -589,13 +589,13 @@ Don't reach for this to report progress on a request leg. `--intent` is one sent
 
 ## Periodic maintenance: koto workspace prune
 
-`koto workspace prune` reclaims the derived files the dispatch substrate accumulates over time — stale scan cursors (`~/.koto/coordinators/<id>/scan_cursor.toml`), stale compaction locks, and stale claim sidecars (`claim.lock`). It does NOT reclaim session bodies under `~/.koto/sessions/`; per-session cleanup still routes through `koto session cleanup <session-id>`. It also leaves request records under `~/.koto/requests/` alone — a closed request stays readable, which is what makes it an audit trail.
+`koto workspace prune --root <session-id>` removes the sessions of a finished root's subtree that the retention rule releases, deepest first and the root last, and lists the rest with their reasons (a live dispatcher, the retention not yet passed, a stale anchor with its close command). The root is judged with every edge and each descendant without the root's lineage to its children, so a child whose dispatcher still runs stays, with everything under it. It also reclaims the derived files the dispatch substrate accumulates over time — stale scan cursors (`~/.koto/coordinators/<id>/scan_cursor.toml`), stale compaction locks, and stale claim sidecars (`claim.lock`). It leaves request records under `~/.koto/requests/` alone — a closed request stays readable, which is what makes it an audit trail.
 
 Suggest the verb when the user reports growing `~/.koto/` disk usage, when the discovery scan starts noticeably slowing at year-2 scale, or when stale-claim recovery events show up in the audit log.
 
 Recommended cadence is **weekly to monthly** for typical workloads. See `docs/workspace-layout.md` ("Sizing your prune cadence") for the per-workload sizing math and cron snippets.
 
-Flags worth knowing: `--root <session-id>` (required; terminal-state root to prune), `--dry-run` (preview without reclaiming), `--yes` (cron-friendly; skip the confirmation prompt), `--force` (bypass the terminal-state safety gate — dangerous). Full flag set lives in `docs/guides/cli-usage.md`.
+Flags worth knowing: `--root <session-id>` (required; terminal-state root to prune), `--dry-run` (preview without reclaiming), `--yes` (cron-friendly; skip the confirmation prompt), `--force` (bypass the terminal-state safety gate; it never overrides the retention rule, so a live root stays). Full flag set lives in `docs/guides/cli-usage.md`.
 
 ```bash
 koto workspace prune --root <session-id> --dry-run

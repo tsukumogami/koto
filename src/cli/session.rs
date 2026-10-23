@@ -629,6 +629,95 @@ pub fn handle_hierarchy(backend: &Backend, name: &str, json: bool) -> Result<()>
     Ok(())
 }
 
+/// What an explicit removal (`koto session cleanup`, `koto cancel
+/// --cleanup`) broke: every other live member of the removed session's
+/// hierarchy, judged just before the removal.
+pub(crate) struct LiveMembers {
+    /// `{name, kind, observed}` for each live member other than the session
+    /// itself. Empty when nothing else is alive, so the rule would not have
+    /// kept the session for a live member.
+    pub members: Vec<serde_json::Value>,
+    /// Why the hierarchy couldn't be judged, when it couldn't; `members` is
+    /// then empty and says nothing.
+    pub error: Option<String>,
+}
+
+/// Judge `name`'s hierarchy in the local store `base` and list its other
+/// live members. Never fails: the removal goes ahead whatever this finds.
+/// A malformed retention setting falls back to the defaults (it only moves
+/// when an unobserved anchor idles out), with a warning.
+pub(crate) fn live_members(base: &std::path::Path, name: &str) -> LiveMembers {
+    use crate::session::hierarchy::{sanitize, Graph, Judge, RetentionSettings, Scope, Verdict};
+
+    let none = |error: Option<String>| LiveMembers {
+        members: Vec::new(),
+        error,
+    };
+    if ValidatedSessionId::new(name).is_err() {
+        return none(None);
+    }
+    let settings = RetentionSettings::load().unwrap_or_else(|e| {
+        eprintln!("warning: {e:#}; judging '{name}''s hierarchy with the default settings");
+        let day = std::time::Duration::from_secs(86_400);
+        RetentionSettings::from_durations(7 * day, 7 * day, 30 * day)
+    });
+    let graph = match Graph::scan(base) {
+        Ok(graph) => graph,
+        Err(e) => {
+            return none(Some(format!(
+                "the sessions directory can't be read, so the hierarchy wasn't judged: {e:#}"
+            )))
+        }
+    };
+    if !graph.contains(name) {
+        return none(None);
+    }
+    let mut judge = Judge::new(&graph, settings, std::time::SystemTime::now());
+    match judge.judge(name, &Scope::Whole) {
+        Ok(j) => match j.verdict {
+            Verdict::Keep { keepers, .. } => LiveMembers {
+                members: keepers
+                    .iter()
+                    .filter(|k| k.name != name)
+                    .map(|k| {
+                        serde_json::json!({
+                            "name": sanitize(&k.name),
+                            "kind": k.kind.as_str(),
+                            "observed": k.observed,
+                        })
+                    })
+                    .collect(),
+                error: None,
+            },
+            Verdict::Release { .. } => none(None),
+        },
+        Err(e) => none(Some(format!("{e:#}"))),
+    }
+}
+
+/// Warn on stderr that removing `name` broke what `live` names.
+pub(crate) fn warn_live_members(name: &str, live: &LiveMembers) {
+    use crate::session::hierarchy::sanitize;
+    if let Some(e) = &live.error {
+        eprintln!("warning: removed '{}'; {}", sanitize(name), sanitize(e));
+    }
+    if live.members.is_empty() {
+        return;
+    }
+    let names: Vec<String> = live
+        .members
+        .iter()
+        .filter_map(|m| m["name"].as_str())
+        .map(str::to_string)
+        .collect();
+    eprintln!(
+        "warning: removed '{}', which the retention rule would have kept: still alive in its \
+         hierarchy: {}",
+        sanitize(name),
+        names.join(", ")
+    );
+}
+
 /// Record a dispatched-by link to `dispatcher` in `session` after the
 /// session was opened, warning on stderr instead of failing when it can't
 /// be written: the session is already there, and `koto session link`

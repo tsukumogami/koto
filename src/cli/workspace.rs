@@ -2,8 +2,10 @@
 //!
 //! Reads the root header, validates the workflow has reached a terminal
 //! state (`completed` or `abandoned`), walks descendants via
-//! `backend.list()` + parent filter, and reclaims after operator
-//! confirmation. Symlinked roots reject via `lstat()` before any
+//! `backend.list()` + parent filter, judges the root and every descendant
+//! by the retention rule (`crate::session::hierarchy`), and after operator
+//! confirmation reclaims only the members the rule releases, listing the
+//! rest with their reasons. Symlinked roots reject via `lstat()` before any
 //! directory traversal; `fs::remove_dir_all` (the underlying reclaim
 //! primitive) does not follow symlinks inside the descendant tree, so
 //! a symlink whose target lives outside `~/.koto/` cannot be removed
@@ -30,6 +32,9 @@ use serde_json::json;
 
 use crate::engine::persistence::derive_machine_state;
 use crate::engine::types::{EventPayload, StateFileHeader};
+use crate::session::hierarchy::{
+    self, Graph, Judge, MemberKind, RetentionSettings, Scope, Verdict,
+};
 use crate::session::{validate::validate_session_id, SessionBackend, SessionInfo};
 use crate::template::types::CompiledTemplate;
 
@@ -65,11 +70,16 @@ impl TerminalStatus {
 
 /// Handle `koto workspace prune --root <id> [--dry-run] [--yes] [--force]`.
 ///
+/// The root and its descendants are each judged by the retention rule
+/// (see [`scope_for`]); only the members it releases are removed, and the
+/// rest are listed with their reasons. `--force` passes the terminal-state
+/// gate, never the rule.
+///
 /// Returns on success; on caller errors (invalid root, non-terminal
-/// without `--force`, symlinked root, declined confirmation) calls
-/// `exit_with_error_code` and never returns.
+/// without `--force`, symlinked root, declined confirmation, a malformed
+/// retention setting) calls `exit_with_error_code` and never returns.
 pub fn handle_prune(
-    backend: &dyn SessionBackend,
+    backend: &crate::session::Backend,
     root: String,
     dry_run: bool,
     yes: bool,
@@ -132,17 +142,44 @@ pub fn handle_prune(
         .with_context(|| "failed to list sessions for descendant walk")?;
     let descendants = collect_descendants(&root, &all_sessions);
 
-    // 7. Compute non-terminal sessions in the to-be-pruned set. Operator
+    // 7. Judge every member of the subtree by the retention rule, over one
+    //    scan of the store. `--force` passes the terminal-state gate above
+    //    and never this rule.
+    let settings = RetentionSettings::load().unwrap_or_else(|e| {
+        exit_with_error_code(
+            json!({
+                "error": format!("{e:#}; nothing was judged or removed"),
+                "command": "workspace prune",
+            }),
+            2,
+        )
+    });
+    let graph = Graph::scan(backend.local_base_dir()).unwrap_or_else(|e| {
+        exit_with_error_code(
+            json!({
+                "error": format!(
+                    "the sessions directory can't be read, so nothing was judged or removed: {e:#}"
+                ),
+                "command": "workspace prune",
+            }),
+            3,
+        )
+    });
+    let now = std::time::SystemTime::now();
+    let plan = judge_subtree(&graph, &settings, now, &root, &descendants);
+
+    // 8. Compute non-terminal sessions in the to-be-pruned set. Operator
     //    visibility before any confirmation prompt.
     let non_terminal_in_set = non_terminal_sessions(
         backend,
         std::iter::once(root.as_str()).chain(descendants.iter().map(String::as_str)),
     );
 
-    // 8. Print preview (descendant set + non-terminal warnings).
-    print_preview(&root, &descendants, &non_terminal_in_set, &status);
+    // 9. Print preview (what goes, what stays and why, non-terminal
+    //    warnings).
+    print_preview(&root, &plan, &non_terminal_in_set, &status);
 
-    // 9. Dry-run exits 0 here without reclaiming.
+    // 10. Dry-run exits 0 here without reclaiming.
     if dry_run {
         return Ok(());
     }
@@ -178,17 +215,16 @@ pub fn handle_prune(
         );
     }
 
-    // 11. Reclaim. Descendants first, deepest first, so a partial failure
-    //     leaves every remaining session under a parent that still exists
-    //     and the root visible in `koto workflows`.
-    for id in descendants.iter().rev() {
-        backend
-            .cleanup(id)
-            .with_context(|| format!("failed to remove descendant session '{}'", id))?;
-    }
-    backend
-        .cleanup(&root)
-        .with_context(|| format!("failed to remove root session '{}'", root))?;
+    // 11. Reclaim the released members. Descendants first, deepest first,
+    //     and the root last, so a partial failure leaves every remaining
+    //     session under a parent that still exists and the root visible in
+    //     `koto workflows`. Each is judged again under its own lock first.
+    let Reclaimed {
+        removed,
+        skipped,
+        failed,
+    } = reclaim(backend, &graph, &settings, now, &root, &plan.remove);
+    let root_removed = removed.contains(&root);
 
     // 12. Issue 7: invoke the cursor GC walk so stale coordinator
     //     cursors are reclaimed as part of prune. A GC failure is
@@ -213,13 +249,261 @@ pub fn handle_prune(
         "{}",
         json!({
             "name": root,
-            "pruned": true,
-            "descendants_removed": descendants.len(),
+            "pruned": root_removed,
+            "descendants_removed": removed.iter().filter(|n| **n != root).count(),
+            "removed": removed,
+            "kept": plan.kept.iter().map(KeptMember::to_json).collect::<Vec<_>>(),
+            "skipped": skipped,
+            "failed": failed,
+            "stale_anchors": plan.stale.values().collect::<Vec<_>>(),
             "cursors_gc": cursors_gc,
         })
     );
+    if !failed.is_empty() {
+        std::process::exit(3);
+    }
 
     Ok(())
+}
+
+/// One subtree member the rule lets go, as the judgment saw it.
+struct ReleasedMember {
+    name: String,
+    session_id: Option<String>,
+    kind: MemberKind,
+}
+
+/// One subtree member the rule keeps, with why.
+struct KeptMember {
+    name: String,
+    reason: String,
+    hierarchy: Option<serde_json::Value>,
+}
+
+impl KeptMember {
+    fn to_json(&self) -> serde_json::Value {
+        let mut v = json!({"name": self.name, "reason": self.reason});
+        if let Some(h) = &self.hierarchy {
+            v["hierarchy"] = h.clone();
+        }
+        v
+    }
+}
+
+/// What a workspace prune removes and keeps.
+struct SubtreePlan {
+    /// Deepest first, the root last.
+    remove: Vec<ReleasedMember>,
+    kept: Vec<KeptMember>,
+    /// Every stale anchor a judgment named as a keeper, by name.
+    stale: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// The scope a subtree member is judged under: the root with every edge,
+/// each other member with only the lineage between the root and its direct
+/// children dropped. That lets the person who named the root dissolve its
+/// subtree, while a grandchild under a kept child stays kept with it.
+fn scope_for(root: &str, member: &str) -> Scope {
+    if member == root {
+        Scope::Whole
+    } else {
+        Scope::DropChildLineageOf(root.to_string())
+    }
+}
+
+/// Judge the root and each descendant (listed each after its parent).
+fn judge_subtree(
+    graph: &Graph,
+    settings: &RetentionSettings,
+    now: std::time::SystemTime,
+    root: &str,
+    descendants: &[String],
+) -> SubtreePlan {
+    let mut judge = Judge::new(graph, settings.clone(), now);
+    let mut plan = SubtreePlan {
+        remove: Vec::new(),
+        kept: Vec::new(),
+        stale: Default::default(),
+    };
+    let order = descendants
+        .iter()
+        .rev()
+        .map(String::as_str)
+        .chain(std::iter::once(root));
+    for member in order {
+        match judge.judge(member, &scope_for(root, member)) {
+            Ok(j) => {
+                if let Verdict::Keep { keepers, .. } = &j.verdict {
+                    for k in keepers.iter().filter(|k| k.stale) {
+                        plan.stale
+                            .entry(k.name.clone())
+                            .or_insert_with(|| hierarchy::keeper_json(k));
+                    }
+                }
+                if j.verdict.is_kept() {
+                    plan.kept.push(KeptMember {
+                        name: member.to_string(),
+                        reason: hierarchy::reason_text(&j.verdict),
+                        hierarchy: Some(hierarchy::to_json(&j, settings)),
+                    });
+                } else {
+                    let facts = graph.facts(member);
+                    plan.remove.push(ReleasedMember {
+                        name: member.to_string(),
+                        session_id: facts.and_then(|f| f.session_id.clone()),
+                        kind: j
+                            .members
+                            .iter()
+                            .find(|m| m.name == member)
+                            .map(|m| m.kind)
+                            .unwrap_or(MemberKind::KotoSession),
+                    });
+                }
+            }
+            Err(e) => plan.kept.push(KeptMember {
+                name: member.to_string(),
+                reason: format!("kept: it can't be judged: {e:#}"),
+                hierarchy: None,
+            }),
+        }
+    }
+    plan
+}
+
+/// What the reclaim did with each released member.
+struct Reclaimed {
+    removed: Vec<String>,
+    skipped: Vec<serde_json::Value>,
+    failed: Vec<serde_json::Value>,
+}
+
+/// Remove the released members, in `members`' order (deepest first, the
+/// root last). Every one is locked first, then judged again with a fresh
+/// judge that reads each hierarchy member afresh, before anything is
+/// removed; one now kept, held by another process, or replaced under its
+/// name is skipped. A member is removed only when every released member
+/// below it went, so no session left behind names a removed parent.
+fn reclaim(
+    backend: &crate::session::Backend,
+    graph: &Graph,
+    settings: &RetentionSettings,
+    now: std::time::SystemTime,
+    root: &str,
+    members: &[ReleasedMember],
+) -> Reclaimed {
+    use crate::session::SessionError;
+    let mut out = Reclaimed {
+        removed: Vec::new(),
+        skipped: Vec::new(),
+        failed: Vec::new(),
+    };
+    let mut left: Vec<String> = Vec::new();
+    fn skip(out: &mut Reclaimed, left: &mut Vec<String>, name: &str, reason: String) {
+        out.skipped.push(json!({"name": name, "reason": reason}));
+        left.push(name.to_string());
+    }
+
+    let mut locked = Vec::new();
+    for member in members {
+        match backend.lock_state_file(&member.name) {
+            Ok(lock) => locked.push((member, lock)),
+            Err(SessionError::Locked { .. }) => skip(
+                &mut out,
+                &mut left,
+                &member.name,
+                "another koto process holds the session's lock".to_string(),
+            ),
+            Err(SessionError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                skip(
+                    &mut out,
+                    &mut left,
+                    &member.name,
+                    "the session is already gone".to_string(),
+                );
+            }
+            Err(e) => skip(
+                &mut out,
+                &mut left,
+                &member.name,
+                format!("the session can't be locked: {e}"),
+            ),
+        }
+    }
+
+    // Judge again, under the locks and before anything goes.
+    let mut judge = Judge::new(graph, settings.clone(), now);
+    let mut cleared = Vec::new();
+    for (member, lock) in locked {
+        let name = member.name.as_str();
+        let refusal = match judge.judge(name, &scope_for(root, name)) {
+            Ok(j) if j.verdict.is_kept() => {
+                Some(format!("now {}", hierarchy::reason_text(&j.verdict)))
+            }
+            Ok(_) => match backend.read_header(name) {
+                Err(e) => Some(format!("its header can't be read: {e:#}")),
+                Ok(h)
+                    if Some(h.session_id.clone()).filter(|id| !id.is_empty())
+                        != member.session_id =>
+                {
+                    Some("a different session now has this name".to_string())
+                }
+                // An anchor never reaches a terminal state; the judgment just
+                // made is what says it is closed.
+                Ok(_)
+                    if member.kind == MemberKind::KotoSession
+                        && !is_terminal_session(backend, name) =>
+                {
+                    Some("the session is no longer finished".to_string())
+                }
+                Ok(_) => None,
+            },
+            Err(e) => Some(format!("it can't be judged again: {e:#}")),
+        };
+        match refusal {
+            Some(reason) => skip(&mut out, &mut left, name, reason),
+            None => cleared.push((member, lock)),
+        }
+    }
+
+    for (member, _lock) in cleared {
+        let name = member.name.as_str();
+        if let Some(below) = left.iter().find(|l| descends_from(graph, l, name)) {
+            let reason = format!(
+                "{} below it wasn't removed, and a session goes only after everything below it",
+                hierarchy::sanitize(below)
+            );
+            skip(&mut out, &mut left, name, reason);
+            continue;
+        }
+        match backend.cleanup(name) {
+            Ok(()) => out.removed.push(name.to_string()),
+            Err(e) => {
+                out.failed
+                    .push(json!({"name": name, "error": format!("{e:#}")}));
+                left.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Whether `name`'s `parent_workflow` chain passes through `ancestor`.
+fn descends_from(graph: &Graph, name: &str, ancestor: &str) -> bool {
+    let mut seen = HashSet::new();
+    let mut current = name.to_string();
+    while let Some(parent) = graph
+        .facts(&current)
+        .and_then(|f| f.parent_workflow.clone())
+    {
+        if parent == ancestor {
+            return true;
+        }
+        if !seen.insert(parent.clone()) {
+            return false;
+        }
+        current = parent;
+    }
+    false
 }
 
 /// `lstat()` the candidate path; if it is a symlink, reject with a
@@ -528,30 +812,58 @@ where
     out
 }
 
-/// Print operator-facing preview of what's about to be reclaimed.
+/// Print the operator-facing preview: what the rule removes, in order,
+/// what it keeps and why, the stale anchors with their close commands, and
+/// the sessions under the root that aren't terminal.
 ///
-/// Always emits to stdout (the verb's primary output channel). The
-/// preview lists the root + descendant count, and explicitly names
-/// any non-terminal sessions in the to-be-pruned set so the operator
-/// can abort if `--force` is masking a live session.
+/// Always emits to stdout (the verb's primary output channel).
 fn print_preview(
     root: &str,
-    descendants: &[String],
+    plan: &SubtreePlan,
     non_terminal_in_set: &[String],
     status: &TerminalStatus,
 ) {
     println!("root: {} ({})", root, status.describe());
-    if descendants.is_empty() {
+    let descendants = plan.remove.len() + plan.kept.len() - 1;
+    if descendants == 0 {
         println!("descendants: (none)");
     } else {
-        println!("descendants ({}):", descendants.len());
-        for d in descendants {
-            println!("  {}", d);
+        println!("descendants: {descendants}");
+    }
+    if plan.remove.is_empty() {
+        println!("remove: (none)");
+    } else {
+        println!("remove ({}, in this order):", plan.remove.len());
+        for m in &plan.remove {
+            println!("  {}", hierarchy::sanitize(&m.name));
+        }
+    }
+    if !plan.kept.is_empty() {
+        println!("keep ({}):", plan.kept.len());
+        for k in &plan.kept {
+            println!(
+                "  {}: {}",
+                hierarchy::sanitize(&k.name),
+                hierarchy::sanitize(&k.reason)
+            );
+        }
+    }
+    if !plan.stale.is_empty() {
+        println!("stale anchors (close each by hand once its agent session is gone):");
+        for (name, v) in &plan.stale {
+            match v.get("close_command").and_then(|c| c.as_str()) {
+                Some(cmd) => println!("  {}: {}", hierarchy::sanitize(name), cmd),
+                None => println!(
+                    "  {}: its observed marker or harness session id is malformed, so no close \
+                     command is printed",
+                    hierarchy::sanitize(name)
+                ),
+            }
         }
     }
     if !non_terminal_in_set.is_empty() {
         println!();
-        println!("WARNING: the following sessions in the prune set are non-terminal:");
+        println!("note: these sessions under the root are not terminal; the rule keeps each while it runs:");
         for id in non_terminal_in_set {
             println!("  {}", id);
         }

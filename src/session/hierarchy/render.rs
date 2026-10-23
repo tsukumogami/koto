@@ -26,7 +26,11 @@ pub fn close_command(key: &str, harness_session: &str) -> Option<String> {
     })
 }
 
-fn keeper_json(k: &Keeper) -> Value {
+/// A keeper as the JSON of a judgment lists it: `name`, `kind`,
+/// `observed`, and for a stale anchor `stale` with its `close_command` or
+/// `malformed_marker`. The prunes list stale anchors through this too, so
+/// they print the same command the query prints.
+pub fn keeper_json(k: &Keeper) -> Value {
     let mut v = json!({
         "name": sanitize(&k.name),
         "kind": k.kind.as_str(),
@@ -137,6 +141,27 @@ fn keeper_text(k: &Keeper) -> String {
         text.push_str(", stale");
     }
     text.push(')');
+    text
+}
+
+/// One line naming a live member, and for a stale anchor the command that
+/// closes it by hand (or why there is none): the detail a prune gives a
+/// session that is itself alive.
+pub fn keeper_line(k: &Keeper) -> String {
+    let mut text = format!("alive: {}", keeper_text(k));
+    if k.stale {
+        match &k.close_command {
+            Some(cmd) => text.push_str(&format!(
+                "; stale: past retention.stale_after since its last activity; close it by hand \
+                 with: {}",
+                sanitize(cmd)
+            )),
+            None => text.push_str(
+                "; stale: past retention.stale_after since its last activity; its observed marker \
+                 or harness session id is malformed, so no close command is printed",
+            ),
+        }
+    }
     text
 }
 
