@@ -10,9 +10,9 @@ problem: |
   pull request, has no way to be kept, and nobody can say "keep this one" in
   any form koto reads.
 goals: |
-  Anyone can pin a finished koto session with a reason, and from then on no
-  removal koto makes, on any host sharing the store, takes it; every removal
-  that passes it over names the pin and its reason. Only an explicit unpin
+  Anyone can pin a koto session with a reason, and from then on no removal
+  koto makes, on any host sharing the store, takes it; every removal that
+  passes it over names the pin and its reason. Only an explicit unpin
   releases it, and an agent session releases one only when it was handed
   koto's release authority. Sessions nobody pinned keep exactly today's
   behaviour, and all of it works with koto and no niwa.
@@ -36,7 +36,7 @@ it from that pull request weeks afterwards.
 koto has no way to keep one. Session retention, which koto now applies at
 every removal by rule or subtree, keeps a finished session only while a
 member of its hierarchy is alive: an open anchor (the koto session that
-stands for a running agent session) holding it through a held-by link, a
+stands for a running agent session) holding it through a held-by link, or a
 running koto session joined to it by a dispatched-by link or lineage, and
 then for the retention period after the hierarchy's release instant. Once
 the agent sessions involved are gone and the retention passes, the next
@@ -52,40 +52,58 @@ record, never pruning, or copying the session out by hand are the only
 options, none of them is a statement that this session should stay, and
 none survives an operator's routine prune on a second host. The cloud case
 is worse than it looks: a second host decides from its own local copy,
-which holds only the keys it happened to read, and `koto session cleanup`
-there deletes a bucket session the host never pulled.
+which holds only the keys it happened to read, one host's push can replace
+the bucket's index of a session's keys, and `koto session cleanup` on a
+second host deletes a bucket session that host never pulled.
 
 ### Terms
 
 These terms are used from here on with exactly these meanings. Terms from
-session retention keep their meaning: anchor, held-by and dispatched-by
-links, hierarchy, alive, release instant, retention, removal by rule or
-subtree.
+session retention keep their meaning: anchor, open and closed anchors,
+observed close, held-by and dispatched-by links, hierarchy, alive, stop
+instant, release instant, retention, migrated source.
 
 - **Pin**: a koto-owned record in a session's own reserved context area that
-  says the session is to be kept, with a reason. A session has at most one.
-- **Pinned session**: a session whose pin is present, readable or not.
-- **Unreadable pin**: a pin koto finds but can't parse or bound-check, or
-  one the store lists but whose content is missing.
-- **Setter** and **releaser**: the caller that pinned or unpinned, recorded
-  as the anchor its environment named (or none) and the time.
-- **Release authority**: koto's authority named `release-pin`, which permits
+  says the session is to be kept. It holds a reason, the setter and the time
+  it was set. A session holds at most one.
+- **Pinned session**: a session in which koto finds a pin, readable or not,
+  in the local store or, under the cloud backend, in the bucket.
+- **Unreadable pin**: a pin koto finds but can't use, for exactly one of
+  these reasons, each reported by its name: `unparseable` (not the pin's
+  format), `too_large` (over 4 KiB), `not_a_file` (a symlink, directory or
+  special file), `missing_content` (the store's index lists the pin and its
+  content is absent).
+- **Anchor variable**: `KOTO_ANCHOR`, the environment variable that names the
+  caller's anchor, as session retention defines it.
+- **By hand**: a call whose environment has no anchor variable, treated as
+  the person at the shell.
+- **Setter** and **releaser**: the anchor the anchor variable named when the
+  pin was set or released, or none for a call by hand.
+- **Start**: one session-start event of an agent session as koto's
+  Claude Code plugin sees it: the first start, or a start again on resume,
+  compaction or `/clear`. A **successor anchor** is the new anchor a start
+  opens when the agent session's previous anchor reads closed by an observed
+  close or migrated, as session retention defines it.
+- **Release authority**: the koto authority named `release-pin`, which permits
   an agent session to unpin.
-- **Handed authority**: the koto authorities an agent session was given at
-  its start or dispatch, through the variable `KOTO_AUTHORITY`.
-- **By hand**: a call whose environment names no anchor, treated as the
-  person at the shell.
-- **Removal**: any koto command that deletes a session's log and keys:
-  the terminal tick, the parent sweep, the same-name replace,
+- **Handed authority**: the koto authority names given to an agent session
+  through the variable `KOTO_AUTHORITY` at a start.
+- **Removal**: any koto command that deletes a session's log and keys: the
+  terminal tick, the parent sweep, the same-name replace,
   `koto workspace prune`, `koto session prune`, `koto session cleanup` and
   `koto cancel --cleanup`.
-- **Bucket check**: a fresh read of the bucket, made by the command about to
-  delete, that answers whether the session holds a pin there.
+- **Bucket check**: a read of the bucket made by the command about to delete
+  a session, after any confirmation and before its first delete, that lists
+  the session's objects in the bucket and answers whether a pin is among
+  them.
+- **Output surface**: any text or JSON a command named in this PRD prints to
+  stdout or stderr.
 
 ## Goals
 
-- A person or agent who finishes work worth keeping pins its session in one
-  step, with a reason, and doesn't have to think about it again.
+- A person or agent who finishes work worth keeping pins its session with
+  one command and a reason, and no later removal needs anything more from
+  them.
 - No removal koto makes takes a pinned session, on this host or any other
   host sharing the cloud bucket, and each one that passes it over names the
   pin and its reason, apart from sessions kept because something is alive.
@@ -93,7 +111,7 @@ subtree.
   the retention period never take it off, and the next removal after an
   unpin treats the session like any other.
 - An agent session releases a pin only when it was handed koto's release
-  authority; a refused release says which authority it lacked.
+  authority, and a refused release says which authority it lacked.
 - A pin koto can't read keeps its session and is reported.
 - Sessions nobody pinned keep today's behaviour exactly.
 - It all works on a host with koto and no niwa installed.
@@ -116,370 +134,477 @@ subtree.
   pinned session records, I want to unpin it from my shell when the record is
   no longer needed, so that the next prune reclaims it like any other
   finished session.
+- **Handing the authority on.** As a coordinator that dispatches a worker to
+  tidy finished records, I want to start the worker with the release
+  authority so its unpins succeed and are recorded as made under that
+  authority, so that the release is traceable to what I handed it.
 - **A worker without the authority.** As a coordinator that dispatched a
-  worker without handing it the release authority, I want the worker's
-  attempt to unpin a record to be refused and to name the authority it
-  lacks, so that only sessions I trusted with it release records.
+  worker without the release authority, I want the worker's attempt to unpin
+  a record refused, naming the authority it lacks, so that only sessions I
+  trusted with it release records.
 - **A damaged pin.** As an operator running prune after a pin was truncated
   by a failed write, I want the session kept and reported as kept because its
-  pin can't be read, so that I repair or release it rather than lose it.
+  pin can't be read, and why, so that I repair or release it rather than lose
+  it.
 - **Finding every pin.** As an operator, I want to list every pinned session
-  in the store with its reason, setter and age, so that I can find a runaway
-  skill that pins everything.
+  my host can see with its reason, setter and when it was set, so that I can
+  find a runaway skill that pins everything.
 
 ## Requirements
 
 ### Setting and releasing a pin
 
 - **R1. Pin a session.** `koto session pin <name> --reason <text>` records a
-  pin in the named session. The reason is required, non-empty after trimming,
-  at most 500 characters, and has control characters refused. The pin holds
-  the reason, the setter's anchor (or none, by hand), the setter's koto
-  session id hint where one exists, and the time. The command prints the pin
-  as JSON and the store it was written to. It refuses, with exit 2 and
-  nothing written, a name with no session, an anchor or an anchor's close
-  record (pins are for koto workflow sessions), and a migrated source.
-- **R2. A session may be pinned while it runs.** A running or finished
-  session can be pinned; the pin takes effect whenever a removal would
-  otherwise take the session, including at its own terminal tick.
-- **R3. Pinning is idempotent.** Pinning a session that already holds a
-  readable pin changes nothing, exits 0 and prints the existing pin. To
-  change the reason, unpin and pin again.
+  pin in the named session holding the reason, the setter and the time (RFC
+  3339, UTC). The reason is required, at most 500 Unicode scalar values, not
+  empty after trimming whitespace, and contains no character in Unicode
+  category Cc (tab and newline included). On success it exits 0 and prints
+  JSON with `name`, `pin` (`reason`, `set_by` as the anchor name or `null`,
+  `set_at`) and `store` (`local`, or `cloud` with the bucket name). It
+  refuses with exit 2, writing nothing, when: the reason breaks a rule above;
+  no session has the name; the session is an anchor or an anchor's close
+  record (kinds koto already records in the session's header); or the
+  session is a migrated source.
+- **R2. A running session may be pinned.** The pin takes effect whenever a
+  removal would otherwise take the session, including at the session's own
+  terminal tick. While the session runs it's alive by the existing rule, and
+  that's what keeps the rest of its hierarchy (R9).
+- **R3. Pinning is idempotent; an unreadable pin blocks pinning.** Pinning a
+  session that holds a readable pin changes nothing, exits 0 and prints the
+  existing pin, whatever reason was given. Pinning a session that holds an
+  unreadable pin refuses with exit 2, naming the unreadable pin and that an
+  unpin clears it.
 - **R4. Setting a pin needs no authority.** Any caller may pin, by hand or
   under an anchor, with or without handed authority.
-- **R5. Unpin a session.** `koto session unpin <name>` removes the pin when
-  the caller may release it (R7), whatever the pin's content, so an
-  unreadable pin can always be cleared. An optional `--reason <text>` is
-  recorded with the release. Unpinning a session that holds no pin changes
-  nothing and exits 0.
-- **R6. A release is recorded.** Each unpin records, in the unpinned session,
-  the releaser's anchor (or none, by hand), the authority it presented and
-  where koto read it, the release reason when given, the time, and the
-  released pin's reason and setter. The hierarchy query for the session shows
-  the latest release until the session is removed.
-- **R7. Who may release.** A caller whose environment names no anchor
-  releases by hand and may unpin. A caller whose environment names an anchor
-  may unpin only when its agent session holds the release authority among its
-  handed authorities (R8). Otherwise the unpin is refused with exit 2,
-  nothing changes, and the refusal names the authority it lacks
-  (`release-pin`), the anchor koto judged as the caller, and that authority is
-  handed to an agent session at its start or dispatch. The pin's setter gets
-  no special standing: setting a pin never grants its release.
+- **R5. Unpin a session.** `koto session unpin <name> [--reason <text>]`
+  first reads the session's pin. With no pin, it changes nothing and exits 0,
+  whoever the caller is. With a pin, readable or not, it removes the pin when
+  the caller may release it (R7) and exits 0, printing the release record.
+  The optional reason follows R1's rules for a reason. Under the cloud
+  backend, unpin acts on the bucket's pin for a session this host holds no
+  local copy of.
+- **R6. A release is recorded.** Each unpin writes a release record into the
+  unpinned session with: `released_by` (the releaser's anchor, or `null`),
+  `authority` (`release-pin`, or `null` for a release by hand), `reason` (or
+  `null`), `released_at`, and the released pin's `reason`, `set_by` and
+  `set_at` (each `null` when the pin was unreadable). A later release replaces
+  the earlier record. The release record is not a pin, a link or a keeper,
+  never makes its session pinned or unreadable, moves with the session at a
+  replace and an import, and is removed with the session. The record is
+  written before the pin is removed, so an unpin interrupted between the two
+  leaves the session pinned.
+- **R7. Who may release.** A caller by hand may unpin. A caller whose anchor
+  variable names an anchor may unpin only when that anchor records
+  `release-pin` among its handed authorities (R8). Otherwise the unpin exits
+  2, changes nothing and writes no release record, and its message names:
+  the authority it lacks, `release-pin`; the anchor it read authority from;
+  and that the authority is handed to an agent session at its start. When
+  the named anchor doesn't exist or can't be read, the unpin is refused the
+  same way and says so. Setting a pin never grants its release: the setter
+  gets no standing of its own.
 - **R8. How authority reaches koto.** koto reads an agent session's handed
-  authorities only from what was handed to that session, never from niwa's
-  records, niwa's commands or any other tool's state. They arrive in the
-  variable `KOTO_AUTHORITY`, a comma-separated list of koto authority names,
-  present in the agent session's environment when it starts. koto's
-  Claude Code plugin records the handed list in the agent session's anchor
-  when it opens the anchor, and removes the variable from the shells the
-  session starts, so a worker or `claude -p` child launched from those
-  shells inherits nothing; koto then reads the authorities an agent session
-  holds from its anchor. Each start of the same agent session records what
-  that start was handed. A successor anchor holds only what its own start
-  was handed. Unknown names in the list are recorded, ignored for every
-  decision, and reported by the hierarchy query. koto's vocabulary is a
-  closed set per koto version and holds one authority in this version,
+  authority only from what was handed to that agent session, never from
+  niwa's records, niwa's commands or any other tool's state. The decision
+  source is the caller's anchor: at each start, koto's Claude Code plugin
+  reads `KOTO_AUTHORITY` (a comma-separated list; each name trimmed, names
+  matched exactly in lowercase) from the agent session's environment,
+  records the list in the agent session's anchor, replacing what an earlier
+  start recorded, and removes `KOTO_AUTHORITY` from the shells the session
+  starts, so a worker or `claude -p` child launched from them inherits none.
+  A successor anchor records only what its own start was handed. A value of
+  `KOTO_AUTHORITY` in the caller's own environment at unpin time is never
+  read. Unknown names are recorded and ignored for every decision, and the
+  hierarchy query for the anchor lists them as `unknown_authorities`. koto's
+  authority names are a closed set per koto version; this version has one,
   `release-pin`.
 
 ### Keeping a pinned session
 
-- **R9. A pin keeps its session and nothing else.** The retention rule treats
-  a pin as a keeper of the pinned session with no release instant: the
-  pinned session is kept by every removal for as long as the pin is present.
-  A pin keeps only the session it's in. Other members of the pinned
-  session's hierarchy are kept or released by the existing rule as if the
-  pinned session were a finished member, and a pin adds no link to its setter
-  or to anyone else, so it never joins hierarchies.
-- **R10. Every removal keeps a pinned session.** The terminal tick (with or
-  without `--no-cleanup`, and for a failure terminal), the parent sweep, the
-  same-name replace, `koto workspace prune` (with or without `--force`) and
-  `koto session prune` (whatever its filters) keep a pinned session. A
-  same-name replace that meets a pinned finished predecessor keeps it
-  readable under a new name, as the replace already does for a held
-  predecessor, and the pin moves with it.
+- **R9. A pin keeps its session and nothing else.** A pin keeps the pinned
+  session with no release instant, for as long as the pin is present. It
+  keeps only that session: every other member of its hierarchy is kept or
+  released by the existing rule, with the pinned session counted as alive
+  while it runs and, once finished, as a finished member with its own stop
+  instant. A pin adds no link to its setter or anyone else, so the links,
+  lineage and hierarchy membership of every session are the same before and
+  after a pin is set or removed.
+- **R10. Every removal keeps a pinned session.** These keep a pinned session:
+  the terminal tick, with or without `--no-cleanup` and for a failure
+  terminal; the parent sweep; the same-name replace; `koto workspace prune`,
+  with or without `--force` or `--yes`; and `koto session prune` with every
+  flag it accepts (`--all`, `--apply`, `--plan`, `--execution-dir`,
+  `--older-than`, `--migrated-from`). A same-name replace that meets a pinned
+  finished predecessor moves it aside under a new name by the replace's
+  existing naming, keeping its log, keys, pin and release record; the new run
+  takes the original name with no pin.
 - **R11. Explicit removal refuses a pinned session.** `koto session cleanup`
-  of a pinned session refuses with exit 2 and removes nothing, naming the pin,
-  its reason and that unpinning comes first. `koto cancel --cleanup` of a
-  pinned session refuses the same way before writing anything, so the session
-  is neither cancelled nor removed; `koto cancel` without `--cleanup` still
-  cancels it.
-- **R12. Check the pin just before deleting.** Each removal reads the pin
-  again from the session itself immediately before it deletes the session,
-  so a pin set after the command started (including while
-  `koto workspace prune` waits for its confirmation) keeps the session, which
-  the output lists as kept with the pin.
+  of a pinned session exits 2 and removes nothing, and its message names the
+  pin's reason, setter and time (or that the pin is unreadable, and why) and
+  that an unpin comes first. `koto cancel --cleanup` of a pinned session,
+  running or finished, refuses the same way before writing anything, so the
+  session is neither cancelled nor removed; `koto cancel` without `--cleanup`
+  still cancels it and leaves it pinned. For a name with no session in the
+  local store or the bucket, both commands behave exactly as today.
+- **R12. Read the pin again just before deleting.** Each removal reads the
+  session's pin after any confirmation prompt and immediately before its
+  first delete of that session, and keeps a session pinned since the command
+  started. This narrows the window to the time between that read and the
+  delete; it isn't atomic. Pin and unpin take the same per-session lock that
+  removals take before deleting, so a pin or unpin and a removal of the same
+  session on one host never interleave.
 - **R13. Unpinned sessions are unchanged.** A session that holds no pin is
-  kept and removed exactly as today by every removal, with today's output,
-  including when another member of its hierarchy is pinned (R9).
-- **R14. An unpinned session is eligible again.** After an unpin the session
-  is judged by the existing rule alone, and the next removal that would take
-  an unpinned session in its position takes it.
+  kept and removed exactly as today by every removal, and every output surface
+  prints for it exactly what it prints today, also when another member of its
+  hierarchy is pinned.
+- **R14. An unpinned session is eligible again at once.** An unpin doesn't
+  restart any clock. After it, the session is judged by the existing rule
+  alone, using its hierarchy's existing release instant, so a session whose
+  hierarchy is past its retention is taken by the next removal that applies.
 
 ### Saying why
 
-- **R15. Every removal that keeps a pinned session names the pin.** The
-  terminal tick's answer, the parent sweep's kept-children listing, the
-  replace's answer, `koto workspace prune`'s kept list, `koto session prune`'s
-  preview and apply, and the refusals of R11 each name the pinned session,
-  the pin's reason, its setter and when it was set, and mark the session as
-  kept by a pin, apart from sessions kept because a member is alive. A pinned
-  session that is also failure-terminal or also held by a live member names
-  the pin as well as the other reasons. No surface describes a pinned
-  session as alive or as unreadable when its pin is readable.
-- **R16. The hierarchy query shows pins.** `koto session hierarchy <name>`
-  (text and JSON) shows, for a pinned session, the pin with its reason,
-  setter and time, the latest release (R6), and that the pin keeps that
-  session only; for another member of a pinned session's hierarchy, which
-  members are pinned. It writes nothing.
+- **R15. Every removal that keeps a pinned session names the pin.** In JSON,
+  each kept-session entry for a pinned session carries `kept_by_pin: true` and
+  a `pin` object (`reason`, `set_by`, `set_at`, `source`: `local` or `bucket`),
+  or, for an unreadable pin, `kept_by_pin: true` and `pin_unreadable` with its
+  reason name (Terms). The text form prints `pinned: <reason> (set by
+  <anchor or "hand"> at <time>)` or `pin unreadable: <reason name>`. This holds
+  for the terminal tick's `retention`, the parent sweep's kept-children
+  listing, the replace's answer, `koto workspace prune`'s kept and skipped
+  lists, `koto session prune`'s preview, plan and apply, and the refusals of
+  R11. A pinned session also failure-terminal, or also held by a live member,
+  carries the pin as well as its other reasons. No output surface describes a
+  session with a readable pin as alive or as unreadable on the pin's account.
+- **R16. The hierarchy query shows pins.** `koto session hierarchy <name>`, in
+  text and JSON, shows for a pinned session its pin (as R15) and its latest
+  release record, and states that the pin keeps that session only. For every
+  other session in a hierarchy that has pinned members, it lists the name of
+  each pinned member. For an anchor it lists the handed authorities it
+  records and any `unknown_authorities`. It writes nothing.
 - **R17. Pins can be listed.** `koto session list --pinned` lists every
-  pinned session in the store with its reason, setter and when it was set,
-  and every unreadable pin with why; its JSON form carries the same fields.
+  pinned session in the local store, sorted by name, each with its pin (as
+  R15) and whether it's running or finished, and prints an empty list when
+  there are none. Under the cloud backend it also lists, marked
+  `source: bucket`, pinned sessions in the bucket this host holds no local
+  copy of. Its JSON form carries the same fields.
 
 ### Failing toward keeping
 
-- **R18. An unreadable pin keeps its session.** When koto finds a pin it
-  can't read, the session is kept by every removal and the removal reports
-  the session as kept because its pin can't be read, with why. An unreadable
-  pin keeps only its session, like a readable one.
-- **R19. A pin a store lists but can't produce keeps its session**, and so
-  does a pin present without the store's listing of it, so a write
-  interrupted between the two still keeps.
+- **R18. An unreadable pin keeps its session.** A session with an unreadable
+  pin is kept by every removal, and the removal reports it as R15 says, with
+  the reason name. An unreadable pin keeps only its session, like a readable
+  one.
+- **R19. The store's index never decides alone.** A pin file present in the
+  session without the store's index listing it is a readable pin; a pin the
+  index lists without its content is `missing_content`. Both keep.
 
 ### Cloud backend
 
-- **R20. A pin reaches the bucket or the command fails.** Under the cloud
-  backend, `koto session pin` succeeds only once the bucket holds the pin; if
-  it can't confirm that, it exits non-zero (3), says the pin is held in the
-  local store only, and a later koto command on the session retries the push.
-  `koto session unpin` likewise succeeds only once the bucket no longer holds
-  the pin.
+- **R20. Pin and unpin reach the bucket or fail.** Under the cloud backend,
+  `koto session pin` exits 0 only once the bucket holds the pin; if it can't
+  confirm that, it exits 3, says the pin is held in the local store only, and
+  the next pin, unpin, tick or `koto context` write on that session on this
+  host retries the push, printing the same message if it fails again.
+  `koto session unpin` exits 0 only once the bucket holds the release record
+  and no longer holds the pin; otherwise it exits 3 and the bucket's pin
+  stays in force.
 - **R21. Every removal checks the bucket before deleting.** Under the cloud
-  backend, before any removal deletes a session's local or bucket copy, it
-  makes a bucket check for that session. A pin found there keeps the session
-  on this host and in the bucket, and the removal reports it (R15) from the
-  bucket's pin, even when this host's local copy holds no pin or the host
-  never pulled the session. This holds for `koto session cleanup` of a name
-  the host has no local copy of.
-- **R22. A failed bucket check keeps.** When the bucket check can't be made
-  or can't be read, the removal deletes neither copy and reports that the
-  bucket couldn't be checked for a pin; an explicit removal then exits
-  non-zero. A prune keeps that session, reports it and carries on with the
-  rest.
-- **R23. Keeping doesn't depend on another host's store.** A pin keeps its
-  session from the pin alone, so a removal on a second host keeps and
-  reports a pinned session even when the anchors and other members that hold
-  it live only in the first host's local store, as happens when the cloud
-  backend is chosen by environment and koto's start hook opens anchors in
-  the local store.
+  backend, before any removal deletes either copy of a session, it makes a
+  bucket check for that session. A pin found in the local copy or in the
+  bucket keeps the session on this host and in the bucket, and the removal
+  reports it (R15) with `source` naming where it was found. This holds when
+  this host's local copy holds no pin, when the host never pulled the session,
+  and for `koto session cleanup` of a name the host holds no local copy of.
+- **R22. The bucket check finds a pin by its object.** The bucket check lists
+  the session's objects directly and finds a pin from its own object, never
+  only from the bucket's index of the session's keys, so a pin is found after
+  another host pushed an index without it. No context write, index push or
+  state push removes or overwrites a pin object; only unpin removes one.
+- **R23. A failed bucket check keeps.** When the bucket check can't be made
+  (an error or timeout talking to the bucket) or returns a listing koto can't
+  parse, the removal deletes neither copy and reports the session as kept
+  because the bucket couldn't be checked for a pin. A listing that succeeds
+  and holds no pin object is not a failure. The outcome per removal: the
+  terminal tick keeps the session and says so in its `retention`; the parent
+  sweep skips the child and lists it; the same-name replace moves the
+  predecessor aside as for a pinned one; `koto workspace prune` and
+  `koto session prune` list the session as kept and carry on with the rest,
+  exiting as they do today when they skip a session; `koto session cleanup`
+  and `koto cancel --cleanup` exit 3 and change nothing.
+- **R24. Keeping doesn't depend on another host's store.** A pin keeps its
+  session from the pin alone, so a removal on a second host keeps and reports
+  a pinned session even when the anchors and other members that hold it live
+  only in the first host's local store, as happens when the cloud backend is
+  chosen by environment and koto's start hook opens anchors in the local
+  store.
 
 ### Import and compatibility
 
-- **R24. A pin travels with import.** `koto session import` carries a
-  session's pin to the moved copy unchanged, including its setter and time.
-  The migrated source keeps nothing, as today.
-- **R25. Older koto builds keep a pinned session.** A koto release that
-  reads session-retention links but predates this feature reads a pin as an
-  unreadable record, never as an ordinary link, so its prunes, terminal tick
-  and replace keep a pinned session (with a reason naming the unreadable
-  record) rather than remove it. koto's guide and changelog state which
-  releases honour pins in full, that older releases' `koto session cleanup`
-  and `koto cancel --cleanup` and imports don't, and that every host sharing
-  a bucket needs a release that does.
+- **R25. A pin travels with import.** `koto session import` carries a
+  session's pin and release record to the moved copy unchanged, an
+  unreadable pin included. The migrated source keeps nothing, as today.
+- **R26. Older builds keep a pinned session.** koto v0.23.0 and later
+  releases without this feature, which read session-retention links, read a
+  pin as an unreadable record and never as an ordinary link, so their
+  `koto session prune`, `koto workspace prune`, terminal tick and same-name
+  replace keep a pinned session. koto's changelog for the first release with
+  this feature, and its session-retention guide, name that release as the
+  first that honours pins in full, and say that older releases' `koto session
+  cleanup`, `koto cancel --cleanup` and `koto session import` don't honour
+  pins and that every host sharing a bucket needs the new release. Each koto
+  guide that tells a reader to run `koto session cleanup` as a recovery step
+  says to unpin a pinned session first.
 
 ### Non-functional
 
-- **R26. No niwa.** Every requirement holds on a host with koto and its
-  plugin and no niwa installed. A dispatcher other than niwa, or a person
-  starting a session, hands authority with the same variable. koto's guide
-  says how a niwa workspace passes `KOTO_AUTHORITY` through to workers with
-  its generic pass-through list, without niwa naming koto.
-- **R27. Bounded cost.** Locally, pins keep the existing bounds: on the
-  session-retention cost fixture (2,000 sessions in 200 hierarchies) with 200
-  sessions pinned, the hierarchy query for one session answers within 1
-  second and a full prune preview within 10 seconds on the CI runner,
-  enforced by a test. Under the cloud backend, the bucket check adds at most
-  one bucket request per session a removal would delete, plus one read of a
-  pin it finds, and no request for a session the removal keeps for another
-  reason.
-- **R28. Writes stay with their session.** Pin and unpin write only into the
-  named session, plus the release record of R6 in that session; recording
-  handed authority writes only into the agent session's own anchor. Nothing
-  writes into another session, and `koto context add` and
-  `koto context remove` refuse the pin's key area as they refuse the rest of
-  koto's reserved keys.
+- **R27. No niwa.** Every requirement holds on a host with koto and its
+  plugin and no niwa installed. Any launcher, or a person starting a session
+  by hand, hands authority by setting `KOTO_AUTHORITY` in the environment a
+  Claude Code session with koto's plugin starts in. An agent session without
+  the plugin has no anchor variable, so its calls are by hand (R7). koto's
+  guide says how a workspace that dispatches with niwa passes
+  `KOTO_AUTHORITY` through to workers with niwa's generic variable
+  pass-through, which needs no change to niwa.
+- **R28. Bounded cost.** Locally, on the session-retention cost fixture (2,000
+  sessions in 200 hierarchies of at most 10 sessions) with 200 sessions
+  pinned, the hierarchy query for one session answers within 1 second and a
+  full prune preview within 10 seconds of wall-clock time on a GitHub-hosted
+  `ubuntu-latest` runner, measured by the same test harness and method as the
+  existing retention cost test. Under the cloud backend, the bucket check
+  makes one listing request per session the removal would otherwise delete,
+  plus one read per pin it finds, and none for a session the removal keeps for
+  another reason.
+- **R29. Writes stay with their session.** Pin and unpin write only into the
+  named session. Recording handed authority writes only into the starting
+  agent session's own anchor. Nothing in this feature writes into any other
+  session. `koto context add` and `koto context remove` refuse the pin, the
+  release record and the recorded authority with exit 2, as they refuse koto's
+  other reserved keys.
 
 ## Acceptance Criteria
 
 ### Setup and conventions
 
-Unless a criterion says otherwise: retention durations are set through the
-environment to short values (for example retention 20s, idle period 10s,
-stale threshold 60s); every agent session involved has been deleted and its
-anchor closed; "after the retention" means after waiting past it from the
-hierarchy's release instant; and P is a finished koto session pinned by hand
-with reason `record of the merged change`, while U is a finished session in
-the same store with no pin and no live member, past its retention.
+Unless a criterion says otherwise: retention 20s, idle period 10s and stale
+threshold 60s are set through the environment; every agent session involved
+has been deleted and its anchor closed; "after the retention" means 25
+seconds after the hierarchy's release instant; calls are by hand. The fixture
+creates P and U as running koto sessions in one store, with X a koto parent of
+P, and pins P by hand with reason `record of the merged change`. U has no pin
+and no live member. Each criterion's checks are on JSON output unless it says
+text.
 
-**Removal set S**, run against P and U in this order: S1, P's and U's own
-terminal steps without `--no-cleanup`; S2, a koto parent X of P reaching its
-terminal step without `--no-cleanup`, so the parent sweep runs; S3,
-`koto session prune --apply --all`; S4, in a separate pass,
-`koto workspace prune --root X --yes`; S5, `koto session cleanup P` and
-`koto session cleanup U`; S6, a same-name replace of P's topic
-(`koto init --replace-terminal`).
+**Removal set S**, run in this order: S1, P and U each ticked to their success
+terminal without `--no-cleanup`; S2, X ticked to its terminal without
+`--no-cleanup`, so the parent sweep runs; then, after the retention, S3,
+`koto session prune --apply --all`; S4, in a fresh fixture where X finished
+with `--no-cleanup`, `koto workspace prune --root X --yes`; S5,
+`koto session cleanup P`; S6, a same-name replace of P's name
+(`koto init --replace-terminal`). U is removed at S1 (it has no edge), as on
+a build without this feature, and S2 to S6 don't apply to it.
 
 ### Keeping and reporting
 
-- [ ] **Pinned survives every removal.** After each step of S, P's log and
-  keys are readable and byte-identical to before the step, and U is removed by
-  the first step that applies to it, as on a build without this feature.
-- [ ] **Each removal names the pin.** S1's tick answer, S2's kept-children
-  listing, S3's preview and apply, S4's kept list, S5's refusal for P and S6's
-  replace answer each carry P's pin with reason `record of the merged change`,
-  its setter (none, by hand) and its time, and mark it as kept by a pin.
-  None of them describes P as alive or unreadable.
-- [ ] **Cleanup refuses.** `koto session cleanup P` exits 2, P is unchanged,
-  and the message names the pin, its reason and that an unpin comes first.
-  `koto cancel --cleanup` on a running pinned session exits 2 and writes no
-  event into it; `koto cancel` on it then cancels it and leaves it pinned.
-- [ ] **Replace moves a pinned predecessor aside.** S6 leaves P readable under
-  the new name its answer reports, still pinned with the same reason and
-  setter, and the new run holds the original name with no pin.
-- [ ] **Pinned while running.** A session pinned before its terminal step is
-  kept at that step, both with and without `--no-cleanup`, and a
-  failure-terminal pinned session's answer names the pin as well as the
-  failure terminal.
-- [ ] **Pin keeps its session only.** A dispatches B and pins A; both finish,
-  nothing is alive. After the retention, `koto session prune --apply --all`
-  keeps A, naming its pin, and removes B. The hierarchy query for A says the
-  pin keeps A only, and for B (before the prune) names A as a pinned member.
+- [ ] **Pinned survives every removal.** After each of S1 to S5, P's log and
+  keys hash the same as before the step; after S6, P's log, keys, pin and
+  release record hash the same under the new name the replace reports.
+- [ ] **Each removal names the pin.** S1's `retention`, S2's kept-children
+  entry, S3's preview and apply entries, S4's kept entry, S5's refusal and
+  S6's answer each carry `kept_by_pin: true` and `pin` with reason
+  `record of the merged change`, `set_by: null`, P's `set_at` and
+  `source: local`; none carries an alive keeper or an unreadable item for P.
+  The text forms print `pinned: record of the merged change (set by hand at
+  <time>)`.
+- [ ] **Flags don't bypass.** With P finished and past the retention,
+  `koto workspace prune --root X --yes --force`, `koto session prune --apply`
+  with each of `--all`, `--execution-dir <P's directory>`, `--older-than 1s`,
+  and `--apply --plan` on a plan listing P, each keep P and name the pin.
+- [ ] **Cleanup and cancel refuse.** `koto session cleanup P` exits 2, P
+  hashes the same, and the message names the pin's reason, setter and time
+  and says to unpin first. On a running pinned session R, and on a finished
+  pinned session F, `koto cancel R --cleanup` and `koto cancel F --cleanup`
+  exit 2 with the same message and write no event; `koto cancel R` then exits
+  0, R is cancelled and still pinned. `koto session cleanup nosuch` behaves as
+  on a build without this feature.
+- [ ] **Replace moves a pinned predecessor aside.** After S6 the new run holds
+  P's original name with no pin, and `koto session hierarchy` for the moved
+  name shows the same pin.
+- [ ] **Pinned while running and failure terminal.** A session pinned while
+  running is kept at its terminal tick with and without `--no-cleanup`. A
+  pinned session ticked to a failure terminal has a `retention` carrying the
+  pin and `failure_terminal`. A pinned session held by a live anchor is
+  reported with the pin and the anchor.
+- [ ] **Pin keeps its session only.** A dispatches B and A is pinned; both
+  finish and nothing else is alive. After the retention, the prune keeps A
+  with the pin and removes B. Before that prune, the hierarchy query for B
+  lists A as a pinned member, and for A states the pin keeps A only.
+- [ ] **Pin adds no edge.** The hierarchy query JSON for every session in a
+  fixture of two hierarchies, one containing the pinning agent session's open
+  anchor, lists the same members and edges before and after the pin is set
+  under that anchor.
 - [ ] **Unpinned members unchanged.** With A pinned and C, a finished session
-  in A's hierarchy, held by a live anchor, the prune keeps C naming only the
-  anchor, exactly as without the pin.
-- [ ] **Late pin.** `koto workspace prune --root X` (without `--yes`) shows P
-  unpinned for removal; P is pinned while the prompt waits; after confirming,
-  P is kept and listed as kept with the pin. The same holds for
-  `koto session prune --apply` when P is pinned between preview and apply.
-- [ ] **Hierarchy query.** For a pinned session, `koto session hierarchy`
-  text and JSON show the pin's reason, setter and time and that it keeps that
-  session only, and the session's files hash the same before and after.
-- [ ] **Listing pins.** With three pinned sessions, one with an unreadable
-  pin, and ten unpinned, `koto session list --pinned` lists exactly the three,
-  each with reason, setter and time, the unreadable one with why; the JSON
-  form carries the same.
+  in A's hierarchy, held by a live anchor, the prune's entry for C equals,
+  byte for byte, its entry from the same fixture without the pin.
+- [ ] **Late pin.** With the test holding stdin open, `koto workspace prune
+  --root X` (no `--yes`) lists P for removal and waits; P is pinned from
+  another process; the test confirms; P is kept and its entry carries the
+  pin. The same holds for `koto session prune --apply --plan` when P is pinned
+  after the plan was written.
+- [ ] **Hierarchy query.** For a pinned session, `koto session hierarchy` text
+  and JSON show the pin as R15 and that it keeps that session only, and the
+  session's files hash the same before and after the query.
+- [ ] **Listing pins.** With three pinned sessions (one running, one with an
+  unreadable pin) and ten unpinned, `koto session list --pinned` lists exactly
+  the three, sorted by name, each with its pin or `pin_unreadable` and its
+  state. With none pinned it prints an empty list and exits 0.
 
 ### Setting, releasing and authority
 
-- [ ] **Pin command.** `koto session pin P --reason <r>` exits 0 and prints
-  the pin and the store. Pinning P again with any reason exits 0, changes
-  nothing and prints the existing pin. An empty or whitespace reason, one over
-  500 characters, one with a control character, a missing session, an anchor,
-  a close record and a migrated source each exit 2 and write nothing.
-- [ ] **Unpin by hand makes it eligible.** From a bare shell, unpinning P
-  exits 0; the next `koto session prune --apply --all` after the retention
-  removes P. Unpinning an unpinned session exits 0 and changes nothing.
+- [ ] **Pin command.** By hand, `koto session pin P --reason <r>` exits 0 and
+  prints `name`, `pin.reason`, `pin.set_by: null`, `pin.set_at` and
+  `store: local`; under an anchor, `pin.set_by` names it. A reason of exactly
+  500 scalar values (including multibyte characters) is accepted; 501, an
+  empty or whitespace-only reason, and reasons containing a tab, a newline or
+  U+0007 each exit 2 and write nothing. A missing session, an anchor, a close
+  record and a migrated source each exit 2 and write nothing.
+- [ ] **Pinning again.** Pinning P again with a different reason exits 0,
+  prints the existing pin and leaves P hashing the same. Pinning a session
+  with an unreadable pin exits 2 naming the unreadable pin.
+- [ ] **Unpin by hand makes it eligible at once.** P is pinned, finished and
+  past the retention. From a bare shell `koto session unpin P` exits 0 and the
+  very next `koto session prune --apply --all` removes P. Unpinning a session
+  with no pin exits 0 and leaves it hashing the same, also under an anchor
+  holding no authority.
 - [ ] **Unpin clears an unreadable pin.** With P's pin truncated, an unpin by
-  hand exits 0 and leaves P with no pin.
-- [ ] **Release record.** After an unpin with `--reason done`, the hierarchy
-  query for P shows the release: releaser (none, by hand), authority presented
-  (none), reason `done`, time, and the released pin's reason and setter.
-- [ ] **Refused without authority.** Under an anchor whose agent session was
-  started with no `KOTO_AUTHORITY`, `koto session unpin P` exits 2, P keeps
-  its pin, and the refusal names `release-pin`, the caller's anchor, and that
-  the authority is handed at session start or dispatch. The same holds when
-  `KOTO_AUTHORITY` lists only unknown names.
-- [ ] **Allowed with authority.** Under an anchor whose agent session was
-  started with `KOTO_AUTHORITY=release-pin`, the unpin exits 0 and the release
-  record names that anchor and `release-pin`.
-- [ ] **Authority isn't inherited.** Run with synthetic hook inputs, a session
-  started with `KOTO_AUTHORITY=release-pin` has its anchor record
-  `release-pin`, its shells see no `KOTO_AUTHORITY`, and a `claude -p` child
-  launched from them, and a successor anchor opened after an observed close
-  whose start was handed nothing, are each refused an unpin.
-- [ ] **Exporting mid-session doesn't grant.** Under an anchor whose start was
-  handed nothing, running `KOTO_AUTHORITY=release-pin koto session unpin P`
-  is refused with the same message.
+  hand exits 0, P holds no pin, and the release record's pin fields are
+  `null`.
+- [ ] **Release record.** After `koto session unpin P --reason done` by hand,
+  the hierarchy query for P shows `released_by: null`, `authority: null`,
+  `reason: done`, `released_at`, and the released pin's reason, setter and
+  time. After a second pin and unpin it shows only the second release. An
+  unpinned P with a release record is removed by the next prune after the
+  retention, as an unpinned session.
+- [ ] **Refused without authority.** Under an anchor whose start had no
+  `KOTO_AUTHORITY`, `koto session unpin P` exits 2, P hashes the same, no
+  release record is written, and the message names `release-pin`, that
+  anchor, and that the authority is handed at the agent session's start. The
+  same holds when the start was handed `bogus`, and when the anchor variable
+  names an anchor that doesn't exist (the message says it couldn't be read).
+- [ ] **Allowed with authority.** Under an anchor whose start was handed
+  `release-pin`, and under one handed ` release-pin , bogus`, the unpin exits
+  0 and the release record has `released_by` naming the anchor and
+  `authority: release-pin`; the hierarchy query for the second anchor lists
+  `bogus` under `unknown_authorities`.
+- [ ] **Authority isn't inherited or exported.** Run with synthetic hook
+  inputs: a session started with `KOTO_AUTHORITY=release-pin` has its anchor
+  record `release-pin` and its shells see no `KOTO_AUTHORITY`. A `claude -p`
+  child launched from those shells, a successor anchor whose own start was
+  handed nothing, and a start again of the same agent session handed nothing
+  are each refused an unpin. Under an anchor whose start was handed nothing,
+  `KOTO_AUTHORITY=release-pin koto session unpin P` is refused.
 - [ ] **Setter gets no release.** The agent session that pinned P, holding no
   release authority, is refused an unpin of P.
 - [ ] **Pinning needs no authority.** Under an anchor with no handed
-  authority, `koto session pin` succeeds and records that anchor as setter.
-- [ ] **Single writer.** During pin, unpin and the authority recording, every
-  session other than the named session and the caller's own anchor is
-  byte-identical before and after, and `koto context add` and
-  `koto context remove` on the pin's key exit 2.
+  authority, `koto session pin` exits 0 and `pin.set_by` names that anchor.
+- [ ] **Single writer.** During pin, unpin and the authority recording at a
+  start, every session other than the named session (for pin and unpin) and
+  the starting agent session's anchor (for the start) hashes the same before
+  and after. `koto context add` and `koto context remove` on the pin, the
+  release record and the recorded authority each exit 2.
+- [ ] **Concurrent pin, unpin and removal.** Twenty runs each of a pin racing
+  an unpin, and of a pin racing `koto session prune --apply --all` on a
+  finished P past the retention, end with P either pinned (and present) or
+  unpinned with a release record, never with a pin and no session, a partial
+  pin, or a removed session that was pinned when the prune read it.
 
 ### Failing toward keeping
 
-- [ ] **Unreadable pin keeps.** With P's pin made unparseable, over its size
-  bound, a symlink, a directory, or listed by the store with its content
-  missing, every step of S keeps P and reports it as kept because its pin
-  can't be read, naming why; P's hierarchy siblings are judged as if P were
-  an ordinary finished member.
-- [ ] **Unlisted pin keeps.** A pin present in P's store with the store's
-  listing of it removed keeps P through S.
+- [ ] **Unreadable pin keeps.** For each unreadable case (P's pin replaced by
+  invalid content, by 5 KiB of valid content, by a symlink, by a directory,
+  and listed by the store's index with its content deleted), every step of S
+  keeps P and its entry carries `pin_unreadable` with `unparseable`,
+  `too_large`, `not_a_file`, `not_a_file` and `missing_content` respectively.
+  A session dispatched by P and finished is removed by the prune after the
+  retention.
+- [ ] **Unindexed pin keeps.** A pin present in P with the store's index entry
+  for it removed keeps P through S and is reported as a readable pin.
 
 ### Cloud backend
 
-All cloud criteria run against a stand-in bucket shared by two hosts (two
-working copies at the same canonical path with separate local stores, or two
-machines), with the cloud backend set by environment on both.
+All cloud criteria run on two hosts sharing a stand-in bucket (two working
+copies at the same canonical path with separate local stores, or two
+machines), with the cloud backend set by environment on both. Host 1 pins P
+by hand and finishes it; X is P's koto parent.
 
-- [ ] **Second host keeps.** Host 1 pins P and finishes; host 2 has never
-  pulled P. On host 2, `koto session cleanup P` exits 2 naming the bucket's
-  pin and reason and deletes nothing in the bucket; host 2's
-  `koto session prune --apply --all`, its terminal tick of a session it shares
-  with P's hierarchy, and `koto workspace prune --root X --yes` over a stale
-  local copy of P without the pin each keep P in the bucket and name the pin
-  and reason. U, unpinned in the same bucket, is removed by the same commands.
-- [ ] **Stale write doesn't unpin.** Host 2 holds a local copy of P taken
-  before the pin, writes a context key into it (pushing its manifest), and
-  then runs the removals above; P is still kept and its pin still reported.
+- [ ] **Second host keeps, every removal.** Host 2 has never pulled P:
+  `koto session cleanup P` exits 2 naming the pin with `source: bucket` and
+  makes no delete request to the bucket. With host 2 holding a local copy of
+  P taken before the pin, each of host 2's `koto session prune --apply --all`,
+  `koto workspace prune --root X --yes`, terminal tick of X (parent sweep),
+  same-name replace of P, terminal tick of a session in P's hierarchy, and
+  `koto cancel P --cleanup` keeps P in the bucket (its objects listed the same
+  before and after) and reports the pin with `source: bucket`. U, unpinned in
+  the same bucket, is removed from the bucket by the same commands.
+- [ ] **Stale index push doesn't unpin.** Host 2, holding a copy of P taken
+  before the pin, writes a context key into P (pushing an index without the
+  pin) and then runs the removals above; each keeps P and reports the pin, and
+  the pin object is still in the bucket.
 - [ ] **Anchors elsewhere.** P is held by an anchor that lives only in host
-  1's local store (the start hook dropped `KOTO_SESSION_*`); host 2's removals
-  keep P from its pin alone and report the pin, not the anchor.
-- [ ] **Failed bucket check keeps.** With the bucket unreachable for the
-  check, `koto session cleanup P` and `koto session cleanup U` each exit
-  non-zero and delete neither copy, and `koto session prune --apply --all`
-  keeps both, reporting that the bucket couldn't be checked, and exits as it
-  does when it skips a session.
-- [ ] **Pin reaches the bucket or fails.** With the bucket refusing writes,
-  `koto session pin P` exits 3 and says the pin is held locally only; once
-  the bucket accepts writes, the next koto command on P pushes it and host 2
-  sees it. `koto session unpin` with the bucket refusing deletes exits 3 and
-  P stays pinned in the bucket.
+  1's local store (opened by the start hook with `KOTO_SESSION_*` dropped);
+  host 2's prune, workspace prune and terminal tick keep P and report the pin,
+  not the anchor.
+- [ ] **Failed bucket check keeps.** With the stand-in failing every listing
+  request, and again with it returning an unparseable listing: on host 2,
+  `koto session cleanup P` and `koto session cleanup U` exit 3 and delete
+  neither copy; `koto session prune --apply --all` lists P and U as kept
+  because the bucket couldn't be checked and exits 0; the terminal tick of X
+  keeps its children; `koto workspace prune --root X --yes` deletes nothing
+  and lists each member as kept.
+- [ ] **Pin and unpin reach the bucket or fail.** With the stand-in refusing
+  writes, `koto session pin P` exits 3 and says the pin is held locally only;
+  `koto session pin P` again exits 3 with the same message; once writes are
+  accepted, the next `koto session pin P` exits 0 and host 2's
+  `koto session list --pinned` lists P with `source: bucket`. With deletes
+  refused, `koto session unpin P` exits 3 and host 2 still keeps P.
 - [ ] **Unpin on one host frees on another.** Host 1 unpins P by hand; after
-  the retention, host 2's prune removes P from the bucket.
-- [ ] **Cost.** On the stand-in bucket with a fixed per-request latency, a
-  `koto session prune --apply --all` over 20 finished sessions, 5 of them
-  pinned, makes at most one bucket check per deleted session plus one pin
-  read per pin found, counted by the stand-in.
+  the retention, host 2's prune removes P from the bucket. Host 2 unpinning a
+  pinned session it holds no local copy of exits 0 and host 1 sees no pin.
+- [ ] **Bucket request count.** For `koto session prune --apply --all` over 20
+  finished sessions past the retention, 5 of them pinned in the bucket only,
+  the stand-in counts at most 20 listing requests for the bucket checks and 5
+  reads of pin objects beyond what the same prune makes without this feature.
 
 ### Import and compatibility
 
 - [ ] **Import carries the pin.** With the per-command cloud configuration in
-  the environment, importing P into another workspace leaves the moved copy
-  pinned with the same reason, setter and time; S there keeps it; the
-  migrated source keeps nothing.
-- [ ] **Older koto keeps.** With a pin written by this build, the published
-  koto 0.23.0 release binary's `koto session prune --apply --all`,
-  `koto workspace prune --root X --yes`, terminal tick and same-name replace,
-  run on the same store, each keep P, with a reason naming an unreadable
-  record.
-- [ ] **Changelog and guide.** koto's changelog for the release and its
-  session-retention guide state which releases honour pins in full and what
-  older releases do, and the guides that tell a reader to run
-  `koto session cleanup` as a recovery step say to unpin a pinned session
-  first.
+  the environment, importing P (pinned, with a release record from an earlier
+  pin) into another workspace leaves the moved copy with the same pin and
+  release record; S there keeps it; the migrated source keeps nothing.
+  Importing a session with an unreadable pin carries it unchanged.
+- [ ] **Older koto keeps.** With a pin written by this build, the koto
+  v0.23.0 release binary (fetched by the test from the project's release page
+  and checked against its published checksum) runs `koto session prune
+  --apply --all`, `koto workspace prune --root X --yes`, a terminal tick of X
+  and a same-name replace of P on the same store; each keeps P, and the
+  prune's entry for P lists an unreadable item naming the pin's record.
+- [ ] **Changelog and guides.** The changelog entry and the session-retention
+  guide each name the first release that honours pins in full and each of
+  `koto session cleanup`, `koto cancel --cleanup` and `koto session import`
+  as not honouring pins in older releases; every guide that runs
+  `koto session cleanup` as a recovery step has an unpin-first line, checked
+  by a doc test.
 
 ### Cross-cutting
 
-- [ ] **No niwa.** On a host with no niwa installed, Pinned survives every
-  removal, Cleanup refuses, Refused without authority, Allowed with
-  authority, Unreadable pin keeps and Second host keeps pass with koto and
+- [ ] **No niwa.** On a host with no niwa installed, every criterion in the
+  Keeping and reporting, Setting, releasing and authority, and Failing toward
+  keeping sections, and Second host keeps, every removal, pass with koto and
   koto-skills alone.
 - [ ] **Unchanged for unpinned.** koto's existing retention and removal tests
-  pass unchanged.
-- [ ] **Cost.** The R27 local test passes on the CI runner.
+  pass unchanged, and for a fixture of unpinned sessions every output surface
+  in R15 matches, byte for byte, a recorded golden output from a build
+  without this feature.
+- [ ] **Cost.** The R28 local test passes on the CI runner.
 
 ## Out of Scope
 
@@ -487,44 +612,48 @@ machines), with the cloud backend set by environment on both.
   explicit unpin takes a pin off.
 - **Changing how unpinned sessions are kept or removed.** The retention rule,
   its settings and its reasons stay as they are for them.
-- **Pinning a whole hierarchy in one call.** A pin keeps its own session; to
-  keep more, pin each session that matters. A hierarchy-wide pin can be added
-  later without changing the pin format.
+- **Pinning a whole hierarchy, or many sessions by pattern, in one call.** A
+  pin keeps its own session; to keep more, pin each session that matters. A
+  hierarchy-wide pin can be added later without changing the pin's format.
+- **Changing a pin's reason in place.** Unpin and pin again.
+- **Several pins on one session.** A second party sees the existing pin.
 - **Defining or granting authority beyond koto's own name.** What
   authorities niwa or any other tool defines, who grants them and how a
-  dispatcher decides to hand `release-pin` on are outside koto. koto reads
-  only what's handed to a session.
-- **Enforcement stronger than today's.** A caller can unset its anchor
-  variable to act by hand, and anyone with file access can delete the store;
-  the release record shows the first, and nothing here prevents the second.
+  dispatcher decides to hand `release-pin` on are outside koto.
+- **Enforcement stronger than today's.** A caller can drop its anchor variable
+  to act by hand, and anyone with file access can delete the store; the
+  release record shows the first, and nothing here prevents the second.
 - **An automatic pruner, or any change to when removals run.**
 - **Host-level stores**: the request store, the decider ledger, the terminal
   index, finished records.
 - **Removals inside a run koto is still driving.** Batch and retry respawns
   that delete a child koto just created or is re-running don't consult pins.
-- **koto requiring niwa, or niwa naming koto.** niwa needs no change; a
-  workspace declares the variable in its existing pass-through list.
+- **koto requiring niwa, or niwa naming koto.** niwa needs no change.
 
 ## Known Limitations
 
 - **Older builds on a shared bucket.** A host running a koto release from
   before this feature can still remove a pinned session with
   `koto session cleanup` or `koto cancel --cleanup`, or drop the pin on
-  import, and releases before session retention ignore pins entirely. Every
-  host sharing a bucket needs a release that honours pins (R25).
-- **A bypass shows rather than stops.** An agent that unsets `KOTO_ANCHOR` is
-  treated as acting by hand and may unpin; the release record then shows a
-  by-hand release where no person was present.
+  import, and releases before v0.23.0 ignore pins entirely (v0.22 prunes keep
+  a pinned session; its terminal tick and replace don't). Every host sharing
+  a bucket needs a release that honours pins (R26).
+- **A bypass shows rather than stops.** An agent that drops its anchor
+  variable is treated as acting by hand and may unpin; the release record
+  then shows a by-hand release where no person was present.
 - **A host with no bucket access can't remove under cloud.** Because a failed
-  bucket check keeps (R22), a host whose bucket is unreachable removes
-  nothing until it can check.
+  bucket check keeps (R23), a host whose bucket is unreachable removes nothing
+  until it can check.
 - **A pin keeps storage until released.** A skill that pins every run grows
   the store and the bucket without bound; listing pins (R17) and the prune
   reports make that visible, and nothing limits it.
-- **A narrow race on a second host.** A pin written on one host between
-  another host's bucket check and its deletes can leave a pin object with no
-  session behind it; the session is gone. The check runs immediately before
-  the deletes to keep the window small.
+- **Races aren't closed.** On one host, the per-session lock (R12) orders pins
+  and removals. Across hosts nothing orders them: a pin written on one host
+  between another host's bucket check and its deletes can leave a pin with no
+  session behind it.
+- **Older Claude Code sessions.** An agent session started before the plugin
+  records authority holds none, so its unpins are refused until it starts
+  again with authority handed.
 
 ## Decisions and Trade-offs
 
@@ -540,44 +669,47 @@ machines), with the cloud backend set by environment on both.
   was rejected: it's koto guessing, the refusal couldn't name an authority,
   and the setter is usually gone by release time. niwa's named authorities
   are niwa's closed set, and koto may not read niwa's record, so the name and
-  the variable are koto's own and any dispatcher hands them, the way the
-  dispatcher's anchor is handed today. A by-hand release keeps the issue's
+  the variable are koto's own and any launcher hands them, the way a
+  dispatcher's anchor is handed today. A release by hand keeps the issue's
   interim rule (release stays with whoever runs the command by hand) and the
   escape hatch for a mistaken pin.
-- **Authority is what the session was handed at its start, recorded in its
-  anchor, and the variable is removed from its shells.** Reading the variable
-  at unpin time was rejected: an agent could export it mid-session, and any
-  child launched from the shell would inherit it. This mirrors how the start
-  hook already records niwa's reap key once and removes it from the shells.
+- **Authority is what a start was handed, recorded in the anchor, and the
+  variable is removed from the shells.** Reading the variable at unpin time
+  was rejected: an agent could export it mid-session, and any child launched
+  from the shell would inherit it. This mirrors how the start hook already
+  records niwa's reap key once and removes it from the shells.
 - **Setting a pin needs no authority.** A pin errs toward keeping and a
-  person can always undo it; requiring authority would break the first user story
-  for every agent nobody handed anything to, which on a host without niwa is
-  every agent. A required reason, a recorded setter, a pin listing and the
-  prune reports make pins visible instead. The authority list could later
+  person can always undo it; requiring authority would break the first user
+  story for every agent nobody handed anything to, which on a host without
+  niwa is every agent. A required reason, a recorded setter, a pin listing and
+  the prune reports make pins visible instead. The authority set could later
   carry a pinning authority as an additive change.
 - **Explicit removal refuses a pinned session.** Session retention lets
   `koto session cleanup` remove whatever retention says; a pin is a stronger
   statement than a live member, and leaving cleanup able to delete it would
-  make an unpin pointless as a gate. Refusing (rather than keeping silently)
+  make an unpin pointless as a gate. Refusing, rather than keeping silently,
   tells the operator what to do. `koto cancel --cleanup` refuses before it
   cancels, so a refused command changes nothing.
-- **Under the cloud backend every removal checks the bucket, and a failed
-  check keeps.** A second host decides from a local copy that may lack the
-  pin, and one host's write can replace the bucket's index of a session's
-  keys; trusting the local copy, or relying on the prune's existing check
-  that the bucket copy isn't ahead, would delete records. The cost is one
-  bucket request per session a removal deletes, which is the listing a
-  delete already makes.
+- **An unpin restarts no clock.** Restarting the retention at unpin was
+  considered; the brief and issue ask that the next removal after an unpin
+  take the session, and a released record nobody needs has no reason to stay
+  another retention period.
+- **Under the cloud backend every removal checks the bucket, by object, and a
+  failed check keeps.** A second host decides from a local copy that may lack
+  the pin, and one host's push can replace the bucket's index of a session's
+  keys; trusting the local copy, the index, or the prune's existing check
+  that the bucket copy isn't ahead would delete records. The cost is one
+  listing per session a removal deletes.
 - **Pin writes are strict under the cloud backend.** Today a context write
   whose push fails only warns; a pin that silently stays local gives false
   confidence on every other host.
 - **Older builds must keep, not release.** The pin's stored form is chosen so
   that a release with session-retention links but no pin support reads it as
   unreadable, which keeps, rather than as an ordinary link, which releases.
+  The stored form itself is the design's choice under that constraint.
 - **One pin per session; re-pinning is idempotent.** Several pins with their
   own setters and reasons were considered; one pin keeps the release rule and
-  every report simple, and a second party who needs the record can see the
-  existing pin.
+  every report simple.
 - **Pins are for koto workflow sessions only.** Pinning an anchor or a close
-  record would keep only bookkeeping sessions under the session-only rule,
+  record would keep only a bookkeeping session under the session-only rule,
   which is never what's wanted.
