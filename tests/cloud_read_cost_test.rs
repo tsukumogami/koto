@@ -277,18 +277,11 @@ fn a_current_read_costs_one_listing() {
     );
 }
 
-/// A read after another host changed a key fetches the new manifest and the
-/// key, and sees the new value. The other host's push is made straight into
-/// the bucket: the key's object and its manifest entry, as a push leaves
-/// them.
-#[test]
-fn a_read_after_another_host_wrote_fetches_what_changed() {
+/// Another host's write of `k.md` in `session`, made straight into the
+/// bucket: the key's object and its manifest entry, as a push leaves them.
+fn change_key_elsewhere(s3: &FakeS3, h: &Host, session: &str, value: &[u8]) {
     use sha2::{Digest, Sha256};
-    let s3 = FakeS3::start(BUCKET);
-    let a = Host::new(&s3, true);
-    worker_with_a_key(&a);
-    let key = |rest: &str| format!("{}/{WORKER}/{rest}", a.prefix());
-    let value = b"changed elsewhere";
+    let key = |rest: &str| format!("{}/{session}/{rest}", h.prefix());
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&s3.object(&key("ctx/manifest.json")).unwrap()).unwrap();
     manifest["keys"]["k.md"]["hash"] = hex::encode(Sha256::digest(value)).into();
@@ -297,6 +290,16 @@ fn a_read_after_another_host_wrote_fetches_what_changed() {
         &key("ctx/manifest.json"),
         &serde_json::to_vec(&manifest).unwrap(),
     );
+}
+
+/// A read after another host changed a key fetches the new manifest and the
+/// key, and sees the new value.
+#[test]
+fn a_read_after_another_host_wrote_fetches_what_changed() {
+    let s3 = FakeS3::start(BUCKET);
+    let a = Host::new(&s3, true);
+    worker_with_a_key(&a);
+    change_key_elsewhere(&s3, &a, WORKER, b"changed elsewhere");
 
     let mut out = None;
     let reqs = requests_during(&s3, &a.prefix(), || {
@@ -310,16 +313,79 @@ fn a_read_after_another_host_wrote_fetches_what_changed() {
     ] {
         assert!(reqs.contains(&expected), "missing {expected}: {reqs:?}");
     }
-    // The pull wrote the local store, which is logged as a `context_added`
-    // by `sync` and pushed with the state file, as before this change; the
-    // read itself is spooled. Nothing else is written. That push is a write
-    // to a session this host only read, which koto#431 removes; this pins
-    // today's behaviour until then.
-    let puts: Vec<&String> = reqs.iter().filter(|r| r.starts_with("PUT")).collect();
-    assert_eq!(
-        puts,
-        vec![&format!("PUT {WORKER}/koto-{WORKER}.state.jsonl")],
-        "{reqs:?}"
+    // The pull wrote this host's local store only. It is spooled beside the
+    // read, as a `context_added` by `sync`, and neither logged into the
+    // worker's state file nor pushed: a reader writes nothing under a
+    // session it only read (koto#431).
+    assert!(
+        !reqs.iter().any(|r| r.starts_with("PUT")),
+        "a read wrote to the bucket: {reqs:?}"
+    );
+    let state = std::fs::read_to_string(
+        a.session_dir(WORKER)
+            .join(format!("koto-{WORKER}.state.jsonl")),
+    )
+    .unwrap();
+    assert!(
+        !state
+            .lines()
+            .any(|l| l.contains("\"context_added\"") && l.contains("\"writer\":\"sync\"")),
+        "the pull is not in the worker's log: {state}"
+    );
+    let spool = std::fs::read_to_string(a.session_dir(WORKER).join("context-reads.jsonl")).unwrap();
+    assert!(
+        spool.lines().any(|l| l.contains("\"context_added\"")
+            && l.contains("\"k.md\"")
+            && l.contains("\"sync\"")),
+        "the pull is in the spool: {spool}"
+    );
+
+    // This host's copy is in step with the bucket afterwards: the next read
+    // lists the session and downloads nothing.
+    let mut out = None;
+    let again = requests_during(&s3, &a.prefix(), || {
+        out = Some(a.ok(&["context", "get", WORKER, "k.md"]));
+    });
+    assert_eq!(out.unwrap().stdout, "changed elsewhere");
+    let worker_reqs: Vec<&String> = again.iter().filter(|r| r.contains(WORKER)).collect();
+    assert_eq!(worker_reqs, vec![&format!("LIST {WORKER}/")], "{again:?}");
+}
+
+/// A session's own tick that reads a key another host changed still logs the
+/// pull in the session's log, and the tick pushes it with the rest of what
+/// it wrote: the session is the tick's to write.
+#[test]
+fn a_pull_by_the_sessions_own_tick_is_logged_and_pushed() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    h.init(
+        WORKER,
+        &format!("koto context get {WORKER} k.md > /dev/null"),
+    );
+    h.add(WORKER, "k.md", b"the value");
+    change_key_elsewhere(&s3, &h, WORKER, b"changed elsewhere");
+
+    h.ok(&["next", WORKER]);
+
+    let remote = String::from_utf8(
+        s3.object(&format!(
+            "{}/{WORKER}/koto-{WORKER}.state.jsonl",
+            h.prefix()
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        remote.lines().any(|l| l.contains("\"context_added\"")
+            && l.contains("\"k.md\"")
+            && l.contains("\"writer\":\"sync\"")),
+        "the tick pushed its pull: {remote}"
+    );
+    let spool = std::fs::read_to_string(h.session_dir(WORKER).join("context-reads.jsonl"))
+        .unwrap_or_default();
+    assert!(
+        !spool.contains("\"context_added\""),
+        "the own tick's pull is not spooled: {spool}"
     );
 }
 

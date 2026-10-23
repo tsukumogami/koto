@@ -116,6 +116,8 @@ koto keeps what it last knew of the bucket's copy in host-local files beside the
 
 A `koto context get` or `koto context exists` records the read for the run journal. A read made by the session's own tick goes into its log, as before. A read made from anywhere else, another session's tick or your shell, goes into `context-reads.jsonl` beside the session on this host and is never pushed, so reading a session never writes to it.
 
+A read of a key another host changed downloads the key into this host's copy of the session first, and records that pull as a `context_added` whose writer is `sync`. The pull follows the read: from the session's own tick it goes into the log and up with the tick's push; from anywhere else it goes into `context-reads.jsonl` beside the read, and the session's log and its copy in the bucket are left as they were. The next read finds this host's copy current and costs one listing.
+
 ### Commands a `koto next` runs
 
 A `koto context` call made from a template's command (a default action or a gate) works on the session that `koto next` is advancing, and it doesn't push to the bucket itself. It writes the local copy and leaves the push to the tick, which pushes everything its commands wrote once, before it returns. A call costs a request or two instead of a full round of pulls and pushes, so an action can make many of them inside its time limit.
