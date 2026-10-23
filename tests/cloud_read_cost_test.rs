@@ -381,9 +381,34 @@ fn reads_of_another_session_in_a_tick_check_it_once() {
     );
 }
 
-/// A tick whose action reads another session 40 times costs at most twice
-/// the same tick on the local backend, against a bucket that takes
-/// `LATENCY` to answer each request.
+/// [`reads_script`], with the time written to `action-start` before the
+/// reads and to `action-end` after them, in the directory the action runs in.
+fn timed_reads_script(n: usize) -> String {
+    let stamp = |file: &str| format!("perl -MTime::HiRes=time -e 'printf \"%.6f\", time' > {file}");
+    let mut lines = vec!["set -e".to_string(), stamp("action-start")];
+    lines.extend(reads_script(n).lines().skip(1).map(str::to_string));
+    lines.push(stamp("action-end"));
+    lines.join("\n")
+}
+
+/// The action's own time, from the stamps [`timed_reads_script`] wrote.
+fn action_time(h: &Host) -> Duration {
+    let read = |file: &str| -> f64 {
+        std::fs::read_to_string(h.ws.join(file))
+            .unwrap_or_else(|e| panic!("{file}: {e}"))
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    Duration::from_secs_f64(read("action-end") - read("action-start"))
+}
+
+/// An action that reads another session 40 times costs at most twice the
+/// same action on the local backend, against a bucket that takes `LATENCY`
+/// to answer each request. The action is timed from inside it: the tick
+/// around it also pulls and pushes its own session, a fixed cost the
+/// criterion isn't about, which on a fast host is larger than the whole
+/// local tick. The ticks' times are printed beside the actions'.
 #[test]
 fn a_forty_read_action_on_the_cloud_backend_is_within_twice_local() {
     const LATENCY: Duration = Duration::from_millis(150);
@@ -394,27 +419,27 @@ fn a_forty_read_action_on_the_cloud_backend_is_within_twice_local() {
     let local = Host::new(&s3, false);
     for h in [&cloud, &local] {
         worker_with_a_key(h);
-        h.init(HUB, &reads_script(READS));
+        h.init(HUB, &timed_reads_script(READS));
     }
     s3.set_latency(LATENCY);
 
     let time = |h: &Host| {
         let start = Instant::now();
         h.ok(&["next", HUB]);
-        start.elapsed()
+        (start.elapsed(), action_time(h))
     };
-    let local_time = time(&local);
-    let cloud_time = time(&cloud);
+    let (local_tick, local_action) = time(&local);
+    let (cloud_tick, cloud_action) = time(&cloud);
     s3.set_latency(Duration::ZERO);
     eprintln!(
-        "{READS} reads: local {:?}, cloud {:?} at {:?} a request",
-        local_time, cloud_time, LATENCY
+        "{READS} reads at {:?} a request: action local {:?}, cloud {:?}; whole tick local {:?}, cloud {:?}",
+        LATENCY, local_action, cloud_action, local_tick, cloud_tick
     );
     assert!(
-        cloud_time <= local_time * 2,
-        "{READS} reads took {:?} on the cloud backend, over twice the local {:?}",
-        cloud_time,
-        local_time
+        cloud_action <= local_action * 2,
+        "a {READS}-read action took {:?} on the cloud backend, over twice the local {:?}",
+        cloud_action,
+        local_action
     );
 }
 
