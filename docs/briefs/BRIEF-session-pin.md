@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Draft
+status: Accepted
 problem: |
   koto keeps a finished session only while something live holds it, then
   removes it at the next cleanup, prune or terminal tick, on every host
@@ -23,7 +23,7 @@ motivating_context: |
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
@@ -153,10 +153,3 @@ the operator knows to repair or release it rather than guess.
 - Keeping a session that koto's batch machinery removes and respawns inside a
   run it's still driving. Those removals are part of a live run, not removals
   of finished sessions.
-
-## Open Questions
-
-- Who may release a mark, and how that authority reaches koto as something
-  handed to the session rather than read from another tool's record.
-- Whether a mark is set on one session or on a whole hierarchy.
-- Whether setting a mark needs any authority, or only releasing one.
