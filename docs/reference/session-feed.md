@@ -1331,6 +1331,12 @@ Records one read of a context key. It never carries the key's content or
 size; a present key's `hash` is what joins the read to the write that
 produced it.
 
+Anchorless context reads are no longer written to the read session's log:
+a `koto context get` or `exists` with no reader anchor goes to the
+host-local read spool beside the session (see the table below), which the
+run journal's `context_reads` records fold in and
+`koto::session::read_spool::read` reads back.
+
 This is the highest-volume event this feature adds, one per logged read. A consumer
 that doesn't need context lineage can skip it like any Tier 2 event, and
 nothing else in the feed depends on it.

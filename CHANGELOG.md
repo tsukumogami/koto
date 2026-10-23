@@ -8,6 +8,18 @@ to `0.9.x`).
 
 ## [Unreleased]
 
+### Compatibility
+
+- **Anchorless context reads are no longer written to the read session's
+  log.** `koto context get` and `koto context exists` run with no reader
+  anchor record their `context_read` in the host-local read spool,
+  `context-reads.jsonl` beside the session's local copy, which never leaves
+  the host. A reader that names another agent session's anchor records it in
+  that anchor's log instead. A tool that counted `context_read` events in a
+  session's own log should read the run journal's `context_reads` records,
+  which fold in spooled reads, or the spool through
+  `koto::session::read_spool::read`.
+
 ### Added
 
 - **The run journal carries what a routing decider answered, and what the
