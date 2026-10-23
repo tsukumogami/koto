@@ -128,10 +128,13 @@ fn write_templates(dir: &Path) -> PathBuf {
     parent
 }
 
-/// Drive a child to its `done` terminal state WITHOUT `--no-cleanup`,
-/// so the child's session directory is auto-cleaned immediately after
-/// the terminal response. This is the scenario #134 is about: the next
-/// `koto next <parent>` call cannot see the child on disk anymore.
+/// Drive a child to its `done` terminal state WITHOUT `--no-cleanup`, then
+/// remove its session. This is the scenario #134 is about: the next `koto
+/// next <parent>` call cannot see the child on disk anymore. A child has
+/// lineage to its parent, so the tick keeps it with its hierarchy; the
+/// removal these tests need -- a finished child known only from its
+/// parent's `ChildCompleted` record -- is an explicit `koto session
+/// cleanup` now, as it is for a failure terminal.
 fn drive_child_to_done_with_cleanup(dir: &Path, name: &str) {
     let (ok, json, stderr) = run_koto(dir, &["next", name, "--with-data", r#"{"marker": "done"}"#]);
     assert!(
@@ -141,6 +144,13 @@ fn drive_child_to_done_with_cleanup(dir: &Path, name: &str) {
         stderr,
         serde_json::to_string_pretty(&json).unwrap_or_default()
     );
+    assert_eq!(
+        json["retention"],
+        serde_json::json!({"retained": true, "reason": "hierarchy"}),
+        "a child is kept with its hierarchy"
+    );
+    let (ok, _, stderr) = run_koto(dir, &["session", "cleanup", name]);
+    assert!(ok, "session cleanup {} failed: {}", name, stderr);
 }
 
 /// Drive a child to its `failed` terminal WITHOUT `--no-cleanup`, then remove

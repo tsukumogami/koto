@@ -1,10 +1,14 @@
 //! Integration tests for removing a parent's kept descendants with it
 //! (koto issue 240).
 //!
-//! A child kept at a failure terminal, or with `--no-cleanup`, must not
-//! outlive a parent that koto removes or replaces. The sweep that does this
-//! runs without anyone naming the sessions it removes, so it never touches
-//! live work, a session it can't read, or anything under a live session.
+//! A kept child must not outlive a parent that koto removes. A parent with
+//! children has lineage, so its own terminal tick keeps it, and its children
+//! with it (`kept_children` lists them); the sweep removes them when a
+//! replace finds the parent's hierarchy released. The sweep runs without
+//! anyone naming the sessions it removes, so it never touches live work, a
+//! session it can't read, or anything under a live session. While the
+//! hierarchy is kept, the replace moves the subtree aside instead, and a
+//! subtree holding live or unreadable work refuses it.
 
 #![cfg(unix)]
 
@@ -205,8 +209,49 @@ fn done_kept(dir: &Path, name: &str) {
     );
 }
 
-fn finish_parent(dir: &Path, name: &str) {
-    run_ok(dir, &["next", name, "--with-data", r#"{"go":"done"}"#]);
+/// Finish a parent without `--no-cleanup`. It has children, so the tick
+/// keeps it with its hierarchy; returns the response.
+fn finish_parent(dir: &Path, name: &str) -> Value {
+    let resp = run_ok(dir, &["next", name, "--with-data", r#"{"go":"done"}"#]);
+    assert_eq!(
+        resp["retention"],
+        serde_json::json!({"retained": true, "reason": "hierarchy"}),
+        "{resp}"
+    );
+    resp
+}
+
+/// The names a kept parent's tick lists under `kept_children`.
+fn kept_children(resp: &Value) -> Vec<String> {
+    let mut names: Vec<String> = resp["kept_children"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|c| c["name"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Replace the finished `name` once a one-second retention has passed, so
+/// the rule releases its hierarchy unless something in it is alive or
+/// can't be read. Returns the exit code and the JSON answer.
+fn released_replace(dir: &Path, name: &str, template: &str) -> (i32, Value) {
+    std::thread::sleep(std::time::Duration::from_millis(1300));
+    let t = write(dir, &format!("{name}-again.md"), template);
+    let output = koto_cmd(dir)
+        .env("KOTO_RETENTION_KEEP", "1s")
+        .args(["init", name, "--template", &t, "--replace-terminal"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let last = stdout.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("");
+    (
+        output.status.code().unwrap_or(-1),
+        serde_json::from_str(last).unwrap_or(Value::Null),
+    )
 }
 
 fn set_writable(path: &Path, writable: bool) {
@@ -230,8 +275,30 @@ fn removes_terminal_descendants_with_the_parent() {
     done_kept(dir, "p.kept");
     assert!(exists(dir, "p.failed") && exists(dir, "p.kept") && exists(dir, "p.kept.gc"));
 
-    finish_parent(dir, "p");
-    assert!(!exists(dir, "p"), "the parent is removed");
+    // The parent's own terminal keeps it and every descendant, and lists
+    // what the sweep would have walked.
+    let resp = finish_parent(dir, "p");
+    assert_eq!(
+        kept_children(&resp),
+        vec!["p.failed", "p.kept", "p.kept.gc"],
+        "{resp}"
+    );
+    for name in ["p", "p.failed", "p.kept", "p.kept.gc"] {
+        assert!(exists(dir, name), "{name} is kept at the parent's terminal");
+    }
+
+    // A replace of the released parent removes them.
+    let (code, resp) = released_replace(dir, "p", PARENT);
+    assert_eq!(code, 0, "{resp}");
+    assert!(
+        resp.get("moved_to").is_none(),
+        "released, not moved: {resp}"
+    );
+    assert_eq!(
+        run_ok(dir, &["status", "p"])["current_state"],
+        "wait",
+        "p is a fresh run"
+    );
     assert!(
         !exists(dir, "p.failed"),
         "its kept failed child goes with it"
@@ -257,10 +324,19 @@ fn leaves_live_children_and_their_subtrees() {
     fail(dir, "p.failed");
     fail(dir, "p.live.gc");
 
-    finish_parent(dir, "p");
-    assert!(!exists(dir, "p.failed"));
-    assert!(exists(dir, "p.live"), "a live child is left alone");
-    assert!(exists(dir, "p.live.gc"), "and so is everything under it");
+    // The listing doesn't descend into a live child.
+    let resp = finish_parent(dir, "p");
+    assert_eq!(kept_children(&resp), vec!["p.failed"], "{resp}");
+
+    // A live child keeps the hierarchy, and the replace that would move it
+    // aside refuses, naming it; nothing changes.
+    let (code, resp) = released_replace(dir, "p", PARENT);
+    assert_eq!(code, 2, "{resp}");
+    assert_eq!(resp["code"], "replace_held_live", "{resp}");
+    assert!(resp["error"].as_str().unwrap().contains("p.live"), "{resp}");
+    for name in ["p", "p.failed", "p.live", "p.live.gc"] {
+        assert!(exists(dir, name), "{name} is left alone");
+    }
 }
 
 #[test]
@@ -326,13 +402,19 @@ fn skips_an_unclassifiable_descendant() {
     lines.insert(1, "not json");
     std::fs::write(&path, lines.join("\n") + "\n").unwrap();
 
-    finish_parent(dir, "p");
-    assert!(!exists(dir, "p"), "the parent is still removed");
-    assert!(
-        exists(dir, "p.bad"),
-        "an unreadable descendant is left alone"
-    );
-    assert!(!exists(dir, "p.failed"));
+    // The parent is kept, and the listing skips what it can't read.
+    let resp = finish_parent(dir, "p");
+    assert_eq!(kept_children(&resp), vec!["p.failed"], "{resp}");
+
+    // An unreadable member keeps the hierarchy, and the move refuses on it
+    // as it would on a live one.
+    let (code, resp) = released_replace(dir, "p", PARENT);
+    assert_eq!(code, 2, "{resp}");
+    assert_eq!(resp["code"], "replace_held_live", "{resp}");
+    assert!(resp["error"].as_str().unwrap().contains("p.bad"), "{resp}");
+    for name in ["p", "p.bad", "p.failed"] {
+        assert!(exists(dir, name), "{name} is left alone");
+    }
 }
 
 /// A descendant whose compiled template file is gone can't be classified,
@@ -367,21 +449,30 @@ fn skips_a_descendant_whose_template_is_missing() {
         .to_string();
     std::fs::remove_file(&compiled).unwrap();
 
-    finish_parent(dir, "p");
-    assert!(!exists(dir, "p"), "the parent is still removed");
+    let resp = finish_parent(dir, "p");
+    assert_eq!(kept_children(&resp), vec!["p.failed"], "{resp}");
+
+    // Neither the release nor the move goes past a descendant it can't
+    // classify: the replace refuses, naming it, and nothing changes.
+    let (code, resp) = released_replace(dir, "p", PARENT);
+    assert_eq!(code, 2, "{resp}");
+    assert_eq!(resp["code"], "replace_held_live", "{resp}");
     assert!(
-        exists(dir, "p.orphan"),
-        "an unclassifiable descendant is left alone"
+        resp["error"].as_str().unwrap().contains("p.orphan"),
+        "{resp}"
     );
-    assert!(!exists(dir, "p.failed"));
+    for name in ["p", "p.orphan", "p.failed"] {
+        assert!(exists(dir, name), "{name} is left alone");
+    }
 }
 
 #[test]
 fn stops_on_a_parent_cycle() {
     // a -> b -> a: remove `a`, then re-create it under its former child.
-    // The sweep is driven through the replace path: a terminal tick would not
-    // sweep here (`a` has no batch hook and no reported child), and the walk
-    // is the same function either way.
+    // The replace walks `a`'s descendants with the shared guarded walk. `a`
+    // finished just now, so its hierarchy is kept and the replace moves the
+    // subtree aside; the walk's visited set has to end the cycle for the
+    // move to finish.
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     init_root(dir, "a", CHILD);
@@ -392,8 +483,8 @@ fn stops_on_a_parent_cycle() {
     run_ok(dir, &["init", "a", "--template", &t, "--parent", "b"]);
     done_kept(dir, "a");
 
-    // Replacing the finished `a` sweeps its descendants and must terminate.
-    run_ok(
+    // Replacing the finished `a` walks its descendants and must terminate.
+    let resp = run_ok(
         dir,
         &[
             "init",
@@ -404,7 +495,8 @@ fn stops_on_a_parent_cycle() {
             "--replace-terminal",
         ],
     );
-    assert!(exists(dir, "a"));
+    assert_eq!(resp["moved_to"], "a_r1", "{resp}");
+    assert!(exists(dir, "a") && exists(dir, "a_r1"));
     assert!(exists(dir, "b"), "a session in a cycle is not removed");
 }
 
@@ -433,19 +525,14 @@ fn replace_terminal_removes_retained_children() {
     fail(dir, "r.c");
     done_kept(dir, "r");
 
-    let t = write(dir, "r.md", CHILD);
-    run_ok(
-        dir,
-        &[
-            "init",
-            "r",
-            "--template",
-            &t,
-            "--attach-live",
-            "--replace-terminal",
-        ],
+    let (code, resp) = released_replace(dir, "r", CHILD);
+    assert_eq!(code, 0, "{resp}");
+    assert!(
+        resp.get("moved_to").is_none(),
+        "released, not moved: {resp}"
     );
     assert!(!exists(dir, "r.c"), "the old run's kept child is removed");
+    assert!(!exists(dir, "r_r1"));
     let status = run_ok(dir, &["status", "r"]);
     assert_eq!(status["current_state"], "work", "r is a fresh session");
 }
@@ -514,7 +601,7 @@ fn a_retained_child_with_a_lost_notice_is_still_swept() {
     assert!(!log.contains("child_completed"), "the notice was lost");
     assert!(exists(dir, "p.leaf"));
 
-    run_ok(
+    let resp = run_ok(
         dir,
         &[
             "next",
@@ -523,8 +610,16 @@ fn a_retained_child_with_a_lost_notice_is_still_swept() {
             r#"{"tasks":[{"name":"leaf","waits_on":[]}],"finalize":"yes"}"#,
         ],
     );
-    assert!(!exists(dir, "p"));
-    assert!(!exists(dir, "p.leaf"), "swept via the parent's batch hook");
+    assert_eq!(
+        kept_children(&resp),
+        vec!["p.leaf"],
+        "listed via the parent's batch hook: {resp}"
+    );
+    assert!(exists(dir, "p") && exists(dir, "p.leaf"));
+
+    let (code, resp) = released_replace(dir, "p", BATCH_PARENT);
+    assert_eq!(code, 0, "{resp}");
+    assert!(!exists(dir, "p.leaf"), "swept with the released parent");
 }
 
 /// A descendant bound to a request leg that is still open (its promotion
@@ -586,7 +681,14 @@ fn keeps_a_descendant_whose_leg_is_still_open() {
     fail(dir, "p.failed");
 
     finish_parent(dir, "p");
-    assert!(!exists(dir, "p.failed"));
+    assert!(exists(dir, "p.failed") && exists(dir, "p.bound"));
+
+    // Nothing in the hierarchy is alive, so the replace releases it; the
+    // sweep removes the failed child and leaves the one whose leg still
+    // waits for its result.
+    let (code, resp) = released_replace(dir, "p", PARENT);
+    assert_eq!(code, 0, "{resp}");
+    assert!(!exists(dir, "p.failed"), "{resp}");
     assert!(
         exists(dir, "p.bound"),
         "a child whose leg is still open is kept"

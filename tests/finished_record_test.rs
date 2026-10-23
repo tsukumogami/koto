@@ -79,8 +79,13 @@ impl Env {
     }
 
     fn run(&self, args: &[&str]) -> std::process::Output {
+        self.run_env(args, &[])
+    }
+
+    fn run_env(&self, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
         Command::cargo_bin("koto")
             .unwrap()
+            .envs(env.iter().copied())
             .current_dir(&self.work)
             .env("HOME", &self.home)
             .env("XDG_CACHE_HOME", &self.cache)
@@ -359,9 +364,31 @@ fn a_parent_records_each_kept_child_it_removes() {
     env.ok(&["cancel", "child-cancelled"]);
     let kept_done = json(&env.status("child-done"));
 
-    // The parent finishes and is removed, taking its kept children.
+    // The parent finishes and is kept with its hierarchy, children and all.
     env.finish("parent", "yes", false);
     for name in ["parent", "child-done", "child-cancelled"] {
+        assert!(env.sessions().join(name).exists(), "{name} is gone");
+    }
+    // Once the retention passes, a replace of the parent releases the old
+    // run and removes its kept children with it.
+    std::thread::sleep(std::time::Duration::from_millis(1300));
+    let out = env.run_env(
+        &[
+            "init",
+            "parent",
+            "--template",
+            env.template.to_str().unwrap(),
+            "--replace-terminal",
+        ],
+        &[("KOTO_RETENTION_KEEP", "1s")],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(json(&out).get("moved_to").is_none(), "released, not moved");
+    for name in ["child-done", "child-cancelled"] {
         assert!(!env.sessions().join(name).exists(), "{name} is still there");
     }
 
@@ -381,8 +408,6 @@ fn a_parent_records_each_kept_child_it_removes() {
     assert_eq!(status["is_terminal"], true);
     assert_eq!(status["status"], "cancelled");
     assert_eq!(status["current_state"], "start");
-
-    assert_eq!(env.record("parent")["removed_by"], "terminal");
 }
 
 #[test]

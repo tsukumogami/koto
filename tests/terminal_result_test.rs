@@ -303,9 +303,9 @@ fn expected_done_payload() -> Value {
 /// One session, one template, every place a result is read from. The first
 /// tick parks the terminal (`--no-cleanup`), which keeps the child's own log
 /// and `koto status` readable, and already delivers the parent's
-/// `ChildCompleted`; the second tick lets cleanup run and re-sends the notice
-/// before removing the session. Both ticks report the value recorded on the
-/// first.
+/// `ChildCompleted`; the second tick, without the flag, still keeps the
+/// child, which has lineage to its parent. Both ticks report the value
+/// recorded on the first.
 #[test]
 fn the_declared_payload_rides_all_five_carriers() {
     let tmp = TempDir::new().unwrap();
@@ -349,8 +349,8 @@ fn the_declared_payload_rides_all_five_carriers() {
     assert_eq!(status["result"], result);
 
     // 4. `ChildCompleted` on the parent, emitted on the arrival even though
-    // the session is kept. The later tick that removes the session re-sends
-    // it, so a removed child always left its notice behind.
+    // the session is kept. A later tick without the flag still keeps the
+    // child (it has lineage to its parent), so it sends nothing more.
     assert_eq!(
         child_completed_results(dir, "coord-a"),
         vec![result.clone()]
@@ -360,14 +360,12 @@ fn the_declared_payload_rides_all_five_carriers() {
         final_tick["result"], result,
         "a later tick reports the record"
     );
+    assert_eq!(final_tick["retention"]["reason"], "hierarchy");
     assert_eq!(
         child_completed_results(dir, "coord-a"),
-        vec![result.clone(), result.clone()]
+        vec![result.clone()]
     );
-    assert!(
-        !session_dir(dir, "child-1").exists(),
-        "the session is cleaned up on the tick without --no-cleanup"
-    );
+    assert!(session_dir(dir, "child-1").exists());
 }
 
 /// `koto next --to <terminal>` is the other terminal write site.

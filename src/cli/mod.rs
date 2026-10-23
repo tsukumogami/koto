@@ -13,6 +13,7 @@ pub mod decider_port;
 pub mod disputes;
 pub mod init_child;
 pub mod init_entry;
+pub(crate) mod move_aside;
 pub mod next;
 pub mod next_types;
 pub mod overrides;
@@ -31,7 +32,7 @@ pub mod workspace;
 pub use init_child::{init_child_from_parent, TemplateCompileCache};
 pub use task_spawn_error::{SpawnErrorKind, TaskSpawnError};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -3518,8 +3519,9 @@ fn append_terminal_index_for_session(
 /// delivered. Promotion is gated on the leg having no result yet, which
 /// makes a repeat tick a silent no-op there too. `retention` decides only
 /// step 6, whether the session stays on disk: a failure terminal is always
-/// kept, and `--no-cleanup` keeps any other. Keeping a session never
-/// withholds its result from the parent or the leg (koto issue 240).
+/// kept, a session with a link or lineage is kept with its hierarchy, and
+/// `--no-cleanup` keeps any other. Keeping a session never withholds its
+/// result from the parent or the leg (koto issue 240).
 ///
 /// A tick that is not an arrival and will remove the session re-sends
 /// step 5 before it tries to. That is a tick after
@@ -3527,7 +3529,11 @@ fn append_terminal_index_for_session(
 /// failure), and the first flagless tick of a terminal an earlier tick
 /// kept with `--no-cleanup`. A removed child therefore always left its
 /// `ChildCompleted` behind; a duplicate is harmless, because the converge
-/// keeps the latest event per task and prefers an on-disk child.
+/// keeps the latest event per task and prefers an on-disk child. A tick
+/// that is not an arrival and keeps the session re-sends step 5 only when
+/// the parent holds no notice for the current arrival
+/// ([`parent_lacks_notice`]): a child has lineage, so it is never removed at
+/// a tick, and a notice whose append failed would otherwise never arrive.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn finish_terminal_tick(
@@ -3581,7 +3587,10 @@ fn finish_terminal_tick(
             .unwrap_or_default();
         append_terminal_index_for_session(backend, name, &post_events, has_result);
     }
-    if arrival || remove {
+    // A kept session's repeat tick re-sends only a notice its parent lacks:
+    // the arrival's append failed, and since a child with lineage is kept,
+    // no removal tick will ever re-send it.
+    if arrival || remove || parent_lacks_notice(backend, name, header) {
         let append_result = append_child_completed_to_parent(
             backend,
             name,
@@ -3621,7 +3630,9 @@ fn finish_terminal_tick(
         );
         #[cfg(test)]
         finished_record_hooks::before_removal(name);
-        // A parent koto removes takes its kept terminal descendants with it.
+        // Only a session `edge_of` found no edge for gets here, and a parent
+        // with a child has lineage, so this finds nothing in practice. It
+        // stays as the safety net `sweep_if_parent` describes.
         workspace::sweep_if_parent(backend, context_store, name, compiled);
         if let Err(e) = backend.cleanup(name) {
             eprintln!("warning: session cleanup failed: {}", e);
@@ -3629,6 +3640,45 @@ fn finish_terminal_tick(
             forget_finished_record(backend, name);
         }
     }
+}
+
+/// Whether `name`'s parent holds no `ChildCompleted` for the session's
+/// current arrival at its terminal: none naming it at or after the child's
+/// latest `request_store.result`, which the arrival tick records just before
+/// it notifies the parent. Only a parent read cleanly and found without the
+/// notice answers `true`; anything unreadable, or a session with no parent
+/// or no recorded result, answers `false` and so writes nothing.
+#[cfg(unix)]
+fn parent_lacks_notice(
+    backend: &dyn SessionBackend,
+    name: &str,
+    header: &crate::engine::types::StateFileHeader,
+) -> bool {
+    use crate::engine::wake::parse_rfc3339_millis;
+    let Some(parent) = header.parent_workflow.as_deref() else {
+        return false;
+    };
+    if !backend.exists(parent) {
+        return false;
+    }
+    let Ok((_, own)) = backend.read_events(name) else {
+        return false;
+    };
+    let Some(recorded) = own
+        .iter()
+        .rev()
+        .find(|e| matches!(e.payload, EventPayload::RequestStoreResult { .. }))
+        .and_then(|e| parse_rfc3339_millis(&e.timestamp))
+    else {
+        return false;
+    };
+    let Ok((_, parent_events)) = backend.read_events(parent) else {
+        return false;
+    };
+    !parent_events.iter().any(|e| {
+        matches!(&e.payload, EventPayload::ChildCompleted { child_name, .. } if child_name == name)
+            && parse_rfc3339_millis(&e.timestamp).is_none_or(|at| at >= recorded)
+    })
 }
 
 /// Write the finished record of a session koto is about to remove, beside
@@ -3752,22 +3802,65 @@ pub(crate) mod finished_record_hooks {
 }
 
 /// Whether koto keeps a session that has just reached `final_state`, and
-/// why. A failure terminal is always kept, whatever the flag says, so its
-/// record survives for a retry, a rewind, or a read (koto issue 240); any
-/// other terminal is kept only under `--no-cleanup`. The failure case reads
-/// the same projection `ChildCompleted` carries, so the parent's view of the
-/// outcome and the retention rule can't disagree.
+/// why, decided in this order:
+///
+/// 1. A failure terminal is always kept, whatever the flag says, so its
+///    record survives for a retry, a rewind, or a read (koto issue 240). It
+///    reads the same projection `ChildCompleted` carries, so the parent's
+///    view of the outcome and the retention rule can't disagree.
+/// 2. A session with a link or lineage is kept (`hierarchy`), with or
+///    without `--no-cleanup`: [`crate::session::hierarchy::edge_of`] finds a
+///    link of its own, a `parent_workflow`, a `chain/parent`, or another
+///    session naming it, in one pass over the local sessions directory that
+///    stops at the first inbound hit. It reads no retention setting and
+///    judges no retention, so a malformed setting can never fail a tick;
+///    `koto session prune` reclaims the session once its hierarchy is
+///    released. Anything it can't read answers "edge" and keeps.
+/// 3. `--no-cleanup` keeps any other terminal.
+///
+/// Otherwise the session is removed, as it always was: a lone session pays
+/// one header-level pass for the check.
 fn terminal_retention(
+    backend: &dyn SessionBackend,
+    name: &str,
     compiled: &CompiledTemplate,
     final_state: &str,
     no_cleanup: bool,
 ) -> Option<next_types::RetentionReason> {
     if project_terminal_outcome(compiled, final_state) == TerminalOutcome::Failure {
-        Some(next_types::RetentionReason::FailureTerminal)
+        return Some(next_types::RetentionReason::FailureTerminal);
+    }
+    let session_dir = backend.session_dir(name);
+    let has_edge = match session_dir.parent() {
+        Some(base) => crate::session::hierarchy::edge_of(base, name),
+        None => true,
+    };
+    if has_edge {
+        Some(next_types::RetentionReason::Hierarchy)
     } else if no_cleanup {
         Some(next_types::RetentionReason::NoCleanup)
     } else {
         None
+    }
+}
+
+/// The `retention` a terminal tick reports: the reason it keeps the
+/// session, and, for a parent kept with its hierarchy, the terminal
+/// children it keeps too.
+fn terminal_retention_report(
+    backend: &dyn SessionBackend,
+    name: &str,
+    compiled: &CompiledTemplate,
+    reason: Option<next_types::RetentionReason>,
+) -> next_types::Retention {
+    let kept_children = if reason == Some(next_types::RetentionReason::Hierarchy) {
+        workspace::kept_children(backend, name, compiled)
+    } else {
+        Vec::new()
+    };
+    next_types::Retention {
+        reason,
+        kept_children,
     }
 }
 
@@ -5564,13 +5657,15 @@ fn handle_next(
                 } else {
                     None
                 };
-                let retention = terminal
-                    .as_ref()
-                    .and_then(|_| terminal_retention(&compiled, target, no_cleanup));
+                let retention = terminal.as_ref().and_then(|_| {
+                    terminal_retention(backend, &name, &compiled, target, no_cleanup)
+                });
                 let resp = match &terminal {
                     Some(record) => resp
                         .with_terminal_result(record.result.clone())
-                        .with_retention(next_types::Retention { reason: retention }),
+                        .with_retention(terminal_retention_report(
+                            backend, &name, &compiled, retention,
+                        )),
                     None => resp,
                 };
                 // A directed move into a state that routes a retry offers it
@@ -7052,13 +7147,15 @@ fn handle_next(
             } else {
                 None
             };
-            let retention = terminal
-                .as_ref()
-                .and_then(|_| terminal_retention(&compiled, final_state, no_cleanup));
+            let retention = terminal.as_ref().and_then(|_| {
+                terminal_retention(backend, &name, &compiled, final_state, no_cleanup)
+            });
             let resp = match &terminal {
                 Some(record) => resp
                     .with_terminal_result(record.result.clone())
-                    .with_retention(next_types::Retention { reason: retention }),
+                    .with_retention(terminal_retention_report(
+                        backend, &name, &compiled, retention,
+                    )),
                 None => resp,
             };
 
@@ -7941,19 +8038,25 @@ fn derive_stale_template_source_dir(
     }))
 }
 
-/// Discover superseded branches by scanning for sessions whose name
-/// starts with `<parent_name>~`. Returns unique branch prefixes
+/// Discover superseded branches: the epoch-branch names (`<parent_name>~N`)
+/// that sessions' `parent_workflow` values name, by the shared lineage rule
+/// ([`crate::session::hierarchy::lineage_target`]): a value that is
+/// `<parent_name>~<digits>` and names no session is lineage to
+/// `<parent_name>` through that branch. Returns the unique branch names
 /// (e.g., `["parent~1", "parent~2"]`), sorted.
 fn derive_superseded_branches(backend: &dyn SessionBackend, parent_name: &str) -> Vec<String> {
-    let prefix = format!("{}~", parent_name);
     let sessions = match backend.list() {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
+    let names: HashSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
     let mut branches: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for info in sessions {
+    for info in &sessions {
         if let Some(pw) = &info.parent_workflow {
-            if pw.starts_with(&prefix) {
+            if pw != parent_name
+                && crate::session::hierarchy::lineage_target(pw, |n| names.contains(n))
+                    == parent_name
+            {
                 branches.insert(pw.clone());
             }
         }

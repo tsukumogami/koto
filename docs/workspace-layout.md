@@ -56,23 +56,26 @@ must not be deleted manually except via `koto session cleanup` or
 ### How long a session directory lives
 
 koto removes a session's directory on the tick that lands it in a
-terminal state, with two exceptions that keep it: a terminal declared
-`failure: true` is always kept, and any other terminal is kept when
-that tick passes `koto next --no-cleanup`. The terminal response's
-`retention` field says which applied. A kept session's log and `ctx/`
+terminal state, with three exceptions that keep it: a terminal declared
+`failure: true` is always kept; a session with a link or lineage (a
+dispatcher, a koto parent or child, a `chain/parent`, or another session
+naming it) is kept with its hierarchy, with or without the flag; and any
+other terminal is kept when that tick passes `koto next --no-cleanup`.
+The terminal response's `retention` field says which applied. A kept session's log and `ctx/`
 stay exactly where they were, so `koto status`, `koto context get`,
 `koto rewind` and a parent's `retry_failed` all still work on it.
 
 A kept session is removed later by:
 
 - reaching a success terminal without `--no-cleanup` after a retry or
-  rewind;
-- its parent being removed by koto at the parent's own terminal, or
-  replaced with `koto init --attach-live --replace-terminal`, which
-  first removes the parent's terminal descendants (never a running one,
-  one with anything running under it, one it can't read, or one whose
-  request leg still waits for its result; on the terminal tick only a
-  parent with a batch hook or a `ChildCompleted` in its log is swept);
+  rewind, when it has no link or lineage;
+- its parent being replaced with `koto init --attach-live
+  --replace-terminal` once the retention rule releases their hierarchy,
+  which first removes the parent's terminal descendants (never a running
+  one, one with anything running under it, one it can't read, or one
+  whose request leg still waits for its result); while the rule keeps
+  the hierarchy, the replace moves the old run and its subtree aside to
+  `<name>_r<N>` instead;
 - `koto workspace prune --root <root>` on the finished root above it,
   once the retention rule releases it;
 - `koto session prune`, which removes finished sessions as a previewed

@@ -181,6 +181,28 @@ struct AnyLinkBody {
     session_id: Option<String>,
 }
 
+/// What the link file at `path` names, for [`super::edge_of`]: the session
+/// its body names and the session id it recorded. `Ok(None)` for a file
+/// that names nothing the graph could join (empty, oversized or malformed,
+/// which the graph reads as a problem of its holder, never as an edge);
+/// `Err` for a file that can't be read.
+pub(crate) fn link_file_names(
+    path: &Path,
+) -> std::io::Result<Option<(Option<String>, Option<String>)>> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let body = read_bounded(path)?;
+    if body.is_empty() || body.len() > MAX_LINK_BODY_BYTES {
+        return Ok(None);
+    }
+    Ok(serde_json::from_slice::<AnyLinkBody>(&body)
+        .ok()
+        .map(|b| (b.session, b.session_id)))
+}
+
 impl SessionFacts {
     /// Read session `name` under `base`.
     pub fn read(base: &Path, name: &str) -> SessionFacts {

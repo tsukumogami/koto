@@ -2183,6 +2183,67 @@ impl SessionBackend for CloudBackend {
         Ok(())
     }
 
+    fn remote_prefix_free(&self, id: &str) -> anyhow::Result<bool> {
+        // The prefix ends in `/`, so `x_r1/` never matches `x_r10/...`.
+        let prefix = self.session_prefix(id);
+        let results = self.bucket.list(prefix.clone(), None).map_err(|e| {
+            anyhow::anyhow!(
+                "listing {} failed: {}",
+                prefix,
+                without_url_userinfo(&e.to_string())
+            )
+        })?;
+        Ok(!results
+            .iter()
+            .any(|page| page.contents.iter().any(|o| o.key.starts_with(&prefix))))
+    }
+
+    fn relocate_checked(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.local_guard(from)?;
+        self.local_guard(to)?;
+        let old_prefix = self.session_prefix(from);
+        let new_prefix = self.session_prefix(to);
+        // List before renaming, so a failed listing changes nothing.
+        let results = self.bucket.list(old_prefix.clone(), None).map_err(|e| {
+            anyhow::anyhow!(
+                "listing {} failed: {}",
+                old_prefix,
+                without_url_userinfo(&e.to_string())
+            )
+        })?;
+        self.local.relocate(from, to)?;
+        // The state log's object name embeds the session name, so it is
+        // not copied: the caller pushes it under the new name. The marker
+        // stays where it is, as it does through a cleanup.
+        let old_state = self.state_key(from);
+        for page in &results {
+            for obj in &page.contents {
+                let Some(suffix) = obj.key.strip_prefix(&old_prefix) else {
+                    continue;
+                };
+                if obj.key == old_state || is_migration_marker(&old_prefix, &obj.key) {
+                    continue;
+                }
+                let bytes = self.fetch_object(&obj.key)?.ok_or_else(|| {
+                    anyhow::anyhow!("{} was listed but could not be fetched", obj.key)
+                })?;
+                self.put_object(&format!("{new_prefix}{suffix}"), &bytes)
+                    .with_context(|| format!("copying {} under {}", obj.key, new_prefix))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn relocate_local_only(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.local_guard(from)?;
+        self.local_guard(to)?;
+        self.local.relocate(from, to)
+    }
+
+    fn delete_remote_checked(&self, id: &str) -> anyhow::Result<()> {
+        self.delete_remote_session_checked(id)
+    }
+
     fn lock_state_file(&self, id: &str) -> Result<SessionLock, SessionError> {
         // `flock` is strictly a local, per-host primitive. Cloud
         // instances running on different hosts cannot observe each

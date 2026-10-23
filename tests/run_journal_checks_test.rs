@@ -2077,8 +2077,9 @@ fn a_terminal_tick_still_notifies_its_parent_while_the_journal_lock_is_held() {
         .map(|e| e["payload"]["child_name"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(notices, vec!["kid-free", "kid-held"]);
+    // Both are kept the same way: a child has lineage to its parent.
     for name in ["kid-free", "kid-held"] {
-        assert!(!env.session_dir(name).exists(), "{name} was kept");
+        assert!(env.session_dir(name).exists(), "{name} was removed");
     }
 }
 

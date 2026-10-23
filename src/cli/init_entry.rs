@@ -591,6 +591,43 @@ fn spawn_kind_code(kind: &SpawnErrorKind) -> String {
         .unwrap_or_else(|| "init_failed".to_string())
 }
 
+/// What a replace does with the finished session it finds.
+enum Disposition {
+    /// Its hierarchy is released: it is removed as it always was.
+    Release,
+    /// Its hierarchy is kept, for `reason`: it moves aside.
+    Keep { reason: String },
+}
+
+/// Judge the finished session `name` by the retention rule, over one scan
+/// of the local sessions directory. Anything that stops the judgment (a
+/// malformed retention setting, a sessions directory that can't be read, a
+/// judgment that fails) counts as keep, with a warning, so the old run is
+/// moved aside rather than removed.
+fn predecessor_disposition(backend: &Backend, name: &str) -> Disposition {
+    use crate::session::hierarchy::{reason_text, Graph, Judge, RetentionSettings, Scope};
+    let keep = |why: String| {
+        eprintln!("warning: {why}; the finished session '{name}' is moved aside, not removed");
+        Disposition::Keep { reason: why }
+    };
+    let settings = match RetentionSettings::load() {
+        Ok(s) => s,
+        Err(e) => return keep(format!("{e:#}")),
+    };
+    let graph = match Graph::scan(backend.local_base_dir()) {
+        Ok(g) => g,
+        Err(e) => return keep(format!("the sessions directory can't be read: {e:#}")),
+    };
+    let mut judge = Judge::new(&graph, settings, std::time::SystemTime::now());
+    match judge.judge(name, &Scope::Whole) {
+        Ok(j) if j.verdict.is_kept() => Disposition::Keep {
+            reason: reason_text(&j.verdict),
+        },
+        Ok(_) => Disposition::Release,
+        Err(e) => keep(format!("its hierarchy can't be judged: {e:#}")),
+    }
+}
+
 /// Create a session, or replace a terminal one, then bind the leg.
 fn create(
     backend: &Backend,
@@ -634,25 +671,77 @@ fn create(
         let result = replaced_result(backend, name, &old);
         (old.current_state.clone(), old.terminal.clone(), result)
     });
+    // The old run is judged by the retention rule. Released, it goes as it
+    // always did; kept, it and its subtree move aside (Decision 4).
+    let mut moved: Option<(super::move_aside::Moved, String)> = None;
     if replaced.is_some() {
-        // A new run under this name must not inherit the old run's kept
-        // children; they go with the session they belonged to. Unlike the
-        // terminal tick, this sweeps without checking for a batch hook: the
-        // template in scope here is the new one, not the one the old
-        // session ran, and replacing a finished session is rare. If the
-        // cleanup below then fails, the replace is refused with the old
-        // session in place and its kept children already gone; they were
-        // terminal, so nothing live is lost.
-        super::workspace::sweep_terminal_descendants(backend, backend, name);
-        if let Err(e) = backend.cleanup(name) {
-            refuse(
-                entry,
-                Refusal::new(
-                    Some("replace_failed"),
-                    format!("could not remove finished session '{name}': {e}"),
-                    1,
+        match predecessor_disposition(backend, name) {
+            Disposition::Release => {
+                // A new run under this name must not inherit the old run's
+                // kept children; they go with the session they belonged to,
+                // released with it. Unlike the terminal tick, this sweeps
+                // without checking for a batch hook: the template in scope
+                // here is the new one, not the one the old session ran. If
+                // the cleanup below then fails, the replace is refused with
+                // the old session in place and its kept children already
+                // gone; they were terminal, so nothing live is lost.
+                super::workspace::sweep_terminal_descendants(backend, backend, name);
+                if let Err(e) = backend.cleanup(name) {
+                    refuse(
+                        entry,
+                        Refusal::new(
+                            Some("replace_failed"),
+                            format!("could not remove finished session '{name}': {e}"),
+                            1,
+                        ),
+                    );
+                }
+            }
+            Disposition::Keep { reason } => match super::move_aside::move_aside(backend, name) {
+                Ok(m) => {
+                    for (old, why) in &m.undeleted {
+                        eprintln!(
+                            "warning: '{old}' moved, but its old remote prefix still holds \
+                             objects: {why}"
+                        );
+                    }
+                    moved = Some((m, reason));
+                }
+                Err(super::move_aside::MoveRefusal::HeldLive { live }) => refuse(
+                    entry,
+                    Refusal::new(
+                        Some("replace_held_live"),
+                        format!(
+                            "session '{name}' is kept by its hierarchy ({reason}), so it would \
+                             move aside, but its subtree holds live work that can't move: {}; \
+                             wait for it to finish, or cancel it, then replace",
+                            live.join(", ")
+                        ),
+                        2,
+                    )
+                    .with_field("live", live),
                 ),
-            );
+                Err(super::move_aside::MoveRefusal::Failed { message, stranded }) => {
+                    let mut r = Refusal::new(
+                        Some("replace_failed"),
+                        format!(
+                            "could not move finished session '{name}' aside: {message}; \
+                             nothing was replaced"
+                        ),
+                        1,
+                    );
+                    if !stranded.is_empty() {
+                        r = r.with_field(
+                            "stranded",
+                            stranded
+                                .iter()
+                                .map(|(o, n)| serde_json::json!({"from": o, "to": n}))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    refuse(entry, r)
+                }
+            },
         }
     }
 
@@ -729,6 +818,24 @@ fn create(
     if let Some((old_state, terminal, result)) = replaced {
         out["replaced_state"] = terminal.unwrap_or(old_state).into();
         out["replaced_result"] = serde_json::to_value(result)?;
+    }
+    if let Some((m, reason)) = moved {
+        out["moved_to"] = m.moved_to.into();
+        out["moved_reason"] = reason.into();
+        out["moved"] = m
+            .renamed
+            .iter()
+            .map(|(o, n)| serde_json::json!({"from": o, "to": n}))
+            .collect::<Vec<_>>()
+            .into();
+        if !m.undeleted.is_empty() {
+            out["undeleted_remote_prefixes"] = m
+                .undeleted
+                .iter()
+                .map(|(o, why)| serde_json::json!({"name": o, "error": why}))
+                .collect::<Vec<_>>()
+                .into();
+        }
     }
     if let Some((target, written)) = leg {
         out["leg"] = leg_json(target, written);

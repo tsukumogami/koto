@@ -1095,6 +1095,53 @@ fn edge_of_finds_own_and_inbound_edges() {
     assert!(edge_of(&s.base, "lone"));
 }
 
+/// `edge_of` finds every edge the graph joins a session through, the ones
+/// a link body names included: a session-id hint naming a predecessor moved
+/// aside under a new name, and a body of an unknown version naming a
+/// session other than its key's.
+#[test]
+fn edge_of_counts_what_link_bodies_name_as_the_graph_does() {
+    let s = store();
+    // `b` moved aside to `b_r1` (keeping its id), and a new run took `b`.
+    // `c`'s link names `b` by name and `b_r1` by the id it recorded.
+    s.finished("b_r1", 1);
+    s.finished("b", 2);
+    s.finished("c", 1);
+    let body = json!({"v": 1, "session": "b", "session_id": "id-b_r1", "at": ts(0)});
+    s.key(
+        "c",
+        "koto/links/dispatched-by/b",
+        body.to_string().as_bytes(),
+    );
+    let graph = Graph::scan(&s.base).unwrap();
+    assert!(graph
+        .edges()
+        .iter()
+        .any(|e| e.target == "b_r1" && matches!(e.via, Via::SessionIdHint(_))));
+    assert!(
+        edge_of(&s.base, "b_r1"),
+        "the hint joins the moved predecessor"
+    );
+
+    // A body of a version this koto doesn't know is an edge to the session
+    // it names, whatever the key's name.
+    s.finished("named", 1);
+    s.finished("holder", 1);
+    let body = json!({"v": 9, "session": "named"});
+    s.key(
+        "holder",
+        "koto/links/watched-by/other-name",
+        body.to_string().as_bytes(),
+    );
+    let graph = Graph::scan(&s.base).unwrap();
+    assert!(graph.edges().iter().any(|e| e.target == "named"));
+    assert!(edge_of(&s.base, "named"));
+
+    // A lone session is still lone: neither body names it.
+    s.finished("lone", 1);
+    assert!(!edge_of(&s.base, "lone"));
+}
+
 // ===== Rendering =====
 
 #[test]
@@ -1412,16 +1459,71 @@ fn the_two_level_verdict_equals_a_full_read_reference() {
             assert_eq!(&present, members, "round {round}, {name}: members");
             assert_eq!(j.verdict.is_kept(), *kept, "round {round}, {name}: {j:?}");
             // The terminal tick's probe never answers "no edge" for a session
-            // the graph joins to anything by name (session-id hints are the
-            // documented exception, and these stores write none).
-            let joined = graph.edges().iter().any(|e| {
-                !matches!(e.via, Via::SessionIdHint(_)) && (e.holder == name || e.target == name)
-            });
+            // the graph joins to anything.
+            let joined = graph
+                .edges()
+                .iter()
+                .any(|e| e.holder == name || e.target == name);
             if joined {
                 assert!(edge_of(&s.base, name), "round {round}, {name}: edge_of");
             }
         }
     }
+}
+
+/// The terminal tick removes a session only when `edge_of` answers "no
+/// edge", so it must never miss an edge the graph joins a session through,
+/// session-id hints included. Over random stores (migrated copies among
+/// them) where some links name one session and carry the id of another, as
+/// a link does once a re-run moves its peer aside or an import copies it,
+/// every session the graph joins to anything has an edge.
+#[test]
+fn edge_of_never_misses_an_edge_the_graph_joins_hints_included() {
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let mut hinted = 0;
+    for round in 0..60 {
+        let s = random_store(&mut rng);
+        let first = Graph::scan(&s.base).unwrap();
+        let names: Vec<String> = first.names().map(str::to_string).collect();
+        let pick = |rng: &mut Rng| names[rng.below(names.len() as u64) as usize].clone();
+        for _ in 0..1 + rng.below(4) {
+            let (holder, named, carrier) = (pick(&mut rng), pick(&mut rng), pick(&mut rng));
+            if holder == named || holder == carrier || named == carrier {
+                continue;
+            }
+            let Some(id) = first.facts(&carrier).and_then(|f| f.session_id.clone()) else {
+                continue;
+            };
+            let body = json!({"v": 1, "session": named, "session_id": id, "at": ts(0)});
+            // A holder koto refuses to write (a migrated source) just
+            // contributes no hint.
+            let _ = s.backend.add_with_writer(
+                &holder,
+                &format!("koto/links/dispatched-by/{named}"),
+                body.to_string().as_bytes(),
+                WRITER_KOTO,
+            );
+        }
+        let graph = Graph::scan(&s.base).unwrap();
+        for name in graph.names() {
+            let touching: Vec<_> = graph
+                .edges()
+                .iter()
+                .filter(|e| e.holder == name || e.target == name)
+                .collect();
+            // Joined by a hint alone: the case a probe by name would miss.
+            hinted += usize::from(
+                !touching.is_empty()
+                    && touching
+                        .iter()
+                        .all(|e| e.target == name && matches!(e.via, Via::SessionIdHint(_))),
+            );
+            if !touching.is_empty() {
+                assert!(edge_of(&s.base, name), "round {round}, {name}: edge_of");
+            }
+        }
+    }
+    assert!(hinted > 0, "no session was joined by a hint alone");
 }
 
 // ===== Layering =====

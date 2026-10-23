@@ -4,8 +4,9 @@
 //! Delivery and retention are separate: every arrival at a terminal records
 //! the result on the session's own log, writes the terminal-index entry and
 //! notifies the parent, once, whether or not the session is then kept.
-//! Retention is separate: a failure terminal is always kept, and
-//! `--no-cleanup` keeps any other terminal.
+//! Retention is separate: a failure terminal is always kept, a session with a
+//! link or lineage (every child here has lineage to its parent) is kept with
+//! its hierarchy, and `--no-cleanup` keeps any other terminal.
 
 #![cfg(unix)]
 
@@ -489,10 +490,11 @@ fn zero_one_or_two_parent_notices_give_the_same_gate() {
 
 /// With the parent log unwritable on the terminal tick, the tick still
 /// exits 0, warns, and keeps the child so the parent can still see it. The
-/// next tick, with the parent writable, delivers the notice and removes the
-/// child.
+/// next tick, with the parent writable, delivers the notice. The child stays
+/// either way: it has lineage to its parent, so it is kept with its
+/// hierarchy until a prune releases it.
 #[test]
-fn a_failed_parent_notice_keeps_the_child_until_it_is_delivered() {
+fn a_failed_parent_notice_is_delivered_on_the_next_tick() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     init_parent(dir, "p", PARENT_KEYED);
@@ -513,19 +515,23 @@ fn a_failed_parent_notice_keeps_the_child_until_it_is_delivered() {
     assert!(session_dir(dir, "p.leaf").exists(), "the child is kept");
     assert_eq!(child_completed(dir, "p").len(), 0);
 
-    run_ok(dir, &["next", "p.leaf"]);
+    let resp = run_ok(dir, &["next", "p.leaf"]);
+    assert_eq!(
+        resp["retention"],
+        serde_json::json!({"retained": true, "reason": "hierarchy"})
+    );
     assert!(
-        !session_dir(dir, "p.leaf").exists(),
-        "removed once delivered"
+        session_dir(dir, "p.leaf").exists(),
+        "kept with its hierarchy"
     );
     assert_eq!(child_completed(dir, "p").len(), 1);
 }
 
 /// A success terminal kept with `--no-cleanup` and ticked again without it
-/// is removed. The index gains nothing; the parent gains exactly one more
-/// notice, carrying the arrival's result, sent before the removal.
+/// is still kept: a child has lineage, so the flag doesn't decide. The
+/// index gains nothing, and neither does the parent's log.
 #[test]
-fn a_kept_child_ticked_without_the_flag_is_removed_and_renotifies_once() {
+fn a_kept_child_ticked_without_the_flag_stays_and_writes_nothing() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     init_parent(dir, "p", PARENT_KEYED);
@@ -547,11 +553,13 @@ fn a_kept_child_ticked_without_the_flag_is_removed_and_renotifies_once() {
 
     let resp = run_ok(dir, &["next", "p.leaf"]);
     assert_eq!(resp["action"], "done");
-    assert!(!session_dir(dir, "p.leaf").exists());
+    assert_eq!(
+        resp["retention"],
+        serde_json::json!({"retained": true, "reason": "hierarchy"})
+    );
+    assert!(session_dir(dir, "p.leaf").exists());
     assert_eq!(index_entries(dir, "p.leaf"), 1);
-    let after = child_completed(dir, "p");
-    assert_eq!(after.len(), 2, "{after:?}");
-    assert!(after.iter().all(|n| n["result"] == first[0]["result"]));
+    assert_eq!(child_completed(dir, "p"), first);
 }
 
 // ===== Helpers that change files =====
@@ -890,10 +898,9 @@ fn a_removed_session_is_still_refused() {
     let dir = tmp.path();
     batch_with_leaf(dir);
     run_ok(dir, &["next", "p.leaf", "--with-data", DONE]);
-    assert!(
-        !session_dir(dir, "p.leaf").exists(),
-        "a success terminal is removed"
-    );
+    // The child is kept with its hierarchy; a person removes it.
+    run_ok(dir, &["session", "cleanup", "p.leaf"]);
+    assert!(!session_dir(dir, "p.leaf").exists());
 
     let (_, out, _) = run(
         dir,
@@ -992,28 +999,31 @@ fn a_directed_move_between_terminals_notifies_once() {
     assert_eq!(resp["state"], "done");
     assert_eq!(
         resp["retention"],
-        serde_json::json!({"retained": true, "reason": "no_cleanup"})
+        serde_json::json!({"retained": true, "reason": "hierarchy"})
     );
     let notices = child_completed(dir, "p");
     assert_eq!(notices.len(), 2);
     assert_eq!(notices[1]["final_state"], "done");
     assert_eq!(notices[1]["result"]["status"], "success");
 
-    // Without the flag, the same move lands in a success terminal and the
-    // session is removed after its notice.
+    // Without the flag, the same move lands in a success terminal, sends its
+    // notice, and the child stays with its hierarchy.
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     init_parent(dir, "p", PARENT_KEYED);
     init_child(dir, "p.leaf", "p", CHILD_WITH_RECOVERY);
     run_ok(dir, &["next", "p.leaf", "--with-data", FAIL]);
     let resp = run_ok(dir, &["next", "p.leaf", "--to", "done"]);
-    assert_eq!(resp["retention"], serde_json::json!({"retained": false}));
-    assert!(!session_dir(dir, "p.leaf").exists());
+    assert_eq!(
+        resp["retention"],
+        serde_json::json!({"retained": true, "reason": "hierarchy"})
+    );
+    assert!(session_dir(dir, "p.leaf").exists());
     assert_eq!(child_completed(dir, "p").len(), 2);
 }
 
 #[test]
-fn a_retried_child_that_succeeds_is_removed() {
+fn a_retried_child_that_succeeds_is_kept_with_its_hierarchy() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     batch_with_leaf(dir);
@@ -1027,11 +1037,13 @@ fn a_retried_child_that_succeeds_is_removed() {
             r#"{"retry_failed":{"children":["leaf"]}}"#,
         ],
     );
-    run_ok(dir, &["next", "p.leaf", "--with-data", DONE]);
-    assert!(
-        !session_dir(dir, "p.leaf").exists(),
-        "a success terminal is removed"
+    let resp = run_ok(dir, &["next", "p.leaf", "--with-data", DONE]);
+    assert_eq!(
+        resp["retention"],
+        serde_json::json!({"retained": true, "reason": "hierarchy"}),
+        "a child's success terminal is kept with its hierarchy"
     );
+    assert!(session_dir(dir, "p.leaf").exists());
 
     let output = gate_output(&run_ok(dir, &["next", "p"]));
     let leaf = gate_child(&output, "p.leaf");

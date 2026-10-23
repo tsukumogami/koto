@@ -440,15 +440,22 @@ fn init_dispatched_by_with_entry_flags_and_from_stdin_records_the_link() {
             "--no-cleanup",
         ],
     );
-    single_writer(dir, "w4", || {
-        let out = init(
-            dir,
-            "w4",
-            &["--replace-terminal", "--dispatched-by", "dispatcher"],
-        );
-        assert_eq!(out["outcome"], "replaced", "{out}");
-    });
+    // The finished run is inside its retention, so it moves aside to
+    // `w4_r1` rather than being removed; it and the new run are the only
+    // sessions the replace writes.
+    let before = other_sessions(dir, "w4");
+    let out = init(
+        dir,
+        "w4",
+        &["--replace-terminal", "--dispatched-by", "dispatcher"],
+    );
+    assert_eq!(out["outcome"], "replaced", "{out}");
+    assert_eq!(out["moved_to"], "w4_r1", "{out}");
+    let mut after = other_sessions(dir, "w4");
+    assert!(after.remove("w4_r1").is_some());
+    assert_eq!(after, before, "a session other than the moved run changed");
     assert!(link(dir, "w4", "dispatcher").is_some());
+    assert!(link(dir, "w4_r1", "dispatcher").is_none());
 }
 
 #[test]

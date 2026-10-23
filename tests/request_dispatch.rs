@@ -457,9 +457,10 @@ fn a_bound_childs_terminal_tick_resolves_its_leg() {
     );
     assert_eq!(terminal["action"], "done");
 
-    // The session is gone, and the leg is resolved anyway: the envelope
-    // rides by value, so promotion needs no surviving directory.
-    assert!(!session_dir(tmp.path(), "child-1").exists());
+    // The child has lineage to its coordinator, so the tick keeps it with
+    // its hierarchy, and the leg is resolved on that same tick.
+    assert_eq!(terminal["retention"]["reason"], "hierarchy");
+    assert!(session_dir(tmp.path(), "child-1").exists());
 
     let envelope = run_ok(tmp.path(), &["request", "get", &id]);
     let leg = &envelope["legs"]["reviewer-a"];
@@ -523,7 +524,7 @@ fn a_directed_transition_to_terminal_also_resolves_the_leg() {
     // open forever.
     let terminal = run_ok(tmp.path(), &["next", "child-1", "--to", "done"]);
     assert_eq!(terminal["action"], "done");
-    assert!(!session_dir(tmp.path(), "child-1").exists());
+    assert_eq!(terminal["retention"]["reason"], "hierarchy");
 
     let envelope = run_ok(tmp.path(), &["request", "get", &id]);
     assert_eq!(envelope["legs"]["reviewer-a"]["disposition"], "resolved");
@@ -669,7 +670,8 @@ fn a_closed_request_does_not_fail_a_bound_childs_terminal_tick() {
         ],
     );
     assert_eq!(code, 0, "a closed request must not fail the tick: {stderr}");
-    assert!(!session_dir(tmp.path(), "child-1").exists());
+    // Kept with its hierarchy: it has lineage to its coordinator.
+    assert!(session_dir(tmp.path(), "child-1").exists());
 }
 
 #[test]
@@ -690,7 +692,7 @@ fn an_unbound_child_completes_exactly_as_before() {
     );
     assert_eq!(terminal["action"], "done");
     assert!(terminal.get("leg").is_none());
-    assert!(!session_dir(tmp.path(), "child-1").exists());
+    assert_eq!(terminal["retention"]["reason"], "hierarchy");
     let parent_log = std::fs::read_to_string(state_path(tmp.path(), "coord-a")).unwrap();
     assert!(
         parent_log.contains("child_completed"),

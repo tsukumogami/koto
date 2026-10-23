@@ -867,6 +867,65 @@ fn a_subtree_member_with_a_live_dispatcher_stays_and_a_released_one_goes() {
     assert_eq!(v["descendants_removed"], 2);
 }
 
+/// A tree its own terminal ticks kept (a child has lineage, so neither the
+/// child's tick nor the root's removes anything) is reclaimed by the prune
+/// once released. The subtree walk is the shared one: a member whose
+/// `parent_workflow` names an epoch branch nothing holds (`x~1`, as a batch
+/// rewind leaves it) is under `x`, and goes with it.
+#[test]
+fn a_tree_kept_at_its_terminal_ticks_is_reclaimed_through_the_shared_walk() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    init_workflow(d, "x", non_terminal_template());
+    init_child_workflow(d, "x", "c", non_terminal_template());
+    init_child_workflow(d, "x", "e", terminal_at_init_template());
+    let e_state = session_dir(d, "e").join("koto-e.state.jsonl");
+    koto::engine::claim::rewrite_header_atomically(&e_state, |mut h| {
+        h.parent_workflow = Some("x~1".into());
+        h
+    })
+    .unwrap();
+
+    let tick = |name: &str| {
+        let out = koto_cmd(d)
+            .args(["next", name, "--with-data", r#"{"done": true}"#])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        last_json(&out.stdout)
+    };
+    let v = tick("c");
+    assert_eq!(v["retention"]["reason"], "hierarchy", "{v:#}");
+    let v = tick("x");
+    assert_eq!(v["retention"]["reason"], "hierarchy", "{v:#}");
+    for name in ["x", "c", "e"] {
+        assert!(
+            session_dir(d, name).exists(),
+            "{name} was removed at a tick"
+        );
+    }
+
+    settle();
+    let (v, _) = prune_yes(d, "x", &[]);
+    let removed: Vec<String> = v["removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(removed.last().map(String::as_str), Some("x"), "{v:#}");
+    for name in ["c", "e"] {
+        assert!(removed.contains(&name.to_string()), "{name}: {v:#}");
+    }
+    for name in ["x", "c", "e"] {
+        assert!(!session_dir(d, name).exists(), "{name} was left");
+    }
+}
+
 #[test]
 fn a_finished_tree_inside_its_retention_is_kept_and_listed() {
     let dir = TempDir::new().unwrap();

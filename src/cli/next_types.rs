@@ -721,24 +721,46 @@ pub enum RetentionReason {
     FailureTerminal,
     /// A non-failure terminal kept because the tick passed `--no-cleanup`.
     NoCleanup,
+    /// The session has a link or lineage: a link of its own, a
+    /// `parent_workflow`, a `chain/parent`, or another session naming it
+    /// through one of those (`crate::session::hierarchy::edge_of`). Kept with
+    /// or without `--no-cleanup`; `koto session prune` reclaims it once its
+    /// hierarchy is released.
+    Hierarchy,
 }
 
 impl RetentionReason {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             RetentionReason::FailureTerminal => "failure_terminal",
             RetentionReason::NoCleanup => "no_cleanup",
+            RetentionReason::Hierarchy => "hierarchy",
         }
     }
+}
+
+/// One terminal descendant a kept parent's tick lists in `kept_children`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KeptChild {
+    pub name: String,
+    /// The retention reason code, as `retention.reason` spells it.
+    pub reason: &'static str,
+    /// The links and lineage that keep it, naming the sessions they name.
+    pub detail: String,
 }
 
 /// What koto does with a session after a terminal tick, as the `retention`
 /// field of the `koto next` response: `{"retained": false}` when the session
 /// is removed, `{"retained": true, "reason": "..."}` when it is kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `kept_children` rides beside it as the response's own `kept_children`
+/// field, present only when it isn't empty: the terminal descendants a
+/// kept parent's tick would have swept, each kept with its hierarchy.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Retention {
     /// `Some` when the session is kept, carrying why.
     pub reason: Option<RetentionReason>,
+    pub kept_children: Vec<KeptChild>,
 }
 
 impl Serialize for Retention {
@@ -857,8 +879,14 @@ impl Serialize for NextResponse {
                 result,
                 retention,
             } => {
-                let count =
-                    6 + result.as_ref().map_or(0, |_| 1) + retention.as_ref().map_or(0, |_| 1);
+                let kept_children = retention
+                    .as_ref()
+                    .map(|r| r.kept_children.as_slice())
+                    .unwrap_or(&[]);
+                let count = 6
+                    + result.as_ref().map_or(0, |_| 1)
+                    + retention.as_ref().map_or(0, |_| 1)
+                    + usize::from(!kept_children.is_empty());
                 let mut map = serializer.serialize_map(Some(count))?;
                 map.serialize_entry("action", "done")?;
                 map.serialize_entry("state", state)?;
@@ -871,6 +899,9 @@ impl Serialize for NextResponse {
                 }
                 if let Some(r) = retention {
                     map.serialize_entry("retention", r)?;
+                }
+                if !kept_children.is_empty() {
+                    map.serialize_entry("kept_children", kept_children)?;
                 }
                 map.end()
             }
