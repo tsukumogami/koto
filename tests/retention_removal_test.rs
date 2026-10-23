@@ -12,7 +12,10 @@
 //! also delivers the session's completion to its koto parent, so that
 //! parent's log may grow by `child_completed` events and nothing else.
 //! Other sessions are read with commands that record no read (`koto session
-//! hierarchy`, `koto context list`).
+//! hierarchy`, `koto context list`), and, in Finished child, Finished parent
+//! and Grandchild, with `koto context get` and `koto context exists` from
+//! another agent session, whose read records go to that session's anchor
+//! (`Env::read_from_another_agent_session`).
 //!
 //! The workspace-prune steps of these scenarios live here rather than in
 //! `tests/cli_workspace_prune.rs` because they need the same single-writer
@@ -240,6 +243,49 @@ impl Env {
             "--from-file",
             file.to_str().unwrap(),
         ]);
+    }
+
+    /// Read `key` of `name` from another agent session, as an agent driving
+    /// another session would: `koto context get` and `koto context exists`
+    /// with `KOTO_ANCHOR` naming that agent session's anchor,
+    /// `anchor-reader` (opened here on first use). Each is a single-writer
+    /// step in which only the reader's anchor may change, so `name` hashes
+    /// the same, and each adds one read record to the anchor naming `name`
+    /// and `key` (DESIGN-session-retention.md, Decision 5).
+    fn read_from_another_agent_session(&self, name: &str, key: &str) {
+        const READER: &str = "anchor-reader";
+        if !self.exists(READER) {
+            let out = self.run(
+                &[
+                    "session",
+                    "anchor",
+                    "open",
+                    "--harness-session",
+                    "reader",
+                    "--source",
+                    "startup",
+                ],
+                &[],
+            );
+            assert!(out.status.success(), "anchor open: {out:?}");
+        }
+        let env = [("KOTO_ANCHOR", READER)];
+        for (verb, access) in [("get", "content"), ("exists", "presence")] {
+            let before = self.events_text(READER).len();
+            self.step(&[READER], None, &[], || {
+                let out = self.run(&["context", verb, name, key], &env);
+                assert!(out.status.success(), "context {verb} {name} {key}: {out:?}");
+            });
+            let added: Vec<Value> = self.events_text(READER)[before..]
+                .iter()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert_eq!(added.len(), 1, "{added:#?}");
+            assert_eq!(added[0]["type"], "context_read");
+            assert_eq!(added[0]["payload"]["session"], name);
+            assert_eq!(added[0]["payload"]["key"], key);
+            assert_eq!(added[0]["payload"]["access"], access);
+        }
     }
 
     /// The keys `name` holds, read with a command that records no read.
@@ -571,6 +617,7 @@ fn a_finished_parent_is_kept_and_lists_its_terminal_children() {
     assert!(env.keys("a").contains(&"notes/a".to_string()));
     let h = env.hierarchy("c", &[]);
     assert!(listed(&h, "members").contains(&"a".to_string()), "{h:#}");
+    env.read_from_another_agent_session("a", "notes/a");
 
     // The prunes name c as why a and b are kept.
     for args in [&[][..], &["--apply", "--all"][..]] {
@@ -634,6 +681,7 @@ fn finished_child(no_request_store: bool) {
     assert!(env.keys("b").contains(&"notes/b".to_string()));
     let h = env.hierarchy("a", &[]);
     assert!(listed(&h, "members").contains(&"b".to_string()), "{h:#}");
+    env.read_from_another_agent_session("b", "notes/b");
     assert!(env.exists("x"));
 }
 
@@ -667,6 +715,7 @@ fn grandchild(no_request_store: bool) {
         );
     }
     assert!(env.exists("b") && env.exists("c"));
+    env.read_from_another_agent_session("c", "notes/c");
 }
 
 #[test]

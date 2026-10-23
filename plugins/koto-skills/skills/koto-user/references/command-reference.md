@@ -1103,6 +1103,8 @@ Retrieves stored content and writes it to stdout, or to `--to-file` if specified
 
 Exit 3 if the key does not exist or an I/O error occurs.
 
+**Where the read is recorded.** `get` and `exists` each log one `context_read` (key name and value hash, never the value). Under the local backend, when `KOTO_ANCHOR` names an anchor that is neither `<session>` nor one `<session>` holds through `koto/links/held-by/<anchor>` (a read from another agent session), the record goes into that anchor's log with a `session` field naming `<session>`, and `<session>`'s files stay byte-identical. Your own session's reads, and reads with no anchor (unset, or naming no anchor here), still log in `<session>`. A record that can't be appended prints a warning and the read still answers. Under the cloud backend every read still logs in `<session>`. `koto context list` and `koto status` record no read anywhere.
+
 ---
 
 ## koto context exists
@@ -1111,7 +1113,7 @@ Exit 3 if the key does not exist or an I/O error occurs.
 koto context exists <session> <key>
 ```
 
-Checks whether a key exists in the session's context store.
+Checks whether a key exists in the session's context store. The read is recorded as `koto context get`'s is (see above).
 
 **Exit-code contract:**
 - Exit 0 — key is present

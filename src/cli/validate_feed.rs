@@ -549,4 +549,25 @@ Body text.
             assert!(result.is_err(), "shipped spec accepted: {bad}");
         }
     }
+
+    /// A reader's anchor log: one `context_read` carrying the optional
+    /// `session` field naming the session read, and one without it, both
+    /// accepted; a `session` that isn't a string is refused, so the field is
+    /// declared rather than skipped as unknown.
+    #[test]
+    fn shipped_spec_accepts_a_context_read_with_and_without_session() {
+        let lines = [
+            anchored_header_line(),
+            r#"{"seq":1,"timestamp":"t","type":"context_read","payload":{"key":"k","reader":"cli","state":"s","present":true,"hash":"h","access":"content","session":"wf-b"}}"#,
+            r#"{"seq":2,"timestamp":"t","type":"context_read","payload":{"key":"k","reader":"cli","state":"s","present":false,"access":"presence"}}"#,
+        ];
+        let log = write_temp(&(lines.join("\n") + "\n"));
+        let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+        assert!(result.is_ok(), "shipped spec rejected: {:?}", result.err());
+
+        let bad = r#"{"seq":1,"timestamp":"t","type":"context_read","payload":{"key":"k","reader":"cli","state":"s","present":false,"session":7}}"#;
+        let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), bad));
+        let result = validate_feed_with_spec(log.path().to_str().unwrap(), &shipped_spec());
+        assert!(result.is_err(), "shipped spec accepted: {bad}");
+    }
 }
