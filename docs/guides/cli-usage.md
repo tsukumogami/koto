@@ -643,6 +643,13 @@ Records that another session dispatched this one.
 koto session link <session> --dispatched-by <name>
 ```
 
+For example, a run started with no request leg records the coordinator that dispatched it, either afterwards or as it is created:
+
+```bash
+koto session link work-on-12 --dispatched-by deliver-a
+koto init work-on-13 --template ./work-on.md --dispatched-by deliver-a
+```
+
 Writes one dispatched-by link, the context key `koto/links/dispatched-by/<name>`, into `<session>`'s own context and nowhere else. The dispatcher isn't written and need not exist. The command is meant for the session's own driver, when a dispatch had no request leg to record it; `koto init --dispatched-by` does the same as the session is created, and a leg-bound session gets its link from the request (see [init](#entry-flags) and [request attach](#request-attach)).
 
 The link's value is one JSON object:
@@ -694,6 +701,23 @@ The guarded form a workspace runs when an agent session is reaped:
 koto session anchor close --help >/dev/null 2>&1 || exit 0
 exec koto session anchor close --key="$NIWA_REAP_KEY" --harness-session="$NIWA_SESSION_ID"
 ```
+
+Each guard exits 0 quietly: with no reap key, with no koto on the `PATH`, and with a koto older than the anchor verbs, whose `koto session anchor close --help` fails. So the same command is safe on a host that hasn't upgraded. In niwa's workspace configuration, declare `KOTO_DISPATCHER_ANCHOR` and nothing else in the dispatch pass-through list, so a dispatched worker's start hook links its anchor to the dispatcher's, and `KOTO_ANCHOR` in the list of variables removed from the worker's environment, so a worker never acts under its dispatcher's anchor.
+
+An agent session, a run it holds, and the close its reap would run, by hand:
+
+```bash
+koto session anchor open --harness-session demo-1 --source startup --observed-key demo-key
+# anchor=anchor-demo-1
+# opened=new
+# observed=yes
+KOTO_ANCHOR=anchor-demo-1 koto init demo-run --template ./demo.md
+koto session hierarchy demo-run      # kept: anchor-demo-1 is alive
+koto session anchor close --key=demo-key --harness-session=demo-1
+# closed=1
+```
+
+**The koto-skills start hook.** With the koto-skills plugin, Claude Code runs `hooks/session-start.sh` at every start, resume, compaction and `/clear`. It opens `anchor-<session id>` with the agent process's token, the transcript path and the working directory, passing the anchor it inherited (`KOTO_DISPATCHER_ANCHOR`, else `KOTO_ANCHOR`) as `--dispatched-by`, and niwa's `NIWA_REAP_KEY` as `--observed-key` only when no `KOTO_ANCHOR` was inherited, so a process started from another agent session's shell never takes that session's key. It then replaces its own block, between `# >>> koto-skills` and `# <<< koto-skills`, in the hook's `CLAUDE_ENV_FILE`, which Claude Code sources before every shell command: `export KOTO_ANCHOR='<anchor>'` and `export KOTO_DISPATCHER_ANCHOR='<anchor>'`, both naming the session's own anchor, then `unset NIWA_REAP_KEY`. When the open fails, the block unsets both variables instead, so the shells never keep a dispatcher's anchor. When `CLAUDE_ENV_FILE` is unset, a symlink, or in another session's directory, nothing is written and the hook returns the `KOTO_ANCHOR` export line as `additionalContext`. On a start with no key (and a resume that opened a successor), a detached watcher reads, and never sources, the session's other env files for niwa's `export NIWA_REAP_KEY='<value>'` line for three minutes and runs `observe --key` with it; after a `/clear`, one runs `observe --inherit` until `inherit_until`. The hook always exits 0, and does nothing without koto or `jq`; with a koto that has no anchor verbs, or one that takes longer than 5 seconds and is cut off, it unsets both variables. Every koto call it makes runs with the `KOTO_SESSION_*` variables removed, so the anchor lives in the store koto's config files name: a user who chooses the cloud backend through those variables alone, and not in a config file, gets an anchor their shells' koto commands don't see, which keeps nothing, as before the hook. Set the backend in a config file instead. Don't run the anchor verbs yourself in such a session; `koto session hierarchy` says why a session is kept.
 
 #### session hierarchy
 
@@ -1172,6 +1196,13 @@ Credential keys (`access_key`, `secret_key`) can also be provided through enviro
 The `decider` keys opt a user in to consulting a decider on template fields that declare one. `KOTO_DECIDER`, `KOTO_DECIDER_API_KEY`, and `KOTO_DECIDER_ENDPOINT` override `mode`, `api_key`, and `endpoint`. Unlike other keys, a project `decider.mode` doesn't replace the user's: the lower of the two applies, so a repository can turn the decider down but never on. koto ignores `api_key`, `endpoint`, and `timeout_ms` in project config with a warning. A key is sent only to an endpoint set in the same place (both env or both user config) or to the default, and `koto config get decider.api_key` prints `<set>`, never the key. A key must be printable ASCII: one holding a control character (a newline, say) or a non-ASCII character is ignored with a warning, and `koto config set` refuses it. A config file that won't parse is reported by path, line, and column only; koto never prints its content, since it can hold a key. See [decider-authoring.md](decider-authoring.md) for opting in, what a consultation sends, and how a template value is promoted.
 
 The `retention` keys decide how long a finished hierarchy of sessions is kept (see [session hierarchy](#session-hierarchy)): `retention.keep` is how long after its release instant, `retention.idle_period` how long an anchor with no observed marker stays open after its last activity, and `retention.stale_after` how long after its last activity an observed anchor is reported stale. Each resolves `KOTO_RETENTION_KEEP`, `KOTO_RETENTION_IDLE_PERIOD` or `KOTO_RETENTION_STALE_AFTER` first, then project config, then user config, then the default, and `koto config list` prints where each came from (`# origin: retention.keep = env KOTO_RETENTION_KEEP`, or the `origins` object with `--json`). A value is a whole number followed by `s`, `m`, `h` or `d` and longer than zero, and `retention.stale_after` must be longer than `retention.keep`, so a stale report never comes before a release. `koto config set` refuses a malformed value; one that reaches a config file or the environment anyway is refused, naming the setting and where it came from, by the commands that judge retention. Loading the configuration never fails on these keys, and no tick fails on them: whether a tick keeps its session never depends on them, and the activity throttle of `init` and `next` reads `retention.idle_period` with a fallback to the default. They are outside the `KOTO_SESSION_*` family on purpose: koto passes that family to the commands a tick runs.
+
+```bash
+koto config set --user retention.keep 3d        # keep released hierarchies three days
+koto config set retention.idle_period 12h       # this project: unobserved anchors close after 12 hours
+KOTO_RETENTION_STALE_AFTER=60d koto session prune   # one preview with a longer stale threshold
+koto config list | grep retention                # each value with its origin
+```
 
 `workflows.native` controls rendering koto sessions in Claude Code's `/workflows` screen (see [native-workflows-verification.md](native-workflows-verification.md)); it is on by default and a participating session self-discovers its target directory from `CLAUDE_CODE_SESSION_ID`. Set it to `false` to opt out. A fully headless run (no Claude Code environment) renders nothing regardless.
 

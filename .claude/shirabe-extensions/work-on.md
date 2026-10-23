@@ -22,7 +22,7 @@ default list and passes the gate without the checks this file names for them: ru
   `build.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `CLAUDE.md` -> every default command below
 - `plugins/**`, `.claude-plugin/**`, `scripts/check-evals-exist.sh`, `scripts/check-inline-evidence.sh`,
   `scripts/check-inline-evidence_test.sh` -> all of:
-  - `cargo test --test doc_names` (the only Rust test that reads `plugins/`)
+  - `cargo test --test doc_names --test plugin_hooks_shape` (the two Rust tests that read `plugins/`)
   - `bash scripts/check-evals-exist.sh`
   - `bash scripts/check-inline-evidence_test.sh` (`validate.yml`'s `inline-evidence` job)
   - `for d in $(find plugins/*/skills/*/ -maxdepth 0 -type d 2>/dev/null); do test ! -f "$d/hooks.json" || exit 1; done`
@@ -30,6 +30,7 @@ default list and passes the gate without the checks this file names for them: ru
   - `M=.claude-plugin/marketplace.json && test -f "$M" && jq -e ".name and (.name | length > 0)" "$M" >/dev/null && jq -e ".owner and (.owner | length > 0)" "$M" >/dev/null && jq -e ".plugins and (.plugins | length > 0)" "$M" >/dev/null`
   - `cargo build --release && K="${CARGO_TARGET_DIR:-target}/release/koto" && { test -x "$K" || { echo "no koto binary at $K" >&2; exit 1; }; } && T=$(find plugins/koto-skills/skills/ -path "*/koto-templates/*.md" ! -name "*.mermaid.md" -type f) && test -n "$T" && printf "%s\n" "$T" | xargs -r -n1 "$K" template compile` (unlike CI: fails on an empty list, so it can't pass having compiled nothing, and finds the binary through `CARGO_TARGET_DIR`)
   - `cargo build --release -q && ( K="${CARGO_TARGET_DIR:-target}/release" && { test -x "$K/koto" || { echo "no koto binary at $K/koto" >&2; exit 1; }; } && S=$(mktemp -d) && mkdir -p "$S/mock" && printf '{"schema_version":1,"workflow":"mock","template_hash":"abc123","created_at":"2025-01-01T00:00:00Z"}\n{"seq":1,"timestamp":"2025-01-01T00:00:00Z","type":"workflow_initialized","payload":{"template_path":"mock","variables":{}}}\n{"seq":2,"timestamp":"2025-01-01T00:00:00Z","type":"transitioned","payload":{"from":null,"to":"test-state","condition_type":"auto"}}\n' > "$S/mock/koto-mock.state.jsonl" && export PATH="$(cd "$K" && pwd):$PATH" && export KOTO_SESSIONS_BASE="$S" && bash plugins/koto-skills/hooks/stop-workflows.sh 2>/dev/null | grep -q "Active koto workflow detected" && export KOTO_SESSIONS_BASE=$(mktemp -d) && test -z "$(bash plugins/koto-skills/hooks/stop-workflows.sh 2>/dev/null || true)" )` (unlike CI, finds the binary through `CARGO_TARGET_DIR` and fails if none was built, so it can't test an installed koto)
+  - `cargo build --release -q && K="${CARGO_TARGET_DIR:-target}/release" && { test -x "$K/koto" || { echo "no koto binary at $K/koto" >&2; exit 1; }; } && PATH="$(cd "$K" && pwd):$PATH" bash plugins/koto-skills/hooks/test/session-start.test.sh` (unlike CI, finds the binary through `CARGO_TARGET_DIR`, and reports the hook's 95th-percentile time without enforcing the 300 ms bound unless `CI` or `KOTO_HOOK_TIMING=enforce` is set)
 - `docs/**` -> all of:
   - `cargo test --test doc_names` and `cargo test --lib shipped_spec` (the only tests that read `docs/`)
   - `B=$(git merge-base origin/main HEAD) && git diff --name-only --diff-filter=ACMR "$B" -- :/docs/ | grep -vE "(^|/)(evals|tests)/fixtures/" | xargs -r shirabe validate --visibility=public` (errors out when `origin/main` is missing: that is cannot-verify, not a failed change)
@@ -71,7 +72,7 @@ default list and passes the gate without the checks this file names for them: ru
 - `.github/**` (except `.github/pull_request_template.md` and the two workflows in the previous
   entry); `install.sh`; `scripts/**` (except `scripts/check-evals-exist.sh`, the two inline-evidence files and the
   three run-evals files above); `.release/**`; `.goreleaser.yaml`; `.cargo/**`;
-  `plugins/koto-skills/hooks/*.sh`; `.claude/settings.json` -> no local check exists. Still run
+  `plugins/koto-skills/hooks/*.sh` (except `session-start.sh`, which the session-start suite in the `plugins/**` entry runs); `.claude/settings.json` -> no local check exists. Still run
   every other selected command; if one fails the outcome is failed, otherwise it is cannot-verify:
   no command here checks what these files do and most are not read by PR CI either, so the run
   stops for a person to check them. (shirabe's schema has no form for such an entry yet:

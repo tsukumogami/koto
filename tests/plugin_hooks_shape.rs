@@ -7,8 +7,9 @@
 //! root-level `hooks.json` with the command entries directly under each event,
 //! which Claude Code never read, so none of its hooks ran.
 //!
-//! The file now registers no hook; its empty `hooks` object is where a later
-//! SessionStart group goes. The /workflows SessionStart script
+//! The file registers one SessionStart group, which runs
+//! `hooks/session-start.sh` (it opens the agent session's anchor) and nothing
+//! else. The /workflows SessionStart script
 //! (`hooks/session-start-workflows.sh`) and the Stop reminder
 //! (`hooks/stop-workflows.sh`) stay on disk and stay off: registering them
 //! would run a command at every session start and every turn end for every
@@ -96,6 +97,41 @@ fn plugin_hook_file_is_matcher_group_shaped_and_keeps_old_hooks_off() {
     if let Err(problems) = check_hooks_path(&path) {
         panic!("{HOOKS_FILE}:\n  {}", problems.join("\n  "));
     }
+}
+
+#[test]
+fn plugin_hook_file_registers_only_the_anchor_hook() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(root.join(HOOKS_FILE)).unwrap();
+    let doc: Value = serde_json::from_str(&text).unwrap();
+    let events = doc["hooks"].as_object().unwrap();
+    assert_eq!(
+        events.keys().collect::<Vec<_>>(),
+        ["SessionStart"],
+        "{HOOKS_FILE} registers an event other than SessionStart"
+    );
+    let groups = events["SessionStart"].as_array().unwrap();
+    assert_eq!(
+        groups.len(),
+        1,
+        "{HOOKS_FILE} has more than one SessionStart group"
+    );
+    let hooks = groups[0]["hooks"].as_array().unwrap();
+    assert_eq!(
+        hooks.len(),
+        1,
+        "the SessionStart group runs more than one command"
+    );
+    let command = hooks[0]["command"].as_str().unwrap();
+    assert_eq!(
+        command, r#"bash "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh""#,
+        "the SessionStart group runs something other than hooks/session-start.sh"
+    );
+    assert!(
+        root.join("plugins/koto-skills/hooks/session-start.sh")
+            .is_file(),
+        "hooks/session-start.sh is missing"
+    );
 }
 
 #[test]

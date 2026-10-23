@@ -899,6 +899,17 @@ koto session anchor close --help >/dev/null 2>&1 || exit 0
 exec koto session anchor close --key="$NIWA_REAP_KEY" --harness-session="$NIWA_SESSION_ID"
 ```
 
+Every guard exits 0 quietly, including the `--help` check, which fails on a koto older than the anchor verbs, so the command is safe on a host that hasn't upgraded. In niwa's workspace configuration, declare only `KOTO_DISPATCHER_ANCHOR` in the dispatch pass-through list and `KOTO_ANCHOR` in the list of variables removed from a worker's environment.
+
+```bash
+koto session anchor open --harness-session demo-1 --source startup --observed-key demo-key
+# anchor=anchor-demo-1 / opened=new / observed=yes
+KOTO_ANCHOR=anchor-demo-1 koto init demo-run --template ./demo.md
+koto session anchor close --key=demo-key --harness-session=demo-1    # closed=1
+```
+
+**The plugin's start hook.** koto-skills registers `hooks/session-start.sh` for every start, resume, compaction and `/clear`. It opens `anchor-<session id>`, linked to the anchor it inherited (`KOTO_DISPATCHER_ANCHOR`, else `KOTO_ANCHOR`), with niwa's `NIWA_REAP_KEY` as the marker only when no `KOTO_ANCHOR` was inherited. It writes `export KOTO_ANCHOR='<anchor>'` and `export KOTO_DISPATCHER_ANCHOR='<anchor>'` (both its own anchor) and `unset NIWA_REAP_KEY` into its `# >>> koto-skills` block of `CLAUDE_ENV_FILE`, or `unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR` when the open fails. Without a usable env file it returns the `KOTO_ANCHOR` export line as `additionalContext`. A detached watcher picks up a reap key niwa writes later, or a `/clear` predecessor's marker. So in a session with the plugin `KOTO_ANCHOR` is already set: don't run the anchor verbs, and ask `koto session hierarchy` why a session is kept.
+
 ---
 
 ## koto session hierarchy
@@ -906,6 +917,8 @@ exec koto session anchor close --key="$NIWA_REAP_KEY" --harness-session="$NIWA_S
 ```
 koto session hierarchy <name> [--json]
 ```
+
+For example, `koto session hierarchy work-on-12 --json | jq '{kept, keepers, retention}'` says whether `work-on-12` is kept, by whom, and when its retention passes.
 
 Shows the hierarchy a session belongs to and whether koto keeps it. Read-only: it writes nothing and reads only the local sessions directory, never the cloud bucket. A hierarchy is every session joined to `<name>` by a link (dispatched-by, held-by, closes), koto lineage (`parent_workflow`) or `chain/parent`. It is kept while any member is alive: a koto session that is running or can't be read, or an anchor that hasn't closed. An anchor with no observed marker closes once `retention.idle_period` has passed since its last activity (its own starts, `init`/`next` ticks and read records, or the import that copied it in); an observed anchor closes only through `koto session anchor close`. Once nothing is alive, the hierarchy is kept until `retention.keep` has passed since its release instant (the latest stop among its members), then released.
 
@@ -1209,7 +1222,7 @@ koto config list --json          # Print merged config as JSON
 
 Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `session.cloud.path_style`, `session.cloud.marker_retain_days`, `workflows.native`, `retention.keep`, `retention.idle_period`, `retention.stale_after`, `decider.mode`, `decider.api_key`, `decider.endpoint`, `decider.timeout_ms`.
 
-The `retention.*` keys set how long finished session hierarchies are kept (see `koto session hierarchy`): `retention.keep` (default `7d`), `retention.idle_period` (default `7d`, after which an unobserved anchor closes) and `retention.stale_after` (default `30d`, after which an observed anchor is reported stale). Each takes a whole number followed by `s`, `m`, `h` or `d`, may be set in user or project config, and is overridden by `KOTO_RETENTION_KEEP`, `KOTO_RETENTION_IDLE_PERIOD` or `KOTO_RETENTION_STALE_AFTER`. A malformed value, or a `stale_after` not longer than `keep`, is refused by the commands that judge retention, naming the setting; it never fails a tick, and the activity throttle falls back to the default.
+The `retention.*` keys set how long finished session hierarchies are kept (see `koto session hierarchy`): `retention.keep` (default `7d`), `retention.idle_period` (default `7d`, after which an unobserved anchor closes) and `retention.stale_after` (default `30d`, after which an observed anchor is reported stale). Each takes a whole number followed by `s`, `m`, `h` or `d`, may be set in user or project config, and is overridden by `KOTO_RETENTION_KEEP`, `KOTO_RETENTION_IDLE_PERIOD` or `KOTO_RETENTION_STALE_AFTER`. A malformed value, or a `stale_after` not longer than `keep`, is refused by the commands that judge retention, naming the setting; it never fails a tick, and the activity throttle falls back to the default. For example, `koto config set retention.keep 3d --user` keeps released hierarchies three days, and `KOTO_RETENTION_IDLE_PERIOD=12h koto session hierarchy work-on-12` judges one hierarchy with a shorter idle period.
 
 `session.cloud.path_style` takes `true` or `false` (unset means `false`). `true` puts the bucket in the URL path instead of a subdomain, which an endpoint given as an IP address needs.
 

@@ -7,6 +7,7 @@
     "clippy": {"run": ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"], "timeout_secs": 3600},
     "decider-purity": {"run": ["bash", "scripts/check-decider-purity.sh"]},
     "doc-names": {"run": ["cargo", "test", "--locked", "--test", "doc_names"], "timeout_secs": 3600},
+    "plugin-hooks-shape": {"run": ["cargo", "test", "--locked", "--test", "plugin_hooks_shape"], "timeout_secs": 3600},
     "shipped-spec": {"run": ["cargo", "test", "--locked", "--lib", "shipped_spec"], "timeout_secs": 3600},
     "evals-exist": {"run": ["bash", "scripts/check-evals-exist.sh"]},
     "inline-evidence": {"run": ["bash", "scripts/check-inline-evidence_test.sh"]},
@@ -19,7 +20,7 @@
     },
     {
       "paths": ["plugins/**", ".claude-plugin/**", "scripts/check-evals-exist.sh", "scripts/check-inline-evidence.sh", "scripts/check-inline-evidence_test.sh"],
-      "commands": ["doc-names", "evals-exist", "inline-evidence"]
+      "commands": ["doc-names", "plugin-hooks-shape", "evals-exist", "inline-evidence"]
     },
     {
       "paths": ["docs/**"],

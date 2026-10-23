@@ -7,6 +7,11 @@ on:
     paths:
       - 'plugins/**'
       - '.claude-plugin/**'
+      # The anchor verbs the session-start hook calls, so a change to their
+      # output runs the hook suite.
+      - 'src/session/anchor.rs'
+      - 'src/session/anchor/**'
+      - 'src/cli/session_anchor.rs'
 
 jobs:
   template-compilation:
@@ -102,6 +107,14 @@ jobs:
             echo "Got: '$OUTPUT'"
             exit 1
           fi
+
+      # Copied into .claude/shirabe-extensions/work-on.md (the /work-on verification map), with any deliberate differences noted there; change both together.
+      - name: Test the session-start anchor hook
+        run: |
+          # The suite enforces the 300 ms bound on the hook's synchronous
+          # part because CI is set here.
+          export PATH="$PWD/target/release:$PATH"
+          bash plugins/koto-skills/hooks/test/session-start.test.sh
 
   schema-validation:
     name: Schema Validation
