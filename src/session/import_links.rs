@@ -130,7 +130,7 @@ pub struct Settlement<'a> {
 }
 
 /// The local anchors among `names` that are open and not migrated, and
-/// whether `importer` is an anchor here. A store that can't be scanned
+/// whether `importer` is an anchor here that is open and not migrated too. A store that can't be scanned
 /// can't say which anchors are open, so every name counts as open and no
 /// held-by link is changed.
 fn resolve_anchors(
@@ -153,7 +153,6 @@ fn resolve_anchors(
             .facts(name)
             .is_some_and(|f| f.kind == SessionKind::Anchor)
     };
-    let importer_is_anchor = importer.is_some_and(is_anchor);
     let settings = RetentionSettings::load().unwrap_or_else(|e| {
         eprintln!(
             "warning: {e:#}; koto session import judges the held-by anchors with the default \
@@ -163,11 +162,11 @@ fn resolve_anchors(
         RetentionSettings::from_durations(7 * day, 7 * day, 30 * day)
     });
     let mut judge = Judge::new(&graph, settings, std::time::SystemTime::now());
-    let open = names
-        .iter()
-        .filter(|n| is_anchor(n) && !graph.is_migrated(n) && judge.is_alive(n))
-        .cloned()
-        .collect();
+    let mut usable = |n: &str| is_anchor(n) && !graph.is_migrated(n) && judge.is_alive(n);
+    let open = names.iter().filter(|n| usable(n)).cloned().collect();
+    // The importer's own anchor passes the same test as a held-by anchor: a
+    // closed or migrated anchor can't take over the copy's links.
+    let importer_is_anchor = importer.is_some_and(&mut usable);
     (open, importer_is_anchor)
 }
 

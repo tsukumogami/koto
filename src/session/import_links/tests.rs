@@ -441,3 +441,46 @@ fn an_import_of_the_importers_own_anchor_never_links_it_to_itself() {
         ["koto/imported-from"]
     );
 }
+
+/// The importer's own anchor takes over the copy's unresolved held-by links
+/// only when it is open and not migrated here, the same test a held-by
+/// anchor passes: a closed (idle) or migrated importer anchor gets no
+/// held-by link, and the link is dropped instead.
+#[test]
+fn a_closed_or_migrated_importer_anchor_takes_over_no_held_by_link() {
+    for importer in ["anchor-idle", "anchor-moved"] {
+        let s = store();
+        let mut manifest = staged(
+            &s.ctx,
+            &[(
+                "koto/links/held-by/anchor-gone",
+                &body("anchor-gone", "/ws"),
+            )],
+        );
+        let settled = settle(&s, Some(importer), &mut manifest);
+        assert!(settled.rewritten.is_empty(), "{importer}");
+        assert_eq!(settled.dropped, vec!["anchor-gone"], "{importer}");
+        assert_eq!(
+            manifest.keys.keys().collect::<Vec<_>>(),
+            ["koto/imported-from"],
+            "{importer}"
+        );
+        assert_consistent(&s.ctx, &manifest);
+    }
+
+    let s = store();
+    let mut manifest = staged(
+        &s.ctx,
+        &[(
+            "koto/links/held-by/anchor-gone",
+            &body("anchor-gone", "/ws"),
+        )],
+    );
+    let settled = settle(&s, Some("anchor-imp"), &mut manifest);
+    assert_eq!(
+        settled.rewritten,
+        vec![("anchor-gone".to_string(), "anchor-imp".to_string())]
+    );
+    assert!(manifest.keys.contains_key("koto/links/held-by/anchor-imp"));
+    assert_consistent(&s.ctx, &manifest);
+}
