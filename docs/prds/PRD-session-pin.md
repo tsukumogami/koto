@@ -162,7 +162,8 @@ instant, release instant, retention, migrated source.
   JSON with `name`, `pin` (`reason`, `set_by` as the anchor name or `null`,
   `set_at`) and `store` (`local`, or `cloud` with the bucket name). It
   refuses with exit 2, writing nothing, when: the reason breaks a rule above;
-  no session has the name; the session is an anchor or an anchor's close
+  no session has the name (in the local store, or under the cloud backend in
+  the bucket either); the session is an anchor or an anchor's close
   record (kinds koto already records in the session's header); or the
   session is a migrated source.
 - **R2. A running session may be pinned.** The pin takes effect whenever a
@@ -177,12 +178,14 @@ instant, release instant, retention, migrated source.
 - **R4. Setting a pin needs no authority.** Any caller may pin, by hand or
   under an anchor, with or without handed authority.
 - **R5. Unpin a session.** `koto session unpin <name> [--reason <text>]`
-  first reads the session's pin. With no pin, it changes nothing and exits 0,
-  whoever the caller is. With a pin, readable or not, it removes the pin when
-  the caller may release it (R7) and exits 0, printing the release record.
-  The optional reason follows R1's rules for a reason. Under the cloud
-  backend, unpin acts on the bucket's pin for a session this host holds no
-  local copy of.
+  refuses with exit 2, writing nothing, when no session has the name (as R1
+  checks it) or the reason breaks R1's rules for a reason. Otherwise it reads
+  the session's pin. With no pin, it changes nothing and exits 0, whoever the
+  caller is. With a pin, readable or not, it removes the pin when the caller
+  may release it (R7) and exits 0, printing the release record. Under the
+  cloud backend, unpin acts on the bucket's pin for a session this host holds
+  no local copy of. When pin or unpin can't read the bucket to find the
+  session or its pin, it exits 3 and changes nothing.
 - **R6. A release is recorded.** Each unpin writes a release record into the
   unpinned session with: `released_by` (the releaser's anchor, or `null`),
   `authority` (`release-pin`, or `null` for a release by hand), `reason` (or
@@ -194,8 +197,8 @@ instant, release instant, retention, migrated source.
   written before the pin is removed, so an unpin interrupted between the two
   leaves the session pinned.
 - **R7. Who may release.** A caller by hand may unpin. A caller whose anchor
-  variable names an anchor may unpin only when that anchor records
-  `release-pin` among its handed authorities (R8). Otherwise the unpin exits
+  variable names an anchor may unpin only when that anchor, open or closed,
+  records `release-pin` among its handed authorities (R8). Otherwise the unpin exits
   2, changes nothing and writes no release record, and its message names:
   the authority it lacks, `release-pin`; the anchor it read authority from;
   and that the authority is handed to an agent session at its start. When
@@ -236,7 +239,9 @@ instant, release instant, retention, migrated source.
   `--older-than`, `--migrated-from`). A same-name replace that meets a pinned
   finished predecessor moves it aside under a new name by the replace's
   existing naming, keeping its log, keys, pin and release record; the new run
-  takes the original name with no pin.
+  takes the original name with no pin. Under the cloud backend the moved
+  predecessor's objects, its pin included, are in the bucket under the new
+  name, and the original name's objects are only the new run's.
 - **R11. Explicit removal refuses a pinned session.** `koto session cleanup`
   of a pinned session exits 2 and removes nothing, and its message names the
   pin's reason, setter and time (or that the pin is unreadable, and why) and
@@ -286,7 +291,9 @@ instant, release instant, retention, migrated source.
   R15) and whether it's running or finished, and prints an empty list when
   there are none. Under the cloud backend it also lists, marked
   `source: bucket`, pinned sessions in the bucket this host holds no local
-  copy of. Its JSON form carries the same fields.
+  copy of; when the bucket can't be read it prints the local results with
+  `bucket_unchecked` (R23) and exits 3. Its JSON form carries the same
+  fields.
 
 ### Failing toward keeping
 
@@ -303,8 +310,9 @@ instant, release instant, retention, migrated source.
 - **R20. Pin and unpin reach the bucket or fail.** Under the cloud backend,
   `koto session pin` exits 0 only once the bucket holds the pin; if it can't
   confirm that, it exits 3, says the pin is held in the local store only, and
-  the next pin, unpin, tick or `koto context` write on that session on this
-  host retries the push, printing the same message if it fails again.
+  the next `koto session pin`, `koto session unpin`, `koto next` or
+  `koto context add` on that session on this host retries the push, printing
+  the same message if it fails again.
   `koto session unpin` exits 0 only once the bucket holds the release record
   and no longer holds the pin; otherwise it exits 3 and the bucket's pin
   stays in force.
@@ -323,7 +331,10 @@ instant, release instant, retention, migrated source.
 - **R23. A failed bucket check keeps.** When the bucket check can't be made
   (an error or timeout talking to the bucket) or returns a listing koto can't
   parse, the removal deletes neither copy and reports the session as kept
-  because the bucket couldn't be checked for a pin. A listing that succeeds
+  because the bucket couldn't be checked for a pin: in JSON, the session's
+  entry carries `bucket_unchecked` with `error` (`unreachable` or
+  `unparseable`), and the text form prints
+  `kept: bucket not checked for a pin (<error>)`. A listing that succeeds
   and holds no pin object is not a failure. The outcome per removal: the
   terminal tick keeps the session and says so in its `retention`; the parent
   sweep skips the child and lists it; the same-name replace moves the
@@ -365,7 +376,7 @@ instant, release instant, retention, migrated source.
   guide says how a workspace that dispatches with niwa passes
   `KOTO_AUTHORITY` through to workers with niwa's generic variable
   pass-through, which needs no change to niwa.
-- **R28. Bounded cost.** Locally, on the session-retention cost fixture (2,000
+- **R28. Bounded cost.** On the local backend, on the session-retention cost fixture (2,000
   sessions in 200 hierarchies of at most 10 sessions) with 200 sessions
   pinned, the hierarchy query for one session answers within 1 second and a
   full prune preview within 10 seconds of wall-clock time on a GitHub-hosted
@@ -445,11 +456,13 @@ a build without this feature, and S2 to S6 don't apply to it.
 - [ ] **Unpinned members unchanged.** With A pinned and C, a finished session
   in A's hierarchy, held by a live anchor, the prune's entry for C equals,
   byte for byte, its entry from the same fixture without the pin.
-- [ ] **Late pin.** With the test holding stdin open, `koto workspace prune
+- [ ] **Late pin.** In a fixture where P starts unpinned, finished and past
+  the retention, with the test holding stdin open, `koto workspace prune
   --root X` (no `--yes`) lists P for removal and waits; P is pinned from
   another process; the test confirms; P is kept and its entry carries the
   pin. The same holds for `koto session prune --apply --plan` when P is pinned
-  after the plan was written.
+  after the plan was written, and, under the cloud backend, when host 1 pins
+  P after host 2's prune printed its preview.
 - [ ] **Hierarchy query.** For a pinned session, `koto session hierarchy` text
   and JSON show the pin as R15 and that it keeps that session only, and the
   session's files hash the same before and after the query.
@@ -478,6 +491,10 @@ a build without this feature, and S2 to S6 don't apply to it.
 - [ ] **Unpin clears an unreadable pin.** With P's pin truncated, an unpin by
   hand exits 0, P holds no pin, and the release record's pin fields are
   `null`.
+- [ ] **Unpin of a missing session.** `koto session unpin nosuch` exits 2 and
+  writes nothing.
+- [ ] **Interrupted unpin.** With the pin's removal made to fail after the
+  release record is written, P is still pinned and every step of S keeps it.
 - [ ] **Release record.** After `koto session unpin P --reason done` by hand,
   the hierarchy query for P shows `released_by: null`, `authority: null`,
   `reason: done`, `released_at`, and the released pin's reason, setter and
@@ -559,12 +576,16 @@ by hand and finishes it; X is P's koto parent.
   neither copy; `koto session prune --apply --all` lists P and U as kept
   because the bucket couldn't be checked and exits 0; the terminal tick of X
   keeps its children; `koto workspace prune --root X --yes` deletes nothing
-  and lists each member as kept.
+  and lists each member as kept; a same-name replace of U moves it aside;
+  `koto cancel U --cleanup` exits 3 and writes nothing. Each kept entry
+  carries `bucket_unchecked` with the matching `error`.
 - [ ] **Pin and unpin reach the bucket or fail.** With the stand-in refusing
   writes, `koto session pin P` exits 3 and says the pin is held locally only;
   `koto session pin P` again exits 3 with the same message; once writes are
   accepted, the next `koto session pin P` exits 0 and host 2's
-  `koto session list --pinned` lists P with `source: bucket`. With deletes
+  `koto session list --pinned` lists P with `source: bucket`. In a second run,
+  once writes are accepted, a `koto context add P <key>` on host 1 pushes the
+  pin instead. With deletes
   refused, `koto session unpin P` exits 3 and host 2 still keeps P.
 - [ ] **Unpin on one host frees on another.** Host 1 unpins P by hand; after
   the retention, host 2's prune removes P from the bucket. Host 2 unpinning a
