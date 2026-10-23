@@ -19,7 +19,10 @@
 # event listed in EVENT_CHECKS, including the fields the check events gained
 # (attempt stamps, findings, rule_counts, duration_ms and a failed command
 # gate's leading stdout/stderr) and the context events (the reads a gate and
-# `koto context get` log, and the writer `koto context add` records).
+# `koto context get` log, and the writer `koto context add` records). The
+# `koto context get` runs with no reader anchor, so its read lands in the
+# host-local read spool beside the log (`context-reads.jsonl`) rather than in
+# the log; the checks and the mutations read both.
 # v0.14.1 must then run `koto status`, `koto next` and `koto context get` on
 # that session, exit 0, and report the state the new build reports.
 #
@@ -304,6 +307,9 @@ pass "the new build reports current state $NEW_STATE"
 
 LOG_FILE="$(find "$HOME_DIR" "$WORK_DIR" -name 'koto-wf.state.jsonl' -type f | head -n 1)"
 [ -n "$LOG_FILE" ] || fail "session: no koto-wf.state.jsonl was written"
+# An anchorless read is spooled beside the log, never written into it.
+SPOOL_FILE="$(dirname "$LOG_FILE")/context-reads.jsonl"
+[ -f "$SPOOL_FILE" ] || fail "session: the anchorless koto context get left no read spool"
 
 # Context writers: a transition assigns the published-location key, then koto
 # overwrites it.
@@ -345,16 +351,19 @@ drop_lines() {
 # strip_field KEY FILTER: delete .payload.KEY from every log line the jq
 # filter selects, leaving the bytes of every other line as they are.
 strip_field() {
-  local key="$1" filter="$2" tmp="$LOG_FILE.mut" line
-  : >"$tmp"
-  while IFS= read -r line || [ -n "$line" ]; do
-    if printf '%s' "$line" | jq -e "$filter" >/dev/null 2>&1; then
-      printf '%s' "$line" | jq -c --arg k "$key" 'del(.payload[$k])' >>"$tmp"
-      continue
-    fi
-    printf '%s\n' "$line" >>"$tmp"
-  done <"$LOG_FILE"
-  mv "$tmp" "$LOG_FILE"
+  local key="$1" filter="$2" file tmp line
+  for file in "$LOG_FILE" "$SPOOL_FILE"; do
+    tmp="$file.mut"
+    : >"$tmp"
+    while IFS= read -r line || [ -n "$line" ]; do
+      if printf '%s' "$line" | jq -e "$filter" >/dev/null 2>&1; then
+        printf '%s' "$line" | jq -c --arg k "$key" 'del(.payload[$k])' >>"$tmp"
+        continue
+      fi
+      printf '%s\n' "$line" >>"$tmp"
+    done <"$file"
+    mv "$tmp" "$file"
+  done
 }
 
 case "$MUTATION" in
@@ -368,8 +377,9 @@ case "$MUTATION" in
     ;;
   drop-event:*)
     entry="${EVENT_CHECKS[${MUTATION#drop-event:}]}"
-    echo "MUTATION: deleting log lines for '${entry%%|*}'"
+    echo "MUTATION: deleting log and spool lines for '${entry%%|*}'"
     drop_lines "${entry#*|}"
+    drop_lines "${entry#*|}" "$SPOOL_FILE"
     ;;
   drop-writer-event:*)
     entry="${WRITER_CHECKS[${MUTATION#drop-writer-event:}]}"
@@ -389,9 +399,9 @@ esac
 for entry in "${EVENT_CHECKS[@]}"; do
   label="${entry%%|*}"
   filter="${entry#*|}"
-  n="$(jq -s "[.[] | select($filter)] | length" "$LOG_FILE")" \
+  n="$(jq -s "[.[] | select($filter)] | length" "$LOG_FILE" "$SPOOL_FILE")" \
     || fail "events: the filter for '$label' did not run"
-  [ "$n" -ge 1 ] || fail "events: the log holds no event for '$label'"
+  [ "$n" -ge 1 ] || fail "events: the log and the spool hold no event for '$label'"
   pass "events: $label ($n)"
 done
 for entry in "${WRITER_CHECKS[@]}"; do
