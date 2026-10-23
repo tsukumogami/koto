@@ -74,7 +74,10 @@ pub const CLOSE_RECORD_KEY: &str = "koto/anchor-close";
 /// one only, never `KOTO_DISPATCHER_ANCHOR`.
 pub const ANCHOR_ENV: &str = "KOTO_ANCHOR";
 
-/// The idle period's environment override (`retention.idle_period`).
+/// The idle period's environment override. The `retention.idle_period`
+/// config key and its project precedence arrive with the retention settings
+/// (a later change); until then the variable is the only way to set it, and
+/// only the activity throttle reads it.
 pub const IDLE_PERIOD_ENV: &str = "KOTO_RETENTION_IDLE_PERIOD";
 
 /// The idle period when nothing sets one.
@@ -780,7 +783,9 @@ fn find_resume_predecessor<S: ContextStore + SessionBackend + ?Sized>(
 /// Whether a missing first anchor `base` existed before: its close session
 /// or a successor is still there, or the start is one that only an
 /// existing agent session makes (a compaction, or a resume of the same
-/// conversation).
+/// conversation). A compaction or same-id resume with no anchor can also
+/// be the first open on a host that never ran the hook before; it reads
+/// `reopened` then, which changes the label and nothing else.
 fn existed_before<S: SessionBackend + ?Sized>(store: &S, base: &str, req: &OpenRequest) -> bool {
     if state_path(store, &close_name(base)).exists()
         || state_path(store, &successor_name(base, 2)).exists()
@@ -1080,7 +1085,9 @@ pub fn observe<S: ContextStore + SessionBackend>(
 /// anchor, when its `anchor_started` recorded that harness id, and the
 /// successors reached from it through `predecessor` after a `/clear` or a
 /// resume under a new id; each only when its observed marker is `key`.
-/// The walk doesn't pass an anchor whose marker differs.
+/// The walk doesn't pass an anchor whose marker differs: a different
+/// marker means a different reap key owns that anchor, so it and whatever
+/// succeeded it close when that key's session is reaped, never this one's.
 pub fn close_targets<S: ContextStore + SessionBackend>(
     store: &S,
     key: &str,
@@ -1369,6 +1376,11 @@ pub fn hold<S: ContextStore + SessionBackend>(
         Ok(())
     };
     link(anchor, &mut outcome)?;
+    // The activity goes to the anchor that is still alive. A closed anchor's
+    // agent session ended, and the session whose shells still name it now
+    // lives in its family's later anchor: that is the running agent
+    // session's own anchor, and writing there leaves the closed one as it
+    // is.
     let mut live = anchor.to_string();
     if close_check(store, anchor).is_closed() {
         let current = current_of_family(store, family_base(anchor));

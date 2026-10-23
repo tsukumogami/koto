@@ -706,3 +706,87 @@ fn the_workflows_materializer_skips_anchors() {
     );
     assert_eq!(std::fs::read_dir(&wf_dir).unwrap().count(), 1);
 }
+
+/// Copy the directory `from` to `to`, files and subdirectories.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let target = to.join(e.file_name());
+        if e.path().is_dir() {
+            copy_dir(&e.path(), &target);
+        } else {
+            std::fs::copy(e.path(), target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_leftover_staging_entry_is_invisible_to_list_and_prune_and_is_swept() {
+    let tmp = setup();
+    let dir = tmp.path();
+    open(dir, "h1", &["--observed-key", "k1"]);
+    ok(
+        run(
+            dir,
+            &[
+                "session",
+                "anchor",
+                "close",
+                "--key=k1",
+                "--harness-session=h1",
+            ],
+        ),
+        "close",
+    );
+    // A complete close session left under the staging prefix, as a close
+    // interrupted before its rename leaves it.
+    let staging = sessions(dir).join(".koto-staging-anchor-h9-closed-0000");
+    copy_dir(
+        &sessions(dir).join("anchor-h1-closed"),
+        &staging.join("anchor-h1-closed"),
+    );
+
+    let list = ok(run(dir, &["session", "list"]), "list").stdout;
+    assert!(!list.contains("koto-staging"), "{list}");
+    let prune = ok(run(dir, &["session", "prune", "--all"]), "prune").stdout;
+    assert!(!prune.contains("koto-staging"), "{prune}");
+    let wfs = ok(run(dir, &["workflows"]), "workflows").stdout;
+    assert!(!wfs.contains("koto-staging"), "{wfs}");
+
+    // A close while the entry is fresh leaves it; once it is older than ten
+    // minutes, the next close sweeps it.
+    open(dir, "h2", &["--observed-key", "k2"]);
+    ok(
+        run(
+            dir,
+            &[
+                "session",
+                "anchor",
+                "close",
+                "--key=k2",
+                "--harness-session=h2",
+            ],
+        ),
+        "close h2",
+    );
+    assert!(staging.exists());
+    let old = std::time::SystemTime::now() - Duration::from_secs(11 * 60);
+    std::fs::File::open(&staging)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    ok(
+        run(
+            dir,
+            &[
+                "session",
+                "anchor",
+                "close",
+                "--key=k2",
+                "--harness-session=h2",
+            ],
+        ),
+        "close again",
+    );
+    assert!(!staging.exists());
+}
