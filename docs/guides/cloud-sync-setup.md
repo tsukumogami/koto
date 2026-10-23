@@ -106,17 +106,25 @@ There are no sync commands. These commands read or write the session's copy in t
 - `koto context add`, `koto context get`, `koto context list`, `koto context exists`, `koto context remove`
 - `koto session list`, `koto session rebind`, `koto session cleanup`, `koto session resolve`, `koto session import`
 
-That list isn't exhaustive: any command that reads a session's state through the cloud backend pulls it from the bucket first. If the bucket is unreachable, a command keeps working on the local copy and prints a warning to stderr.
+That list isn't exhaustive: any command that reads a session's state through the cloud backend checks it against the bucket first. If the bucket is unreachable, a command keeps working on the local copy and prints a warning to stderr.
+
+### What a read costs
+
+A read checks a session with one listing of its objects in the bucket, which says whether it was imported elsewhere and whether its state file and its context manifest changed since this host last pulled or pushed them. Only what changed is downloaded, so a read whose local copy is current costs that one request. Inside a tick, a session the tick's commands already checked isn't checked again: the tick is the window a command relies on, so its later reads of that session make no request. A change another host makes during the tick is read by the next tick.
+
+koto keeps what it last knew of the bucket's copy in host-local files beside the session in the local store (`cloud-sync.json`, `cloud-manifest.json`, `cloud-tick.id`). Nothing uploads them.
+
+A `koto context get` or `koto context exists` records the read for the run journal. A read made by the session's own tick goes into its log, as before. A read made from anywhere else, another session's tick or your shell, goes into `context-reads.jsonl` beside the session on this host and is never pushed, so reading a session never writes to it.
 
 ### Commands a `koto next` runs
 
 A `koto context` call made from a template's command (a default action or a gate) works on the session that `koto next` is advancing, and it doesn't push to the bucket itself. It writes the local copy and leaves the push to the tick, which pushes everything its commands wrote once, before it returns. A call costs a request or two instead of a full round of pulls and pushes, so an action can make many of them inside its time limit.
 
-Two checks still run on every call: whether the session was imported elsewhere, which refuses, and on the first write of the tick, whether another host's writes conflict with this one's, which also refuses. The tick checks both again before it pushes. The tick's own session is pulled from the bucket once, when the tick starts, not again by each command.
+Two checks still run: whether the session was imported elsewhere, which refuses, once per tick, and on the first write of the tick, whether another host's writes conflict with this one's, which also refuses. The tick checks both again before it pushes. The tick's own session is pulled from the bucket once, when the tick starts, not again by each command.
 
 While the tick's commands have writes it hasn't pushed, the bucket holds a `batch-open.json` object beside the session's state file, and `koto session import` refuses the session (`import_source_unpushed`). A tick that was killed before it pushed leaves the writes on its host. The next koto command on the session there, `koto status <name>` for instance, pushes them and removes the object. The same command removes an object left by a `koto context` call killed while it was putting the object in the bucket, before it had written anything.
 
-A `koto context` call for any other session, or made outside a tick, pushes at once, as before.
+A `koto context add` or `koto context remove` for any other session, or made outside a tick, pushes at once, as before.
 
 ### Where a session lives in the bucket
 
@@ -289,6 +297,8 @@ Resolve by picking a side:
 koto session resolve <name> --keep local   # force-upload your version
 koto session resolve <name> --keep remote  # download the bucket's version
 ```
+
+`--keep local` uploads in one pass: it reads the bucket's manifest once and uploads only the context keys whose content the bucket doesn't already hold, several at a time, then the manifest, the state file and the version. The response's `elapsed_ms` says how long the session took.
 
 ## Config reference
 

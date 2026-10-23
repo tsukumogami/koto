@@ -202,9 +202,10 @@ pub struct CloudBackend {
     /// Per-process answers of [`CloudBackend::probe`], by session id: one
     /// listing of the session's prefix, which the migration check, the
     /// state pull and the manifest fetch all read
-    /// (`crate::session::sync_stamp`). Boxed for the same reason as
+    /// (`crate::session::sync_stamp`). `None` when the listing failed: the
+    /// process doesn't ask again. Boxed for the same reason as
     /// `local_migration_checks`.
-    probes: Box<Mutex<HashMap<String, sync_stamp::Probe>>>,
+    probes: Box<Mutex<HashMap<String, Option<sync_stamp::Probe>>>>,
 }
 
 impl CloudBackend {
@@ -443,21 +444,32 @@ impl CloudBackend {
     /// the answer after this process writes the session.
     ///
     /// An object listed without an ETag reads as present with an empty one,
-    /// which no stamp matches, so it is always fetched.
+    /// which no stamp matches, so it is always fetched. A listing that
+    /// failed fails every later probe of `id` in the process without a
+    /// request: an unreachable bucket costs a process one failed listing,
+    /// not one per read.
     fn probe(&self, id: &str) -> anyhow::Result<sync_stamp::Probe> {
-        if let Some(probe) = self
+        if let Some(answer) = self
             .probes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
         {
-            return Ok(probe.clone());
+            return answer.clone().ok_or_else(|| {
+                anyhow::anyhow!("listing {} failed earlier", self.session_prefix(id))
+            });
         }
         let prefix = self.session_prefix(id);
-        let results = self
-            .bucket
-            .list(prefix.clone(), None)
-            .map_err(|e| anyhow::anyhow!("listing {} failed: {}", prefix, e))?;
+        let results = match self.bucket.list(prefix.clone(), None) {
+            Ok(results) => results,
+            Err(e) => {
+                self.probes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id.to_string(), None);
+                anyhow::bail!("listing {} failed: {}", prefix, e);
+            }
+        };
         let (marker, state, manifest) = (
             self.marker_key(id),
             self.state_key(id),
@@ -484,14 +496,19 @@ impl CloudBackend {
         self.probes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id.to_string(), probe.clone());
+            .insert(id.to_string(), Some(probe.clone()));
         Ok(probe)
     }
 
     /// Start a tick of `id`: write the id its commands read as the current
-    /// tick ([`CloudBackend::current_tick`]).
+    /// tick ([`CloudBackend::current_tick`]). Nothing is written for a
+    /// session the local guard refuses (an import of it is pending, or it is
+    /// the other side of a same-host import): the tick refuses it before
+    /// touching it.
     pub fn begin_tick(&self, id: &str) {
-        sync_stamp::begin_tick(&self.local.session_dir(id));
+        if self.local_guard(id).is_ok() {
+            sync_stamp::begin_tick(&self.local.session_dir(id));
+        }
     }
 
     /// Drop this process's probe of `id`, after a write that changed what
@@ -815,14 +832,19 @@ impl CloudBackend {
     /// same-host import can bring together, and writing one over the other
     /// would destroy a session.
     ///
-    /// Three cases make no request. A command a tick on `id` runs reads the
+    /// Four cases make no request. A command a tick on `id` runs reads the
     /// local copy as it is: the tick pulled it, and the writes it and its
     /// commands made since are there and not yet in the bucket. A tick
-    /// pulls its own session once per process. And a pull never writes over
-    /// an open batch: the batch is flushed instead, after which the local
-    /// copy is the bucket's; a flush that fails leaves the local copy as it
-    /// is, and refuses when the failure is a migration marker or a version
-    /// conflict.
+    /// pulls its own session once per process. A command of a tick that
+    /// already checked `id` reads the local copy as that check left it
+    /// (`crate::session::sync_stamp`). And a pull never writes over an open
+    /// batch: the batch is flushed instead, after which the local copy is
+    /// the bucket's; a flush that fails leaves the local copy as it is, and
+    /// refuses when the failure is a migration marker or a version conflict.
+    ///
+    /// Otherwise the session's probe lists its prefix, and the state file is
+    /// fetched only when the bucket's ETag moved since this host's stamp, or
+    /// the local file is no longer the stamped bytes.
     ///
     /// A batch begun and never opened (its process killed, or its marker
     /// PUT failed) is cleared first ([`CloudBackend::clear_unopened_batch`]):
@@ -2064,45 +2086,74 @@ impl CloudBackend {
             );
         }
 
-        // Upload state file. Directly, not through `sync_push_state`, which
+        // One pass (koto#428): the session's prefix is listed once and its
+        // manifest read once, and a context key goes up unless the bucket
+        // both holds its object and names it in the manifest with this
+        // host's hash: this is a repair, so an object the manifest names but
+        // the bucket lost goes up too. The keys go in parallel; then the
+        // manifest, the state file and `version.json`, in the order the
+        // batch flush uses. Host-local keys stay on this host, and files in
+        // `ctx/` the manifest doesn't name (its lock) are not context. A key
+        // the manifest names with no content file here refuses the push
+        // rather than send a manifest naming it; a failed upload is a
+        // warning, as every push here always was. When the listing or the
+        // manifest can't be read, every key goes up.
+        self.manifest_cache.invalidate();
+        self.forget_probe(id);
+        self.prime_manifest(id);
+        let remote = self.manifest_cache.get(id).unwrap_or_default();
+        let prefix = self.session_prefix(id);
+        let listed: HashSet<String> = self
+            .bucket
+            .list(prefix.clone(), None)
+            .map(|pages| {
+                pages
+                    .iter()
+                    .flat_map(|page| page.contents.iter())
+                    .map(|obj| obj.key.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ctx_dir = session_dir.join("ctx");
+        let manifest = self.local.read_manifest(id)?;
+        let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
+        for (key, meta) in &manifest.keys {
+            let held = listed.contains(&format!("{}ctx/{}", prefix, key))
+                && remote.keys.get(key).is_some_and(|r| r.hash == meta.hash);
+            if is_host_local_key(key) || held {
+                continue;
+            }
+            let data = std::fs::read(ctx_dir.join(key))
+                .with_context(|| format!("reading context key '{}'", key))?;
+            uploads.push((key.clone(), data));
+        }
+        let _ = in_parallel(&uploads, |(name, data)| {
+            let s3_key = format!("{}/{}/ctx/{}", self.prefix, id, name);
+            if let Err(e) = self.put_object(&s3_key, data) {
+                eprintln!("warning: cloud sync: failed to upload ctx/{}: {}", name, e);
+            }
+            Ok(())
+        });
+        if let Some(data) = sync::bucket_manifest_bytes(&ctx_dir.join("manifest.json"))? {
+            let s3_key = format!("{}/{}/ctx/manifest.json", self.prefix, id);
+            if let Err(e) = self.put_object(&s3_key, &data) {
+                eprintln!(
+                    "warning: cloud sync: failed to upload ctx/manifest.json: {}",
+                    e
+                );
+            }
+        }
+        self.manifest_cache.invalidate();
+        self.forget_probe(id);
+
+        // The state file directly, not through `sync_push_state`, which
         // would flush an open batch and refuse on the very conflict this
-        // upload resolves; the context files below cover the batch's keys.
+        // upload resolves; the context files above cover the batch's keys.
         if let Err(e) = self.push_local_state_bytes(id) {
             eprintln!("warning: cloud sync failed for state upload: {:#}", e);
         }
 
-        // Upload version.json.
         self.push_version(id)?;
-
-        // Upload every context key the manifest names, then the manifest,
-        // in the order the batch flush uses. Host-local keys stay on this
-        // host, and files in `ctx/` the manifest doesn't name (its lock) are
-        // not context. A key the manifest names with no content file here
-        // refuses the push rather than send a manifest naming it; a failed
-        // upload is a warning, as every push here always was.
-        let ctx_dir = session_dir.join("ctx");
-        let manifest = self.local.read_manifest(id)?;
-        let mut uploads: Vec<(String, PathBuf)> = manifest
-            .keys
-            .keys()
-            .filter(|key| !is_host_local_key(key))
-            .map(|key| (key.clone(), ctx_dir.join(key)))
-            .collect();
-        uploads.push(("manifest.json".to_string(), ctx_dir.join("manifest.json")));
-        for (name, path) in uploads {
-            let data = if name == "manifest.json" {
-                match sync::bucket_manifest_bytes(&path)? {
-                    Some(data) => data,
-                    None => continue,
-                }
-            } else {
-                std::fs::read(&path).with_context(|| format!("reading context key '{}'", name))?
-            };
-            let s3_key = format!("{}/{}/ctx/{}", self.prefix, id, name);
-            if let Err(e) = self.put_object(&s3_key, &data) {
-                eprintln!("warning: cloud sync: failed to upload ctx/{}: {}", name, e);
-            }
-        }
 
         Ok(())
     }

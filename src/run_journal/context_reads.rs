@@ -453,6 +453,43 @@ mod tests {
         .unwrap()
     }
 
+    /// A visit's reads this host spooled count with its logged ones, in time
+    /// order; a read spooled before the visit opened belongs to no part of it.
+    #[test]
+    fn the_fold_counts_the_visits_spooled_reads_in_time_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let spooled = |key: &str| EventPayload::ContextRead {
+            key: key.into(),
+            reader: "cli".into(),
+            state: "a".into(),
+            present: true,
+            hash: Some("cd".repeat(32)),
+            access: None,
+            gate: None,
+        };
+        let spool = |at: &str, key: &str| {
+            crate::session::read_spool::append(dir.path(), at, &spooled(key)).unwrap()
+        };
+        spool("2026-10-10T23:59:59.000Z", "before-the-visit");
+        spool("2026-10-11T00:00:01.000Z", "spooled");
+        let log = [entry(1, moved("x", "a")), read(2, "logged", true)].join("\n") + "\n";
+
+        let fold = fold_with_spool(&log, 1, dir.path()).expect("the visit has reads");
+        let keys: Vec<&str> = fold.tuples.iter().map(|t| t.key.as_str()).collect();
+        assert_eq!(keys, ["logged", "spooled"]);
+        assert!(fold.tuples.iter().all(|t| t.counts
+            == Counts {
+                reads: 1,
+                present: 1
+            }));
+
+        // With nothing logged, the spooled read alone makes the visit's fold.
+        let log = entry(1, moved("x", "a")) + "\n";
+        let fold = fold_with_spool(&log, 1, dir.path()).expect("the spooled read counts");
+        assert_eq!(fold.tuples.len(), 1);
+        assert_eq!(fold.tuples[0].key, "spooled");
+    }
+
     fn moved(from: &str, to: &str) -> EventPayload {
         EventPayload::Transitioned {
             from: Some(from.into()),
