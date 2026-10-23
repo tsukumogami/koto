@@ -2362,7 +2362,9 @@ impl SessionBackend for CloudBackend {
         // A read of `id` by anything but its own tick, and the pull of a
         // changed key that read made, are kept on this host, in the read
         // spool, and never written into `id`'s log or pushed: the reader
-        // must not become a writer of a session it only read.
+        // must not become a writer of a session it only read. Nothing that
+        // decides from the log misses the pull: clear-on-entry already
+        // passes over `sync` writes (`crate::engine::clear_on_entry`).
         if crate::session::read_spool::spooled(payload) && !self.is_own_tick(id) {
             return crate::session::read_spool::append(
                 &self.local.session_dir(id),

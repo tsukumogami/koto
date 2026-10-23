@@ -25,6 +25,11 @@
 //! appended by whichever process read. It is host-local: nothing uploads
 //! it, and a read made on another host isn't in it.
 //!
+//! So the spool holds `context_added` lines as well as reads, and [`read`]
+//! skips them on purpose: its callers fold every line it returns as a read,
+//! and a pull is what a read cost, not a read. A reader that wants the pulls
+//! finds them in the file, beside the reads that made them.
+//!
 //! [`read`] is its one reader of reads and [`append`] its one writer (called
 //! from `crate::session::cloud`). Whatever consumes these reads (today the run
 //! journal's visit fold, `crate::run_journal`) goes through `read`, so the
