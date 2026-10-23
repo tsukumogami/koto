@@ -1,4 +1,5 @@
 pub mod resolve;
+pub mod retention;
 pub mod session_env;
 pub mod validate;
 
@@ -17,6 +18,12 @@ pub struct KotoConfig {
     pub workflows: WorkflowsConfig,
     #[serde(default)]
     pub run_journal: RunJournalConfig,
+    /// How long a finished hierarchy of sessions is kept, and when an
+    /// anchor idles or goes stale. The values are kept as written and
+    /// parsed where they are used (see [`retention`]), so a malformed one
+    /// fails only the commands that judge retention, never a config load.
+    #[serde(default, skip_serializing_if = "retention::RetentionConfig::is_empty")]
+    pub retention: retention::RetentionConfig,
     /// Opt-in decider settings. Omitted from `koto config list` output
     /// when nothing is set, so configs without a `[decider]` table print
     /// exactly as before.
@@ -528,6 +535,9 @@ pub fn get_value(config: &KotoConfig, key: &str) -> Option<String> {
         "run_journal.rotate_bytes" => Some(config.run_journal.rotate_bytes.to_string()),
         "run_journal.retain_days" => Some(config.run_journal.retain_days.to_string()),
         "run_journal.reader_stale_days" => Some(config.run_journal.reader_stale_days.to_string()),
+        "retention.keep" | "retention.idle_period" | "retention.stale_after" => {
+            Some(config.retention.effective(key)?.to_string())
+        }
         // The effective mode (global minimum project), shown only when a
         // mode is configured somewhere.
         "decider.mode" => {
@@ -664,6 +674,18 @@ pub fn set_value_in_toml(doc: &mut toml::Value, key: &str, value: &str) -> Resul
             let rj_table = rj.as_table_mut().ok_or("run_journal is not a table")?;
             rj_table.insert(field.to_string(), toml::Value::Integer(parsed));
         }
+        "retention.keep" | "retention.idle_period" | "retention.stale_after" => {
+            let field = key.strip_prefix("retention.").unwrap();
+            retention::check_value(key, value)?;
+            let rt = table
+                .entry("retention")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            let rt_table = rt.as_table_mut().ok_or("retention is not a table")?;
+            rt_table.insert(
+                field.to_string(),
+                toml::Value::String(value.trim().to_string()),
+            );
+        }
         k if k.starts_with("request_store.recursion.") => {
             // The recursion namespace is reserved-but-ignored at V1
             // (the runtime caps are hard-coded in src/engine/caps.rs).
@@ -789,6 +811,15 @@ pub fn unset_value_in_toml(doc: &mut toml::Value, key: &str) -> Result<bool, Str
             }
             Ok(false)
         }
+        "retention.keep" | "retention.idle_period" | "retention.stale_after" => {
+            let field = key.strip_prefix("retention.").unwrap();
+            if let Some(rt) = table.get_mut("retention") {
+                if let Some(t) = rt.as_table_mut() {
+                    return Ok(t.remove(field).is_some());
+                }
+            }
+            Ok(false)
+        }
         k if k.starts_with("request_store.recursion.") => {
             let field = k.strip_prefix("request_store.recursion.").unwrap();
             if field.is_empty() || field.contains('.') {
@@ -850,6 +881,9 @@ pub const ALL_KEYS: &[&str] = &[
     "run_journal.rotate_bytes",
     "run_journal.retain_days",
     "run_journal.reader_stale_days",
+    "retention.keep",
+    "retention.idle_period",
+    "retention.stale_after",
     "decider.mode",
     "decider.api_key",
     "decider.endpoint",

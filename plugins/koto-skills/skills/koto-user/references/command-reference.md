@@ -27,6 +27,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session rebind` | Runner — after a checkout moves |
 | `koto session link` | Runner — the dispatched session's own driver, after a dispatch with no request leg |
 | `koto session anchor open/observe/close` | Hooks and operators — an agent session's start hook, its watcher, and a workspace's reap command |
+| `koto session hierarchy` | Runner and operator — why a session is kept, and when its hierarchy is released |
 | `koto session import` | Runner — cloud backend only, after a session moves to another host or workspace |
 | `koto session resolve` | Runner — cloud backend only |
 | `koto status` | Runner — primary |
@@ -878,6 +879,29 @@ exec koto session anchor close --key="$NIWA_REAP_KEY" --harness-session="$NIWA_S
 
 ---
 
+## koto session hierarchy
+
+```
+koto session hierarchy <name> [--json]
+```
+
+Shows the hierarchy a session belongs to and whether koto keeps it. Read-only: it writes nothing and reads only the local sessions directory, never the cloud bucket. A hierarchy is every session joined to `<name>` by a link (dispatched-by, held-by, closes), koto lineage (`parent_workflow`) or `chain/parent`. It is kept while any member is alive: a koto session that is running or can't be read, or an anchor that hasn't closed. An anchor with no observed marker closes once `retention.idle_period` has passed since its last activity (its own `init`/`next` ticks and starts); an observed anchor closes only through `koto session anchor close`. Once nothing is alive, the hierarchy is kept until `retention.keep` has passed since its release instant (the latest stop among its members), then released.
+
+`--json` prints:
+
+| Field | Meaning |
+|-------|---------|
+| `kept` | `true` while anything keeps the hierarchy |
+| `keepers` | the live members, each `{name, kind, observed}`; an observed anchor past `retention.stale_after` since its last activity adds `"stale": true` and `close_command`, the exact command that closes it by hand (or `"malformed_marker": true` and no command when its marker or harness id isn't `^[A-Za-z0-9_-]{1,128}$`) |
+| `retention` | when nothing is alive: `{release: {at, member, close_kind}, passes_at}`, `close_kind` being `terminal`, `cancelled`, `observed` or `idle`; `null` otherwise |
+| `unreadable` | `[{name, reason}]` for anything that couldn't be read, which keeps the hierarchy |
+| `members` | every member with `kind` (`koto_session`, `anchor`, `anchor_close`), `alive`, `stopped_at`, `close_kind`, `absent`, `migrated`, `observed`, `stale` and `joined_by` (the edges that joined it) |
+| `settings` | the three retention settings, each `{value, origin}` |
+
+A stale anchor is a report and nothing more: koto never closes an observed anchor on its own. When the agent session behind it is truly gone, run the printed `close_command`. A malformed retention setting, or a name with no session, exits 2; a sessions directory that can't be listed exits 3.
+
+---
+
 ## koto session import (cloud backend only)
 
 ```
@@ -1156,13 +1180,15 @@ koto config list                 # Print merged config as TOML
 koto config list --json          # Print merged config as JSON
 ```
 
-Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `session.cloud.path_style`, `session.cloud.marker_retain_days`, `workflows.native`, `decider.mode`, `decider.api_key`, `decider.endpoint`, `decider.timeout_ms`.
+Valid key paths: `session.backend`, `session.cloud.endpoint`, `session.cloud.bucket`, `session.cloud.region`, `session.cloud.access_key`, `session.cloud.secret_key`, `session.cloud.path_style`, `session.cloud.marker_retain_days`, `workflows.native`, `retention.keep`, `retention.idle_period`, `retention.stale_after`, `decider.mode`, `decider.api_key`, `decider.endpoint`, `decider.timeout_ms`.
+
+The `retention.*` keys set how long finished session hierarchies are kept (see `koto session hierarchy`): `retention.keep` (default `7d`), `retention.idle_period` (default `7d`, after which an unobserved anchor closes) and `retention.stale_after` (default `30d`, after which an observed anchor is reported stale). Each takes a whole number followed by `s`, `m`, `h` or `d`, may be set in user or project config, and is overridden by `KOTO_RETENTION_KEEP`, `KOTO_RETENTION_IDLE_PERIOD` or `KOTO_RETENTION_STALE_AFTER`. A malformed value, or a `stale_after` not longer than `keep`, is refused by the commands that judge retention, naming the setting; it never fails a tick, and the activity throttle falls back to the default.
 
 `session.cloud.path_style` takes `true` or `false` (unset means `false`). `true` puts the bucket in the URL path instead of a subdomain, which an endpoint given as an IP address needs.
 
 Every `session.*` key except `marker_retain_days` also reads an environment variable, `KOTO_` plus the dotted name upper-cased with dots as underscores (`KOTO_SESSION_BACKEND`, `KOTO_SESSION_CLOUD_ENDPOINT`, `KOTO_SESSION_CLOUD_BUCKET`, `KOTO_SESSION_CLOUD_REGION`, `KOTO_SESSION_CLOUD_PATH_STYLE`, `KOTO_SESSION_CLOUD_ACCESS_KEY`, `KOTO_SESSION_CLOUD_SECRET_KEY`), which wins over project and user config; empty means unset. The two credential variables replace `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` as a pair. These refuse on any command that opens a session, naming the variable: a backend other than `local`/`cloud` or a path style other than `true`/`false` from the environment, one credential variable set without the other, and the endpoint or bucket coming from project config while the koto pair is in use. `koto config list` still runs and shows them.
 
-`koto config list` ends with one `# origin: <key> = <source>` comment line per session key (`env <VARIABLE>`, `project`, `user`, `default`, `unset`); `--json` has the same under a top-level `origins` object.
+`koto config list` ends with one `# origin: <key> = <source>` comment line per session key and retention key (`env <VARIABLE>`, `project`, `user`, `default`, `unset`); `--json` has the same under a top-level `origins` object.
 
 The `[decider]` keys opt the user in to consulting a decider on declared template fields. It's off by default, and it's the user's choice, not the agent's: don't set these keys unless the user asks you to.
 

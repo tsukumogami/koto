@@ -528,6 +528,58 @@ pub fn handle_update(backend: &dyn SessionBackend, name: &str, intent: &str) -> 
 /// with `{"error", "command"}`; a write that fails exits 3. Prints
 /// `{"name", "kind", "peer", "written"}`, `written: false` when the link
 /// was already there and nothing changed.
+/// Handle `koto session hierarchy <name> [--json]`: judge the hierarchy
+/// `name` belongs to and print the verdict, its members and the settings.
+///
+/// Reads the local sessions directory directly and writes nothing; under
+/// the cloud backend no other session's data is listed or read from the
+/// bucket. A malformed name or retention setting exits 2, as does a name
+/// with no session; a sessions directory that can't be listed exits 3.
+pub fn handle_hierarchy(backend: &Backend, name: &str, json: bool) -> Result<()> {
+    use crate::session::hierarchy::{self, Graph, Judge, RetentionSettings, Scope};
+
+    let fail = |error: String, code: i32| -> ! {
+        super::exit_with_error_code(
+            serde_json::json!({ "error": error, "command": "session hierarchy" }),
+            code,
+        )
+    };
+    if let Err(e) = ValidatedSessionId::new(name) {
+        fail(e.to_string(), super::EXIT_CALLER_ERROR);
+    }
+    let settings = match crate::config::resolve::load_config() {
+        Ok(config) => RetentionSettings::resolve(&config.retention)
+            .unwrap_or_else(|e| fail(e.to_string(), super::EXIT_CALLER_ERROR)),
+        Err(e) => fail(format!("{e:#}"), super::EXIT_CALLER_ERROR),
+    };
+    let base = backend.local_base_dir();
+    let graph = Graph::scan(base).unwrap_or_else(|e| {
+        fail(
+            format!("the sessions directory can't be read, so nothing can be judged: {e:#}"),
+            super::EXIT_INFRASTRUCTURE,
+        )
+    });
+    if !graph.contains(name) {
+        fail(
+            format!("session '{name}' does not exist"),
+            super::EXIT_CALLER_ERROR,
+        );
+    }
+    let mut judge = Judge::new(&graph, settings.clone(), std::time::SystemTime::now());
+    let judgment = judge
+        .judge(name, &Scope::Whole)
+        .unwrap_or_else(|e| fail(format!("{e:#}"), super::EXIT_INFRASTRUCTURE));
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&hierarchy::to_json(&judgment, &settings))?
+        );
+    } else {
+        print!("{}", hierarchy::render_text(&judgment, &settings));
+    }
+    Ok(())
+}
+
 pub fn handle_link(backend: &Backend, session: &str, dispatched_by: &str) -> Result<()> {
     use crate::session::links::{self, LinkHints, LinkKind};
 

@@ -660,6 +660,32 @@ pub enum SessionCommand {
         dispatched_by: String,
     },
 
+    /// Show the hierarchy a session belongs to, and whether it is kept.
+    ///
+    /// A hierarchy is every session joined to NAME through links
+    /// (dispatched-by, held-by, closes), koto lineage (`parent_workflow`)
+    /// and `chain/parent`. It is kept while any member is alive: a koto
+    /// session that runs or can't be read, or an anchor that hasn't closed.
+    /// Once nothing is alive it is kept until `retention.keep` has passed
+    /// since its release instant, the latest stop among its members.
+    ///
+    /// Prints kept or not, the keepers (an observed anchor past
+    /// `retention.stale_after` is flagged stale, with the command that
+    /// closes it by hand) or the release instant and when the retention
+    /// passes, anything unreadable, every member with its kind, liveness,
+    /// stop and the edge that joined it, and the three retention settings
+    /// with their origins. Reads the local sessions directory only and
+    /// writes nothing. A malformed retention setting exits 2 naming it; a
+    /// sessions directory that can't be read exits 3.
+    Hierarchy {
+        /// The session whose hierarchy to show
+        name: String,
+
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Open, observe and close agent-session anchors.
     ///
     /// An anchor is the session koto keeps for one agent session, so that
@@ -1842,6 +1868,9 @@ pub fn run(app: App) -> Result<()> {
                     dispatched_by,
                 } => session::handle_link(&backend, &session, &dispatched_by),
                 SessionCommand::Anchor { action } => session_anchor::handle(&backend, action),
+                SessionCommand::Hierarchy { name, json } => {
+                    session::handle_hierarchy(&backend, &name, json)
+                }
                 SessionCommand::Rebind { name, to } => {
                     session::handle_rebind(&backend, &name, to.as_deref())
                 }
@@ -2234,22 +2263,28 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
         }
         ConfigCommand::List { json } => {
             let resolved = config::resolve::load_config()?;
-            let redacted = config::redact(&resolved);
-            // Where each session setting came from, beside the tables and
-            // never inside them: one `origins` field in JSON, comment lines
-            // in TOML, so the tables read exactly as before.
+            let mut redacted = config::redact(&resolved);
+            // The retention settings print with the values they resolve
+            // to, defaults included, since a default is what applies.
+            redacted.retention = resolved.retention.resolved_for_display();
+            // Where each session and retention setting came from, beside
+            // the tables and never inside them: one `origins` field in
+            // JSON, comment lines in TOML, so the tables read exactly as
+            // before.
             if json {
                 let mut value = serde_json::to_value(&redacted)?;
                 if let Some(map) = value.as_object_mut() {
-                    map.insert(
-                        "origins".to_string(),
-                        config::session_env::origins_json(&resolved),
-                    );
+                    let mut origins = config::session_env::origins_json(&resolved);
+                    if let Some(o) = origins.as_object_mut() {
+                        config::retention::origins_json(&resolved.retention, o);
+                    }
+                    map.insert("origins".to_string(), origins);
                 }
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 println!("{}", toml::to_string_pretty(&redacted)?);
                 print!("{}", config::session_env::origins_toml(&resolved));
+                print!("{}", config::retention::origins_toml(&resolved.retention));
             }
             Ok(())
         }

@@ -74,11 +74,9 @@ pub const CLOSE_RECORD_KEY: &str = "koto/anchor-close";
 /// one only, never `KOTO_DISPATCHER_ANCHOR`.
 pub const ANCHOR_ENV: &str = "KOTO_ANCHOR";
 
-/// The idle period's environment override. The `retention.idle_period`
-/// config key and its project precedence arrive with the retention settings
-/// (a later change); until then the variable is the only way to set it, and
-/// only the activity throttle reads it.
-pub const IDLE_PERIOD_ENV: &str = "KOTO_RETENTION_IDLE_PERIOD";
+/// The idle period's environment override, over the `retention.idle_period`
+/// setting in the project and user files.
+pub const IDLE_PERIOD_ENV: &str = crate::config::retention::ENV_IDLE_PERIOD;
 
 /// The idle period when nothing sets one.
 pub const DEFAULT_IDLE_PERIOD: Duration = Duration::from_secs(7 * 86_400);
@@ -198,13 +196,22 @@ pub fn digest(value: &str) -> String {
     hex
 }
 
-/// The idle period: [`IDLE_PERIOD_ENV`] when it parses as a non-zero
-/// duration, [`DEFAULT_IDLE_PERIOD`] otherwise. A malformed value never
-/// fails a command that reads it.
+/// The idle period, which sets the activity throttle: `retention.idle_period`
+/// as the configuration resolves it (`KOTO_RETENTION_IDLE_PERIOD`, then the
+/// project file, then the user file), when it parses as a non-zero
+/// duration, and [`DEFAULT_IDLE_PERIOD`] otherwise. A malformed value, or a
+/// configuration that fails to load, never fails a command that reads it:
+/// the throttle is the only reader here, and the retention engine reads the
+/// same setting and refuses a malformed one where it judges.
 pub fn idle_period() -> Duration {
-    std::env::var(IDLE_PERIOD_ENV)
-        .ok()
-        .and_then(|v| crate::session::duration::parse_age(v.trim()))
+    let raw = match crate::config::resolve::load_config() {
+        Ok(config) => config
+            .retention
+            .effective("retention.idle_period")
+            .map(str::to_string),
+        Err(_) => std::env::var(IDLE_PERIOD_ENV).ok(),
+    };
+    raw.and_then(|v| crate::session::duration::parse_age(v.trim()))
         .filter(|d| !d.is_zero())
         .unwrap_or(DEFAULT_IDLE_PERIOD)
 }
@@ -379,19 +386,28 @@ pub fn close_check<S: ContextStore + SessionBackend + ?Sized>(
     store: &S,
     anchor: &str,
 ) -> CloseCheck {
+    checked_close_record(store, anchor).0
+}
+
+/// [`close_check`], plus the close record when it counts. The retention
+/// engine reads the record's `at` as the instant the anchor closed.
+pub fn checked_close_record<S: ContextStore + SessionBackend + ?Sized>(
+    store: &S,
+    anchor: &str,
+) -> (CloseCheck, Option<CloseRecord>) {
     let Some(anchor_header) = local_header(store, anchor) else {
-        return CloseCheck::Open;
+        return (CloseCheck::Open, None);
     };
     if anchor_header.session_kind() != SessionKind::Anchor {
-        return CloseCheck::Open;
+        return (CloseCheck::Open, None);
     }
     let closed = close_name(anchor);
     if crate::discover::validate_workflow_name(&closed).is_err()
         || !state_path(store, &closed).exists()
     {
-        return CloseCheck::Open;
+        return (CloseCheck::Open, None);
     }
-    let taint = |why: &str| CloseCheck::Tainted(why.to_string());
+    let taint = |why: &str| (CloseCheck::Tainted(why.to_string()), None);
     let Some(header) = local_header(store, &closed) else {
         return taint("the close session's header can't be read");
     };
@@ -419,7 +435,7 @@ pub fn close_check<S: ContextStore + SessionBackend + ?Sized>(
         return taint("the close record's anchor_session_id isn't the anchor's id");
     }
     match read_marker(store, anchor) {
-        Some(marker) if marker.key == record.key => CloseCheck::Closed,
+        Some(marker) if marker.key == record.key => (CloseCheck::Closed, Some(record)),
         Some(_) => taint("the close record's key isn't the anchor's observed marker"),
         None => taint("the anchor holds no observed marker"),
     }

@@ -98,6 +98,7 @@ fn list_without_decider_has_no_decider_key() {
         vec![
             "origins",
             "request_store",
+            "retention",
             "run_journal",
             "session",
             "workflows"
