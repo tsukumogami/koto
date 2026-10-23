@@ -954,15 +954,16 @@ and settles only the moved session's own held-by links, so a hierarchy
 follows a session by name. Reads from another agent session go into the
 reader's anchor, so the read session stays byte-identical.
 
-Three existing koto behaviours still write into a session from another
+Four existing koto behaviours still write into a session from another
 session's process and stay outside this build, named so nobody mistakes
 them for part of the rule: a child's terminal tick appending its completion
 to its parent's log (koto#409 tracks replacing it with the parent reading
 its children at its own tick); `koto context add` naming any session
-(koto#411); and, on the cloud backend, a read that finds a changed key and
+(koto#411); on the cloud backend, a read that finds a changed key and
 downloads it logs a `context_added` by `sync` into the read session's log
-and pushes that session's state (koto#431). Retention counts only an
-anchor's own log, so that sync write never counts as activity. A read with
+and pushes that session's state (koto#431); and a `koto context get` or `exists` that finds a transition's store write was lost restores the assigned value into the read session (koto#436). Retention
+counts only an anchor's own log, so neither the sync write nor the restore
+counts as activity. A read by the anchor that holds the read session (through `koto/links/held-by/<anchor>`) is that agent session's own read and is still logged in the read session (`append_own_read`); that is by design, not a cross-session write. A read with
 no reader anchor no longer logs into the read session: it goes to the
 reading host's spool (koto#412 closed). Under the cloud
 backend a migrated source refuses the first two. Nothing in this design treats
@@ -1470,7 +1471,7 @@ store shared by mixed koto versions loses the guarantee.
   deletion.
 - Every `koto init` and tick under an anchor may append one event to that
   anchor, throttled to one per tenth of the idle period.
-- Three existing cross-session writers remain.
+- Four existing cross-session writers remain.
 - A store shared by an older koto loses the guarantee: the older binary
   ignores links.
 
@@ -1487,8 +1488,9 @@ store shared by mixed koto versions loses the guarantee.
   identified before any index.
 - Each harness assumption has a fallback that degrades to the koto-level
   reading, never to removal, and the hand checks gate Phase 8's merge.
-- koto#409, koto#411 and koto#431 track the three remaining cross-session
-  writers;
+- koto#409, koto#411, koto#431 and koto#436 track the four remaining
+  cross-session writers; an own read by the holding anchor still logs in the
+  read session by design;
   anchorless reads go to a host-local spool, closing koto#412.
 - Past the stale threshold (`retention.stale_after`, 30 days by default),
   prune and the hierarchy query name each stale observed anchor with the

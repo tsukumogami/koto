@@ -1032,17 +1032,20 @@ S3.
 
 ## Known Limitations
 
-- **Known cross-session writers.** Three existing koto behaviours write
+- **Known cross-session writers.** Four existing koto behaviours write
   into a session from another session's process and are left as they are:
   a child's terminal tick appending its completion to its parent's log;
-  `koto context add` naming any session; and, on the cloud backend, a read that finds a changed key and downloads it logs a `context_added` by `sync` into the read session's log and pushes that session's state (koto#431).
+  `koto context add` naming any session; on the cloud backend, a read that
+  finds a changed key and downloads it logs a `context_added` by `sync` into
+  the read session's log and pushes that session's state; and a `koto context get` or `exists` that finds a transition's store write was lost restores the assigned value into the read session (koto#436).
   Under the cloud backend a migrated source refuses the first two. Nothing
   in this feature treats a child's completion record as a link or a sign of
-  life, and none of the three counts as activity: retention counts only an
-  anchor's own log, so the sync write never extends an anchor's life.
-  koto#409 tracks the first, koto#411 the second and koto#431 the third. A third, a read with
-  no anchor on the reader's side, no longer writes into the read session:
-  it goes to the reading host's spool (R21), which closes koto#412.
+  life, and none of the four counts as activity: retention counts only an
+  anchor's own log, so neither the sync write nor the restore extends an
+  anchor's life. koto#409 tracks the first, koto#411 the second, koto#431
+  the third and koto#436 the fourth. A read by the anchor that holds the read session (through `koto/links/held-by/<anchor>`) is that agent session's own read and is still logged in the read session (`append_own_read`); that is by design, not a cross-session write. A read with no anchor on
+  the reader's side no longer writes into the read session: it goes to the
+  reading host's spool (R21), which closes koto#412.
 - An unobserved agent session (a plain terminal session, or one on a host
   with no niwa) left idle past the idle period loses its hold on the sessions
   it dispatched, even though a person could still resume it; so does an
