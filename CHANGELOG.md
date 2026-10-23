@@ -24,7 +24,9 @@ to `0.9.x`).
   compaction and `/clear`. With a koto older than the anchor verbs it opens
   no anchor, and its block in `CLAUDE_ENV_FILE` unsets `KOTO_ANCHOR` and
   `KOTO_DISPATCHER_ANCHOR`. Without koto or `jq` it does nothing. It always
-  exits 0.
+  exits 0. It runs koto with the `KOTO_SESSION_*` variables removed, so a
+  cloud backend chosen only through those variables, and not in a config
+  file, gets no anchor its shells can see; set the backend in a config file.
 
 ### Added
 
