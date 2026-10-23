@@ -38,6 +38,10 @@ fn koto(dir: &Path) -> StdCommand {
     cmd.env("HOME", dir);
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.env_remove("KOTO_WORKFLOWS_DIR");
+    // Every command runs as `s`'s own agent session, whose anchor holds it,
+    // so a `context get` is an own read and appends to `s`'s log, racing the
+    // tick: a read with no anchor would go to the host's read spool instead.
+    cmd.env("KOTO_ANCHOR", "anchor-own");
     cmd
 }
 
@@ -74,6 +78,18 @@ fn concurrent_appends_keep_seq_unique_and_every_read_logged_once() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     std::fs::create_dir_all(sessions_base(dir)).unwrap();
+    run_ok(
+        dir,
+        &[
+            "session",
+            "anchor",
+            "open",
+            "--harness-session",
+            "own",
+            "--source",
+            "startup",
+        ],
+    );
     let template = dir.join("race.md");
     std::fs::write(&template, chain_template(12)).unwrap();
     run_ok(

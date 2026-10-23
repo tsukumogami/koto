@@ -277,6 +277,7 @@ mod tests {
             hash: None,
             access: None,
             gate: None,
+            session: None,
         };
         let events = [event(1, to_done()), event(2, read())];
         assert_eq!(last_state_change(&events).map(|e| e.seq), Some(1));

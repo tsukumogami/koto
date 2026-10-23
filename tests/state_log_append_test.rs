@@ -71,9 +71,16 @@ fn koto(dir: &Path) -> StdCommand {
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.env_remove("KOTO_WORKFLOWS_DIR");
     cmd.env_remove("KOTO_TICK_SESSION");
+    // Every command runs as `s`'s own agent session, whose anchor holds it,
+    // so a `context get` is an own read and appends to `s`'s log: a read
+    // with no anchor would go to the host's read spool instead.
+    cmd.env("KOTO_ANCHOR", OWN_ANCHOR);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd
 }
+
+/// The anchor of the agent session that owns `s`.
+const OWN_ANCHOR: &str = "anchor-own";
 
 fn run_ok(dir: &Path, args: &[&str]) -> std::process::Output {
     let out = koto(dir).args(args).output().unwrap();
@@ -89,6 +96,18 @@ fn run_ok(dir: &Path, args: &[&str]) -> std::process::Output {
 /// A session `s` with a `note` key, plus the files the writers read.
 fn setup(dir: &Path) {
     std::fs::create_dir_all(sessions_base(dir)).unwrap();
+    run_ok(
+        dir,
+        &[
+            "session",
+            "anchor",
+            "open",
+            "--harness-session",
+            "own",
+            "--source",
+            "startup",
+        ],
+    );
     let template = dir.join("appends.md");
     std::fs::write(&template, TEMPLATE).unwrap();
     run_ok(

@@ -7,13 +7,22 @@
 //! out of the log bytes the commit already read under its lock and writes
 //! one record per distinct (key, reader, access) tuple, in first-read
 //! order. Nothing is kept between processes, because the session's log
-//! already holds the event that opened the visit and every read its own tick
-//! made, and the read spool beside it (`crate::session::read_spool`) holds
-//! the reads this host made from anywhere else.
+//! already holds the event that opened the visit and every own read (its
+//! tick's, and its own agent session's), and the read spool beside it
+//! (`crate::session::read_spool`) holds the reads this host made with no
+//! reader's anchor, under either backend.
 //!
 //! The fold holds at most [`MAX_TUPLES`] tuples and one overflow counter,
 //! however long the visit is, and parses only the lines whose type word is
 //! `context_read`.
+//!
+//! A read from another agent session is logged in the reader's anchor, not
+//! in the session it read, with a `session` field naming that session
+//! (DESIGN-session-retention.md, Decision 5). The read session's fold never
+//! sees it, since neither that session's log nor its spool holds it, and the
+//! anchor's fold skips it. [`anchor_read`] journals it instead, when the anchor
+//! commits it: one `context_reads` record attributed to the session the
+//! `session` field names, so the read shows up against that session.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -23,6 +32,7 @@ use serde::Deserialize;
 use super::{name_or_digest, Record, Relay};
 use crate::engine::persistence::opens_visit;
 use crate::engine::types::{Event, EventPayload};
+use crate::session::SessionBackend;
 
 /// The most tuples one visit writes a record of their own for. Reads of
 /// any further tuple are summed into one overflow record, so a visit writes
@@ -66,21 +76,19 @@ pub(super) fn closes_visit(payload: &EventPayload) -> bool {
 #[cfg(test)]
 pub(super) fn fold(log: &str, visit_seq: u64) -> Option<Fold> {
     let window = window(log, visit_seq)?;
-    let mut fold = Fold::default();
-    for line in window.lines() {
-        if head(line).is_some_and(|(_, kind)| kind == CONTEXT_READ) {
-            if let Ok(read) = serde_json::from_str::<ReadLine<'_>>(line) {
-                fold.add(&read.payload);
-            }
-        }
-    }
-    (!fold.is_empty()).then_some(fold)
+    fold_reads(
+        window
+            .lines()
+            .filter(|line| head(line).is_some_and(|(_, kind)| kind == CONTEXT_READ)),
+    )
 }
 
 /// [`fold`], with the visit's reads this host spooled beside the session
 /// (`crate::session::read_spool`, read through its one reader) folded in
-/// too: the reads made by anything but the session's own tick, which the
-/// cloud backend keeps out of the log. A spooled read belongs to the visit
+/// too: the reads made with no reader's anchor, which both backends keep
+/// out of the log (and, under the cloud backend, any other read made outside
+/// the session's own tick by a caller that doesn't route its reads). A
+/// spooled read belongs to the visit
 /// when it was made at or after the event the window starts from. Log and
 /// spool reads are folded in time order, so first-read order holds across
 /// both.
@@ -100,10 +108,20 @@ pub(super) fn fold_with_spool(log: &str, visit_seq: u64, session_dir: &Path) -> 
     );
     // Stable, so reads at the same instant keep log-then-spool order.
     lines.sort_by(|a, b| a.0.cmp(b.0));
+    fold_reads(lines.into_iter().map(|(_, line)| line))
+}
+
+/// Fold `context_read` lines, in the order given, into one visit's
+/// [`Fold`]; `None` when none counted. A read an anchor recorded for another
+/// session (one carrying `session`) is skipped: it was journaled against
+/// that session when the anchor committed it (see [`anchor_read`]).
+fn fold_reads<'a>(lines: impl Iterator<Item = &'a str>) -> Option<Fold> {
     let mut fold = Fold::default();
-    for (_, line) in lines {
+    for line in lines {
         if let Ok(read) = serde_json::from_str::<ReadLine<'_>>(line) {
-            fold.add(&read.payload);
+            if read.payload.session.is_none() {
+                fold.add(&read.payload);
+            }
         }
     }
     (!fold.is_empty()).then_some(fold)
@@ -117,6 +135,73 @@ fn line_timestamp(line: &str) -> Option<&str> {
     let start = line.find(KEY)? + KEY.len();
     let rest = &line[start..];
     Some(&rest[..rest.find(QUOTE)?])
+}
+
+/// The `context_reads` record of a read the reader's anchor `anchor`
+/// recorded for another session: a committed `context_read` whose
+/// `session` names the session read. `None` for any other payload, for a
+/// `session` that isn't a session name, and when `anchor` isn't an anchor in
+/// the local store: only koto writes `session`, and only into a reader's
+/// anchor, so the field in any other log (one pulled from a bucket someone
+/// else can write, say) is not a read record.
+///
+/// The record is attributed to the session read: its `session`,
+/// `koto.session.id` and `koto.run.id` are that session's, read from its
+/// header and its sidecar in place (nothing of it is written), and
+/// `koto.context.read_by` names the anchor. It describes the one read, so
+/// its counts are 1 or 0, and it carries no `koto.seq` or `koto.visit.seq`:
+/// those number the read session's log, which holds no event for the read.
+/// A read session whose header can't be read here gets a record with its
+/// name alone.
+pub(super) fn anchor_read(
+    backend: &dyn SessionBackend,
+    anchor: &str,
+    payload: &EventPayload,
+) -> Option<Record> {
+    let EventPayload::ContextRead {
+        key,
+        reader,
+        state,
+        present,
+        hash,
+        access,
+        session: Some(read),
+        ..
+    } = payload
+    else {
+        return None;
+    };
+    crate::session::validate::validate_session_id(read).ok()?;
+    if !crate::session::anchor::is_anchor(backend, anchor) {
+        return None;
+    }
+    let dir = backend.session_dir(read);
+    let header =
+        crate::engine::persistence::read_header(&dir.join(crate::session::state_file_name(read)))
+            .ok();
+    let session_id = header.as_ref().map_or("", |h| h.session_id.as_str());
+    let run_id = super::sidecar::read(&dir)
+        .and_then(|s| s.run_id)
+        .or_else(|| {
+            header
+                .as_ref()
+                .and_then(|h| super::run_id::run_id(backend, h))
+        });
+    let access = access.as_deref().unwrap_or(DEFAULT_ACCESS);
+    let mut record = Record::new("context_reads", read, session_id, run_id.as_deref())
+        .name("koto.state", Some(state.as_str()))
+        .name("koto.context.key", Some(name_or_digest(key).as_str()))
+        .name("koto.context.reader", Some(name_or_digest(reader).as_str()))
+        .name("koto.context.access", Some(name_or_digest(access).as_str()))
+        .name("koto.context.read_by", Some(anchor))
+        .int("koto.context.read_count", Some(1))
+        .int("koto.context.present_count", Some(u64::from(*present)));
+    if *present {
+        record = record
+            .id("koto.context.first_hash", hash.as_deref())
+            .id("koto.context.last_hash", hash.as_deref());
+    }
+    Some(record)
 }
 
 /// [`fold`], as the `context_reads` records of the commit `relay`
@@ -241,6 +326,10 @@ struct Read<'a> {
     hash: Option<Cow<'a, str>>,
     #[serde(default, borrow)]
     access: Option<Cow<'a, str>>,
+    /// The session read, on a read an anchor recorded for another session.
+    /// Any value, a malformed one included, keeps the read out of the fold.
+    #[serde(default)]
+    session: Option<serde::de::IgnoredAny>,
 }
 
 /// Reads and present reads.
@@ -466,6 +555,7 @@ mod tests {
             hash: Some("cd".repeat(32)),
             access: None,
             gate: None,
+            session: None,
         };
         let spool = |at: &str, key: &str| {
             crate::session::read_spool::append(dir.path(), at, &spooled(key)).unwrap()
@@ -542,6 +632,7 @@ mod tests {
             present: hash.is_some(),
             hash: hash.map(Cow::Borrowed),
             access: None,
+            session: None,
         }
     }
 

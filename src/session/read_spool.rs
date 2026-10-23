@@ -1,15 +1,21 @@
-//! Reads of a session made by anything but that session's own tick, kept on
-//! this host and never in the session's log (koto#428).
+//! Reads of a session made with no reader's anchor, and the pulls such reads
+//! make, kept on this host and never in the session's log (koto#428,
+//! koto#431, DESIGN-session-retention.md Decision 5).
 //!
 //! A `koto context get` or `exists` logs its read as a `context_read`, so a
 //! visit's reads can be folded into the run journal when the visit closes.
-//! Logged into the read session's own log, a read from another session's
-//! tick, or from outside any tick, makes the reader a writer of that
-//! session: on the cloud backend a push of its whole state file for every
-//! read, from a host that may not own the session (koto#412, koto#410). So
-//! the cloud backend appends such a read here instead, beside the session in
-//! the local store, and never pushes it. A session's own tick still logs its
-//! reads in the log, as before.
+//! Logged into the read session's own log, a read from a shell with no
+//! anchor makes the reader a writer of that session: on the cloud backend a
+//! push of its whole state file for every read, from a host that may not own
+//! the session (koto#412, koto#410). So such a read is appended here instead,
+//! beside the session in the local store, under either backend, and never
+//! pushed. There are two writers: `koto context get` and `exists` spool an
+//! anchorless read themselves (`src/cli/context.rs`), on both backends, and
+//! the cloud backend's `append_event` spools any other `context_read` made
+//! outside the session's own tick, as a backstop for a caller that doesn't
+//! route its reads. An own read (the reader's anchor is the session or holds
+//! it, or the read ran in its own tick) still goes into the log, and so does
+//! a read another agent session's anchor records of it, in that anchor's log.
 //!
 //! A read of a key another host changed downloads it into this host's local
 //! store first, and the cloud backend records that pull as a `context_added`
@@ -30,11 +36,14 @@
 //! and a pull is what a read cost, not a read. A reader that wants the pulls
 //! finds them in the file, beside the reads that made them.
 //!
-//! [`read`] is its one reader of reads and [`append`] its one writer (called
-//! from `crate::session::cloud`). Whatever consumes these reads (today the run
+//! [`read`] is its one reader of reads and [`append`] its one writer
+//! function, which two production call sites use: the read routing of
+//! `koto context get` and `koto context exists` for an anchorless read on the
+//! local backend, and the cloud backend's read path in
+//! `crate::session::cloud`. Whatever consumes these reads (today the run
 //! journal's visit fold, `crate::run_journal`) goes through `read`, so the
-//! spool can move to the reader's own side, as the session-retention work
-//! plans, by changing these two functions and the writer's one call site.
+//! spool can move or change shape by changing these two functions and both
+//! call sites.
 //! A line names no session: the spool's place beside the session says
 //! which, so a move that keeps reads elsewhere adds the session to the
 //! line and to `read`'s arguments.
@@ -57,11 +66,13 @@ pub const SPOOL_FILE: &str = "context-reads.jsonl";
 const CONTEXT_READ: &str = "context_read";
 
 /// Whether `payload` belongs in the spool rather than the read session's
-/// log, when anything but the session's own tick logs it: a read, or the
-/// pull a read made (a `context_added` written by `sync`).
+/// log, when anything but the session's own tick logs it: a read with no
+/// reader's anchor (`session` unset), or the pull a read made (a
+/// `context_added` written by `sync`). A read that names the session it
+/// read is an anchor's own record and goes into that anchor's log.
 pub fn spooled(payload: &EventPayload) -> bool {
     match payload {
-        EventPayload::ContextRead { .. } => true,
+        EventPayload::ContextRead { session: None, .. } => true,
         EventPayload::ContextAdded { writer, .. } => writer.as_deref() == Some(WRITER_SYNC),
         _ => false,
     }
@@ -89,10 +100,10 @@ struct SpoolHead {
 
 /// Append `payload`, made at `timestamp`, to the spool of the session whose
 /// local directory is `session_dir`. A payload [`spooled`] doesn't accept is
-/// refused: only reads and their pulls go here.
+/// refused: only anchorless reads and their pulls go here.
 pub fn append(session_dir: &Path, timestamp: &str, payload: &EventPayload) -> anyhow::Result<()> {
     if !spooled(payload) {
-        anyhow::bail!("only a context_read or a sync context_added is spooled");
+        anyhow::bail!("only an anchorless context_read or a sync context_added is spooled");
     }
     let line = serde_json::to_string(&SpooledRead {
         timestamp,
@@ -141,6 +152,7 @@ mod tests {
             hash: Some("ab".repeat(32)),
             access: None,
             gate: None,
+            session: None,
         }
     }
 
@@ -180,16 +192,40 @@ mod tests {
     }
 
     #[test]
-    fn only_a_read_or_a_sync_pull_is_spooled() {
+    fn only_an_anchorless_read_or_a_sync_pull_is_spooled() {
         let dir = tempfile::TempDir::new().unwrap();
         let other = EventPayload::WorkflowCancelled {
             state: "work".to_string(),
             reason: "x".to_string(),
         };
+        let anchored = match read_payload("a") {
+            EventPayload::ContextRead {
+                key,
+                reader,
+                state,
+                present,
+                hash,
+                access,
+                gate,
+                ..
+            } => EventPayload::ContextRead {
+                key,
+                reader,
+                state,
+                present,
+                hash,
+                access,
+                gate,
+                session: Some("worker".to_string()),
+            },
+            _ => unreachable!(),
+        };
         assert!(append(dir.path(), "t", &other).is_err());
         assert!(append(dir.path(), "t", &added_payload("a", "agent")).is_err());
+        assert!(append(dir.path(), "t", &anchored).is_err());
         assert!(!dir.path().join(SPOOL_FILE).exists());
         assert!(spooled(&read_payload("a")));
+        assert!(!spooled(&anchored));
         assert!(spooled(&added_payload("a", WRITER_SYNC)));
     }
 

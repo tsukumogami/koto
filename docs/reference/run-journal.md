@@ -93,7 +93,7 @@ their digest (see
 | `decider_check_answered` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.decider.answer`, `koto.decider.reason`, `koto.decider.fallback_seq` | `koto decider answer` records the agent's answer to a criterion handed to it. |
 | `check_overridden` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check` | An override is recorded for a gate. |
 | `response` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.response.source`, `koto.response.directive_bytes`, `koto.response.details_bytes` | `koto next` or `koto status` has printed a non-terminal state's directive. |
-| `context_reads` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.context.key`, `koto.context.reader`, `koto.context.access`, `koto.context.overflow`, `koto.context.read_count`, `koto.context.present_count`, `koto.context.first_hash`, `koto.context.last_hash` | A state visit that read context keys ends. |
+| `context_reads` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.context.key`, `koto.context.reader`, `koto.context.access`, `koto.context.overflow`, `koto.context.read_count`, `koto.context.present_count`, `koto.context.first_hash`, `koto.context.last_hash`, `koto.context.read_by` | A state visit that read context keys ends, or a reader's anchor records a read of another session. |
 
 The first five are the identity kinds. The next five are the check kinds,
 described in [Check records](#check-records), the seven after them are the
@@ -668,6 +668,34 @@ Context-read records hold key names and content hashes. koto never sends
 journal lines off the host; a tool that does must leave out every
 `context_reads` line.
 
+### Reads from another agent session
+
+A `koto context get` or `koto context exists` with no reader's anchor
+(`KOTO_ANCHOR` unset, or naming no anchor here) goes to this host's read
+spool beside the session read, not to its log. A visit's sum reads the
+session's log and its spool together, merged by timestamp: a spooled read
+made at or after the event the visit's window starts from counts in that
+visit, in first-read order with the log's reads. The spool is never sent
+anywhere and holds only reads made on this host.
+
+A `koto context get` or `koto context exists` run from another agent
+session (one whose `KOTO_ANCHOR` names an anchor that doesn't hold the
+session read) is logged in the reader's anchor, not in the session it read
+(see the [session-feed contract](session-feed.md#reads-from-another-agent-session)).
+The session read's own visits never count it, since neither its log nor its
+spool holds it. When the anchor commits the read, koto writes one
+`context_reads` record for it, attributed to the session read:
+
+- `session`, `koto.session.id` and `koto.run.id` are the session read's,
+  taken from its header and its cached run id without writing anything of
+  it. A session whose header can't be read here gets its name alone.
+- `koto.context.read_by` is the anchor that recorded the read.
+- `koto.state` is the session read's state at the read.
+- `koto.context.read_count` is 1 and `koto.context.present_count` 1 or 0;
+  the hashes are the read's, when it found the key.
+- It carries no `koto.seq` or `koto.visit.seq`: those number the session
+  read's log, which holds nothing for this read.
+
 ### When a visit's reads are written
 
 The records go in the same write as the record of the event that ends the
@@ -704,6 +732,7 @@ before that rewind's `state_entered`.
 | `koto.context.present_count` | integer | always | Those of them that found the key. |
 | `koto.context.first_hash` | string | when `koto.context.present_count` is at least 1, except on the overflow record | The unsalted SHA-256 of the content the first read that found the key saw, in lowercase hex, as the session log records it. |
 | `koto.context.last_hash` | string | as `koto.context.first_hash` | The same for the last such read. Equal to the first when the content didn't change. |
+| `koto.context.read_by` | string | on a read a reader's anchor recorded only | The anchor that recorded the read of this session (see [Reads from another agent session](#reads-from-another-agent-session)). Such a record has no `koto.seq` or `koto.visit.seq`. |
 
 ### What writes no context-read record
 

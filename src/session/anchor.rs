@@ -48,6 +48,19 @@ pub const ANCHOR_TEMPLATE: &str = include_str!("anchor_template.md");
 /// The close session's embedded template: its initial state is terminal.
 pub const ANCHOR_CLOSE_TEMPLATE: &str = include_str!("anchor_close_template.md");
 
+/// The compiled bytes of this build's [`ANCHOR_TEMPLATE`], exactly as an
+/// anchor this build opens records them (its header's `template_hash` is
+/// their SHA-256). `koto session import` uses them for an anchor whose
+/// template this host's cache doesn't hold, since no anchor's template ever
+/// reaches the cache.
+pub fn compiled_anchor_template() -> anyhow::Result<Vec<u8>> {
+    let dir = tempfile::tempdir()?;
+    let source = dir.path().join("koto-anchor.md");
+    std::fs::write(&source, ANCHOR_TEMPLATE)?;
+    let (artifact, _) = crate::cache::compile_cached_into(&source, dir.path(), true)?;
+    Ok(std::fs::read(artifact)?)
+}
+
 /// Every anchor's name starts with this.
 pub const ANCHOR_PREFIX: &str = "anchor-";
 
