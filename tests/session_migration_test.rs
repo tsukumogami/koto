@@ -165,6 +165,8 @@ fn carrier_moves_a_session_from_a_to_b_to_c() {
     for key in carrier.key_hashes.keys() {
         expected.push(format!("{}ctx/{}", b_session, key));
     }
+    // The record of where the copy came from, which every import writes.
+    expected.push(format!("{}ctx/koto/imported-from", b_session));
     expected.sort();
     ensure(
         step,
@@ -835,10 +837,11 @@ fn import_refuses_a_source_log_it_cannot_carry() {
     );
 }
 
-/// A session that never stored a key imports, and its target has an empty
-/// manifest, here and in the bucket.
+/// A session that never stored a key imports, and its target's manifest
+/// lists only the `koto/imported-from` record the import writes, here and
+/// in the bucket.
 #[test]
-fn a_source_with_no_context_keys_imports_with_an_empty_manifest() {
+fn a_source_with_no_context_keys_imports_with_only_its_import_record() {
     let s3 = FakeS3::start(BUCKET);
     let root = tempfile::TempDir::new().unwrap();
     let cloud = cloud(&s3);
@@ -857,18 +860,19 @@ fn a_source_with_no_context_keys_imports_with_an_empty_manifest() {
     let run = import(&b, "bare", &a, &[]);
     assert!(run.ok(), "import: {}", run.describe());
     assert_eq!(run.json["keys"], 0, "{}", run.describe());
-    let empty = serde_json::json!({"keys": {}});
-    assert_eq!(b.manifest("bare"), empty);
+    let manifest = b.manifest("bare");
+    let keys: Vec<&String> = manifest["keys"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["koto/imported-from"]);
     let pushed = s3
         .object(&format!("{}ctx/manifest.json", session_prefix(&b, "bare")))
-        .expect("the empty manifest is pushed");
+        .expect("the manifest is pushed");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&pushed).unwrap(),
-        empty
+        manifest
     );
     let run = b.koto(&["context", "list", "bare"]);
     assert!(run.ok(), "context list: {}", run.describe());
-    assert_eq!(run.json, serde_json::json!([]));
+    assert_eq!(run.json, serde_json::json!(["koto/imported-from"]));
 }
 
 /// A PUT that fails part way through the push: the import takes back
@@ -884,7 +888,8 @@ fn a_failed_push_takes_back_exactly_what_it_pushed() {
     start_session(&a, "wf");
     compile(&b);
 
-    // The state file, the template and notes.md go up before the manifest.
+    // The state file, the template, notes.md and the import's own
+    // `koto/imported-from` go up before the manifest.
     let target = session_prefix(&b, "wf");
     let manifest = format!("{}ctx/manifest.json", target);
     s3.fail("PUT", &manifest, 500);
@@ -908,6 +913,7 @@ fn a_failed_push_takes_back_exactly_what_it_pushed() {
         format!("{}koto-wf.state.jsonl", target),
         format!("{}template.json", target),
         format!("{}ctx/notes.md", target),
+        format!("{}ctx/koto/imported-from", target),
     ]
     .into_iter()
     .collect();
@@ -948,9 +954,10 @@ fn an_unmarked_import_keeps_its_target_and_a_rerun_only_marks() {
     );
     assert_eq!(staging_dirs(&b), Vec::<String>::new());
     let target = holdings(&s3, &b, "wf");
+    // State file, template, notes.md, koto/imported-from, manifest, version.
     assert_eq!(
         target.1.len(),
-        5,
+        6,
         "the target in the bucket: {:?}",
         target.1
     );
@@ -1498,7 +1505,8 @@ fn import_requests_grow_by_one_get_and_one_put_per_key() {
                 .count()
         };
         assert_eq!(per_key("GET", &a), n, "GETs of {name}'s keys");
-        assert_eq!(per_key("PUT", &b), n, "PUTs of {name}'s keys");
+        // The source's keys, plus the `koto/imported-from` the import writes.
+        assert_eq!(per_key("PUT", &b), n + 1, "PUTs of {name}'s keys");
         totals.push(requests.len());
     }
     assert_eq!(

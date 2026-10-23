@@ -44,6 +44,11 @@ const CLEARED: &[&str] = &[
     "CLAUDE_CODE_SESSION_ID",
     "KOTO_WORKFLOWS_DIR",
     "KOTO_TEST_IMPORT_FAULT",
+    "KOTO_ANCHOR",
+    "KOTO_DISPATCHER_ANCHOR",
+    "KOTO_RETENTION_KEEP",
+    "KOTO_RETENTION_IDLE_PERIOD",
+    "KOTO_RETENTION_STALE_AFTER",
 ];
 
 /// One host: one `HOME` and template cache, two workspaces.
@@ -67,7 +72,12 @@ impl Out {
     fn ok(&self) -> bool {
         self.code == Some(0)
     }
+    /// stdout as JSON: the whole of it (a pretty-printed answer), else its
+    /// last non-empty line.
     fn json(&self) -> serde_json::Value {
+        if let Ok(v) = serde_json::from_str(self.stdout.trim()) {
+            return v;
+        }
         let line = self
             .stdout
             .lines()
@@ -1004,4 +1014,721 @@ fn a_marker_from_another_import_is_never_taken_for_this_one() {
     // Everything this run pushed or staged was taken back.
     assert!(b_objects(&h, &s3).is_empty());
     assert!(!h.pending().exists());
+}
+
+// ===== Settling koto's own keys (DESIGN-session-retention.md, Decision 6) =====
+//
+// Each scenario runs on this one host, with the cloud backend configured
+// per command in the environment. A scenario that needs a second host's
+// store gives it a second `Host` (its own HOME and template cache) over the
+// same bucket.
+
+/// A command that must succeed, in workspace `ws`, with `env` added.
+fn ok(h: &Host, ws: &Path, args: &[&str], env: &[(&str, &str)]) -> Out {
+    let out = h.koto(ws, args, env);
+    assert!(out.ok(), "koto {args:?}: {}", out.describe());
+    out
+}
+
+/// Open the anchor of harness session `harness` (`anchor-<harness>`), with
+/// an observed marker when `key` is given.
+fn open_anchor(h: &Host, ws: &Path, harness: &str, key: Option<&str>) -> String {
+    let mut args = vec![
+        "session",
+        "anchor",
+        "open",
+        "--harness-session",
+        harness,
+        "--source",
+        "startup",
+    ];
+    if let Some(key) = key {
+        args.extend(["--observed-key", key]);
+    }
+    ok(h, ws, &args, &[]);
+    format!("anchor-{harness}")
+}
+
+/// Start session `name` in `ws` with `extra` arguments, `notes.md` added.
+fn start(h: &Host, ws: &Path, name: &str, extra: &[&str], env: &[(&str, &str)]) {
+    let mut args = vec!["init", name, "--template", TEMPLATE_FILE];
+    args.extend_from_slice(extra);
+    ok(h, ws, &args, env);
+    let file = h.home.join(format!("notes-{name}"));
+    std::fs::write(&file, b"the notes\n").unwrap();
+    ok(
+        h,
+        ws,
+        &[
+            "context",
+            "add",
+            name,
+            "notes.md",
+            "--from-file",
+            file.to_str().unwrap(),
+        ],
+        &[],
+    );
+}
+
+/// Tick `name` in `ws` to its terminal, without `--no-cleanup`; returns the
+/// terminal response.
+fn finish(h: &Host, ws: &Path, name: &str, env: &[(&str, &str)]) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    for data in [
+        None,
+        Some(r#"{"choice":"go"}"#),
+        Some(r#"{"verdict":"approve"}"#),
+    ] {
+        let mut args = vec!["next", name];
+        if let Some(d) = data {
+            args.extend(["--with-data", d]);
+        }
+        last = ok(h, ws, &args, env).json();
+    }
+    assert_eq!(last["action"], "done", "{last:#}");
+    last
+}
+
+/// Import `name` from workspace `from` into `ws`, as `as_name` when given.
+fn import(
+    h: &Host,
+    ws: &Path,
+    name: &str,
+    from: &Path,
+    as_name: Option<&str>,
+    env: &[(&str, &str)],
+) -> Out {
+    let mut args = vec!["session", "import", name, "--from", from.to_str().unwrap()];
+    if let Some(n) = as_name {
+        args.extend(["--as", n]);
+    }
+    ok(h, ws, &args, env)
+}
+
+fn session_file(h: &Host, name: &str, rel: &str) -> PathBuf {
+    h.sessions().join(name).join(rel)
+}
+
+/// The keys `name`'s local manifest lists.
+fn manifest_keys(h: &Host, name: &str) -> Vec<String> {
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(session_file(h, name, "ctx/manifest.json")).unwrap())
+            .unwrap();
+    m["keys"].as_object().unwrap().keys().cloned().collect()
+}
+
+/// The parsed body of `name`'s link `koto/links/<kind>/<peer>`, or `None`.
+fn link(h: &Host, name: &str, kind: &str, peer: &str) -> Option<serde_json::Value> {
+    let rel = format!("ctx/koto/links/{kind}/{peer}");
+    std::fs::read(session_file(h, name, &rel))
+        .ok()
+        .map(|b| serde_json::from_slice(&b).unwrap())
+}
+
+/// Every object under `name`'s key prefix in workspace `ws`, with its bytes.
+fn objects(s3: &FakeS3, ws: &Path, name: &str) -> Files {
+    let prefix = format!("{}/{}/", prefix_of(ws), name);
+    let mut out: Files = s3
+        .keys_under(&prefix)
+        .into_iter()
+        .map(|k| {
+            let v = s3.object(&k).unwrap();
+            (k, v)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every file of `name`'s local directory, but the locks and the run
+/// journal's sidecar.
+fn local_files(h: &Host, name: &str) -> Files {
+    let dir = h.sessions().join(name);
+    let mut out: Files = walk(&dir)
+        .into_iter()
+        .filter_map(|p| {
+            let rel = p.strip_prefix(&dir).unwrap().to_string_lossy().into_owned();
+            (!rel.ends_with(".lock") && rel != "run-journal.json")
+                .then(|| (rel, std::fs::read(&p).unwrap()))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// `before` and `after` are the same objects but the migration marker the
+/// import adds beside the source.
+fn only_marked(before: &Files, after: &Files, ws: &Path, name: &str) {
+    let marker = format!("{}/{}/migrated.json", prefix_of(ws), name);
+    let rest: Files = after
+        .iter()
+        .filter(|(k, _)| *k != marker)
+        .cloned()
+        .collect();
+    assert_eq!(&rest, before, "the source changed beyond its marker");
+    assert!(
+        after.iter().any(|(k, _)| *k == marker),
+        "no marker on {name}"
+    );
+}
+
+/// The kept entry for `name` in a prune's output, as its `detail`.
+fn kept_detail(prune: &serde_json::Value, name: &str) -> String {
+    prune["kept"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["name"] == name)
+        .unwrap_or_else(|| panic!("{name} isn't kept: {prune:#}"))["detail"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn removed_names(prune: &serde_json::Value) -> Vec<String> {
+    prune["removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            r.get("name")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| r.as_str())
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The named member of a `koto session hierarchy --json` answer.
+fn member(h: &serde_json::Value, name: &str) -> serde_json::Value {
+    h["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("{name} isn't a member: {h:#}"))
+}
+
+/// Milliseconds since the epoch of a UTC timestamp as koto writes them.
+fn millis(ts: &str) -> i64 {
+    let n = |r: std::ops::Range<usize>| ts[r].parse::<i64>().unwrap();
+    let (y, m, d) = (n(0..4), n(5..7), n(8..10));
+    let (hh, mm, ss) = (n(11..13), n(14..16), n(17..19));
+    let ms = if ts.as_bytes().get(19) == Some(&b'.') {
+        n(20..23)
+    } else {
+        0
+    };
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    (days * 86_400 + hh * 3600 + mm * 60 + ss) * 1000 + ms
+}
+
+fn sleep_until(at_ms: i64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    if at_ms > now {
+        std::thread::sleep(std::time::Duration::from_millis((at_ms - now) as u64));
+    }
+}
+
+/// The timestamp of the last event in `name`'s local log, in milliseconds.
+fn last_event_ms(h: &Host, name: &str) -> i64 {
+    let log = std::fs::read_to_string(h.state_path(name)).unwrap();
+    let line = log.lines().rfind(|l| !l.trim().is_empty()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(line).unwrap();
+    millis(v["timestamp"].as_str().unwrap())
+}
+
+/// A coordinator `coord` opened by an agent session whose anchor has since
+/// closed, with a finished `b` it dispatched, moved to workspace B by
+/// another agent session: the copy's held-by is rewritten to the importer's
+/// anchor, the copy is kept at its terminal step, a prune names the
+/// importer's anchor as why the copy and `b` are kept, the migrated source
+/// keeps nothing and refuses reads, and `b` stays readable from B.
+#[test]
+fn an_import_from_an_agent_session_holds_the_moved_copy_and_its_hierarchy() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    let old = open_anchor(&h, &h.a, "OLD", Some("K-OLD"));
+    let under_old = [("KOTO_ANCHOR", old.as_str())];
+    start(&h, &h.a, "coord", &[], &under_old);
+    start(&h, &h.a, "b", &["--dispatched-by", "coord"], &under_old);
+    let v = finish(&h, &h.a, "b", &under_old);
+    assert_eq!(v["retention"]["retained"], true, "{v:#}");
+    // The old agent session ends: its anchor reads closed by its observed
+    // close.
+    ok(
+        &h,
+        &h.a,
+        &[
+            "session",
+            "anchor",
+            "close",
+            "--key=K-OLD",
+            "--harness-session=OLD",
+        ],
+        &[],
+    );
+    let imp = open_anchor(&h, &h.b, "IMP", None);
+    let as_importer = [("KOTO_ANCHOR", imp.as_str())];
+    let source_objects = objects(&s3, &h.a, "coord");
+    let source_local = local_files(&h, "coord");
+
+    let out = import(&h, &h.b, "coord", &h.a, Some("coord-b"), &as_importer);
+    assert_eq!(out.json()["name"], "coord-b");
+    // The held-by link now names the importer's anchor, and says which it
+    // replaced.
+    assert!(link(&h, "coord-b", "held-by", &old).is_none());
+    let held = link(&h, "coord-b", "held-by", &imp).expect("a held-by to the importer");
+    assert_eq!(held["session"], imp.as_str());
+    assert_eq!(held["was"], old.as_str());
+    // The source changed only by its marker, locally and in the bucket.
+    only_marked(&source_objects, &objects(&s3, &h.a, "coord"), &h.a, "coord");
+    assert_eq!(local_files(&h, "coord"), source_local);
+
+    // The copy reaches its terminal step without --no-cleanup and is kept.
+    let v = finish(&h, &h.b, "coord-b", &as_importer);
+    assert_eq!(v["retention"]["retained"], true, "{v:#}");
+    assert_eq!(v["retention"]["reason"], "hierarchy", "{v:#}");
+    assert!(h.sessions().join("coord-b").is_dir());
+
+    // A prune names the importer's anchor as why the copy and b are kept.
+    for args in [
+        &["session", "prune"][..],
+        &["session", "prune", "--apply", "--all"][..],
+    ] {
+        let out = ok(&h, &h.b, args, &[]).json();
+        for name in ["coord-b", "b"] {
+            let why = kept_detail(&out, name);
+            assert!(why.contains(&imp), "{name}: {why}");
+        }
+    }
+    // The migrated source keeps nothing and refuses reads.
+    let hierarchy = ok(&h, &h.b, &["session", "hierarchy", "b", "--json"], &[]).json();
+    let source = member(&hierarchy, "coord");
+    assert_eq!(source["migrated"], true, "{hierarchy:#}");
+    assert_eq!(source["alive"], false);
+    let refused = h.koto(&h.a, &["context", "get", "coord", "notes.md"], &[]);
+    assert_eq!(refused.code, Some(2), "{}", refused.describe());
+    assert!(format!("{}{}", refused.stdout, refused.stderr).contains("session_migrated"));
+
+    // The reviewer reads b's log and keys from B.
+    let out = ok(&h, &h.b, &["context", "list", "b"], &as_importer);
+    assert!(out.stdout.contains("notes.md"), "{}", out.describe());
+    let out = ok(&h, &h.b, &["status", "b"], &as_importer);
+    assert_eq!(out.json()["is_terminal"], true, "{}", out.describe());
+    let out = ok(&h, &h.b, &["context", "get", "b", "notes.md"], &as_importer);
+    assert_eq!(out.raw, b"the notes\n");
+}
+
+/// A held-by link whose anchor is open here is kept as it is, although the
+/// anchor's own workspace is another one than the importing workspace.
+#[test]
+fn a_held_by_naming_an_open_anchor_here_is_kept_whatever_its_workspace() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    let anchor = open_anchor(&h, &h.a, "A", None);
+    start(&h, &h.a, "s", &[], &[("KOTO_ANCHOR", anchor.as_str())]);
+    let body = std::fs::read(session_file(
+        &h,
+        "s",
+        &format!("ctx/koto/links/held-by/{anchor}"),
+    ))
+    .unwrap();
+    let header: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(h.state_path(&anchor))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(header["execution_dir"], h.a.to_str().unwrap());
+    assert_ne!(h.a, h.b);
+
+    import(&h, &h.b, "s", &h.a, Some("s-b"), &[]);
+    assert_eq!(
+        std::fs::read(session_file(
+            &h,
+            "s-b",
+            &format!("ctx/koto/links/held-by/{anchor}")
+        ))
+        .unwrap(),
+        body
+    );
+}
+
+/// When the anchor a held-by link names is closed or migrated here, an
+/// import from an agent session rewrites the link to that session's anchor
+/// with `"was"` holding the old name; the source changes only by its mark.
+#[test]
+fn a_held_by_naming_a_closed_or_migrated_anchor_is_rewritten_to_the_importers() {
+    // Closed: the anchor was imported first, from a bare shell, and has
+    // idled out since its import.
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    let x = open_anchor(&h, &h.a, "X", Some("K-X"));
+    start(&h, &h.a, "s", &[], &[("KOTO_ANCHOR", x.as_str())]);
+    import(&h, &h.b, &x, &h.a, None, &[]);
+    let imported_at = last_event_ms(&h, &x);
+    let imp = open_anchor(&h, &h.b, "IMP", None);
+    sleep_until(imported_at + 1300);
+    let before = objects(&s3, &h.a, "s");
+    import(
+        &h,
+        &h.b,
+        "s",
+        &h.a,
+        None,
+        &[
+            ("KOTO_ANCHOR", imp.as_str()),
+            ("KOTO_RETENTION_IDLE_PERIOD", "1s"),
+        ],
+    );
+    assert!(link(&h, "s", "held-by", &x).is_none());
+    let held = link(&h, "s", "held-by", &imp).expect("rewritten to the importer");
+    assert_eq!(held["was"], x.as_str());
+    only_marked(&before, &objects(&s3, &h.a, "s"), &h.a, "s");
+
+    // Migrated: the anchor was imported under another name, so the one
+    // here is the migrated source.
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    let x = open_anchor(&h, &h.a, "X", None);
+    start(&h, &h.a, "s", &[], &[("KOTO_ANCHOR", x.as_str())]);
+    import(&h, &h.b, &x, &h.a, Some("anchor-X2"), &[]);
+    let imp = open_anchor(&h, &h.b, "IMP", None);
+    let before = (objects(&s3, &h.a, "s"), local_files(&h, "s"));
+    import(
+        &h,
+        &h.b,
+        "s",
+        &h.a,
+        Some("s-b"),
+        &[("KOTO_ANCHOR", imp.as_str())],
+    );
+    let hierarchy = ok(&h, &h.b, &["session", "hierarchy", &x, "--json"], &[]).json();
+    assert_eq!(member(&hierarchy, &x)["migrated"], true, "{hierarchy:#}");
+    assert!(link(&h, "s-b", "held-by", &x).is_none());
+    let held = link(&h, "s-b", "held-by", &imp).expect("rewritten to the importer");
+    assert_eq!(held["was"], x.as_str());
+    only_marked(&before.0, &objects(&s3, &h.a, "s"), &h.a, "s");
+    assert_eq!(local_files(&h, "s"), before.1);
+}
+
+/// From a bare shell on another host, a finished session's held-by link is
+/// dropped (its anchor isn't in that host's store) and its dispatched-by
+/// link is carried unchanged; a prune there removes it once the retention
+/// from its finish has passed. Its original anchor stays open throughout.
+#[test]
+fn an_import_with_no_anchor_drops_the_held_by_and_the_session_is_released_later() {
+    let s3 = FakeS3::start(BUCKET);
+    let h1 = Host::new(&s3);
+    let h2 = Host::new(&s3);
+    let anchor = open_anchor(&h1, &h1.a, "O", None);
+    let under = [("KOTO_ANCHOR", anchor.as_str())];
+    start(&h1, &h1.a, "coord", &[], &[]);
+    start(&h1, &h1.a, "b", &["--dispatched-by", "coord"], &under);
+    finish(&h1, &h1.a, "b", &under);
+    let dispatched =
+        std::fs::read(session_file(&h1, "b", "ctx/koto/links/dispatched-by/coord")).unwrap();
+    let finished_at = last_event_ms(&h1, "b");
+
+    let template = h2.a.join(TEMPLATE_FILE);
+    ok(
+        &h2,
+        &h2.a,
+        &["template", "compile", template.to_str().unwrap()],
+        &[],
+    );
+    import(&h2, &h2.a, "b", &h1.a, None, &[]);
+    assert!(manifest_keys(&h2, "b")
+        .iter()
+        .all(|k| !k.starts_with("koto/links/held-by/")));
+    assert!(link(&h2, "b", "held-by", &anchor).is_none());
+    assert_eq!(
+        std::fs::read(session_file(&h2, "b", "ctx/koto/links/dispatched-by/coord")).unwrap(),
+        dispatched
+    );
+
+    // Inside the retention from its finish the prune keeps it; past it,
+    // the prune removes it.
+    let keep_long = [("KOTO_RETENTION_KEEP", "1h")];
+    let out = ok(
+        &h2,
+        &h2.a,
+        &["session", "prune", "--apply", "--all"],
+        &keep_long,
+    )
+    .json();
+    assert!(kept_detail(&out, "b").contains("retention"), "{out:#}");
+    sleep_until(finished_at + 2300);
+    let keep_short = [("KOTO_RETENTION_KEEP", "2s")];
+    let out = ok(
+        &h2,
+        &h2.a,
+        &["session", "prune", "--apply", "--all"],
+        &keep_short,
+    )
+    .json();
+    assert!(removed_names(&out).contains(&"b".to_string()), "{out:#}");
+    assert!(!h2.sessions().join("b").exists());
+
+    // The original anchor is open on its own host.
+    let hierarchy = ok(
+        &h1,
+        &h1.a,
+        &["session", "hierarchy", &anchor, "--json"],
+        &[],
+    )
+    .json();
+    assert_eq!(member(&hierarchy, &anchor)["alive"], true, "{hierarchy:#}");
+}
+
+/// An anchor imported from a bare shell, then a finished session it holds:
+/// the session's held-by still names the anchor, which reads here with no
+/// observed marker and its import as its last activity. Inside the idle
+/// period from the import the prune keeps the session naming the anchor;
+/// past it the anchor reads closed (idle); inside the retention after that
+/// close the session is still kept, and past it the prune removes it,
+/// naming the idle close.
+#[test]
+fn an_imported_anchor_holds_what_it_held_until_it_idles_out() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    let anchor = open_anchor(&h, &h.a, "A", Some("K-A"));
+    assert!(manifest_keys(&h, &anchor).contains(&"koto/anchor/observed".to_string()));
+    let under = [("KOTO_ANCHOR", anchor.as_str())];
+    start(&h, &h.a, "b", &[], &under);
+    finish(&h, &h.a, "b", &under);
+    let body = std::fs::read(session_file(
+        &h,
+        "b",
+        &format!("ctx/koto/links/held-by/{anchor}"),
+    ))
+    .unwrap();
+
+    import(&h, &h.b, &anchor, &h.a, None, &[]);
+    import(&h, &h.b, "b", &h.a, None, &[]);
+    let imported_at = {
+        let log = std::fs::read_to_string(h.state_path(&anchor)).unwrap();
+        let last: serde_json::Value =
+            serde_json::from_str(log.lines().rfind(|l| !l.trim().is_empty()).unwrap()).unwrap();
+        assert_eq!(last["type"], "session_imported", "{last}");
+        millis(last["timestamp"].as_str().unwrap())
+    };
+    // The anchor reads here, unobserved and imported; b still names it.
+    assert!(!manifest_keys(&h, &anchor).contains(&"koto/anchor/observed".to_string()));
+    assert!(!session_file(&h, &anchor, "ctx/koto/anchor/observed").exists());
+    assert_eq!(
+        std::fs::read(session_file(
+            &h,
+            "b",
+            &format!("ctx/koto/links/held-by/{anchor}")
+        ))
+        .unwrap(),
+        body
+    );
+    let fast = [
+        ("KOTO_RETENTION_IDLE_PERIOD", "3s"),
+        ("KOTO_RETENTION_KEEP", "3s"),
+        ("KOTO_RETENTION_STALE_AFTER", "1h"),
+    ];
+    let hierarchy = ok(&h, &h.b, &["session", "hierarchy", "b", "--json"], &fast).json();
+    let a = member(&hierarchy, &anchor);
+    assert_eq!(a["alive"], true, "{hierarchy:#}");
+    assert_eq!(a["observed"], false);
+    assert_eq!(a["imported"], true);
+
+    // Inside the idle period: kept, naming the anchor.
+    let out = ok(&h, &h.b, &["session", "prune", "--apply", "--all"], &fast).json();
+    assert!(kept_detail(&out, "b").contains(&anchor), "{out:#}");
+
+    // Past it: the anchor reads closed, idle, from its import; b is kept
+    // through the retention after that close.
+    sleep_until(imported_at + 3400);
+    let hierarchy = ok(&h, &h.b, &["session", "hierarchy", "b", "--json"], &fast).json();
+    let a = member(&hierarchy, &anchor);
+    assert_eq!(a["alive"], false, "{hierarchy:#}");
+    assert_eq!(a["close_kind"], "idle");
+    assert_eq!(
+        millis(a["stopped_at"].as_str().unwrap()),
+        imported_at + 3000
+    );
+    let out = ok(&h, &h.b, &["session", "prune", "--apply", "--all"], &fast).json();
+    let why = kept_detail(&out, "b");
+    assert!(why.contains("idle"), "{why}");
+
+    // Past the retention: removed, naming the idle close.
+    sleep_until(imported_at + 6400);
+    let hierarchy = ok(&h, &h.b, &["session", "hierarchy", "b", "--json"], &fast).json();
+    assert_eq!(hierarchy["kept"], false, "{hierarchy:#}");
+    assert_eq!(hierarchy["retention"]["release"]["member"], anchor.as_str());
+    assert_eq!(hierarchy["retention"]["release"]["close_kind"], "idle");
+    let out = ok(&h, &h.b, &["session", "prune", "--apply", "--all"], &fast).json();
+    assert!(removed_names(&out).contains(&"b".to_string()), "{out:#}");
+    let removed_anchor = out["removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == anchor.as_str())
+        .unwrap_or_else(|| panic!("the anchor wasn't removed with b: {out:#}"));
+    assert_eq!(
+        millis(removed_anchor["stopped_at"].as_str().unwrap()),
+        imported_at + 3000,
+        "the prune names the idle close as the anchor's stop"
+    );
+    assert!(!h.sessions().join("b").exists());
+}
+
+/// A bucket that can't be trusted for the reserved area: a link whose body
+/// names another session than its key, an observed marker, a close link and
+/// a forged imported-from record, each listed in the manifest with its
+/// right hash. The import drops all four, warns about the malformed link,
+/// keeps the well-formed one, and writes its own imported-from.
+#[test]
+fn an_import_drops_the_reserved_keys_a_bucket_must_not_carry() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    start(&h, &h.a, "s", &[], &[]);
+    let prefix = format!("{}/s/", prefix_of(&h.a));
+    let manifest_key = format!("{prefix}ctx/manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&s3.object(&manifest_key).unwrap()).unwrap();
+    let body = |peer: &str| {
+        format!(
+            r#"{{"v":1,"session":"{peer}","session_id":null,"workspace":null,"at":"2026-01-01T00:00:00.000Z"}}"#
+        )
+        .into_bytes()
+    };
+    let planted: Vec<(&str, Vec<u8>)> = vec![
+        ("koto/links/dispatched-by/good", body("good")),
+        ("koto/links/dispatched-by/evil", body("someone-else")),
+        (
+            "koto/anchor/observed",
+            br#"{"v":1,"key":"K","at":"2026-01-01T00:00:00.000Z"}"#.to_vec(),
+        ),
+        ("koto/links/closes/anchor-x", body("anchor-x")),
+        (
+            "koto/imported-from",
+            br#"{"from_session":"forged","from_session_id":"forged-id"}"#.to_vec(),
+        ),
+    ];
+    for (key, bytes) in &planted {
+        s3.put(&format!("{prefix}ctx/{key}"), bytes);
+        manifest["keys"][key] = serde_json::json!({
+            "created_at": "2026-01-01T00:00:00.000Z",
+            "size": bytes.len(),
+            "hash": migration_carrier::sha256_hex(bytes),
+            "writer": "koto",
+        });
+    }
+    s3.put(&manifest_key, &serde_json::to_vec(&manifest).unwrap());
+    let source_id = {
+        let log =
+            String::from_utf8(s3.object(&format!("{prefix}koto-s.state.jsonl")).unwrap()).unwrap();
+        let header: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        header["session_id"].as_str().unwrap().to_string()
+    };
+
+    let out = import(&h, &h.b, "s", &h.a, Some("s-b"), &[]);
+    assert!(
+        out.stderr.contains("koto/links/dispatched-by/evil"),
+        "the malformed link isn't reported: {}",
+        out.describe()
+    );
+    assert_eq!(out.json()["keys"], 2, "notes.md and the good link");
+    assert_eq!(
+        manifest_keys(&h, "s-b"),
+        [
+            "koto/imported-from",
+            "koto/links/dispatched-by/good",
+            "notes.md"
+        ]
+    );
+    for gone in [
+        "koto/links/dispatched-by/evil",
+        "koto/anchor/observed",
+        "koto/links/closes/anchor-x",
+    ] {
+        assert!(
+            !session_file(&h, "s-b", &format!("ctx/{gone}")).exists(),
+            "{gone}"
+        );
+    }
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(session_file(&h, "s-b", "ctx/koto/imported-from")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        record,
+        serde_json::json!({"from_session": "s", "from_session_id": source_id})
+    );
+    // The pushed manifest is the copy's, so the bucket copy verifies.
+    let pushed = s3
+        .object(&format!("{}/s-b/ctx/manifest.json", prefix_of(&h.b)))
+        .unwrap();
+    assert_eq!(
+        pushed,
+        std::fs::read(session_file(&h, "s-b", "ctx/manifest.json")).unwrap()
+    );
+    let pushed: serde_json::Value = serde_json::from_slice(&pushed).unwrap();
+    for (key, meta) in pushed["keys"].as_object().unwrap() {
+        let bytes = s3
+            .object(&format!("{}/s-b/ctx/{key}", prefix_of(&h.b)))
+            .unwrap_or_else(|| panic!("{key} wasn't pushed"));
+        assert_eq!(meta["hash"], migration_carrier::sha256_hex(&bytes), "{key}");
+    }
+}
+
+/// An anchor's close session is never a source: the import refuses it
+/// before anything is written.
+#[test]
+fn an_import_refuses_an_anchor_close_session() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3);
+    start(&h, &h.a, "s", &[], &[]);
+    let key = format!("{}/s/koto-s.state.jsonl", prefix_of(&h.a));
+    let log = String::from_utf8(s3.object(&key).unwrap()).unwrap();
+    let mut lines: Vec<String> = log.lines().map(str::to_string).collect();
+    let mut header: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    header["kind"] = serde_json::Value::from("anchor-close");
+    lines[0] = header.to_string();
+    s3.put(&key, (lines.join("\n") + "\n").as_bytes());
+    let before = objects(&s3, &h.a, "s");
+
+    let out = h.koto(
+        &h.b,
+        &[
+            "session",
+            "import",
+            "s",
+            "--from",
+            h.a.to_str().unwrap(),
+            "--as",
+            "s-b",
+        ],
+        &[],
+    );
+    assert_refused(&out, "import_source_is_anchor_close");
+    assert!(out.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("anchor-close"));
+    assert_eq!(objects(&s3, &h.a, "s"), before);
+    assert!(s3
+        .keys_under(&format!("{}/s-b/", prefix_of(&h.b)))
+        .is_empty());
+    assert!(!h.sessions().join("s-b").exists());
 }
