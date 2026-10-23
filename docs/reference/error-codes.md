@@ -55,7 +55,7 @@ The `error` text for duplicate and unknown keys, and for an allowlist failure, i
 | `session_live` | `--replace-terminal` without `--attach-live` found a running session. | `state` |
 | `session_terminal` | `--attach-live` without `--replace-terminal` found a finished session. | `state` |
 | `template_mismatch` | `--attach-live` found a session built from another template file. | `recorded`, `requested` |
-| `origin_mismatch` | `--attach-live` found a session from another worktree or session store, or one with no origin record. | `recorded`, `requested` |
+| `origin_mismatch` | `--attach-live` found a session from another worktree, session store or bucket, or one with no origin record. A session the local store started is not refused under the cloud backend from the same anchor and sessions directory: it is uploaded and adopted. | `recorded`, `requested` |
 | `var_mismatch` | An explicitly passed non-`rebind` variable differs from the session's recorded value. | `var`, `recorded`, `requested` |
 | `replace_held_live` | `--replace-terminal` found a finished session the retention rule keeps, so it would move aside, but a descendant in its subtree is still running, waits to promote its result to a request leg, or can't be read. | `live` |
 

@@ -1911,6 +1911,28 @@ impl CloudBackend {
         self.discard_batch(id)
     }
 
+    /// Make the bucket hold `id` exactly as this host's local copy has it:
+    /// how `koto init --attach-live` adopts a session the local store
+    /// started, once the host runs on the cloud backend over the same
+    /// sessions directory. A `koto next` there pushes only the state file,
+    /// so the whole copy goes up the way `--keep local` sends it. A session
+    /// another host imported is refused. The whole-session push only warns
+    /// on a failed state upload, so this fails unless the bucket ends up
+    /// with the local state file byte for byte.
+    pub fn adopt_local_copy(&self, id: &str) -> anyhow::Result<()> {
+        self.check_not_migrated(id)?;
+        self.resolve_conflict(id, "local")?;
+        let local = self
+            .read_local_state_bytes(id)
+            .ok_or_else(|| anyhow::anyhow!("session '{id}' has no local state file"))?;
+        match self.fetch_remote_state_bytes(id)? {
+            Some(remote) if remote == local => Ok(()),
+            _ => anyhow::bail!(
+                "after the upload, the bucket doesn't hold the state of session '{id}'"
+            ),
+        }
+    }
+
     /// Read the local state file bytes for a session, if present.
     fn read_local_state_bytes(&self, id: &str) -> Option<Vec<u8>> {
         let path = self.local.session_dir(id).join(state_file_name(id));
@@ -2319,6 +2341,7 @@ impl SessionBackend for CloudBackend {
         Some(crate::engine::types::SessionStoreIdentity {
             kind: "cloud".to_string(),
             base: std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf()),
+            bucket: Some(self.bucket.name()),
         })
     }
 
