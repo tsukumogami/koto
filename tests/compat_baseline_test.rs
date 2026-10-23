@@ -31,6 +31,8 @@
 
 #[path = "support/json_baseline.rs"]
 mod json_baseline;
+#[path = "support/koto_command.rs"]
+mod koto_command;
 
 use assert_cmd::Command;
 use assert_fs::TempDir;
@@ -292,7 +294,7 @@ const NOTES: &[&str] = &[
 fn koto_cmd(dir: &Path) -> Command {
     let sessions = dir.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     // No decider settings from the developer's shell, as the bash twin

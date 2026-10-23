@@ -3,6 +3,9 @@
 //! filtering. This guards the stream routing against a regression where
 //! an `eprintln!` diagnostic is changed to `println!`.
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use std::fs;
 use std::path::Path;
@@ -12,7 +15,7 @@ use std::path::Path;
 /// `~/.koto/sessions/`. `KOTO_SESSIONS_BASE` is deliberately NOT set:
 /// that override bypasses the migration path this test exercises.
 fn koto_at_home(home: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.env("HOME", home);
     cmd.env_remove("KOTO_SESSIONS_BASE");

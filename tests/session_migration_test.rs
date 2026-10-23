@@ -13,6 +13,8 @@
 
 #[path = "support/fake_s3.rs"]
 mod fake_s3;
+#[path = "support/koto_command.rs"]
+mod koto_command;
 #[path = "support/migration_carrier.rs"]
 mod migration_carrier;
 
@@ -721,8 +723,7 @@ fn import_refuses_a_manifest_entry_with_no_content_object() {
 /// The help text states the stopped-source rule.
 #[test]
 fn import_help_states_the_stopped_source_rule() {
-    let output = assert_cmd::Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .args(["session", "import", "--help"])
         .output()
         .unwrap();

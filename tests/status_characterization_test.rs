@@ -15,6 +15,8 @@
 
 #[path = "support/fake_s3.rs"]
 mod fake_s3;
+#[path = "support/koto_command.rs"]
+mod koto_command;
 
 use assert_cmd::Command;
 use assert_fs::TempDir;
@@ -24,7 +26,7 @@ use koto::session::Backend;
 use std::path::{Path, PathBuf};
 
 fn koto_cmd(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID"); // koto#331
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
@@ -390,7 +392,7 @@ fn a_migrated_session_exits_two_with_the_exact_error_object() {
     let ws = tmp.path().join("ws");
     let src = ws.join("t.md");
     std::fs::write(&src, TEMPLATE).unwrap();
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(&ws);
     cmd.env("HOME", tmp.path());
@@ -422,7 +424,7 @@ fn a_migrated_session_exits_two_with_the_exact_error_object() {
         .unwrap(),
     );
 
-    let mut status = Command::cargo_bin("koto").unwrap();
+    let mut status = koto_command::koto();
     status.env_remove("CLAUDE_CODE_SESSION_ID");
     status.current_dir(&ws);
     status.env("HOME", tmp.path());

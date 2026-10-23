@@ -14,8 +14,9 @@
 
 #[path = "support/fake_s3.rs"]
 mod fake_s3;
+#[path = "support/koto_command.rs"]
+mod koto_command;
 
-use assert_cmd::Command;
 use fake_s3::FakeS3;
 use std::path::PathBuf;
 
@@ -126,7 +127,7 @@ impl Box_ {
     }
 
     fn koto(&self, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
-        let mut cmd = Command::cargo_bin("koto").unwrap();
+        let mut cmd = koto_command::koto();
         for k in CLEARED {
             cmd.env_remove(k);
         }
@@ -530,7 +531,7 @@ fn env_only_cloud_syncs_and_signs_with_the_koto_pair() {
     let env = as_refs(&env);
     let out = b.koto(&["init", "demo", "--template", "demo.md"], &env);
     assert!(out.status.success(), "{}", describe(&out));
-    let mut add = Command::cargo_bin("koto").unwrap();
+    let mut add = koto_command::koto();
     for k in CLEARED {
         add.env_remove(k);
     }
@@ -600,7 +601,7 @@ fn empty_koto_credentials_fall_through_to_the_aws_pair() {
 /// authenticate.
 #[test]
 fn a_gate_that_calls_koto_reaches_the_cloud_backend() {
-    let koto_bin = PathBuf::from(env!("CARGO_BIN_EXE_koto"));
+    let koto_bin = koto_command::koto_bin();
     let bin_dir = koto_bin.parent().unwrap().to_path_buf();
     for legacy in [false, true] {
         let s3 = FakeS3::start(BUCKET);
@@ -625,7 +626,7 @@ fn a_gate_that_calls_koto_reaches_the_cloud_backend() {
         }
         let out = b.koto(&init, &env);
         assert!(out.status.success(), "legacy={legacy}: {}", describe(&out));
-        let mut add = Command::cargo_bin("koto").unwrap();
+        let mut add = koto_command::koto();
         for k in CLEARED {
             add.env_remove(k);
         }

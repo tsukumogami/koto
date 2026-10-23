@@ -17,6 +17,8 @@
 
 #[path = "support/fake_s3.rs"]
 mod fake_s3;
+#[path = "support/koto_command.rs"]
+mod koto_command;
 
 use assert_cmd::Command;
 use fake_s3::FakeS3;
@@ -80,10 +82,7 @@ Done.
 }
 
 fn koto_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_koto"))
-        .parent()
-        .unwrap()
-        .to_path_buf()
+    koto_command::koto_bin().parent().unwrap().to_path_buf()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -161,7 +160,7 @@ impl Host {
     /// [`Host::cmd`] as a `std` command, for a test that spawns koto and
     /// stops it part way.
     fn std_cmd(&self, args: &[&str]) -> std::process::Command {
-        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("koto"));
+        let mut cmd = koto_command::koto_std();
         cmd.env_clear()
             .current_dir(&self.ws)
             .env("PATH", format!("{}:{}", koto_dir().display(), SYSTEM_PATH))
@@ -707,8 +706,7 @@ fn the_local_backend_keeps_no_batch() {
     )
     .unwrap();
     let run = |args: &[&str]| {
-        let o = Command::cargo_bin("koto")
-            .unwrap()
+        let o = koto_command::koto()
             .env_clear()
             .current_dir(&ws)
             .env("PATH", format!("{}:{}", koto_dir().display(), SYSTEM_PATH))

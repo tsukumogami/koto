@@ -10,6 +10,8 @@ mod decider_stub;
 
 #[path = "support/decider_session.rs"]
 mod decider_session;
+#[path = "support/koto_command.rs"]
+mod koto_command;
 
 use std::time::{Duration, Instant};
 

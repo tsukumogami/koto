@@ -14,8 +14,11 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command as StdCommand, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
@@ -26,7 +29,7 @@ use assert_fs::TempDir;
 const WAKE_BOUND: Duration = Duration::from_secs(1);
 
 fn koto_cmd(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("HOME", dir);
@@ -102,7 +105,7 @@ fn cursor_now(dir: &Path, session: &str) -> String {
 /// Start `koto request watch` in the background from a known cursor, so
 /// no ring between reading the cursor and the watch starting is missed.
 fn spawn_watch(dir: &Path, session: &str, since: &str) -> Child {
-    StdCommand::new(assert_cmd::cargo::cargo_bin("koto"))
+    koto_command::koto_std()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .current_dir(dir)
         .env("HOME", dir)

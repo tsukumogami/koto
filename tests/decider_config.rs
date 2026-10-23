@@ -2,6 +2,9 @@
 //! key redaction, `koto config set` refusals, and user-config file
 //! permissions.
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use assert_fs::TempDir;
 use std::path::{Path, PathBuf};
@@ -37,7 +40,7 @@ fn dirs() -> Dirs {
 /// from `cwd`, with every decider env var removed so the file layers are
 /// what's under test.
 fn koto(d: &Dirs) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(&d.cwd);
     cmd.env("HOME", &d.home);

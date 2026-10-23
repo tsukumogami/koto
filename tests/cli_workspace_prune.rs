@@ -4,6 +4,9 @@
 //! refusal, `--force`/`--yes` interlock, `--dry-run`, descendant walk,
 //! and the no-coordinator-of-record-check property.
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use assert_fs::TempDir;
 use std::path::{Path, PathBuf};
@@ -12,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// Every command runs with a one-second retention, so a finished tree is
 /// released once [`settle`] has waited it out.
 fn koto_cmd(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     for var in [
         "CLAUDE_CODE_SESSION_ID",
         "KOTO_ANCHOR",

@@ -23,6 +23,8 @@
 
 #[path = "support/fake_s3.rs"]
 mod fake_s3;
+#[path = "support/koto_command.rs"]
+mod koto_command;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -142,7 +144,7 @@ impl Env {
     }
 
     fn cmd(&self, env: &[(&str, &str)]) -> Command {
-        let mut cmd = Command::cargo_bin("koto").unwrap();
+        let mut cmd = koto_command::koto();
         cmd.current_dir(&self.work)
             .env("HOME", &self.home)
             .env("XDG_CACHE_HOME", &self.cache)

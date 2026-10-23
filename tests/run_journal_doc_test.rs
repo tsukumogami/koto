@@ -9,6 +9,9 @@
 //! outside the koto repository, no attribute name outside the `koto.`
 //! namespace, and no cost figure.
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use regex::Regex;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -383,7 +386,7 @@ fn the_session_feed_contract_declares_the_lineage_header_fields() {
             "root",
         ],
     ] {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_koto"))
+        let out = koto_command::koto_std()
             .args(&args)
             .current_dir(tmp.path())
             .env("HOME", &home)

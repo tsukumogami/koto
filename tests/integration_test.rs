@@ -1,3 +1,6 @@
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use assert_fs::TempDir;
 use std::path::{Path, PathBuf};
@@ -8,7 +11,7 @@ use std::path::{Path, PathBuf};
 /// All integration tests must use this to avoid writing session data into
 /// the real `~/.koto/` directory.
 fn koto_cmd(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
@@ -91,8 +94,7 @@ fn compile_template(dir: &Path) -> String {
 
 #[test]
 fn version_exits_0_and_produces_json() {
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["version", "--json"])
         .output()
@@ -3679,8 +3681,7 @@ fn write_var_template_source(dir: &Path) -> std::path::PathBuf {
 
 #[test]
 fn version_outputs_human_readable_by_default() {
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .arg("version")
         .output()
@@ -3702,8 +3703,7 @@ fn version_outputs_human_readable_by_default() {
 
 #[test]
 fn version_is_derived_from_git_not_cargo_toml() {
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["version", "--json"])
         .output()
@@ -4894,8 +4894,7 @@ fn export_md_and_json_produce_identical_output() {
 fn export_cli_outputs_mermaid_to_stdout() {
     let fixture = fixture_multi_state();
 
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["template", "export", fixture.to_str().unwrap()])
         .output()
@@ -4963,15 +4962,13 @@ fn export_cli_writes_to_output_file() {
 fn export_determinism_via_cli() {
     let fixture = fixture_multi_state();
 
-    let first = Command::cargo_bin("koto")
-        .unwrap()
+    let first = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["template", "export", fixture.to_str().unwrap()])
         .output()
         .unwrap();
 
-    let second = Command::cargo_bin("koto")
-        .unwrap()
+    let second = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["template", "export", fixture.to_str().unwrap()])
         .output()
@@ -4993,8 +4990,7 @@ fn export_check_fresh_file_exits_0() {
     let output_path = dir.path().join("diagram.mermaid.md");
 
     // First, generate the file.
-    let gen = Command::cargo_bin("koto")
-        .unwrap()
+    let gen = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5012,8 +5008,7 @@ fn export_check_fresh_file_exits_0() {
     );
 
     // Now check: should exit 0 because the file is fresh.
-    let check = Command::cargo_bin("koto")
-        .unwrap()
+    let check = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5041,8 +5036,7 @@ fn export_check_stale_file_exits_1() {
     // Write stale content.
     std::fs::write(&output_path, b"stale content").unwrap();
 
-    let check = Command::cargo_bin("koto")
-        .unwrap()
+    let check = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5079,8 +5073,7 @@ fn export_check_missing_file_exits_1() {
     let fixture = fixture_multi_state();
     let output_path = dir.path().join("nonexistent.mermaid.md");
 
-    let check = Command::cargo_bin("koto")
-        .unwrap()
+    let check = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5121,8 +5114,7 @@ fn export_check_fix_command_resolves_drift() {
     std::fs::write(&output_path, b"stale").unwrap();
 
     // Run --check to get the fix command (it will fail).
-    let check = Command::cargo_bin("koto")
-        .unwrap()
+    let check = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5139,8 +5131,7 @@ fn export_check_fix_command_resolves_drift() {
     assert!(!check.status.success());
 
     // Apply the fix: regenerate the file.
-    let fix = Command::cargo_bin("koto")
-        .unwrap()
+    let fix = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5160,8 +5151,7 @@ fn export_check_fix_command_resolves_drift() {
     );
 
     // Now --check should pass.
-    let recheck = Command::cargo_bin("koto")
-        .unwrap()
+    let recheck = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5188,8 +5178,7 @@ fn export_html_to_file(fixture: &Path) -> (String, TempDir) {
     let dir = TempDir::new().unwrap();
     let output_path = dir.path().join("preview.html");
 
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5282,8 +5271,7 @@ fn export_html_determinism_via_cli() {
     let first_path = dir.path().join("first.html");
     let second_path = dir.path().join("second.html");
 
-    let first = Command::cargo_bin("koto")
-        .unwrap()
+    let first = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5297,8 +5285,7 @@ fn export_html_determinism_via_cli() {
         .output()
         .unwrap();
 
-    let second = Command::cargo_bin("koto")
-        .unwrap()
+    let second = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5396,8 +5383,7 @@ fn export_html_check_fresh_exits_0() {
     let output_path = dir.path().join("preview.html");
 
     // Generate the file.
-    let gen = Command::cargo_bin("koto")
-        .unwrap()
+    let gen = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5417,8 +5403,7 @@ fn export_html_check_fresh_exits_0() {
     );
 
     // Check: should exit 0 because the file is fresh.
-    let check = Command::cargo_bin("koto")
-        .unwrap()
+    let check = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5448,8 +5433,7 @@ fn export_html_check_stale_exits_1() {
     // Write stale content.
     std::fs::write(&output_path, b"<html>stale</html>").unwrap();
 
-    let check = Command::cargo_bin("koto")
-        .unwrap()
+    let check = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5488,8 +5472,7 @@ fn export_html_check_missing_exits_1() {
     let fixture = fixture_multi_state();
     let output_path = dir.path().join("nonexistent.html");
 
-    let check = Command::cargo_bin("koto")
-        .unwrap()
+    let check = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5532,8 +5515,7 @@ fn export_html_check_fix_command_resolves_drift() {
     std::fs::write(&output_path, b"stale").unwrap();
 
     // Run --check (it will fail).
-    let check = Command::cargo_bin("koto")
-        .unwrap()
+    let check = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5550,8 +5532,7 @@ fn export_html_check_fix_command_resolves_drift() {
     assert!(!check.status.success());
 
     // Apply the fix: regenerate the file.
-    let fix = Command::cargo_bin("koto")
-        .unwrap()
+    let fix = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5571,8 +5552,7 @@ fn export_html_check_fix_command_resolves_drift() {
     );
 
     // Now --check should pass.
-    let recheck = Command::cargo_bin("koto")
-        .unwrap()
+    let recheck = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5597,8 +5577,7 @@ fn export_html_check_fix_command_resolves_drift() {
 fn export_flag_html_without_output_errors() {
     let fixture = fixture_multi_state();
 
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5629,8 +5608,7 @@ fn export_flag_open_without_html_errors() {
     let fixture = fixture_multi_state();
     let output_path = dir.path().join("out.mermaid.md");
 
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5664,8 +5642,7 @@ fn export_flag_open_with_check_errors() {
     let fixture = fixture_multi_state();
     let output_path = dir.path().join("out.html");
 
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "template",
@@ -5698,8 +5675,7 @@ fn export_flag_open_with_check_errors() {
 fn export_flag_check_without_output_errors() {
     let fixture = fixture_multi_state();
 
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["template", "export", fixture.to_str().unwrap(), "--check"])
         .output()
@@ -5720,8 +5696,7 @@ fn export_flag_check_without_output_errors() {
 
 #[test]
 fn export_nonexistent_input_file_errors() {
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["template", "export", "/tmp/nonexistent-template-abc123.md"])
         .output()
@@ -5745,8 +5720,7 @@ fn export_malformed_json_input_errors() {
     let bad_json = dir.path().join("broken.json");
     std::fs::write(&bad_json, "{ this is not valid json }").unwrap();
 
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["template", "export", bad_json.to_str().unwrap()])
         .output()
@@ -5774,8 +5748,7 @@ fn export_invalid_template_errors() {
     )
     .unwrap();
 
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["template", "export", bad_md.to_str().unwrap()])
         .output()
@@ -5795,8 +5768,7 @@ fn export_latency_under_500ms() {
     let fixture = fixture_multi_state();
 
     let start = std::time::Instant::now();
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["template", "export", fixture.to_str().unwrap()])
         .output()
@@ -5840,8 +5812,7 @@ fn export_30_state_template_latency_under_500ms() {
     std::fs::write(&template_path, &yaml).unwrap();
 
     let start = std::time::Instant::now();
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["template", "export", template_path.to_str().unwrap()])
         .output()
@@ -5879,7 +5850,7 @@ fn export_30_state_template_latency_under_500ms() {
 /// Helper that creates a koto command with HOME overridden to a temp dir
 /// so config tests never touch the real ~/.koto/.
 fn koto_config_cmd(dir: &Path, home: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("HOME", home);
@@ -6129,7 +6100,7 @@ fn config_env_var_overrides_config_file() {
 
     // Now get with env var override.
     let output = {
-        let mut cmd = Command::cargo_bin("koto").unwrap();
+        let mut cmd = koto_command::koto();
         cmd.env_remove("CLAUDE_CODE_SESSION_ID");
         cmd.current_dir(tmp.path());
         cmd.env("HOME", &home);
@@ -6188,7 +6159,7 @@ fn config_set_unknown_key_fails() {
 
 /// Return a koto command with controlled HOME and KOTO_SESSIONS_BASE.
 fn koto_backend_cmd(dir: &Path, home: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("HOME", home);
@@ -6931,8 +6902,7 @@ fn fixture_legacy_gates() -> std::path::PathBuf {
 
 #[test]
 fn allow_legacy_gates_flag_present_in_help() {
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["template", "compile", "--help"])
         .output()

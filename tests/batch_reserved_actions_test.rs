@@ -15,6 +15,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use assert_fs::TempDir;
 use std::path::{Path, PathBuf};
@@ -28,7 +31,7 @@ fn sessions_base(dir: &Path) -> PathBuf {
 }
 
 fn koto_cmd(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
@@ -113,14 +116,14 @@ fn fail_task_1(dir: &Path) {
 /// Run `invocation` through a shell exactly as an agent would copy it, with
 /// `koto` resolving to the binary under test.
 fn run_invocation(dir: &Path, invocation: &str) -> serde_json::Value {
-    let bin = assert_cmd::cargo::cargo_bin("koto");
+    let bin = koto_command::koto_bin();
     let bin_dir = bin.parent().unwrap();
     let path = format!(
         "{}:{}",
         bin_dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let output = std::process::Command::new("sh")
+    let output = koto_command::scrub(&mut std::process::Command::new("sh"))
         .arg("-c")
         .arg(invocation)
         .current_dir(dir)

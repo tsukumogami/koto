@@ -13,6 +13,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 
@@ -31,7 +34,7 @@ fn sessions_base(dir: &Path) -> PathBuf {
 }
 
 fn koto(dir: &Path) -> StdCommand {
-    let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_koto"));
+    let mut cmd = koto_command::koto_std();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));

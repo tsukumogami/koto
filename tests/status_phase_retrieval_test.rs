@@ -12,6 +12,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use assert_fs::TempDir;
 use std::io::Write as _;
@@ -26,7 +29,7 @@ use koto::session::SessionBackend;
 // ---------------------------------------------------------------------------
 
 fn koto_cmd(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
@@ -770,9 +773,9 @@ fn trace_status_flocks(rotate: bool) -> Option<Vec<String>> {
     assert!(!before.is_empty());
 
     let trace_path = root.join("status.strace");
-    let koto_bin = assert_cmd::cargo::cargo_bin("koto");
+    let koto_bin = koto_command::koto_bin();
 
-    let spawn = std::process::Command::new("strace")
+    let spawn = koto_command::scrub(&mut std::process::Command::new("strace"))
         .args([
             "-f",
             "-y",
@@ -845,7 +848,7 @@ fn status_returns_promptly_while_koto_next_is_mid_tick_on_a_slow_gate() {
     let root = dir.path();
     init_workflow(root, "wf", SLOW_GATE_TEMPLATE);
 
-    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("koto"))
+    let child = koto_command::koto_std()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["next", "wf"])
         .current_dir(root)

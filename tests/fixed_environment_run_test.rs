@@ -8,6 +8,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use assert_fs::TempDir;
 use std::collections::BTreeSet;
@@ -57,7 +60,7 @@ impl Env {
     /// and the session store are set here, then `extra`, which may replace
     /// any of them.
     fn koto(&self, extra: &[(&str, &str)]) -> Command {
-        let mut cmd = Command::cargo_bin("koto").unwrap();
+        let mut cmd = koto_command::koto();
         cmd.env_remove("CLAUDE_CODE_SESSION_ID");
         cmd.env_clear();
         cmd.current_dir(&self.cwd);
@@ -183,10 +186,7 @@ fn path_with(dir: &Path) -> String {
 }
 
 fn koto_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_koto"))
-        .parent()
-        .unwrap()
-        .to_path_buf()
+    koto_command::koto_bin().parent().unwrap().to_path_buf()
 }
 
 /// One state whose single command gate must pass before `done`.

@@ -4,6 +4,9 @@
 //!
 //! docs/designs/DESIGN-koto-decider-checks.md, Decision 1.
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use std::io::Write as _;
 
 use koto::template::compile::compile;
@@ -433,7 +436,7 @@ fn a_compiled_check_with_no_spec_is_refused_on_load() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.json");
     std::fs::write(&path, &text).unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_koto"))
+    let out = koto_command::koto_std()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["template", "validate"])
         .arg(&path)
