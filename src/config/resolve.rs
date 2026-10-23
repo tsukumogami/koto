@@ -74,6 +74,9 @@ pub fn load_config() -> Result<KotoConfig> {
             mark_file_origins(&mut config, &user_config, Origin::User, true);
             merge_run_journal(&mut config, &user_config);
             merge_marker_retention(&mut config, &user_config);
+            config
+                .retention
+                .merge_file(&user_config.config.retention, Origin::User);
             merge_decider(
                 &mut config.decider,
                 &user_config.config.decider,
@@ -89,6 +92,9 @@ pub fn load_config() -> Result<KotoConfig> {
         record_file_secrets(&mut config.secret_sources, &project_config.config);
         merge_config(&mut config, &project_config);
         mark_file_origins(&mut config, &project_config, Origin::Project, false);
+        config
+            .retention
+            .merge_file(&project_config.config.retention, Origin::Project);
         merge_decider(
             &mut config.decider,
             &project_config.config.decider,
@@ -109,6 +115,9 @@ pub fn load_config() -> Result<KotoConfig> {
 
     // Layer 3c: KOTO_DECIDER* env overrides for the global decider values.
     apply_decider_env(&mut config.decider, |k| env::var(k).ok());
+
+    // Layer 3d: KOTO_RETENTION_* over the retention settings' file values.
+    config.retention.apply_env(|k| env::var(k).ok());
 
     Ok(config)
 }
@@ -1240,6 +1249,7 @@ mod tests {
                 request_store: RequestStoreConfig::default(),
                 workflows: Default::default(),
                 run_journal: Default::default(),
+                retention: Default::default(),
                 decider: Default::default(),
                 secret_sources: Default::default(),
                 session_env: Default::default(),

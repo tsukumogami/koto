@@ -49,7 +49,7 @@ koto init <name> --template <path>
 - `--dispatched-by <name>` -- Record that session `<name>` dispatched this one: a dispatched-by link in the new (or attached, or replacement) session's own context, the same link [`koto session link`](#session-link) writes. Nothing is written into `<name>`, which need not exist. A name that fails the session-name rule, or that is the session's own, exits 2 with `invalid_usage` before anything is created. A link that can't be written after the session was created prints a warning on stderr and leaves the session in place; `koto session link` records it later. Works with every init path, `--from-stdin` and `--parent` included.
 
 **Agent-session anchor:**
-- `KOTO_ANCHOR` -- When this variable names an anchor (see [session anchor](#session-anchor)) other than the session being created, init writes a held-by link, `koto/links/held-by/<anchor>`, into the new session's context, unless it already holds one, and appends an `anchor_activity` event to that anchor. When the anchor reads closed by an observed close and its family has a later anchor (`<anchor>-s2` and so on), the session also gets a held-by link to that one, and the activity goes there. Activity is throttled: at most one event per tenth of the idle period (`KOTO_RETENTION_IDLE_PERIOD`, default `7d`), judged from the anchor's last event. A variable that is unset, empty, or names no anchor does nothing and prints nothing. koto reads only `KOTO_ANCHOR`, never `KOTO_DISPATCHER_ANCHOR`. No other session is written.
+- `KOTO_ANCHOR` -- When this variable names an anchor (see [session anchor](#session-anchor)) other than the session being created, init writes a held-by link, `koto/links/held-by/<anchor>`, into the new session's context, unless it already holds one, and appends an `anchor_activity` event to that anchor. When the anchor reads closed by an observed close and its family has a later anchor (`<anchor>-s2` and so on), the session also gets a held-by link to that one, and the activity goes there. Activity is throttled: at most one event per tenth of the idle period (`retention.idle_period`, default `7d`, see [config](#config-keys-reference)), judged from the anchor's last event; a malformed value falls back to the default here and never fails the command. A variable that is unset, empty, or names no anchor does nothing and prints nothing. koto reads only `KOTO_ANCHOR`, never `KOTO_DISPATCHER_ANCHOR`. No other session is written.
 
 **Output (JSON):**
 
@@ -677,6 +677,52 @@ koto session anchor close --help >/dev/null 2>&1 || exit 0
 exec koto session anchor close --key="$NIWA_REAP_KEY" --harness-session="$NIWA_SESSION_ID"
 ```
 
+#### session hierarchy
+
+Shows the hierarchy a session belongs to, and whether koto keeps it.
+
+```bash
+koto session hierarchy <name> [--json]
+```
+
+A hierarchy is every session joined to `<name>` through a link (`koto/links/dispatched-by/`, `held-by/` or `closes/`), koto lineage (a header's `parent_workflow`; a value of the form `<p>~<digits>` that names no session counts as lineage to `<p>`) or a well-formed `chain/parent` context key. A link whose `session_id` hint names a session other than the one its name resolves to (a predecessor moved aside under a new name) joins that one too. A name with no session behind it is listed as `absent` and joins nothing. A session another session's import copied into this store is `migrated`: links naming it resolve to the copy, and it keeps nothing itself. A session counts as migrated only when the copy's `koto/imported-from` names it with its session id, the copy's log holds the matching `session_imported` event, and its own last event is no later than that one.
+
+The hierarchy is kept while any member is alive:
+
+- A koto session is alive while it runs, and while its log can't be read.
+- An anchor with no observed marker (one never observed, or an imported one) closes once `retention.idle_period` has passed since its last activity. Activity is what its own agent session writes to it: its `anchor_started` events, the `anchor_activity` events `init` and `next` record, its own read records, and, for an anchor copied in by `koto session import`, the `session_imported` event the import appended. A read of the anchor or of a session it holds from anywhere else, a child's completion record, or a `koto context add` from a bare shell never counts.
+- An observed anchor closes only through a valid observed close (`koto session anchor close`); nothing else closes it. Past `retention.stale_after` since its last activity it is reported `stale`, with the command that closes it by hand, `koto session anchor close --key='<marker>' --harness-session='<id>'`, its own values filled in. The command is printed only when both values match `^[A-Za-z0-9_-]{1,128}$`; otherwise the anchor is listed as stale with a malformed marker and no command. A stale report closes nothing.
+- An anchor's close session is never alive; it stops at its record's time.
+
+Once nothing is alive, the release instant is the latest stop among the members: the transition into a terminal state, a trailing cancel, an observed close, or an idle close. The hierarchy is kept until `retention.keep` has passed since then, and released after.
+
+Everything fails toward keeping. A malformed link, close record or `chain/parent`, a log that can't be read, a symlink or anything other than a regular file under a session's `ctx/koto/`, a link body over 4 KiB, or a timestamp more than five minutes in the future keeps its hierarchy, and is listed under `unreadable` with the session it belongs to. A header, manifest or links directory that can't be read keeps every hierarchy in the store, since that session could name any of them. Instants in the future are clamped to now and the members they came from are listed under `clamped`.
+
+The text form says kept or released and why, then lists the keepers (a stale anchor with its close command), the release instant and when the retention passes, anything unreadable, each member with its kind, liveness, stop and the edges that joined it, and the three settings with their origins. `--json` prints:
+
+```json
+{
+  "session": "worker",
+  "kept": true,
+  "keepers": [{"name": "anchor-1f3c", "kind": "anchor", "observed": true,
+               "stale": true, "close_command": "koto session anchor close --key='K' --harness-session='1f3c'"}],
+  "retention": null,
+  "unreadable": [],
+  "members": [{"name": "worker", "kind": "koto_session", "alive": false,
+               "stopped_at": "2026-10-22T18:01:02.000Z", "close_kind": "terminal",
+               "absent": false, "migrated": false, "observed": false, "imported": false,
+               "stale": false, "clamped": false,
+               "joined_by": [{"holder": "worker", "via": "held-by link", "named": "anchor-1f3c", "target": "anchor-1f3c"}]}],
+  "clamped": [],
+  "now": "2026-10-22T19:00:00.000Z",
+  "settings": {"retention.keep": {"value": "7d", "origin": "default"}, "...": {}}
+}
+```
+
+When nothing is alive, `keepers` is empty and `retention` is `{"release": {"at", "member", "close_kind"}, "passes_at"}`, with `close_kind` one of `terminal`, `cancelled`, `observed` or `idle`; `kept` stays `true` until `passes_at`. A stale keeper whose marker or harness session id fails the pattern carries `"malformed_marker": true` and no `close_command`.
+
+The command reads the local sessions directory directly and writes nothing; under the cloud backend it lists and reads no session through the bucket. A malformed retention setting, a malformed name, or a name with no session exits 2; a sessions directory that can't be listed exits 3. koto assumes `~/.koto` is private to its user: anyone who can write the store can forge the records this command reads.
+
 #### session cleanup
 
 Removes a session directory and all its contents. Idempotent -- succeeds even if the session doesn't exist.
@@ -1066,6 +1112,9 @@ koto config list --json
 | `session.cloud.access_key` | Access key ID | -- | no |
 | `session.cloud.secret_key` | Secret access key | -- | no |
 | `workflows.native` | `true`, `false` | `true` | yes |
+| `retention.keep` | Duration (`90s`, `45m`, `12h`, `7d`) | `"7d"` | yes |
+| `retention.idle_period` | Duration | `"7d"` | yes |
+| `retention.stale_after` | Duration, longer than `retention.keep` | `"30d"` | yes |
 | `decider.mode` | `"off"`, `"shadow"`, `"auto"` | `"off"` | yes (can only lower the mode) |
 | `decider.api_key` | Decider API key | -- | no |
 | `decider.endpoint` | `https` URL of the decision call (plain `http` only for loopback) | `"https://api.typesafe.ai/v1/systemone"` | no |
@@ -1074,6 +1123,8 @@ koto config list --json
 Credential keys (`access_key`, `secret_key`) can also be provided through environment variables `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Environment variables take precedence over config file values.
 
 The `decider` keys opt a user in to consulting a decider on template fields that declare one. `KOTO_DECIDER`, `KOTO_DECIDER_API_KEY`, and `KOTO_DECIDER_ENDPOINT` override `mode`, `api_key`, and `endpoint`. Unlike other keys, a project `decider.mode` doesn't replace the user's: the lower of the two applies, so a repository can turn the decider down but never on. koto ignores `api_key`, `endpoint`, and `timeout_ms` in project config with a warning. A key is sent only to an endpoint set in the same place (both env or both user config) or to the default, and `koto config get decider.api_key` prints `<set>`, never the key. A key must be printable ASCII: one holding a control character (a newline, say) or a non-ASCII character is ignored with a warning, and `koto config set` refuses it. A config file that won't parse is reported by path, line, and column only; koto never prints its content, since it can hold a key. See [decider-authoring.md](decider-authoring.md) for opting in, what a consultation sends, and how a template value is promoted.
+
+The `retention` keys decide how long a finished hierarchy of sessions is kept (see [session hierarchy](#session-hierarchy)): `retention.keep` is how long after its release instant, `retention.idle_period` how long an anchor with no observed marker stays open after its last activity, and `retention.stale_after` how long after its last activity an observed anchor is reported stale. Each resolves `KOTO_RETENTION_KEEP`, `KOTO_RETENTION_IDLE_PERIOD` or `KOTO_RETENTION_STALE_AFTER` first, then project config, then user config, then the default, and `koto config list` prints where each came from (`# origin: retention.keep = env KOTO_RETENTION_KEEP`, or the `origins` object with `--json`). A value is a whole number followed by `s`, `m`, `h` or `d` and longer than zero, and `retention.stale_after` must be longer than `retention.keep`, so a stale report never comes before a release. `koto config set` refuses a malformed value; one that reaches a config file or the environment anyway is refused, naming the setting and where it came from, by the commands that judge retention. Loading the configuration never fails on these keys, and no tick fails on them: whether a tick keeps its session never depends on them, and the activity throttle of `init` and `next` reads `retention.idle_period` with a fallback to the default. They are outside the `KOTO_SESSION_*` family on purpose: koto passes that family to the commands a tick runs.
 
 `workflows.native` controls rendering koto sessions in Claude Code's `/workflows` screen (see [native-workflows-verification.md](native-workflows-verification.md)); it is on by default and a participating session self-discovers its target directory from `CLAUDE_CODE_SESSION_ID`. Set it to `false` to opt out. A fully headless run (no Claude Code environment) renders nothing regardless.
 

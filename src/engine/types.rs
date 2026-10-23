@@ -530,9 +530,10 @@ pub struct StateFileHeader {
 }
 
 /// What a session's header says it is, from [`StateFileHeader::kind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionKind {
     /// A workflow: no `kind`, or one this build doesn't know.
+    #[default]
     Ordinary,
     /// An agent session's anchor (`kind: "anchor"`).
     Anchor,

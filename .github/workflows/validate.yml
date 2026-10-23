@@ -42,6 +42,23 @@ jobs:
       - name: Run tests
         run: cargo test --locked -- --test-threads=1
 
+  retention-cost:
+    # The retention engine's cost bound: on a generated store of 2,000
+    # sessions, `koto session hierarchy` answers within 1 second and a full
+    # scan and judgment within 10. The bounds hold for a release build only,
+    # so the default suite runs the test on a smaller store without them.
+    name: Retention Cost (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the cost test in release mode
+        run: cargo test --locked --release --test retention_cost -- --nocapture
+
   bash-sh-reproduction:
     # The exported-function reproduction from DESIGN-koto-fixed-environment.md.
     # Only a bash /bin/sh imports exported functions (BASH_FUNC_*), and the
@@ -688,7 +705,7 @@ jobs:
 
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, stability-tests, msrv, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, poll-forge-neutral, inline-evidence, audit, tsuku-distributed-install, cloud-integration]
+    needs: [check-artifacts, unit-tests, retention-cost, stability-tests, msrv, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, poll-forge-neutral, inline-evidence, audit, tsuku-distributed-install, cloud-integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -696,6 +713,7 @@ jobs:
         run: |
           if [ "${{ needs.check-artifacts.result }}" = "failure" ] || \
              [ "${{ needs.unit-tests.result }}" = "failure" ] || \
+             [ "${{ needs.retention-cost.result }}" = "failure" ] || \
              [ "${{ needs.stability-tests.result }}" = "failure" ] || \
              [ "${{ needs.msrv.result }}" = "failure" ] || \
              [ "${{ needs.fmt.result }}" = "failure" ] || \

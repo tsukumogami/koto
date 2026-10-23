@@ -13,6 +13,9 @@ const PROJECT_ALLOWLIST: &[&str] = &[
     "session.cloud.bucket",
     "session.cloud.region",
     "session.cloud.path_style",
+    "retention.keep",
+    "retention.idle_period",
+    "retention.stale_after",
     "decider.mode",
 ];
 

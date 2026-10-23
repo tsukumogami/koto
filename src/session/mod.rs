@@ -5,6 +5,8 @@ pub mod context;
 pub mod context_log;
 pub mod duration;
 pub mod finished;
+pub mod hierarchy;
+pub mod inventory;
 pub mod links;
 pub mod local;
 pub mod recover;
