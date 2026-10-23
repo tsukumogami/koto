@@ -23,11 +23,13 @@
 //! read. It is host-local: nothing uploads it, and a read made on another
 //! host isn't in it.
 //!
-//! [`read`] is its one reader and [`append`] its one writer (called from
-//! `crate::session::cloud`). Whatever consumes these reads (today the run
-//! journal's visit fold, `crate::run_journal`) goes through `read`, so the
-//! spool can move to the reader's own side, as the session-retention work
-//! plans, by changing these two functions and the writer's one call site.
+//! [`read`] is its one reader and [`append`] its one writer function, which
+//! two production call sites use: the read routing of `koto context get`
+//! and `koto context exists` for an anchorless read on the local backend,
+//! and the cloud backend's read path in `crate::session::cloud`. Whatever consumes these reads (today the
+//! run journal's visit fold, `crate::run_journal`) goes through `read`, so
+//! the spool can move or change shape by changing these two functions and
+//! both call sites.
 //! A line names no session: the spool's place beside the session says
 //! which, so a move that keeps reads elsewhere adds the session to the
 //! line and to `read`'s arguments.

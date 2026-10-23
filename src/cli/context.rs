@@ -79,6 +79,10 @@ pub fn handle_add(
 /// current state without reading it again; `None` exactly when nothing was
 /// read, which is also when the read logs nothing. The check here is
 /// bookkeeping and logs no read of its own.
+///
+/// This is the one place a read still writes into the session it reads:
+/// after a lost store write, `reconcile` stores the assigned value in the
+/// read session, whichever process read it (koto#436 tracks removing it).
 pub fn restore_assigned(
     store: &dyn ContextStore,
     backend: &dyn SessionBackend,
