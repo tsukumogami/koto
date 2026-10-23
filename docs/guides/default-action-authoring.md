@@ -167,7 +167,10 @@ inherit the environment of the `koto next` process: it gets one koto builds from
 record, described in [What a command's environment is](#what-a-commands-environment-is).
 
 **Every single run gets 30 seconds**, and that isn't configurable. On expiry the process group is
-killed and the failure reports `timed_out`. `polling` doesn't change this: `timeout_secs` bounds
+killed and the failure reports `timed_out`. koto records the result only once nothing is left in
+that group, so nothing the command started in it can write to the session after the tick has
+moved on; if the group is still there five seconds after the kill, koto goes on and the timeout
+message says so. `polling` doesn't change this: `timeout_secs` bounds
 how long koto keeps *retrying* the command, while each individual attempt still gets its 30
 seconds. So `polling` is for a condition that needs waiting out -- re-run this until the state's
 gates pass -- not for one long command. A single command that can't finish in 30 seconds isn't
