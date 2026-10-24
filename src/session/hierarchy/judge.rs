@@ -161,6 +161,10 @@ pub struct Member {
     pub stale: bool,
     /// An instant read for it lay ahead of `now` and was clamped.
     pub clamped: bool,
+    /// For an anchor, its last activity (clamped to `now`): the instant its
+    /// idle close and its stale report count from. `None` for every other
+    /// member, and for an anchor whose activity can't be read.
+    pub last_activity: Option<String>,
     /// The edges that joined it to the hierarchy.
     pub joined_by: Vec<Edge>,
 }
@@ -213,6 +217,7 @@ struct MemberState {
     close_command: Option<String>,
     malformed_marker: bool,
     clamped: bool,
+    last_activity: Option<SystemTime>,
     unreadable: Vec<String>,
 }
 
@@ -340,6 +345,7 @@ impl<'g> Judge<'g> {
                 imported: state.imported,
                 stale: state.stale,
                 clamped: state.clamped,
+                last_activity: state.last_activity.map(iso8601_at),
                 joined_by: self.joined_by(m, scope, &in_component),
             });
         }
@@ -362,6 +368,7 @@ impl<'g> Judge<'g> {
                 imported: false,
                 stale: false,
                 clamped: false,
+                last_activity: None,
                 joined_by: self.joined_by(leaf, scope, &in_component),
             });
         }
@@ -479,6 +486,7 @@ impl<'g> Judge<'g> {
             close_command: None,
             malformed_marker: false,
             clamped: false,
+            last_activity: None,
             unreadable: Vec::new(),
         };
         // A migrated session's records live in its copy: it keeps nothing
@@ -573,6 +581,7 @@ impl<'g> Judge<'g> {
             return;
         };
         let last = self.clamp(last, "last activity", state);
+        state.last_activity = Some(last);
 
         let mut candidates: Vec<(SystemTime, CloseKind)> = Vec::new();
         match anchor::checked_close_record(&self.store, name) {

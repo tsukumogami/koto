@@ -142,6 +142,12 @@ pub fn handle_prune(
         .list()
         .with_context(|| "failed to list sessions for descendant walk")?;
     let descendants = collect_descendants(&root, &all_sessions);
+    // A pinned child the root's tree names but its lineage no longer
+    // reaches: listed as kept, never removed (it isn't in the subtree).
+    let by_name: Vec<String> = pinned_children_by_name(backend, &root, &descendants)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
 
     // 7. Judge every member of the subtree by the retention rule, over one
     //    scan of the store. `--force` passes the terminal-state gate above
@@ -167,7 +173,7 @@ pub fn handle_prune(
         )
     });
     let now = std::time::SystemTime::now();
-    let plan = judge_subtree(&graph, &settings, now, &root, &descendants);
+    let plan = judge_subtree(&graph, &settings, now, &root, &descendants, &by_name);
 
     // 8. Compute non-terminal sessions in the to-be-pruned set. Operator
     //    visibility before any confirmation prompt.
@@ -318,13 +324,17 @@ fn scope_for(root: &str, member: &str) -> Scope {
     }
 }
 
-/// Judge the root and each descendant (listed each after its parent).
+/// Judge the root and each descendant (listed each after its parent), then
+/// list each of `by_name`, the pinned children the subtree's logs name
+/// outside its lineage, as kept by its pin (as the scan read it), never for
+/// removal.
 fn judge_subtree(
     graph: &Graph,
     settings: &RetentionSettings,
     now: std::time::SystemTime,
     root: &str,
     descendants: &[String],
+    by_name: &[String],
 ) -> SubtreePlan {
     let mut judge = Judge::new(graph, settings.clone(), now);
     let mut plan = SubtreePlan {
@@ -385,6 +395,23 @@ fn judge_subtree(
                 pin: Default::default(),
             }),
         }
+    }
+    for member in by_name {
+        let Some(pin) = graph.facts(member).map(|f| &f.pin) else {
+            continue;
+        };
+        let Some(reason) = hierarchy::pin_text(pin) else {
+            continue;
+        };
+        plan.kept.push(KeptMember {
+            name: member.to_string(),
+            reason,
+            hierarchy: judge
+                .judge(member, &Scope::Whole)
+                .ok()
+                .map(|j| hierarchy::to_json(&j, settings)),
+            pin: hierarchy::pin_fields(pin, crate::session::pin::SOURCE_LOCAL),
+        });
     }
     plan
 }
@@ -804,8 +831,9 @@ pub(crate) fn sweep_if_parent(
 /// cleared for the sessions above it, so its own parent still goes and the
 /// child stays with a `parent_workflow` naming an absent peer. The sweep
 /// walks `parent_workflow` lineage, so a pinned session whose lineage to
-/// `parent` was removed is outside the walk: nothing here removes it, and
-/// nothing here lists it.
+/// `parent` was removed is outside the walk and nothing here removes it;
+/// when a log in the tree names it as a child, it is listed with the
+/// pinned descendants all the same ([`pinned_children_by_name`]).
 pub(crate) fn sweep_terminal_descendants(
     backend: &dyn SessionBackend,
     context_store: &dyn crate::session::context::ContextStore,
@@ -818,13 +846,20 @@ pub(crate) fn sweep_terminal_descendants(
             return Vec::new();
         }
     };
+    let tree = LineageTree::from_sessions(&sessions);
+    // The lineage before the sweep removes any of it, so the logs of the
+    // children it removes are read too.
+    let lineage = lineage_of(&tree, parent);
+    let by_name = pinned_children_by_name(backend, parent, &lineage);
     let mut sweep = Sweep {
         backend,
         context_store,
         pinned: Vec::new(),
     };
-    LineageTree::from_sessions(&sessions).walk(parent, &mut sweep);
-    sweep.pinned
+    tree.walk(parent, &mut sweep);
+    let mut pinned = sweep.pinned;
+    pinned.extend(by_name.iter().map(|(n, pin)| pinned_child(n, pin)));
+    pinned
 }
 
 /// The sweep's half of the shared walk: it skips a branch it can't clear
@@ -874,6 +909,63 @@ impl DescendantVisitor for Sweep<'_> {
     }
 }
 
+/// Every descendant of `root` by koto lineage, whatever state it is in.
+fn lineage_of(tree: &LineageTree, root: &str) -> Vec<String> {
+    struct All(Vec<String>);
+    impl DescendantVisitor for All {
+        fn enter(&mut self, child: &str, _parent: &str) -> bool {
+            self.0.push(child.to_string());
+            true
+        }
+    }
+    let mut all = All(Vec::new());
+    tree.walk(root, &mut all);
+    all.0
+}
+
+/// The pinned children of `root` that its lineage no longer reaches: the
+/// finished sessions the log of `root`, or of one of its lineage
+/// descendants (`lineage`), names as a child (`ChildCompleted`), that
+/// aren't `root` or in `lineage`, and that hold a pin, readable or not.
+/// Each with its pin, sorted by name.
+///
+/// A pinned child is found by its own name and its own pin, never through
+/// its `parent_workflow`, which import doesn't carry and which can be gone.
+/// These are never removed here (a walk of lineage never reaches them);
+/// they are listed so the parent's report names every child a pin keeps.
+/// A read only: it writes nothing into the child or its pin.
+fn pinned_children_by_name(
+    backend: &dyn SessionBackend,
+    root: &str,
+    lineage: &[String],
+) -> Vec<(String, crate::session::pin::PinFact)> {
+    let walked: HashSet<&str> = std::iter::once(root)
+        .chain(lineage.iter().map(String::as_str))
+        .collect();
+    let mut named = std::collections::BTreeSet::new();
+    for parent in &walked {
+        let Ok((_, events)) = backend.read_events(parent) else {
+            continue;
+        };
+        for e in events {
+            if let EventPayload::ChildCompleted { child_name, .. } = e.payload {
+                if !walked.contains(child_name.as_str()) {
+                    named.insert(child_name);
+                }
+            }
+        }
+    }
+    named
+        .into_iter()
+        .filter(|n| validate_session_id(n).is_ok() && backend.exists(n))
+        .filter(|n| is_terminal_session(backend, n))
+        .filter_map(|n| {
+            let pin = crate::session::pin::local_guard(backend, &n).fact();
+            pin.is_pinned().then_some((n, pin))
+        })
+        .collect()
+}
+
 /// The `kept_children` entry for a child its own pin keeps: reason
 /// `pinned`, the pin's text as its detail, and the pin's fields.
 fn pinned_child(name: &str, pin: &crate::session::pin::PinFact) -> KeptChild {
@@ -894,7 +986,9 @@ fn pinned_child(name: &str, pin: &crate::session::pin::PinFact) -> KeptChild {
 /// would have walked instead (the same walk, which doesn't descend into a
 /// live child), so `koto session prune` can be pointed at it later. Only a
 /// session that can have children lists anything: one whose template
-/// declares a batch hook, or whose log holds a `ChildCompleted`.
+/// declares a batch hook, or whose log holds a `ChildCompleted`. A pinned
+/// child its lineage no longer reaches is listed too, when a log in the
+/// tree names it ([`pinned_children_by_name`]).
 pub(crate) fn kept_children(
     backend: &dyn SessionBackend,
     name: &str,
@@ -923,13 +1017,16 @@ pub(crate) fn kept_children(
         backend,
         out: Vec::new(),
     };
-    LineageTree::from_sessions(&sessions).walk(name, &mut list);
+    let tree = LineageTree::from_sessions(&sessions);
+    tree.walk(name, &mut list);
+    let by_name = pinned_children_by_name(backend, name, &lineage_of(&tree, name));
     let base = backend
         .session_dir(name)
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default();
-    list.out
+    let mut kept: Vec<KeptChild> = list
+        .out
         .into_iter()
         .map(|child| {
             let facts = hierarchy::SessionFacts::read(&base, &child);
@@ -967,7 +1064,9 @@ pub(crate) fn kept_children(
                 pin: Default::default(),
             }
         })
-        .collect()
+        .collect();
+    kept.extend(by_name.iter().map(|(n, pin)| pinned_child(n, pin)));
+    kept
 }
 
 /// Whether `name` can have koto children: its template declares a batch

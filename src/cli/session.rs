@@ -615,25 +615,13 @@ pub fn handle_pin(backend: &Backend, name: &str, reason: &str) -> Result<()> {
 /// `{"error": {"code", "message", ...}}` and exits 2; a store that can't be
 /// written exits 3. See [`crate::session::pin::unpin`].
 pub fn handle_unpin(backend: &Backend, name: &str, reason: Option<&str>) -> Result<()> {
-    use crate::session::hierarchy::display_text;
     use crate::session::pin;
 
     let released = pin::unpin(backend, name, reason)
         .unwrap_or_else(|e| super::exit_with_error_code(e.to_json(), e.exit));
-    let text = |s: &Option<String>| s.as_deref().map(display_text);
-    let released = released.map(|r| {
-        serde_json::json!({
-            "released_by": text(&r.released_by),
-            "authority": text(&r.authority),
-            "reason": text(&r.reason),
-            "released_at": display_text(&r.released_at),
-            "pin": {
-                "reason": text(&r.pin.reason),
-                "set_by": text(&r.pin.set_by),
-                "set_at": text(&r.pin.set_at),
-            },
-        })
-    });
+    let released = released
+        .as_ref()
+        .map(crate::session::hierarchy::release_json);
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({
@@ -651,6 +639,11 @@ pub fn handle_unpin(backend: &Backend, name: &str, reason: Option<&str>) -> Resu
 /// the cloud backend no other session's data is listed or read from the
 /// bucket. A malformed name or retention setting exits 2, as does a name
 /// with no session; a sessions directory that can't be listed exits 3.
+///
+/// For a pinned session it shows the pin and that the pin keeps that
+/// session only; for a session with a release record, the latest one; for
+/// any other session whose hierarchy holds a pinned member, that member's
+/// name; and for each anchor member, its last activity.
 pub fn handle_hierarchy(backend: &Backend, name: &str, json: bool) -> Result<()> {
     use crate::session::hierarchy::{self, Graph, Judge, RetentionSettings, Scope};
 
@@ -682,13 +675,112 @@ pub fn handle_hierarchy(backend: &Backend, name: &str, json: bool) -> Result<()>
     let judgment = judge
         .judge(name, &Scope::Whole)
         .unwrap_or_else(|e| fail(format!("{e:#}"), super::EXIT_INFRASTRUCTURE));
+    let release = crate::session::pin::read_release(base, name);
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&hierarchy::to_json(&judgment, &settings))?
+            serde_json::to_string_pretty(&hierarchy::query_json(
+                &judgment,
+                &settings,
+                release.as_ref()
+            ))?
         );
     } else {
-        print!("{}", hierarchy::render_text(&judgment, &settings));
+        print!(
+            "{}",
+            hierarchy::query_text(&judgment, &settings, release.as_ref())
+        );
+    }
+    Ok(())
+}
+
+/// Handle `koto session list --pinned [--json]`: every session in the local
+/// store holding a pin, readable or not, sorted by name, each with its pin
+/// (or `pin_unreadable`), whether it is `running` or `finished`, and
+/// `source: local`. A koto session whose log can't be read is
+/// `unreadable`. No pins prints an empty list (`[]`, or `no pinned
+/// sessions` as text) and exits 0.
+///
+/// It reads the local sessions directory directly, as the retention engine
+/// does, and writes nothing. A malformed retention setting exits 2 and a
+/// sessions directory that can't be listed exits 3.
+pub fn handle_list_pinned(backend: &Backend, json: bool) -> Result<()> {
+    use crate::engine::types::SessionKind;
+    use crate::session::hierarchy::{self, Graph, Judge, RetentionSettings};
+    use crate::session::inventory::{inspect, SessionStatus, TemplateCache};
+
+    let fail = |error: String, code: i32| -> ! {
+        super::exit_with_error_code(
+            serde_json::json!({ "error": error, "command": "session list --pinned" }),
+            code,
+        )
+    };
+    let settings = RetentionSettings::load()
+        .unwrap_or_else(|e| fail(format!("{e:#}"), super::EXIT_CALLER_ERROR));
+    let base = backend.local_base_dir();
+    let graph = Graph::scan(base).unwrap_or_else(|e| {
+        fail(
+            format!("the sessions directory can't be read, so no pin can be listed: {e:#}"),
+            super::EXIT_INFRASTRUCTURE,
+        )
+    });
+    let mut judge = Judge::new(&graph, settings, std::time::SystemTime::now());
+    let mut cache = TemplateCache::new();
+    let source = crate::session::pin::SOURCE_LOCAL;
+    // `Graph::names` is sorted, so the rows are too.
+    let pinned: Vec<(String, crate::session::pin::PinFact, SessionKind)> = graph
+        .names()
+        .filter_map(|n| {
+            let facts = graph.facts(n)?;
+            facts
+                .pin
+                .is_pinned()
+                .then(|| (n.to_string(), facts.pin.clone(), facts.kind))
+        })
+        .collect();
+    let mut rows = Vec::new();
+    let mut lines = Vec::new();
+    for (name, pin, kind) in pinned {
+        let state = match kind {
+            SessionKind::Ordinary => match inspect(base, &name, &mut cache).status {
+                SessionStatus::Running => "running",
+                SessionStatus::Terminal | SessionStatus::Cancelled => "finished",
+                SessionStatus::Unreadable => "unreadable",
+            },
+            // An anchor or close record found pinned (it arrived by
+            // import): running while the engine counts it alive.
+            SessionKind::Anchor | SessionKind::AnchorClose => {
+                if judge.is_alive(&name) {
+                    "running"
+                } else {
+                    "finished"
+                }
+            }
+        };
+        let shown = hierarchy::sanitize(&name);
+        let mut row = serde_json::Map::new();
+        row.insert("name".to_string(), serde_json::json!(shown));
+        row.insert("state".to_string(), serde_json::json!(state));
+        for (k, v) in hierarchy::pin_fields(&pin, source) {
+            if k != "kept_by_pin" {
+                row.insert(k, v);
+            }
+        }
+        row.insert("source".to_string(), serde_json::json!(source));
+        rows.push(serde_json::Value::Object(row));
+        lines.push(format!(
+            "{shown} ({state}): {}",
+            hierarchy::pin_text(&pin).unwrap_or_default()
+        ));
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else if lines.is_empty() {
+        println!("no pinned sessions");
+    } else {
+        for line in lines {
+            println!("{line}");
+        }
     }
     Ok(())
 }

@@ -550,6 +550,17 @@ pub enum SessionCommand {
         /// event.
         #[arg(long)]
         state: bool,
+
+        /// List only the pinned sessions in the local store, sorted by name,
+        /// each with its pin (or `pin_unreadable`) and whether it is running
+        /// or finished; prints text unless `--json` is given. Hidden until
+        /// every removal honours a pin.
+        #[arg(long, hide = true, conflicts_with_all = ["execution_dir", "state"])]
+        pinned: bool,
+
+        /// With `--pinned`, print JSON instead of text.
+        #[arg(long, hide = true, requires = "pinned")]
+        json: bool,
     },
     /// Remove a session directory (idempotent).
     ///
@@ -1871,8 +1882,12 @@ pub fn run(app: App) -> Result<()> {
                 ),
                 SessionCommand::Dir { name } => session::handle_dir(&backend, &name),
                 SessionCommand::List {
+                    pinned: true, json, ..
+                } => session::handle_list_pinned(&backend, json),
+                SessionCommand::List {
                     execution_dir,
                     state,
+                    ..
                 } => session::handle_list(&backend, execution_dir.as_deref(), state),
                 SessionCommand::Cleanup { name } => {
                     // Query children before cleanup so the parent is still visible.

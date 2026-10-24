@@ -930,7 +930,7 @@ Shows the hierarchy a session belongs to and whether koto keeps it. Read-only: i
 | `keepers` | the live members, each `{name, kind, observed}`; an observed anchor past `retention.stale_after` since its last activity adds `"stale": true` and `close_command`, the exact command that closes it by hand (or `"malformed_marker": true` and no command when its marker or harness id isn't `^[A-Za-z0-9_-]{1,128}$`) |
 | `retention` | when nothing is alive: `{release: {at, member, close_kind}, passes_at}`, `close_kind` being `terminal`, `cancelled`, `observed` or `idle`; `null` otherwise |
 | `unreadable` | `[{name, reason}]` for anything that couldn't be read, which keeps the hierarchy |
-| `members` | every member with `kind` (`koto_session`, `anchor`, `anchor_close`), `alive`, `stopped_at`, `close_kind`, `absent`, `migrated`, `observed`, `stale` and `joined_by` (the edges that joined it) |
+| `members` | every member with `kind` (`koto_session`, `anchor`, `anchor_close`), `alive`, `stopped_at`, `close_kind`, `absent`, `migrated`, `observed`, `stale` and `joined_by` (the edges that joined it); an anchor adds `last_activity`, the instant its idle close and stale report count from |
 | `settings` | the three retention settings, each `{value, origin}` |
 
 A stale anchor is a report and nothing more: koto never closes an observed anchor on its own. When the agent session behind it is truly gone, run the printed `close_command`. A malformed retention setting, or a name with no session, exits 2; a sessions directory that can't be listed exits 3.

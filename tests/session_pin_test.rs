@@ -329,10 +329,14 @@ fn pinning_changes_no_hierarchy() {
     assert_eq!(edge["holder"], "B");
     assert_eq!(edge["via"], "dispatched-by link");
     assert_eq!(edge["target"], "A");
-    // B holds no pin, so its output is what it was, `now` aside.
+    // B holds no pin, so its output is what it was, `now` aside, but for
+    // the line naming A as a pinned member of its hierarchy.
+    assert_eq!(b_after["pinned_members"], serde_json::json!(["A"]));
+    assert!(b_before.get("pinned_members").is_none());
     let strip_now = |v: &Value| {
         let mut v = v.clone();
         v.as_object_mut().unwrap().remove("now");
+        v.as_object_mut().unwrap().remove("pinned_members");
         v
     };
     assert_eq!(strip_now(&b_after), strip_now(&b_before));

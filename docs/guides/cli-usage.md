@@ -761,7 +761,7 @@ The text form says kept or released and why, then lists the keepers (a stale anc
 }
 ```
 
-When nothing is alive, `keepers` is empty and `retention` is `{"release": {"at", "member", "close_kind"}, "passes_at"}`, with `close_kind` one of `terminal`, `cancelled`, `observed` or `idle`; `kept` stays `true` until `passes_at`. A stale keeper whose marker or harness session id fails the pattern carries `"malformed_marker": true` and no `close_command`.
+When nothing is alive, `keepers` is empty and `retention` is `{"release": {"at", "member", "close_kind"}, "passes_at"}`, with `close_kind` one of `terminal`, `cancelled`, `observed` or `idle`; `kept` stays `true` until `passes_at`. A stale keeper whose marker or harness session id fails the pattern carries `"malformed_marker": true` and no `close_command`. Each anchor member also carries `last_activity`, the instant its idle close and stale report count from (`null` when it can't be read); the `hierarchy` object a prune entry carries leaves it out.
 
 The command reads the local sessions directory directly and writes nothing; under the cloud backend it lists and reads no session through the bucket. A malformed retention setting, a malformed name, or a name with no session exits 2; a sessions directory that can't be listed exits 3. koto assumes `~/.koto` is private to its user: anyone who can write the store can forge the records this command reads.
 

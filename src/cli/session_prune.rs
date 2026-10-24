@@ -171,7 +171,8 @@ pub struct KeptEntry {
     pub rule: char,
     pub detail: String,
     /// For rules a and h: the JSON `koto session hierarchy <name> --json`
-    /// prints for the same judgment.
+    /// prints for the same judgment, less the blocks only the query prints
+    /// (`hierarchy::query_json`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hierarchy: Option<serde_json::Value>,
     /// For rule p: `kept_by_pin` and `pin` or `pin_unreadable`. Empty, and
