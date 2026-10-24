@@ -1,12 +1,36 @@
 ---
+schema: design/v1
 status: Proposed
-upstream: docs/prds/PRD-koto-session-continues.md
 problem: |
-  Placeholder, completed in Phase 6.
+  koto's retention engine joins sessions into undirected hierarchies and
+  judges each one alone, so a session that carries on another's work has no
+  way to keep its predecessor, and import retires its source on purpose.
+  Under the cloud backend the judgment reads only the local store, and a
+  successor usually lives under another workspace's bucket prefix, so a host
+  that never pulled it can't see the relationship at all.
 decision: |
-  Placeholder, completed in Phase 6.
+  The successor holds a fourth link kind, `koto/links/continues/<PRED>`,
+  written by `--continues` on `koto init` or `koto session link` and by import
+  in its copy. Retention keeps it out of the hierarchy graph and reads it as a
+  directed per-member overlay: a session is kept while a later member is
+  pinned, alive or within its own retention. Under the cloud backend the
+  successor also writes a back-reference under its predecessor's `ctx/koto/`,
+  which the pin guard's listing finds, and each removal walks and verifies
+  those within a counted request budget. Import keeps its marker and write
+  refusals, serves the source's reads through the read-only bucket reader,
+  and `prune --migrated-from` waits on the same walk.
 rationale: |
-  Placeholder, completed in Phase 6.
+  An undirected edge would let an earlier session keep a later one and leave
+  pins per member; a per-member overlay beside the pin keeps every hierarchy
+  unchanged and gives both directions the PRD asks for. The back-reference is
+  the only placement that finds successors under any prefix at no extra
+  request, and verifying it against the holder's own relation means a forged
+  pointer can only over-keep. Reusing the link layout, the pin guard's
+  listing, the marker check and the workspace reader keeps the change out of
+  most of the push and pull code that koto#477 is working on.
+upstream: docs/prds/PRD-koto-session-continues.md
+user_visible_surface: true
+decision_provenance: inline-resolved
 ---
 
 # DESIGN: A session names the session it continues
