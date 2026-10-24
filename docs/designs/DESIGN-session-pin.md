@@ -43,6 +43,8 @@ decision_provenance: inline-resolved
 
 Planned
 
+The local-backend implementation has landed: pin and unpin, every removal point, the reports and release authority. The cloud backend (R20 to R24) and import with older-release compatibility (R25, R26) are still to come in a follow-up.
+
 ## Context and Problem Statement
 
 koto's session retention is built around one engine,

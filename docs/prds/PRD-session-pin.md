@@ -27,6 +27,8 @@ absorbed:
 
 In Progress
 
+The local-backend implementation has landed: pin and unpin, every removal point, the reports and release authority. The cloud backend (R20 to R24) and import with older-release compatibility (R25, R26) are still to come in a follow-up.
+
 Absorbed [BRIEF-session-pin](docs/briefs/BRIEF-session-pin.md); carried in Absorbed Brief.
 
 ## Absorbed Brief
