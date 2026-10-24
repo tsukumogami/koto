@@ -308,6 +308,91 @@ where
     Ok(LinkWrite::Written)
 }
 
+/// The standalone reserved records [`write_reserved_record`] and
+/// [`remove_reserved_record`] may touch: a pin and its release record
+/// (DESIGN-session-pin.md, Decision 3). Every other reserved key goes
+/// through the context store.
+fn is_standalone_record(key: &str) -> bool {
+    key == crate::session::pin::PIN_KEY || key == crate::session::pin::RELEASE_KEY
+}
+
+/// Write `content` as reserved record `key` of local session `session`: the
+/// file by temp file and rename, then its manifest entry with writer `koto`,
+/// under the manifest lock. Unlike a context write it logs no event,
+/// journals nothing and takes no per-key lock file, so the session's log
+/// and every clock read from it stay as they were. Only the pin and the
+/// release record are written this way, and only by
+/// [`crate::session::pin`], which holds the session's lock around it.
+pub(crate) fn write_reserved_record(
+    store: &crate::session::local::LocalBackend,
+    session: &str,
+    key: &str,
+    content: &[u8],
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    anyhow::ensure!(
+        is_standalone_record(key),
+        "'{key}' isn't a standalone reserved record"
+    );
+    crate::session::validate::validate_context_key(key)?;
+    let path = store.session_dir(session).join("ctx").join(key);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("'{key}' has no parent directory"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", parent.display()))?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".koto-record-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|e| {
+            anyhow::anyhow!("failed to create a temp file in {}: {e}", parent.display())
+        })?;
+    tmp.write_all(content)
+        .and_then(|_| tmp.as_file().sync_all())
+        .map_err(|e| anyhow::anyhow!("failed to write {key}: {e}"))?;
+    tmp.persist(&path)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {}", path.display(), e.error))?;
+    let meta = crate::session::context::KeyMeta {
+        created_at: crate::engine::types::now_iso8601(),
+        size: content.len() as u64,
+        hash: crate::cache::sha256_hex(content),
+        writer: Some(WRITER_KOTO.to_string()),
+    };
+    store.update_manifest_locked(session, |m| {
+        m.keys.insert(key.to_string(), meta);
+    })
+}
+
+/// Remove reserved record `key` of local session `session`: its manifest
+/// entry, then its file. Logs no event. A record already gone is not an
+/// error. A directory at the record's path (an unreadable record) goes
+/// whole, with every manifest entry under it. The counterpart of
+/// [`write_reserved_record`], with the same limits.
+pub(crate) fn remove_reserved_record(
+    store: &crate::session::local::LocalBackend,
+    session: &str,
+    key: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        is_standalone_record(key),
+        "'{key}' isn't a standalone reserved record"
+    );
+    crate::session::validate::validate_context_key(key)?;
+    let under = format!("{key}/");
+    store.update_manifest_locked(session, |m| {
+        m.keys.retain(|k, _| k != key && !k.starts_with(&under));
+    })?;
+    let path = store.session_dir(session).join("ctx").join(key);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path),
+        Ok(_) => std::fs::remove_file(&path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+    .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", path.display()))
+}
+
 /// The links `session` holds, in key order. A key in the links area whose
 /// kind koto doesn't know, or whose shape isn't `<kind>/<peer>`, is skipped.
 ///

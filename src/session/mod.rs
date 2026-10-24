@@ -10,6 +10,7 @@ pub mod import_links;
 pub mod inventory;
 pub mod links;
 pub mod local;
+pub mod pin;
 pub mod read_spool;
 pub mod recover;
 pub mod sync;

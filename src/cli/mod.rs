@@ -668,6 +668,48 @@ pub enum SessionCommand {
         dispatched_by: String,
     },
 
+    /// Pin a session so no removal by rule takes it.
+    ///
+    /// Records a pin holding REASON, the setter (the anchor `KOTO_ANCHOR`
+    /// names, or none by hand) and the time in NAME's own context, with no
+    /// event in its log. A pin keeps NAME only: the rest of its hierarchy is
+    /// kept or released by the retention rule as before. Pinning a session
+    /// that already holds a readable pin changes nothing and prints that
+    /// pin. Refuses with exit 2, writing nothing, an invalid reason, a name
+    /// with no session, an anchor or close record, and a session whose pin
+    /// can't be read.
+    ///
+    /// Hidden until every removal honours a pin.
+    #[command(hide = true)]
+    Pin {
+        /// The session to pin
+        name: String,
+
+        /// Why the session is kept: at most 500 characters, not blank, with
+        /// no tab, newline or other control character
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Release a session's pin.
+    ///
+    /// Writes a release record into NAME, then removes its pin, with no
+    /// event in its log. A session with no pin changes nothing and exits 0.
+    /// A caller by hand (no `KOTO_ANCHOR`) may release; a caller under an
+    /// anchor needs the `release-pin` authority its agent session was
+    /// handed at its start, and is refused with exit 2 otherwise.
+    ///
+    /// Hidden until every removal honours a pin.
+    #[command(hide = true)]
+    Unpin {
+        /// The session to release
+        name: String,
+
+        /// Why the pin is released, recorded in the release record
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
     /// Show the hierarchy a session belongs to, and whether it is kept.
     ///
     /// A hierarchy is every session joined to NAME through links
@@ -1909,6 +1951,12 @@ pub fn run(app: App) -> Result<()> {
                     dispatched_by,
                 } => session::handle_link(&backend, &session, &dispatched_by),
                 SessionCommand::Anchor { action } => session_anchor::handle(&backend, action),
+                SessionCommand::Pin { name, reason } => {
+                    session::handle_pin(&backend, &name, &reason)
+                }
+                SessionCommand::Unpin { name, reason } => {
+                    session::handle_unpin(&backend, &name, reason.as_deref())
+                }
                 SessionCommand::Hierarchy { name, json } => {
                     session::handle_hierarchy(&backend, &name, json)
                 }

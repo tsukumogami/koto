@@ -619,6 +619,28 @@ impl LocalBackend {
         Ok(())
     }
 
+    /// Change session `session`'s local manifest with `change`, under the
+    /// manifest lock every context write takes, and write it back. For
+    /// koto's standalone reserved records ([`crate::session::links::write_reserved_record`]),
+    /// which write their own file and need only the entry kept in step.
+    pub(crate) fn update_manifest_locked(
+        &self,
+        session: &str,
+        change: impl FnOnce(&mut Manifest),
+    ) -> anyhow::Result<()> {
+        let ctx_dir = self.ctx_dir(session);
+        fs::create_dir_all(&ctx_dir)
+            .with_context(|| format!("failed to create ctx directory: {}", ctx_dir.display()))?;
+        #[cfg(unix)]
+        let manifest_lock = Self::acquire_flock(&self.manifest_lock_path(session))?;
+        let mut manifest = self.read_manifest(session)?;
+        change(&mut manifest);
+        self.write_manifest(session, &manifest)?;
+        #[cfg(unix)]
+        Self::release_flock(&manifest_lock);
+        Ok(())
+    }
+
     /// Acquire an exclusive advisory flock on the given path (blocking).
     ///
     /// Creates the lock file if it doesn't exist. Returns the open File

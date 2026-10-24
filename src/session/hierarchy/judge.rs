@@ -1,7 +1,7 @@
 //! [`Judge`]: the full inspection of one component's members, and the
 //! [`Verdict`] every removal point and the query share.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -18,6 +18,7 @@ use crate::session::context::ContextStore;
 use crate::session::inventory::{inspect_full, SessionStatus, TemplateCache};
 use crate::session::links::MAX_LINK_BODY_BYTES;
 use crate::session::local::LocalBackend;
+use crate::session::pin::PinFact;
 use crate::session::state_file_name;
 
 /// What a member is.
@@ -165,6 +166,13 @@ pub struct Member {
 }
 
 /// One judgment: the verdict for a session's hierarchy and its members.
+///
+/// The verdict is the component's and knows nothing of pins. A pin keeps
+/// its own session and nothing else, so it is an overlay asked about one
+/// member at a time: a gate that asks whether the component may go at all
+/// reads `verdict.is_kept()`, and a decision to delete one member asks
+/// [`Judgment::keeps`]. Asking `keeps` of a component's first member at a
+/// component gate would let a pinned member keep its whole component.
 #[derive(Debug, Clone)]
 pub struct Judgment {
     pub session: String,
@@ -174,6 +182,23 @@ pub struct Judgment {
     pub clamped: Vec<String>,
     /// The `now` the judgment was made at.
     pub now: String,
+    /// The judged session's own pin.
+    pub pin: PinFact,
+    /// Each present member holding a pin, readable or not, by name.
+    pub pinned_members: BTreeMap<String, PinFact>,
+}
+
+impl Judgment {
+    /// Whether `member` is kept: by its own pin, or because the component's
+    /// verdict keeps every member.
+    pub fn keeps(&self, member: &str) -> bool {
+        self.pinned_members.contains_key(member) || self.verdict.is_kept()
+    }
+
+    /// `member`'s pin, as the scan read it.
+    pub fn pin_of(&self, member: &str) -> &PinFact {
+        self.pinned_members.get(member).unwrap_or(&PinFact::None)
+    }
 }
 
 /// What the full inspection learned about one present member.
@@ -259,10 +284,14 @@ impl<'g> Judge<'g> {
         let mut keepers = Vec::new();
         let mut release: Option<(SystemTime, String, CloseKind)> = None;
         let mut clamped = Vec::new();
+        let mut pinned_members = BTreeMap::new();
 
         for m in &present {
             let state = self.state_of(m);
             if let Some(f) = self.graph.facts(m) {
+                if f.pin.is_pinned() {
+                    pinned_members.insert(m.clone(), f.pin.clone());
+                }
                 for p in &f.problems {
                     unreadable.insert(Unreadable {
                         name: m.clone(),
@@ -377,6 +406,8 @@ impl<'g> Judge<'g> {
             members,
             clamped,
             now: iso8601_at(self.now),
+            pin: pinned_members.get(name).cloned().unwrap_or_default(),
+            pinned_members,
         })
     }
 

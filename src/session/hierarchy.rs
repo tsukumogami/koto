@@ -57,7 +57,8 @@ pub use judge::{
     Verdict,
 };
 pub use render::{
-    close_command, keeper_json, keeper_line, reason_text, render_text, sanitize, to_json,
+    close_command, display_text, keeper_json, keeper_line, pin_fields, pin_json, pin_text,
+    reason_text, render_text, sanitize, to_json,
 };
 pub use settings::{RetentionSettings, Setting, SettingError};
 

@@ -10,10 +10,94 @@ use super::judge::{Judgment, Keeper, Member, Retention, Unreadable, Verdict};
 use super::settings::RetentionSettings;
 use crate::config::session_env::Origin;
 use crate::session::anchor::valid_token;
+use crate::session::pin::{Pin, PinFact};
 
 /// `s` with every control character removed.
 pub fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Whether `c` is escaped by [`display_text`]: a control character, a
+/// bidirectional override or isolate, a zero-width or invisible formatting
+/// character, or a line or paragraph separator.
+fn needs_escape(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+/// Stored text from a pin, a release record or an authority record, as
+/// every surface prints it: each character [`needs_escape`] names is
+/// written as `\u{XXXX}` and a backslash as `\\`, so a stored string can't
+/// carry a terminal escape or reorder the line it lands in. JSON output
+/// carries the escaped form too.
+pub fn display_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if needs_escape(c) {
+            out.push_str(&format!("\\u{{{:04X}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A readable pin as every kept entry carries it: `reason`, `set_by`,
+/// `set_at`, and `source`, where the pin was read (`local` in this build).
+pub fn pin_json(pin: &Pin, source: &str) -> Value {
+    json!({
+        "reason": display_text(&pin.reason),
+        "set_by": pin.set_by.as_deref().map(display_text),
+        "set_at": display_text(&pin.set_at),
+        "source": source,
+    })
+}
+
+/// The fields a kept entry for a pinned session carries: `kept_by_pin`
+/// and either `pin` or `pin_unreadable`. Empty for a session with no pin,
+/// so its entry is the one it was before pins existed.
+pub fn pin_fields(pin: &PinFact, source: &str) -> serde_json::Map<String, Value> {
+    let mut fields = serde_json::Map::new();
+    match pin {
+        PinFact::None => {}
+        PinFact::Present(p) => {
+            fields.insert("kept_by_pin".to_string(), json!(true));
+            fields.insert("pin".to_string(), pin_json(p, source));
+        }
+        PinFact::Unreadable(problem) => {
+            fields.insert("kept_by_pin".to_string(), json!(true));
+            fields.insert("pin_unreadable".to_string(), json!(problem.as_str()));
+        }
+    }
+    fields
+}
+
+/// The text a kept pinned session prints: `pinned: <reason> (set by
+/// <anchor or "hand"> at <time>)`, or `pin unreadable: <reason name>`.
+/// `None` for a session with no pin.
+pub fn pin_text(pin: &PinFact) -> Option<String> {
+    match pin {
+        PinFact::None => None,
+        PinFact::Present(p) => Some(format!(
+            "pinned: {} (set by {} at {})",
+            display_text(&p.reason),
+            p.set_by
+                .as_deref()
+                .map(display_text)
+                .unwrap_or_else(|| "hand".to_string()),
+            display_text(&p.set_at)
+        )),
+        PinFact::Unreadable(problem) => Some(format!("pin unreadable: {}", problem.as_str())),
+    }
 }
 
 /// The command that closes an observed anchor by hand, with its observed
@@ -119,7 +203,7 @@ pub fn to_json(j: &Judgment, settings: &RetentionSettings) -> Value {
         ),
         Verdict::Release { release } => (false, &[][..], release.as_ref(), &[][..]),
     };
-    json!({
+    let mut out = json!({
         "session": sanitize(&j.session),
         "kept": kept,
         "keepers": keepers.iter().map(keeper_json).collect::<Vec<_>>(),
@@ -129,7 +213,17 @@ pub fn to_json(j: &Judgment, settings: &RetentionSettings) -> Value {
         "clamped": j.clamped.iter().map(|n| sanitize(n)).collect::<Vec<_>>(),
         "now": j.now,
         "settings": settings_json(settings),
-    })
+    });
+    // A pinned session's own judgment adds its pin, and says the pin keeps
+    // this session only: `kept` stays the hierarchy's verdict. Nothing is
+    // added for a session with no pin.
+    if j.pin.is_pinned() {
+        for (k, v) in pin_fields(&j.pin, "local") {
+            out[k] = v;
+        }
+        out["pin_keeps"] = json!([sanitize(&j.session)]);
+    }
+    out
 }
 
 fn keeper_text(k: &Keeper) -> String {
@@ -242,11 +336,19 @@ fn edge_text(e: &Edge, member: &str) -> String {
 /// The text `koto session hierarchy` prints.
 pub fn render_text(j: &Judgment, settings: &RetentionSettings) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "{}: {}\n",
-        sanitize(&j.session),
-        reason_text(&j.verdict)
-    ));
+    match pin_text(&j.pin) {
+        None => out.push_str(&format!(
+            "{}: {}\n",
+            sanitize(&j.session),
+            reason_text(&j.verdict)
+        )),
+        Some(pin) => out.push_str(&format!(
+            "{name}: kept by its pin; its hierarchy: {}\n{pin}\n  the pin keeps {name} only; \
+             every other member is kept or released by the hierarchy's rule\n",
+            reason_text(&j.verdict),
+            name = sanitize(&j.session),
+        )),
+    }
     if let Verdict::Keep { keepers, .. } = &j.verdict {
         if !keepers.is_empty() {
             out.push_str("keepers:\n");

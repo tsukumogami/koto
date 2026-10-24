@@ -22,6 +22,10 @@
 //!   `"was"` holding the old name;
 //! - with no importer anchor (unset, or naming no anchor here), dropped.
 //!
+//! A pin (`koto/links/pin`) and its release record (`koto/pin-release`)
+//! are carried verbatim, an unreadable pin included: the pin isn't a link,
+//! so it is never validated as one.
+//!
 //! Nothing here reads or writes the source: it works on the staging
 //! directory and reads the local store's sessions in place.
 
@@ -213,11 +217,13 @@ impl Settlement<'_> {
     pub fn apply(&self, ctx_dir: &Path, manifest: &mut Manifest) -> std::io::Result<Settled> {
         let mut settled = Settled::default();
 
-        // Every link body the copy keeps is validated.
+        // Every link body the copy keeps is validated. The pin isn't a link:
+        // it travels verbatim, an unreadable one included, so the copy is
+        // kept exactly as its source was.
         let link_keys: Vec<String> = manifest
             .keys
             .keys()
-            .filter(|k| k.starts_with(LINKS_PREFIX))
+            .filter(|k| k.starts_with(LINKS_PREFIX) && !crate::session::pin::is_pin_key(k))
             .cloned()
             .collect();
         let mut held_by = BTreeSet::new();

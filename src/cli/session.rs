@@ -580,6 +580,70 @@ pub fn handle_link(backend: &Backend, session: &str, dispatched_by: &str) -> Res
     Ok(())
 }
 
+/// `koto session pin <name> --reason <reason>`: record a pin in `name`.
+///
+/// Prints `{"name", "pin": {"reason", "set_by", "set_at"}, "store"}`, the
+/// existing pin unchanged when the session already held one. A refusal
+/// prints `{"error": {"code", "message", ...}}` and exits 2; a store that
+/// can't be written exits 3. See [`crate::session::pin::pin`].
+pub fn handle_pin(backend: &Backend, name: &str, reason: &str) -> Result<()> {
+    use crate::session::hierarchy::display_text;
+    use crate::session::pin;
+
+    let outcome = pin::pin(backend, name, reason)
+        .unwrap_or_else(|e| super::exit_with_error_code(e.to_json(), e.exit));
+    let p = outcome.pin();
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "name": name,
+            "pin": {
+                "reason": display_text(&p.reason),
+                "set_by": p.set_by.as_deref().map(display_text),
+                "set_at": display_text(&p.set_at),
+            },
+            "store": "local",
+        }))?
+    );
+    Ok(())
+}
+
+/// `koto session unpin <name> [--reason <reason>]`: release `name`'s pin.
+///
+/// Prints `{"name", "released"}`, where `released` is the release record
+/// written, or `null` when the session held no pin. A refusal prints
+/// `{"error": {"code", "message", ...}}` and exits 2; a store that can't be
+/// written exits 3. See [`crate::session::pin::unpin`].
+pub fn handle_unpin(backend: &Backend, name: &str, reason: Option<&str>) -> Result<()> {
+    use crate::session::hierarchy::display_text;
+    use crate::session::pin;
+
+    let released = pin::unpin(backend, name, reason)
+        .unwrap_or_else(|e| super::exit_with_error_code(e.to_json(), e.exit));
+    let text = |s: &Option<String>| s.as_deref().map(display_text);
+    let released = released.map(|r| {
+        serde_json::json!({
+            "released_by": text(&r.released_by),
+            "authority": text(&r.authority),
+            "reason": text(&r.reason),
+            "released_at": display_text(&r.released_at),
+            "pin": {
+                "reason": text(&r.pin.reason),
+                "set_by": text(&r.pin.set_by),
+                "set_at": text(&r.pin.set_at),
+            },
+        })
+    });
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "name": name,
+            "released": released,
+        }))?
+    );
+    Ok(())
+}
+
 /// Handle `koto session hierarchy <name> [--json]`: judge the hierarchy
 /// `name` belongs to and print the verdict, its members and the settings.
 ///
