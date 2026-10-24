@@ -403,6 +403,51 @@ fn an_unreadable_bucket_is_reported_as_unreadable() {
     );
 }
 
+/// A session an older koto created records no prefix in its origin, and
+/// one started with `--execution-dir` or rebound has an anchor whose prefix
+/// isn't the one it lives under. A command from another directory refuses
+/// such a session as bound elsewhere, judging by its anchor; the reader
+/// must not, since it reads the session under the prefix it names, or its
+/// context reads would answer from an empty scratch copy.
+#[test]
+fn a_session_with_no_recorded_prefix_and_an_anchor_elsewhere_reads_in_full() {
+    let f = fixture();
+    let key = format!("{}/{}/koto-{}.state.jsonl", f.a.prefix(), NAME, NAME);
+    let log = String::from_utf8(f.s3.object(&key).unwrap()).unwrap();
+    let (header, events) = log.split_once('\n').unwrap();
+    let mut header: serde_json::Value = serde_json::from_str(header).unwrap();
+    let elsewhere = f._root.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let elsewhere = std::fs::canonicalize(elsewhere).unwrap();
+    header["origin"]["store"]
+        .as_object_mut()
+        .expect("a cloud session records its store")
+        .remove("prefix");
+    header["origin"]["anchor"] = serde_json::json!(elsewhere);
+    header["execution_dir"] = serde_json::json!(elsewhere);
+    f.s3.put(&key, format!("{}\n{}", header, events).as_bytes());
+    let before = objects(&f.s3);
+    f.s3.clear_requests();
+
+    let status = read(&f.b, &f.a.prefix(), &["status", NAME]);
+    ok(&status, "status");
+    assert_eq!(status.json["current_state"], "done");
+    let get = read(&f.b, &f.a.prefix(), &["context", "get", NAME, "notes.md"]);
+    ok(&get, "context get");
+    assert_eq!(get.stdout.as_bytes(), NOTES);
+    let list = read(&f.b, &f.a.prefix(), &["context", "list", NAME]);
+    ok(&list, "context list");
+    assert_eq!(list.json, serde_json::json!(["notes.md"]));
+    let exists = read(
+        &f.b,
+        &f.a.prefix(),
+        &["context", "exists", NAME, "notes.md"],
+    );
+    assert_eq!(exists.code, Some(0), "{}", exists.describe());
+    assert_eq!(writes(&f.s3), Vec::<String>::new());
+    assert_eq!(objects(&f.s3), before);
+}
+
 /// A session imported into another workspace refuses the read as it
 /// refuses any other, naming where it went.
 #[test]

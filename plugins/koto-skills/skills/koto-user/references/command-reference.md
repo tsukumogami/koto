@@ -1010,7 +1010,7 @@ koto --workspace <workspace-path-or-id> context list <name> [--prefix <p>]
 
 Reads a session that lives in another workspace's part of the bucket, where it is, without importing it: for a finished run's session read from another checkout or host. The value is the workspace's absolute path as it was on the host that created the session (what `koto session import --from` takes) or its id, the 16 lowercase hex digits of its bucket prefix. The option goes before the verb.
 
-Output and exit codes are the verb's own. The read writes nothing: no bucket object, no `context_read` record, nothing in this host's session store; what it downloads goes to a temporary directory removed before koto exits. Every other verb refuses the option with `workspace_read_only` (exit 2) before touching anything.
+It is the read-only answer to `session_bound_elsewhere`: a plain `koto status` or `koto context` from another directory refuses, and the same verb with `--workspace <that directory>` reads the session from the bucket instead. Output and exit codes are the verb's own. The read writes nothing: no bucket object, no `context_read` record, nothing in this host's session store; what it downloads goes to a temporary directory removed before koto exits. Every other verb refuses the option with `workspace_read_only` (exit 2) before touching anything.
 
 | `code` | Exit | Meaning |
 |---|---|---|

@@ -591,7 +591,17 @@ impl CloudBackend {
     /// wrong-directory runs this guards against; a wrong guess there is the
     /// silent stale read itself. A refusal that names the directory is loud
     /// when it is wrong.
+    ///
+    /// A read-only backend (`koto --workspace`) is never bound elsewhere: its
+    /// local copy is a scratch one it pulled from this very prefix, so the
+    /// prefix is the session's by construction. Judged by its header instead,
+    /// a session that records no prefix and whose anchor hashes elsewhere (an
+    /// older session started with `--execution-dir`, say) would skip every
+    /// pull and answer from the empty scratch copy.
     fn bound_elsewhere(&self, id: &str) -> Option<SessionBoundElsewhere> {
+        if self.probes.read_only {
+            return None;
+        }
         let dir = self.local.session_dir(id);
         let header: Option<serde_json::Value> = first_line(&dir.join(state_file_name(id)))
             .and_then(|line| serde_json::from_str(line.trim()).ok());

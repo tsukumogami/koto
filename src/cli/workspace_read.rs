@@ -121,7 +121,11 @@ pub(super) fn run(workspace: &str, command: Command) -> Result<()> {
     let (cloud, scratch) = reader.into_parts();
     let backend = Backend::Cloud(cloud);
     // A session imported into another workspace refuses here, exit 2, as
-    // it does without `--workspace`, naming where it went.
+    // it does without `--workspace`, naming where it went. There is no
+    // `session_bound_elsewhere` check, on purpose: that refusal guards this
+    // host's shared copy against another directory's prefix, and this
+    // backend reads the session under the prefix it was named by into a
+    // scratch copy, never the shared one.
     if let Err(e) = backend.check_not_migrated(&name) {
         exit_with_error_code(
             serde_json::json!({ "error": e.to_string(), "command": verb }),
