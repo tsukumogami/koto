@@ -30,6 +30,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto session hierarchy` | Runner and operator — why a session is kept, and when its hierarchy is released |
 | `koto session import` | Runner — cloud backend only, after a session moves to another host or workspace |
 | `koto session resolve` | Runner — cloud backend only |
+| `--workspace <id>` before `status` or `context get/exists/list` | Reader — cloud backend only, a session in another workspace, read in place |
 | `koto status` | Runner — primary |
 | `koto request create/bind/get/wait/list` | Runner — coordinator |
 | `koto request attach` | Runner — whoever starts a root session on a requester's behalf |
@@ -995,6 +996,33 @@ The new session holds the source's events plus a `session_imported` event, every
 | `import_source_unpushed` | 2 | Same host: the source's local copy holds events or context the bucket lacks. Any host: the bucket holds the source's `batch-open.json`, left by a `koto next` that stopped before it pushed its commands' writes. | Same host: run `koto session resolve <name> --keep local` in the source workspace. For `batch-open.json`: run any koto command on the session in the source workspace on its host, such as `koto status <name>`, which pushes the writes. Then import again. |
 | `import_source_has_children` | 2 | Same host: a local session names the source as its parent. | Finish or clean up the child the message names, or import with `--as`. |
 | `import_unmarked` | 1 | Imported and pushed, but the source's marker couldn't be written, so the old copy won't refuse yet. | Run the same import again; it writes only the marker. Keep the source stopped meanwhile. |
+
+---
+
+## Reading another workspace's session: `--workspace` (cloud backend only)
+
+```
+koto --workspace <workspace-path-or-id> status <name>
+koto --workspace <workspace-path-or-id> context get <name> <key> [--to-file <path>]
+koto --workspace <workspace-path-or-id> context exists <name> <key>
+koto --workspace <workspace-path-or-id> context list <name> [--prefix <p>]
+```
+
+Reads a session that lives in another workspace's part of the bucket, where it is, without importing it: for a finished run's session read from another checkout or host. The value is the workspace's absolute path as it was on the host that created the session (what `koto session import --from` takes) or its id, the 16 hex digits of its bucket prefix. The option goes before the verb.
+
+Output and exit codes are the verb's own. The read writes nothing: no bucket object, no `context_read` record, nothing in this host's session store; what it downloads goes to a temporary directory removed before koto exits. Every other verb refuses the option with `workspace_read_only` (exit 2) before touching anything.
+
+| `code` | Exit | Meaning |
+|---|---|---|
+| `session_not_found` | 2 | The workspace has sessions in the bucket, but not `<name>` |
+| `workspace_not_found` | 2 | No session under the workspace's prefix |
+| `workspace_unreadable` | 3 | Listing or reading the bucket failed; never reported as empty |
+| `invalid_workspace` | 2 | Neither a 16-hex id nor an absolute path |
+| `invalid_session` | 2 | Not a session name koto could have created |
+| `workspace_needs_cloud` | 2 | The session backend here is local |
+| `workspace_read_only` | 2 | The verb writes or removes |
+
+A session imported elsewhere refuses with `session_migrated` (exit 2), naming where it went.
 
 ---
 

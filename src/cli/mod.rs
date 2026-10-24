@@ -28,6 +28,7 @@ pub mod task_spawn_error;
 pub mod validate_feed;
 pub mod vars;
 pub mod workspace;
+pub mod workspace_read;
 
 pub use init_child::{init_child_from_parent, TemplateCompileCache};
 pub use task_spawn_error::{SpawnErrorKind, TaskSpawnError};
@@ -96,6 +97,14 @@ pub(super) const EXIT_CALLER_ERROR: i32 = 2;
     about = "Workflow orchestration engine for AI coding agents"
 )]
 pub struct App {
+    /// Read a session in another workspace's part of the cloud bucket, in
+    /// place and without importing it. Takes the workspace's id (its 16-hex
+    /// prefix in the bucket) or its absolute path, and goes before the
+    /// verb. Only `status`, `context get`, `context exists` and `context
+    /// list` accept it; every other verb refuses it.
+    #[arg(long, value_name = "ID")]
+    pub workspace: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -1545,6 +1554,9 @@ where
 }
 
 pub fn run(app: App) -> Result<()> {
+    if let Some(workspace) = app.workspace.as_deref() {
+        return workspace_read::run(workspace, app.command);
+    }
     match app.command {
         Command::Version { json } => {
             let info = buildinfo::build_info();
