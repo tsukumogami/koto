@@ -1116,7 +1116,7 @@ impl CloudBackend {
                         if is_migration_marker(&prefix, &obj.key) {
                             continue;
                         }
-                        if let Err(e) = self.bucket.delete_object(&obj.key) {
+                        if let Err(e) = self.delete_object(&obj.key) {
                             eprintln!("warning: cloud sync: failed to delete {}: {}", obj.key, e);
                         }
                     }
@@ -1152,7 +1152,7 @@ impl CloudBackend {
                 if is_migration_marker(&prefix, &obj.key) {
                     continue;
                 }
-                if let Err(e) = self.bucket.delete_object(&obj.key) {
+                if let Err(e) = self.delete_object(&obj.key) {
                     first.get_or_insert_with(|| {
                         anyhow::anyhow!(
                             "deleting {} failed: {}",
@@ -1485,7 +1485,7 @@ impl CloudBackend {
             )
         })?;
         let delete = |key: &str| {
-            self.bucket.delete_object(key).map(|_| ()).map_err(|e| {
+            self.delete_object(key).map(|_| ()).map_err(|e| {
                 anyhow::anyhow!(
                     "deleting {} failed: {}",
                     key,
@@ -1550,6 +1550,17 @@ impl CloudBackend {
     fn s3_session_exists(&self, id: &str) -> bool {
         let key = self.state_key(id);
         self.bucket.head_object(&key).is_ok()
+    }
+
+    /// DELETE `key`. Every delete this backend makes goes through here, as
+    /// every PUT goes through [`CloudBackend::put_object`], so a read-only
+    /// backend refuses all of them in one place.
+    fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("S3 DELETE of {}", key))?;
+        self.bucket
+            .delete_object(key)
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
     }
 
     /// Wrapper around `bucket.put_object` that returns a Result.
@@ -1827,8 +1838,7 @@ impl CloudBackend {
             .get_object_if_present(&key)
             .with_context(|| format!("reading the batch-open marker of '{}'", id))?;
         if in_bucket.as_deref() == Some(ours.as_slice()) {
-            self.bucket
-                .delete_object(&key)
+            self.delete_object(&key)
                 .with_context(|| format!("deleting the batch-open marker of '{}'", id))?;
         }
         journal.abandon(&lock)
@@ -1953,7 +1963,7 @@ impl CloudBackend {
         local.save(&version_path)?;
         self.push_version(id)?;
         let _ = in_parallel(&gone, |key| {
-            if let Err(e) = self.bucket.delete_object(ctx_key(key)) {
+            if let Err(e) = self.delete_object(&ctx_key(key)) {
                 eprintln!(
                     "warning: cloud sync: failed to delete context key '{}': {}",
                     key, e
@@ -1967,8 +1977,7 @@ impl CloudBackend {
         // closed, nothing would come back to delete a marker left behind,
         // and every import would refuse the session for good. The next
         // flush pushes the batch again, which changes nothing, and retries.
-        self.bucket
-            .delete_object(self.batch_marker_key(id))
+        self.delete_object(&self.batch_marker_key(id))
             .with_context(|| format!("deleting the batch-open marker of '{}'", id))?;
         journal.close(&lock)
     }
@@ -2002,8 +2011,7 @@ impl CloudBackend {
         let Some(lock) = journal.lock()? else {
             return Ok(());
         };
-        self.bucket
-            .delete_object(self.batch_marker_key(id))
+        self.delete_object(&self.batch_marker_key(id))
             .with_context(|| format!("deleting the batch-open marker of '{}'", id))?;
         journal.close(&lock)
     }
@@ -2739,7 +2747,7 @@ impl SessionBackend for CloudBackend {
                                     );
                                     continue;
                                 }
-                                if let Err(e) = self.bucket.delete_object(&obj.key) {
+                                if let Err(e) = self.delete_object(&obj.key) {
                                     eprintln!(
                                         "warning: cloud sync: relocate delete failed for {}: {}",
                                         obj.key, e
@@ -4255,7 +4263,7 @@ impl CloudBackend {
     /// free and imports afresh over whatever is left.
     fn take_back(&self, pushed: &[String]) {
         for key in pushed {
-            if let Err(e) = self.bucket.delete_object(key) {
+            if let Err(e) = self.delete_object(key) {
                 eprintln!(
                     "warning: cloud sync: failed to remove {} after a failed import: {}",
                     key, e

@@ -150,7 +150,7 @@ koto --workspace /srv/ws-a context get review summary.md
 koto --workspace 3f9a1c0d2b4e6f81 context list review
 ```
 
-`--workspace` takes the workspace's absolute path as it was on the host that created the session, the same path `koto session import --from` takes, or its id: the 16 hex digits of its prefix in the bucket. Four verbs accept it: `koto status`, `koto context get`, `koto context exists` and `koto context list`. They read the session where it is and write nothing: no object in the bucket, no `context_read` record, and no copy in this host's session store. What a read downloads is kept in a temporary directory that koto removes before it exits. This host doesn't become the session's host, and the source isn't marked migrated.
+`--workspace` takes the workspace's absolute path as it was on the host that created the session, the same path `koto session import --from` takes, or its id: the 16 lowercase hex digits of its prefix in the bucket. Four verbs accept it: `koto status`, `koto context get`, `koto context exists` and `koto context list`. They read the session where it is and write nothing: no object in the bucket, no `context_read` record, and no copy in this host's session store. What a read downloads is kept in a temporary directory that koto removes before it exits. This host doesn't become the session's host, and the source isn't marked migrated.
 
 Every other verb refuses the option with `workspace_read_only` (exit 2) before it reads or writes anything, so a reader can't advance, change or remove another workspace's session by mistake. The option goes before the verb; after it, the verb's own arguments are parsed and `--workspace` is an unexpected argument (`koto session anchor open` has an unrelated `--workspace` of its own).
 
@@ -161,7 +161,7 @@ The errors a read through `--workspace` can print, each as JSON with a `code`:
 | `session_not_found` | 2 | The workspace has sessions in the bucket, but not this one |
 | `workspace_not_found` | 2 | The bucket holds no session under the workspace's prefix |
 | `workspace_unreadable` | 3 | Listing or reading the bucket failed; nothing is reported as empty |
-| `invalid_workspace` | 2 | The value is neither a 16-hex id nor an absolute path |
+| `invalid_workspace` | 2 | The value is neither a 16-digit lowercase hex id nor an absolute path |
 | `invalid_session` | 2 | The session name isn't one koto could have created |
 | `workspace_needs_cloud` | 2 | The session backend here is local, so there's no bucket to read |
 | `workspace_read_only` | 2 | The verb writes or removes |

@@ -12,8 +12,8 @@
 //! Read-only means the reader writes nothing to the bucket and nothing to
 //! this host's session store:
 //!
-//! - every PUT, every log append, every key write or removal and every
-//!   cleanup the backend would make refuses (`CloudBackend::refuse_if_read_only`);
+//! - every PUT and DELETE, every log append, every key write or removal and
+//!   every cleanup the backend would make refuses (`CloudBackend::refuse_if_read_only`);
 //! - a `koto next` tick marker in the environment doesn't apply, so a
 //!   reader running inside a tick of a same-named session in its own
 //!   workspace neither defers into a batch nor counts as that session's tick;
@@ -175,11 +175,6 @@ impl WorkspaceReader {
             workspace,
             scratch,
         })
-    }
-
-    /// The workspace this reader reads.
-    pub fn workspace(&self) -> &WorkspaceId {
-        &self.workspace
     }
 
     /// The scratch directory the reader's copies are kept in, removed when
@@ -387,6 +382,8 @@ mod tests {
         let err = backend
             .put_object("0123456789abcdef/s/x", b"x")
             .unwrap_err();
+        assert!(err.to_string().contains("--workspace"), "{err}");
+        let err = backend.delete_object("0123456789abcdef/s/x").unwrap_err();
         assert!(err.to_string().contains("--workspace"), "{err}");
         let err = backend.add("s", "k", b"x").unwrap_err();
         assert!(err.to_string().contains("--workspace"), "{err}");

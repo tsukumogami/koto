@@ -115,7 +115,10 @@ pub(super) fn run(workspace: &str, command: Command) -> Result<()> {
     if let Err(e) = located {
         exit_with_read_error(verb, &e);
     }
-    let (cloud, _scratch) = reader.into_parts();
+    // `scratch` owns the directory `backend` keeps its copies in, so it
+    // must outlive `backend`: it is dropped last, or by hand before
+    // `process::exit` below.
+    let (cloud, scratch) = reader.into_parts();
     let backend = Backend::Cloud(cloud);
     // A session imported into another workspace refuses here, exit 2, as
     // it does without `--workspace`, naming where it went.
@@ -136,6 +139,9 @@ pub(super) fn run(workspace: &str, command: Command) -> Result<()> {
             key,
             to_file,
         } => {
+            // No events and no reader anchor: the read is logged nowhere
+            // and nothing is restored into the session (see the module
+            // header), unlike the same verb without `--workspace`.
             if let Err(e) = context::handle_get(
                 &backend,
                 &backend,
@@ -152,6 +158,7 @@ pub(super) fn run(workspace: &str, command: Command) -> Result<()> {
             }
         }
         ContextCommand::Exists { session, key } => {
+            // Logged nowhere, as `context get` above.
             let code = match context::handle_exists(&backend, &backend, None, None, &session, &key)
             {
                 context::KeyPresence::Present => 0,
@@ -163,8 +170,11 @@ pub(super) fn run(workspace: &str, command: Command) -> Result<()> {
                     );
                 }
             };
+            // `process::exit` runs no destructor and not the exit flush,
+            // which only `exit_with_error_code` runs, so the scratch
+            // directory is removed here by hand.
             drop(backend);
-            drop(_scratch);
+            drop(scratch);
             std::process::exit(code);
         }
         ContextCommand::List { session, prefix } => {

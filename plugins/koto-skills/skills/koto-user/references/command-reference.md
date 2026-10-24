@@ -1008,7 +1008,7 @@ koto --workspace <workspace-path-or-id> context exists <name> <key>
 koto --workspace <workspace-path-or-id> context list <name> [--prefix <p>]
 ```
 
-Reads a session that lives in another workspace's part of the bucket, where it is, without importing it: for a finished run's session read from another checkout or host. The value is the workspace's absolute path as it was on the host that created the session (what `koto session import --from` takes) or its id, the 16 hex digits of its bucket prefix. The option goes before the verb.
+Reads a session that lives in another workspace's part of the bucket, where it is, without importing it: for a finished run's session read from another checkout or host. The value is the workspace's absolute path as it was on the host that created the session (what `koto session import --from` takes) or its id, the 16 lowercase hex digits of its bucket prefix. The option goes before the verb.
 
 Output and exit codes are the verb's own. The read writes nothing: no bucket object, no `context_read` record, nothing in this host's session store; what it downloads goes to a temporary directory removed before koto exits. Every other verb refuses the option with `workspace_read_only` (exit 2) before touching anything.
 
@@ -1017,7 +1017,7 @@ Output and exit codes are the verb's own. The read writes nothing: no bucket obj
 | `session_not_found` | 2 | The workspace has sessions in the bucket, but not `<name>` |
 | `workspace_not_found` | 2 | No session under the workspace's prefix |
 | `workspace_unreadable` | 3 | Listing or reading the bucket failed; never reported as empty |
-| `invalid_workspace` | 2 | Neither a 16-hex id nor an absolute path |
+| `invalid_workspace` | 2 | Neither a 16-digit lowercase hex id nor an absolute path |
 | `invalid_session` | 2 | Not a session name koto could have created |
 | `workspace_needs_cloud` | 2 | The session backend here is local |
 | `workspace_read_only` | 2 | The verb writes or removes |
