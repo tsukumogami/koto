@@ -335,8 +335,10 @@ Key assumptions:
 #### Chosen: a back-reference object under the predecessor's `ctx/koto/`, verified against the holder's relation, walked within a counted budget
 
 The successor writes one standalone object,
-`<Pp>/<P>/ctx/koto/continued-by/<Sp>/<S>`, whose body is the exact bytes of
-its relation. It is written by a direct, checked cross-prefix PUT, never
+`<Pp>/<P>/ctx/koto/continued-by/<Sp>/<S>`, whose body is only
+`{"v":1,"holder_session_id":"<id>"}`: the guard never decides anything from a
+pointer's body, and no workspace path is copied into another workspace's
+prefix. It is written by a direct, checked cross-prefix PUT, never
 through the context store, so it is never in a manifest and no push deletes
 it; it sits outside `koto/links/`, so no build's scan reads it as a link. The
 pin guard's existing `ctx/koto/` listing therefore finds every successor of P,
@@ -357,11 +359,18 @@ pointer before moving and deletes the old one after.
 Pointers outlive P's deletion, as `migrated.json` does: the guarded delete
 paths skip `ctx/koto/continued-by/`, so a reused name reads as `mismatch` on
 every host. The move-aside carries P's pointers to the moved name. The holder
-deletes its own pointer when it is removed; the guard never deletes one.
+deletes its own pointer when it is removed, building the key only from its own
+workspace id and name and the predecessor its own relation names, never from
+anything read from the bucket; the guard never deletes one.
 
-The guard trusts only the holder's own relation. For each pointer under P it
-lists `<Sp>/<S>/ctx/koto/` (a failed listing keeps P as `bucket_unchecked`
-naming S); no continues key means a stale pointer, ignored; a key over 4 KiB is
+The guard trusts only the holder's own relation. Before a pointer key becomes
+a request it is validated: exactly `continued-by/<Sp>/<S>` under P's own
+`ctx/koto/`, `<Sp>` 16 lowercase hex digits, `<S>` a valid session name. A key
+that fails is reported as `relation_unreadable` (`unparseable`) and keeps P.
+For each valid pointer the guard lists `<Sp>/<S>/ctx/koto/`; a listing that
+fails for any reason, a permission error included, keeps P as
+`bucket_unchecked` naming S, so a credentials gap can't turn into a deletion.
+No continues key in a successful listing means a stale pointer, ignored; a key over 4 KiB is
 `too_large`; otherwise it GETs the relation, and a recorded session id equal to
 P's makes S a later member, the same name with another id is `mismatch`, and
 anything else is ignored. A forged pointer can only send the guard to read a
@@ -372,7 +381,11 @@ member's relation and its own pointers), the relation GET, and a GET of the pin
 when listed (standing `pin`, which takes precedence) or else of the state file
 (alive, cancelled, stop instant, through a new standing-from-bytes function
 that applies `inventory.rs`'s rules, with the template from the local cache or
-one `template.json` GET per hash per run). A reached member counts as migrated
+one `template.json` GET per hash per run, checked against the hash the state
+header records and parsed as data only; nothing in it runs). Every GET the
+walk makes is bounded in size (4 KiB for relations and pins, the existing
+limits for state and template files), and anything that doesn't parse keeps.
+A reached member counts as migrated
 (no standing of its own) when one of its successors holds `koto/imported-from`
 and a relation naming its id written no earlier than its last event, which is
 the local graph's `find_migrated` rule on reads the walk already makes. One
@@ -385,9 +398,11 @@ delete and the pin guard is clear, so a session kept for its own standing
 costs nothing; it shares the pin listing through an additive
 `bucket_removal_facts` beside `bucket_pin`. The final guard before the delete
 compares its fresh listing with the judgment's pointers and walks only new
-ones. It counts its requests against 2 for P plus 3 per member reached; a read
-that would pass the allowance stops the walk and keeps P as
-`bucket_unchecked` naming the member it couldn't afford. Counts: nothing names
+ones. It counts its requests against 2 for P plus 3 per member reached, and
+every pointer it examines, valid or not, stale or not, draws from that
+allowance; a listing with more than 64 pointers is not walked at all. A read
+that would pass the allowance, or a pointer flood, stops the walk and keeps P
+as `bucket_unchecked` naming what it couldn't afford. Counts: nothing names
 P, 1 request (2 where no pin listing is shared); fifty deletions naming
 nothing, at most 100; the three-member chain judged on a host holding only v1,
 7, or 8 with one uncached template, against an allowance of 8. When P's header
@@ -538,7 +553,7 @@ koto session link <SESSION> (--dispatched-by <NAME> | --continues <PRED>) [--con
 context key  koto/links/continues/<PRED>
 body         {"v":1,"session":"<PRED>","session_id":"<id>","workspace":"<path>",
               "prefix":"<16 hex>|null","holder_session_id":"<id>","at":"<rfc3339>"}
-bucket       <Pp>/<PRED>/ctx/koto/continued-by/<Sp>/<SUCC>   (body: the relation's bytes)
+bucket       <Pp>/<PRED>/ctx/koto/continued-by/<Sp>/<SUCC>   (body: {"v":1,"holder_session_id":"<id>"})
 ```
 
 ```rust
@@ -667,7 +682,59 @@ Deliverables:
 
 ## Security Considerations
 
-To be completed by the security review.
+The relation adds objects that other hosts write and this host reads, so each
+of them is untrusted input.
+
+A back-reference is only a hint. The guard never decides anything from its
+body; it uses the key to find the holder's own relation and trusts that
+relation only after matching its recorded session id to the predecessor's. A
+forged, stale or reused-name pointer therefore finds nothing and is ignored,
+finds a mismatch and keeps the session, or finds a real relation and keeps
+the session. No forged object can delete, hide or release anything. Every part
+of a key or body that becomes a request, a scratch path or output is validated
+first: workspace ids are 16 lowercase hex digits, names pass the session-name
+grammar, and pointer keys have exactly the expected segments. Anything else is
+reported as unreadable and keeps.
+
+Work is bounded. Every pointer examined, valid or not, draws from the walk's
+request allowance, and a listing with more than 64 pointers isn't walked;
+running out keeps the session and reports `bucket_unchecked`. A listing that
+fails for any reason other than an absent key, a permission error included, is
+`bucket_unchecked` and keeps, so a credentials gap can't become a deletion.
+Relation, pin, state and template reads are size-bounded, and a template
+fetched from the bucket is checked against the hash its session's header
+records and read as data only; nothing in it runs.
+
+The permission this feature adds is the successor's write into its
+predecessor's prefix. It needs PUT and DELETE only on `ctx/koto/continued-by/`
+keys there, and LIST and GET on other workspaces' `ctx/koto/` and state
+objects; without write access the verb exits 3 and writes nothing. A holder
+deletes only the pointer built from its own workspace id, its own name and the
+predecessor its own relation names, never one named by bucket data. The
+`koto/continued-by/` area sits under the reserved `koto/` prefix, so
+`koto context add` and `remove` can't touch it. A successor can keep its
+predecessor for as long as it stands, which is the relation's purpose and
+costs one small object; it can't read, change or remove anything else, and
+explicit `koto session cleanup` still removes the predecessor while a pin
+still refuses.
+
+The pointer body carries no workspace path, so no local path is copied into
+another workspace's prefix. Reads of a migrated source are served only for the
+caller's own workspace prefix or a prefix the caller names with
+`--workspace`, under the same prefix checks `--workspace` applies today; they
+write nothing and use a private scratch directory removed afterwards. Names
+and prefixes printed in `relation_keepers`, `relation_unreadable` and
+`bucket_unchecked` come from bucket data, so they go through the retention
+reports' existing `sanitize`/`display_text` rendering, and a value that fails
+its validator is shown as a placeholder.
+
+The relation grants no authority. The verb reads no anchor, authority or
+request leg; continues links are kept out of the hierarchy graph and out of
+the anchor family's lookup, which reads dispatched-by links only; and pin
+release keeps checking the caller's anchor for `release-pin`, never a link.
+Residual risks accepted: anyone who can write a relation or a pointer can hold
+a session in place until it is removed by hand, and an older release sharing
+the bucket ignores relations.
 
 ## Consequences
 
@@ -698,8 +765,8 @@ To be completed by the security review.
 
 ### Mitigations
 
-- The pointer's body is the relation's own bytes and is trusted only after
-  the holder's relation is read and matched by session id, so a forged or
+- A pointer decides nothing until the holder's own relation is read and
+  matched by session id, so a forged or
   stale pointer can only over-keep; the retention guide lists it with koto's
   other cross-session writers (#445).
 - A ghost prefix holds one small object per holder and goes when the holder
