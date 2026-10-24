@@ -1656,7 +1656,13 @@ impl CloudBackend {
         let results = self
             .bucket
             .list(prefix.clone(), Some("/".to_string()))
-            .map_err(|e| anyhow::anyhow!("listing {} failed: {}", prefix, e))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "listing {} failed: {}",
+                    prefix,
+                    without_url_userinfo(&e.to_string())
+                )
+            })?;
         let mut ids = Vec::new();
         for list in &results {
             if let Some(ref prefixes) = list.common_prefixes {
@@ -1683,9 +1689,11 @@ impl CloudBackend {
         self.bucket.head_object(&key).is_ok()
     }
 
-    /// DELETE `key`. Every delete this backend makes goes through here, as
-    /// every PUT goes through [`CloudBackend::put_object`], so a read-only
-    /// backend refuses all of them in one place.
+    /// DELETE `key`. Every delete this backend makes itself goes through
+    /// here, as its own PUTs go through [`CloudBackend::put_object`], so a
+    /// read-only backend refuses them in one place. The key pushes and
+    /// deletes in `sync` take the bucket directly; they are reached only
+    /// through a context add or remove, which refuse first.
     fn delete_object(&self, key: &str) -> anyhow::Result<()> {
         self.refuse_if_read_only(&format!("S3 DELETE of {}", key))?;
         self.bucket

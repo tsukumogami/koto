@@ -189,6 +189,8 @@ impl WorkspaceReader {
         (self.backend, self.scratch)
     }
 
+    /// An unreadable bucket, as printed on stdout: the request's error with
+    /// any credentials in the endpoint's URL removed.
     fn unreadable(&self, what: &str, e: impl std::fmt::Display) -> WorkspaceReadError {
         WorkspaceReadError::new(
             WorkspaceReadErrorCode::Unreadable,
@@ -196,7 +198,7 @@ impl WorkspaceReader {
                 "could not read {} of workspace {} from the bucket: {}",
                 what,
                 self.workspace.describe(),
-                e
+                without_url_userinfo(&e.to_string())
             ),
         )
     }
@@ -300,9 +302,23 @@ impl WorkspaceReader {
         }
         // An absolute path this host lacks resolves to the file of the same
         // name in the session directory; a relative one resolves there too.
-        let target = match Path::new(&recorded).file_name() {
-            Some(file) if Path::new(&recorded).is_absolute() => session_dir.join(file),
-            _ => PathBuf::from(&resolved),
+        // The recorded path comes from the bucket, so a relative one is
+        // taken only when every part of it is a plain name: a `..` would
+        // still pass a prefix check on the joined path and write outside
+        // the scratch directory.
+        let recorded_path = Path::new(&recorded);
+        let target = if recorded_path.is_absolute() {
+            match recorded_path.file_name() {
+                Some(file) => session_dir.join(file),
+                None => return Ok(()),
+            }
+        } else if recorded_path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            session_dir.join(recorded_path)
+        } else {
+            return Ok(());
         };
         let Some(bytes) = self
             .backend
@@ -315,9 +331,6 @@ impl WorkspaceReader {
             return Ok(());
         }
         if let Some(parent) = target.parent() {
-            if !parent.starts_with(&session_dir) {
-                return Ok(());
-            }
             std::fs::create_dir_all(parent)
                 .map_err(|e| self.unreadable(&format!("the compiled template of '{}'", name), e))?;
         }
@@ -367,6 +380,29 @@ mod tests {
             );
             assert!(err.message.contains("--workspace"), "{}", err.message);
         }
+    }
+
+    /// A request error that names the endpoint's URL, credentials and all,
+    /// reaches the printed envelope without them.
+    #[test]
+    fn an_unreadable_error_drops_the_endpoints_credentials() {
+        let reader = WorkspaceReader::with_bucket(
+            test_support::cloud_backend_at(Path::new("/nonexistent"), "http://127.0.0.1:1".into())
+                .bucket,
+            WorkspaceId::parse("0123456789abcdef").unwrap(),
+        )
+        .unwrap();
+        let err = reader.unreadable(
+            "the session listing",
+            "error sending request for url (http://reader:hunter2@127.0.0.1:1/qa?list-type=2)",
+        );
+        assert_eq!(err.code, WorkspaceReadErrorCode::Unreadable);
+        assert!(!err.message.contains("hunter2"), "{}", err.message);
+        assert!(
+            err.message.contains("http://127.0.0.1:1/qa"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

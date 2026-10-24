@@ -448,6 +448,83 @@ fn a_session_with_no_recorded_prefix_and_an_anchor_elsewhere_reads_in_full() {
     assert_eq!(objects(&f.s3), before);
 }
 
+/// The template path a session's log records comes from the bucket. One
+/// that climbs out with `..` is refused when `status` puts the session's
+/// compiled template in place, so nothing is written outside the reader's
+/// scratch directory, whose parent here is the run's own `TMPDIR`.
+#[test]
+fn a_template_path_that_climbs_out_writes_nothing_outside_scratch() {
+    let f = fixture();
+    let key = format!("{}/{}/koto-{}.state.jsonl", f.a.prefix(), NAME, NAME);
+    let log = String::from_utf8(f.s3.object(&key).unwrap()).unwrap();
+    let mut planted = false;
+    let lines: Vec<String> = log
+        .lines()
+        .map(|line| {
+            let mut event: serde_json::Value = serde_json::from_str(line).unwrap();
+            if event["type"] == "workflow_initialized" {
+                event["payload"]["template_path"] = serde_json::json!("../../escaped.json");
+                planted = true;
+            }
+            event.to_string()
+        })
+        .collect();
+    assert!(planted, "no workflow_initialized event in {}", log);
+    f.s3.put(&key, format!("{}\n", lines.join("\n")).as_bytes());
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let output =
+        f.b.cmd()
+            .env("TMPDIR", tmp.path())
+            .args(["--workspace", &f.a.prefix(), "status", NAME])
+            .output()
+            .unwrap();
+    let left: Vec<PathBuf> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "status wrote {:?} outside its scratch directory (exit {:?}, stdout {})",
+        left,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// Credentials in the endpoint's URL never reach what a read prints when
+/// the bucket can't be read.
+#[test]
+fn an_unreadable_bucket_prints_no_endpoint_credentials() {
+    let root = tempfile::TempDir::new().unwrap();
+    let reader = Host::new(
+        root.path(),
+        "reader",
+        &Cloud {
+            endpoint: "http://reader:hunter2-secret@127.0.0.1:1".to_string(),
+            bucket: BUCKET.to_string(),
+            region: "us-east-1".to_string(),
+            path_style: true,
+            credentials: Some(("test-access-key".to_string(), "test-secret-key".to_string())),
+        },
+    );
+    for args in read_verbs(NAME) {
+        let run = read(&reader, "0123456789abcdef", &args);
+        assert_eq!(run.code, Some(3), "{}", run.describe());
+        assert_eq!(
+            run.json["code"],
+            "workspace_unreadable",
+            "{}",
+            run.describe()
+        );
+        assert!(
+            !run.stdout.contains("hunter2-secret") && !run.stderr.contains("hunter2-secret"),
+            "the endpoint's credentials were printed: {}",
+            run.describe()
+        );
+    }
+}
+
 /// A session imported into another workspace refuses the read as it
 /// refuses any other, naming where it went.
 #[test]
