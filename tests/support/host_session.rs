@@ -1,8 +1,9 @@
 //! Keeps the hosting Claude Code session out of a test that runs koto's
 //! library in-process.
 //!
-//! Include it from every test file that names the `koto` crate, itself or
-//! through a support module it includes:
+//! Include it from every test crate (a `tests/*.rs` file or a
+//! `tests/<dir>/main.rs`) that names the `koto` crate, in its own files or
+//! through a support module it includes, however deep:
 //!
 //! ```ignore
 //! #[path = "support/host_session.rs"]
@@ -23,14 +24,19 @@
 //! its binary loads, before the harness starts a test thread, so no test
 //! has to clear them and none races another that reads them. A test that
 //! wants one set gives it to the child process it starts.
-//! `tests/host_session_env.rs` fails the suite when a test file that names
-//! the `koto` crate doesn't include this module, and proves that an
+//! `tests/host_session_env.rs` fails the suite when a test crate that names
+//! the `koto` crate doesn't include this module or when `src/` reads a host
+//! variable through `host_env` that `HOST_SESSION_ENV` doesn't list, and
+//! proves that an
 //! in-process append in a binary that does include it reads neither
 //! variable and writes nothing to the hosting session's `/workflows`.
 
 #![allow(dead_code)]
 
-/// The hosting session's variables that koto's library reads in-process.
+/// The hosting session's variables that koto's library reads in-process,
+/// each through `host_env` in `src/host_env.rs`. Add a variable here when
+/// the library starts reading it; `tests/host_session_env.rs` fails until
+/// you do.
 pub const HOST_SESSION_ENV: [&str; 2] = ["CLAUDE_CODE_SESSION_ID", "KOTO_WORKFLOWS_DIR"];
 
 extern "C" fn clear_host_session_env() {
