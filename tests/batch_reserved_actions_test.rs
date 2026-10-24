@@ -203,6 +203,36 @@ fn the_example_coordinator_can_retry_from_analyze_failures() {
 }
 
 #[test]
+fn the_offered_evidence_retries_when_submitted_from_a_file() {
+    // Issue #405: an agent that can't run a quoted argument takes the
+    // action's `evidence` field, writes it to a file, and submits it with
+    // `--with-data @<file>`; no shell string is parsed.
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    start_example_batch(dir);
+    fail_task_1(dir);
+
+    let json = run_ok(dir, &["next", "coord"]);
+    assert_eq!(json["state"], "analyze_failures", "{json}");
+    let action = retry_action(&json);
+    assert_eq!(
+        action["evidence"],
+        serde_json::json!({"retry_failed": {"children": ["task-1"]}}),
+        "{json}"
+    );
+
+    let file = dir.join("retry.json");
+    std::fs::write(&file, action["evidence"].to_string()).unwrap();
+    let with_data = format!("@{}", file.display());
+    let retried = run_ok(dir, &["next", "coord", "--with-data", &with_data]);
+    assert_eq!(retried["state"], "plan_and_await", "{retried}");
+    let dispatched = retried["retry_dispatched"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no retry_dispatched in {retried}"));
+    assert_eq!(dispatched[0]["task"], "task-1", "{retried}");
+}
+
+#[test]
 fn giving_up_leaves_no_retry_on_the_terminal_response() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();

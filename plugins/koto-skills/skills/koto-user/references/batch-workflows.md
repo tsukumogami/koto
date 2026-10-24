@@ -173,6 +173,8 @@ Two kinds of state carry it:
 - **The batching state** (the one declaring `materialize_children`), on every tick where the batch has retryable children.
 - **A state reached after the batch that routes a retry**: a non-terminal state that accepts evidence and has a transition guarded on `evidence.retry_failed` leading back to the batching state, like the coordinator example's `analyze_failures`. There the list comes from the most recently recorded batch (`batch_final_view`), starting with the response that moved the parent there, whether it advanced on the completing tick or left with `koto next --to`. It appears on every tick in that state until a `retry_failed` or a rewind starts the batch over. It names only children that have a session: a dependent skipped because its upstream failed may have none yet, and retrying the upstream brings it back. A state without such a route, or a terminal state, never carries it, because a retry there has nowhere to go.
 
+Each entry looks like this, with its `invocation` string left out (see the table):
+
 ```json
 {
   "reserved_actions": [
@@ -181,7 +183,7 @@ Two kinds of state carry it:
       "label": "Retry failed children",
       "description": "Re-run children whose outcome is failure, skipped, or spawn_failed.",
       "applies_to": ["task-2"],
-      "invocation": "koto next 'coord' --with-data '{\"retry_failed\":{\"children\":[\"task-2\"]}}'"
+      "evidence": {"retry_failed": {"children": ["task-2"]}}
     }
   ]
 }
@@ -193,9 +195,10 @@ Two kinds of state carry it:
 | `label` | Short human-readable label. |
 | `description` | One-line summary. |
 | `applies_to` | Short task names to retry: children whose outcome is `failure`, `skipped`, or `spawn_failed`. In a state reached after the batch, only those that have a session on disk. |
-| `invocation` | POSIX-safe ready-to-run command string. It carries its evidence, `{"retry_failed": {...}}`, as inline JSON; submit that JSON from a file, as below. |
+| `evidence` | The JSON object the retry submits, `{"retry_failed": {...}}`. Write it to a file and submit it, as below. |
+| `invocation` | The same submission as a POSIX-safe shell command, `koto next <parent>` with `evidence` passed to `--with-data` as single-quoted inline JSON. Kept for callers that run it as is; don't take it apart, read `evidence` instead. |
 
-The `retry_failed` key is reserved evidence: it isn't validated against the state's `accepts` fields and isn't part of `expects.fields`, although the state still has to accept evidence at all for `--with-data` to be taken. Read `reserved_actions` and submit the JSON its `invocation` passes to `--with-data`, whole and on its own: the object with the `retry_failed` key at the top, not just the value under it. Write it to a file and pass `--with-data @<file>`, as with any evidence (the skill's "Sub-case A" says why). It's the same JSON the invocation would have sent, so the retry is the same. Don't try to cram `retry_failed` into a normal evidence submission alongside other keys.
+The `retry_failed` key is reserved evidence: it isn't validated against the state's `accepts` fields and isn't part of `expects.fields`, although the state still has to accept evidence at all for `--with-data` to be taken. Read `reserved_actions` and submit the action's `evidence` whole and on its own: the object with the `retry_failed` key at the top, not just the value under it. Write it to a file and pass `--with-data @<file>`, as with any evidence (the skill's "Sub-case A" says why). It's the same JSON `invocation` would have sent, so the retry is the same. Don't try to cram `retry_failed` into a normal evidence submission alongside other keys.
 
 ```bash
 EV=$(mktemp -d)
@@ -325,7 +328,7 @@ Multiple surfaces expose batch state. Use the right one for the question you're 
 | "How is a bound leg going before it finishes?" | `koto request get <request-id>` — `legs[*].progress` and `legs[*].disposition`. This is the only place mid-flight progress exists. |
 | "I restarted, or I'm not the session holding the gate — where's the result?" | `koto request get <request-id>` — `legs[*].result`. Same envelope the directive carried, promoted from the child's terminal tick. |
 | "What reason should I render for a failed child?" | `children[*].reason` with `reason_source` as the provenance tag: in `blocking_conditions[0].output` while the parent waits in the batching state, and in `batch_final_view` (the terminal response, or `koto context get <parent> batch_final_view`) once the tick that completed the batch has moved the parent on. |
-| "Which children are eligible for retry, and how do I invoke it?" | `reserved_actions[0].applies_to`, and the `{"retry_failed": ...}` JSON in `reserved_actions[0].invocation`, submitted from a file (see "`reserved_actions`: the retry-discovery surface"). |
+| "Which children are eligible for retry, and how do I invoke it?" | `reserved_actions[0].applies_to`, and `reserved_actions[0].evidence` submitted from a file (see "`reserved_actions`: the retry-discovery surface"). |
 | "Is this the final batch outcome?" | `batch_final_view` on the terminal `done` response (its counts, booleans and `children[]`), or `koto context get <parent> batch_final_view` from a later non-terminal state. |
 | "Are there children on disk I forgot about?" | `scheduler.feedback.orphan_candidates`. |
 | "Is this child itself a sub-batch coordinator?" | `materialized_children[*].role == "coordinator"` with `subbatch_status` for inner-batch counts. |
