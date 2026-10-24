@@ -5,9 +5,11 @@
 //! the pinned session, holding one JSON object ([`Pin`]) of at most
 //! [`MAX_PIN_BYTES`]. It names no peer, so it is never an edge: the
 //! retention engine reads it as a per-session fact ([`PinFact`]) beside the
-//! links, and it keeps exactly its own session. A koto build from before
-//! pins reads the key as one that isn't a link key, a problem that keeps
-//! the session's hierarchy, so an older build keeps a pinned session too.
+//! links, and it keeps exactly its own session. koto v0.23.0, from before
+//! pins, reads the key as one that isn't a link key, a problem that keeps
+//! the session's hierarchy, so its prunes, terminal tick and replace keep a
+//! session pinned in a local store. Its cleanup, cancel `--cleanup` and
+//! import don't, and under the cloud backend it never sees the pin object.
 //!
 //! The release record, [`RELEASE_KEY`] (`koto/pin-release`), sits outside
 //! `koto/links/` so no build reads it as a link. An unpin writes it before
@@ -29,9 +31,17 @@
 //! retry respawns, init rollbacks, the replace's move-aside, a migrated
 //! source) don't go through it.
 //!
-//! This build supports pins on the local backend. Under the cloud backend
-//! both verbs refuse, since a pin that reached only one host's copy would
-//! be believed there and missed everywhere else.
+//! Under the cloud backend the bucket decides (Decision 3). [`pin`] and
+//! [`unpin`] write only their own objects, `<prefix>/<name>/ctx/koto/links/pin`
+//! and `.../ctx/koto/pin-release`, checked, and never the session's log,
+//! state, manifest or version, so a host holding a stale copy, or none, can
+//! pin a session another host owns. A local copy of either record is a bare
+//! file the sync doesn't track (R20a): no manifest entry, nothing marked
+//! ahead, nothing pushed. The guard lists the session's `ctx/koto/` objects
+//! before every delete ([`SessionBackend::bucket_pin`]): a pin object keeps
+//! the session wherever the local copy stands, a local pin whose `id` the
+//! bucket's release record names was released on another host, and a
+//! listing that fails keeps the session too ([`Guard::BucketUnchecked`]).
 
 use std::fs;
 use std::io::Read;
@@ -128,6 +138,13 @@ pub struct ReleaseRecord {
     pub released_by: Option<String>,
     /// The authority the release used, or `None` by hand.
     pub authority: Option<String>,
+    /// When the releaser's anchor was handed that authority and by which
+    /// start (`at` and `source` of its `koto/anchor/authority` record), so
+    /// a reader sees how it arrived; `None` by hand.
+    #[serde(default)]
+    pub authority_at: Option<String>,
+    #[serde(default)]
+    pub authority_source: Option<String>,
     pub reason: Option<String>,
     pub released_at: String,
     /// The pin it released; each field `None` when that pin was unreadable.
@@ -171,6 +188,28 @@ fn parse_pin(bytes: &[u8]) -> Option<Pin> {
     serde_json::from_slice::<Pin>(bytes)
         .ok()
         .filter(|p| p.v == RECORD_VERSION && !p.id.is_empty())
+}
+
+/// What the bytes of a pin object read as: a pin, `too_large` past
+/// [`MAX_PIN_BYTES`], `unparseable` otherwise.
+pub fn pin_of_bytes(bytes: &[u8]) -> PinFact {
+    if bytes.len() > MAX_PIN_BYTES {
+        return PinFact::Unreadable(PinProblem::TooLarge);
+    }
+    match parse_pin(bytes) {
+        Some(pin) => PinFact::Present(pin),
+        None => PinFact::Unreadable(PinProblem::Unparseable),
+    }
+}
+
+/// A release record's bytes, when they hold one this koto reads.
+pub fn release_of_bytes(bytes: &[u8]) -> Option<ReleaseRecord> {
+    if bytes.len() > MAX_PIN_BYTES {
+        return None;
+    }
+    serde_json::from_slice::<ReleaseRecord>(bytes)
+        .ok()
+        .filter(|r| r.v == RECORD_VERSION)
 }
 
 /// Read at most one byte more than [`MAX_PIN_BYTES`] of the file at `path`.
@@ -257,11 +296,7 @@ pub fn read_release(base: &Path, name: &str) -> Option<ReleaseRecord> {
         Ok(meta) if meta.file_type().is_file() => {}
         _ => return None,
     }
-    read_bounded(&path)
-        .ok()
-        .filter(|b| b.len() <= MAX_PIN_BYTES)
-        .and_then(|b| serde_json::from_slice::<ReleaseRecord>(&b).ok())
-        .filter(|r| r.v == RECORD_VERSION)
+    read_bounded(&path).ok().and_then(|b| release_of_bytes(&b))
 }
 
 /// Who is calling, as `KOTO_ANCHOR` says.
@@ -346,16 +381,32 @@ impl PinOutcome {
     }
 }
 
-/// The local store a pin is written to, or the refusal for a backend this
-/// build can't pin on.
-fn local_store(backend: &Backend) -> Result<&crate::session::local::LocalBackend, PinError> {
-    match backend {
-        Backend::Local(local) => Ok(local),
-        Backend::Cloud(_) => Err(PinError::failure(
-            "unsupported_backend",
-            "pins aren't supported under the cloud backend in this koto; nothing was written",
-        )),
-    }
+/// Whether this host holds a local copy of session `name`. Under the cloud
+/// backend a session can be in the bucket only; pin and unpin then write
+/// its objects and nothing on this host.
+fn local_copy(backend: &Backend, name: &str) -> bool {
+    backend
+        .local_base_dir()
+        .join(name)
+        .join(state_file_name(name))
+        .exists()
+}
+
+/// The refusal for a pin or unpin the bucket couldn't be asked about.
+fn bucket_unchecked(name: &str, error: BucketError) -> PinError {
+    PinError::failure(
+        "bucket_unchecked",
+        format!(
+            "the bucket couldn't be checked for a pin on '{}' ({}); nothing was written, run the \
+             command again once the bucket can be reached",
+            crate::session::hierarchy::display_text(name),
+            error.as_str()
+        ),
+    )
+    .with(
+        "bucket_unchecked",
+        serde_json::json!({"error": error.as_str()}),
+    )
 }
 
 /// The checks pin and unpin share before they lock: a session name, a
@@ -370,10 +421,35 @@ fn check_session(backend: &Backend, name: &str) -> Result<(), PinError> {
             format!("session '{name}' does not exist"),
         ));
     }
-    if let Err(e) = backend.check_not_migrated(name) {
+    // Pin and unpin write, so the migration check is a write's: never an
+    // answer another process's listing lent this one.
+    let migrated = match backend {
+        Backend::Local(_) => Ok(()),
+        Backend::Cloud(cloud) => cloud.check_not_migrated_to_write(name),
+    };
+    if let Err(e) = migrated {
+        // Name the way out, or the refusal is a dead end. A cross-host
+        // migrated source's pin is inert, so cleanup here removes it. After
+        // a same-host import the local copy at this name is the moved copy,
+        // which keeps its pin and refuses cleanup here, so the old copy in
+        // the bucket goes only through a prune of migrated sources run from
+        // the workspace it moved to.
+        let shown = crate::session::hierarchy::display_text(name);
+        let way_out = match backend {
+            Backend::Cloud(cloud) if cloud.local_guard(name).is_err() => {
+                "the local copy at this name is the moved one, which keeps its pin; the old \
+                 copy in the bucket goes with `koto session prune --migrated-from <this \
+                 workspace>` run from the workspace it moved to"
+                    .to_string()
+            }
+            _ => format!(
+                "its moved copy holds its pin, and a pin here keeps nothing: \
+                 `koto session cleanup {shown}` in this workspace removes this copy"
+            ),
+        };
         return Err(PinError::refusal(
             "not_pinnable",
-            format!("{e:#}; its moved copy holds what it held"),
+            format!("{e:#}; {way_out}"),
         ));
     }
     Ok(())
@@ -415,16 +491,155 @@ fn lock(backend: &Backend, name: &str) -> Result<SessionLock, PinError> {
     }
 }
 
-/// The kind session `name`'s header records.
-fn kind_of(base: &Path, name: &str) -> Result<SessionKind, PinError> {
-    crate::engine::persistence::read_header(&base.join(name).join(state_file_name(name)))
-        .map(|h| h.session_kind())
-        .map_err(|e| {
-            PinError::failure(
-                "session_unreadable",
-                format!("session '{name}''s header can't be read: {e:#}"),
+/// The kind session `name`'s header records: read from the local copy when
+/// this host holds one (`held`), else from the bucket's state file.
+fn kind_of(backend: &Backend, name: &str, held: bool) -> Result<SessionKind, PinError> {
+    let unreadable = |e: &dyn std::fmt::Display| {
+        PinError::failure(
+            "session_unreadable",
+            format!("session '{name}''s header can't be read: {e:#}"),
+        )
+    };
+    let header = match backend {
+        Backend::Cloud(cloud) if !held => cloud
+            .remote_header(name)
+            .map_err(|e| unreadable(&format!("{e:#}")))?
+            .ok_or_else(|| unreadable(&"the bucket holds no state file for it"))?,
+        _ => crate::engine::persistence::read_header(
+            &backend
+                .local_base_dir()
+                .join(name)
+                .join(state_file_name(name)),
+        )
+        .map_err(|e| unreadable(&format!("{e:#}")))?,
+    };
+    Ok(header.session_kind())
+}
+
+/// Write record `key` (the pin or the release record) of session `name`.
+/// On the local backend it is an indexed record. Under the cloud backend it
+/// is its own object, and the call fails unless the bucket confirms it;
+/// only then, when this host holds a copy (`held`), is a bare local file
+/// written, which the sync doesn't track (R20a). A local write that fails
+/// after the bucket took the object only warns: the bucket decides.
+fn put_record(
+    backend: &Backend,
+    name: &str,
+    held: bool,
+    key: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    use crate::session::links::write_reserved_record;
+    match backend {
+        Backend::Local(local) => write_reserved_record(local, name, key, bytes, true),
+        Backend::Cloud(cloud) => {
+            cloud.put_reserved_object(name, key, bytes)?;
+            if held {
+                if let Err(e) = write_reserved_record(cloud.local(), name, key, bytes, false) {
+                    eprintln!(
+                        "warning: the bucket holds {key} of '{name}', but this host's copy \
+                         wasn't updated: {e:#}"
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Remove the pin of session `name`: on the local backend, its record and
+/// index entry; under the cloud backend, its object, checked, and then this
+/// host's copy of it, if any, which only warns when it fails.
+fn delete_pin(backend: &Backend, name: &str, held: bool) -> anyhow::Result<()> {
+    use crate::session::links::remove_reserved_record;
+    match backend {
+        Backend::Local(local) => remove_reserved_record(local, name, PIN_KEY),
+        Backend::Cloud(cloud) => {
+            cloud.delete_reserved_object(name, PIN_KEY)?;
+            if held {
+                if let Err(e) = remove_reserved_record(cloud.local(), name, PIN_KEY) {
+                    eprintln!(
+                        "warning: the bucket's pin of '{name}' is gone, but this host's copy of \
+                         it wasn't removed: {e:#}"
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Upload the pin and release record this host's copy of session `name`
+/// lists in its index, each as its own object, and drop their index
+/// entries once the bucket holds them: a session pinned under the local
+/// backend, carried on its first push under the cloud backend (R20a). A
+/// record already gone, or a key not listed, is skipped. The first failure
+/// is returned after the rest were tried, and its entry stays for the next
+/// push to retry.
+///
+/// The bucket is asked first: when it already holds a pin, or a release
+/// record naming this copy's pin, it decides, so nothing is uploaded over
+/// it and the entries are only dropped. A bucket that can't be checked
+/// uploads nothing and leaves the entries for a later push.
+pub(crate) fn carry_indexed(
+    cloud: &crate::session::cloud::CloudBackend,
+    name: &str,
+) -> anyhow::Result<()> {
+    let local = cloud.local();
+    let listed = match local.read_manifest(name) {
+        Ok(m) => m.keys,
+        Err(_) => return Ok(()),
+    };
+    if !listed.contains_key(PIN_KEY) && !listed.contains_key(RELEASE_KEY) {
+        return Ok(());
+    }
+    let local_id = match read_local(local.base_dir(), name) {
+        PinFact::Present(pin) => Some(pin.id),
+        _ => None,
+    };
+    let upload = match cloud.bucket_pin(name, local_id.as_deref()) {
+        BucketPin::Unchecked(error) => {
+            anyhow::bail!(
+                "the bucket couldn't be checked for a pin ({})",
+                error.as_str()
             )
-        })
+        }
+        BucketPin::Pin(_) | BucketPin::NoPin { released: true } => false,
+        BucketPin::NoPin { released: false } | BucketPin::NotApplicable => true,
+    };
+    let mut first: Option<anyhow::Error> = None;
+    for key in [PIN_KEY, RELEASE_KEY] {
+        if !listed.contains_key(key) {
+            continue;
+        }
+        let path = local.session_dir(name).join("ctx").join(key);
+        let result = match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() => fs::read(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|bytes| {
+                    if upload {
+                        cloud.put_reserved_object(name, key, &bytes)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .and_then(|()| {
+                    local.update_manifest_locked(name, |m| {
+                        m.keys.remove(key);
+                    })
+                }),
+            // Nothing to upload: an unreadable record stays as this host
+            // reads it, indexed, and keeps the session from here.
+            _ => Ok(()),
+        };
+        if let Err(e) = result {
+            first.get_or_insert(e);
+        }
+    }
+    match first {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// The anchor a pin set now records as its setter: `KOTO_ANCHOR`, when it
@@ -451,8 +666,13 @@ fn setter(base: &Path, caller: &Caller) -> Option<String> {
 /// is refused with `authority_required`, naming the authority, the anchor
 /// and why: the anchor records none, records only names koto doesn't know,
 /// or its authority couldn't be read (no such session, not an anchor, an
-/// unreadable header or record).
-fn check_release_authority(base: &Path, name: &str, anchor: &str) -> Result<(), PinError> {
+/// unreadable header or record). An allowed release gets the record back,
+/// for the release record to copy its `at` and `source`.
+fn check_release_authority(
+    base: &Path,
+    name: &str,
+    anchor: &str,
+) -> Result<crate::session::anchor::AuthorityRecord, PinError> {
     use crate::session::anchor::{read_authority, AuthorityRead};
     let shown = crate::session::hierarchy::display_text(anchor);
     let unreadable = |what: &str| format!("whose authority couldn't be read: {what}");
@@ -468,7 +688,7 @@ fn check_release_authority(base: &Path, name: &str, anchor: &str) -> Result<(), 
             }
             Ok(_) => match read_authority(&base.join(anchor)) {
                 AuthorityRead::Record(r) if r.names.iter().any(|n| n == RELEASE_PIN) => {
-                    return Ok(())
+                    return Ok(r)
                 }
                 AuthorityRead::Record(r) if !r.unknown.is_empty() => {
                     let names: Vec<String> = r
@@ -521,13 +741,23 @@ fn new_id() -> String {
 /// `name`, under its lock, with no log event. A session that already holds
 /// a readable pin keeps it unchanged ([`PinOutcome::Existing`]); one whose
 /// pin can't be read is refused, since an unpin clears it.
+///
+/// Under the cloud backend the existing pin is the bucket's ([`guard_removal`])
+/// and the new one is written as its own object first: a write the bucket
+/// doesn't confirm exits 3 (`pin_not_pushed`) with no pin anywhere. A pin
+/// only this host's copy holds (set under the local backend, not yet
+/// pushed) is uploaded now and reported as the existing pin.
 pub fn pin(backend: &Backend, name: &str, reason: &str) -> Result<PinOutcome, PinError> {
     validate_reason(reason).map_err(|why| PinError::refusal("invalid_reason", why))?;
-    let local = local_store(backend)?;
     check_session(backend, name)?;
-    let base = local.base_dir();
-    let _lock = lock(backend, name)?;
-    match kind_of(base, name)? {
+    let base = backend.local_base_dir();
+    let held = local_copy(backend, name);
+    let _lock = if held || !backend.is_cloud() {
+        Some(lock(backend, name)?)
+    } else {
+        None
+    };
+    match kind_of(backend, name, held)? {
         SessionKind::Ordinary => {}
         SessionKind::Anchor | SessionKind::AnchorClose => {
             return Err(PinError::refusal(
@@ -539,9 +769,31 @@ pub fn pin(backend: &Backend, name: &str, reason: &str) -> Result<PinOutcome, Pi
             ))
         }
     }
-    match read_local(base, name) {
-        PinFact::Present(existing) => return Ok(PinOutcome::Existing(existing)),
-        PinFact::Unreadable(problem) => {
+    let not_pushed = |e: anyhow::Error| match backend {
+        Backend::Local(_) => PinError::failure(
+            "pin_not_written",
+            format!("the pin wasn't written into '{name}': {e:#}"),
+        ),
+        Backend::Cloud(_) => PinError::failure(
+            "pin_not_pushed",
+            format!("the bucket didn't take the pin of '{name}', so nothing was written: {e:#}"),
+        ),
+    };
+    match guard_removal(backend, name) {
+        Guard::Clear => {}
+        Guard::Pinned { pin, source } => {
+            if let (Backend::Cloud(cloud), SOURCE_LOCAL) = (backend, source) {
+                carry_indexed(cloud, name).map_err(not_pushed)?;
+                if !matches!(cloud.bucket_pin(name, None), BucketPin::Pin(_)) {
+                    let bytes = serde_json::to_vec(&pin).expect("a pin always serializes");
+                    cloud
+                        .put_reserved_object(name, PIN_KEY, &bytes)
+                        .map_err(not_pushed)?;
+                }
+            }
+            return Ok(PinOutcome::Existing(pin));
+        }
+        Guard::PinUnreadable { problem, .. } => {
             return Err(PinError::refusal(
                 "pin_unreadable",
                 format!(
@@ -552,7 +804,7 @@ pub fn pin(backend: &Backend, name: &str, reason: &str) -> Result<PinOutcome, Pi
             )
             .with("pin_unreadable", serde_json::json!(problem.as_str())))
         }
-        PinFact::None => {}
+        Guard::BucketUnchecked { error, .. } => return Err(bucket_unchecked(name, error)),
     }
     let pin = Pin {
         v: RECORD_VERSION,
@@ -562,12 +814,7 @@ pub fn pin(backend: &Backend, name: &str, reason: &str) -> Result<PinOutcome, Pi
         set_at: crate::engine::types::now_iso8601(),
     };
     let bytes = serde_json::to_vec(&pin).expect("a pin always serializes");
-    crate::session::links::write_reserved_record(local, name, PIN_KEY, &bytes).map_err(|e| {
-        PinError::failure(
-            "pin_not_written",
-            format!("the pin wasn't written into '{name}': {e:#}"),
-        )
-    })?;
+    put_record(backend, name, held, PIN_KEY, &bytes).map_err(not_pushed)?;
     Ok(PinOutcome::Set(pin))
 }
 
@@ -581,6 +828,11 @@ pub fn pin(backend: &Backend, name: &str, reason: &str) -> Result<PinOutcome, Pi
 /// the authorities its agent session's start was handed
 /// ([`check_release_authority`]); otherwise the unpin is refused with
 /// `authority_required` and writes nothing.
+///
+/// Under the cloud backend the pin released is the bucket's, so a host
+/// holding no copy, or a stale one, can unpin. The release record goes up
+/// as its own object and then the pin object is deleted, each checked; a
+/// failure of either exits 3 and leaves the bucket's pin in force.
 pub fn unpin(
     backend: &Backend,
     name: &str,
@@ -589,61 +841,109 @@ pub fn unpin(
     if let Some(reason) = reason {
         validate_reason(reason).map_err(|why| PinError::refusal("invalid_reason", why))?;
     }
-    let local = local_store(backend)?;
     check_session(backend, name)?;
-    let base = local.base_dir();
-    let _lock = lock(backend, name)?;
-    let released = match read_local(base, name) {
-        PinFact::None => return Ok(None),
-        PinFact::Present(pin) => ReleasedPin {
+    let base = backend.local_base_dir();
+    let held = local_copy(backend, name);
+    let _lock = if held || !backend.is_cloud() {
+        Some(lock(backend, name)?)
+    } else {
+        None
+    };
+    let released = match guard_removal(backend, name) {
+        Guard::Clear => return Ok(None),
+        Guard::Pinned { pin, .. } => ReleasedPin {
             id: Some(pin.id),
             reason: Some(pin.reason),
             set_by: pin.set_by,
             set_at: Some(pin.set_at),
         },
-        PinFact::Unreadable(_) => ReleasedPin {
+        Guard::PinUnreadable { .. } => ReleasedPin {
             id: None,
             reason: None,
             set_by: None,
             set_at: None,
         },
+        Guard::BucketUnchecked { error, .. } => return Err(bucket_unchecked(name, error)),
     };
-    let released_by = match caller() {
-        Caller::ByHand => None,
+    let (released_by, granted) = match caller() {
+        Caller::ByHand => (None, None),
         Caller::Anchor(anchor) => {
-            check_release_authority(base, name, &anchor)?;
-            Some(anchor)
+            let granted = check_release_authority(base, name, &anchor)?;
+            (Some(anchor), Some(granted))
         }
     };
     let record = ReleaseRecord {
         v: RECORD_VERSION,
-        authority: released_by.as_ref().map(|_| RELEASE_PIN.to_string()),
+        authority: granted.as_ref().map(|_| RELEASE_PIN.to_string()),
+        authority_at: granted.as_ref().map(|g| g.at.clone()),
+        authority_source: granted.map(|g| g.source),
         released_by,
         reason: reason.map(str::to_string),
         released_at: crate::engine::types::now_iso8601(),
         pin: released,
     };
+    let code = if backend.is_cloud() {
+        "pin_not_pushed"
+    } else {
+        "pin_not_released"
+    };
     let bytes = serde_json::to_vec(&record).expect("a release record always serializes");
-    crate::session::links::write_reserved_record(local, name, RELEASE_KEY, &bytes).map_err(
-        |e| {
-            PinError::failure(
-                "pin_not_released",
-                format!("the release record wasn't written into '{name}', so the pin stays: {e:#}"),
-            )
-        },
-    )?;
-    crate::session::links::remove_reserved_record(local, name, PIN_KEY).map_err(|e| {
+    put_record(backend, name, held, RELEASE_KEY, &bytes).map_err(|e| {
         PinError::failure(
-            "pin_not_released",
+            code,
+            format!("the release record wasn't written into '{name}', so the pin stays: {e:#}"),
+        )
+    })?;
+    delete_pin(backend, name, held).map_err(|e| {
+        PinError::failure(
+            code,
             format!("the pin wasn't removed from '{name}' and stays in force: {e:#}"),
         )
     })?;
     Ok(Some(record))
 }
 
-/// Where a pin the guard found was read. This build reads the local copy
-/// only.
+/// Where a pin the guard found was read: this host's copy of the session.
 pub const SOURCE_LOCAL: &str = "local";
+
+/// Where a pin the guard found was read: the bucket's pin object, under the
+/// cloud backend.
+pub const SOURCE_BUCKET: &str = "bucket";
+
+/// Why a bucket check couldn't say whether a session holds a pin (R23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketError {
+    /// The listing, or the read of a pin it found, failed.
+    Unreachable,
+    /// The listing came back as something koto can't parse.
+    Unparseable,
+}
+
+impl BucketError {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BucketError::Unreachable => "unreachable",
+            BucketError::Unparseable => "unparseable",
+        }
+    }
+}
+
+/// What the bucket holds of a session's pin, as
+/// [`SessionBackend::bucket_pin`] reads it: one listing of the session's
+/// `ctx/koto/` objects, and one read for each record it has to look at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BucketPin {
+    /// The backend has no bucket.
+    NotApplicable,
+    /// The session's pin object, readable or not.
+    Pin(PinFact),
+    /// No pin object. `released` says whether the bucket's release record
+    /// names the local pin `id` the caller asked about: that pin was
+    /// released on another host.
+    NoPin { released: bool },
+    /// The bucket couldn't be checked.
+    Unchecked(BucketError),
+}
 
 /// What [`guard_removal`] found: the one answer every removal point
 /// decides a delete by. Only [`Guard::Clear`] lets the delete run.
@@ -658,51 +958,95 @@ pub enum Guard {
         problem: PinProblem,
         source: &'static str,
     },
+    /// Under the cloud backend, the bucket couldn't be checked for a pin,
+    /// which keeps the session too (R23). `local` is the pin this host's
+    /// copy holds, if any, which the entry names as well.
+    BucketUnchecked { error: BucketError, local: PinFact },
 }
 
 impl Guard {
+    /// The guard for pin `fact` read from `source`.
+    pub fn of(fact: PinFact, source: &'static str) -> Self {
+        match fact {
+            PinFact::None => Guard::Clear,
+            PinFact::Present(pin) => Guard::Pinned { pin, source },
+            PinFact::Unreadable(problem) => Guard::PinUnreadable { problem, source },
+        }
+    }
+
     /// Whether the guard keeps the session.
     pub fn keeps(&self) -> bool {
         !matches!(self, Guard::Clear)
     }
 
-    /// The pin as the engine's fact, for the renderers.
+    /// The pin as the engine's fact, for the renderers: for a bucket that
+    /// couldn't be checked, the local copy's.
     pub fn fact(&self) -> PinFact {
         match self {
             Guard::Clear => PinFact::None,
             Guard::Pinned { pin, .. } => PinFact::Present(pin.clone()),
             Guard::PinUnreadable { problem, .. } => PinFact::Unreadable(*problem),
+            Guard::BucketUnchecked { local, .. } => local.clone(),
         }
     }
 
-    /// Where the pin was read; `local` for [`Guard::Clear`].
+    /// Where the pin was read; `local` for [`Guard::Clear`] and for a
+    /// bucket that couldn't be checked.
     pub fn source(&self) -> &'static str {
         match self {
-            Guard::Clear => SOURCE_LOCAL,
+            Guard::Clear | Guard::BucketUnchecked { .. } => SOURCE_LOCAL,
             Guard::Pinned { source, .. } | Guard::PinUnreadable { source, .. } => source,
         }
     }
 
     /// The fields a kept entry carries: `kept_by_pin` and `pin` or
-    /// `pin_unreadable`; empty for [`Guard::Clear`].
+    /// `pin_unreadable`, and `bucket_unchecked` with its `error` when the
+    /// bucket couldn't be checked; empty for [`Guard::Clear`].
     pub fn fields(&self) -> serde_json::Map<String, serde_json::Value> {
-        crate::session::hierarchy::pin_fields(&self.fact(), self.source())
+        let mut fields = crate::session::hierarchy::pin_fields(&self.fact(), self.source());
+        if let Guard::BucketUnchecked { error, .. } = self {
+            fields.insert(
+                "bucket_unchecked".to_string(),
+                serde_json::json!({"error": error.as_str()}),
+            );
+        }
+        fields
     }
 
-    /// The text a kept entry prints (`pinned: ...` or `pin unreadable:
-    /// ...`); `None` for [`Guard::Clear`].
+    /// The text a kept entry prints (`pinned: ...`, `pin unreadable: ...`
+    /// or `kept: bucket not checked for a pin (<error>)`); `None` for
+    /// [`Guard::Clear`].
     pub fn text(&self) -> Option<String> {
-        crate::session::hierarchy::pin_text(&self.fact())
+        match self {
+            Guard::BucketUnchecked { error, local } => {
+                let unchecked = format!("kept: bucket not checked for a pin ({})", error.as_str());
+                Some(match crate::session::hierarchy::pin_text(local) {
+                    Some(pin) => format!("{unchecked}; {pin}"),
+                    None => unchecked,
+                })
+            }
+            _ => crate::session::hierarchy::pin_text(&self.fact()),
+        }
     }
 
     /// The refusal `koto session cleanup` and `koto cancel --cleanup` print
     /// for a session this guard keeps: exit 2, code `pinned` (or
     /// `pin_unreadable`), naming the pin's reason, setter and time and
-    /// saying to unpin first. `None` for [`Guard::Clear`].
+    /// saying to unpin first; exit 3, code `bucket_unchecked`, when the
+    /// bucket couldn't be checked. `None` for [`Guard::Clear`].
     pub fn refusal(&self, name: &str) -> Option<PinError> {
         let shown = crate::session::hierarchy::display_text(name);
         let error = match self {
             Guard::Clear => return None,
+            Guard::BucketUnchecked { error, .. } => PinError::failure(
+                "bucket_unchecked",
+                format!(
+                    "session '{shown}' wasn't removed: the bucket couldn't be checked for a pin \
+                     ({}), and an unchecked session is kept. Run the command again once the \
+                     bucket can be reached",
+                    error.as_str()
+                ),
+            ),
             Guard::Pinned { pin, .. } => PinError::refusal(
                 "pinned",
                 format!(
@@ -733,20 +1077,81 @@ impl Guard {
     }
 }
 
-/// The removal guard: session `name`'s pin, read from disk now (not from a
-/// scan), so a pin set since the caller decided keeps the session. Called
-/// with the session's lock held, after any confirmation prompt, immediately
-/// before the first delete of that session. A name with no session is
-/// [`Guard::Clear`]. This build reads the local copy only.
+/// The removal guard: session `name`'s pin, read now (not from a scan), so a
+/// pin set since the caller decided keeps the session. Called with the
+/// session's lock held, after any confirmation prompt, immediately before
+/// the first delete of that session. A name with no session is
+/// [`Guard::Clear`].
+///
+/// Under the cloud backend the bucket's objects decide (R21, R22): a pin
+/// object keeps the session whatever this host's copy holds, and is
+/// reported with `source: bucket`; a local pin whose `id` the bucket's
+/// release record names was released on another host and no longer keeps;
+/// a local pin the bucket has never seen (set under the local backend,
+/// not yet pushed) keeps from here. A bucket that can't be checked keeps
+/// ([`Guard::BucketUnchecked`]). A migrated source's pin keeps nothing: the
+/// moved copy holds it. On the local backend it is [`local_guard`].
 pub fn guard_removal(backend: &dyn SessionBackend, name: &str) -> Guard {
-    // The cloud step adds the bucket's pin object here, and only here.
-    local_guard(backend, name)
+    let local = local_guard(backend, name);
+    let local_id = match &local {
+        Guard::Pinned { pin, .. } => Some(pin.id.clone()),
+        _ => None,
+    };
+    let guard = match backend.bucket_pin(name, local_id.as_deref()) {
+        BucketPin::NotApplicable => local,
+        BucketPin::Unchecked(error) => Guard::BucketUnchecked {
+            error,
+            local: local.fact(),
+        },
+        BucketPin::Pin(fact) => Guard::of(fact, SOURCE_BUCKET),
+        BucketPin::NoPin { released: true } if local_id.is_some() => Guard::Clear,
+        BucketPin::NoPin { .. } => local,
+    };
+    // A migrated source's pin is inert (R25): `koto session import` carried
+    // it to the moved copy, which keeps it there, so this copy goes like any
+    // other migrated source and unpin refuses it. Asked only when a pin
+    // would keep, and a check that can't be made keeps.
+    match guard {
+        Guard::Pinned { .. } | Guard::PinUnreadable { .. } if backend.is_migrated_source(name) => {
+            Guard::Clear
+        }
+        guard => guard,
+    }
 }
 
-/// Session `name`'s local pin, read from disk now, as a [`Guard`]: what the
-/// reports read (the terminal tick's `retention`, `kept_children`, the
-/// replace's disposition). Unlike [`guard_removal`] it never reaches beyond
-/// this host's copy, so a report costs no request.
+/// Under the cloud backend, check each pin a scan of the local store read
+/// against the bucket, so a judgment made from the scan agrees with the
+/// guard: a pin the bucket's release record names was released on another
+/// host and no longer keeps, and one the bucket holds is reported with
+/// `source: bucket`. A pin only this host's copy holds, or one whose
+/// bucket couldn't be checked, stays as scanned, which keeps. One bucket
+/// check per pinned session and none for any other; nothing on the local
+/// backend.
+pub fn reconcile(backend: &Backend, graph: &mut crate::session::hierarchy::Graph) {
+    if !backend.is_cloud() {
+        return;
+    }
+    let pinned: Vec<String> = graph
+        .names()
+        .filter(|n| graph.facts(n).is_some_and(|f| f.pin.is_pinned()))
+        .map(str::to_string)
+        .collect();
+    for name in pinned {
+        match guard_removal(backend, &name) {
+            Guard::Clear => graph.set_pin(&name, PinFact::None, false),
+            guard if guard.source() == SOURCE_BUCKET && guard.keeps() => {
+                graph.set_pin(&name, guard.fact(), true)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Session `name`'s local pin, read from disk now, as a [`Guard`]: what a
+/// report of sessions nothing is about to remove reads (`kept_children`,
+/// and the terminal tick for a session kept for another reason). Unlike
+/// [`guard_removal`] it never reaches beyond this host's copy, so it costs
+/// no request.
 pub fn local_guard(backend: &dyn SessionBackend, name: &str) -> Guard {
     let dir = backend.session_dir(name);
     let Some(base) = dir.parent() else {

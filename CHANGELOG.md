@@ -10,6 +10,26 @@ to `0.9.x`).
 
 ### Compatibility
 
+- **The first release after v0.24.0 is the
+  first release that honours pins in full.** Every host that shares a bucket
+  needs it. koto v0.24.0 has pins
+  on the local backend only, with the commands hidden: under the cloud
+  backend it refuses to pin, and its removals read only their own host's
+  copy, so it doesn't keep a session pinned in the bucket. koto v0.23.0
+  reads a pin as a malformed link,
+  which keeps the session's hierarchy, so its `koto session prune`,
+  `koto workspace prune`, terminal tick and same-name replace keep a session
+  pinned in a local store; its `koto session cleanup`, `koto cancel --cleanup`
+  and `koto session import` don't honour pins and remove a pinned session or
+  drop its pin. Under the cloud backend a pin is a bucket object older
+  releases never read. Releases before v0.23.0 ignore pins entirely.
+- **Pin and unpin write into a session another agent session or host owns.**
+  They are a named exception to the rule that a koto command writes only into
+  the session it opens, ticks, links or imports, and write only the pin and
+  its release record, with no log event. They are listed with koto's other
+  cross-session writers in
+  [koto#445](https://github.com/tsukumogami/koto/issues/445).
+
 - **Anchorless context reads are no longer written to the read session's
   log.** `koto context get` and `koto context exists` run with no reader
   anchor record their `context_read` in the host-local read spool,
@@ -30,6 +50,22 @@ to `0.9.x`).
 
 ### Added
 
+- **Pin a finished session so no removal takes it (koto#441).**
+  `koto session pin <name> --reason <text>` keeps a session from the terminal
+  tick, the parent sweep, the same-name replace, both prunes,
+  `koto session cleanup` and `koto cancel --cleanup` until
+  `koto session unpin <name>`. A pin keeps its own session only, and every
+  removal that keeps one names it (`kept_by_pin`, `pin` with its `source`, or
+  `pin_unreadable`). A call by hand may unpin; an agent session may unpin only
+  when its start was handed `KOTO_AUTHORITY=release-pin`, which the
+  koto-skills start hook records in its anchor. `koto session list --pinned`
+  lists every pin, and `koto session hierarchy` shows a session's pin and its
+  latest release record. Under the cloud backend the pin is the bucket's own
+  object: every host sharing the bucket keeps the session, a removal that
+  can't check the bucket keeps it and reports `bucket_unchecked`, and pin and
+  unpin write nothing else. `koto session import` carries the pin and its
+  release record. The [session retention guide](docs/guides/session-retention.md)
+  has the details.
 - **Read a session in another workspace without importing it (koto#455).**
   `koto --workspace <id|path> status <name>`, and the same option before
   `context get`, `context exists` and `context list`, read a session under

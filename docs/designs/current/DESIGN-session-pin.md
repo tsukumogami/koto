@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 problem: |
   koto's retention engine keeps a session only while a member of its
   hierarchy is alive, and every removal point either asks that engine or
@@ -41,9 +41,9 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Planned
+Current
 
-The local-backend implementation has landed: pin and unpin, every removal point, the reports and release authority. The cloud backend (R20 to R24) and import with older-release compatibility (R25, R26) are still to come in a follow-up.
+Implemented in full: pin and unpin, every removal point, the reports and release authority on the local backend, then the cloud backend (R20 to R24), import and the v0.23.0 compatibility check (R25, R26), the documentation and the cost test. koto v0.24.0 shipped the local-backend half with the commands hidden; the first release after it carries the rest.
 
 ## Context and Problem Statement
 
@@ -283,14 +283,18 @@ Key assumptions:
 A new module, `src/session/pin.rs`, owns the guard:
 `pin::guard_removal(backend, name) -> Guard`, where `Guard` is `Clear`,
 `Pinned { pin, source }`, `PinUnreadable { problem, source }` or
-`BucketUnchecked { error }`. It is called with the session's lock held,
+`BucketUnchecked { error, local }`, `local` being the local copy's pin so
+the entry can name it too. It is called with the session's lock held,
 after any confirmation prompt, immediately before the first delete of that
 session. It reads the local `koto/links/pin` from disk (not from the scan),
 and, when the backend is the cloud backend, calls a new backend method,
-`SessionBackend::bucket_pin(name) -> Result<BucketPin>`, which lists
-`<repo_id>/<name>/ctx/koto/links/pin` directly (one request) and, when an
-object is there, reads it (one more). The local backend's default answers
-`NotApplicable`. A pin in either copy keeps; a listing error or an
+`SessionBackend::bucket_pin(name, local_pin_id) -> BucketPin`, which lists
+`<repo_id>/<name>/ctx/koto/` directly (one request) and, when the pin object
+is there, reads it (one more); with no pin object and a local pin, it reads
+the release record to see whether it names that pin's `id`. `BucketPin` is
+`NotApplicable` (the local backend's default), `Pin(PinFact)`,
+`NoPin { released }` or `Unchecked(error)`. A pin in either copy keeps,
+unless the local one was released on another host; a listing error or an
 unparseable listing is `BucketUnchecked` with `error` `unreachable` or
 `unparseable` (R21 to R23). Only `Clear` lets the delete run.
 
@@ -577,10 +581,10 @@ that command's environment, and unsets the variable in the session's shells.
   removal of one `ctx/koto/` file plus its local manifest entry, under the
   session's lock, logging no event; `check_writer_key` keeps refusing agent
   writes to all of `koto/`, which already covers the new keys (R29).
-- **`src/session/mod.rs` / `cloud.rs`**: `SessionBackend::bucket_pin(name)
-  -> Result<BucketPin>` (default `NotApplicable`), which lists the pin key's
-  object and the release object and reads them when present, outside the
-  probe cache; `put_reserved_object(name, key, bytes)` and
+- **`src/session/mod.rs` / `cloud.rs`**: `SessionBackend::bucket_pin(name,
+  local_pin_id) -> BucketPin` (default `NotApplicable`), which lists the
+  session's `ctx/koto/` objects and reads the pin object, or the release
+  object when it must check a local pin's `id`, outside the probe cache; `put_reserved_object(name, key, bytes)` and
   `delete_reserved_object(name, key)`, each one checked request on exactly
   one object and nothing else (no manifest, log, state or version push).
 - **`src/session/hierarchy/facts.rs`**: `SessionFacts.pin`; the pin key is
@@ -877,8 +881,9 @@ when its CI job enables it, so ordinary test runs make no network fetch.
 
 ### Negative
 
-- **Cost.** Under the cloud backend every removal pays one listing per
-  session it would delete, and the previews one per session they'd list.
+- **Cost.** Under the cloud backend every removal pays one more listing per
+  session it would delete, beside any remote check it already made, and the
+  previews one per session they'd list.
 - **No bucket, no removal.** A host that can't reach the bucket can't remove
   anything under cloud.
 - **Accumulation.** Pins accumulate until someone releases them, and any
@@ -897,8 +902,11 @@ when its CI job enables it, so ordinary test runs make no network fetch.
 
 ### Mitigations
 
-- **Cost:** the listing is one request and replaces the remote check the
-  prune already makes; `in_parallel` keeps a prune's wall time bounded.
+- **Cost:** the guard's listing is one request per session a removal would
+  delete, plus one read per pin found. It doesn't replace the prune's own
+  remote check (rule g), which still lists the session's prefix, so a prune
+  makes two listings per session it deletes; both run one session at a
+  time, so a prune's wall time grows with the number of sessions it deletes.
 - **No bucket, no removal:** the kept entries say `bucket_unchecked`, so the
   operator sees why nothing went.
 - **Accumulation:** `koto session list --pinned` and the prune reports make

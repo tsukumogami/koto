@@ -59,6 +59,37 @@ jobs:
       - name: Run the cost test in release mode
         run: cargo test --locked --release --test retention_cost -- --nocapture
 
+  pin-compat-v0-23:
+    # Proves koto v0.23.0, the last release before pins, keeps a session the
+    # PR's koto pinned through its prunes, its terminal tick and its replace.
+    # The release binary is fetched and checked against the SHA-256 the
+    # repository records for it (tests/fixtures/koto-v0.23.0.sha256, the
+    # release's checksums.txt) before the opt-in test runs it. No secret is
+    # needed, so forks can run it.
+    name: Pin Compat (koto v0.23.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch and verify the v0.23.0 binary
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/koto-v0.23.0"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/koto-linux-amd64" \
+            "https://github.com/tsukumogami/koto/releases/download/v0.23.0/koto-linux-amd64"
+          grep ' koto-linux-amd64$' tests/fixtures/koto-v0.23.0.sha256 > "$dir/expected.sha256"
+          (cd "$dir" && sha256sum -c expected.sha256)
+          chmod +x "$dir/koto-linux-amd64"
+          echo "KOTO_COMPAT_V0_23_BIN=$dir/koto-linux-amd64" >> "$GITHUB_ENV"
+
+      - name: Run the v0.23.0 compatibility test
+        run: cargo test --locked --test pin_compat_v0_23_test -- --nocapture
+
   bash-sh-reproduction:
     # The exported-function reproduction from DESIGN-koto-fixed-environment.md.
     # Only a bash /bin/sh imports exported functions (BASH_FUNC_*), and the
@@ -705,7 +736,7 @@ jobs:
 
   validate:
     name: validate
-    needs: [check-artifacts, unit-tests, retention-cost, stability-tests, msrv, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, poll-forge-neutral, inline-evidence, audit, tsuku-distributed-install, cloud-integration]
+    needs: [check-artifacts, unit-tests, retention-cost, pin-compat-v0-23, stability-tests, msrv, fmt, clippy, decider-checks, decider-compat-v0-12-2, failure-reporting-compat-v0-14-1, ci-wait-stale-keys-compat-v0-14-1, decider-checks-compat-v0-14-1, value-routing-compat-v0-14-1, check-lifecycle-compat-v0-14-1, poll-forge-neutral, inline-evidence, audit, tsuku-distributed-install, cloud-integration]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -714,6 +745,7 @@ jobs:
           if [ "${{ needs.check-artifacts.result }}" = "failure" ] || \
              [ "${{ needs.unit-tests.result }}" = "failure" ] || \
              [ "${{ needs.retention-cost.result }}" = "failure" ] || \
+             [ "${{ needs.pin-compat-v0-23.result }}" = "failure" ] || \
              [ "${{ needs.stability-tests.result }}" = "failure" ] || \
              [ "${{ needs.msrv.result }}" = "failure" ] || \
              [ "${{ needs.fmt.result }}" = "failure" ] || \

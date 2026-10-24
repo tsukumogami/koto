@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 problem: |
   koto keeps a finished session only while something live in its hierarchy
   holds it, plus a retention period, then removes it at the next cleanup,
@@ -25,9 +25,9 @@ absorbed:
 
 ## Status
 
-In Progress
+Done
 
-The local-backend implementation has landed: pin and unpin, every removal point, the reports and release authority. The cloud backend (R20 to R24) and import with older-release compatibility (R25, R26) are still to come in a follow-up.
+Implemented in full: the local backend (koto v0.24.0, with the commands hidden), then the cloud backend (R20 to R24), import and older-release compatibility (R25, R26), the documentation and the cost test, in the first release after v0.24.0.
 
 Absorbed [BRIEF-session-pin](docs/briefs/BRIEF-session-pin.md); carried in Absorbed Brief.
 

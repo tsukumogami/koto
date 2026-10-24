@@ -367,5 +367,7 @@ To clean up a superseded branch when it's no longer needed:
 koto session cleanup parent~1.task-a
 koto session cleanup parent~1.task-b
 ```
+
+A pinned child refuses cleanup (exit 2, code `pinned`). Read its pin's reason, and unpin it first with `koto session unpin <name>` only if the record can go.
 </content>
 </invoke>

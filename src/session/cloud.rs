@@ -27,7 +27,7 @@ use s3::{Bucket, Region};
 use crate::config::CloudConfig;
 use crate::engine::reentrancy;
 use crate::session::batch::{self, BatchLock, Journal, Pending};
-use crate::session::context::{is_host_local_key, ContextStore};
+use crate::session::context::{is_host_local_key, is_pin_record_key, ContextStore};
 use crate::session::local::{repo_id, LocalBackend};
 use crate::session::sync::{self, ManifestCache};
 use crate::session::sync_stamp::{self, Stamp};
@@ -105,10 +105,23 @@ pub enum RemoteCopy {
     /// The remote copy is ahead of the local one or diverged from it; the
     /// string says which.
     NotSafe(String),
-    /// The check couldn't be made: the listing failed, the local log or a
-    /// version file couldn't be read, or a version file didn't parse. The
-    /// string says which.
+    /// The check couldn't be made: the local log or a version file couldn't
+    /// be read, or a version file didn't parse. The string says which.
     Unreadable(String),
+    /// The listing of the session's prefix failed (`unreachable`) or came
+    /// back unparseable, so the bucket couldn't be checked for anything, a
+    /// pin included. The string says what failed.
+    Unlisted(crate::session::pin::BucketError, String),
+}
+
+/// How a failed listing reads to the pin guard: a body koto couldn't parse
+/// is `unparseable`, anything else `unreachable`.
+pub(crate) fn listing_error(e: &S3Error) -> crate::session::pin::BucketError {
+    use crate::session::pin::BucketError;
+    match e {
+        S3Error::SerdeXml(_) | S3Error::Utf8(_) | S3Error::FromUtf8(_) => BucketError::Unparseable,
+        _ => BucketError::Unreachable,
+    }
 }
 
 /// A migrated source copy, as [`CloudBackend::migrated_source_copy`] reads it.
@@ -365,7 +378,7 @@ impl CloudBackend {
     /// standing in for the copy it checked. Those shortcuts are for reads
     /// (koto#439): a write on a borrowed answer could reach a session
     /// imported elsewhere in the meantime.
-    fn check_not_migrated_to_write(&self, id: &str) -> anyhow::Result<()> {
+    pub(crate) fn check_not_migrated_to_write(&self, id: &str) -> anyhow::Result<()> {
         self.check_migration(id, true)
     }
 
@@ -1050,6 +1063,7 @@ impl CloudBackend {
         }
         let data = std::fs::read(&state_path)
             .with_context(|| format!("reading local state file: {}", state_path.display()))?;
+        self.carry_pin_records(id);
         self.put_state(id, &data)
     }
 
@@ -1300,6 +1314,181 @@ impl CloudBackend {
         }
     }
 
+    /// The local store this backend keeps its copies in.
+    pub(crate) fn local(&self) -> &LocalBackend {
+        &self.local
+    }
+
+    /// On a push of `id`: a pin or release record this host's copy still
+    /// indexes (it was set under the local backend) goes up as its own
+    /// object and leaves the index ([`crate::session::pin::carry_indexed`]),
+    /// so from then on it is a bare file the sync doesn't track (R20a). A
+    /// copy with neither file costs two `stat` calls and no request; a
+    /// failed upload warns, keeps the entry and the session stays kept from
+    /// the local pin until a later push carries it.
+    fn carry_pin_records(&self, id: &str) {
+        let ctx = self.local.session_dir(id).join("ctx");
+        if !ctx.join(crate::session::pin::PIN_KEY).exists()
+            && !ctx.join(crate::session::pin::RELEASE_KEY).exists()
+        {
+            return;
+        }
+        if let Err(e) = crate::session::pin::carry_indexed(self, id) {
+            eprintln!("warning: cloud sync: the pin of '{id}' wasn't uploaded: {e:#}");
+        }
+    }
+
+    /// The object key of reserved record `key` (the pin or the release
+    /// record) of session `id`.
+    fn reserved_object_key(&self, id: &str, key: &str) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            key == crate::session::pin::PIN_KEY || key == crate::session::pin::RELEASE_KEY,
+            "'{key}' isn't a pin record"
+        );
+        Ok(format!("{}ctx/{}", self.session_prefix(id), key))
+    }
+
+    /// PUT exactly one object, `<prefix>/<id>/ctx/<key>` for the pin or the
+    /// release record, and fail unless the bucket confirms it. Nothing else
+    /// is pushed: no manifest, log, state or version object, so a host
+    /// holding a stale copy of `id`, or none, replaces nothing another host
+    /// wrote (DESIGN-session-pin.md, Decision 3).
+    pub(crate) fn put_reserved_object(
+        &self,
+        id: &str,
+        key: &str,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let object = self.reserved_object_key(id, key)?;
+        self.bucket.put_object(&object, bytes).map_err(|e| {
+            anyhow::anyhow!(
+                "PUT {object} failed: {}",
+                without_url_userinfo(&e.to_string())
+            )
+        })?;
+        Ok(())
+    }
+
+    /// DELETE exactly one object, the pin or the release record of `id`,
+    /// and fail unless the bucket confirms it. A missing object is a
+    /// success, as S3 answers it.
+    pub(crate) fn delete_reserved_object(&self, id: &str, key: &str) -> anyhow::Result<()> {
+        let object = self.reserved_object_key(id, key)?;
+        self.bucket.delete_object(&object).map_err(|e| {
+            anyhow::anyhow!(
+                "DELETE {object} failed: {}",
+                without_url_userinfo(&e.to_string())
+            )
+        })?;
+        Ok(())
+    }
+
+    /// The header of the bucket's state file for `id`, for a command that
+    /// acts on a session this host holds no copy of. `Ok(None)` when the
+    /// bucket holds no state file.
+    pub(crate) fn remote_header(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<crate::engine::types::StateFileHeader>> {
+        let Some(bytes) = self.fetch_remote_state_bytes(id)? else {
+            return Ok(None);
+        };
+        let line = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
+        let header = serde_json::from_slice(line)
+            .map_err(|e| anyhow::anyhow!("the bucket's header line doesn't parse: {e}"))?;
+        Ok(Some(header))
+    }
+
+    /// The sessions of this workspace whose prefix holds a pin object, from
+    /// one paginated listing of `<prefix>/`: each name whose
+    /// `<prefix>/<name>/ctx/koto/links/pin` (or an object under it) is
+    /// listed and is a valid session id. Sorted. For `koto session list
+    /// --pinned`, which also lists the pins of sessions this host holds no
+    /// copy of (R17).
+    pub(crate) fn bucket_pinned_sessions(
+        &self,
+    ) -> Result<Vec<String>, crate::session::pin::BucketError> {
+        let prefix = format!("{}/", self.prefix);
+        let pages = self
+            .bucket
+            .list(prefix.clone(), None)
+            .map_err(|e| listing_error(&e))?;
+        let pin = format!("/ctx/{}", crate::session::pin::PIN_KEY);
+        let mut names: Vec<String> = pages
+            .iter()
+            .flat_map(|page| page.contents.iter())
+            .filter_map(|obj| {
+                let rest = obj.key.strip_prefix(&prefix)?;
+                let (name, tail) = rest.split_once('/')?;
+                let tail = format!("/{tail}");
+                (tail == pin || tail.starts_with(&format!("{pin}/"))).then(|| name.to_string())
+            })
+            .filter(|name| crate::session::validate::validate_session_id(name).is_ok())
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// [`SessionBackend::bucket_pin`] for the cloud backend: one fresh
+    /// listing of `<prefix>/<id>/ctx/koto/`, outside the probe cache (which
+    /// keeps failures), then a read of the pin object when one is listed, or
+    /// of the release record when no pin is and `local_pin_id` asks whether
+    /// it names this host's pin. A listing that fails is `unreachable`, one
+    /// whose body doesn't parse is `unparseable`; a listing that succeeds
+    /// with no pin object is not a failure. A pin object over the size limit
+    /// is `too_large` without being read, and objects under the pin's key
+    /// (`koto/links/pin/...`) are `not_a_file`, as on a local store.
+    fn bucket_pin_of(
+        &self,
+        id: &str,
+        local_pin_id: Option<&str>,
+    ) -> crate::session::pin::BucketPin {
+        use crate::session::pin::{
+            pin_of_bytes, release_of_bytes, BucketError, BucketPin, PinFact, PinProblem,
+            MAX_PIN_BYTES, PIN_KEY, RELEASE_KEY,
+        };
+        let session = self.session_prefix(id);
+        let pages = match self.bucket.list(format!("{session}ctx/koto/"), None) {
+            Ok(pages) => pages,
+            Err(e) => return BucketPin::Unchecked(listing_error(&e)),
+        };
+        let pin_key = format!("{session}ctx/{PIN_KEY}");
+        let release_key = format!("{session}ctx/{RELEASE_KEY}");
+        let under_pin = format!("{pin_key}/");
+        let objects = || pages.iter().flat_map(|page| page.contents.iter());
+        if objects().any(|o| o.key.starts_with(&under_pin)) {
+            return BucketPin::Pin(PinFact::Unreadable(PinProblem::NotAFile));
+        }
+        if let Some(pin) = objects().find(|o| o.key == pin_key) {
+            if pin.size > MAX_PIN_BYTES as u64 {
+                return BucketPin::Pin(PinFact::Unreadable(PinProblem::TooLarge));
+            }
+            return match self.fetch_object(&pin_key) {
+                Ok(Some(bytes)) => BucketPin::Pin(pin_of_bytes(&bytes)),
+                // Listed, then gone before the read: an unpin on another
+                // host. Read as listed without content, which keeps.
+                Ok(None) => BucketPin::Pin(PinFact::Unreadable(PinProblem::MissingContent)),
+                Err(_) => BucketPin::Unchecked(BucketError::Unreachable),
+            };
+        }
+        let Some(local_id) = local_pin_id else {
+            return BucketPin::NoPin { released: false };
+        };
+        if !objects().any(|o| o.key == release_key) {
+            return BucketPin::NoPin { released: false };
+        }
+        match self.fetch_object(&release_key) {
+            Ok(bytes) => BucketPin::NoPin {
+                released: bytes
+                    .as_deref()
+                    .and_then(release_of_bytes)
+                    .is_some_and(|r| r.pin.id.as_deref() == Some(local_id)),
+            },
+            Err(_) => BucketPin::Unchecked(BucketError::Unreachable),
+        }
+    }
+
     /// Whether the bucket's copy of session `id` may hold anything its local
     /// copy doesn't. One listing of the session's prefix answers two
     /// questions. A remote state log longer than the local one has events
@@ -1317,11 +1506,14 @@ impl CloudBackend {
         let listing = match self.bucket.list(prefix.clone(), None) {
             Ok(listing) => listing,
             Err(e) => {
-                return RemoteCopy::Unreadable(format!(
-                    "listing {} failed: {}",
-                    prefix,
-                    without_url_userinfo(&e.to_string())
-                ))
+                return RemoteCopy::Unlisted(
+                    listing_error(&e),
+                    format!(
+                        "listing {} failed: {}",
+                        prefix,
+                        without_url_userinfo(&e.to_string())
+                    ),
+                )
             }
         };
         let size_of = |key: &str| {
@@ -2092,6 +2284,7 @@ impl CloudBackend {
                 self.put_object(&ctx_key("manifest.json"), &data)?;
             }
         }
+        self.carry_pin_records(id);
         let state_path = self.local.session_dir(id).join(state_file_name(id));
         if state_path.exists() {
             let data = std::fs::read(&state_path)
@@ -2501,7 +2694,9 @@ impl CloudBackend {
         for (key, meta) in &manifest.keys {
             let held = listed.contains(&format!("{}ctx/{}", prefix, key))
                 && remote.keys.get(key).is_some_and(|r| r.hash == meta.hash);
-            if is_host_local_key(key) || held {
+            // A pin record this copy indexes goes up as its own object,
+            // below, and leaves the index.
+            if is_host_local_key(key) || is_pin_record_key(key) || held {
                 continue;
             }
             let data = std::fs::read(ctx_dir.join(key))
@@ -2515,6 +2710,7 @@ impl CloudBackend {
             }
             Ok(())
         });
+        self.carry_pin_records(id);
         if let Some(data) = sync::bucket_manifest_bytes(&ctx_dir.join("manifest.json"))? {
             let s3_key = format!("{}/{}/ctx/manifest.json", self.prefix, id);
             if let Err(e) = self.put_object(&s3_key, &data) {
@@ -2599,6 +2795,33 @@ impl CloudBackend {
     }
 }
 
+/// The pin records a staged import holds under `ctx_dir`, as keys relative
+/// to it: `koto/links/pin` when it is a file, every file under it when it
+/// is a directory (an unreadable pin), and `koto/pin-release`. Sorted.
+fn staged_pin_records(ctx_dir: &Path) -> Vec<String> {
+    use crate::session::pin::{PIN_KEY, RELEASE_KEY};
+    fn files_under(dir: &Path, key: &str, out: &mut Vec<String>) {
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return;
+        };
+        if meta.file_type().is_file() {
+            out.push(key.to_string());
+        } else if meta.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    files_under(&entry.path(), &format!("{key}/{name}"), out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    files_under(&ctx_dir.join(PIN_KEY), PIN_KEY, &mut out);
+    files_under(&ctx_dir.join(RELEASE_KEY), RELEASE_KEY, &mut out);
+    out.sort();
+    out
+}
+
 /// A manifest pulled from the bucket, as this host keeps it: whatever
 /// host-local keys it lists dropped, and this host's own (`kept`) put back.
 /// Bytes that don't parse as a manifest are kept as they are.
@@ -2610,7 +2833,8 @@ fn with_host_local_keys(
     else {
         return pulled;
     };
-    if !manifest.drop_host_local() && kept.is_empty() {
+    let host_local = manifest.drop_host_local();
+    if !manifest.drop_pin_records() && !host_local && kept.is_empty() {
         return pulled;
     }
     manifest.keys.extend(kept.iter().cloned());
@@ -2978,6 +3202,25 @@ impl SessionBackend for CloudBackend {
 
     fn delete_remote_checked(&self, id: &str) -> anyhow::Result<()> {
         self.delete_remote_session_checked(id)
+    }
+
+    fn bucket_pin(&self, id: &str, local_pin_id: Option<&str>) -> crate::session::pin::BucketPin {
+        self.bucket_pin_of(id, local_pin_id)
+    }
+
+    fn is_migrated_source(&self, id: &str) -> bool {
+        // Only the bucket's marker says yes. The local guard refuses, with
+        // the same error type, when the local copy at this name is the moved
+        // copy of a same-host import, which is the copy that holds the pin;
+        // it refuses with a plain error while such an import is pending. Any
+        // refusal of it says no. The write-side check then answers from this
+        // process's own listing; a failed listing warns and lets it pass,
+        // which says no too, so the pin keeps.
+        if self.local_guard(id).is_err() {
+            return false;
+        }
+        self.check_not_migrated_to_write(id)
+            .is_err_and(|e| e.downcast_ref::<SessionMigrated>().is_some())
     }
 
     fn lock_state_file(&self, id: &str) -> Result<SessionLock, SessionError> {
@@ -4213,6 +4456,10 @@ impl CloudBackend {
         // objects. They describe the source's host, so the import leaves
         // them behind and the new session resolves its own.
         manifest.drop_host_local();
+        // The pin and its release record are objects of their own, carried
+        // by `stage_import` from what the bucket holds, whatever the
+        // manifest says of them.
+        manifest.drop_pin_records();
         crate::session::import_links::drop_from_manifest(&mut manifest);
         for key in manifest.keys.keys() {
             validate_context_key(key)
@@ -4294,6 +4541,17 @@ impl CloudBackend {
                 );
             }
             let path = ctx_dir.join(key);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| write_failed(parent, &e))?;
+            }
+            std::fs::write(&path, &bytes).map_err(|e| write_failed(&path, &e))?;
+        }
+        // The source's pin and release record, as the bucket holds them,
+        // carried verbatim, an unreadable pin included (R25). They stay out
+        // of the copy's manifest, as on every cloud copy (R20a), and
+        // `push_staged` pushes each as its own object.
+        for (key, bytes) in self.source_pin_records(source)? {
+            let path = ctx_dir.join(&key);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| write_failed(parent, &e))?;
             }
@@ -4399,6 +4657,12 @@ impl CloudBackend {
                 staged.join("ctx").join(key),
             ));
         }
+        for key in staged_pin_records(&staged.join("ctx")) {
+            uploads.push((
+                format!("{}ctx/{}", prefix, key),
+                staged.join("ctx").join(&key),
+            ));
+        }
         uploads.push((
             format!("{}ctx/manifest.json", prefix),
             staged.join("ctx").join("manifest.json"),
@@ -4420,6 +4684,43 @@ impl CloudBackend {
             pushed.push(key);
         }
         Ok(pushed)
+    }
+
+    /// The source's pin and release record objects, as `(key, bytes)` with
+    /// each key relative to `ctx/`: `koto/links/pin`, any object under it
+    /// (an unreadable pin), and `koto/pin-release`, from one listing of the
+    /// source's `ctx/koto/` objects and one read of each. The bytes are the
+    /// bucket's, unchecked: an unreadable pin travels as it is.
+    fn source_pin_records(
+        &self,
+        source: &ImportSource,
+    ) -> Result<Vec<(String, Vec<u8>)>, ImportError> {
+        use crate::session::context::is_pin_record_key;
+        let ctx = source.key("ctx/");
+        let pages = self
+            .bucket
+            .list(format!("{ctx}koto/"), None)
+            .map_err(|e| source.unreadable("the pin records", &e))?;
+        let mut records = Vec::new();
+        for obj in pages.iter().flat_map(|page| page.contents.iter()) {
+            let Some(key) = obj.key.strip_prefix(&ctx) else {
+                continue;
+            };
+            if !is_pin_record_key(key)
+                || crate::session::validate::validate_context_key(key).is_err()
+            {
+                continue;
+            }
+            let what = format!("context key {:?}", key);
+            // One gone between the listing and the read was unpinned there.
+            if let Some(bytes) = self
+                .fetch_object(&obj.key)
+                .map_err(|e| source.unreadable(&what, &e))?
+            {
+                records.push((key.to_string(), bytes));
+            }
+        }
+        Ok(records)
     }
 
     /// Delete objects an import pushed before it failed.

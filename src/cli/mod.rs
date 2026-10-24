@@ -567,15 +567,15 @@ pub enum SessionCommand {
         #[arg(long)]
         state: bool,
 
-        /// List only the pinned sessions in the local store, sorted by name,
-        /// each with its pin (or `pin_unreadable`) and whether it is running
-        /// or finished; prints text unless `--json` is given. Hidden until
-        /// every removal honours a pin.
-        #[arg(long, hide = true, conflicts_with_all = ["execution_dir", "state"])]
+        /// List only the pinned sessions, sorted by name, each with its pin
+        /// (or `pin_unreadable`), whether it is running or finished, and
+        /// where the pin was read; under the cloud backend, pins in the
+        /// bucket too. Prints text unless `--json` is given.
+        #[arg(long, conflicts_with_all = ["execution_dir", "state"])]
         pinned: bool,
 
         /// With `--pinned`, print JSON instead of text.
-        #[arg(long, hide = true, requires = "pinned")]
+        #[arg(long, requires = "pinned")]
         json: bool,
     },
     /// Remove a session directory (idempotent).
@@ -714,8 +714,9 @@ pub enum SessionCommand {
     /// with no session, an anchor or close record, and a session whose pin
     /// can't be read.
     ///
-    /// Hidden until every removal honours a pin.
-    #[command(hide = true)]
+    /// Under the cloud backend the pin is written to the bucket as its own
+    /// object, and only that; a write the bucket doesn't confirm exits 3
+    /// and leaves no pin anywhere.
     Pin {
         /// The session to pin
         name: String,
@@ -734,8 +735,9 @@ pub enum SessionCommand {
     /// anchor needs the `release-pin` authority its agent session was
     /// handed at its start, and is refused with exit 2 otherwise.
     ///
-    /// Hidden until every removal honours a pin.
-    #[command(hide = true)]
+    /// Under the cloud backend the release record and the pin's removal are
+    /// the bucket's objects, each checked; a failure exits 3 and leaves the
+    /// pin in force.
     Unpin {
         /// The session to release
         name: String,
@@ -4002,18 +4004,47 @@ pub(crate) mod finished_record_hooks {
 /// one header-level pass for the check, and the removal itself goes through
 /// the pin guard ([`finish_terminal_tick`]), which keeps a session pinned
 /// since this check.
+///
+/// Under the cloud backend the bucket's pin counts as well as this host's
+/// copy's: a local pin is confirmed in the bucket (one released on another
+/// host doesn't keep), and a session about to be removed is checked for a
+/// pin object another host wrote, which keeps it as `pinned`; a bucket that
+/// can't be checked then keeps it as `bucket_unchecked`. A session kept for
+/// another reason costs no request.
+///
+/// Returns the reason with the guard that read the pin, which the report
+/// prints ([`terminal_retention_report`]), so the decision and the report
+/// come from one read: the bucket's when it was asked, this host's copy's
+/// otherwise.
 fn terminal_retention(
     backend: &dyn SessionBackend,
     name: &str,
     compiled: &CompiledTemplate,
     final_state: &str,
     no_cleanup: bool,
-) -> Option<next_types::RetentionReason> {
+) -> (
+    Option<next_types::RetentionReason>,
+    crate::session::pin::Guard,
+) {
+    use crate::session::pin::{guard_removal, local_guard, Guard};
+    let kept_by = |guard: &Guard| match guard {
+        Guard::Clear => None,
+        Guard::BucketUnchecked { .. } => Some(next_types::RetentionReason::BucketUnchecked),
+        _ => Some(next_types::RetentionReason::Pinned),
+    };
+    let mut guard = local_guard(backend, name);
     if project_terminal_outcome(compiled, final_state) == TerminalOutcome::Failure {
-        return Some(next_types::RetentionReason::FailureTerminal);
+        return (Some(next_types::RetentionReason::FailureTerminal), guard);
     }
-    if crate::session::pin::local_guard(backend, name).keeps() {
-        return Some(next_types::RetentionReason::Pinned);
+    if guard.keeps() {
+        // Confirmed where the pin is decided: under the cloud backend a pin
+        // the bucket's release record names was released on another host,
+        // and the session then falls through to the checks below like any
+        // unpinned one.
+        guard = guard_removal(backend, name);
+        if let Some(reason) = kept_by(&guard) {
+            return (Some(reason), guard);
+        }
     }
     let session_dir = backend.session_dir(name);
     let has_edge = match session_dir.parent() {
@@ -4021,27 +4052,29 @@ fn terminal_retention(
         None => true,
     };
     if has_edge {
-        Some(next_types::RetentionReason::Hierarchy)
+        (Some(next_types::RetentionReason::Hierarchy), guard)
     } else if no_cleanup {
-        Some(next_types::RetentionReason::NoCleanup)
+        (Some(next_types::RetentionReason::NoCleanup), guard)
     } else {
-        None
+        let guard = guard_removal(backend, name);
+        (kept_by(&guard), guard)
     }
 }
 
 /// The `retention` a terminal tick reports: the reason it keeps the
-/// session, its pin when it holds one (whatever the reason), and, for a
-/// parent kept with its hierarchy or by its pin, the terminal children it
-/// keeps too.
+/// session, its pin when it holds one (whatever the reason), as `guard`
+/// read it for [`terminal_retention`], and, for a parent kept with its
+/// hierarchy or by its pin, the terminal children it keeps too.
 fn terminal_retention_report(
     backend: &dyn SessionBackend,
     name: &str,
     compiled: &CompiledTemplate,
     reason: Option<next_types::RetentionReason>,
+    guard: &crate::session::pin::Guard,
 ) -> next_types::Retention {
     use next_types::RetentionReason;
     let pin = match reason {
-        Some(_) => crate::session::pin::local_guard(backend, name).fields(),
+        Some(_) => guard.fields(),
         None => Default::default(),
     };
     let kept_children = if matches!(
@@ -5852,16 +5885,17 @@ fn handle_next(
                 } else {
                     None
                 };
-                let retention = terminal.as_ref().and_then(|_| {
-                    terminal_retention(backend, &name, &compiled, target, no_cleanup)
-                });
-                let resp = match &terminal {
-                    Some(record) => resp
+                let decided = terminal
+                    .as_ref()
+                    .map(|_| terminal_retention(backend, &name, &compiled, target, no_cleanup));
+                let retention = decided.as_ref().and_then(|(reason, _)| *reason);
+                let resp = match (&terminal, &decided) {
+                    (Some(record), Some((_, guard))) => resp
                         .with_terminal_result(record.result.clone())
                         .with_retention(terminal_retention_report(
-                            backend, &name, &compiled, retention,
+                            backend, &name, &compiled, retention, guard,
                         )),
-                    None => resp,
+                    _ => resp,
                 };
                 // A directed move into a state that routes a retry offers it
                 // on this response too, as an arrival by advance does
@@ -7343,16 +7377,17 @@ fn handle_next(
             } else {
                 None
             };
-            let retention = terminal.as_ref().and_then(|_| {
-                terminal_retention(backend, &name, &compiled, final_state, no_cleanup)
-            });
-            let resp = match &terminal {
-                Some(record) => resp
+            let decided = terminal
+                .as_ref()
+                .map(|_| terminal_retention(backend, &name, &compiled, final_state, no_cleanup));
+            let retention = decided.as_ref().and_then(|(reason, _)| *reason);
+            let resp = match (&terminal, &decided) {
+                (Some(record), Some((_, guard))) => resp
                     .with_terminal_result(record.result.clone())
                     .with_retention(terminal_retention_report(
-                        backend, &name, &compiled, retention,
+                        backend, &name, &compiled, retention, guard,
                     )),
-                None => resp,
+                _ => resp,
             };
 
             // Emit the response JSON. When the scheduler ran, splice

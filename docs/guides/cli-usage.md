@@ -168,6 +168,8 @@ Then koto decides whether to keep the session, and says so in the response's `re
 | `retention` | When |
 |---|---|
 | `{"retained": true, "reason": "failure_terminal"}` | The terminal is declared `failure: true`. The session is always kept, flag or not, so the parent's `retry_failed`, `koto rewind`, `koto status` and `koto context get` still work on it. |
+| `{"retained": true, "reason": "pinned", "kept_by_pin": true, "pin": {...}}` | The session holds a pin (see [session pin](#session-pin)), readable or not (`pin_unreadable`). Kept with or without `--no-cleanup`. A failure terminal that is also pinned reports `failure_terminal` with the pin beside it. Under the cloud backend the bucket's pin object counts, with `source: bucket`. |
+| `{"retained": true, "reason": "bucket_unchecked", "bucket_unchecked": {"error"}}` | Under the cloud backend only: the session would have been removed, and the bucket couldn't be checked for a pin (`unreachable` or `unparseable`). |
 | `{"retained": true, "reason": "hierarchy"}` | The session has a link or lineage: a link of its own (`koto/links/`), a `parent_workflow`, a `chain/parent`, or another session naming it through one of those, a link's session-id hint included. Kept with or without `--no-cleanup`; `koto session prune` reclaims it once its hierarchy is released (see [session hierarchy](#session-hierarchy)). |
 | `{"retained": true, "reason": "no_cleanup"}` | Any other terminal, ticked with `--no-cleanup`. |
 | `{"retained": false}` | Any other terminal, ticked without the flag. koto removes the session directory after the response. |
@@ -763,7 +765,7 @@ The text form says kept or released and why, then lists the keepers (a stale anc
 
 When nothing is alive, `keepers` is empty and `retention` is `{"release": {"at", "member", "close_kind"}, "passes_at"}`, with `close_kind` one of `terminal`, `cancelled`, `observed` or `idle`; `kept` stays `true` until `passes_at`. A stale keeper whose marker or harness session id fails the pattern carries `"malformed_marker": true` and no `close_command`. Each anchor member also carries `last_activity`, the instant its idle close and stale report count from (`null` when it can't be read); the `hierarchy` object a prune entry carries leaves it out.
 
-The command reads the local sessions directory directly and writes nothing; under the cloud backend it lists and reads no session through the bucket. A malformed retention setting, a malformed name, or a name with no session exits 2; a sessions directory that can't be listed exits 3. koto assumes `~/.koto` is private to its user: anyone who can write the store can forge the records this command reads.
+The command reads the local sessions directory directly and writes nothing; under the cloud backend it asks the bucket only about the pins the scan found, and lists and reads no other session through it. A malformed retention setting, a malformed name, or a name with no session exits 2; a sessions directory that can't be listed exits 3. koto assumes `~/.koto` is private to its user: anyone who can write the store can forge the records this command reads.
 
 #### session cleanup
 
@@ -783,6 +785,24 @@ An explicit removal still removes when the retention rule would keep the session
 ```
 
 `koto cancel --cleanup <name>` does the same after appending the cancel: its output gains `live_members` (and `live_members_error` when the judgment failed), naming every other live member of the cancelled session's hierarchy, such as a dispatcher that is still running. A `koto cancel` without `--cleanup` removes nothing and carries neither field.
+
+A pinned session is refused: both commands exit 2 with code `pinned` (or `pin_unreadable`), name the pin's reason, setter and time, and change nothing, so `koto cancel --cleanup` doesn't cancel it either. Unpin it first with `koto session unpin <name>`. A migrated source is the exception: `koto session import` carried its pin to the moved copy, so the source's pin keeps nothing and cleanup removes it, while `koto session unpin` refuses it. If an older release ran the import, check that the moved copy is pinned before removing the source. Under the cloud backend a bucket that can't be checked for a pin refuses with exit 3, code `bucket_unchecked`.
+
+#### session pin
+
+Pins a session so no removal by rule takes it, until it is unpinned. The [session retention guide](session-retention.md) covers what a pin keeps and which releases honour it.
+
+```bash
+koto session pin <name> --reason <text>
+koto session unpin <name> [--reason <text>]
+koto session list --pinned [--json]
+```
+
+`koto session pin` prints `{"name", "pin": {"reason", "set_by", "set_at"}, "store"}`, with `store` `"local"` or `{"cloud": "<bucket>"}`, and exits 0; a session already pinned keeps its pin and prints it. It refuses with exit 2, writing nothing, a reason that is blank, longer than 500 characters or holds a control character (`invalid_reason`), a name with no session (`no_session`), an anchor, a close record or a migrated source (`not_pinnable`), and a session whose pin can't be read (`pin_unreadable`). Under the cloud backend the pin is written to the bucket as its own object and nothing else; a write the bucket refuses exits 3 (`pin_not_pushed`) and leaves no pin anywhere, and a bucket that can't be listed exits 3 (`bucket_unchecked`).
+
+`koto session unpin` prints `{"name", "released"}`: the release record (`released_by`, `authority`, `authority_at`, `authority_source`, `reason`, `released_at`, and the released pin's `reason`, `set_by` and `set_at`), or `null` when the session held no pin. A call with no `KOTO_ANCHOR` may unpin. Under an anchor it needs the `release-pin` authority that anchor's agent session was handed at its start, and is refused otherwise with exit 2, `authority_required`, naming the authority and the anchor. Under the cloud backend the release record and the pin's removal are the bucket's objects; either one failing exits 3 with the pin still in force.
+
+`koto session list --pinned` lists every pinned session, sorted by name, with its pin or `pin_unreadable`, whether it is `running` or `finished`, and `source`. Under the cloud backend it also lists sessions pinned in the bucket, with `source: bucket` and `state` `unknown` when this host holds no copy; when the bucket can't be listed it prints this host's pins as `{"pinned": [...], "bucket_unchecked": {"error"}}` and exits 3.
 
 #### session prune
 
@@ -808,6 +828,7 @@ Every session is judged by the retention rule over one scan of the store, with o
 
 | Rule | Keeps a session that |
 |------|----------------------|
+| `p` | holds a pin, readable or not (see [session pin](#session-pin)). The entry carries `kept_by_pin` and `pin` or `pin_unreadable`, and a `hierarchy` object when the hierarchy is kept as well. A pin keeps its own session only. Under the cloud backend a preview checks the bucket for each session it would remove, and the apply checks again just before each delete: a pin object there keeps the session (`source: bucket`), and a bucket that can't be checked keeps it with `bucket_unchecked` |
 | `a` | is alive: a koto session that runs, or can't be read (its header, log or template is unreadable, or its directory is a symlink), or an anchor that is open |
 | `h` | belongs to a hierarchy the retention rule keeps: another member is alive, `retention.keep` hasn't passed since the hierarchy's release instant, or something in it can't be read (a malformed link, close record or `chain/parent`, an unreadable log, a timestamp more than five minutes in the future, or any session's header, which could name any other) |
 | `d` | has a `chain/parent` context key that isn't exactly one session name |

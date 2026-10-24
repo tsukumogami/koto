@@ -3,7 +3,8 @@
 //!
 //! The bucket is untrusted for the reserved area. Before any key is fetched,
 //! [`drop_from_manifest`] takes out what a copy must never carry: the
-//! observed marker (`koto/anchor/observed`), a close record
+//! observed marker (`koto/anchor/observed`), an anchor's recorded authority
+//! (`koto/anchor/authority`), a close record
 //! (`koto/anchor-close`), every `koto/links/closes/*` link, any
 //! `koto/imported-from` the source carried, and any key whose first
 //! component spells `koto` in another case. Once the kept keys are staged
@@ -24,7 +25,9 @@
 //!
 //! A pin (`koto/links/pin`) and its release record (`koto/pin-release`)
 //! are carried verbatim, an unreadable pin included: the pin isn't a link,
-//! so it is never validated as one.
+//! so it is never validated as one. Under the cloud backend they aren't in
+//! the manifest at all; the import reads them as objects of their own and
+//! pushes them the same way.
 //!
 //! Nothing here reads or writes the source: it works on the staging
 //! directory and reads the local store's sessions in place.
@@ -49,6 +52,9 @@ pub use crate::session::hierarchy::IMPORTED_FROM_KEY;
 /// the record of an earlier import, which this import writes afresh.
 pub fn dropped_on_import(key: &str) -> bool {
     key == OBSERVED_KEY
+        // The authority an agent session's start handed its anchor belongs
+        // to that start on that host; a moved copy holds none (R25).
+        || key == crate::session::anchor::AUTHORITY_KEY
         || key == CLOSE_RECORD_KEY
         || key == IMPORTED_FROM_KEY
         || key.starts_with(&link_key(LinkKind::Closes, ""))
