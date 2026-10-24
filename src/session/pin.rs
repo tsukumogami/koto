@@ -555,6 +555,11 @@ fn delete_pin(backend: &Backend, name: &str, held: bool) -> anyhow::Result<()> {
 /// record already gone, or a key not listed, is skipped. The first failure
 /// is returned after the rest were tried, and its entry stays for the next
 /// push to retry.
+///
+/// The bucket is asked first: when it already holds a pin, or a release
+/// record naming this copy's pin, it decides, so nothing is uploaded over
+/// it and the entries are only dropped. A bucket that can't be checked
+/// uploads nothing and leaves the entries for a later push.
 pub(crate) fn carry_indexed(
     cloud: &crate::session::cloud::CloudBackend,
     name: &str,
@@ -563,6 +568,23 @@ pub(crate) fn carry_indexed(
     let listed = match local.read_manifest(name) {
         Ok(m) => m.keys,
         Err(_) => return Ok(()),
+    };
+    if !listed.contains_key(PIN_KEY) && !listed.contains_key(RELEASE_KEY) {
+        return Ok(());
+    }
+    let local_id = match read_local(local.base_dir(), name) {
+        PinFact::Present(pin) => Some(pin.id),
+        _ => None,
+    };
+    let upload = match cloud.bucket_pin(name, local_id.as_deref()) {
+        BucketPin::Unchecked(error) => {
+            anyhow::bail!(
+                "the bucket couldn't be checked for a pin ({})",
+                error.as_str()
+            )
+        }
+        BucketPin::Pin(_) | BucketPin::NoPin { released: true } => false,
+        BucketPin::NoPin { released: false } | BucketPin::NotApplicable => true,
     };
     let mut first: Option<anyhow::Error> = None;
     for key in [PIN_KEY, RELEASE_KEY] {
@@ -573,7 +595,13 @@ pub(crate) fn carry_indexed(
         let result = match fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_file() => fs::read(&path)
                 .map_err(anyhow::Error::from)
-                .and_then(|bytes| cloud.put_reserved_object(name, key, &bytes))
+                .and_then(|bytes| {
+                    if upload {
+                        cloud.put_reserved_object(name, key, &bytes)
+                    } else {
+                        Ok(())
+                    }
+                })
                 .and_then(|()| {
                     local.update_manifest_locked(name, |m| {
                         m.keys.remove(key);

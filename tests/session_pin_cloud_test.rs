@@ -882,7 +882,8 @@ fn an_import_carries_the_pin_and_its_release_record_and_leaves_the_source_inert(
     h.done(1, "Q");
     h.s3.put(&h.key("Q", PIN), b"garbage");
 
-    let in_dest = |host: u8, args: &[&str]| h.cmd_at(host, true, &dest).args(args).output().unwrap();
+    let in_dest =
+        |host: u8, args: &[&str]| h.cmd_at(host, true, &dest).args(args).output().unwrap();
     let ok_in_dest = |args: &[&str]| {
         let out = in_dest(2, args);
         assert!(
@@ -907,7 +908,10 @@ fn an_import_carries_the_pin_and_its_release_record_and_leaves_the_source_inert(
     );
     let manifest: Value =
         serde_json::from_slice(&h.s3.object(&moved("P", "ctx/manifest.json")).unwrap()).unwrap();
-    assert!(manifest["keys"].get("koto/links/pin").is_none(), "{manifest:#}");
+    assert!(
+        manifest["keys"].get("koto/links/pin").is_none(),
+        "{manifest:#}"
+    );
 
     // The moved copies are kept by their pins, read from the bucket.
     let out = in_dest(3, &["session", "cleanup", "P"]);
@@ -927,7 +931,13 @@ fn an_import_carries_the_pin_and_its_release_record_and_leaves_the_source_inert(
     let out = h.fails(1, &["session", "unpin", "P"], 2);
     assert_eq!(out["error"]["code"], "not_pinnable", "{out}");
     assert!(h.writes().is_empty(), "{:?}", h.writes());
-    let preview = ok_in_dest(&["session", "prune", "--migrated-from", &from, "--source-retired"]);
+    let preview = ok_in_dest(&[
+        "session",
+        "prune",
+        "--migrated-from",
+        &from,
+        "--source-retired",
+    ]);
     let token = preview["plan"].as_str().unwrap().to_string();
     let applied = ok_in_dest(&[
         "session",
@@ -938,7 +948,10 @@ fn an_import_carries_the_pin_and_its_release_record_and_leaves_the_source_inert(
         "--plan",
         &token,
     ]);
-    assert!(names(&applied["removed"]).contains(&"P".to_string()), "{applied:#}");
+    assert!(
+        names(&applied["removed"]).contains(&"P".to_string()),
+        "{applied:#}"
+    );
     assert!(h.s3.object(&h.key("P", PIN)).is_none());
     assert!(h.s3.object(&moved("P", PIN)).is_some());
 }

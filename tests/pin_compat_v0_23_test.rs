@@ -8,7 +8,8 @@
 //! binary; without it the test passes having checked nothing, and says so.
 //! The binary must match one of the SHA-256 digests in
 //! `tests/fixtures/koto-v0.23.0.sha256`, the release's own `checksums.txt`.
-//! CI's `compat-v0-23` job downloads the release asset and sets the variable.
+//! CI's `pin-compat-v0-23` job downloads the release asset and sets the
+//! variable, so a run that should have opted in and didn't shows there.
 //! Both binaries run in a scratch HOME on the local backend, every
 //! `KOTO_SESSION_*` variable removed.
 
@@ -196,7 +197,9 @@ fn koto_v0_23_keeps_a_session_this_build_pinned() {
         &["init", "P", "--template", &template, "--replace-terminal"],
     );
     let v: serde_json::Value = serde_json::from_str(replaced.trim()).unwrap();
-    let moved = v["moved_to"].as_str().unwrap_or_else(|| panic!("{replaced}"));
+    let moved = v["moved_to"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{replaced}"));
     assert_eq!(std::fs::read(s.pin_file(moved)).unwrap(), pin);
     assert!(!s.pin_file("P").exists());
 }

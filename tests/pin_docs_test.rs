@@ -53,7 +53,9 @@ fn every_guide_that_runs_cleanup_says_to_unpin_first() {
 /// The changelog's unreleased section, up to the first released version.
 fn unreleased_changelog() -> String {
     let text = std::fs::read_to_string(root().join("CHANGELOG.md")).unwrap();
-    let start = text.find("## [Unreleased]").expect("an [Unreleased] section");
+    let start = text
+        .find("## [Unreleased]")
+        .expect("an [Unreleased] section");
     let rest = &text[start..];
     let end = rest[1..].find("\n## [").map_or(rest.len(), |i| i + 1);
     rest[..end].to_string()
@@ -62,7 +64,10 @@ fn unreleased_changelog() -> String {
 #[test]
 fn the_changelog_and_the_retention_guide_say_which_releases_honour_pins() {
     let guide = std::fs::read_to_string(root().join("docs/guides/session-retention.md")).unwrap();
-    for (what, text) in [("CHANGELOG.md", unreleased_changelog()), ("session-retention.md", guide)] {
+    for (what, text) in [
+        ("CHANGELOG.md", unreleased_changelog()),
+        ("session-retention.md", guide),
+    ] {
         for needed in [
             "first release that honours pins in full",
             "v0.23.0",
