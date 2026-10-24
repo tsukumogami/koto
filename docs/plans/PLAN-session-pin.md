@@ -144,6 +144,8 @@ After each of S1 to S5 compare P's hash with the recorded one (after S6, hash th
 - [ ] A pin file present with its index entry removed keeps P through S and is reported as a readable pin.
 - [ ] Pinning a session with an unreadable pin exits 2 naming it; unpinning it by hand exits 0 and the release record's pin fields are `null`.
 - [ ] Pin, unpin and the release record add no event to P's log, and the hierarchy query reports the same stop instant, release instant and anchor `last_activity` before and after.
+- [ ] A pinned child whose `parent_workflow` lineage to its parent was removed is kept and also listed, with `kept_by_pin: true` and its pin, in the parent sweep's kept-children entries and `koto workspace prune`'s kept list (step 2 keeps it but doesn't list it).
+- [ ] A pinned session held by a live anchor is reported with both the pin and the anchor in the hierarchy query and in a prune preview, and the anchor's keeper entry is unchanged by the pin.
 
 **Check**: Build the fixture with HOME set to a fresh temporary directory, pin P by hand, replace its pin file by each damaged form in turn, and after each run `koto session prune --apply --all --json` and `koto session list --pinned --json`; see P kept with the named `pin_unreadable` and its dispatched child removed. Then compare `koto session hierarchy P --json` before and after a pin and an unpin and see the same stop instant, release instant and `last_activity`.
 
