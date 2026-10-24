@@ -428,15 +428,28 @@ fn check_session(backend: &Backend, name: &str) -> Result<(), PinError> {
         Backend::Cloud(cloud) => cloud.check_not_migrated_to_write(name),
     };
     if let Err(e) = migrated {
-        // The removal guard treats this copy's pin as inert, so the way out
-        // is cleanup, not an unpin: say so, or the refusal is a dead end.
+        // Name the way out, or the refusal is a dead end. A cross-host
+        // migrated source's pin is inert, so cleanup here removes it. After
+        // a same-host import the local copy at this name is the moved copy,
+        // which keeps its pin and refuses cleanup here, so the old copy in
+        // the bucket goes only through a prune of migrated sources run from
+        // the workspace it moved to.
+        let shown = crate::session::hierarchy::display_text(name);
+        let way_out = match backend {
+            Backend::Cloud(cloud) if cloud.local_guard(name).is_err() => {
+                "the local copy at this name is the moved one, which keeps its pin; the old \
+                 copy in the bucket goes with `koto session prune --migrated-from <this \
+                 workspace>` run from the workspace it moved to"
+                    .to_string()
+            }
+            _ => format!(
+                "its moved copy holds its pin, and a pin here keeps nothing: \
+                 `koto session cleanup {shown}` in this workspace removes this copy"
+            ),
+        };
         return Err(PinError::refusal(
             "not_pinnable",
-            format!(
-                "{e:#}; its moved copy holds its pin, and a pin here keeps nothing: \
-                 `koto session cleanup {}` in this workspace removes this copy",
-                crate::session::hierarchy::display_text(name)
-            ),
+            format!("{e:#}; {way_out}"),
         ));
     }
     Ok(())

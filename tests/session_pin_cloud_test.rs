@@ -939,10 +939,29 @@ fn after_a_same_host_import_the_old_workspace_never_clears_the_moved_copys_pin()
     assert!(h.s3.object(&moved).is_some());
     settle();
 
-    // From the old workspace: neither a prune nor a cleanup takes the moved
-    // copy, and its pin is where it was, locally and in the bucket.
-    let _ = h.run(1, &["session", "prune", "--apply", "--all"]);
-    let _ = h.run(1, &["session", "cleanup", "P"]);
+    // From the old workspace: a prune keeps the moved copy by its pin, a
+    // cleanup refuses it as pinned, and its pin is where it was, locally and
+    // in the bucket.
+    let applied = h.ok(1, &["session", "prune", "--apply", "--all"]);
+    assert!(
+        !names(&applied["removed"]).contains(&"P".to_string()),
+        "{applied:#}"
+    );
+    let kept = entry(&applied["kept"], "P");
+    assert_eq!(kept["rule"], "p", "{kept:#}");
+    assert_eq!(kept["kept_by_pin"], true, "{kept:#}");
+    let refused = h.fails(1, &["session", "cleanup", "P"], 2);
+    assert_eq!(refused["error"]["code"], "pinned", "{refused}");
+    // Unpin refuses here too, and says where the old copy goes.
+    let out = h.fails(1, &["session", "unpin", "P"], 2);
+    assert_eq!(out["error"]["code"], "not_pinnable", "{out}");
+    assert!(
+        out["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("koto session prune --migrated-from"),
+        "{out}"
+    );
     assert_eq!(std::fs::read(&local_pin).unwrap(), pin);
     assert!(h.s3.object(&moved).is_some());
 }
