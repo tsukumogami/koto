@@ -10,8 +10,13 @@ to `0.9.x`).
 
 ### Compatibility
 
-- **This is the first release that honours pins in full.** Every host that
-  shares a bucket needs it. koto v0.23.0 reads a pin as a malformed link,
+- **The first release after v0.24.0 is the
+  first release that honours pins in full.** Every host that shares a bucket
+  needs it. koto v0.24.0 has pins
+  on the local backend only, with the commands hidden: under the cloud
+  backend it refuses to pin, and its removals read only their own host's
+  copy, so it doesn't keep a session pinned in the bucket. koto v0.23.0
+  reads a pin as a malformed link,
   which keeps the session's hierarchy, so its `koto session prune`,
   `koto workspace prune`, terminal tick and same-name replace keep a session
   pinned in a local store; its `koto session cleanup`, `koto cancel --cleanup`

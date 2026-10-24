@@ -88,8 +88,14 @@ migrated source's pin is inert: `koto session unpin` refuses it, and
 
 ## Which releases honour pins
 
-The first release that honours pins in full is the one this guide ships with,
-the first after koto v0.23.0. Every host sharing a bucket needs it.
+The first release that honours pins in full is the first release after koto
+v0.24.0, the one this guide ships with. Every host sharing a bucket needs it.
+
+koto v0.24.0 has pins on the local backend only, with `koto session pin`,
+`koto session unpin` and `koto session list --pinned` hidden from `--help`.
+Its removals keep a pinned session in a local store, but under the cloud
+backend it refuses to pin and its removals read only their own host's copy,
+so it doesn't keep a session that is pinned in the bucket.
 
 koto v0.23.0 reads a pin it doesn't know as a malformed link, which keeps the
 session's hierarchy, so its `koto session prune`, `koto workspace prune`,
