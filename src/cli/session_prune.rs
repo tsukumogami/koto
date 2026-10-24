@@ -701,7 +701,7 @@ fn refuse_short_retention(
     store: &short_retention::Store,
     would_remove: usize,
 ) {
-    if would_remove == 0 || filters.older_than.is_some_and(|d| d >= short_retention::FLOOR) {
+    if would_remove == 0 || !short_retention::selection_is_wide(filters.older_than) {
         return;
     }
     let short = short_retention::short_settings(settings);

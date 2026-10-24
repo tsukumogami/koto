@@ -35,6 +35,13 @@ pub(crate) fn short_settings(settings: &RetentionSettings) -> Vec<&Setting> {
         .collect()
 }
 
+/// Whether a selection reaches sessions that stopped less than [`FLOOR`]
+/// ago: no `--older-than` (`--all`, or `--execution-dir` alone), or one
+/// below it.
+pub(crate) fn selection_is_wide(older_than: Option<Duration>) -> bool {
+    older_than.is_none_or(|d| d < FLOOR)
+}
+
 /// `retention.keep is 1s (from KOTO_RETENTION_KEEP)`, joined with `and`.
 pub(crate) fn settings_text(short: &[&Setting]) -> String {
     short
@@ -93,14 +100,20 @@ impl Store {
 /// The fields a refusal carries for the short settings and the count:
 /// `retention` (each setting, its value and where it came from) and
 /// `would_remove`.
-pub(crate) fn refusal_fields(short: &[&Setting], store: &Store, would_remove: usize) -> Map<String, Value> {
+pub(crate) fn refusal_fields(
+    short: &[&Setting],
+    store: &Store,
+    would_remove: usize,
+) -> Map<String, Value> {
     let mut fields = store.fields();
     fields.insert(
         "retention".into(),
         Value::Array(
             short
                 .iter()
-                .map(|s| json!({"setting": s.name, "value": s.raw.trim(), "from": s.origin_label()}))
+                .map(
+                    |s| json!({"setting": s.name, "value": s.raw.trim(), "from": s.origin_label()}),
+                )
                 .collect(),
         ),
     );
@@ -122,16 +135,24 @@ mod tests {
 
     #[test]
     fn a_setting_is_short_only_below_an_hour() {
-        let names = |s: &RetentionSettings| {
-            short_settings(s)
-                .iter()
-                .map(|s| s.name)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(names(&settings(1, 1)), ["retention.keep", "retention.idle_period"]);
+        let names =
+            |s: &RetentionSettings| short_settings(s).iter().map(|s| s.name).collect::<Vec<_>>();
+        assert_eq!(
+            names(&settings(1, 1)),
+            ["retention.keep", "retention.idle_period"]
+        );
         assert_eq!(names(&settings(3599, 7200)), ["retention.keep"]);
         assert_eq!(names(&settings(7200, 59)), ["retention.idle_period"]);
         assert!(names(&settings(3600, 3600)).is_empty());
+    }
+
+    #[test]
+    fn a_selection_is_wide_without_an_age_bound_of_an_hour() {
+        assert!(selection_is_wide(None));
+        assert!(selection_is_wide(Some(Duration::from_secs(1))));
+        assert!(selection_is_wide(Some(Duration::from_secs(3599))));
+        assert!(!selection_is_wide(Some(FLOOR)));
+        assert!(!selection_is_wide(Some(Duration::from_secs(30 * 86400))));
     }
 
     #[test]

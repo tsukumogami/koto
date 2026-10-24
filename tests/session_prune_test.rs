@@ -1120,7 +1120,7 @@ fn under_the_cloud_backend_a_short_retention_refuses_a_direct_apply_and_removes_
     let dir = env.work.to_str().unwrap().to_string();
     for args in [
         vec!["--apply", "--all"],
-        vec!["--apply", "--older-than", "59m"],
+        vec!["--apply", "--older-than", "1s"],
         vec!["--apply", "--execution-dir", dir.as_str()],
     ] {
         let out = env.prune(&args);
@@ -1165,7 +1165,11 @@ fn under_the_cloud_backend_a_short_retention_refuses_a_direct_apply_and_removes_
     assert_eq!(names(&preview["remove"]), vec!["first", "second"]);
     let token = preview["plan"].as_str().unwrap().to_string();
     let out = env.prune(&["--apply", "--plan", &token]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let applied: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(names(&applied["removed"]), vec!["first", "second"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1173,7 +1177,9 @@ fn under_the_cloud_backend_a_short_retention_refuses_a_direct_apply_and_removes_
         stderr.contains("the cloud store at") && stderr.contains(BUCKET),
         "{stderr}"
     );
-    assert!(s3.keys_under(&format!("{}/first/", env.prefix())).is_empty());
+    assert!(s3
+        .keys_under(&format!("{}/first/", env.prefix()))
+        .is_empty());
 }
 
 #[test]
@@ -1183,11 +1189,17 @@ fn under_the_cloud_backend_the_confirm_flag_removes_under_a_short_retention() {
     env.done("first");
     settle();
     let out = env.prune(&["--apply", "--all", "--confirm-short-retention"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(names(&v["removed"]), vec!["first"]);
     assert!(!env.sessions().join("first").exists());
-    assert!(s3.keys_under(&format!("{}/first/", env.prefix())).is_empty());
+    assert!(s3
+        .keys_under(&format!("{}/first/", env.prefix()))
+        .is_empty());
     // The line naming the store comes before the removal starts.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("koto session prune: removing"), "{stderr}");
@@ -1201,21 +1213,25 @@ fn under_the_cloud_backend_the_guard_leaves_long_retentions_and_old_selections_a
     env.done("first");
     settle();
 
-    // A selection of an hour or more isn't refused: nothing that just
-    // finished is old enough, so nothing goes.
+    // A selection of an hour or more runs as it always did: nothing that
+    // just finished is old enough, so nothing goes.
     let v = env.prune_ok(&["--apply", "--older-than", "1h"]);
     assert!(names(&v["removed"]).is_empty());
 
-    // An idle period under the floor is short too.
+    // An idle period under the floor is named too.
     let out = env.run_env(
         &["session", "prune", "--apply", "--all"],
-        &[
-            ("KOTO_RETENTION_KEEP", "1h"),
-            ("KOTO_RETENTION_IDLE_PERIOD", "30m"),
-        ],
+        &[("KOTO_RETENTION_IDLE_PERIOD", "30m")],
     );
     let error = short_retention_refusal(&out);
-    assert_eq!(error["retention"][0]["setting"], "retention.idle_period");
+    let settings: Vec<_> = error["retention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["setting"].as_str().unwrap())
+        .collect();
+    assert_eq!(settings, ["retention.keep", "retention.idle_period"]);
+    assert_eq!(error["retention"][1]["value"], "30m");
 
     // With every removal setting at an hour or more, the direct form runs
     // as it always did: the retention hasn't passed, so it keeps the session.
@@ -1230,7 +1246,11 @@ fn the_local_backend_removes_under_a_short_retention_without_confirmation() {
     env.done("first");
     settle();
     let out = env.prune(&["--apply", "--all"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(names(&v["removed"]), vec!["first"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1270,7 +1290,11 @@ fn under_the_cloud_backend_workspace_prune_yes_refuses_a_short_retention() {
         &env.work,
         &["workspace", "prune", "--root", "root", "--dry-run"],
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = env.run_in(
         &env.work,
         &[
@@ -1282,7 +1306,11 @@ fn under_the_cloud_backend_workspace_prune_yes_refuses_a_short_retention() {
             "--confirm-short-retention",
         ],
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(!env.sessions().join("root").exists());
     assert!(!env.sessions().join("child").exists());
 }
