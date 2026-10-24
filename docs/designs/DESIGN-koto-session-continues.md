@@ -419,6 +419,31 @@ origin's `ctx/koto/`.
   source without breaking R14 and the import's log-prefix check; and a stale
   host's manifest can drop it.
 
+### Decision 5: What the terminal tick reads
+
+Resolved inline, from the architecture review of Phase 4.
+
+The terminal tick keeps a session whenever `edge_of` finds any edge, without
+judging anything, which is what keeps the tick cheap. A continues link counts
+as an edge for both the holder and the session it names, so the tick already
+keeps the chain; what it lacks is the keeper's name the PRD asks every removal
+to print (R12).
+
+#### Chosen: judge only when a continues link names the session
+
+A new `relation_probe`, sharing `edge_of`'s pass over the store, says whether
+any continues link names the session. Only then does the tick build a graph
+and run `Judge::relation` to fill `retention.relation_keepers`. A session no
+relation names costs exactly what it costs today.
+
+#### Alternatives Considered
+
+- **Judging at every terminal tick.** Correct and simpler, but it puts a full
+  store scan on every tick of every session, which `edge_of` exists to avoid.
+- **Reporting only `reason: hierarchy`.** Cheapest, but the tick would be the
+  one removal point that can't say which later session keeps the predecessor,
+  and the chain criterion checks it there.
+
 ## Decision Outcome
 
 The relation is a link the successor holds, `koto/links/continues/<PRED>`,
