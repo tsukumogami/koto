@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 problem: |
   When a session's work passes to another session (a coordinator's successor,
   a takeover by an unrelated session, or a `koto session import` copy), koto
@@ -25,7 +25,7 @@ upstream: docs/briefs/BRIEF-koto-session-continues.md
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
