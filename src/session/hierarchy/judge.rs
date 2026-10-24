@@ -1,7 +1,7 @@
 //! [`Judge`]: the full inspection of one component's members, and the
 //! [`Verdict`] every removal point and the query share.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -18,6 +18,7 @@ use crate::session::context::ContextStore;
 use crate::session::inventory::{inspect_full, SessionStatus, TemplateCache};
 use crate::session::links::MAX_LINK_BODY_BYTES;
 use crate::session::local::LocalBackend;
+use crate::session::pin::PinFact;
 use crate::session::state_file_name;
 
 /// What a member is.
@@ -160,11 +161,22 @@ pub struct Member {
     pub stale: bool,
     /// An instant read for it lay ahead of `now` and was clamped.
     pub clamped: bool,
+    /// For an anchor, its last activity (clamped to `now`): the instant its
+    /// idle close and its stale report count from. `None` for every other
+    /// member, and for an anchor whose activity can't be read.
+    pub last_activity: Option<String>,
     /// The edges that joined it to the hierarchy.
     pub joined_by: Vec<Edge>,
 }
 
 /// One judgment: the verdict for a session's hierarchy and its members.
+///
+/// The verdict is the component's and knows nothing of pins. A pin keeps
+/// its own session and nothing else, so it is an overlay asked about one
+/// member at a time: a gate that asks whether the component may go at all
+/// reads `verdict.is_kept()`, and a decision to delete one member asks
+/// [`Judgment::keeps`]. Asking `keeps` of a component's first member at a
+/// component gate would let a pinned member keep its whole component.
 #[derive(Debug, Clone)]
 pub struct Judgment {
     pub session: String,
@@ -174,6 +186,23 @@ pub struct Judgment {
     pub clamped: Vec<String>,
     /// The `now` the judgment was made at.
     pub now: String,
+    /// The judged session's own pin.
+    pub pin: PinFact,
+    /// Each present member holding a pin, readable or not, by name.
+    pub pinned_members: BTreeMap<String, PinFact>,
+}
+
+impl Judgment {
+    /// Whether `member` is kept: by its own pin, or because the component's
+    /// verdict keeps every member.
+    pub fn keeps(&self, member: &str) -> bool {
+        self.pinned_members.contains_key(member) || self.verdict.is_kept()
+    }
+
+    /// `member`'s pin, as the scan read it.
+    pub fn pin_of(&self, member: &str) -> &PinFact {
+        self.pinned_members.get(member).unwrap_or(&PinFact::None)
+    }
 }
 
 /// What the full inspection learned about one present member.
@@ -188,6 +217,7 @@ struct MemberState {
     close_command: Option<String>,
     malformed_marker: bool,
     clamped: bool,
+    last_activity: Option<SystemTime>,
     unreadable: Vec<String>,
 }
 
@@ -259,10 +289,14 @@ impl<'g> Judge<'g> {
         let mut keepers = Vec::new();
         let mut release: Option<(SystemTime, String, CloseKind)> = None;
         let mut clamped = Vec::new();
+        let mut pinned_members = BTreeMap::new();
 
         for m in &present {
             let state = self.state_of(m);
             if let Some(f) = self.graph.facts(m) {
+                if f.pin.is_pinned() {
+                    pinned_members.insert(m.clone(), f.pin.clone());
+                }
                 for p in &f.problems {
                     unreadable.insert(Unreadable {
                         name: m.clone(),
@@ -311,6 +345,7 @@ impl<'g> Judge<'g> {
                 imported: state.imported,
                 stale: state.stale,
                 clamped: state.clamped,
+                last_activity: state.last_activity.map(iso8601_at),
                 joined_by: self.joined_by(m, scope, &in_component),
             });
         }
@@ -333,6 +368,7 @@ impl<'g> Judge<'g> {
                 imported: false,
                 stale: false,
                 clamped: false,
+                last_activity: None,
                 joined_by: self.joined_by(leaf, scope, &in_component),
             });
         }
@@ -377,6 +413,8 @@ impl<'g> Judge<'g> {
             members,
             clamped,
             now: iso8601_at(self.now),
+            pin: pinned_members.get(name).cloned().unwrap_or_default(),
+            pinned_members,
         })
     }
 
@@ -448,6 +486,7 @@ impl<'g> Judge<'g> {
             close_command: None,
             malformed_marker: false,
             clamped: false,
+            last_activity: None,
             unreadable: Vec::new(),
         };
         // A migrated session's records live in its copy: it keeps nothing
@@ -542,6 +581,7 @@ impl<'g> Judge<'g> {
             return;
         };
         let last = self.clamp(last, "last activity", state);
+        state.last_activity = Some(last);
 
         let mut candidates: Vec<(SystemTime, CloseKind)> = Vec::new();
         match anchor::checked_close_record(&self.store, name) {

@@ -6,14 +6,158 @@
 use serde_json::{json, Value};
 
 use super::graph::Edge;
-use super::judge::{Judgment, Keeper, Member, Retention, Unreadable, Verdict};
+use super::judge::{Judgment, Keeper, Member, MemberKind, Retention, Unreadable, Verdict};
 use super::settings::RetentionSettings;
 use crate::config::session_env::Origin;
-use crate::session::anchor::valid_token;
+use crate::session::anchor::{valid_token, AuthorityRecord};
+use crate::session::pin::{Pin, PinFact, ReleaseRecord, SOURCE_LOCAL};
 
 /// `s` with every control character removed.
 pub fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Whether `c` is escaped by [`display_text`]: a control character, a
+/// bidirectional override or isolate, a zero-width or invisible formatting
+/// character, or a line or paragraph separator.
+fn needs_escape(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+/// Stored text from a pin, a release record or an authority record, as
+/// every surface prints it: each character [`needs_escape`] names is
+/// written as `\u{XXXX}` and a backslash as `\\`, so a stored string can't
+/// carry a terminal escape or reorder the line it lands in. JSON output
+/// carries the escaped form too.
+pub fn display_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if needs_escape(c) {
+            out.push_str(&format!("\\u{{{:04X}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A readable pin as every kept entry carries it: `reason`, `set_by`,
+/// `set_at`, and `source`, where the pin was read (`local` in this build).
+pub fn pin_json(pin: &Pin, source: &str) -> Value {
+    json!({
+        "reason": display_text(&pin.reason),
+        "set_by": pin.set_by.as_deref().map(display_text),
+        "set_at": display_text(&pin.set_at),
+        "source": source,
+    })
+}
+
+/// The fields a kept entry for a pinned session carries: `kept_by_pin`
+/// and either `pin` or `pin_unreadable`. Empty for a session with no pin,
+/// so its entry is the one it was before pins existed.
+pub fn pin_fields(pin: &PinFact, source: &str) -> serde_json::Map<String, Value> {
+    let mut fields = serde_json::Map::new();
+    match pin {
+        PinFact::None => {}
+        PinFact::Present(p) => {
+            fields.insert("kept_by_pin".to_string(), json!(true));
+            fields.insert("pin".to_string(), pin_json(p, source));
+        }
+        PinFact::Unreadable(problem) => {
+            fields.insert("kept_by_pin".to_string(), json!(true));
+            fields.insert("pin_unreadable".to_string(), json!(problem.as_str()));
+        }
+    }
+    fields
+}
+
+/// The text a kept pinned session prints: `pinned: <reason> (set by
+/// <anchor or "hand"> at <time>)`, or `pin unreadable: <reason name>`.
+/// `None` for a session with no pin.
+pub fn pin_text(pin: &PinFact) -> Option<String> {
+    match pin {
+        PinFact::None => None,
+        PinFact::Present(p) => Some(format!(
+            "pinned: {} (set by {} at {})",
+            display_text(&p.reason),
+            p.set_by
+                .as_deref()
+                .map(display_text)
+                .unwrap_or_else(|| "hand".to_string()),
+            display_text(&p.set_at)
+        )),
+        PinFact::Unreadable(problem) => Some(format!("pin unreadable: {}", problem.as_str())),
+    }
+}
+
+/// A release record as `koto session unpin` and the hierarchy query print
+/// it: who released the pin, with what authority, why and when, and the
+/// pin it released, each `null` where nothing was recorded (a release by
+/// hand, or a pin that couldn't be read).
+pub fn release_json(r: &ReleaseRecord) -> Value {
+    let text = |s: &Option<String>| s.as_deref().map(display_text);
+    json!({
+        "released_by": text(&r.released_by),
+        "authority": text(&r.authority),
+        "reason": text(&r.reason),
+        "released_at": display_text(&r.released_at),
+        "pin": {
+            "reason": text(&r.pin.reason),
+            "set_by": text(&r.pin.set_by),
+            "set_at": text(&r.pin.set_at),
+        },
+    })
+}
+
+/// The line the hierarchy query prints for a release record.
+fn release_text(r: &ReleaseRecord) -> String {
+    let by = match (&r.released_by, &r.authority) {
+        (None, _) => "by hand".to_string(),
+        (Some(anchor), Some(authority)) => format!(
+            "by {} with the {} authority",
+            display_text(anchor),
+            display_text(authority)
+        ),
+        (Some(anchor), None) => format!("by {}", display_text(anchor)),
+    };
+    let mut text = format!("pin released {by} at {}", display_text(&r.released_at));
+    if let Some(reason) = &r.reason {
+        text.push_str(&format!(" (reason: {})", display_text(reason)));
+    }
+    match (&r.pin.reason, &r.pin.set_at) {
+        (Some(reason), Some(set_at)) => text.push_str(&format!(
+            "; the pin it released: {} (set by {} at {})",
+            display_text(reason),
+            r.pin
+                .set_by
+                .as_deref()
+                .map(display_text)
+                .unwrap_or_else(|| "hand".to_string()),
+            display_text(set_at)
+        )),
+        _ => text.push_str("; the pin it released couldn't be read"),
+    }
+    text
+}
+
+/// The pinned members of `j`'s hierarchy other than the judged session,
+/// sorted by name.
+fn other_pinned(j: &Judgment) -> Vec<String> {
+    j.pinned_members
+        .keys()
+        .filter(|n| **n != j.session)
+        .map(|n| sanitize(n))
+        .collect()
 }
 
 /// The command that closes an observed anchor by hand, with its observed
@@ -119,7 +263,7 @@ pub fn to_json(j: &Judgment, settings: &RetentionSettings) -> Value {
         ),
         Verdict::Release { release } => (false, &[][..], release.as_ref(), &[][..]),
     };
-    json!({
+    let mut out = json!({
         "session": sanitize(&j.session),
         "kept": kept,
         "keepers": keepers.iter().map(keeper_json).collect::<Vec<_>>(),
@@ -129,7 +273,77 @@ pub fn to_json(j: &Judgment, settings: &RetentionSettings) -> Value {
         "clamped": j.clamped.iter().map(|n| sanitize(n)).collect::<Vec<_>>(),
         "now": j.now,
         "settings": settings_json(settings),
-    })
+    });
+    // A pinned session's own judgment adds its pin, and says the pin keeps
+    // this session only: `kept` stays the hierarchy's verdict. Nothing is
+    // added for a session with no pin.
+    if j.pin.is_pinned() {
+        for (k, v) in pin_fields(&j.pin, SOURCE_LOCAL) {
+            out[k] = v;
+        }
+        out["pin_keeps"] = json!([sanitize(&j.session)]);
+    }
+    out
+}
+
+/// The JSON `koto session hierarchy <name> --json` prints: [`to_json`],
+/// plus what only the query reports. Each anchor member carries its
+/// `last_activity`; `pinned_members` names every other member a pin keeps,
+/// when there is one; `pin_release` is the judged session's latest
+/// release record, when it has one; and `authorities` and
+/// `unknown_authorities` are what the judged anchor's latest start was
+/// handed (`authority`), when it records any. A prune's `hierarchy` object
+/// is [`to_json`] alone, so a prune entry for a session with no pin prints
+/// what it printed before pins existed.
+pub fn query_json(
+    j: &Judgment,
+    settings: &RetentionSettings,
+    release: Option<&ReleaseRecord>,
+    authority: Option<&AuthorityRecord>,
+) -> Value {
+    let mut out = to_json(j, settings);
+    if let Some(members) = out["members"].as_array_mut() {
+        for (v, m) in members.iter_mut().zip(&j.members) {
+            if m.kind == MemberKind::Anchor {
+                v["last_activity"] = json!(m.last_activity);
+            }
+        }
+    }
+    let others = other_pinned(j);
+    if !others.is_empty() {
+        out["pinned_members"] = json!(others);
+    }
+    if let Some(r) = release {
+        out["pin_release"] = release_json(r);
+    }
+    if let Some(a) = authority {
+        let shown = |names: &[String]| names.iter().map(|n| display_text(n)).collect::<Vec<_>>();
+        out["authorities"] = json!(shown(&a.names));
+        out["unknown_authorities"] = json!(shown(&a.unknown));
+    }
+    out
+}
+
+/// The line the hierarchy query prints for an anchor's authority record.
+fn authority_text(a: &AuthorityRecord) -> String {
+    let list = |names: &[String]| {
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names
+                .iter()
+                .map(|n| display_text(n))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    format!(
+        "authorities handed at its latest start ({}, {}): {}; unknown: {}",
+        display_text(&a.source),
+        display_text(&a.at),
+        list(&a.names),
+        list(&a.unknown)
+    )
 }
 
 fn keeper_text(k: &Keeper) -> String {
@@ -239,14 +453,49 @@ fn edge_text(e: &Edge, member: &str) -> String {
     }
 }
 
-/// The text `koto session hierarchy` prints.
+/// The text `koto session hierarchy` prints for a session with no release
+/// record.
 pub fn render_text(j: &Judgment, settings: &RetentionSettings) -> String {
+    query_text(j, settings, None, None)
+}
+
+/// The text `koto session hierarchy` prints: the verdict, the session's own
+/// pin, its latest release record (`release`), an anchor's authority
+/// record (`authority`) and the hierarchy's other pinned members, then the
+/// keepers, members and settings.
+pub fn query_text(
+    j: &Judgment,
+    settings: &RetentionSettings,
+    release: Option<&ReleaseRecord>,
+    authority: Option<&AuthorityRecord>,
+) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "{}: {}\n",
-        sanitize(&j.session),
-        reason_text(&j.verdict)
-    ));
+    match pin_text(&j.pin) {
+        None => out.push_str(&format!(
+            "{}: {}\n",
+            sanitize(&j.session),
+            reason_text(&j.verdict)
+        )),
+        Some(pin) => out.push_str(&format!(
+            "{name}: kept by its pin; its hierarchy: {}\n{pin}\n  the pin keeps {name} only; \
+             every other member is kept or released by the hierarchy's rule\n",
+            reason_text(&j.verdict),
+            name = sanitize(&j.session),
+        )),
+    }
+    if let Some(r) = release {
+        out.push_str(&format!("{}\n", release_text(r)));
+    }
+    if let Some(a) = authority {
+        out.push_str(&format!("{}\n", authority_text(a)));
+    }
+    let others = other_pinned(j);
+    if !others.is_empty() {
+        out.push_str(&format!(
+            "pinned members, each kept by its own pin: {}\n",
+            others.join(", ")
+        ));
+    }
     if let Verdict::Keep { keepers, .. } = &j.verdict {
         if !keepers.is_empty() {
             out.push_str("keepers:\n");

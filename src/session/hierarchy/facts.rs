@@ -17,6 +17,7 @@ use crate::engine::types::{SessionKind, StateFileHeader};
 use crate::session::anchor::OBSERVED_KEY;
 use crate::session::context::Manifest;
 use crate::session::links::{LinkKind, LINKS_PREFIX, LINK_BODY_VERSION, MAX_LINK_BODY_BYTES};
+use crate::session::pin::{self, PinFact, PIN_KEY};
 use crate::session::state_file_name;
 
 /// The key `koto session import` writes into the copy it creates, naming
@@ -71,6 +72,9 @@ pub struct SessionFacts {
     pub imported_from: Option<ImportedFrom>,
     /// Whether the manifest lists an observed marker.
     pub observed: bool,
+    /// The session's pin (`koto/links/pin`). Never a link and never one of
+    /// its `problems`: a pin, readable or not, keeps this session only.
+    pub pin: PinFact,
     /// What makes this session's own component unreadable: a malformed
     /// link or `chain/parent`, a symlink or special file under `ctx/koto/`.
     pub problems: Vec<String>,
@@ -290,6 +294,10 @@ impl SessionFacts {
             .collect();
         self.observed = listed.contains(OBSERVED_KEY);
 
+        // The pin, before the link walk and kept out of it: whatever sits at
+        // its path is a fact of this session alone.
+        self.pin = pin::read_at(dir, listed.iter().any(|k| pin::is_pin_key(k)));
+
         // Every regular file under ctx/koto/, by its key.
         let mut files: BTreeMap<String, PathBuf> = BTreeMap::new();
         let koto = ctx.join("koto");
@@ -326,7 +334,7 @@ impl SessionFacts {
         // per-key lock files.
         let mut keys: BTreeSet<String> = listed
             .iter()
-            .filter(|k| k.starts_with(LINKS_PREFIX))
+            .filter(|k| k.starts_with(LINKS_PREFIX) && !pin::is_pin_key(k))
             .map(|k| k.to_string())
             .collect();
         let mut bodies: BTreeMap<String, Vec<u8>> = BTreeMap::new();
@@ -374,6 +382,10 @@ impl SessionFacts {
                 continue;
             };
             let key = format!("{prefix}/{file_name}");
+            // The pin is read on its own (`pin::read_at`), whatever its type.
+            if key == PIN_KEY {
+                continue;
+            }
             let path = entry.path();
             // The entry's own type, which never follows a symlink.
             match entry.file_type() {

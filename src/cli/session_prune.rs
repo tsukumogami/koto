@@ -13,6 +13,11 @@
 //! of retention settings and one `now`. The rules judge every local session
 //! that passes the filters, in order, and the first that applies keeps it:
 //!
+//! - p: the session holds a pin, readable or not. A pin keeps its own
+//!   session and nothing else, so the rest of its hierarchy is judged by the
+//!   rules below with the pinned session counted as an ordinary member. The
+//!   entry carries `kept_by_pin` and `pin` (or `pin_unreadable`), and the pin
+//!   is read again from disk under the session's lock just before a delete.
 //! - a: the session is alive by the engine: a koto session that runs or
 //!   can't be read, or an anchor that is open.
 //! - h: its hierarchy is kept: a live member, the retention not yet passed
@@ -57,6 +62,7 @@ use crate::session::hierarchy::{
     self, Graph, Judge, Judgment, MemberKind, RetentionSettings, Scope, Verdict as Hierarchy,
 };
 use crate::session::links::LinkKind;
+use crate::session::pin::PinFact;
 use crate::session::validate::validate_session_id;
 use crate::session::{Backend, SessionBackend, SessionError, SessionLock};
 
@@ -72,6 +78,9 @@ const EXIT_PLAN_REFUSED: i32 = 4;
 
 /// The exit code when a removal failed, or the store couldn't be judged.
 const EXIT_REMOVAL_FAILED: i32 = 3;
+
+/// Where this prune reads pins: the local store.
+const PIN_SOURCE: &str = "local";
 
 /// The kinds of entry the would-remove list holds.
 const KIND_SESSION: &str = "session";
@@ -162,9 +171,14 @@ pub struct KeptEntry {
     pub rule: char,
     pub detail: String,
     /// For rules a and h: the JSON `koto session hierarchy <name> --json`
-    /// prints for the same judgment.
+    /// prints for the same judgment, less the blocks only the query prints
+    /// (`hierarchy::query_json`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hierarchy: Option<serde_json::Value>,
+    /// For rule p: `kept_by_pin` and `pin` or `pin_unreadable`. Empty, and
+    /// absent from the JSON, for every other entry.
+    #[serde(flatten)]
+    pub pin: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The `mode` a session-mode stored plan records. Marker plans record
@@ -310,6 +324,22 @@ fn first_rule(
     base: &Path,
     backend: &Backend,
 ) -> Option<KeptEntry> {
+    // Rule p: the session's own pin, before anything else; it keeps this
+    // session only, so it never reaches the hierarchy rules of the others.
+    // A hierarchy kept besides (a live anchor, the retention not yet
+    // passed) rides along, so the entry names the pin and the keeper.
+    if let Some(detail) = hierarchy::pin_text(judgment.pin_of(name)) {
+        return Some(KeptEntry {
+            name: name.to_string(),
+            rule: 'p',
+            detail,
+            hierarchy: judgment
+                .verdict
+                .is_kept()
+                .then(|| hierarchy::to_json(judgment, settings)),
+            pin: hierarchy::pin_fields(judgment.pin_of(name), PIN_SOURCE),
+        });
+    }
     if let Hierarchy::Keep { keepers, .. } = &judgment.verdict {
         let hierarchy = Some(hierarchy::to_json(judgment, settings));
         if let Some(own) = keepers.iter().find(|k| k.name == name) {
@@ -325,6 +355,7 @@ fn first_rule(
                 rule: 'a',
                 detail,
                 hierarchy,
+                pin: Default::default(),
             });
         }
         return Some(KeptEntry {
@@ -332,6 +363,7 @@ fn first_rule(
             rule: 'h',
             detail: hierarchy::reason_text(&judgment.verdict),
             hierarchy,
+            pin: Default::default(),
         });
     }
     later_rule(name, &session.chain_parent, base, backend).map(|(rule, detail)| KeptEntry {
@@ -339,6 +371,7 @@ fn first_rule(
         rule,
         detail,
         hierarchy: None,
+        pin: Default::default(),
     })
 }
 
@@ -480,6 +513,7 @@ fn judge(inv: &Inventory, engine: &Engine<'_>, filters: &Filters, backend: &Back
                     rule: 'h',
                     detail: format!("kept: its hierarchy can't be judged: {e:#}"),
                     hierarchy: None,
+                    pin: Default::default(),
                 });
                 continue;
             }
@@ -552,6 +586,7 @@ fn judge(inv: &Inventory, engine: &Engine<'_>, filters: &Filters, backend: &Back
                         hierarchy::sanitize(&anchor)
                     ),
                     hierarchy: hierarchies.get(&e.name).cloned(),
+                    pin: Default::default(),
                 });
                 false
             }
@@ -789,10 +824,19 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
             );
         }
         for entry in stored.remove.iter().filter(|e| !now.contains(&e.key())) {
-            outcome.skipped.push(json!({
+            let mut skipped = json!({
                 "name": entry.name,
                 "reason": no_longer_removed(entry, &verdict, &graph),
-            }));
+            });
+            // A session pinned since the preview carries its pin here too.
+            if entry.kind == KIND_SESSION {
+                if let Some(k) = verdict.kept.iter().find(|k| k.name == entry.name) {
+                    for (field, value) in &k.pin {
+                        skipped[field] = value.clone();
+                    }
+                }
+            }
+            outcome.skipped.push(skipped);
         }
         // Never remove what the preview didn't name, whatever the hash says.
         verdict.remove.retain(|e| named.contains(&e.key()));
@@ -897,6 +941,19 @@ fn record_result(
         Err(Refusal::Skipped(reason)) => outcome
             .skipped
             .push(json!({"name": entry.name, "reason": reason})),
+        Err(Refusal::Pinned(pin)) => {
+            let mut skipped = json!({
+                "name": entry.name,
+                "reason": format!(
+                    "now kept by rule p: {}",
+                    hierarchy::pin_text(&pin).unwrap_or_default()
+                ),
+            });
+            for (k, v) in hierarchy::pin_fields(&pin, PIN_SOURCE) {
+                skipped[k] = v;
+            }
+            outcome.skipped.push(skipped);
+        }
         Err(Refusal::Failed(error)) => outcome
             .failed
             .push(json!({"name": entry.name, "error": error})),
@@ -935,24 +992,41 @@ fn apply_component(
         return;
     };
     let mut judge = engine.judge();
-    let reason = match judge.judge(&first.name, &Scope::Whole) {
-        Ok(j) if !j.verdict.is_kept() => None,
-        Ok(j) => Some(format!(
-            "now kept by rule h: {}",
-            hierarchy::reason_text(&j.verdict)
-        )),
-        Err(e) => Some(format!("its hierarchy can't be judged again: {e:#}")),
-    };
-    if let Some(reason) = reason {
-        for (entry, _) in &locked {
-            record_result(outcome, entry, Err(Refusal::Skipped(reason.clone())));
+    // The component gate asks the component's verdict; a pin never keeps
+    // the whole component, only its own member, which is asked below.
+    let judgment = match judge.judge(&first.name, &Scope::Whole) {
+        Ok(j) if !j.verdict.is_kept() => j,
+        Ok(j) => {
+            let reason = format!("now kept by rule h: {}", hierarchy::reason_text(&j.verdict));
+            for (entry, _) in &locked {
+                record_result(outcome, entry, Err(Refusal::Skipped(reason.clone())));
+            }
+            return;
         }
-        return;
-    }
+        Err(e) => {
+            let reason = format!("its hierarchy can't be judged again: {e:#}");
+            for (entry, _) in &locked {
+                record_result(outcome, entry, Err(Refusal::Skipped(reason.clone())));
+            }
+            return;
+        }
+    };
     let mut removed = BTreeSet::new();
     let mut cache = TemplateCache::new();
-    for (entry, _lock) in &locked {
-        let result = remove_member(backend, inv, engine.graph, entry, &removed, &mut cache);
+    for (entry, lock) in &locked {
+        let result = if judgment.keeps(&entry.name) {
+            Err(Refusal::Pinned(judgment.pin_of(&entry.name).clone()))
+        } else {
+            remove_member(
+                backend,
+                inv,
+                engine.graph,
+                entry,
+                lock,
+                &removed,
+                &mut cache,
+            )
+        };
         if result.is_ok() {
             removed.insert(entry.name.clone());
         }
@@ -981,6 +1055,9 @@ fn depth(inv: &Inventory, name: &str) -> usize {
 
 enum Refusal {
     Skipped(String),
+    /// Kept by its own pin, read since the preview: listed as skipped with
+    /// the pin's fields.
+    Pinned(PinFact),
     Failed(String),
 }
 
@@ -999,14 +1076,16 @@ fn lock(backend: &Backend, name: &str) -> std::result::Result<SessionLock, Refus
     }
 }
 
-/// Remove one member of a hierarchy just judged released, under its lock,
-/// after checking it is still the session the judgment saw and still
-/// stopped.
+/// Remove one member of a hierarchy just judged released, under its lock
+/// (`held`), after checking it is still the session the judgment saw and
+/// still stopped. The delete goes through the pin guard, the last thing
+/// before it.
 fn remove_member(
     backend: &Backend,
     inv: &Inventory,
     graph: &Graph,
     entry: &RemoveEntry,
+    held: &SessionLock,
     removed: &BTreeSet<String>,
     cache: &mut TemplateCache,
 ) -> std::result::Result<(), Refusal> {
@@ -1050,17 +1129,23 @@ fn remove_member(
             "now kept by rule {rule}: {detail}"
         )));
     }
-
-    // The remote copy goes first, so a failure leaves the local copy for a
-    // later prune to retry.
-    if let Backend::Cloud(cloud) = backend {
-        cloud
-            .delete_remote_session_checked(name)
-            .map_err(|e| Refusal::Failed(format!("the remote copy wasn't removed: {e:#}")))?;
+    // The pin guard, under the session's lock, the last thing before the
+    // delete: a pin set since the scan keeps the session.
+    let removal = crate::session::pin::remove_guarded_with(backend, name, held, || {
+        // The remote copy goes first, so a failure leaves the local copy
+        // for a later prune to retry.
+        if let Backend::Cloud(cloud) = backend {
+            cloud
+                .delete_remote_session_checked(name)
+                .map_err(|e| Refusal::Failed(format!("the remote copy wasn't removed: {e:#}")))?;
+        }
+        std::fs::remove_dir_all(base.join(name))
+            .map_err(|e| Refusal::Failed(format!("the local directory wasn't removed: {e}")))
+    })?;
+    match removal {
+        crate::session::pin::Removal::Removed => Ok(()),
+        crate::session::pin::Removal::Kept(guard) => Err(Refusal::Pinned(guard.fact())),
     }
-    std::fs::remove_dir_all(base.join(name))
-        .map_err(|e| Refusal::Failed(format!("the local directory wasn't removed: {e}")))?;
-    Ok(())
 }
 
 /// Remove a finished record, after reading it again: a record rewritten

@@ -632,6 +632,21 @@ enum Disposition {
     Release,
     /// Its hierarchy is kept, for `reason`: it moves aside.
     Keep { reason: String },
+    /// Its own pin keeps it, whatever its hierarchy: it moves aside, and the
+    /// answer carries the pin's `fields`.
+    Pinned {
+        reason: String,
+        fields: serde_json::Map<String, serde_json::Value>,
+    },
+}
+
+impl Disposition {
+    fn pinned(guard: &crate::session::pin::Guard) -> Self {
+        Disposition::Pinned {
+            reason: guard.text().unwrap_or_default(),
+            fields: guard.fields(),
+        }
+    }
 }
 
 /// Judge the finished session `name` by the retention rule, over one scan
@@ -641,6 +656,11 @@ enum Disposition {
 /// moved aside rather than removed.
 fn predecessor_disposition(backend: &Backend, name: &str) -> Disposition {
     use crate::session::hierarchy::{reason_text, Graph, Judge, RetentionSettings, Scope};
+    // A pin, read from disk now, keeps the old run before anything else.
+    let guard = crate::session::pin::guard_removal(backend, name);
+    if guard.keeps() {
+        return Disposition::pinned(&guard);
+    }
     let keep = |why: String| {
         eprintln!("warning: {why}; the finished session '{name}' is moved aside, not removed");
         Disposition::Keep { reason: why }
@@ -708,31 +728,49 @@ fn create(
     });
     // The old run is judged by the retention rule. Released, it goes as it
     // always did; kept, it and its subtree move aside (Decision 4).
-    let mut moved: Option<(super::move_aside::Moved, String)> = None;
+    let mut moved: Option<(
+        super::move_aside::Moved,
+        String,
+        serde_json::Map<String, serde_json::Value>,
+    )> = None;
+    // The pinned descendants a released old run's sweep kept.
+    let mut kept_pinned: Vec<super::next_types::KeptChild> = Vec::new();
     if replaced.is_some() {
-        match predecessor_disposition(backend, name) {
-            Disposition::Release => {
-                // A new run under this name must not inherit the old run's
-                // kept children; they go with the session they belonged to,
-                // released with it. Unlike the terminal tick, this sweeps
-                // without checking for a batch hook: the template in scope
-                // here is the new one, not the one the old session ran. If
-                // the cleanup below then fails, the replace is refused with
-                // the old session in place and its kept children already
-                // gone; they were terminal, so nothing live is lost.
-                super::workspace::sweep_terminal_descendants(backend, backend, name);
-                if let Err(e) = backend.cleanup(name) {
-                    refuse(
-                        entry,
-                        Refusal::new(
-                            Some("replace_failed"),
-                            format!("could not remove finished session '{name}': {e}"),
-                            1,
-                        ),
-                    );
+        let mut disposition = predecessor_disposition(backend, name);
+        if let Disposition::Release = disposition {
+            // A new run under this name must not inherit the old run's
+            // kept children; they go with the session they belonged to,
+            // released with it, except a child its own pin keeps. Unlike
+            // the terminal tick, this sweeps without checking for a batch
+            // hook: the template in scope here is the new one, not the one
+            // the old session ran. If the removal below then fails, the
+            // replace is refused with the old session in place and its kept
+            // children already gone; they were terminal, so nothing live is
+            // lost. A pin set on the old run since it was judged keeps it,
+            // and it moves aside instead.
+            kept_pinned = super::workspace::sweep_terminal_descendants(backend, backend, name);
+            match crate::session::pin::remove_guarded(backend, name) {
+                Ok(crate::session::pin::Removal::Removed) => {}
+                Ok(crate::session::pin::Removal::Kept(guard)) => {
+                    disposition = Disposition::pinned(&guard);
                 }
+                Err(e) => refuse(
+                    entry,
+                    Refusal::new(
+                        Some("replace_failed"),
+                        format!("could not remove finished session '{name}': {e}"),
+                        1,
+                    ),
+                ),
             }
-            Disposition::Keep { reason } => match super::move_aside::move_aside(backend, name) {
+        }
+        let (reason, kept_by, fields) = match disposition {
+            Disposition::Release => (None, "", Default::default()),
+            Disposition::Keep { reason } => (Some(reason), "by its hierarchy", Default::default()),
+            Disposition::Pinned { reason, fields } => (Some(reason), "by its pin", fields),
+        };
+        if let Some(reason) = reason {
+            match super::move_aside::move_aside(backend, name) {
                 Ok(m) => {
                     for (old, why) in &m.undeleted {
                         eprintln!(
@@ -740,14 +778,14 @@ fn create(
                              objects: {why}"
                         );
                     }
-                    moved = Some((m, reason));
+                    moved = Some((m, reason, fields));
                 }
                 Err(super::move_aside::MoveRefusal::HeldLive { live }) => refuse(
                     entry,
                     Refusal::new(
                         Some("replace_held_live"),
                         format!(
-                            "session '{name}' is kept by its hierarchy ({reason}), so it would \
+                            "session '{name}' is kept {kept_by} ({reason}), so it would \
                              move aside, but its subtree holds live work that can't move: {}; \
                              wait for it to finish, or cancel it, then replace",
                             live.join(", ")
@@ -776,7 +814,7 @@ fn create(
                     }
                     refuse(entry, r)
                 }
-            },
+            }
         }
     }
 
@@ -854,9 +892,13 @@ fn create(
         out["replaced_state"] = terminal.unwrap_or(old_state).into();
         out["replaced_result"] = serde_json::to_value(result)?;
     }
-    if let Some((m, reason)) = moved {
+    if let Some((m, reason, pin)) = moved {
         out["moved_to"] = m.moved_to.into();
         out["moved_reason"] = reason.into();
+        // The moved run's pin, when its pin is what kept it.
+        for (k, v) in pin {
+            out[k] = v;
+        }
         out["moved"] = m
             .renamed
             .iter()
@@ -871,6 +913,9 @@ fn create(
                 .collect::<Vec<_>>()
                 .into();
         }
+    }
+    if !kept_pinned.is_empty() {
+        out["kept_children"] = serde_json::to_value(&kept_pinned)?;
     }
     if let Some((target, written)) = leg {
         out["leg"] = leg_json(target, written);

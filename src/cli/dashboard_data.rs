@@ -1076,6 +1076,7 @@ mod tests {
             observed_key: Some("k1".to_string()),
             workspace: None,
             transcript_path: None,
+            authority: None,
         };
         anchor::open(&backend, &req).unwrap();
         anchor::close(&backend, "k1", "h1").unwrap();
