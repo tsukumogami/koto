@@ -17,6 +17,9 @@
 //! naming either script, so turning one on by those names means changing this
 //! test too. It matches names, not behaviour: a renamed copy would pass.
 
+#[path = "support/test_home.rs"]
+mod test_home;
+
 use serde_json::Value;
 use std::path::Path;
 

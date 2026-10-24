@@ -4,6 +4,9 @@
 //! so a developer's exported `KOTO_DECIDER` (and key) can't make a test
 //! consult a real decider. If this test fails, that isolation is gone.
 
+#[path = "support/test_home.rs"]
+mod test_home;
+
 #[test]
 fn koto_decider_is_forced_off_for_tests() {
     let got = std::env::var("KOTO_DECIDER");
