@@ -6,6 +6,9 @@
 //! full, say which commands older releases don't honour pins in, and list pin
 //! and unpin among koto's cross-session writers (koto#445).
 
+#[path = "support/test_home.rs"]
+mod test_home;
+
 use std::path::{Path, PathBuf};
 
 fn root() -> PathBuf {
