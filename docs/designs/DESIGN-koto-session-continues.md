@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Proposed
+status: Accepted
 problem: |
   koto's retention engine joins sessions into undirected hierarchies and
   judges each one alone, so a session that carries on another's work has no
@@ -37,7 +37,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context and Problem Statement
 
