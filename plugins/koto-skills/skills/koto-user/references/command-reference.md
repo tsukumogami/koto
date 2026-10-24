@@ -772,7 +772,7 @@ The removal goes ahead even when the retention rule would keep the session. `liv
 ```
 koto session prune [--execution-dir <dir>] [--older-than <age>] [--all]
 koto session prune --apply --plan <token>
-koto session prune --apply (--execution-dir <dir> | --older-than <age> | --all)
+koto session prune --apply (--execution-dir <dir> | --older-than <age> | --all) [--confirm-short-retention]
 koto session prune --migrated-from <workspace> [--source-retired] [--apply [--plan <token>]]
 ```
 
@@ -784,6 +784,7 @@ A stale observed anchor (past `retention.stale_after` since its last activity) k
 
 - `--apply --plan <token>` judges the store again with the filters the preview ran with (don't pass them again). If it would now remove anything the preview didn't list, it removes nothing and exits 4 with `prune_plan_stale` and `added`/`dropped` lists; what it only keeps more of (a session that gained a live member since, say) is `skipped` with the reason, exit 0. A token with no stored plan exits 4 with `prune_plan_unknown`.
 - `--apply` without `--plan` removes the set as it stands now, and needs `--execution-dir`, `--older-than` or `--all`.
+- Under the cloud backend, `--apply` without `--plan` refuses when `retention.keep` or `retention.idle_period` is under an hour and the selection has no age bound of an hour or more: exit 2 with `prune_short_retention`, nothing removed locally or in the bucket, and the error names the short settings, `backend`, `bucket`, `store` and `would_remove`. Preview and apply the token instead, or pass `--confirm-short-retention`. `koto workspace prune --yes` refuses the same way. A scratch `HOME` doesn't move a command off the cloud backend when `KOTO_SESSION_BACKEND` sets it.
 - Apply prints `{"mode": "apply", "removed": [...], "skipped": [...], "kept": [...], "failed": [...], "stale_anchors": [...]}`. Each hierarchy is locked and judged again just before its members go; a session another koto process holds, one the rule now keeps, or one that changed since it was judged is `skipped` (exit 0). A removal that failed is listed under `failed` and the command exits 3.
 - A malformed token or age, `--plan` without `--apply` or with a filter, or a bare `--apply` exits 2 with `invalid_arguments`; a malformed retention setting exits 2 with `invalid_retention_setting`, naming it; a sessions directory that can't be read exits 3 with `prune_scan_failed`. None of these removes anything.
 
