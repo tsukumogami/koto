@@ -81,6 +81,12 @@ fn ok(run: &Run, what: &str) {
     assert!(run.ok(), "{}: {}", what, run.describe());
 }
 
+/// A read through `--workspace` warns about nothing: a write it tried and
+/// the read-only backend refused would show here.
+fn quiet(run: &Run, what: &str) {
+    assert!(run.stderr.is_empty(), "{} warned: {}", what, run.describe());
+}
+
 /// Every object in the bucket, with its bytes.
 fn objects(s3: &FakeS3) -> BTreeMap<String, Vec<u8>> {
     s3.keys()
@@ -198,6 +204,7 @@ fn reads_a_finished_session_from_another_host_in_place() {
     for workspace in [prefix.clone(), f.a.ws_str()] {
         let status = read(&f.b, &workspace, &["status", NAME]);
         ok(&status, "status");
+        quiet(&status, "status");
         assert_eq!(status.json["name"], NAME);
         assert_eq!(status.json["current_state"], "done");
         assert_eq!(status.json["is_terminal"], true);
@@ -209,14 +216,17 @@ fn reads_a_finished_session_from_another_host_in_place() {
 
         let get = read(&f.b, &workspace, &["context", "get", NAME, "notes.md"]);
         ok(&get, "context get");
+        quiet(&get, "context get");
         assert_eq!(get.stdout.as_bytes(), NOTES);
 
         let list = read(&f.b, &workspace, &["context", "list", NAME]);
         ok(&list, "context list");
+        quiet(&list, "context list");
         assert_eq!(list.json, serde_json::json!(["notes.md"]));
 
         let exists = read(&f.b, &workspace, &["context", "exists", NAME, "notes.md"]);
         assert_eq!(exists.code, Some(0), "{}", exists.describe());
+        quiet(&exists, "context exists");
         let absent = read(&f.b, &workspace, &["context", "exists", NAME, "absent.md"]);
         assert_eq!(absent.code, Some(1), "{}", absent.describe());
     }

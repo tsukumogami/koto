@@ -30,7 +30,8 @@ pub const READ_ONLY_CODE: &str = "workspace_read_only";
 ///
 /// This is the whole guard, and it fails closed: a verb added to koto is
 /// refused until it is added here. `tests` walks every verb of the CLI to
-/// hold it to that.
+/// hold it to that. A listing of the workspace's sessions (koto#343) joins
+/// here when it exists, over [`WorkspaceReader::sessions`].
 pub(super) fn read_verb(command: &Command) -> Option<(&'static str, &str)> {
     match command {
         Command::Status { name } => Some(("status", name)),
@@ -93,11 +94,17 @@ pub(super) fn run(workspace: &str, command: Command) -> Result<()> {
     let reader = WorkspaceReader::open(&config.session.cloud, id)?;
     // The scratch directory goes however the command exits: on return when
     // `_scratch` drops, and on `exit_with_error_code`'s way out through the
-    // exit flush, which no other verb sets under `--workspace`.
+    // exit flush. Only `koto next` sets that flush otherwise, and it never
+    // gets here; a read verb that set it first would leave scratch behind,
+    // so that is refused loudly rather than ignored.
     let scratch_path = reader.scratch_dir().to_path_buf();
-    let _ = EXIT_FLUSH.set(Box::new(move || {
+    let set = EXIT_FLUSH.set(Box::new(move || {
         let _ = std::fs::remove_dir_all(&scratch_path);
     }));
+    assert!(
+        set.is_ok(),
+        "the exit flush was already set, so a --workspace read couldn't remove its scratch"
+    );
     let located = reader.locate(&name).and_then(|()| {
         if verb == "status" {
             reader.fetch_template(&name)
