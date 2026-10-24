@@ -551,15 +551,15 @@ pub enum SessionCommand {
         #[arg(long)]
         state: bool,
 
-        /// List only the pinned sessions in the local store, sorted by name,
-        /// each with its pin (or `pin_unreadable`) and whether it is running
-        /// or finished; prints text unless `--json` is given. Hidden until
-        /// every removal honours a pin.
-        #[arg(long, hide = true, conflicts_with_all = ["execution_dir", "state"])]
+        /// List only the pinned sessions, sorted by name, each with its pin
+        /// (or `pin_unreadable`), whether it is running or finished, and
+        /// where the pin was read; under the cloud backend, pins in the
+        /// bucket too. Prints text unless `--json` is given.
+        #[arg(long, conflicts_with_all = ["execution_dir", "state"])]
         pinned: bool,
 
         /// With `--pinned`, print JSON instead of text.
-        #[arg(long, hide = true, requires = "pinned")]
+        #[arg(long, requires = "pinned")]
         json: bool,
     },
     /// Remove a session directory (idempotent).
@@ -690,8 +690,9 @@ pub enum SessionCommand {
     /// with no session, an anchor or close record, and a session whose pin
     /// can't be read.
     ///
-    /// Hidden until every removal honours a pin.
-    #[command(hide = true)]
+    /// Under the cloud backend the pin is written to the bucket as its own
+    /// object, and only that; a write the bucket doesn't confirm exits 3
+    /// and leaves no pin anywhere.
     Pin {
         /// The session to pin
         name: String,
@@ -710,8 +711,9 @@ pub enum SessionCommand {
     /// anchor needs the `release-pin` authority its agent session was
     /// handed at its start, and is refused with exit 2 otherwise.
     ///
-    /// Hidden until every removal honours a pin.
-    #[command(hide = true)]
+    /// Under the cloud backend the release record and the pin's removal are
+    /// the bucket's objects, each checked; a failure exits 3 and leaves the
+    /// pin in force.
     Unpin {
         /// The session to release
         name: String,

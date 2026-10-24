@@ -346,7 +346,7 @@ impl CloudBackend {
     /// standing in for the copy it checked. Those shortcuts are for reads
     /// (koto#439): a write on a borrowed answer could reach a session
     /// imported elsewhere in the meantime.
-    fn check_not_migrated_to_write(&self, id: &str) -> anyhow::Result<()> {
+    pub(crate) fn check_not_migrated_to_write(&self, id: &str) -> anyhow::Result<()> {
         self.check_migration(id, true)
     }
 

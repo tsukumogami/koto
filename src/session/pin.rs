@@ -419,7 +419,13 @@ fn check_session(backend: &Backend, name: &str) -> Result<(), PinError> {
             format!("session '{name}' does not exist"),
         ));
     }
-    if let Err(e) = backend.check_not_migrated(name) {
+    // Pin and unpin write, so the migration check is a write's: never an
+    // answer another process's listing lent this one.
+    let migrated = match backend {
+        Backend::Local(_) => Ok(()),
+        Backend::Cloud(cloud) => cloud.check_not_migrated_to_write(name),
+    };
+    if let Err(e) = migrated {
         return Err(PinError::refusal(
             "not_pinnable",
             format!("{e:#}; its moved copy holds what it held"),

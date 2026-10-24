@@ -3,7 +3,9 @@
 //! of 10 sessions at most 4 deep, whose anchors carry large logs of read
 //! records, `koto session hierarchy` for one session answers within one
 //! second, and a prune-preview-shaped pass (one scan, then a judgment of
-//! every component) finishes within ten.
+//! every component) finishes within ten. One session in each hierarchy is
+//! pinned, 200 pins in all, which hold to the same bounds
+//! (DESIGN-session-pin.md, R28).
 //!
 //! The bounds hold for a release build, which CI runs in its own job
 //! (`cargo test --release --test retention_cost`). A debug build runs the
@@ -180,6 +182,20 @@ fn build() -> Fixture {
             link(&child, "dispatched-by", &root);
             let grandchild = format!("s{h}-{}", c + 3);
             session(&grandchild, Some(&child), false);
+            // One pinned session per hierarchy: 200 pins on the full store
+            // (PRD-session-pin.md, R28).
+            if c == 1 {
+                let pin = json!({"v": 1, "id": format!("{h:032x}"), "reason": "kept for the cost test",
+                                 "set_by": null, "set_at": iso(long_ago)});
+                backend
+                    .add_with_writer(
+                        &grandchild,
+                        "koto/links/pin",
+                        pin.to_string().as_bytes(),
+                        "koto",
+                    )
+                    .unwrap();
+            }
             if c <= 2 {
                 let great = format!("s{h}-{}", c + 6);
                 let running = h % 2 == 1 && c == 1;
@@ -239,15 +255,21 @@ fn the_engine_answers_within_its_bounds_on_a_large_store() {
     let mut judge = Judge::new(&graph, settings(), SystemTime::now());
     let names: Vec<String> = graph.names().map(str::to_string).collect();
     let mut released = 0;
+    let mut pinned = 0;
     for name in &names {
         let j = judge.judge(name, &Scope::Whole).unwrap();
         if !j.verdict.is_kept() {
             released += 1;
         }
+        if j.pin.is_pinned() {
+            pinned += 1;
+        }
     }
     let full = started.elapsed();
     assert_eq!(names.len(), f.hierarchies * 10);
+    // A pin keeps its own session and changes no hierarchy's verdict.
     assert_eq!(released, f.hierarchies / 2 * 10);
+    assert_eq!(pinned, f.hierarchies);
 
     eprintln!(
         "retention cost: {} sessions; query {:?}; scan {:?}; full scan and judgment {:?}",

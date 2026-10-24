@@ -107,8 +107,13 @@ impl Hosts {
     /// retention, no anchor or agent session, and the cloud backend on the
     /// stand-in when `cloud`.
     fn cmd_on(&self, host: u8, cloud: bool) -> assert_cmd::Command {
+        self.cmd_at(host, cloud, &self.work)
+    }
+
+    /// [`Hosts::cmd_on`] in workspace directory `dir`.
+    fn cmd_at(&self, host: u8, cloud: bool, dir: &std::path::Path) -> assert_cmd::Command {
         let mut cmd = koto_command::koto();
-        cmd.current_dir(&self.work)
+        cmd.current_dir(dir)
             .env("HOME", self.home(host))
             .env("XDG_CACHE_HOME", self.root.join(format!("cache{host}")))
             .env_remove("XDG_CONFIG_HOME")
@@ -851,4 +856,89 @@ fn a_prune_asks_the_bucket_once_per_session_it_would_delete() {
     assert!(pin_listings <= 20, "{pin_listings} pin listings");
     assert!(pin_reads <= 5, "{pin_reads} pin reads");
     assert_eq!(release_reads, 0);
+}
+
+/// The bucket prefix of the workspace at `dir`.
+fn prefix_of(dir: &std::path::Path) -> String {
+    let digest = Sha256::digest(dir.to_string_lossy().as_bytes());
+    hex::encode(digest)[..16].to_string()
+}
+
+#[test]
+fn an_import_carries_the_pin_and_its_release_record_and_leaves_the_source_inert() {
+    let h = Hosts::new();
+    let dest = h.root.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    // P is pinned with a release record from an earlier pin; Q's pin is
+    // unreadable.
+    h.init(1, "P", &[]);
+    h.done(1, "P");
+    h.pin(1, "P");
+    h.ok(1, &["session", "unpin", "P"]);
+    h.pin(1, "P");
+    let pin = h.s3.object(&h.key("P", PIN)).unwrap();
+    let release = h.s3.object(&h.key("P", RELEASE)).unwrap();
+    h.init(1, "Q", &[]);
+    h.done(1, "Q");
+    h.s3.put(&h.key("Q", PIN), b"garbage");
+
+    let in_dest = |host: u8, args: &[&str]| h.cmd_at(host, true, &dest).args(args).output().unwrap();
+    let ok_in_dest = |args: &[&str]| {
+        let out = in_dest(2, args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        printed_json(&out.stdout)
+    };
+    ok_in_dest(&["template", "compile", h.template.to_str().unwrap()]);
+    let from = h.work.to_str().unwrap().to_string();
+    ok_in_dest(&["session", "import", "P", "--from", &from]);
+    ok_in_dest(&["session", "import", "Q", "--from", &from]);
+
+    let moved = |name: &str, rest: &str| format!("{}/{}/{}", prefix_of(&dest), name, rest);
+    assert_eq!(h.s3.object(&moved("P", PIN)), Some(pin));
+    assert_eq!(h.s3.object(&moved("P", RELEASE)), Some(release));
+    assert_eq!(
+        h.s3.object(&moved("Q", PIN)).as_deref(),
+        Some(&b"garbage"[..])
+    );
+    let manifest: Value =
+        serde_json::from_slice(&h.s3.object(&moved("P", "ctx/manifest.json")).unwrap()).unwrap();
+    assert!(manifest["keys"].get("koto/links/pin").is_none(), "{manifest:#}");
+
+    // The moved copies are kept by their pins, read from the bucket.
+    let out = in_dest(3, &["session", "cleanup", "P"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_bucket_pin(&printed_json(&out.stdout)["error"]);
+    let out = in_dest(3, &["session", "cleanup", "Q"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        printed_json(&out.stdout)["error"]["pin_unreadable"],
+        "unparseable"
+    );
+
+    // The migrated source's pin is inert: unpin refuses it and writes
+    // nothing, and a prune of migrated sources removes it while the moved
+    // copy stays pinned.
+    h.s3.clear_requests();
+    let out = h.fails(1, &["session", "unpin", "P"], 2);
+    assert_eq!(out["error"]["code"], "not_pinnable", "{out}");
+    assert!(h.writes().is_empty(), "{:?}", h.writes());
+    let preview = ok_in_dest(&["session", "prune", "--migrated-from", &from, "--source-retired"]);
+    let token = preview["plan"].as_str().unwrap().to_string();
+    let applied = ok_in_dest(&[
+        "session",
+        "prune",
+        "--migrated-from",
+        &from,
+        "--apply",
+        "--plan",
+        &token,
+    ]);
+    assert!(names(&applied["removed"]).contains(&"P".to_string()), "{applied:#}");
+    assert!(h.s3.object(&h.key("P", PIN)).is_none());
+    assert!(h.s3.object(&moved("P", PIN)).is_some());
 }
