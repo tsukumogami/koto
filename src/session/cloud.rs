@@ -184,7 +184,10 @@ pub struct CloudBackend {
     /// session id: `Some` when the session carries a migration marker.
     /// A command reads a session's state many times; the marker costs one
     /// request per session per process.
-    migration_checks: Mutex<HashMap<String, Option<SessionMigrated>>>,
+    /// Each answer is kept with whether a listing this process made (or a
+    /// tick check its local copy still matches) confirmed it, rather than a
+    /// read borrowing it (koto#439); a write asks again for a borrowed one.
+    migration_checks: Mutex<HashMap<String, (Option<SessionMigrated>, bool)>>,
     /// Per-process answers of the local half of the migration check
     /// ([`CloudBackend::local_guard`]): `Some` when the local copy at the
     /// name is a session imported from this very workspace's copy, which a
@@ -199,13 +202,26 @@ pub struct CloudBackend {
     /// commands write to, and a second pull would only fetch what it pushed.
     /// Boxed for the same reason as `local_migration_checks`.
     pulled: Box<Mutex<HashSet<String>>>,
-    /// Per-process answers of [`CloudBackend::probe`], by session id: one
-    /// listing of the session's prefix, which the migration check, the
-    /// state pull and the manifest fetch all read
-    /// (`crate::session::sync_stamp`). `None` when the listing failed: the
-    /// process doesn't ask again. Boxed for the same reason as
-    /// `local_migration_checks`.
-    probes: Box<Mutex<HashMap<String, Option<sync_stamp::Probe>>>>,
+    /// Per-process answers of [`CloudBackend::probe`], and the check window.
+    /// Boxed for the same reason as `local_migration_checks`.
+    probes: Box<Probes>,
+}
+
+/// One probe answer: the listing, and whether it was another koto
+/// process's, reused for the check window, which only a read takes.
+type ProbeAnswer = (sync_stamp::Probe, bool);
+
+/// This process's listings of sessions (`crate::session::sync_stamp`).
+struct Probes {
+    /// By session id: one listing of the session's prefix, which the
+    /// migration check, the state pull and the manifest fetch all read.
+    /// `None` when the listing failed: the process doesn't ask again.
+    answers: Mutex<HashMap<String, Option<ProbeAnswer>>>,
+    /// How long a listing another koto process on this host made of a
+    /// session stands in for a new one (`session.cloud.check_window_secs`,
+    /// koto#439). Zero, which [`CloudBackend::with_parts`] leaves it at,
+    /// lists in every process as before.
+    window: std::time::Duration,
 }
 
 impl CloudBackend {
@@ -218,7 +234,9 @@ impl CloudBackend {
         let local = LocalBackend::new()?;
         let prefix = repo_id(working_dir)?;
         let bucket = create_bucket(cloud_config)?;
-        Ok(Self::with_parts(local, bucket, prefix))
+        let mut backend = Self::with_parts(local, bucket, prefix);
+        backend.probes.window = std::time::Duration::from_secs(cloud_config.check_window_secs());
+        Ok(backend)
     }
 
     /// Construct a `CloudBackend` with an explicit `LocalBackend` and bucket.
@@ -238,7 +256,10 @@ impl CloudBackend {
             migration_checks: Mutex::new(HashMap::new()),
             local_migration_checks: Box::new(Mutex::new(HashMap::new())),
             pulled: Box::new(Mutex::new(HashSet::new())),
-            probes: Box::new(Mutex::new(HashMap::new())),
+            probes: Box::new(Probes {
+                answers: Mutex::new(HashMap::new()),
+                window: std::time::Duration::ZERO,
+            }),
         }
     }
 
@@ -302,21 +323,67 @@ impl CloudBackend {
     /// presence is the signal, and a marker written by a newer koto must
     /// not fork the session on an older one.
     pub fn check_not_migrated(&self, id: &str) -> anyhow::Result<()> {
+        self.check_migration(id, false)
+    }
+
+    /// [`CloudBackend::check_not_migrated`] for a write. Its answer comes
+    /// from a listing this process made, or from a tick that checked `id`
+    /// and whose local copy is still what it checked, as every write's has;
+    /// never from a check another process shared or from the tick's batch
+    /// standing in for the copy it checked. Those shortcuts are for reads
+    /// (koto#439): a write on a borrowed answer could reach a session
+    /// imported elsewhere in the meantime.
+    fn check_not_migrated_to_write(&self, id: &str) -> anyhow::Result<()> {
+        self.check_migration(id, true)
+    }
+
+    /// Before a push of `id`'s state file on its own: when this process's
+    /// migration answer for `id` was borrowed by a read, confirm it with a
+    /// listing first. A process holding no answer, or a confirmed one, is
+    /// unchanged by this.
+    fn confirm_borrowed_migration_check(&self, id: &str) -> anyhow::Result<()> {
+        let borrowed = self
+            .migration_checks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .is_some_and(|(_, confirmed)| !confirmed);
+        if borrowed {
+            self.check_not_migrated_to_write(id)?;
+        }
+        Ok(())
+    }
+
+    /// The migration check behind [`CloudBackend::check_not_migrated`] and
+    /// [`CloudBackend::check_not_migrated_to_write`]. Each process keeps its
+    /// answer per session with whether a listing of its own confirmed it; a
+    /// write asks again when the answer it finds was borrowed.
+    fn check_migration(&self, id: &str, write: bool) -> anyhow::Result<()> {
         self.local_guard(id)?;
         let mut checks = self
             .migration_checks
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let answer = match checks.get(id) {
-            Some(answer) => answer.clone(),
+        let cached = checks
+            .get(id)
+            .filter(|(_, confirmed)| *confirmed || !write)
+            .map(|(answer, _)| answer.clone());
+        let answer = match cached {
+            Some(answer) => answer,
             None => {
                 // A tick that already checked `id` saw no marker; otherwise
                 // the session's probe says, in the listing the state pull
                 // and the manifest read take their ETags from.
-                let checked = if self.tick_fresh(id, self.stamp(id).as_ref()) {
-                    Ok(None)
+                let stamp = self.stamp(id);
+                let (checked, confirmed) = if self.tick_fresh(id, stamp.as_ref(), false) {
+                    (Ok(None), true)
+                } else if !write && self.tick_fresh(id, stamp.as_ref(), true) {
+                    (Ok(None), false)
                 } else {
-                    self.probed_migration_marker(id)
+                    match self.probe_for(id, !write) {
+                        Ok((probe, shared)) => (self.marker_in(id, &probe), !shared),
+                        Err(e) => (Err(e), true),
+                    }
                 };
                 let answer = match checked {
                     Ok(answer) => answer,
@@ -328,7 +395,7 @@ impl CloudBackend {
                         None
                     }
                 };
-                checks.insert(id.to_string(), answer.clone());
+                checks.insert(id.to_string(), (answer.clone(), confirmed));
                 answer
             }
         };
@@ -340,8 +407,12 @@ impl CloudBackend {
 
     /// [`CloudBackend::read_migration_marker_of`] through the session's
     /// probe: the marker's body is fetched only when the listing shows it.
-    fn probed_migration_marker(&self, id: &str) -> anyhow::Result<Option<SessionMigrated>> {
-        if !self.probe(id)?.marker {
+    fn marker_in(
+        &self,
+        id: &str,
+        probe: &sync_stamp::Probe,
+    ) -> anyhow::Result<Option<SessionMigrated>> {
+        if !probe.marker {
             return Ok(None);
         }
         Ok(match self.fetch_object(&self.marker_key(id)) {
@@ -460,21 +531,52 @@ impl CloudBackend {
     /// request: an unreachable bucket costs a process one failed listing,
     /// not one per read.
     fn probe(&self, id: &str) -> anyhow::Result<sync_stamp::Probe> {
+        self.probe_for(id, true).map(|(probe, _)| probe)
+    }
+
+    /// [`CloudBackend::probe`], with whether the answer was another koto
+    /// process's listing, reused for the check window (koto#439). Only a
+    /// read takes a shared answer (`allow_shared`); a write's probe is a
+    /// listing this process made, as it always was.
+    fn probe_for(&self, id: &str, allow_shared: bool) -> anyhow::Result<ProbeAnswer> {
         if let Some(answer) = self
             .probes
+            .answers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
+            .filter(|answer| allow_shared || !answer.as_ref().is_some_and(|(_, shared)| *shared))
         {
             return answer.clone().ok_or_else(|| {
                 anyhow::anyhow!("listing {} failed earlier", self.session_prefix(id))
             });
+        }
+        // Another koto process on this host listed the session within the
+        // check window: its answer stands in for a new listing (koto#439).
+        let dir = self.local.session_dir(id);
+        let now = std::time::SystemTime::now();
+        if allow_shared {
+            if let Some(shared) = sync_stamp::load_check(
+                &dir,
+                &self.bucket.url(),
+                &self.state_key(id),
+                self.probes.window,
+                now,
+            ) {
+                self.probes
+                    .answers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id.to_string(), Some((shared.clone(), true)));
+                return Ok((shared, true));
+            }
         }
         let prefix = self.session_prefix(id);
         let results = match self.bucket.list(prefix.clone(), None) {
             Ok(results) => results,
             Err(e) => {
                 self.probes
+                    .answers
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(id.to_string(), None);
@@ -504,11 +606,15 @@ impl CloudBackend {
                 probe.manifest_etag = etag();
             }
         }
+        if !self.probes.window.is_zero() {
+            sync_stamp::save_check(&dir, &self.bucket.url(), &self.state_key(id), &probe, now);
+        }
         self.probes
+            .answers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id.to_string(), Some(probe.clone()));
-        Ok(probe)
+            .insert(id.to_string(), Some((probe.clone(), false)));
+        Ok((probe, false))
     }
 
     /// Start a tick of `id`: write the id its commands read as the current
@@ -522,13 +628,16 @@ impl CloudBackend {
         }
     }
 
-    /// Drop this process's probe of `id`, after a write that changed what
-    /// the bucket holds for it.
+    /// Drop this process's probe of `id`, and the check this host's other
+    /// processes would reuse, after a write that changed what the bucket
+    /// holds for it.
     fn forget_probe(&self, id: &str) {
         self.probes
+            .answers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
+        sync_stamp::forget_check(&self.local.session_dir(id));
     }
 
     /// After this host pushed `id`'s manifest: drop the probe, and forget the
@@ -559,7 +668,14 @@ impl CloudBackend {
     /// Whether the current tick already checked `id` against the bucket and
     /// its local state file is still the bytes it checked: the tick is the
     /// freshness window, so no request is made.
-    fn tick_fresh(&self, id: &str, stamp: Option<&Stamp>) -> bool {
+    ///
+    /// With `batch_counts`, which only a read passes, a command of `id`'s own
+    /// tick whose batch is open is fresh too: the tick's own writes, kept in
+    /// that batch, are what changed the local copy, not the bucket, and the
+    /// tick checks the bucket again before it pushes them (koto#439). A
+    /// write doesn't pass it, so each write still checks for a migration
+    /// marker that landed during the tick.
+    fn tick_fresh(&self, id: &str, stamp: Option<&Stamp>, batch_counts: bool) -> bool {
         let Some(stamp) = stamp else {
             return false;
         };
@@ -568,6 +684,9 @@ impl CloudBackend {
         };
         if stamp.verified_tick.as_deref() != Some(tick.as_str()) {
             return false;
+        }
+        if batch_counts && self.defers(id) && self.journal(id).is_open() {
+            return true;
         }
         let path = self.local.session_dir(id).join(state_file_name(id));
         std::fs::read(path).is_ok_and(|bytes| stamp.matches(&bytes))
@@ -638,7 +757,7 @@ impl CloudBackend {
             manifest.drop_host_local();
             Some(manifest)
         };
-        if self.tick_fresh(id, stamp.as_ref()) {
+        if self.tick_fresh(id, stamp.as_ref(), true) {
             if let Some(etag) = stamp.as_ref().and_then(|s| s.manifest_etag.clone()) {
                 if let Some(manifest) = cached(&etag) {
                     self.manifest_cache.set(id, manifest);
@@ -783,7 +902,9 @@ impl CloudBackend {
             return self.flush_batch(id);
         }
         // No batch is open, so this push goes up on its own; a marker a
-        // stopped opener left would still make imports refuse.
+        // stopped opener left would still make imports refuse. A migration
+        // answer this process only borrowed for a read is confirmed first.
+        self.confirm_borrowed_migration_check(id)?;
         self.try_clear_unopened_batch(id);
         let state_path = self.local.session_dir(id).join(state_file_name(id));
         if !state_path.exists() {
@@ -906,7 +1027,7 @@ impl CloudBackend {
         // what it pulled or pushed (`crate::session::sync_stamp`). Inside a
         // tick that already checked `id`, the bucket isn't asked at all.
         let stamp = self.stamp(id);
-        if self.tick_fresh(id, stamp.as_ref()) {
+        if self.tick_fresh(id, stamp.as_ref(), true) {
             return Ok(());
         }
         let remote_etag = match self.probe(id) {
@@ -1920,7 +2041,7 @@ impl CloudBackend {
     /// on a failed state upload, so this fails unless the bucket ends up
     /// with the local state file byte for byte.
     pub fn adopt_local_copy(&self, id: &str) -> anyhow::Result<()> {
-        self.check_not_migrated(id)?;
+        self.check_not_migrated_to_write(id)?;
         self.resolve_conflict(id, "local")?;
         let local = self
             .read_local_state_bytes(id)
@@ -2708,7 +2829,7 @@ impl CloudBackend {
         if let Some(writer) = writer {
             crate::session::links::check_writer_key(key, writer)?;
         }
-        self.check_not_migrated(session)?;
+        self.check_not_migrated_to_write(session)?;
         let write = || match writer {
             Some(w) => self.local.add_with_writer(session, key, content, w),
             None => self.local.add(session, key, content),
@@ -2875,7 +2996,7 @@ impl ContextStore for CloudBackend {
     }
 
     fn remove(&self, session: &str, key: &str) -> anyhow::Result<()> {
-        self.check_not_migrated(session)?;
+        self.check_not_migrated_to_write(session)?;
         if is_host_local_key(key) {
             return self.local.remove(session, key);
         }
@@ -5654,6 +5775,7 @@ mod tests {
             secret_key: Some("s".to_string()),
             path_style: Some(true),
             marker_retain_days: None,
+            check_window_secs: None,
         };
         let bucket = create_bucket(&config).unwrap();
         assert!(bucket.is_path_style());

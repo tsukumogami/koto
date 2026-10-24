@@ -1,7 +1,7 @@
 //! What this host last knew of a session's copy in the bucket, so a cloud
 //! read whose local copy is current transfers nothing (koto#428).
 //!
-//! Three host-local files in a session's local directory, none of them ever
+//! Four host-local files in a session's local directory, none of them ever
 //! uploaded:
 //!
 //! - `cloud-sync.json` ([`Stamp`]): the bucket's ETag for the state file and
@@ -14,6 +14,10 @@
 //!   running it, written when the tick starts. A command the tick runs
 //!   reads it through the tick marker it inherits, so every command of one
 //!   tick sees the same id without a new variable in its environment.
+//! - `cloud-check.json`: the last listing this host made of the session,
+//!   with when it was made, which every koto process on the host reuses for
+//!   `session.cloud.check_window_secs` (koto#439). A push from this host
+//!   removes it.
 //!
 //! A read probes the bucket once per session per process: one listing of
 //! the session's prefix says whether the migration marker is there and
@@ -24,7 +28,10 @@
 //! since the stamp, or the local file is no longer the stamped bytes; the
 //! manifest only when its ETag moved. And a session the current tick has
 //! already checked is not probed again in that tick: the tick is the
-//! freshness window a command can rely on.
+//! freshness window a command can rely on, and that holds for the tick's own
+//! session too while the only change to its local copy is the tick's open
+//! batch. Outside a tick, a listing another process on this host made within
+//! the check window stands in for a new one.
 
 use std::path::Path;
 
@@ -39,6 +46,9 @@ pub const MANIFEST_FILE: &str = "cloud-manifest.json";
 
 /// File name of the running tick's id, in the ticked session's directory.
 pub const TICK_FILE: &str = "cloud-tick.id";
+
+/// File name of the last listing this host made of a session.
+pub const CHECK_FILE: &str = "cloud-check.json";
 
 /// What this host last knew of one session in the bucket.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +122,86 @@ pub struct Probe {
     pub state_etag: Option<String>,
     /// The bucket's ETag for the manifest; `None` when it has none.
     pub manifest_etag: Option<String>,
+}
+
+/// One listing of a session, as this host last made it, which other koto
+/// processes on the host reuse for the check window (koto#439).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SharedCheck {
+    /// The bucket the listing was made in.
+    bucket: String,
+    /// The state file's bucket key, as the stamp keeps it, so a check left
+    /// in a directory that moved to another name is never reused for it.
+    state_key: String,
+    /// When the listing was made, in milliseconds since the Unix epoch.
+    checked_at_ms: u64,
+    marker: bool,
+    state_etag: Option<String>,
+    manifest_etag: Option<String>,
+}
+
+fn now_ms(now: std::time::SystemTime) -> u64 {
+    now.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// The listing of the session in `dir` that this host made within `window`
+/// before `now`, in `bucket`, for `state_key`. A check stamped after `now`
+/// (the clock moved back) is not reused: the window can't be told from it.
+pub fn load_check(
+    dir: &Path,
+    bucket: &str,
+    state_key: &str,
+    window: std::time::Duration,
+    now: std::time::SystemTime,
+) -> Option<Probe> {
+    if window.is_zero() {
+        return None;
+    }
+    let bytes = std::fs::read(dir.join(CHECK_FILE)).ok()?;
+    let check: SharedCheck = serde_json::from_slice(&bytes).ok()?;
+    let now = now_ms(now);
+    if check.bucket != bucket
+        || check.state_key != state_key
+        || check.checked_at_ms > now
+        || now - check.checked_at_ms >= window.as_millis() as u64
+    {
+        return None;
+    }
+    Some(Probe {
+        marker: check.marker,
+        state_etag: check.state_etag,
+        manifest_etag: check.manifest_etag,
+    })
+}
+
+/// Keep `probe`, the listing just made at `now`, for this host's other
+/// processes. Best-effort.
+pub fn save_check(
+    dir: &Path,
+    bucket: &str,
+    state_key: &str,
+    probe: &Probe,
+    now: std::time::SystemTime,
+) {
+    let check = SharedCheck {
+        bucket: bucket.to_string(),
+        state_key: state_key.to_string(),
+        checked_at_ms: now_ms(now),
+        marker: probe.marker,
+        state_etag: probe.state_etag.clone(),
+        manifest_etag: probe.manifest_etag.clone(),
+    };
+    if let Ok(bytes) = serde_json::to_vec(&check) {
+        write_replacing(dir, CHECK_FILE, &bytes);
+    }
+}
+
+/// Drop the shared check of the session in `dir`, after this host changed
+/// what the bucket holds for it.
+pub fn forget_check(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(CHECK_FILE));
 }
 
 /// An ETag as a header or a listing gives it, without its quotes.
@@ -219,5 +309,60 @@ mod tests {
         Stamp::default().save(&gone);
         begin_tick(&gone);
         assert!(!gone.exists());
+    }
+
+    #[test]
+    fn a_shared_check_is_reused_only_inside_its_window_for_its_session() {
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = Probe {
+            marker: false,
+            state_etag: Some("s1".into()),
+            manifest_etag: Some("m1".into()),
+        };
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let window = Duration::from_secs(5);
+        save_check(
+            dir.path(),
+            "https://b",
+            "p/wf/koto-wf.state.jsonl",
+            &probe,
+            at,
+        );
+        let load = |bucket: &str, key: &str, window: Duration, now: SystemTime| {
+            load_check(dir.path(), bucket, key, window, now)
+        };
+        let key = "p/wf/koto-wf.state.jsonl";
+        let later = |ms: u64| at + Duration::from_millis(ms);
+        assert_eq!(
+            load("https://b", key, window, later(4_999)),
+            Some(probe.clone())
+        );
+        assert_eq!(
+            load("https://b", key, window, later(5_000)),
+            None,
+            "the window passed"
+        );
+        assert_eq!(
+            load("https://b", key, Duration::ZERO, later(0)),
+            None,
+            "a window of 0"
+        );
+        assert_eq!(
+            load("https://other", key, window, later(0)),
+            None,
+            "another bucket"
+        );
+        assert_eq!(
+            load("https://b", "p/x/koto-x.state.jsonl", window, later(0)),
+            None
+        );
+        assert_eq!(
+            load("https://b", key, window, at - Duration::from_secs(1)),
+            None,
+            "a check stamped after now"
+        );
+        forget_check(dir.path());
+        assert_eq!(load("https://b", key, window, later(0)), None, "forgotten");
     }
 }

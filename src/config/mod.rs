@@ -462,16 +462,31 @@ pub struct CloudConfig {
     /// `--source-retired`. Unset means [`DEFAULT_MARKER_RETAIN_DAYS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marker_retain_days: Option<u64>,
+    /// How many seconds this host's koto processes share one check of a
+    /// session against the bucket outside a tick (koto#439). A write from
+    /// this host ends the window at once; a write from another host can go
+    /// unseen for up to this long. 0 turns the sharing off. Unset means
+    /// [`DEFAULT_CHECK_WINDOW_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_window_secs: Option<u64>,
 }
 
 /// The default of `session.cloud.marker_retain_days`.
 pub const DEFAULT_MARKER_RETAIN_DAYS: u64 = 30;
+
+/// The default of `session.cloud.check_window_secs`.
+pub const DEFAULT_CHECK_WINDOW_SECS: u64 = 5;
 
 impl CloudConfig {
     /// `session.cloud.marker_retain_days`, or its default.
     pub fn marker_retain_days(&self) -> u64 {
         self.marker_retain_days
             .unwrap_or(DEFAULT_MARKER_RETAIN_DAYS)
+    }
+
+    /// `session.cloud.check_window_secs`, or its default.
+    pub fn check_window_secs(&self) -> u64 {
+        self.check_window_secs.unwrap_or(DEFAULT_CHECK_WINDOW_SECS)
     }
 }
 
@@ -496,6 +511,10 @@ pub fn get_value(config: &KotoConfig, key: &str) -> Option<String> {
         "session.cloud.marker_retain_days" => {
             Some(config.session.cloud.marker_retain_days().to_string())
         }
+        "session.cloud.check_window_secs" => match config.session_env.invalid_for(key) {
+            Some(bad) => Some(session_env::echo(bad.raw.as_deref(), config)),
+            None => Some(config.session.cloud.check_window_secs().to_string()),
+        },
         "request_store.stale_claim_timeout_seconds" => {
             Some(config.request_store.stale_claim_timeout_seconds.to_string())
         }
@@ -606,7 +625,7 @@ pub fn set_value_in_toml(doc: &mut toml::Value, key: &str, value: &str) -> Resul
             let cloud_table = cloud.as_table_mut().ok_or("cloud is not a table")?;
             cloud_table.insert("path_style".to_string(), toml::Value::Boolean(parsed));
         }
-        "session.cloud.marker_retain_days" => {
+        "session.cloud.marker_retain_days" | "session.cloud.check_window_secs" => {
             let parsed: i64 = value
                 .parse()
                 .map_err(|e| format!("value for {} must parse as an integer: {}", key, e))?;
@@ -625,7 +644,7 @@ pub fn set_value_in_toml(doc: &mut toml::Value, key: &str, value: &str) -> Resul
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
             let cloud_table = cloud.as_table_mut().ok_or("cloud is not a table")?;
             cloud_table.insert(
-                "marker_retain_days".to_string(),
+                key.strip_prefix("session.cloud.").unwrap().to_string(),
                 toml::Value::Integer(parsed),
             );
         }
@@ -769,7 +788,8 @@ pub fn unset_value_in_toml(doc: &mut toml::Value, key: &str) -> Result<bool, Str
         | "session.cloud.access_key"
         | "session.cloud.secret_key"
         | "session.cloud.path_style"
-        | "session.cloud.marker_retain_days" => {
+        | "session.cloud.marker_retain_days"
+        | "session.cloud.check_window_secs" => {
             let field = key.strip_prefix("session.cloud.").unwrap();
             if let Some(session) = table.get_mut("session") {
                 if let Some(st) = session.as_table_mut() {
@@ -867,6 +887,7 @@ pub const ALL_KEYS: &[&str] = &[
     "session.cloud.secret_key",
     "session.cloud.path_style",
     "session.cloud.marker_retain_days",
+    "session.cloud.check_window_secs",
     "request_store.stale_claim_timeout_seconds",
     "request_store.stale_dispatch_timeout_seconds",
     "request_store.redelegation_cap",

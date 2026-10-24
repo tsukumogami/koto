@@ -50,7 +50,7 @@ export KOTO_SESSION_CLOUD_PATH_STYLE=false   # optional
 
 This is the safe way to switch one workspace on a host that runs other sessions: koto re-reads `$HOME/.koto/config.toml` on every command, so changing that file moves every running session on the host to the new backend at once.
 
-Values are trimmed, and an empty or whitespace-only variable counts as unset, so the setting falls through to the files. `KOTO_SESSION_BACKEND` must be `local` or `cloud` and `KOTO_SESSION_CLOUD_PATH_STYLE` `true` or `false`, in lower case. Any other value never falls back to a file or to the local backend: every command that opens a session refuses with an error naming the variable, while `koto config list` and `koto config get` still show it so you can see what's wrong.
+Values are trimmed, and an empty or whitespace-only variable counts as unset, so the setting falls through to the files. `KOTO_SESSION_BACKEND` must be `local` or `cloud`, `KOTO_SESSION_CLOUD_PATH_STYLE` `true` or `false`, in lower case, and `KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS` a whole number of seconds. Any other value never falls back to a file or to the local backend: every command that opens a session refuses with an error naming the variable, while `koto config list` and `koto config get` still show it so you can see what's wrong.
 
 The commands a session runs (gates, actions) get the `KOTO_SESSION_*` variables that set its configuration, so a `koto` command a gate runs reaches the same backend.
 
@@ -110,9 +110,11 @@ That list isn't exhaustive: any command that reads a session's state through the
 
 ### What a read costs
 
-A read checks a session with one listing of its objects in the bucket, which says whether it was imported elsewhere and whether its state file and its context manifest changed since this host last pulled or pushed them. Only what changed is downloaded, so a read whose local copy is current costs that one request. Inside a tick, a session the tick's commands already checked isn't checked again: the tick is the window a command relies on, so its later reads of that session make no request. A change another host makes during the tick is read by the next tick.
+A read checks a session with one listing of its objects in the bucket, which says whether it was imported elsewhere and whether its state file and its context manifest changed since this host last pulled or pushed them. Only what changed is downloaded, so a read whose local copy is current costs that one request. Inside a tick, a session the tick's commands already checked isn't checked again: the tick is the window a command relies on, so its later reads of that session make no request. That includes the tick's own session after its commands wrote to it, since those writes wait in the tick's batch and the tick checks the bucket again before it pushes them. A change another host makes during the tick is read by the next tick.
 
-koto keeps what it last knew of the bucket's copy in host-local files beside the session in the local store (`cloud-sync.json`, `cloud-manifest.json`, `cloud-tick.id`). Nothing uploads them.
+Outside a tick, every koto command is its own process, so a script that calls `koto` many times would check the same session once per call. Instead, a check one koto process on this host made stands in for the next ones for `session.cloud.check_window_secs` seconds (default 5; `KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS` sets it from the environment). A write from this host ends the window at once, so this host always reads its own writes. The cost is the window itself: a write another host makes to a session can go unseen by this host's reads for up to that many seconds, and so can another host's import of the session. Writes don't share checks: each `koto context add` or `remove`, and each push of a session's state on its own, checks the bucket itself, so nothing this host writes reaches a session imported elsewhere. Set it to `0` to check in every process, as before, when sessions are written from more than one host at once and a read must see the other host's write immediately.
+
+koto keeps what it last knew of the bucket's copy in host-local files beside the session in the local store (`cloud-sync.json`, `cloud-manifest.json`, `cloud-tick.id`, and `cloud-check.json` for the shared check). Nothing uploads them.
 
 A `koto context get` or `koto context exists` records the read for the run journal. A read made by the session's own tick goes into its log, as before. A read made from anywhere else, another session's tick or your shell, goes into `context-reads.jsonl` beside the session on this host and is never pushed, so reading a session never writes to it.
 
@@ -326,6 +328,7 @@ koto session resolve <name> --keep remote  # download the bucket's version
 | `session.cloud.region` | `KOTO_SESSION_CLOUD_REGION` | Region | (none) | Yes |
 | `session.cloud.path_style` | `KOTO_SESSION_CLOUD_PATH_STYLE` | Address the bucket in the path (`true`) rather than as a subdomain; needed for an IP-address endpoint | `false` | Yes |
 | `session.cloud.marker_retain_days` | (none) | Days a migration marker whose target is present is kept before `koto session prune --migrated-from` may remove it without `--source-retired` | `30` | No (user only: it guards a deletion, so a cloned repository's config can't shorten it) |
+| `session.cloud.check_window_secs` | `KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS` | Seconds this host's koto processes share one check of a session outside a tick; `0` turns the sharing off. Another host's write can go unseen for up to this long (see [What a read costs](#what-a-read-costs)) | `5` | No (user/env only: a cloned repository's config can't widen it) |
 | `session.cloud.access_key` | `KOTO_SESSION_CLOUD_ACCESS_KEY`, else `AWS_ACCESS_KEY_ID` | Access key ID | (none) | No (user/env only) |
 | `session.cloud.secret_key` | `KOTO_SESSION_CLOUD_SECRET_KEY`, else `AWS_SECRET_ACCESS_KEY` | Secret access key | (none) | No (user/env only) |
 

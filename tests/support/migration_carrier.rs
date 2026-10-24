@@ -209,7 +209,11 @@ impl Host {
             // An import settles held-by links by the importing command's
             // anchor; the carrier imports from a bare shell.
             .env_remove("KOTO_ANCHOR")
-            .env_remove("KOTO_DISPATCHER_ANCHOR");
+            .env_remove("KOTO_DISPATCHER_ANCHOR")
+            // Each command checks the bucket for itself, so the requests a
+            // test asserts and the markers it plants are seen by the very
+            // next command, not hidden by a check an earlier one shared.
+            .env("KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS", "0");
         if let Some((key, secret)) = &self.credentials {
             cmd.env("AWS_ACCESS_KEY_ID", key)
                 .env("AWS_SECRET_ACCESS_KEY", secret);

@@ -3,7 +3,7 @@
 //!
 //! [`resolve::load_config`](super::resolve::load_config) fills a
 //! [`SessionEnv`] while it merges the layers: the origin of each of the
-//! eight session settings, the environment values it couldn't use, and the
+//! nine session settings, the environment values it couldn't use, and the
 //! missing half of a koto credential pair. Loading never fails on any of
 //! them, so `koto config list` can show them; [`check`] refuses them where a
 //! backend is built. The cloud-session-config design records the rules.
@@ -25,10 +25,12 @@ pub const ENV_PATH_STYLE: &str = "KOTO_SESSION_CLOUD_PATH_STYLE";
 pub const ENV_ACCESS_KEY: &str = "KOTO_SESSION_CLOUD_ACCESS_KEY";
 /// `session.cloud.secret_key`, half of the koto credential pair.
 pub const ENV_SECRET_KEY: &str = "KOTO_SESSION_CLOUD_SECRET_KEY";
+/// `session.cloud.check_window_secs`.
+pub const ENV_CHECK_WINDOW: &str = "KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS";
 
 /// The session settings whose origin `koto config list` reports, in the
 /// order it reports them.
-pub const SETTINGS: [&str; 8] = [
+pub const SETTINGS: [&str; 9] = [
     "session.backend",
     "session.cloud.endpoint",
     "session.cloud.bucket",
@@ -37,6 +39,7 @@ pub const SETTINGS: [&str; 8] = [
     "session.cloud.access_key",
     "session.cloud.secret_key",
     "session.cloud.marker_retain_days",
+    "session.cloud.check_window_secs",
 ];
 
 /// The longest raw value an error or origin line repeats.
@@ -92,7 +95,7 @@ impl std::fmt::Debug for InvalidEnv {
 /// What loading learned about the session settings. Never serialized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEnv {
-    origins: [Origin; 8],
+    origins: [Origin; 9],
     /// Environment values koto can't use, in [`SETTINGS`] order.
     pub invalid: Vec<InvalidEnv>,
     /// The koto credential variable that is unset while the other is set.
@@ -102,9 +105,10 @@ pub struct SessionEnv {
 impl Default for SessionEnv {
     fn default() -> Self {
         let origins = SETTINGS.map(|s| match s {
-            "session.backend" | "session.cloud.path_style" | "session.cloud.marker_retain_days" => {
-                Origin::Default
-            }
+            "session.backend"
+            | "session.cloud.path_style"
+            | "session.cloud.marker_retain_days"
+            | "session.cloud.check_window_secs" => Origin::Default,
             _ => Origin::Unset,
         });
         SessionEnv {
@@ -179,6 +183,7 @@ pub fn check(config: &KotoConfig) -> anyhow::Result<()> {
         let wants = match bad.setting {
             "session.backend" => "local or cloud",
             "session.cloud.path_style" => "true or false",
+            "session.cloud.check_window_secs" => "a whole number of seconds (0 turns it off)",
             _ => "a Unicode string",
         };
         anyhow::bail!(
@@ -254,6 +259,10 @@ pub fn command_vars(config: &KotoConfig) -> Vec<(String, String)> {
             },
             "session.cloud.access_key" => cloud.access_key.clone(),
             "session.cloud.secret_key" => cloud.secret_key.clone(),
+            "session.cloud.check_window_secs" => match env.invalid_for(setting) {
+                Some(bad) => bad.raw.clone(),
+                None => cloud.check_window_secs.map(|s| s.to_string()),
+            },
             _ => None,
         };
         if let Some(v) = value {

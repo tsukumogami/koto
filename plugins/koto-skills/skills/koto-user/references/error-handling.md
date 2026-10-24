@@ -176,12 +176,13 @@ The remedy is to continue the session where the message says, from that workspac
 
 ## Session configuration refusals
 
-koto can take its session backend, cloud location and bucket credentials from `KOTO_SESSION_*` environment variables (`KOTO_SESSION_BACKEND`, `KOTO_SESSION_CLOUD_ENDPOINT`, `KOTO_SESSION_CLOUD_BUCKET`, `KOTO_SESSION_CLOUD_REGION`, `KOTO_SESSION_CLOUD_PATH_STYLE`, `KOTO_SESSION_CLOUD_ACCESS_KEY`, `KOTO_SESSION_CLOUD_SECRET_KEY`), which win over the config files. When their values can't be used, every command that opens a session (`koto init`, `koto next`, `koto status`, the `koto context` and `koto session` commands) fails before it touches a session or the bucket, with a plain error on stderr and a non-zero exit:
+koto can take its session backend, cloud location and bucket credentials from `KOTO_SESSION_*` environment variables (`KOTO_SESSION_BACKEND`, `KOTO_SESSION_CLOUD_ENDPOINT`, `KOTO_SESSION_CLOUD_BUCKET`, `KOTO_SESSION_CLOUD_REGION`, `KOTO_SESSION_CLOUD_PATH_STYLE`, `KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS`, `KOTO_SESSION_CLOUD_ACCESS_KEY`, `KOTO_SESSION_CLOUD_SECRET_KEY`), which win over the config files. When their values can't be used, every command that opens a session (`koto init`, `koto next`, `koto status`, the `koto context` and `koto session` commands) fails before it touches a session or the bucket, with a plain error on stderr and a non-zero exit:
 
 | Message starts with | Cause | What to do |
 |---------------------|-------|------------|
 | `KOTO_SESSION_BACKEND is "<value>"` | The variable isn't `local` or `cloud` (case matters) | Report it; the user's environment is wrong |
 | `KOTO_SESSION_CLOUD_PATH_STYLE is "<value>"` | The variable isn't `true` or `false` | Report it |
+| `KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS is "<value>"` | The variable isn't a whole number of seconds | Report it |
 | `KOTO_SESSION_CLOUD_ACCESS_KEY is set but KOTO_SESSION_CLOUD_SECRET_KEY is not` (or the reverse) | Only half of koto's credential pair is set; koto never mixes it with the `AWS_*` pair | Report it; both or neither must be set |
 | `session.cloud.endpoint comes from the project file` (or `session.cloud.bucket`) | The koto credential pair is in use and the project's `.koto/config.toml` names the endpoint or bucket, which may not choose where those credentials go | Report it; the user sets `KOTO_SESSION_CLOUD_ENDPOINT` / `KOTO_SESSION_CLOUD_BUCKET` or the user config instead |
 
