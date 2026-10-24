@@ -1257,7 +1257,8 @@ fn last_event_ms(h: &Host, name: &str) -> i64 {
 /// another agent session: the copy's held-by is rewritten to the importer's
 /// anchor, the copy is kept at its terminal step, a prune names the
 /// importer's anchor as why the copy and `b` are kept, the migrated source
-/// keeps nothing and refuses reads, and `b` stays readable from B.
+/// keeps nothing and refuses reads, and `b`, which didn't move, is read from
+/// its own workspace A and refused from B.
 #[test]
 fn an_import_from_an_agent_session_holds_the_moved_copy_and_its_hierarchy() {
     let s3 = FakeS3::start(BUCKET);

@@ -361,6 +361,11 @@ impl CloudBackend {
     /// write asks again when the answer it finds was borrowed.
     fn check_migration(&self, id: &str, write: bool) -> anyhow::Result<()> {
         self.local_guard(id)?;
+        // A marker under this prefix belongs to another workspace's session
+        // of the same name, not to `id`'s local copy (koto#457).
+        if self.bound_elsewhere(id).is_some() {
+            return Ok(());
+        }
         let mut checks = self
             .migration_checks
             .lock()
@@ -510,55 +515,88 @@ impl CloudBackend {
     /// Refuse a command that names `id` from a directory other than the
     /// session's own, before anything syncs it (koto#457).
     ///
+    /// The local guard answers first: a session this workspace's copy was
+    /// imported into on this host refuses with [`SessionMigrated`], which
+    /// says where it went, rather than as bound elsewhere. Then
+    /// [`CloudBackend::bound_elsewhere`] decides.
+    pub fn check_bound_here(&self, id: &str) -> anyhow::Result<()> {
+        self.local_guard(id)?;
+        match self.bound_elsewhere(id) {
+            Some(refusal) => Err(anyhow::Error::new(refusal)),
+            None => Ok(()),
+        }
+    }
+
+    /// `Some` when `id`'s local copy belongs to another directory's
+    /// workspace than this backend's, asked of the local copy alone with no
+    /// request.
+    ///
     /// Every workspace on a host shares one local store, but this backend's
     /// prefix comes from the directory the command runs in. A read of `id`
     /// from another directory would sync the shared copy against that
     /// directory's prefix, which can hold an older session of the same name:
     /// the state pull would overwrite the local log with it, and a key whose
-    /// hash differs would be pulled over the current value. So the session's
-    /// local copy is asked where it belongs, with no request:
+    /// hash differs would be pulled over the current value.
     ///
-    /// - its execution anchor (`execution_dir`, else `origin.anchor`), whose
-    ///   prefix is the session's own when `koto init` ran there;
-    /// - its sync stamp, which names the prefix this host last pulled or
-    ///   pushed it under, and is the session's own when `koto init` ran
-    ///   somewhere other than the anchor (`--execution-dir`).
+    /// The session's own prefixes come from its header, in this order:
     ///
-    /// When at least one of them is there and neither is this backend's
-    /// prefix, the command refuses with [`SessionBoundElsewhere`], naming
-    /// the anchor. Either one matching is enough: a stamp a wrong-directory
-    /// run of an older koto rewrote doesn't refuse a read from the anchor.
-    /// A session with no local copy, or one recording neither, is read as
-    /// it always was.
+    /// - `origin.store.prefix`, the prefix it was created under, together
+    ///   with its execution anchor's (`execution_dir`, else `origin.anchor`),
+    ///   since the two differ for a session started with `--execution-dir`
+    ///   and a rebind moves the anchor;
+    /// - for a session recorded before koto named the prefix, its anchor's
+    ///   alone;
+    /// - for one with no anchor either, the prefix of this host's sync stamp.
     ///
-    /// The local guard answers first: a session this workspace's copy was
-    /// imported into on this host refuses with [`SessionMigrated`], which
-    /// says where it went, rather than as bound elsewhere.
-    pub fn check_bound_here(&self, id: &str) -> anyhow::Result<()> {
-        self.local_guard(id)?;
+    /// The stamp comes last because any sync rewrites it to the prefix the
+    /// syncing command ran under, so a run of an older koto from the wrong
+    /// directory leaves it naming that directory; the header is the
+    /// session's own and nothing here rewrites it. A session with no local
+    /// copy, or one recording none of these, is not bound elsewhere.
+    ///
+    /// Resolving the session by name instead, syncing it under its own
+    /// prefix from any directory, would rest on the same records, and for a
+    /// session recorded before the prefix was the only one rewritten by the
+    /// wrong-directory runs this guards against; a wrong guess there is the
+    /// silent stale read itself. A refusal that names the directory is loud
+    /// when it is wrong.
+    fn bound_elsewhere(&self, id: &str) -> Option<SessionBoundElsewhere> {
         let dir = self.local.session_dir(id);
-        let anchor = first_line(&dir.join(state_file_name(id))).and_then(|l| bound_anchor(&l));
+        let header: Option<serde_json::Value> = first_line(&dir.join(state_file_name(id)))
+            .and_then(|line| serde_json::from_str(line.trim()).ok());
+        let field = |pointer: &str| {
+            header
+                .as_ref()
+                .and_then(|h| h.pointer(pointer))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        let anchor = field("/execution_dir").or_else(|| field("/origin/anchor"));
         let anchor_prefix = anchor
             .as_deref()
             .and_then(|a| crate::session::local::prefix_for_workspace(Path::new(a)).ok());
-        let stamp_prefix = Stamp::load(&dir).and_then(|s| {
-            s.state_key
-                .split('/')
-                .next()
-                .filter(|p| is_workspace_prefix(p))
-                .map(str::to_string)
-        });
-        let known: Vec<&String> = [anchor_prefix.as_ref(), stamp_prefix.as_ref()]
-            .into_iter()
-            .flatten()
-            .collect();
-        if known.is_empty() || known.iter().any(|p| **p == self.prefix) {
-            return Ok(());
+        let origin_prefix = field("/origin/store/prefix");
+        let own: Vec<String> = match (origin_prefix, anchor_prefix) {
+            (Some(origin), anchor) => std::iter::once(origin).chain(anchor).collect(),
+            (None, Some(anchor)) => vec![anchor],
+            (None, None) => Stamp::load(&dir)
+                .and_then(|s| {
+                    s.state_key
+                        .split('/')
+                        .next()
+                        .filter(|p| is_workspace_prefix(p))
+                        .map(str::to_string)
+                })
+                .into_iter()
+                .collect(),
+        };
+        if own.is_empty() || own.contains(&self.prefix) {
+            return None;
         }
-        Err(anyhow::Error::new(SessionBoundElsewhere {
+        Some(SessionBoundElsewhere {
             name: id.to_string(),
             anchor,
-        }))
+        })
     }
 
     /// S3 key of a session's migration marker under this backend's prefix.
@@ -1075,6 +1113,16 @@ impl CloudBackend {
             return Ok(());
         }
         if own_tick && !self.mark_pulled(id) {
+            return Ok(());
+        }
+        // A session whose local copy belongs to another directory's
+        // workspace is read as this host holds it. This prefix's copy, if
+        // there is one, isn't the session's: pulling it would overwrite the
+        // local log with another session's, or an older one, and rewrite the
+        // stamp to this prefix (koto#457). The commands that name a session
+        // refuse before they get here; this covers koto's own reads of
+        // other sessions, such as an anchor or a hierarchy member.
+        if self.bound_elsewhere(id).is_some() {
             return Ok(());
         }
         // The state file is fetched only when the bucket's copy moved since
@@ -2536,6 +2584,7 @@ impl SessionBackend for CloudBackend {
             kind: "cloud".to_string(),
             base: std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf()),
             bucket: Some(self.bucket.name()),
+            prefix: Some(self.prefix.clone()),
         })
     }
 
@@ -2990,6 +3039,10 @@ impl ContextStore for CloudBackend {
         {
             return None;
         }
+        // Another prefix's manifest isn't this session's (koto#457).
+        if self.bound_elsewhere(session).is_some() {
+            return None;
+        }
         self.prime_manifest(session);
         sync::remote_key_meta(
             &self.bucket,
@@ -3009,6 +3062,11 @@ impl ContextStore for CloudBackend {
                 .pending_keys(session)
                 .is_some_and(|pending| pending.touches(key))
         {
+            return self.local.get(session, key);
+        }
+        // A session bound to another directory's workspace is read as this
+        // host holds it, never pulled from this prefix (koto#457).
+        if self.bound_elsewhere(session).is_some() {
             return self.local.get(session, key);
         }
         // Pull from remote if a newer version exists. A pull that wrote the
@@ -3065,6 +3123,10 @@ impl ContextStore for CloudBackend {
                 .pending_keys(session)
                 .is_some_and(|pending| pending.touches(key))
         {
+            return false;
+        }
+        // Another prefix's manifest isn't this session's (koto#457).
+        if self.bound_elsewhere(session).is_some() {
             return false;
         }
         // Fall back to checking remote manifest.
@@ -3137,6 +3199,11 @@ impl ContextStore for CloudBackend {
         self.check_not_migrated(session)?;
         let mut keys = self.local.list_keys(session, prefix)?;
         let pending = self.pending_keys(session).unwrap_or_default();
+        // Another prefix's manifest isn't this session's (koto#457).
+        if self.bound_elsewhere(session).is_some() {
+            keys.sort();
+            return Ok(keys);
+        }
         // Merge in remote-only keys, leaving out those an open batch
         // removed here.
         self.prime_manifest(session);
@@ -4608,17 +4675,6 @@ fn first_line(path: &Path) -> Option<String> {
     Some(line)
 }
 
-/// The directory a state log's header line binds the session to now: its
-/// execution directory, which a rebind moves, else its origin anchor.
-fn bound_anchor(header_line: &str) -> Option<String> {
-    let header: serde_json::Value = serde_json::from_str(header_line.trim()).ok()?;
-    header
-        .get("execution_dir")
-        .or_else(|| header.pointer("/origin/anchor"))?
-        .as_str()
-        .map(str::to_string)
-}
-
 /// The `session_id` in a state file's header line (its first non-empty
 /// line), or `None` when the header doesn't parse or has none.
 ///
@@ -4920,7 +4976,18 @@ pub(crate) mod test_support {
             parent_workflow: None,
             template_source_dir: None,
             template_source_file: None,
-            origin: None,
+            // Created under the test backend's own prefix, as `koto init`
+            // under `cloud_backend_at` would record it, so its reads sync
+            // whatever its anchor names (koto#457).
+            origin: Some(crate::engine::types::SessionOrigin {
+                anchor: base_dir.to_path_buf(),
+                store: crate::engine::types::SessionStoreIdentity {
+                    kind: "cloud".to_string(),
+                    base: base_dir.to_path_buf(),
+                    bucket: None,
+                    prefix: Some(PREFIX.to_string()),
+                },
+            }),
             execution_dir,
             session_id: String::new(),
             intent: None,
@@ -6337,7 +6404,9 @@ mod tests {
             "template_hash": "a".repeat(64),
             "created_at": "2026-01-01T00:00:00Z",
             "session_id": sid,
-            "origin": {"anchor": "/srv/ws-b", "store": {"kind": "cloud", "base": "/x"}},
+            // Created under the test backend's own prefix, so the pull
+            // tests reach the pull's own checks (koto#457).
+            "origin": {"anchor": "/srv/ws-b", "store": {"kind": "cloud", "base": "/x", "prefix": test_support::PREFIX}},
         });
         let mut lines = vec![header.to_string(), event_json(1).to_string()];
         if let Some((ws, from, from_sid)) = imported {

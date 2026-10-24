@@ -1094,10 +1094,12 @@ pub(super) fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
 }
 
 /// Refuse, exit 2, when `session` belongs to another directory's workspace
-/// under the cloud backend, before `command` reads or syncs it (koto#457):
-/// from here the command would sync against another workspace's prefix and
-/// could read an older copy of the session. The message names the directory
-/// to run from. The local backend never refuses.
+/// under the cloud backend, before `command` reads or writes it (koto#457).
+/// From here a read would answer from this host's copy without checking the
+/// session's own copy in the bucket, and a write would be pushed under
+/// another workspace's prefix, where the session's own workspace never
+/// reads it. The message names the directory to run from. The local backend
+/// never refuses.
 fn refuse_if_bound_elsewhere(backend: &Backend, session: &str, command: &str) {
     if let Err(e) = backend.check_bound_here(session) {
         exit_with_error_code(
@@ -1811,10 +1813,12 @@ pub fn run(app: App) -> Result<()> {
         }
         Command::Cancel { name, cleanup } => {
             let backend = build_backend()?;
+            refuse_if_bound_elsewhere(&backend, &name, "cancel");
             handle_cancel(&backend, backend.local_base_dir(), &name, cleanup)
         }
         Command::Rewind { name, rationale } => {
             let backend = build_backend()?;
+            refuse_if_bound_elsewhere(&backend, &name, "rewind");
             handle_rewind(&backend, &backend, &name, rationale)
         }
         Command::Status { name } => {
@@ -2033,9 +2037,10 @@ pub fn run(app: App) -> Result<()> {
                 ContextCommand::Remove { session, .. } => (session, "context remove"),
                 ContextCommand::List { session, .. } => (session, "context list"),
             };
-            // A session bound to another directory refuses first: from here
-            // even the migration check would list another workspace's
-            // prefix (koto#457).
+            // A session bound to another directory refuses first, naming
+            // where to run the command (koto#457); a session imported away
+            // on this host still refuses as migrated, which the guard asks
+            // before its own question.
             refuse_if_bound_elsewhere(&backend, session, command);
             if let Err(e) = backend.check_not_migrated(session) {
                 exit_with_error_code(
@@ -2294,6 +2299,7 @@ pub fn run(app: App) -> Result<()> {
             let backend = build_backend()?;
             match subcommand {
                 DecisionsSubcommand::Record { name, with_data } => {
+                    refuse_if_bound_elsewhere(&backend, &name, "decisions record");
                     handle_decisions_record(&backend, name, with_data)
                 }
                 DecisionsSubcommand::List { name } => {
@@ -2310,7 +2316,10 @@ pub fn run(app: App) -> Result<()> {
                     gate,
                     rationale,
                     with_data,
-                } => overrides::handle_overrides_record(&backend, name, gate, rationale, with_data),
+                } => {
+                    refuse_if_bound_elsewhere(&backend, &name, "overrides record");
+                    overrides::handle_overrides_record(&backend, name, gate, rationale, with_data)
+                }
                 overrides::OverridesSubcommand::List { name } => {
                     refuse_if_bound_elsewhere(&backend, &name, "overrides list");
                     overrides::handle_overrides_list(&backend, name)

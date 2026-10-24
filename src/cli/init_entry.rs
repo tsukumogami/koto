@@ -1221,6 +1221,7 @@ mod tests {
                 kind: "local".into(),
                 base: "/s".into(),
                 bucket: None,
+                prefix: None,
             },
         };
         let r = check_origin("s", None, Some(&caller)).err().unwrap();
@@ -1249,6 +1250,7 @@ mod tests {
                 kind: kind.into(),
                 base: base.into(),
                 bucket: bucket.map(str::to_string),
+                prefix: None,
             },
         }
     }

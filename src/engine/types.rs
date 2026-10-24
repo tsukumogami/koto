@@ -244,6 +244,14 @@ pub struct SessionStoreIdentity {
     /// cloud origin recorded before koto named the bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
+    /// The prefix the cloud store keeps the session under in the bucket,
+    /// derived from the directory koto ran in when the session was created.
+    /// It is what tells a command run from another directory that the
+    /// session isn't its own (koto#457); nothing rewrites it, unlike this
+    /// host's sync stamp. `None` for the local store, and for a cloud origin
+    /// recorded before koto named the prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
 }
 
 /// The environment a session's commands run with

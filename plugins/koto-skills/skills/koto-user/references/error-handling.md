@@ -175,7 +175,7 @@ The remedy is to continue the session where the message says, from that workspac
 
 ## session_bound_elsewhere
 
-Under the cloud backend a session lives in the bucket under a prefix derived from the directory it was started in, while every workspace on a host shares one local session store. A command that names a session from another directory would sync that shared copy against the other directory's prefix, which can hold an older session of the same name. So `koto status`, the `koto context` commands, `koto decisions list`, `koto overrides list` and `koto session resolve` refuse it first, before any request. A directory counts as the session's workspace when it is the session's execution anchor or the directory this host last synced the session from; a subdirectory of either doesn't. The local backend never refuses.
+Under the cloud backend a session lives in the bucket under a prefix derived from the directory it was started in, while every workspace on a host shares one local session store. A command that names a session from another directory would sync that shared copy against the other directory's prefix, which can hold an older session of the same name. So `koto status`, the `koto context` commands, `koto decisions record` and `list`, `koto overrides record` and `list`, `koto rewind`, `koto cancel` and `koto session resolve` refuse it first, before any request. A directory counts as the session's workspace when it is the directory the session was created in (recorded with its origin) or its execution anchor; a subdirectory of either doesn't. A session an older koto created has no such record and counts only its anchor. The local backend never refuses.
 
 The error goes to **stdout**, flat, exit 2:
 

@@ -282,6 +282,22 @@ fn every_guarded_command_names_the_bound_directory() {
             &["session", "resolve", WF, "--keep", "local"],
             "session resolve",
         ),
+        (
+            &[
+                "decisions",
+                "record",
+                WF,
+                "--with-data",
+                r#"{"choice":"a","rationale":"b"}"#,
+            ],
+            "decisions record",
+        ),
+        (
+            &["overrides", "record", WF, "--gate", "g", "--rationale", "r"],
+            "overrides record",
+        ),
+        (&["rewind", WF], "rewind"),
+        (&["cancel", WF], "cancel"),
     ];
     for (args, command) in cases {
         assert_refused(&h.koto(&elsewhere, args), command, &ws);
@@ -448,4 +464,134 @@ fn a_state_whose_fetch_fails_is_an_error_not_the_local_copy() {
 
     s3.clear_faults();
     h.ok(&ws, &["status", WF]);
+}
+
+/// The state file of `WF` on this host.
+fn state_path(h: &Host) -> PathBuf {
+    h.home
+        .join(".koto/sessions")
+        .join(WF)
+        .join(format!("koto-{WF}.state.jsonl"))
+}
+
+/// Point this host's sync stamp for `WF` at `dir`'s prefix, as a sync run
+/// from `dir` by a koto without the guard left it.
+fn poison_stamp(h: &Host, dir: &Path) {
+    let stamp = h
+        .home
+        .join(".koto/sessions")
+        .join(WF)
+        .join("cloud-sync.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&stamp).unwrap()).unwrap();
+    value["state_key"] = format!("{}/{WF}/koto-{WF}.state.jsonl", prefix_of(dir)).into();
+    std::fs::write(&stamp, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+/// A stamp that a wrong-directory run rewrote to name that directory
+/// doesn't let a read from there through: the prefix the session was
+/// created under, in its header, decides.
+#[test]
+fn a_stamp_rewritten_by_a_wrong_directory_run_lets_nothing_through() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let ws = h.dir("root/ws");
+    let root = h.dir("root");
+    h.init(&ws, &[]);
+    h.add(&ws, "topic.md", b"old topic");
+    copy_session(&s3, &ws, &root);
+    h.add(&ws, "topic.md", b"new topic");
+    h.ok(&ws, &["context", "get", WF, "topic.md"]);
+    poison_stamp(&h, &root);
+
+    let out = h.get(&root, "topic.md");
+    assert_refused(&out, "context get", &ws);
+    assert!(!out.stdout.contains("old topic"), "{}", out.describe());
+    assert_eq!(
+        h.ok(&ws, &["context", "get", WF, "topic.md"]).stdout,
+        "new topic"
+    );
+}
+
+/// A session recorded before koto named the prefix in its origin is bound
+/// to its anchor alone, so a stamp naming another directory doesn't let a
+/// read from there through either, and the anchor still reads.
+#[test]
+fn a_session_without_a_recorded_prefix_is_bound_to_its_anchor() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let ws = h.dir("root/ws");
+    let root = h.dir("root");
+    h.init(&ws, &[]);
+    h.add(&ws, "k.md", b"value");
+    // Drop the prefix from the header, locally and in the bucket, as an
+    // older koto wrote it.
+    let path = state_path(&h);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let (first, rest) = text.split_once('\n').unwrap();
+    let mut header: serde_json::Value = serde_json::from_str(first).unwrap();
+    header["origin"]["store"]
+        .as_object_mut()
+        .unwrap()
+        .remove("prefix")
+        .expect("a new session records its prefix");
+    let old = format!("{}\n{}", serde_json::to_string(&header).unwrap(), rest);
+    std::fs::write(&path, &old).unwrap();
+    s3.put(
+        &format!("{}/{WF}/koto-{WF}.state.jsonl", prefix_of(&ws)),
+        old.as_bytes(),
+    );
+    assert_eq!(h.ok(&ws, &["context", "get", WF, "k.md"]).stdout, "value");
+    poison_stamp(&h, &root);
+
+    assert_refused(&h.get(&root, "k.md"), "context get", &ws);
+    assert_eq!(h.ok(&ws, &["context", "get", WF, "k.md"]).stdout, "value");
+}
+
+/// koto's own read of a session bound elsewhere, here the state read
+/// `koto next` makes before its execution-anchor check refuses, takes
+/// nothing from this directory's prefix: the older copy planted there
+/// never reaches the local log.
+#[test]
+fn an_unguarded_read_never_pulls_another_directory_s_copy() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let ws = h.dir("root/ws");
+    let root = h.dir("root");
+    h.init(&ws, &[]);
+    copy_session(&s3, &ws, &root);
+    // A write from the session's own directory moves its log past the copy
+    // planted under the root's prefix.
+    h.ok(
+        &ws,
+        &[
+            "decisions",
+            "record",
+            WF,
+            "--with-data",
+            r#"{"choice":"a","rationale":"b"}"#,
+        ],
+    );
+    let before = std::fs::read(state_path(&h)).unwrap();
+
+    s3.clear_requests();
+    let out = h.koto(&root, &["next", WF]);
+    assert_ne!(out.code, Some(0), "{}", out.describe());
+    let root_prefix = prefix_of(&root);
+    let fetched: Vec<_> = s3
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "GET" && r.key.starts_with(&root_prefix))
+        .collect();
+    assert!(
+        fetched.is_empty(),
+        "pulled from the root's prefix: {fetched:?}"
+    );
+    assert_eq!(std::fs::read(state_path(&h)).unwrap(), before);
+    let decisions = h.ok(&ws, &["decisions", "list", WF]);
+    assert!(
+        decisions.stdout.contains(r#""choice":"a""#),
+        "{}",
+        decisions.describe()
+    );
 }
