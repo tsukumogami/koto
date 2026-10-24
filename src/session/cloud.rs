@@ -27,7 +27,7 @@ use s3::{Bucket, Region};
 use crate::config::CloudConfig;
 use crate::engine::reentrancy;
 use crate::session::batch::{self, BatchLock, Journal, Pending};
-use crate::session::context::{is_host_local_key, ContextStore};
+use crate::session::context::{is_host_local_key, is_pin_record_key, ContextStore};
 use crate::session::local::{repo_id, LocalBackend};
 use crate::session::sync::{self, ManifestCache};
 use crate::session::sync_stamp::{self, Stamp};
@@ -105,10 +105,23 @@ pub enum RemoteCopy {
     /// The remote copy is ahead of the local one or diverged from it; the
     /// string says which.
     NotSafe(String),
-    /// The check couldn't be made: the listing failed, the local log or a
-    /// version file couldn't be read, or a version file didn't parse. The
-    /// string says which.
+    /// The check couldn't be made: the local log or a version file couldn't
+    /// be read, or a version file didn't parse. The string says which.
     Unreadable(String),
+    /// The listing of the session's prefix failed (`unreachable`) or came
+    /// back unparseable, so the bucket couldn't be checked for anything, a
+    /// pin included. The string says what failed.
+    Unlisted(crate::session::pin::BucketError, String),
+}
+
+/// How a failed listing reads to the pin guard: a body koto couldn't parse
+/// is `unparseable`, anything else `unreachable`.
+pub(crate) fn listing_error(e: &S3Error) -> crate::session::pin::BucketError {
+    use crate::session::pin::BucketError;
+    match e {
+        S3Error::SerdeXml(_) | S3Error::Utf8(_) | S3Error::FromUtf8(_) => BucketError::Unparseable,
+        _ => BucketError::Unreachable,
+    }
 }
 
 /// A migrated source copy, as [`CloudBackend::migrated_source_copy`] reads it.
@@ -203,8 +216,9 @@ pub struct CloudBackend {
     /// commands write to, and a second pull would only fetch what it pushed.
     /// Boxed for the same reason as `local_migration_checks`.
     pulled: Box<Mutex<HashSet<String>>>,
-    /// Per-process answers of [`CloudBackend::probe`], and the check window.
-    /// Boxed for the same reason as `local_migration_checks`.
+    /// Per-process answers of [`CloudBackend::probe`], the check window, and
+    /// whether the backend only reads. Boxed for the same reason as
+    /// `local_migration_checks`.
     probes: Box<Probes>,
 }
 
@@ -223,6 +237,12 @@ struct Probes {
     /// koto#439). Zero, which [`CloudBackend::with_parts`] leaves it at,
     /// lists in every process as before.
     window: std::time::Duration,
+    /// A reader of another workspace's prefix (`koto --workspace`,
+    /// [`workspace_read`]): every write to the bucket and every append to a
+    /// log refuses, and no tick marker in the environment applies, since a
+    /// tick in the reader's own workspace never runs a session in this
+    /// prefix. Kept here, in the box, so the backend stays small.
+    read_only: bool,
 }
 
 impl CloudBackend {
@@ -260,8 +280,32 @@ impl CloudBackend {
             probes: Box::new(Probes {
                 answers: Mutex::new(HashMap::new()),
                 window: std::time::Duration::ZERO,
+                read_only: false,
             }),
         }
+    }
+
+    /// Refuse a write when this backend only reads another workspace's
+    /// prefix (`koto --workspace`).
+    fn refuse_if_read_only(&self, what: &str) -> anyhow::Result<()> {
+        if self.probes.read_only {
+            anyhow::bail!(
+                "{} refused: this command reads workspace {} with --workspace, which never writes",
+                what,
+                self.prefix
+            );
+        }
+        Ok(())
+    }
+
+    /// The session a `koto next` tick this process runs under advances
+    /// ([`reentrancy::enclosing_tick`]); never one for a read-only backend,
+    /// whose prefix no tick of this host's workspace runs.
+    fn enclosing_tick(&self) -> Option<String> {
+        if self.probes.read_only {
+            return None;
+        }
+        reentrancy::enclosing_tick()
     }
 
     /// Delegate to the local store's bounded prefix read; never a remote
@@ -334,7 +378,7 @@ impl CloudBackend {
     /// standing in for the copy it checked. Those shortcuts are for reads
     /// (koto#439): a write on a borrowed answer could reach a session
     /// imported elsewhere in the meantime.
-    fn check_not_migrated_to_write(&self, id: &str) -> anyhow::Result<()> {
+    pub(crate) fn check_not_migrated_to_write(&self, id: &str) -> anyhow::Result<()> {
         self.check_migration(id, true)
     }
 
@@ -560,7 +604,17 @@ impl CloudBackend {
     /// wrong-directory runs this guards against; a wrong guess there is the
     /// silent stale read itself. A refusal that names the directory is loud
     /// when it is wrong.
+    ///
+    /// A read-only backend (`koto --workspace`) is never bound elsewhere: its
+    /// local copy is a scratch one it pulled from this very prefix, so the
+    /// prefix is the session's by construction. Judged by its header instead,
+    /// a session that records no prefix and whose anchor hashes elsewhere (an
+    /// older session started with `--execution-dir`, say) would skip every
+    /// pull and answer from the empty scratch copy.
     fn bound_elsewhere(&self, id: &str) -> Option<SessionBoundElsewhere> {
+        if self.probes.read_only {
+            return None;
+        }
         let dir = self.local.session_dir(id);
         let header: Option<serde_json::Value> = first_line(&dir.join(state_file_name(id)))
             .and_then(|line| serde_json::from_str(line.trim()).ok());
@@ -754,7 +808,7 @@ impl CloudBackend {
     /// The id of the tick this process runs under, read from the ticked
     /// session's directory; `None` outside a tick.
     fn current_tick(&self) -> Option<String> {
-        let tick = reentrancy::enclosing_tick()?;
+        let tick = self.enclosing_tick()?;
         sync_stamp::tick_id(&self.local.session_dir(&tick))
     }
 
@@ -818,6 +872,7 @@ impl CloudBackend {
     /// PUT `id`'s state file and stamp what went up.
     fn put_state(&self, id: &str, data: &[u8]) -> anyhow::Result<()> {
         let key = self.state_key(id);
+        self.refuse_if_read_only(&format!("S3 PUT of {}", key))?;
         let response = self
             .bucket
             .put_object(&key, data)
@@ -1008,6 +1063,7 @@ impl CloudBackend {
         }
         let data = std::fs::read(&state_path)
             .with_context(|| format!("reading local state file: {}", state_path.display()))?;
+        self.carry_pin_records(id);
         self.put_state(id, &data)
     }
 
@@ -1092,7 +1148,7 @@ impl CloudBackend {
             return Ok(());
         }
         let own_tick =
-            reentrancy::is_tick_process() && reentrancy::enclosing_tick().as_deref() == Some(id);
+            reentrancy::is_tick_process() && self.enclosing_tick().as_deref() == Some(id);
         self.try_clear_unopened_batch(id);
         if self.journal(id).is_open() {
             match self.flush_pending(id) {
@@ -1205,7 +1261,7 @@ impl CloudBackend {
                         if is_migration_marker(&prefix, &obj.key) {
                             continue;
                         }
-                        if let Err(e) = self.bucket.delete_object(&obj.key) {
+                        if let Err(e) = self.delete_object(&obj.key) {
                             eprintln!("warning: cloud sync: failed to delete {}: {}", obj.key, e);
                         }
                     }
@@ -1241,7 +1297,7 @@ impl CloudBackend {
                 if is_migration_marker(&prefix, &obj.key) {
                     continue;
                 }
-                if let Err(e) = self.bucket.delete_object(&obj.key) {
+                if let Err(e) = self.delete_object(&obj.key) {
                     first.get_or_insert_with(|| {
                         anyhow::anyhow!(
                             "deleting {} failed: {}",
@@ -1255,6 +1311,181 @@ impl CloudBackend {
         match first {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+
+    /// The local store this backend keeps its copies in.
+    pub(crate) fn local(&self) -> &LocalBackend {
+        &self.local
+    }
+
+    /// On a push of `id`: a pin or release record this host's copy still
+    /// indexes (it was set under the local backend) goes up as its own
+    /// object and leaves the index ([`crate::session::pin::carry_indexed`]),
+    /// so from then on it is a bare file the sync doesn't track (R20a). A
+    /// copy with neither file costs two `stat` calls and no request; a
+    /// failed upload warns, keeps the entry and the session stays kept from
+    /// the local pin until a later push carries it.
+    fn carry_pin_records(&self, id: &str) {
+        let ctx = self.local.session_dir(id).join("ctx");
+        if !ctx.join(crate::session::pin::PIN_KEY).exists()
+            && !ctx.join(crate::session::pin::RELEASE_KEY).exists()
+        {
+            return;
+        }
+        if let Err(e) = crate::session::pin::carry_indexed(self, id) {
+            eprintln!("warning: cloud sync: the pin of '{id}' wasn't uploaded: {e:#}");
+        }
+    }
+
+    /// The object key of reserved record `key` (the pin or the release
+    /// record) of session `id`.
+    fn reserved_object_key(&self, id: &str, key: &str) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            key == crate::session::pin::PIN_KEY || key == crate::session::pin::RELEASE_KEY,
+            "'{key}' isn't a pin record"
+        );
+        Ok(format!("{}ctx/{}", self.session_prefix(id), key))
+    }
+
+    /// PUT exactly one object, `<prefix>/<id>/ctx/<key>` for the pin or the
+    /// release record, and fail unless the bucket confirms it. Nothing else
+    /// is pushed: no manifest, log, state or version object, so a host
+    /// holding a stale copy of `id`, or none, replaces nothing another host
+    /// wrote (DESIGN-session-pin.md, Decision 3).
+    pub(crate) fn put_reserved_object(
+        &self,
+        id: &str,
+        key: &str,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let object = self.reserved_object_key(id, key)?;
+        self.bucket.put_object(&object, bytes).map_err(|e| {
+            anyhow::anyhow!(
+                "PUT {object} failed: {}",
+                without_url_userinfo(&e.to_string())
+            )
+        })?;
+        Ok(())
+    }
+
+    /// DELETE exactly one object, the pin or the release record of `id`,
+    /// and fail unless the bucket confirms it. A missing object is a
+    /// success, as S3 answers it.
+    pub(crate) fn delete_reserved_object(&self, id: &str, key: &str) -> anyhow::Result<()> {
+        let object = self.reserved_object_key(id, key)?;
+        self.bucket.delete_object(&object).map_err(|e| {
+            anyhow::anyhow!(
+                "DELETE {object} failed: {}",
+                without_url_userinfo(&e.to_string())
+            )
+        })?;
+        Ok(())
+    }
+
+    /// The header of the bucket's state file for `id`, for a command that
+    /// acts on a session this host holds no copy of. `Ok(None)` when the
+    /// bucket holds no state file.
+    pub(crate) fn remote_header(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<crate::engine::types::StateFileHeader>> {
+        let Some(bytes) = self.fetch_remote_state_bytes(id)? else {
+            return Ok(None);
+        };
+        let line = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
+        let header = serde_json::from_slice(line)
+            .map_err(|e| anyhow::anyhow!("the bucket's header line doesn't parse: {e}"))?;
+        Ok(Some(header))
+    }
+
+    /// The sessions of this workspace whose prefix holds a pin object, from
+    /// one paginated listing of `<prefix>/`: each name whose
+    /// `<prefix>/<name>/ctx/koto/links/pin` (or an object under it) is
+    /// listed and is a valid session id. Sorted. For `koto session list
+    /// --pinned`, which also lists the pins of sessions this host holds no
+    /// copy of (R17).
+    pub(crate) fn bucket_pinned_sessions(
+        &self,
+    ) -> Result<Vec<String>, crate::session::pin::BucketError> {
+        let prefix = format!("{}/", self.prefix);
+        let pages = self
+            .bucket
+            .list(prefix.clone(), None)
+            .map_err(|e| listing_error(&e))?;
+        let pin = format!("/ctx/{}", crate::session::pin::PIN_KEY);
+        let mut names: Vec<String> = pages
+            .iter()
+            .flat_map(|page| page.contents.iter())
+            .filter_map(|obj| {
+                let rest = obj.key.strip_prefix(&prefix)?;
+                let (name, tail) = rest.split_once('/')?;
+                let tail = format!("/{tail}");
+                (tail == pin || tail.starts_with(&format!("{pin}/"))).then(|| name.to_string())
+            })
+            .filter(|name| crate::session::validate::validate_session_id(name).is_ok())
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// [`SessionBackend::bucket_pin`] for the cloud backend: one fresh
+    /// listing of `<prefix>/<id>/ctx/koto/`, outside the probe cache (which
+    /// keeps failures), then a read of the pin object when one is listed, or
+    /// of the release record when no pin is and `local_pin_id` asks whether
+    /// it names this host's pin. A listing that fails is `unreachable`, one
+    /// whose body doesn't parse is `unparseable`; a listing that succeeds
+    /// with no pin object is not a failure. A pin object over the size limit
+    /// is `too_large` without being read, and objects under the pin's key
+    /// (`koto/links/pin/...`) are `not_a_file`, as on a local store.
+    fn bucket_pin_of(
+        &self,
+        id: &str,
+        local_pin_id: Option<&str>,
+    ) -> crate::session::pin::BucketPin {
+        use crate::session::pin::{
+            pin_of_bytes, release_of_bytes, BucketError, BucketPin, PinFact, PinProblem,
+            MAX_PIN_BYTES, PIN_KEY, RELEASE_KEY,
+        };
+        let session = self.session_prefix(id);
+        let pages = match self.bucket.list(format!("{session}ctx/koto/"), None) {
+            Ok(pages) => pages,
+            Err(e) => return BucketPin::Unchecked(listing_error(&e)),
+        };
+        let pin_key = format!("{session}ctx/{PIN_KEY}");
+        let release_key = format!("{session}ctx/{RELEASE_KEY}");
+        let under_pin = format!("{pin_key}/");
+        let objects = || pages.iter().flat_map(|page| page.contents.iter());
+        if objects().any(|o| o.key.starts_with(&under_pin)) {
+            return BucketPin::Pin(PinFact::Unreadable(PinProblem::NotAFile));
+        }
+        if let Some(pin) = objects().find(|o| o.key == pin_key) {
+            if pin.size > MAX_PIN_BYTES as u64 {
+                return BucketPin::Pin(PinFact::Unreadable(PinProblem::TooLarge));
+            }
+            return match self.fetch_object(&pin_key) {
+                Ok(Some(bytes)) => BucketPin::Pin(pin_of_bytes(&bytes)),
+                // Listed, then gone before the read: an unpin on another
+                // host. Read as listed without content, which keeps.
+                Ok(None) => BucketPin::Pin(PinFact::Unreadable(PinProblem::MissingContent)),
+                Err(_) => BucketPin::Unchecked(BucketError::Unreachable),
+            };
+        }
+        let Some(local_id) = local_pin_id else {
+            return BucketPin::NoPin { released: false };
+        };
+        if !objects().any(|o| o.key == release_key) {
+            return BucketPin::NoPin { released: false };
+        }
+        match self.fetch_object(&release_key) {
+            Ok(bytes) => BucketPin::NoPin {
+                released: bytes
+                    .as_deref()
+                    .and_then(release_of_bytes)
+                    .is_some_and(|r| r.pin.id.as_deref() == Some(local_id)),
+            },
+            Err(_) => BucketPin::Unchecked(BucketError::Unreachable),
         }
     }
 
@@ -1275,11 +1506,14 @@ impl CloudBackend {
         let listing = match self.bucket.list(prefix.clone(), None) {
             Ok(listing) => listing,
             Err(e) => {
-                return RemoteCopy::Unreadable(format!(
-                    "listing {} failed: {}",
-                    prefix,
-                    without_url_userinfo(&e.to_string())
-                ))
+                return RemoteCopy::Unlisted(
+                    listing_error(&e),
+                    format!(
+                        "listing {} failed: {}",
+                        prefix,
+                        without_url_userinfo(&e.to_string())
+                    ),
+                )
             }
         };
         let size_of = |key: &str| {
@@ -1574,7 +1808,7 @@ impl CloudBackend {
             )
         })?;
         let delete = |key: &str| {
-            self.bucket.delete_object(key).map(|_| ()).map_err(|e| {
+            self.delete_object(key).map(|_| ()).map_err(|e| {
                 anyhow::anyhow!(
                     "deleting {} failed: {}",
                     key,
@@ -1596,35 +1830,49 @@ impl CloudBackend {
         delete(&marker)
     }
 
-    /// List session IDs present in S3 under this backend's prefix.
+    /// List session IDs present in S3 under this backend's prefix. A listing
+    /// that fails warns and reads as none.
     fn s3_list_sessions(&self) -> Vec<String> {
+        self.try_list_sessions().unwrap_or_else(|e| {
+            eprintln!("warning: cloud sync: failed to list sessions: {}", e);
+            Vec::new()
+        })
+    }
+
+    /// The session IDs under this backend's prefix, one per
+    /// `<prefix>/<session-id>/` the bucket lists. `Err` when the listing
+    /// failed, which a caller that must tell an empty workspace from an
+    /// unreadable bucket keeps apart from an empty `Ok`.
+    pub(crate) fn try_list_sessions(&self) -> anyhow::Result<Vec<String>> {
         let prefix = format!("{}/", self.prefix);
-        match self.bucket.list(prefix.clone(), Some("/".to_string())) {
-            Ok(results) => {
-                let mut ids = Vec::new();
-                for list in &results {
-                    if let Some(ref prefixes) = list.common_prefixes {
-                        for cp in prefixes {
-                            // Common prefix looks like "<prefix>/<session-id>/"
-                            if let Some(name) = cp
-                                .prefix
-                                .strip_prefix(&prefix)
-                                .and_then(|s| s.strip_suffix('/'))
-                            {
-                                if !name.is_empty() {
-                                    ids.push(name.to_string());
-                                }
-                            }
+        let results = self
+            .bucket
+            .list(prefix.clone(), Some("/".to_string()))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "listing {} failed: {}",
+                    prefix,
+                    without_url_userinfo(&e.to_string())
+                )
+            })?;
+        let mut ids = Vec::new();
+        for list in &results {
+            if let Some(ref prefixes) = list.common_prefixes {
+                for cp in prefixes {
+                    // Common prefix looks like "<prefix>/<session-id>/"
+                    if let Some(name) = cp
+                        .prefix
+                        .strip_prefix(&prefix)
+                        .and_then(|s| s.strip_suffix('/'))
+                    {
+                        if !name.is_empty() {
+                            ids.push(name.to_string());
                         }
                     }
                 }
-                ids
-            }
-            Err(e) => {
-                eprintln!("warning: cloud sync: failed to list sessions: {}", e);
-                Vec::new()
             }
         }
+        Ok(ids)
     }
 
     /// Check if a session exists in S3 by looking for its state file.
@@ -1633,8 +1881,22 @@ impl CloudBackend {
         self.bucket.head_object(&key).is_ok()
     }
 
+    /// DELETE `key`. Every delete this backend makes itself goes through
+    /// here, as its own PUTs go through [`CloudBackend::put_object`], so a
+    /// read-only backend refuses them in one place. The key pushes and
+    /// deletes in `sync` take the bucket directly; they are reached only
+    /// through a context add or remove, which refuse first.
+    fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("S3 DELETE of {}", key))?;
+        self.bucket
+            .delete_object(key)
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+    }
+
     /// Wrapper around `bucket.put_object` that returns a Result.
     fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("S3 PUT of {}", key))?;
         self.bucket
             .put_object(key, data)
             .with_context(|| format!("S3 PUT failed for key: {}", key))?;
@@ -1781,13 +2043,13 @@ impl CloudBackend {
     /// Whether this process's writes to `id` wait for the tick that runs
     /// it ([`reentrancy::runs_inside_tick_of`]).
     fn defers(&self, id: &str) -> bool {
-        reentrancy::runs_inside_tick_of(id)
+        !self.probes.read_only && reentrancy::runs_inside_tick_of(id)
     }
 
     /// Whether this process is `id`'s own tick or a command it runs: the
     /// tick marker names `id`.
     fn is_own_tick(&self, id: &str) -> bool {
-        reentrancy::enclosing_tick().as_deref() == Some(id)
+        self.enclosing_tick().as_deref() == Some(id)
     }
 
     /// Append `payload` to `id`'s log locally, then push the state file;
@@ -1799,6 +2061,7 @@ impl CloudBackend {
         payload: &crate::engine::types::EventPayload,
         timestamp: &str,
     ) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("appending to the log of '{}'", id))?;
         if self.defers(id) {
             if let Some((_journal, _lock)) = self.open_batch(id)? {
                 return self.local.append_event(id, payload, timestamp);
@@ -1906,8 +2169,7 @@ impl CloudBackend {
             .get_object_if_present(&key)
             .with_context(|| format!("reading the batch-open marker of '{}'", id))?;
         if in_bucket.as_deref() == Some(ours.as_slice()) {
-            self.bucket
-                .delete_object(&key)
+            self.delete_object(&key)
                 .with_context(|| format!("deleting the batch-open marker of '{}'", id))?;
         }
         journal.abandon(&lock)
@@ -2022,6 +2284,7 @@ impl CloudBackend {
                 self.put_object(&ctx_key("manifest.json"), &data)?;
             }
         }
+        self.carry_pin_records(id);
         let state_path = self.local.session_dir(id).join(state_file_name(id));
         if state_path.exists() {
             let data = std::fs::read(&state_path)
@@ -2032,7 +2295,7 @@ impl CloudBackend {
         local.save(&version_path)?;
         self.push_version(id)?;
         let _ = in_parallel(&gone, |key| {
-            if let Err(e) = self.bucket.delete_object(ctx_key(key)) {
+            if let Err(e) = self.delete_object(&ctx_key(key)) {
                 eprintln!(
                     "warning: cloud sync: failed to delete context key '{}': {}",
                     key, e
@@ -2046,8 +2309,7 @@ impl CloudBackend {
         // closed, nothing would come back to delete a marker left behind,
         // and every import would refuse the session for good. The next
         // flush pushes the batch again, which changes nothing, and retries.
-        self.bucket
-            .delete_object(self.batch_marker_key(id))
+        self.delete_object(&self.batch_marker_key(id))
             .with_context(|| format!("deleting the batch-open marker of '{}'", id))?;
         journal.close(&lock)
     }
@@ -2081,8 +2343,7 @@ impl CloudBackend {
         let Some(lock) = journal.lock()? else {
             return Ok(());
         };
-        self.bucket
-            .delete_object(self.batch_marker_key(id))
+        self.delete_object(&self.batch_marker_key(id))
             .with_context(|| format!("deleting the batch-open marker of '{}'", id))?;
         journal.close(&lock)
     }
@@ -2433,7 +2694,9 @@ impl CloudBackend {
         for (key, meta) in &manifest.keys {
             let held = listed.contains(&format!("{}ctx/{}", prefix, key))
                 && remote.keys.get(key).is_some_and(|r| r.hash == meta.hash);
-            if is_host_local_key(key) || held {
+            // A pin record this copy indexes goes up as its own object,
+            // below, and leaves the index.
+            if is_host_local_key(key) || is_pin_record_key(key) || held {
                 continue;
             }
             let data = std::fs::read(ctx_dir.join(key))
@@ -2447,6 +2710,7 @@ impl CloudBackend {
             }
             Ok(())
         });
+        self.carry_pin_records(id);
         if let Some(data) = sync::bucket_manifest_bytes(&ctx_dir.join("manifest.json"))? {
             let s3_key = format!("{}/{}/ctx/manifest.json", self.prefix, id);
             if let Err(e) = self.put_object(&s3_key, &data) {
@@ -2531,6 +2795,33 @@ impl CloudBackend {
     }
 }
 
+/// The pin records a staged import holds under `ctx_dir`, as keys relative
+/// to it: `koto/links/pin` when it is a file, every file under it when it
+/// is a directory (an unreadable pin), and `koto/pin-release`. Sorted.
+fn staged_pin_records(ctx_dir: &Path) -> Vec<String> {
+    use crate::session::pin::{PIN_KEY, RELEASE_KEY};
+    fn files_under(dir: &Path, key: &str, out: &mut Vec<String>) {
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return;
+        };
+        if meta.file_type().is_file() {
+            out.push(key.to_string());
+        } else if meta.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    files_under(&entry.path(), &format!("{key}/{name}"), out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    files_under(&ctx_dir.join(PIN_KEY), PIN_KEY, &mut out);
+    files_under(&ctx_dir.join(RELEASE_KEY), RELEASE_KEY, &mut out);
+    out.sort();
+    out
+}
+
 /// A manifest pulled from the bucket, as this host keeps it: whatever
 /// host-local keys it lists dropped, and this host's own (`kept`) put back.
 /// Bytes that don't parse as a manifest are kept as they are.
@@ -2542,7 +2833,8 @@ fn with_host_local_keys(
     else {
         return pulled;
     };
-    if !manifest.drop_host_local() && kept.is_empty() {
+    let host_local = manifest.drop_host_local();
+    if !manifest.drop_pin_records() && !host_local && kept.is_empty() {
         return pulled;
     }
     manifest.keys.extend(kept.iter().cloned());
@@ -2597,6 +2889,7 @@ impl SessionBackend for CloudBackend {
     }
 
     fn cleanup(&self, id: &str) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("removing '{}'", id))?;
         // A workspace whose copy was imported on this host must not delete
         // the imported session that now holds the name.
         self.local_guard(id)?;
@@ -2818,7 +3111,7 @@ impl SessionBackend for CloudBackend {
                                     );
                                     continue;
                                 }
-                                if let Err(e) = self.bucket.delete_object(&obj.key) {
+                                if let Err(e) = self.delete_object(&obj.key) {
                                     eprintln!(
                                         "warning: cloud sync: relocate delete failed for {}: {}",
                                         obj.key, e
@@ -2911,6 +3204,25 @@ impl SessionBackend for CloudBackend {
         self.delete_remote_session_checked(id)
     }
 
+    fn bucket_pin(&self, id: &str, local_pin_id: Option<&str>) -> crate::session::pin::BucketPin {
+        self.bucket_pin_of(id, local_pin_id)
+    }
+
+    fn is_migrated_source(&self, id: &str) -> bool {
+        // Only the bucket's marker says yes. The local guard refuses, with
+        // the same error type, when the local copy at this name is the moved
+        // copy of a same-host import, which is the copy that holds the pin;
+        // it refuses with a plain error while such an import is pending. Any
+        // refusal of it says no. The write-side check then answers from this
+        // process's own listing; a failed listing warns and lets it pass,
+        // which says no too, so the pin keeps.
+        if self.local_guard(id).is_err() {
+            return false;
+        }
+        self.check_not_migrated_to_write(id)
+            .is_err_and(|e| e.downcast_ref::<SessionMigrated>().is_some())
+    }
+
     fn lock_state_file(&self, id: &str) -> Result<SessionLock, SessionError> {
         // `flock` is strictly a local, per-host primitive. Cloud
         // instances running on different hosts cannot observe each
@@ -2948,6 +3260,7 @@ impl CloudBackend {
         content: &[u8],
         writer: Option<&str>,
     ) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("storing '{}' in '{}'", key, session))?;
         if let Some(writer) = writer {
             crate::session::links::check_writer_key(key, writer)?;
         }
@@ -3142,6 +3455,7 @@ impl ContextStore for CloudBackend {
     }
 
     fn remove(&self, session: &str, key: &str) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("removing '{}' from '{}'", key, session))?;
         self.check_not_migrated_to_write(session)?;
         if is_host_local_key(key) {
             return self.local.remove(session, key);
@@ -3655,6 +3969,9 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 #[path = "cloud_takeover.rs"]
 mod takeover;
 
+#[path = "cloud_workspace_read.rs"]
+pub mod workspace_read;
+
 impl CloudBackend {
     /// Import session `req.name` from the workspace at `req.from` into this
     /// workspace as `req.target`, anchored at `req.anchor`.
@@ -4139,6 +4456,10 @@ impl CloudBackend {
         // objects. They describe the source's host, so the import leaves
         // them behind and the new session resolves its own.
         manifest.drop_host_local();
+        // The pin and its release record are objects of their own, carried
+        // by `stage_import` from what the bucket holds, whatever the
+        // manifest says of them.
+        manifest.drop_pin_records();
         crate::session::import_links::drop_from_manifest(&mut manifest);
         for key in manifest.keys.keys() {
             validate_context_key(key)
@@ -4220,6 +4541,17 @@ impl CloudBackend {
                 );
             }
             let path = ctx_dir.join(key);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| write_failed(parent, &e))?;
+            }
+            std::fs::write(&path, &bytes).map_err(|e| write_failed(&path, &e))?;
+        }
+        // The source's pin and release record, as the bucket holds them,
+        // carried verbatim, an unreadable pin included (R25). They stay out
+        // of the copy's manifest, as on every cloud copy (R20a), and
+        // `push_staged` pushes each as its own object.
+        for (key, bytes) in self.source_pin_records(source)? {
+            let path = ctx_dir.join(&key);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| write_failed(parent, &e))?;
             }
@@ -4325,6 +4657,12 @@ impl CloudBackend {
                 staged.join("ctx").join(key),
             ));
         }
+        for key in staged_pin_records(&staged.join("ctx")) {
+            uploads.push((
+                format!("{}ctx/{}", prefix, key),
+                staged.join("ctx").join(&key),
+            ));
+        }
         uploads.push((
             format!("{}ctx/manifest.json", prefix),
             staged.join("ctx").join("manifest.json"),
@@ -4348,6 +4686,43 @@ impl CloudBackend {
         Ok(pushed)
     }
 
+    /// The source's pin and release record objects, as `(key, bytes)` with
+    /// each key relative to `ctx/`: `koto/links/pin`, any object under it
+    /// (an unreadable pin), and `koto/pin-release`, from one listing of the
+    /// source's `ctx/koto/` objects and one read of each. The bytes are the
+    /// bucket's, unchecked: an unreadable pin travels as it is.
+    fn source_pin_records(
+        &self,
+        source: &ImportSource,
+    ) -> Result<Vec<(String, Vec<u8>)>, ImportError> {
+        use crate::session::context::is_pin_record_key;
+        let ctx = source.key("ctx/");
+        let pages = self
+            .bucket
+            .list(format!("{ctx}koto/"), None)
+            .map_err(|e| source.unreadable("the pin records", &e))?;
+        let mut records = Vec::new();
+        for obj in pages.iter().flat_map(|page| page.contents.iter()) {
+            let Some(key) = obj.key.strip_prefix(&ctx) else {
+                continue;
+            };
+            if !is_pin_record_key(key)
+                || crate::session::validate::validate_context_key(key).is_err()
+            {
+                continue;
+            }
+            let what = format!("context key {:?}", key);
+            // One gone between the listing and the read was unpinned there.
+            if let Some(bytes) = self
+                .fetch_object(&obj.key)
+                .map_err(|e| source.unreadable(&what, &e))?
+            {
+                records.push((key.to_string(), bytes));
+            }
+        }
+        Ok(records)
+    }
+
     /// Delete objects an import pushed before it failed.
     ///
     /// On a re-run over a target an earlier run left only in the bucket,
@@ -4356,7 +4731,7 @@ impl CloudBackend {
     /// free and imports afresh over whatever is left.
     fn take_back(&self, pushed: &[String]) {
         for key in pushed {
-            if let Err(e) = self.bucket.delete_object(key) {
+            if let Err(e) = self.delete_object(key) {
                 eprintln!(
                     "warning: cloud sync: failed to remove {} after a failed import: {}",
                     key, e

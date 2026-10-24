@@ -975,12 +975,19 @@ fn a_prune_in_the_source_workspace_never_removes_the_imported_session() {
     }
     let state = std::fs::read(h.state_path(NAME)).unwrap();
     for args in [
-        vec!["session", "prune", "--apply", "--all"],
         vec![
             "session",
             "prune",
             "--apply",
             "--all",
+            "--confirm-short-retention",
+        ],
+        vec![
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
             "--execution-dir",
             h.b.to_str().unwrap(),
         ],
@@ -1309,7 +1316,13 @@ fn an_import_from_an_agent_session_holds_the_moved_copy_and_its_hierarchy() {
     // A prune names the importer's anchor as why the copy and b are kept.
     for args in [
         &["session", "prune"][..],
-        &["session", "prune", "--apply", "--all"][..],
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ][..],
     ] {
         let out = ok(&h, &h.b, args, &[]).json();
         for name in ["coord-b", "b"] {
@@ -1480,7 +1493,13 @@ fn an_import_with_no_anchor_drops_the_held_by_and_the_session_is_released_later(
     let out = ok(
         &h2,
         &h2.a,
-        &["session", "prune", "--apply", "--all"],
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
         &keep_long,
     )
     .json();
@@ -1490,7 +1509,13 @@ fn an_import_with_no_anchor_drops_the_held_by_and_the_session_is_released_later(
     let out = ok(
         &h2,
         &h2.a,
-        &["session", "prune", "--apply", "--all"],
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
         &keep_short,
     )
     .json();
@@ -1564,7 +1589,19 @@ fn an_imported_anchor_holds_what_it_held_until_it_idles_out() {
     assert_eq!(a["imported"], true);
 
     // Inside the idle period: kept, naming the anchor.
-    let out = ok(&h, &h.b, &["session", "prune", "--apply", "--all"], &fast).json();
+    let out = ok(
+        &h,
+        &h.b,
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
+        &fast,
+    )
+    .json();
     assert!(kept_detail(&out, "b").contains(&anchor), "{out:#}");
 
     // Past it: the anchor reads closed, idle, from its import; b is kept
@@ -1578,7 +1615,19 @@ fn an_imported_anchor_holds_what_it_held_until_it_idles_out() {
         millis(a["stopped_at"].as_str().unwrap()),
         imported_at + 3000
     );
-    let out = ok(&h, &h.b, &["session", "prune", "--apply", "--all"], &fast).json();
+    let out = ok(
+        &h,
+        &h.b,
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
+        &fast,
+    )
+    .json();
     let why = kept_detail(&out, "b");
     assert!(why.contains("idle"), "{why}");
 
@@ -1588,7 +1637,19 @@ fn an_imported_anchor_holds_what_it_held_until_it_idles_out() {
     assert_eq!(hierarchy["kept"], false, "{hierarchy:#}");
     assert_eq!(hierarchy["retention"]["release"]["member"], anchor.as_str());
     assert_eq!(hierarchy["retention"]["release"]["close_kind"], "idle");
-    let out = ok(&h, &h.b, &["session", "prune", "--apply", "--all"], &fast).json();
+    let out = ok(
+        &h,
+        &h.b,
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
+        &fast,
+    )
+    .json();
     assert!(removed_names(&out).contains(&"b".to_string()), "{out:#}");
     let removed_anchor = out["removed"]
         .as_array()

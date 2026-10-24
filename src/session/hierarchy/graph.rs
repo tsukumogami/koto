@@ -326,6 +326,24 @@ impl Graph {
         self.facts.keys().map(String::as_str)
     }
 
+    /// Replace the pin the scan read for `name` with what a cloud host's
+    /// bucket check found (`crate::session::pin::reconcile`): the bucket's
+    /// pin object (`in_bucket`), or no pin for one released on another
+    /// host. Pins never change an edge, a component or a release instant,
+    /// so nothing else the scan read moves. A name not in the store is
+    /// left out.
+    pub(crate) fn set_pin(
+        &mut self,
+        name: &str,
+        pin: crate::session::pin::PinFact,
+        in_bucket: bool,
+    ) {
+        if let Some(facts) = self.facts.get_mut(name) {
+            facts.pin = pin;
+            facts.pin_in_bucket = in_bucket;
+        }
+    }
+
     /// Every edge, sorted.
     pub fn edges(&self) -> &[Edge] {
         &self.edges

@@ -177,6 +177,8 @@ Then koto decides whether to keep the session, and says so in the response's `re
 | `retention` | When |
 |---|---|
 | `{"retained": true, "reason": "failure_terminal"}` | The terminal is declared `failure: true`. The session is always kept, flag or not, so the parent's `retry_failed`, `koto rewind`, `koto status` and `koto context get` still work on it. |
+| `{"retained": true, "reason": "pinned", "kept_by_pin": true, "pin": {...}}` | The session holds a pin (see [session pin](#session-pin)), readable or not (`pin_unreadable`). Kept with or without `--no-cleanup`. A failure terminal that is also pinned reports `failure_terminal` with the pin beside it. Under the cloud backend the bucket's pin object counts, with `source: bucket`. |
+| `{"retained": true, "reason": "bucket_unchecked", "bucket_unchecked": {"error"}}` | Under the cloud backend only: the session would have been removed, and the bucket couldn't be checked for a pin (`unreachable` or `unparseable`). |
 | `{"retained": true, "reason": "hierarchy"}` | The session has a link or lineage: a link of its own (`koto/links/`), a `parent_workflow`, a `chain/parent`, or another session naming it through one of those, a link's session-id hint included. Kept with or without `--no-cleanup`; `koto session prune` reclaims it once its hierarchy is released (see [session hierarchy](#session-hierarchy)). |
 | `{"retained": true, "reason": "no_cleanup"}` | Any other terminal, ticked with `--no-cleanup`. |
 | `{"retained": false}` | Any other terminal, ticked without the flag. koto removes the session directory after the response. |
@@ -778,7 +780,7 @@ The text form says kept or released and why, then lists the keepers (a stale anc
 
 When nothing is alive, `keepers` is empty and `retention` is `{"release": {"at", "member", "close_kind"}, "passes_at"}`, with `close_kind` one of `terminal`, `cancelled`, `observed` or `idle`; `kept` stays `true` until `passes_at`. A stale keeper whose marker or harness session id fails the pattern carries `"malformed_marker": true` and no `close_command`. Each anchor member also carries `last_activity`, the instant its idle close and stale report count from (`null` when it can't be read); the `hierarchy` object a prune entry carries leaves it out.
 
-The command reads the local sessions directory directly and writes nothing; under the cloud backend it lists and reads no session through the bucket. A malformed retention setting, a malformed name, or a name with no session exits 2; a sessions directory that can't be listed exits 3. koto assumes `~/.koto` is private to its user: anyone who can write the store can forge the records this command reads.
+The command reads the local sessions directory directly and writes nothing; under the cloud backend it asks the bucket only about the pins the scan found, and lists and reads no other session through it. A malformed retention setting, a malformed name, or a name with no session exits 2; a sessions directory that can't be listed exits 3. koto assumes `~/.koto` is private to its user: anyone who can write the store can forge the records this command reads.
 
 #### session cleanup
 
@@ -799,6 +801,24 @@ An explicit removal still removes when the retention rule would keep the session
 
 `koto cancel --cleanup <name>` does the same after appending the cancel: its output gains `live_members` (and `live_members_error` when the judgment failed), naming every other live member of the cancelled session's hierarchy, such as a dispatcher that is still running. A `koto cancel` without `--cleanup` removes nothing and carries neither field.
 
+A pinned session is refused: both commands exit 2 with code `pinned` (or `pin_unreadable`), name the pin's reason, setter and time, and change nothing, so `koto cancel --cleanup` doesn't cancel it either. Unpin it first with `koto session unpin <name>`. A migrated source is the exception: `koto session import` carried its pin to the moved copy, so the source's pin keeps nothing and cleanup removes it, while `koto session unpin` refuses it. If an older release ran the import, check that the moved copy is pinned before removing the source. Under the cloud backend a bucket that can't be checked for a pin refuses with exit 3, code `bucket_unchecked`.
+
+#### session pin
+
+Pins a session so no removal by rule takes it, until it is unpinned. The [session retention guide](session-retention.md) covers what a pin keeps and which releases honour it.
+
+```bash
+koto session pin <name> --reason <text>
+koto session unpin <name> [--reason <text>]
+koto session list --pinned [--json]
+```
+
+`koto session pin` prints `{"name", "pin": {"reason", "set_by", "set_at"}, "store"}`, with `store` `"local"` or `{"cloud": "<bucket>"}`, and exits 0; a session already pinned keeps its pin and prints it. It refuses with exit 2, writing nothing, a reason that is blank, longer than 500 characters or holds a control character (`invalid_reason`), a name with no session (`no_session`), an anchor, a close record or a migrated source (`not_pinnable`), and a session whose pin can't be read (`pin_unreadable`). Under the cloud backend the pin is written to the bucket as its own object and nothing else; a write the bucket refuses exits 3 (`pin_not_pushed`) and leaves no pin anywhere, and a bucket that can't be listed exits 3 (`bucket_unchecked`).
+
+`koto session unpin` prints `{"name", "released"}`: the release record (`released_by`, `authority`, `authority_at`, `authority_source`, `reason`, `released_at`, and the released pin's `reason`, `set_by` and `set_at`), or `null` when the session held no pin. A call with no `KOTO_ANCHOR` may unpin. Under an anchor it needs the `release-pin` authority that anchor's agent session was handed at its start, and is refused otherwise with exit 2, `authority_required`, naming the authority and the anchor. Under the cloud backend the release record and the pin's removal are the bucket's objects; either one failing exits 3 with the pin still in force.
+
+`koto session list --pinned` lists every pinned session, sorted by name, with its pin or `pin_unreadable`, whether it is `running` or `finished`, and `source`. Under the cloud backend it also lists sessions pinned in the bucket, with `source: bucket` and `state` `unknown` when this host holds no copy; when the bucket can't be listed it prints this host's pins as `{"pinned": [...], "bucket_unchecked": {"error"}}` and exits 3.
+
 #### session prune
 
 Removes finished sessions as a set, after showing the set first.
@@ -806,7 +826,7 @@ Removes finished sessions as a set, after showing the set first.
 ```bash
 koto session prune [--execution-dir <dir>] [--older-than <age>] [--all]
 koto session prune --apply --plan <token>
-koto session prune --apply (--execution-dir <dir> | --older-than <age> | --all)...
+koto session prune --apply (--execution-dir <dir> | --older-than <age> | --all)... [--confirm-short-retention]
 koto session prune --migrated-from <workspace> [--source-retired] [--apply [--plan <token>]]
 ```
 
@@ -823,6 +843,7 @@ Every session is judged by the retention rule over one scan of the store, with o
 
 | Rule | Keeps a session that |
 |------|----------------------|
+| `p` | holds a pin, readable or not (see [session pin](#session-pin)). The entry carries `kept_by_pin` and `pin` or `pin_unreadable`, and a `hierarchy` object when the hierarchy is kept as well. A pin keeps its own session only. Under the cloud backend a preview checks the bucket for each session it would remove, and the apply checks again just before each delete: a pin object there keeps the session (`source: bucket`), and a bucket that can't be checked keeps it with `bucket_unchecked` |
 | `a` | is alive: a koto session that runs, or can't be read (its header, log or template is unreadable, or its directory is a symlink), or an anchor that is open |
 | `h` | belongs to a hierarchy the retention rule keeps: another member is alive, `retention.keep` hasn't passed since the hierarchy's release instant, or something in it can't be read (a malformed link, close record or `chain/parent`, an unreadable log, a timestamp more than five minutes in the future, or any session's header, which could name any other) |
 | `d` | has a `chain/parent` context key that isn't exactly one session name |
@@ -861,7 +882,9 @@ A removable anchor or close session also carries `session_kind` (`anchor` or `an
 
 The token is the first 32 hex digits of a SHA-256 over the would-remove list's kinds, names and session ids, so it changes when a session joins or leaves the list, or a removed name is taken by a new session, and not when anything outside the list changes.
 
-**Applying.** Every apply takes one fresh scan of the store and judges it again. `--apply --plan <token>` does so with the filters the preview ran with (the stored plan records them, and passing a filter alongside `--plan` is an error). It refuses when the fresh judgment would remove anything the plan didn't name: it removes nothing, exits 4 with `prune_plan_stale`, and lists under `added` and `dropped` how the set changed. A fresh judgment that only keeps more than the plan isn't a refusal: what the plan named and the rules now keep (a session that gained a live member since the preview, say) goes to `skipped` with its reason, and the rest is removed, exit 0. A token with no stored plan (it expired, was applied, or was previewed on another host) also exits 4, with `prune_plan_unknown`. `--apply` without `--plan` removes the set it works out now, in one step with no preview anyone read, and needs `--execution-dir`, `--older-than` or `--all` so that a bare `--apply` can't empty the store by mistake. It is the form for scheduled runs; the rules apply to it all the same, but only `--plan` guarantees that nothing goes that someone didn't see.
+**Applying.** Every apply takes one fresh scan of the store and judges it again. `--apply --plan <token>` does so with the filters the preview ran with (the stored plan records them, and passing a filter alongside `--plan` is an error). It refuses when the fresh judgment would remove anything the plan didn't name: it removes nothing, exits 4 with `prune_plan_stale`, and lists under `added` and `dropped` how the set changed. A fresh judgment that only keeps more than the plan isn't a refusal: what the plan named and the rules now keep (a session that gained a live member since the preview, say) goes to `skipped` with its reason, and the rest is removed, exit 0. A token with no stored plan (it expired, was applied, or was previewed on another host) also exits 4, with `prune_plan_unknown`. `--apply` without `--plan` removes the set it works out now, in one step with no preview anyone read, and needs `--execution-dir`, `--older-than` or `--all` so that a bare `--apply` can't empty the store by mistake. It is the form for scheduled runs; the rules apply to it all the same, but only `--plan` guarantees that nothing goes that someone didn't see. Every apply prints the store it acts on to stderr before it removes anything (`koto session prune: removing from the cloud store at <path> (bucket <name>)`), so a log shows which store was hit.
+
+**Short retention under the cloud backend.** A retention under an hour releases almost every finished session, and under the cloud backend each removal also deletes the session's copy in the bucket. So `--apply` without `--plan` refuses when the backend is cloud, `retention.keep` or `retention.idle_period` resolves under an hour (from the environment or a config file), the selection has no age bound of an hour or more (`--all`, `--execution-dir` alone, or `--older-than` under an hour), and the set isn't empty. It exits 2 with `prune_short_retention` and removes nothing, locally or in the bucket. The error carries `retention` (each short setting with its `value` and where it came `from`), `backend`, `bucket`, `store` and `would_remove`, and its message names the safe path: preview without `--apply`, then `--apply --plan <token>`. `--confirm-short-retention` removes the set anyway. The guard reads the backend koto resolved, not where `HOME` points: the cloud backend can come from `KOTO_SESSION_BACKEND` and the `KOTO_SESSION_CLOUD_*` variables alone, so a scratch `HOME` doesn't keep a command off the bucket. The local backend, `--apply --plan` and the preview are unchanged.
 
 Sessions are removed one hierarchy at a time. Every member to be removed is locked first, then the hierarchy is judged again as a unit, reading each member afresh; a hierarchy the rule now keeps loses nothing, and its members go to `skipped` with the reason. Then each member is checked under its lock: one replaced by a new session under the same name, a koto session that is no longer finished (rewound, say), and one rules d to g now keep are skipped, as is one another koto process holds. Children go before their parents and anchors before their close sessions, and a close session whose anchor is still there (skipped, say) is skipped too, so no apply removes a close session while its anchor remains. A session created after the apply's own scan that links to a member isn't seen. Under the cloud backend a session's remote copy is deleted before its local directory, apart from a migration marker, so a failure leaves the local copy for a later prune to retry. The remote delete isn't conditional: a push from another host that lands between rule g's check and the delete is lost with it; that window can't close without conditional deletes. The prune never touches the run journal, and writes nothing into any session it doesn't remove.
 
@@ -870,7 +893,7 @@ Sessions are removed one hierarchy at a time. Every member to be removed is lock
 | Exit code | Meaning |
 |-----------|---------|
 | 0 | Previewed, or applied with nothing failed (skipped sessions included) |
-| 2 | `invalid_arguments`: a malformed token or age, `--plan` without `--apply` or with a filter, or `--apply` with nothing naming the set; or `invalid_retention_setting`: a retention setting is malformed, and the message names it. Nothing was judged or removed |
+| 2 | `invalid_arguments`: a malformed token or age, `--plan` without `--apply` or with a filter, or `--apply` with nothing naming the set; or `invalid_retention_setting`: a retention setting is malformed, and the message names it. Nothing was judged or removed. Or `prune_short_retention`: a direct apply under the cloud backend with a retention under an hour; nothing was removed |
 | 3 | A session couldn't be removed; it is listed under `failed`. Or `prune_scan_failed`: the sessions directory can't be listed, so nothing was judged or removed, in preview and in apply |
 | 4 | `prune_plan_stale` or `prune_plan_unknown`; nothing was removed |
 
@@ -1457,7 +1480,7 @@ Reclaims a workspace tree rooted at a terminal session. The verb reads the root 
 **Subtree scope.** The root is judged with every edge. Each descendant is judged with only the lineage between the root and its direct children dropped, so naming the root lets you dissolve its subtree: a child whose own hierarchy (its descendants, and anything linked to them) is released past `retention.keep` goes, while a child with a live dispatcher stays, and so does a grandchild under it. The root goes only when its whole hierarchy is released, which includes every child, so no kept child is left naming a removed parent. Members the rule keeps are listed with their reasons; nothing outside the subtree is removed. Before anything is removed, every released member is locked and judged again, and one now kept, held by another process, or replaced under its name is skipped, as is any member with a skipped one below it. A stale observed anchor that keeps a member is listed with its close command, as `koto session prune` lists it; the prune closes nothing. A malformed retention setting is refused (exit 2) and a sessions directory that can't be listed exits 3; neither removes anything.
 
 ```bash
-koto workspace prune --root <session-id> [--dry-run] [--yes] [--force]
+koto workspace prune --root <session-id> [--dry-run] [--yes] [--confirm-short-retention] [--force]
 ```
 
 **Required:**
@@ -1465,7 +1488,8 @@ koto workspace prune --root <session-id> [--dry-run] [--yes] [--force]
 
 **Optional:**
 - `--dry-run` -- Print what would be removed, in order, and what is kept and why, then exit 0 without reclaiming.
-- `--yes` -- Skip the interactive confirmation prompt. Required for cron-friendly invocation.
+- `--yes` -- Skip the interactive confirmation prompt. Required for cron-friendly invocation. Under the cloud backend, with `retention.keep` or `retention.idle_period` under an hour, a `--yes` run that would remove anything refuses (exit 2, `"code": "prune_short_retention"`, with `retention`, `backend`, `bucket`, `store` and `would_remove`) and removes nothing, since each removal also deletes the copy in the bucket and nobody reads the list first. Run without `--yes` to review it at the prompt, or pass `--confirm-short-retention`.
+- `--confirm-short-retention` -- With `--yes`, remove under a retention below an hour on the cloud backend.
 - `--force` -- Bypass the terminal-state safety gate. Allows judging a tree whose root has NOT reached a terminal state. It never overrides the retention rule: a live root, and every member whose hierarchy has a live member, stays. Combining `--yes` with `--force` adds a second confirmation prompt that requires typing the literal string `force-prune` to proceed.
 
 **Symlink refusal:** the verb `lstat()`s the root before any directory traversal. A root that is a symlink (pointing inside or outside `~/.koto/`) is rejected categorically with exit code 2 — this is a workspace-escape mitigation.

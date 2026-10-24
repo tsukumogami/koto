@@ -592,6 +592,12 @@ pub fn handle_pin(backend: &Backend, name: &str, reason: &str) -> Result<()> {
     let outcome = pin::pin(backend, name, reason)
         .unwrap_or_else(|e| super::exit_with_error_code(e.to_json(), e.exit));
     let p = outcome.pin();
+    let store = match backend {
+        Backend::Local(_) => serde_json::json!("local"),
+        Backend::Cloud(_) => serde_json::json!({
+            "cloud": backend.store_identity().and_then(|s| s.bucket),
+        }),
+    };
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({
@@ -601,7 +607,7 @@ pub fn handle_pin(backend: &Backend, name: &str, reason: &str) -> Result<()> {
                 "set_by": p.set_by.as_deref().map(display_text),
                 "set_at": display_text(&p.set_at),
             },
-            "store": "local",
+            "store": store,
         }))?
     );
     Ok(())
@@ -635,8 +641,9 @@ pub fn handle_unpin(backend: &Backend, name: &str, reason: Option<&str>) -> Resu
 /// `name` belongs to and print the verdict, its members and the settings.
 ///
 /// Reads the local sessions directory directly and writes nothing; under
-/// the cloud backend no other session's data is listed or read from the
-/// bucket. A malformed name or retention setting exits 2, as does a name
+/// the cloud backend the bucket is asked only about the pins the scan read
+/// (one check each), and no other session's data is listed or read from it.
+/// A malformed name or retention setting exits 2, as does a name
 /// with no session; a sessions directory that can't be listed exits 3.
 ///
 /// For a pinned session it shows the pin and that the pin keeps that
@@ -658,12 +665,15 @@ pub fn handle_hierarchy(backend: &Backend, name: &str, json: bool) -> Result<()>
     let settings = RetentionSettings::load()
         .unwrap_or_else(|e| fail(format!("{e:#}"), super::EXIT_CALLER_ERROR));
     let base = backend.local_base_dir();
-    let graph = Graph::scan(base).unwrap_or_else(|e| {
+    let mut graph = Graph::scan(base).unwrap_or_else(|e| {
         fail(
             format!("the sessions directory can't be read, so nothing can be judged: {e:#}"),
             super::EXIT_INFRASTRUCTURE,
         )
     });
+    // Under the cloud backend, each pin the scan read is checked in the
+    // bucket, so one released on another host isn't shown as in force.
+    crate::session::pin::reconcile(backend, &mut graph);
     if !graph.contains(name) {
         fail(
             format!("session '{name}' does not exist"),
@@ -712,10 +722,20 @@ pub fn handle_hierarchy(backend: &Backend, name: &str, json: bool) -> Result<()>
 /// It reads the local sessions directory directly, as the retention engine
 /// does, and writes nothing. A malformed retention setting exits 2 and a
 /// sessions directory that can't be listed exits 3.
+///
+/// Under the cloud backend each local pin is checked in the bucket (one
+/// released on another host isn't listed, one the bucket holds is
+/// `source: bucket`), and one listing of the workspace's prefix adds every
+/// session pinned in the bucket that this host holds no pinned copy of, with
+/// `source: bucket` and the `state` `unknown` when no copy is here to read
+/// it from. When the bucket can't be listed, the local rows are printed
+/// with `bucket_unchecked` (`{"pinned": [...], "bucket_unchecked":
+/// {"error"}}` in JSON) and the command exits 3.
 pub fn handle_list_pinned(backend: &Backend, json: bool) -> Result<()> {
     use crate::engine::types::SessionKind;
     use crate::session::hierarchy::{self, Graph, Judge, RetentionSettings};
     use crate::session::inventory::{inspect, SessionStatus, TemplateCache};
+    use crate::session::pin::{BucketPin, PinFact};
 
     let fail = |error: String, code: i32| -> ! {
         super::exit_with_error_code(
@@ -726,44 +746,74 @@ pub fn handle_list_pinned(backend: &Backend, json: bool) -> Result<()> {
     let settings = RetentionSettings::load()
         .unwrap_or_else(|e| fail(format!("{e:#}"), super::EXIT_CALLER_ERROR));
     let base = backend.local_base_dir();
-    let graph = Graph::scan(base).unwrap_or_else(|e| {
+    let mut graph = Graph::scan(base).unwrap_or_else(|e| {
         fail(
             format!("the sessions directory can't be read, so no pin can be listed: {e:#}"),
             super::EXIT_INFRASTRUCTURE,
         )
     });
+    crate::session::pin::reconcile(backend, &mut graph);
     let mut judge = Judge::new(&graph, settings, std::time::SystemTime::now());
     let mut cache = TemplateCache::new();
-    let source = crate::session::pin::SOURCE_LOCAL;
-    // `Graph::names` is sorted, so the rows are too.
-    let pinned: Vec<(String, crate::session::pin::PinFact, SessionKind)> = graph
+    // (name, pin, kind, source); `None` for the kind of a session this host
+    // holds no copy of.
+    let mut pinned: Vec<(String, PinFact, Option<SessionKind>, &'static str)> = graph
         .names()
         .filter_map(|n| {
             let facts = graph.facts(n)?;
-            facts
-                .pin
-                .is_pinned()
-                .then(|| (n.to_string(), facts.pin.clone(), facts.kind))
+            facts.pin.is_pinned().then(|| {
+                (
+                    n.to_string(),
+                    facts.pin.clone(),
+                    Some(facts.kind),
+                    facts.pin_source(),
+                )
+            })
         })
         .collect();
+    let mut unchecked: Option<crate::session::pin::BucketError> = None;
+    if let Backend::Cloud(cloud) = backend {
+        match cloud.bucket_pinned_sessions() {
+            Ok(names) => {
+                for name in names {
+                    if pinned.iter().any(|(n, ..)| *n == name) {
+                        continue;
+                    }
+                    match cloud.bucket_pin(&name, None) {
+                        BucketPin::Pin(pin) if pin.is_pinned() => {
+                            let kind = graph.facts(&name).map(|f| f.kind);
+                            pinned.push((name, pin, kind, crate::session::pin::SOURCE_BUCKET));
+                        }
+                        BucketPin::Unchecked(e) => {
+                            unchecked.get_or_insert(e);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => unchecked = Some(e),
+        }
+    }
+    pinned.sort_by(|a, b| a.0.cmp(&b.0));
     let mut rows = Vec::new();
     let mut lines = Vec::new();
-    for (name, pin, kind) in pinned {
+    for (name, pin, kind, source) in pinned {
         let state = match kind {
-            SessionKind::Ordinary => match inspect(base, &name, &mut cache).status {
+            Some(SessionKind::Ordinary) => match inspect(base, &name, &mut cache).status {
                 SessionStatus::Running => "running",
                 SessionStatus::Terminal | SessionStatus::Cancelled => "finished",
                 SessionStatus::Unreadable => "unreadable",
             },
             // An anchor or close record found pinned (it arrived by
             // import): running while the engine counts it alive.
-            SessionKind::Anchor | SessionKind::AnchorClose => {
+            Some(SessionKind::Anchor | SessionKind::AnchorClose) => {
                 if judge.is_alive(&name) {
                     "running"
                 } else {
                     "finished"
                 }
             }
+            None => "unknown",
         };
         let shown = hierarchy::sanitize(&name);
         let mut row = serde_json::Map::new();
@@ -780,6 +830,26 @@ pub fn handle_list_pinned(backend: &Backend, json: bool) -> Result<()> {
             "{shown} ({state}): {}",
             hierarchy::pin_text(&pin).unwrap_or_default()
         ));
+    }
+    if let Some(error) = unchecked {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "pinned": rows,
+                    "bucket_unchecked": {"error": error.as_str()},
+                }))?
+            );
+        } else {
+            for line in lines {
+                println!("{line}");
+            }
+            println!(
+                "bucket not checked for pins ({}); only this host's pins are listed",
+                error.as_str()
+            );
+        }
+        std::process::exit(super::EXIT_INFRASTRUCTURE);
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);

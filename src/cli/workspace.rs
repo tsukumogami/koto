@@ -69,7 +69,8 @@ impl TerminalStatus {
     }
 }
 
-/// Handle `koto workspace prune --root <id> [--dry-run] [--yes] [--force]`.
+/// Handle `koto workspace prune --root <id> [--dry-run] [--yes]
+/// [--confirm-short-retention] [--force]`.
 ///
 /// The root and its descendants are each judged by the retention rule
 /// (see [`scope_for`]); only the members it releases are removed, and the
@@ -84,6 +85,7 @@ pub fn handle_prune(
     root: String,
     dry_run: bool,
     yes: bool,
+    confirm_short_retention: bool,
     force: bool,
 ) -> Result<()> {
     // 1. Parse-time validation. Reject injection attempts before any
@@ -161,7 +163,7 @@ pub fn handle_prune(
             2,
         )
     });
-    let graph = Graph::scan(backend.local_base_dir()).unwrap_or_else(|e| {
+    let mut graph = Graph::scan(backend.local_base_dir()).unwrap_or_else(|e| {
         exit_with_error_code(
             json!({
                 "error": format!(
@@ -172,8 +174,25 @@ pub fn handle_prune(
             3,
         )
     });
+    // Under the cloud backend, a pin the scan read and the bucket's release
+    // record names was released on another host, and no longer keeps.
+    crate::session::pin::reconcile(backend, &mut graph);
     let now = std::time::SystemTime::now();
-    let plan = judge_subtree(&graph, &settings, now, &root, &descendants, &by_name);
+    let mut plan = judge_subtree(&graph, &settings, now, &root, &descendants, &by_name);
+    // A preview someone reads before deciding shows a pin another host set:
+    // under the cloud backend each member it would remove is checked in the
+    // bucket. With `--yes` nobody reads it first, and the guard at each
+    // delete asks the bucket instead.
+    if dry_run || !yes {
+        keep_bucket_pinned(backend, &mut plan);
+    }
+
+    // With `--yes` nobody reads the list before it goes. Under the cloud
+    // backend each removal also deletes the copy in the bucket, so a
+    // retention under an hour needs `--confirm-short-retention` too.
+    if yes && !dry_run && !confirm_short_retention && backend.is_cloud() {
+        refuse_short_retention(backend, &settings, &root, plan.remove.len());
+    }
 
     // 8. Compute non-terminal sessions in the to-be-pruned set. Operator
     //    visibility before any confirmation prompt.
@@ -302,6 +321,41 @@ impl KeptMember {
     }
 }
 
+/// Refuse a `--yes` run under the cloud backend that would remove members
+/// with a removal setting under an hour. A run that would remove nothing
+/// goes on.
+fn refuse_short_retention(
+    backend: &crate::session::Backend,
+    settings: &RetentionSettings,
+    root: &str,
+    would_remove: usize,
+) {
+    use super::short_retention;
+    let short = short_retention::short_settings(settings);
+    if would_remove == 0 || short.is_empty() {
+        return;
+    }
+    let store = short_retention::Store::of(backend);
+    let mut out = short_retention::refusal_fields(&short, &store, would_remove);
+    out.insert(
+        "error".into(),
+        json!(format!(
+            "refusing to remove {would_remove} session{} under {} from {} with a retention \
+             under an hour ({}): each removal also deletes the session's copy in the bucket; \
+             nothing was removed. Run without --yes to review the list and confirm at the \
+             prompt, or with --dry-run to preview it; or pass --confirm-short-retention to \
+             remove it now",
+            if would_remove == 1 { "" } else { "s" },
+            hierarchy::sanitize(root),
+            store.describe(),
+            short_retention::settings_text(&short),
+        )),
+    );
+    out.insert("code".into(), json!(short_retention::CODE));
+    out.insert("command".into(), json!("workspace prune"));
+    exit_with_error_code(serde_json::Value::Object(out), 2)
+}
+
 /// What a workspace prune removes and keeps.
 struct SubtreePlan {
     /// Deepest first, the root last.
@@ -364,7 +418,7 @@ fn judge_subtree(
                         name: member.to_string(),
                         reason: pinned,
                         hierarchy: Some(hierarchy::to_json(&j, settings)),
-                        pin: hierarchy::pin_fields(&j.pin, crate::session::pin::SOURCE_LOCAL),
+                        pin: hierarchy::pin_fields(&j.pin, j.pin_source),
                     });
                 } else if j.verdict.is_kept() {
                     plan.kept.push(KeptMember {
@@ -396,9 +450,10 @@ fn judge_subtree(
         }
     }
     for member in by_name {
-        let Some(pin) = graph.facts(member).map(|f| &f.pin) else {
+        let Some(facts) = graph.facts(member) else {
             continue;
         };
+        let pin = &facts.pin;
         let Some(reason) = hierarchy::pin_text(pin) else {
             continue;
         };
@@ -409,10 +464,36 @@ fn judge_subtree(
                 .judge(member, &Scope::Whole)
                 .ok()
                 .map(|j| hierarchy::to_json(&j, settings)),
-            pin: hierarchy::pin_fields(pin, crate::session::pin::SOURCE_LOCAL),
+            pin: hierarchy::pin_fields(pin, facts.pin_source()),
         });
     }
     plan
+}
+
+/// Under the cloud backend, run the removal guard's bucket check for each
+/// member `plan` would remove, and list each one the bucket keeps (a pin
+/// object, or a bucket that couldn't be checked) as kept, with the guard's
+/// fields. Like a member planned as kept by its pin, it keeps nothing above
+/// it. Nothing on the local backend, whose pins the scan already read.
+fn keep_bucket_pinned(backend: &crate::session::Backend, plan: &mut SubtreePlan) {
+    if !backend.is_cloud() {
+        return;
+    }
+    let mut remove = Vec::with_capacity(plan.remove.len());
+    for member in std::mem::take(&mut plan.remove) {
+        let guard = crate::session::pin::guard_removal(backend, &member.name);
+        if !guard.keeps() {
+            remove.push(member);
+            continue;
+        }
+        plan.kept.push(KeptMember {
+            name: member.name,
+            reason: guard.text().unwrap_or_default(),
+            hierarchy: None,
+            pin: guard.fields(),
+        });
+    }
+    plan.remove = remove;
 }
 
 /// What the reclaim did with each released member.
@@ -529,9 +610,21 @@ fn reclaim(
         }) {
             Ok(crate::session::pin::Removal::Removed) => out.removed.push(name.to_string()),
             Ok(crate::session::pin::Removal::Kept(guard)) => {
+                // A local pin the guard read was set since the scan; a pin
+                // in the bucket, or a bucket that couldn't be checked, the
+                // scan never saw.
+                let reason = match &guard {
+                    crate::session::pin::Guard::BucketUnchecked { .. } => {
+                        guard.text().unwrap_or_default()
+                    }
+                    g if g.source() == crate::session::pin::SOURCE_BUCKET => {
+                        format!("kept by its pin: {}", g.text().unwrap_or_default())
+                    }
+                    g => format!("now kept by its pin: {}", g.text().unwrap_or_default()),
+                };
                 let mut entry = json!({
                     "name": name,
-                    "reason": format!("now kept by its pin: {}", guard.text().unwrap_or_default()),
+                    "reason": reason,
                 });
                 for (k, v) in guard.fields() {
                     entry[k] = v;
@@ -857,7 +950,7 @@ pub(crate) fn sweep_terminal_descendants(
     };
     tree.walk(parent, &mut sweep);
     let mut pinned = sweep.pinned;
-    pinned.extend(by_name.iter().map(|(n, pin)| pinned_child(n, pin)));
+    pinned.extend(by_name.iter().map(|(n, guard)| pinned_child(n, guard)));
     pinned
 }
 
@@ -893,7 +986,7 @@ impl DescendantVisitor for Sweep<'_> {
             Ok(crate::session::pin::Removal::Kept(guard)) => {
                 #[cfg(unix)]
                 super::forget_finished_record(backend, child);
-                self.pinned.push(pinned_child(child, &guard.fact()));
+                self.pinned.push(pinned_child(child, &guard));
                 // Kept by its own pin, which keeps nothing above it: the
                 // parent is judged as if this child had gone.
                 true
@@ -932,12 +1025,14 @@ fn lineage_of(tree: &LineageTree, root: &str) -> Vec<String> {
 /// its `parent_workflow`, which import doesn't carry and which can be gone.
 /// These are never removed here (a walk of lineage never reaches them);
 /// they are listed so the parent's report names every child a pin keeps.
-/// A read only: it writes nothing into the child or its pin.
+/// A read only: it writes nothing into the child or its pin, and, being a
+/// report of sessions nothing here removes, asks no bucket (R28): each pin
+/// is this host's copy's.
 fn pinned_children_by_name(
     backend: &dyn SessionBackend,
     root: &str,
     lineage: &[String],
-) -> Vec<(String, crate::session::pin::PinFact)> {
+) -> Vec<(String, crate::session::pin::Guard)> {
     let walked: HashSet<&str> = std::iter::once(root)
         .chain(lineage.iter().map(String::as_str))
         .collect();
@@ -959,20 +1054,26 @@ fn pinned_children_by_name(
         .filter(|n| validate_session_id(n).is_ok() && backend.exists(n))
         .filter(|n| is_terminal_session(backend, n))
         .filter_map(|n| {
-            let pin = crate::session::pin::local_guard(backend, &n).fact();
-            pin.is_pinned().then_some((n, pin))
+            let guard = crate::session::pin::local_guard(backend, &n);
+            guard.keeps().then_some((n, guard))
         })
         .collect()
 }
 
-/// The `kept_children` entry for a child its own pin keeps: reason
-/// `pinned`, the pin's text as its detail, and the pin's fields.
-fn pinned_child(name: &str, pin: &crate::session::pin::PinFact) -> KeptChild {
+/// The `kept_children` entry for a child the pin guard keeps: reason
+/// `pinned` (or `bucket_unchecked`, under the cloud backend), the guard's
+/// text as its detail, and its fields, each pin with where it was read.
+fn pinned_child(name: &str, guard: &crate::session::pin::Guard) -> KeptChild {
+    use super::next_types::RetentionReason;
+    let reason = match guard {
+        crate::session::pin::Guard::BucketUnchecked { .. } => RetentionReason::BucketUnchecked,
+        _ => RetentionReason::Pinned,
+    };
     KeptChild {
         name: name.to_string(),
-        reason: super::next_types::RetentionReason::Pinned.as_str(),
-        detail: hierarchy::pin_text(pin).unwrap_or_default(),
-        pin: hierarchy::pin_fields(pin, crate::session::pin::SOURCE_LOCAL),
+        reason: reason.as_str(),
+        detail: guard.text().unwrap_or_default(),
+        pin: guard.fields(),
     }
 }
 
@@ -1030,7 +1131,10 @@ pub(crate) fn kept_children(
         .map(|child| {
             let facts = hierarchy::SessionFacts::read(&base, &child);
             if facts.pin.is_pinned() {
-                return pinned_child(&child, &facts.pin);
+                return pinned_child(
+                    &child,
+                    &crate::session::pin::Guard::of(facts.pin.clone(), facts.pin_source()),
+                );
             }
             let mut via: Vec<String> = facts
                 .links
@@ -1064,7 +1168,7 @@ pub(crate) fn kept_children(
             }
         })
         .collect();
-    kept.extend(by_name.iter().map(|(n, pin)| pinned_child(n, pin)));
+    kept.extend(by_name.iter().map(|(n, guard)| pinned_child(n, guard)));
     kept
 }
 

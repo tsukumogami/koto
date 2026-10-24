@@ -7,6 +7,9 @@
 //! plan didn't name; what the plan named and the rules now keep is skipped
 //! and listed. `--apply` alone (with `--execution-dir`, `--older-than` or
 //! `--all`) removes the set it works out now. Both modes run the same rules.
+//! Under the cloud backend that direct form refuses a selection with no age
+//! bound of an hour or more while a removal setting is below an hour, unless
+//! `--confirm-short-retention` is given ([`super::short_retention`]).
 //!
 //! Every session is judged by the retention engine
 //! ([`crate::session::hierarchy`]) over one scan of the store, with one set
@@ -51,7 +54,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::exit_with_error_code;
+use super::{exit_with_error_code, short_retention};
 use crate::cli::session_inventory::{
     inspect_full, normalize_filter, under_dir, HeaderFields, Inspection, SessionStatus,
     TemplateCache,
@@ -79,9 +82,6 @@ const EXIT_PLAN_REFUSED: i32 = 4;
 /// The exit code when a removal failed, or the store couldn't be judged.
 const EXIT_REMOVAL_FAILED: i32 = 3;
 
-/// Where this prune reads pins: the local store.
-const PIN_SOURCE: &str = "local";
-
 /// The kinds of entry the would-remove list holds.
 const KIND_SESSION: &str = "session";
 const KIND_RECORD: &str = "record";
@@ -96,6 +96,9 @@ pub struct PruneArgs<'a> {
     pub all: bool,
     pub apply: bool,
     pub plan: Option<&'a str>,
+    /// `--confirm-short-retention`: a direct apply under the cloud backend
+    /// goes on with a retention below the floor.
+    pub confirm_short_retention: bool,
     /// Marker mode: the source workspace whose migration markers to judge.
     pub migrated_from: Option<&'a str>,
     /// Marker mode: the source host is gone, so a present target's marker is
@@ -337,7 +340,7 @@ fn first_rule(
                 .verdict
                 .is_kept()
                 .then(|| hierarchy::to_json(judgment, settings)),
-            pin: hierarchy::pin_fields(judgment.pin_of(name), PIN_SOURCE),
+            pin: hierarchy::pin_fields(judgment.pin_of(name), judgment.pin_source),
         });
     }
     if let Hierarchy::Keep { keepers, .. } = &judgment.verdict {
@@ -366,40 +369,55 @@ fn first_rule(
             pin: Default::default(),
         });
     }
-    later_rule(name, &session.chain_parent, base, backend).map(|(rule, detail)| KeptEntry {
+    later_rule(name, &session.chain_parent, base, backend).map(|(rule, detail, fields)| KeptEntry {
         name: name.to_string(),
         rule,
         detail,
         hierarchy: None,
-        pin: Default::default(),
+        pin: fields,
     })
 }
 
-/// Rules d to g: what keeps a session whose hierarchy is released.
+/// Rules d to g: what keeps a session whose hierarchy is released, with
+/// the fields its entry carries besides: `bucket_unchecked` when rule g's
+/// listing of the bucket failed, since that listing would have found a pin
+/// too (R23). Empty otherwise.
 fn later_rule(
     name: &str,
     chain_parent: &ChainParent,
     base: &Path,
     backend: &Backend,
-) -> Option<(char, String)> {
+) -> Option<(char, String, serde_json::Map<String, serde_json::Value>)> {
+    let plain = |rule: char, detail: String| Some((rule, detail, serde_json::Map::new()));
     if let ChainParent::Malformed(why) = chain_parent {
-        return Some((
+        return plain(
             'd',
             format!("its chain/parent context key is malformed: {why}"),
-        ));
+        );
     }
     if let Some(detail) = leg_keeps(&base.join(name)) {
-        return Some(('e', detail));
+        return plain('e', detail);
     }
     if name.starts_with("coordinate-") {
-        return Some(('f', "a coordinator's session".to_string()));
+        return plain('f', "a coordinator's session".to_string());
     }
     if let Backend::Cloud(cloud) = backend {
         match cloud.remote_copy_check(name) {
             RemoteCopy::Safe => {}
-            RemoteCopy::NotSafe(detail) => return Some(('g', detail)),
+            RemoteCopy::NotSafe(detail) => return plain('g', detail),
             RemoteCopy::Unreadable(why) => {
-                return Some(('g', format!("the remote copy can't be checked: {why}")))
+                return plain('g', format!("the remote copy can't be checked: {why}"))
+            }
+            RemoteCopy::Unlisted(error, why) => {
+                let guard = crate::session::pin::Guard::BucketUnchecked {
+                    error,
+                    local: PinFact::None,
+                };
+                return Some((
+                    'g',
+                    format!("the remote copy can't be checked: {why}"),
+                    guard.fields(),
+                ));
             }
         }
     }
@@ -685,6 +703,42 @@ fn usage(message: impl Into<String>) -> ! {
     )
 }
 
+/// Refuse a direct apply that would remove sessions, and their copies in the
+/// bucket, under a retention below the floor, when the selection has no age
+/// bound at or above it either. A selection that would remove nothing goes
+/// on: there is nothing to protect.
+fn refuse_short_retention(
+    settings: &RetentionSettings,
+    filters: &Filters,
+    store: &short_retention::Store,
+    would_remove: usize,
+) {
+    if would_remove == 0 || !short_retention::selection_is_wide(filters.older_than) {
+        return;
+    }
+    let short = short_retention::short_settings(settings);
+    if short.is_empty() {
+        return;
+    }
+    let mut error = short_retention::refusal_fields(&short, store, would_remove);
+    error.insert("code".into(), json!(short_retention::CODE));
+    error.insert(
+        "message".into(),
+        json!(format!(
+            "refusing to remove {would_remove} finished session{} from {} with a retention \
+             under an hour ({}): it releases almost everything, and each removal also deletes \
+             the session's copy in the bucket; nothing was removed. Run the same command \
+             without --apply to preview the set, then remove what it lists with \
+             `koto session prune --apply --plan <token>`; or pass --confirm-short-retention \
+             to remove the set now",
+            if would_remove == 1 { "" } else { "s" },
+            store.describe(),
+            short_retention::settings_text(&short),
+        )),
+    );
+    exit_with_error_code(json!({ "error": error }), 2)
+}
+
 /// Handle `koto session prune`.
 pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
     if args.migrated_from.is_some() {
@@ -752,7 +806,7 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
     });
     // One scan for the whole run, preview or apply. A store that can't be
     // listed can't be judged, so nothing is removed.
-    let graph = Graph::scan(&base).unwrap_or_else(|e| {
+    let mut graph = Graph::scan(&base).unwrap_or_else(|e| {
         exit_with_error_code(
             json!({"error": {
                 "code": "prune_scan_failed",
@@ -764,6 +818,9 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
             EXIT_REMOVAL_FAILED,
         )
     });
+    // Under the cloud backend, the pins the scan read are checked against
+    // the bucket first: one released on another host no longer keeps.
+    crate::session::pin::reconcile(backend, &mut graph);
     let engine = Engine {
         graph: &graph,
         settings,
@@ -773,7 +830,16 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
     let mut verdict = judge(&inv, &engine, &filters, backend);
     let stale: Vec<_> = verdict.stale.values().cloned().collect();
 
+    let store = short_retention::Store::of(backend);
+    if args.apply && args.plan.is_none() && !args.confirm_short_retention && backend.is_cloud() {
+        refuse_short_retention(&engine.settings, &filters, &store, verdict.remove.len());
+    }
+
     if !args.apply {
+        // A preview shows a pin another host set: under the cloud backend
+        // each session it would remove is checked in the bucket. An apply
+        // asks the bucket once per session, at the delete.
+        keep_bucket_pinned(backend, &mut verdict, |_| true);
         store_plan(&base, &verdict, &plan_filters)?;
         println!(
             "{}",
@@ -791,6 +857,10 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
     let mut outcome = Outcome::default();
     if let (Some(token), Some(stored)) = (args.plan, &stored) {
         let named: BTreeSet<_> = stored.remove.iter().map(RemoveEntry::key).collect();
+        // The preview checked the bucket for what it would remove, so a
+        // session its plan left out for a pin there reads as one the plan
+        // didn't name; ask the bucket about those before refusing.
+        keep_bucket_pinned(backend, &mut verdict, |e| !named.contains(&e.key()));
         let now: BTreeSet<_> = verdict.remove.iter().map(RemoveEntry::key).collect();
         // Refused only when the fresh judgment would remove something the
         // plan didn't name; one that only keeps more than the plan goes on,
@@ -842,6 +912,8 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
         verdict.remove.retain(|e| named.contains(&e.key()));
     }
 
+    // A log of the run says which store it acted on, before anything goes.
+    eprintln!("koto session prune: removing from {}", store.describe());
     apply(backend, &inv, &engine, &verdict, &mut outcome);
     if let Some(token) = args.plan {
         if outcome.failed.is_empty() {
@@ -864,6 +936,47 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
         std::process::exit(EXIT_REMOVAL_FAILED);
     }
     Ok(())
+}
+
+/// Under the cloud backend, run the removal guard's bucket check for each
+/// session entry of `verdict.remove` that `which` selects, and move each one
+/// the bucket keeps (a pin object, or a bucket that couldn't be checked) to
+/// the kept list under rule p, with the guard's fields; the plan token is
+/// computed again. One listing per entry checked, plus one read per pin
+/// found. Nothing on the local backend, whose pins the scan already read.
+fn keep_bucket_pinned(
+    backend: &Backend,
+    verdict: &mut Verdict,
+    which: impl Fn(&RemoveEntry) -> bool,
+) {
+    if !backend.is_cloud() {
+        return;
+    }
+    let mut moved = false;
+    let mut remove = Vec::with_capacity(verdict.remove.len());
+    for entry in std::mem::take(&mut verdict.remove) {
+        if entry.kind != KIND_SESSION || !which(&entry) {
+            remove.push(entry);
+            continue;
+        }
+        let guard = crate::session::pin::guard_removal(backend, &entry.name);
+        if !guard.keeps() {
+            remove.push(entry);
+            continue;
+        }
+        moved = true;
+        verdict.kept.push(KeptEntry {
+            name: entry.name.clone(),
+            rule: 'p',
+            detail: guard.text().unwrap_or_default(),
+            hierarchy: None,
+            pin: guard.fields(),
+        });
+    }
+    verdict.remove = remove;
+    if moved {
+        verdict.token = plan_token(&verdict.remove);
+    }
 }
 
 /// Why an entry a plan named isn't removed now.
@@ -941,15 +1054,32 @@ fn record_result(
         Err(Refusal::Skipped(reason)) => outcome
             .skipped
             .push(json!({"name": entry.name, "reason": reason})),
-        Err(Refusal::Pinned(pin)) => {
+        Err(Refusal::SkippedWith(reason, fields)) => {
+            let mut skipped = json!({"name": entry.name, "reason": reason});
+            for (k, v) in fields {
+                skipped[k] = v;
+            }
+            outcome.skipped.push(skipped);
+        }
+        Err(Refusal::Pinned(guard)) => {
+            // The scan read every pin on this host before the plan, so a
+            // local pin the guard read was set since. A pin the bucket
+            // holds, or a bucket that couldn't be checked, the scan never
+            // saw.
+            let when = match guard {
+                crate::session::pin::Guard::Pinned { source, .. }
+                | crate::session::pin::Guard::PinUnreadable { source, .. }
+                    if source == crate::session::pin::SOURCE_LOCAL =>
+                {
+                    "now kept"
+                }
+                _ => "kept",
+            };
             let mut skipped = json!({
                 "name": entry.name,
-                "reason": format!(
-                    "now kept by rule p: {}",
-                    hierarchy::pin_text(&pin).unwrap_or_default()
-                ),
+                "reason": format!("{when} by rule p: {}", guard.text().unwrap_or_default()),
             });
-            for (k, v) in hierarchy::pin_fields(&pin, PIN_SOURCE) {
+            for (k, v) in guard.fields() {
                 skipped[k] = v;
             }
             outcome.skipped.push(skipped);
@@ -1015,7 +1145,13 @@ fn apply_component(
     let mut cache = TemplateCache::new();
     for (entry, lock) in &locked {
         let result = if judgment.keeps(&entry.name) {
-            Err(Refusal::Pinned(judgment.pin_of(&entry.name).clone()))
+            Err(Refusal::Pinned(crate::session::pin::Guard::of(
+                judgment.pin_of(&entry.name).clone(),
+                engine
+                    .graph
+                    .facts(&entry.name)
+                    .map_or(crate::session::pin::SOURCE_LOCAL, |f| f.pin_source()),
+            )))
         } else {
             remove_member(
                 backend,
@@ -1055,9 +1191,12 @@ fn depth(inv: &Inventory, name: &str) -> usize {
 
 enum Refusal {
     Skipped(String),
-    /// Kept by its own pin, read since the preview: listed as skipped with
-    /// the pin's fields.
-    Pinned(PinFact),
+    /// Skipped, with fields its entry carries besides (`later_rule`'s).
+    SkippedWith(String, serde_json::Map<String, serde_json::Value>),
+    /// Kept by its own pin, read since the preview, or by a bucket that
+    /// couldn't be checked for one: listed as skipped with the guard's
+    /// fields.
+    Pinned(crate::session::pin::Guard),
     Failed(String),
 }
 
@@ -1122,12 +1261,13 @@ fn remove_member(
             }
         }
     }
-    if let Some((rule, detail)) =
+    if let Some((rule, detail, fields)) =
         later_rule(name, &read_chain_parent(&base.join(name)), base, backend)
     {
-        return Err(Refusal::Skipped(format!(
-            "now kept by rule {rule}: {detail}"
-        )));
+        return Err(Refusal::SkippedWith(
+            format!("now kept by rule {rule}: {detail}"),
+            fields,
+        ));
     }
     // The pin guard, under the session's lock, the last thing before the
     // delete: a pin set since the scan keeps the session.
@@ -1144,7 +1284,7 @@ fn remove_member(
     })?;
     match removal {
         crate::session::pin::Removal::Removed => Ok(()),
-        crate::session::pin::Removal::Kept(guard) => Err(Refusal::Pinned(guard.fact())),
+        crate::session::pin::Removal::Kept(guard) => Err(Refusal::Pinned(guard)),
     }
 }
 
