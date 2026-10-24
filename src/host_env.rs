@@ -3,6 +3,12 @@
 //! Every read of a host variable goes through [`host_env`], so the
 //! `/workflows` renderer and the run journal see the same value and a unit
 //! test controls both through one seam.
+//!
+//! Integration tests link the library without `cfg(test)`, so they read the
+//! real environment. `HOST_SESSION_ENV` in `tests/support/host_session.rs`
+//! lists every variable read here and removes each from a test process as
+//! it loads; `tests/host_session_env.rs` fails when a `host_env` read names
+//! a variable that list doesn't.
 
 /// The id of the Claude Code session driving this process, set by Claude
 /// Code in every subprocess it starts.
