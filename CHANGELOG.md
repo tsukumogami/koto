@@ -66,6 +66,15 @@ to `0.9.x`).
   unpin write nothing else. `koto session import` carries the pin and its
   release record. The [session retention guide](docs/guides/session-retention.md)
   has the details.
+- **Read a session in another workspace without importing it (koto#455).**
+  `koto --workspace <id|path> status <name>`, and the same option before
+  `context get`, `context exists` and `context list`, read a session under
+  another workspace's prefix in the cloud bucket, in place. The read writes
+  nothing to the bucket or to this host's session store and logs no
+  `context_read`. Every other verb refuses the option with
+  `workspace_read_only`. A missing session or workspace is reported as
+  `session_not_found` or `workspace_not_found` (exit 2), and a bucket that
+  can't be read as `workspace_unreadable` (exit 3).
 - **A `reserved_actions` retry carries its evidence as a field (koto#405).**
   Each entry has `evidence`, the `{"retry_failed": {...}}` object its
   `invocation` submits. An agent writes it to a file and submits it with

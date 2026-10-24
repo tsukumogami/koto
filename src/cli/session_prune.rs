@@ -7,6 +7,9 @@
 //! plan didn't name; what the plan named and the rules now keep is skipped
 //! and listed. `--apply` alone (with `--execution-dir`, `--older-than` or
 //! `--all`) removes the set it works out now. Both modes run the same rules.
+//! Under the cloud backend that direct form refuses a selection with no age
+//! bound of an hour or more while a removal setting is below an hour, unless
+//! `--confirm-short-retention` is given ([`super::short_retention`]).
 //!
 //! Every session is judged by the retention engine
 //! ([`crate::session::hierarchy`]) over one scan of the store, with one set
@@ -51,7 +54,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::exit_with_error_code;
+use super::{exit_with_error_code, short_retention};
 use crate::cli::session_inventory::{
     inspect_full, normalize_filter, under_dir, HeaderFields, Inspection, SessionStatus,
     TemplateCache,
@@ -93,6 +96,9 @@ pub struct PruneArgs<'a> {
     pub all: bool,
     pub apply: bool,
     pub plan: Option<&'a str>,
+    /// `--confirm-short-retention`: a direct apply under the cloud backend
+    /// goes on with a retention below the floor.
+    pub confirm_short_retention: bool,
     /// Marker mode: the source workspace whose migration markers to judge.
     pub migrated_from: Option<&'a str>,
     /// Marker mode: the source host is gone, so a present target's marker is
@@ -697,6 +703,42 @@ fn usage(message: impl Into<String>) -> ! {
     )
 }
 
+/// Refuse a direct apply that would remove sessions, and their copies in the
+/// bucket, under a retention below the floor, when the selection has no age
+/// bound at or above it either. A selection that would remove nothing goes
+/// on: there is nothing to protect.
+fn refuse_short_retention(
+    settings: &RetentionSettings,
+    filters: &Filters,
+    store: &short_retention::Store,
+    would_remove: usize,
+) {
+    if would_remove == 0 || !short_retention::selection_is_wide(filters.older_than) {
+        return;
+    }
+    let short = short_retention::short_settings(settings);
+    if short.is_empty() {
+        return;
+    }
+    let mut error = short_retention::refusal_fields(&short, store, would_remove);
+    error.insert("code".into(), json!(short_retention::CODE));
+    error.insert(
+        "message".into(),
+        json!(format!(
+            "refusing to remove {would_remove} finished session{} from {} with a retention \
+             under an hour ({}): it releases almost everything, and each removal also deletes \
+             the session's copy in the bucket; nothing was removed. Run the same command \
+             without --apply to preview the set, then remove what it lists with \
+             `koto session prune --apply --plan <token>`; or pass --confirm-short-retention \
+             to remove the set now",
+            if would_remove == 1 { "" } else { "s" },
+            store.describe(),
+            short_retention::settings_text(&short),
+        )),
+    );
+    exit_with_error_code(json!({ "error": error }), 2)
+}
+
 /// Handle `koto session prune`.
 pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
     if args.migrated_from.is_some() {
@@ -788,6 +830,11 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
     let mut verdict = judge(&inv, &engine, &filters, backend);
     let stale: Vec<_> = verdict.stale.values().cloned().collect();
 
+    let store = short_retention::Store::of(backend);
+    if args.apply && args.plan.is_none() && !args.confirm_short_retention && backend.is_cloud() {
+        refuse_short_retention(&engine.settings, &filters, &store, verdict.remove.len());
+    }
+
     if !args.apply {
         // A preview shows a pin another host set: under the cloud backend
         // each session it would remove is checked in the bucket. An apply
@@ -865,6 +912,8 @@ pub fn handle_prune(backend: &Backend, args: PruneArgs<'_>) -> Result<()> {
         verdict.remove.retain(|e| named.contains(&e.key()));
     }
 
+    // A log of the run says which store it acted on, before anything goes.
+    eprintln!("koto session prune: removing from {}", store.describe());
     apply(backend, &inv, &engine, &verdict, &mut outcome);
     if let Some(token) = args.plan {
         if outcome.failed.is_empty() {

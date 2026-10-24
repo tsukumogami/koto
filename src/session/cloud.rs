@@ -216,8 +216,9 @@ pub struct CloudBackend {
     /// commands write to, and a second pull would only fetch what it pushed.
     /// Boxed for the same reason as `local_migration_checks`.
     pulled: Box<Mutex<HashSet<String>>>,
-    /// Per-process answers of [`CloudBackend::probe`], and the check window.
-    /// Boxed for the same reason as `local_migration_checks`.
+    /// Per-process answers of [`CloudBackend::probe`], the check window, and
+    /// whether the backend only reads. Boxed for the same reason as
+    /// `local_migration_checks`.
     probes: Box<Probes>,
 }
 
@@ -236,6 +237,12 @@ struct Probes {
     /// koto#439). Zero, which [`CloudBackend::with_parts`] leaves it at,
     /// lists in every process as before.
     window: std::time::Duration,
+    /// A reader of another workspace's prefix (`koto --workspace`,
+    /// [`workspace_read`]): every write to the bucket and every append to a
+    /// log refuses, and no tick marker in the environment applies, since a
+    /// tick in the reader's own workspace never runs a session in this
+    /// prefix. Kept here, in the box, so the backend stays small.
+    read_only: bool,
 }
 
 impl CloudBackend {
@@ -273,8 +280,32 @@ impl CloudBackend {
             probes: Box::new(Probes {
                 answers: Mutex::new(HashMap::new()),
                 window: std::time::Duration::ZERO,
+                read_only: false,
             }),
         }
+    }
+
+    /// Refuse a write when this backend only reads another workspace's
+    /// prefix (`koto --workspace`).
+    fn refuse_if_read_only(&self, what: &str) -> anyhow::Result<()> {
+        if self.probes.read_only {
+            anyhow::bail!(
+                "{} refused: this command reads workspace {} with --workspace, which never writes",
+                what,
+                self.prefix
+            );
+        }
+        Ok(())
+    }
+
+    /// The session a `koto next` tick this process runs under advances
+    /// ([`reentrancy::enclosing_tick`]); never one for a read-only backend,
+    /// whose prefix no tick of this host's workspace runs.
+    fn enclosing_tick(&self) -> Option<String> {
+        if self.probes.read_only {
+            return None;
+        }
+        reentrancy::enclosing_tick()
     }
 
     /// Delegate to the local store's bounded prefix read; never a remote
@@ -573,7 +604,17 @@ impl CloudBackend {
     /// wrong-directory runs this guards against; a wrong guess there is the
     /// silent stale read itself. A refusal that names the directory is loud
     /// when it is wrong.
+    ///
+    /// A read-only backend (`koto --workspace`) is never bound elsewhere: its
+    /// local copy is a scratch one it pulled from this very prefix, so the
+    /// prefix is the session's by construction. Judged by its header instead,
+    /// a session that records no prefix and whose anchor hashes elsewhere (an
+    /// older session started with `--execution-dir`, say) would skip every
+    /// pull and answer from the empty scratch copy.
     fn bound_elsewhere(&self, id: &str) -> Option<SessionBoundElsewhere> {
+        if self.probes.read_only {
+            return None;
+        }
         let dir = self.local.session_dir(id);
         let header: Option<serde_json::Value> = first_line(&dir.join(state_file_name(id)))
             .and_then(|line| serde_json::from_str(line.trim()).ok());
@@ -767,7 +808,7 @@ impl CloudBackend {
     /// The id of the tick this process runs under, read from the ticked
     /// session's directory; `None` outside a tick.
     fn current_tick(&self) -> Option<String> {
-        let tick = reentrancy::enclosing_tick()?;
+        let tick = self.enclosing_tick()?;
         sync_stamp::tick_id(&self.local.session_dir(&tick))
     }
 
@@ -831,6 +872,7 @@ impl CloudBackend {
     /// PUT `id`'s state file and stamp what went up.
     fn put_state(&self, id: &str, data: &[u8]) -> anyhow::Result<()> {
         let key = self.state_key(id);
+        self.refuse_if_read_only(&format!("S3 PUT of {}", key))?;
         let response = self
             .bucket
             .put_object(&key, data)
@@ -1106,7 +1148,7 @@ impl CloudBackend {
             return Ok(());
         }
         let own_tick =
-            reentrancy::is_tick_process() && reentrancy::enclosing_tick().as_deref() == Some(id);
+            reentrancy::is_tick_process() && self.enclosing_tick().as_deref() == Some(id);
         self.try_clear_unopened_batch(id);
         if self.journal(id).is_open() {
             match self.flush_pending(id) {
@@ -1219,7 +1261,7 @@ impl CloudBackend {
                         if is_migration_marker(&prefix, &obj.key) {
                             continue;
                         }
-                        if let Err(e) = self.bucket.delete_object(&obj.key) {
+                        if let Err(e) = self.delete_object(&obj.key) {
                             eprintln!("warning: cloud sync: failed to delete {}: {}", obj.key, e);
                         }
                     }
@@ -1255,7 +1297,7 @@ impl CloudBackend {
                 if is_migration_marker(&prefix, &obj.key) {
                     continue;
                 }
-                if let Err(e) = self.bucket.delete_object(&obj.key) {
+                if let Err(e) = self.delete_object(&obj.key) {
                     first.get_or_insert_with(|| {
                         anyhow::anyhow!(
                             "deleting {} failed: {}",
@@ -1766,7 +1808,7 @@ impl CloudBackend {
             )
         })?;
         let delete = |key: &str| {
-            self.bucket.delete_object(key).map(|_| ()).map_err(|e| {
+            self.delete_object(key).map(|_| ()).map_err(|e| {
                 anyhow::anyhow!(
                     "deleting {} failed: {}",
                     key,
@@ -1788,35 +1830,49 @@ impl CloudBackend {
         delete(&marker)
     }
 
-    /// List session IDs present in S3 under this backend's prefix.
+    /// List session IDs present in S3 under this backend's prefix. A listing
+    /// that fails warns and reads as none.
     fn s3_list_sessions(&self) -> Vec<String> {
+        self.try_list_sessions().unwrap_or_else(|e| {
+            eprintln!("warning: cloud sync: failed to list sessions: {}", e);
+            Vec::new()
+        })
+    }
+
+    /// The session IDs under this backend's prefix, one per
+    /// `<prefix>/<session-id>/` the bucket lists. `Err` when the listing
+    /// failed, which a caller that must tell an empty workspace from an
+    /// unreadable bucket keeps apart from an empty `Ok`.
+    pub(crate) fn try_list_sessions(&self) -> anyhow::Result<Vec<String>> {
         let prefix = format!("{}/", self.prefix);
-        match self.bucket.list(prefix.clone(), Some("/".to_string())) {
-            Ok(results) => {
-                let mut ids = Vec::new();
-                for list in &results {
-                    if let Some(ref prefixes) = list.common_prefixes {
-                        for cp in prefixes {
-                            // Common prefix looks like "<prefix>/<session-id>/"
-                            if let Some(name) = cp
-                                .prefix
-                                .strip_prefix(&prefix)
-                                .and_then(|s| s.strip_suffix('/'))
-                            {
-                                if !name.is_empty() {
-                                    ids.push(name.to_string());
-                                }
-                            }
+        let results = self
+            .bucket
+            .list(prefix.clone(), Some("/".to_string()))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "listing {} failed: {}",
+                    prefix,
+                    without_url_userinfo(&e.to_string())
+                )
+            })?;
+        let mut ids = Vec::new();
+        for list in &results {
+            if let Some(ref prefixes) = list.common_prefixes {
+                for cp in prefixes {
+                    // Common prefix looks like "<prefix>/<session-id>/"
+                    if let Some(name) = cp
+                        .prefix
+                        .strip_prefix(&prefix)
+                        .and_then(|s| s.strip_suffix('/'))
+                    {
+                        if !name.is_empty() {
+                            ids.push(name.to_string());
                         }
                     }
                 }
-                ids
-            }
-            Err(e) => {
-                eprintln!("warning: cloud sync: failed to list sessions: {}", e);
-                Vec::new()
             }
         }
+        Ok(ids)
     }
 
     /// Check if a session exists in S3 by looking for its state file.
@@ -1825,8 +1881,22 @@ impl CloudBackend {
         self.bucket.head_object(&key).is_ok()
     }
 
+    /// DELETE `key`. Every delete this backend makes itself goes through
+    /// here, as its own PUTs go through [`CloudBackend::put_object`], so a
+    /// read-only backend refuses them in one place. The key pushes and
+    /// deletes in `sync` take the bucket directly; they are reached only
+    /// through a context add or remove, which refuse first.
+    fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("S3 DELETE of {}", key))?;
+        self.bucket
+            .delete_object(key)
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+    }
+
     /// Wrapper around `bucket.put_object` that returns a Result.
     fn put_object(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("S3 PUT of {}", key))?;
         self.bucket
             .put_object(key, data)
             .with_context(|| format!("S3 PUT failed for key: {}", key))?;
@@ -1973,13 +2043,13 @@ impl CloudBackend {
     /// Whether this process's writes to `id` wait for the tick that runs
     /// it ([`reentrancy::runs_inside_tick_of`]).
     fn defers(&self, id: &str) -> bool {
-        reentrancy::runs_inside_tick_of(id)
+        !self.probes.read_only && reentrancy::runs_inside_tick_of(id)
     }
 
     /// Whether this process is `id`'s own tick or a command it runs: the
     /// tick marker names `id`.
     fn is_own_tick(&self, id: &str) -> bool {
-        reentrancy::enclosing_tick().as_deref() == Some(id)
+        self.enclosing_tick().as_deref() == Some(id)
     }
 
     /// Append `payload` to `id`'s log locally, then push the state file;
@@ -1991,6 +2061,7 @@ impl CloudBackend {
         payload: &crate::engine::types::EventPayload,
         timestamp: &str,
     ) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("appending to the log of '{}'", id))?;
         if self.defers(id) {
             if let Some((_journal, _lock)) = self.open_batch(id)? {
                 return self.local.append_event(id, payload, timestamp);
@@ -2098,8 +2169,7 @@ impl CloudBackend {
             .get_object_if_present(&key)
             .with_context(|| format!("reading the batch-open marker of '{}'", id))?;
         if in_bucket.as_deref() == Some(ours.as_slice()) {
-            self.bucket
-                .delete_object(&key)
+            self.delete_object(&key)
                 .with_context(|| format!("deleting the batch-open marker of '{}'", id))?;
         }
         journal.abandon(&lock)
@@ -2225,7 +2295,7 @@ impl CloudBackend {
         local.save(&version_path)?;
         self.push_version(id)?;
         let _ = in_parallel(&gone, |key| {
-            if let Err(e) = self.bucket.delete_object(ctx_key(key)) {
+            if let Err(e) = self.delete_object(&ctx_key(key)) {
                 eprintln!(
                     "warning: cloud sync: failed to delete context key '{}': {}",
                     key, e
@@ -2239,8 +2309,7 @@ impl CloudBackend {
         // closed, nothing would come back to delete a marker left behind,
         // and every import would refuse the session for good. The next
         // flush pushes the batch again, which changes nothing, and retries.
-        self.bucket
-            .delete_object(self.batch_marker_key(id))
+        self.delete_object(&self.batch_marker_key(id))
             .with_context(|| format!("deleting the batch-open marker of '{}'", id))?;
         journal.close(&lock)
     }
@@ -2274,8 +2343,7 @@ impl CloudBackend {
         let Some(lock) = journal.lock()? else {
             return Ok(());
         };
-        self.bucket
-            .delete_object(self.batch_marker_key(id))
+        self.delete_object(&self.batch_marker_key(id))
             .with_context(|| format!("deleting the batch-open marker of '{}'", id))?;
         journal.close(&lock)
     }
@@ -2821,6 +2889,7 @@ impl SessionBackend for CloudBackend {
     }
 
     fn cleanup(&self, id: &str) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("removing '{}'", id))?;
         // A workspace whose copy was imported on this host must not delete
         // the imported session that now holds the name.
         self.local_guard(id)?;
@@ -3042,7 +3111,7 @@ impl SessionBackend for CloudBackend {
                                     );
                                     continue;
                                 }
-                                if let Err(e) = self.bucket.delete_object(&obj.key) {
+                                if let Err(e) = self.delete_object(&obj.key) {
                                     eprintln!(
                                         "warning: cloud sync: relocate delete failed for {}: {}",
                                         obj.key, e
@@ -3191,6 +3260,7 @@ impl CloudBackend {
         content: &[u8],
         writer: Option<&str>,
     ) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("storing '{}' in '{}'", key, session))?;
         if let Some(writer) = writer {
             crate::session::links::check_writer_key(key, writer)?;
         }
@@ -3385,6 +3455,7 @@ impl ContextStore for CloudBackend {
     }
 
     fn remove(&self, session: &str, key: &str) -> anyhow::Result<()> {
+        self.refuse_if_read_only(&format!("removing '{}' from '{}'", key, session))?;
         self.check_not_migrated_to_write(session)?;
         if is_host_local_key(key) {
             return self.local.remove(session, key);
@@ -3897,6 +3968,9 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 
 #[path = "cloud_takeover.rs"]
 mod takeover;
+
+#[path = "cloud_workspace_read.rs"]
+pub mod workspace_read;
 
 impl CloudBackend {
     /// Import session `req.name` from the workspace at `req.from` into this
@@ -4657,7 +4731,7 @@ impl CloudBackend {
     /// free and imports afresh over whatever is left.
     fn take_back(&self, pushed: &[String]) {
         for key in pushed {
-            if let Err(e) = self.bucket.delete_object(key) {
+            if let Err(e) = self.delete_object(key) {
                 eprintln!(
                     "warning: cloud sync: failed to remove {} after a failed import: {}",
                     key, e

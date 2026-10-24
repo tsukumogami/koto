@@ -69,7 +69,8 @@ impl TerminalStatus {
     }
 }
 
-/// Handle `koto workspace prune --root <id> [--dry-run] [--yes] [--force]`.
+/// Handle `koto workspace prune --root <id> [--dry-run] [--yes]
+/// [--confirm-short-retention] [--force]`.
 ///
 /// The root and its descendants are each judged by the retention rule
 /// (see [`scope_for`]); only the members it releases are removed, and the
@@ -84,6 +85,7 @@ pub fn handle_prune(
     root: String,
     dry_run: bool,
     yes: bool,
+    confirm_short_retention: bool,
     force: bool,
 ) -> Result<()> {
     // 1. Parse-time validation. Reject injection attempts before any
@@ -183,6 +185,13 @@ pub fn handle_prune(
     // delete asks the bucket instead.
     if dry_run || !yes {
         keep_bucket_pinned(backend, &mut plan);
+    }
+
+    // With `--yes` nobody reads the list before it goes. Under the cloud
+    // backend each removal also deletes the copy in the bucket, so a
+    // retention under an hour needs `--confirm-short-retention` too.
+    if yes && !dry_run && !confirm_short_retention && backend.is_cloud() {
+        refuse_short_retention(backend, &settings, &root, plan.remove.len());
     }
 
     // 8. Compute non-terminal sessions in the to-be-pruned set. Operator
@@ -311,6 +320,41 @@ impl KeptMember {
         }
         v
     }
+}
+
+/// Refuse a `--yes` run under the cloud backend that would remove members
+/// with a removal setting under an hour. A run that would remove nothing
+/// goes on.
+fn refuse_short_retention(
+    backend: &crate::session::Backend,
+    settings: &RetentionSettings,
+    root: &str,
+    would_remove: usize,
+) {
+    use super::short_retention;
+    let short = short_retention::short_settings(settings);
+    if would_remove == 0 || short.is_empty() {
+        return;
+    }
+    let store = short_retention::Store::of(backend);
+    let mut out = short_retention::refusal_fields(&short, &store, would_remove);
+    out.insert(
+        "error".into(),
+        json!(format!(
+            "refusing to remove {would_remove} session{} under {} from {} with a retention \
+             under an hour ({}): each removal also deletes the session's copy in the bucket; \
+             nothing was removed. Run without --yes to review the list and confirm at the \
+             prompt, or with --dry-run to preview it; or pass --confirm-short-retention to \
+             remove it now",
+            if would_remove == 1 { "" } else { "s" },
+            hierarchy::sanitize(root),
+            store.describe(),
+            short_retention::settings_text(&short),
+        )),
+    );
+    out.insert("code".into(), json!(short_retention::CODE));
+    out.insert("command".into(), json!("workspace prune"));
+    exit_with_error_code(serde_json::Value::Object(out), 2)
 }
 
 /// What a workspace prune removes and keeps.

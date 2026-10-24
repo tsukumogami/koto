@@ -24,10 +24,12 @@ pub mod session_anchor;
 pub(crate) mod session_inventory;
 #[cfg(unix)]
 pub(crate) mod session_prune;
+pub(crate) mod short_retention;
 pub mod task_spawn_error;
 pub mod validate_feed;
 pub mod vars;
 pub mod workspace;
+pub mod workspace_read;
 
 pub use init_child::{init_child_from_parent, TemplateCompileCache};
 pub use task_spawn_error::{SpawnErrorKind, TaskSpawnError};
@@ -96,6 +98,14 @@ pub(super) const EXIT_CALLER_ERROR: i32 = 2;
     about = "Workflow orchestration engine for AI coding agents"
 )]
 pub struct App {
+    /// Read a session in another workspace's part of the cloud bucket, in
+    /// place and without importing it. Takes the workspace's id (its 16-hex
+    /// prefix in the bucket) or its absolute path, and goes before the
+    /// verb. Only `status`, `context get`, `context exists` and `context
+    /// list` accept it; every other verb refuses it.
+    #[arg(long, value_name = "ID")]
+    pub workspace: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -383,6 +393,12 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         yes: bool,
 
+        /// With `--yes` under the cloud backend: remove even though
+        /// `retention.keep` or `retention.idle_period` is under an hour.
+        /// Without it that run refuses (exit 2) and removes nothing.
+        #[arg(long = "confirm-short-retention")]
+        confirm_short_retention: bool,
+
         /// DANGER: bypasses the terminal-state safety gate on the root.
         /// Without it, prune refuses a root that is not terminal; the
         /// descendants are removed whatever their state either way (the
@@ -623,6 +639,14 @@ pub enum SessionCommand {
         /// preview's sessions.
         #[arg(long, value_name = "TOKEN")]
         plan: Option<String>,
+
+        /// With `--apply` and no `--plan` under the cloud backend: remove even
+        /// though `retention.keep` or `retention.idle_period` is under an hour
+        /// and the selection is `--all`, `--execution-dir` alone, or an
+        /// `--older-than` under an hour. Without it that apply refuses (exit
+        /// 2) and removes nothing.
+        #[arg(long = "confirm-short-retention", requires = "apply")]
+        confirm_short_retention: bool,
 
         /// Remove migration markers, and the old copies beside them, under
         /// this source workspace's bucket prefix instead of finished local
@@ -1566,6 +1590,9 @@ where
 }
 
 pub fn run(app: App) -> Result<()> {
+    if let Some(workspace) = app.workspace.as_deref() {
+        return workspace_read::run(workspace, app.command);
+    }
     match app.command {
         Command::Version { json } => {
             let info = buildinfo::build_info();
@@ -1939,6 +1966,7 @@ pub fn run(app: App) -> Result<()> {
                     all,
                     apply,
                     plan,
+                    confirm_short_retention,
                     migrated_from,
                     source_retired,
                 } => session_prune::handle_prune(
@@ -1949,6 +1977,7 @@ pub fn run(app: App) -> Result<()> {
                         all,
                         apply,
                         plan: plan.as_deref(),
+                        confirm_short_retention,
                         migrated_from: migrated_from.as_deref(),
                         source_retired,
                         // Only marker mode reads the bound, so a config that
@@ -2350,8 +2379,16 @@ pub fn run(app: App) -> Result<()> {
                     root,
                     dry_run,
                     yes,
+                    confirm_short_retention,
                     force,
-                } => workspace::handle_prune(&backend, root, dry_run, yes, force),
+                } => workspace::handle_prune(
+                    &backend,
+                    root,
+                    dry_run,
+                    yes,
+                    confirm_short_retention,
+                    force,
+                ),
             }
         }
         Command::Dashboard(args) => {
