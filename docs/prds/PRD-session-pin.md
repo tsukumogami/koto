@@ -202,7 +202,9 @@ instant, release instant, retention, migrated source.
   no session has the name (in the local store, or under the cloud backend in
   the bucket either); the session is an anchor or an anchor's close
   record (kinds koto already records in the session's header); or the
-  session is a migrated source.
+  session is a migrated source. Pinning is opt-in: nothing in koto or its
+  plugin pins a session on its own, so no existing dispatch, coordinator or
+  plan run changes unless something calls this command.
 - **R2. A running session may be pinned.** The pin takes effect whenever a
   removal would otherwise take the session, including at the session's own
   terminal tick. While the session runs it's alive by the existing rule, and
@@ -216,7 +218,8 @@ instant, release instant, retention, migrated source.
   under an anchor, with or without handed authority.
 - **R5. Unpin a session.** `koto session unpin <name> [--reason <text>]`
   refuses with exit 2, writing nothing, when no session has the name (as R1
-  checks it) or the reason breaks R1's rules for a reason. Otherwise it reads
+  checks it), the session is a migrated source (its moved copy holds the pin,
+  R25), or the reason breaks R1's rules for a reason. Otherwise it reads
   the session's pin. With no pin, it changes nothing and exits 0, whoever the
   caller is. With a pin, readable or not, it removes the pin when the caller
   may release it (R7) and exits 0, printing the release record. Under the
@@ -241,7 +244,9 @@ instant, release instant, retention, migrated source.
   and that the authority is handed to an agent session at its start. When
   the named anchor doesn't exist or can't be read, the unpin is refused the
   same way and says so. Setting a pin never grants its release: the setter
-  gets no standing of its own.
+  gets no standing of its own. Nothing that happens to an anchor releases a
+  pin: the setter's anchor closing, being removed or going stale leaves the
+  pin in force.
 - **R8. How authority reaches koto.** koto reads an agent session's handed
   authority only from what was handed to that agent session, never from
   niwa's records, niwa's commands or any other tool's state. The decision
@@ -272,8 +277,11 @@ instant, release instant, retention, migrated source.
   the terminal tick, with or without `--no-cleanup` and for a failure
   terminal; the parent sweep; the same-name replace; `koto workspace prune`,
   with or without `--force` or `--yes`; and `koto session prune` with every
-  flag it accepts (`--all`, `--apply`, `--plan`, `--execution-dir`,
-  `--older-than`, `--migrated-from`). A same-name replace that meets a pinned
+  flag that selects sessions to judge (`--all`, `--apply`, `--plan`,
+  `--execution-dir`, `--older-than`). `koto session prune --migrated-from`
+  is the one exception, and keeps nothing on a pin's account: it removes a
+  migrated source, whose pin is inert because the moved copy holds it (R25).
+  A same-name replace that meets a pinned
   finished predecessor moves it aside under a new name by the replace's
   existing naming, keeping its log, keys, pin and release record; the new run
   takes the original name with no pin. Under the cloud backend the moved
@@ -302,6 +310,11 @@ instant, release instant, retention, migrated source.
   restart any clock. After it, the session is judged by the existing rule
   alone, using its hierarchy's existing release instant, so a session whose
   hierarchy is past its retention is taken by the next removal that applies.
+- **R14a. Pin records move no clock.** Setting a pin, removing it and writing
+  a release record add no event to the pinned session's log and change
+  neither its stop instant, nor any anchor's last activity, nor its
+  hierarchy's release instant. Reading an anchor's recorded authority at
+  unpin logs no read in any session, anchor or read spool.
 
 ### Saying why
 
@@ -344,15 +357,18 @@ instant, release instant, retention, migrated source.
 
 ### Cloud backend
 
-- **R20. Pin and unpin reach the bucket or fail.** Under the cloud backend,
-  `koto session pin` exits 0 only once the bucket holds the pin; if it can't
-  confirm that, it exits 3, says the pin is held in the local store only, and
-  the next `koto session pin`, `koto session unpin`, `koto next` or
-  `koto context add` on that session on this host retries the push, printing
-  the same message if it fails again.
-  `koto session unpin` exits 0 only once the bucket holds the release record
-  and no longer holds the pin; otherwise it exits 3 and the bucket's pin
-  stays in force.
+- **R20. Pin and unpin write their own objects, or fail.** Under the cloud
+  backend, `koto session pin` writes the pin as its own object under the
+  session's prefix and exits 0 only once the bucket holds it; it writes
+  nothing else to the bucket (no log, state, index or version object), so a
+  host holding a stale copy, or no copy, of a session another host owns can
+  pin it without replacing anything that host wrote. If the bucket doesn't
+  confirm the write, it exits 3 and writes nothing locally either, so a pin
+  is never held locally only; running it again retries. `koto session unpin`
+  writes the release record as its own object, then deletes the pin object,
+  and exits 0 only once both are confirmed; otherwise it exits 3 and the
+  bucket's pin stays in force. On a host with a local copy, the local pin and
+  release record follow the bucket's (R22).
 - **R21. Every removal checks the bucket before deleting.** Under the cloud
   backend, before any removal deletes either copy of a session, it makes a
   bucket check for that session. A pin found in the local copy or in the
@@ -365,6 +381,9 @@ instant, release instant, retention, migrated source.
   only from the bucket's index of the session's keys, so a pin is found after
   another host pushed an index without it. No context write, index push or
   state push removes or overwrites a pin object; only unpin removes one.
+  Under the cloud backend the bucket's objects decide: a local pin whose
+  `set_at` matches the bucket's latest release record was released on another
+  host and no longer keeps, and a pin object the local copy lacks keeps.
 - **R23. A failed bucket check keeps.** When the bucket check can't be made
   (an error or timeout talking to the bucket) or returns a listing koto can't
   parse, the removal deletes neither copy and reports the session as kept
@@ -390,7 +409,12 @@ instant, release instant, retention, migrated source.
 
 - **R25. A pin travels with import.** `koto session import` carries a
   session's pin and release record to the moved copy unchanged, an
-  unreadable pin included. The migrated source keeps nothing, as today.
+  unreadable pin included, and nothing else of this feature: an anchor's
+  recorded authority never travels, and pinning adds nothing to what import
+  already leaves behind (the read spool, the request store and the run
+  journal stay on their host, as today). The migrated source keeps nothing,
+  as today: its pin is inert, unpin refuses it (R5), and
+  `koto session prune --migrated-from` removes it (R10).
 - **R26. Older builds keep a pinned session.** koto v0.23.0 and later
   releases without this feature, which read session-retention links, read a
   pin as an unreadable record and never as an ordinary link, so their
@@ -422,12 +446,24 @@ instant, release instant, retention, migrated source.
   makes one listing request per session the removal would otherwise delete,
   plus one read per pin it finds, and none for a session the removal keeps for
   another reason.
-- **R29. Writes stay with their session.** Pin and unpin write only into the
-  named session. Recording handed authority writes only into the starting
-  agent session's own anchor. Nothing in this feature writes into any other
-  session. `koto context add` and `koto context remove` refuse the pin, the
-  release record and the recorded authority with exit 2, as they refuse koto's
-  other reserved keys.
+- **R29. One named exception to the one-writer rule.** Session retention lets
+  a koto command write only into the session it opens, ticks, links or
+  imports, or into the running agent session's own anchor. Pin and unpin are
+  an explicit exception: they write the pin and the release record into the
+  named session, which can belong to another agent session or host. The
+  exception is bounded to those two records, kept as standalone records in
+  the session's reserved area (on the local store, each record and its index
+  entry; under the cloud backend, only their own objects, R20), with no event
+  in the session's log and no clock moved (R14a). The justification: the
+  record has to live with the session, because a record on the setter's side
+  wouldn't travel to another host or through import, and keeping the session
+  everywhere is the point. The exception is tracked in koto#445, beside the
+  existing cross-session writers. Recording handed authority writes only into
+  the starting agent session's own anchor. Nothing else in this feature
+  writes into another session, and pinning pushes none of the read spool, the
+  request store or the run journal anywhere. `koto context add` and
+  `koto context remove` refuse the pin, the release record and the recorded
+  authority with exit 2, as they refuse koto's other reserved keys.
 
 ## Acceptance Criteria
 
@@ -565,6 +601,15 @@ a build without this feature, and S2 to S6 don't apply to it.
   the starting agent session's anchor (for the start) hashes the same before
   and after. `koto context add` and `koto context remove` on the pin, the
   release record and the recorded authority each exit 2.
+- [ ] **Pin records move no clock.** For a finished P in a hierarchy with an
+  anchor A that holds it: across a pin, an unpin and the release record, P's
+  log has no new event, and `koto session hierarchy` for P reports the same
+  stop instant, the same release instant and the same `last_activity` for A
+  before and after. An unpin under an anchor whose authority it reads leaves
+  that anchor's log and the host's read spool hashing the same.
+- [ ] **No release by anchor events.** P pinned under anchor A stays pinned,
+  and is kept by the next prune, after A is closed by an observed close,
+  after A idles past the idle period, and after A is removed.
 - [ ] **Concurrent pin, unpin and removal.** Twenty runs each of a pin racing
   an unpin, and of a pin racing `koto session prune --apply --all` on a
   finished P past the retention, end with P either pinned (and present) or
@@ -616,17 +661,28 @@ by hand and finishes it; X is P's koto parent.
   and lists each member as kept; a same-name replace of U moves it aside;
   `koto cancel U --cleanup` exits 3 and writes nothing. Each kept entry
   carries `bucket_unchecked` with the matching `error`.
-- [ ] **Pin and unpin reach the bucket or fail.** With the stand-in refusing
-  writes, `koto session pin P` exits 3 and says the pin is held locally only;
-  `koto session pin P` again exits 3 with the same message; once writes are
-  accepted, the next `koto session pin P` exits 0 and host 2's
-  `koto session list --pinned` lists P with `source: bucket`. In a second run,
-  once writes are accepted, a `koto context add P <key>` on host 1 pushes the
-  pin instead. With deletes
-  refused, `koto session unpin P` exits 3 and host 2 still keeps P.
+- [ ] **Pin and unpin write their own objects, or fail.** With the stand-in
+  refusing writes, `koto session pin P` exits 3, and neither the bucket nor
+  host 1's local copy of P holds a pin; once writes are accepted, running it
+  again exits 0 and host 2's `koto session list --pinned` lists P with
+  `source: bucket`. With deletes refused, `koto session unpin P` exits 3 and
+  host 2 still keeps P.
+- [ ] **Pin from a stale copy writes only the pin.** Host 1 runs P and pushes
+  it; host 2 holds a copy of P taken earlier, and another holding no copy at
+  all. From each, `koto session pin P` exits 0, and the stand-in records a
+  write of the pin object and no write of P's log, state, index or version
+  objects; host 1's next `koto next P` and its prune see P pinned. The same
+  holds for `koto session unpin P`, which writes only the release object and
+  deletes only the pin object.
 - [ ] **Unpin on one host frees on another.** Host 1 unpins P by hand; after
   the retention, host 2's prune removes P from the bucket. Host 2 unpinning a
-  pinned session it holds no local copy of exits 0 and host 1 sees no pin.
+  pinned session it holds no local copy of exits 0 and host 1 sees no pin:
+  host 1's local copy still holds the old pin file, which its prune treats as
+  released because the bucket's release record names its `set_at`.
+- [ ] **Pull from an index without the pin.** With the bucket's index for P
+  lacking the pin entry (a host 2 push) and the pin object present, host 1
+  pulls P whole (`koto session resolve --keep remote`) and its
+  `koto session list --pinned` and prune both show P pinned.
 - [ ] **Bucket request count.** For `koto session prune --apply --all` over 20
   finished sessions past the retention, 5 of them pinned in the bucket only,
   the stand-in counts at most 20 listing requests for the bucket checks and 5
@@ -638,7 +694,12 @@ by hand and finishes it; X is P's koto parent.
   the environment, importing P (pinned, with a release record from an earlier
   pin) into another workspace leaves the moved copy with the same pin and
   release record; S there keeps it; the migrated source keeps nothing.
-  Importing a session with an unreadable pin carries it unchanged.
+  Importing a session with an unreadable pin carries it unchanged. Importing
+  an anchor that records `release-pin` leaves the moved copy with no recorded
+  authority. After the import, `koto session unpin` on the migrated source
+  exits 2 and writes nothing, and `koto session prune --migrated-from <source
+  workspace>` removes the source copy, its inert pin with it, while the moved
+  copy stays pinned.
 - [ ] **Older koto keeps.** With a pin written by this build, the koto
   v0.23.0 release binary (fetched by the test from the project's release page
   and checked against its published checksum) runs `koto session prune
@@ -694,7 +755,9 @@ by hand and finishes it; X is P's koto parent.
   before this feature can still remove a pinned session with
   `koto session cleanup` or `koto cancel --cleanup`, or drop the pin on
   import, and releases before v0.23.0 ignore pins entirely (v0.22 prunes keep
-  a pinned session; its terminal tick and replace don't). Every host sharing
+  a pinned session; its terminal tick and replace don't). A session imported
+  by an older release loses its pin, and a later `koto session prune
+  --migrated-from` then removes the only copy that held it. Every host sharing
   a bucket needs a release that honours pins (R26).
 - **A bypass shows rather than stops.** An agent that drops its anchor
   variable is treated as acting by hand and may unpin; the release record
@@ -758,9 +821,25 @@ by hand and finishes it; X is P's koto parent.
   keys; trusting the local copy, the index, or the prune's existing check
   that the bucket copy isn't ahead would delete records. The cost is one
   listing per session a removal deletes.
+- **Pin and unpin are a named exception to the one-writer rule, and write
+  only their own records.** Recording the pin on the setter's side was
+  considered: it keeps every write in the setter's own session, but such a
+  record doesn't travel with the pinned session to another host or through
+  import, and a host-level record stays on its host. The pin has to live with
+  the session it keeps. So the exception is named and tracked (koto#445) and
+  kept narrow: two standalone records, no log event, no clock moved, and
+  under the cloud backend only their own objects, never the session's log,
+  state, index or version, so a host with a stale copy can't replace another
+  host's writes by pinning.
 - **Pin writes are strict under the cloud backend.** Today a context write
   whose push fails only warns; a pin that silently stays local gives false
-  confidence on every other host.
+  confidence on every other host, so a pin the bucket doesn't confirm is not
+  written at all.
+- **A migrated source's pin is inert.** Guarding `koto session prune
+  --migrated-from` would keep a source the import already moved; removing
+  the pin at import would write into the source, which import doesn't do
+  beyond its migrated mark. The moved copy holds the pin, so the source's copy
+  of it keeps nothing and unpin refuses it.
 - **Older builds must keep, not release.** The pin's stored form is chosen so
   that a release with session-retention links but no pin support reads it as
   unreadable, which keeps, rather than as an ordinary link, which releases.

@@ -16,8 +16,10 @@ decision: |
   it as an unreadable link key and keep. Every removal point goes through one
   removal guard, called under the per-session lock immediately before the
   delete, that reads the local pin and, under the cloud backend, lists the
-  session's pin object in the bucket. `koto session pin` and `unpin` write
-  strictly to the bucket. Release authority is `release-pin`, handed in
+  session's pin object in the bucket. `koto session pin` and `unpin`, the
+  one named exception to the one-writer rule, write only the pin and release
+  records as standalone objects, checked, with no log event and no other
+  object pushed. Release authority is `release-pin`, handed in
   `KOTO_AUTHORITY`, recorded in the anchor by the start hook through
   `koto session anchor open --record-authority`, and read from the caller's
   anchor.
@@ -119,9 +121,10 @@ hierarchy` and `koto session list --pinned` (R16, R17); an index-less pin
 file counting as readable and an indexed pin with no content as
 `missing_content` (R19); no restart of any clock at unpin (R14); unpinned
 sessions byte-for-byte unchanged (R13); the retention cost bounds with 200
-pins (R28); writes only into the named session or the starting agent
-session's own anchor, and `koto context add`/`remove` refusing every new key
-(R29); and everything with no niwa (R27).
+pins (R28); pin records that move no clock and log no event (R14a); one
+named, tracked exception to the one-writer rule, limited to the pin and the
+release record (R29, koto#445), and `koto context add`/`remove` refusing
+every new key; and everything with no niwa (R27).
 
 ## Decision Drivers
 
@@ -141,10 +144,12 @@ session's own anchor, and `koto context add`/`remove` refusing every new key
 - **Unpinned output unchanged.** Every existing surface prints the same bytes
   for a session with no pin (R13), so new fields appear only on pinned
   entries.
-- **Single writer.** Pin, unpin and the release record write only into the
-  named session; recording authority writes only into the starting agent
-  session's own anchor (R29), as session retention's one-writer rule already
-  requires.
+- **One named exception, kept narrow.** Pin and unpin write the pin and the
+  release record into the named session, the one exception to session
+  retention's one-writer rule (R29, koto#445), as standalone records with no
+  log event and, under cloud, no object but their own (R14a, R20); recording
+  authority writes only into the starting agent session's own anchor, which
+  the rule already allows.
 - **Bounded cost.** Reading a pin adds one small file read per session to the
   scan locally and one listing per session a removal would delete under cloud
   (R28).
@@ -198,7 +203,7 @@ readable pin (R19); a manifest entry with no file is `missing_content`; a
 symlink, directory (`koto/links/pin/...`) or special file is `not_a_file`.
 
 The component verdict is unchanged. `Judgment` gains two fields: `pin`, the
-judged session's own `PinFact`, and `pinned_members`, a map from each member
+judged session's own `PinFact`, and `pinned_members`, a map keyed by session name from each member
 whose `PinFact` isn't `None` to that fact. A new method,
 `Judgment::keeps(member)`, answers for one member: true when the member is in
 `pinned_members` or when the component verdict is `Keep`. The two questions
@@ -347,30 +352,67 @@ Key assumptions:
 - The bucket check of Decision 2 lists objects, so it finds a pin whatever
   the manifest says.
 
-#### Chosen: strict writes for the pin and its release, objects as truth
+#### Chosen: standalone records, object-only writes, objects as truth
 
-`koto session pin` writes `koto/links/pin` with writer `koto` through a new
-`write_reserved_strict(name, key, value)` in `src/session/links.rs`, which
-journals the key as `add_as` does and then calls `ensure_pushed`; any failure
-exits 3 with "pin held in the local store only", and the open batch makes the
-next `koto session pin`, `unpin`, `koto next` or `koto context add` on that
-session retry (R20). `koto session unpin` writes `koto/pin-release`
-strictly first and then removes `koto/links/pin` strictly (the object delete
-is checked), so an unpin interrupted between the two leaves the pin in force
-(R6). Removal of `koto/links/pin` is allowed only from `pin.rs`; the generic
-context remove path refuses every `koto/` key already. Because the bucket
-check reads the object, a host 2 push of an index that lacks the pin can't
-hide it (R22).
+Pin and unpin are the one named exception to session retention's one-writer
+rule (PRD R29, tracked in koto#445): they write into the named session, which
+can belong to another agent session or host, and only these two records. The
+records are standalone. Neither goes through the context write path, so
+neither appends an event to the session's log, journals a key, or triggers a
+push of the session's state, log, manifest or version object (R14a, R20).
+
+- **Local store.** `pin.rs` writes `ctx/koto/links/pin` (or
+  `ctx/koto/pin-release`) by temp file and rename, under the session's lock,
+  and adds or removes the key's entry in the local manifest, also under the
+  lock, with writer `koto`. The manifest entry is what lets v0.23.0's reader,
+  which reads `koto/links/*` only when the manifest lists it, see the pin and
+  keep the session (R26). No event is logged.
+- **Cloud backend.** A new backend method, `put_reserved_object(name, key,
+  bytes)`, PUTs exactly the object `<repo_id>/<name>/ctx/<key>` and checks the
+  response; `delete_reserved_object(name, key)` deletes exactly one object and
+  checks it. Neither touches any other object. The local record (when this
+  host holds a copy) is written only after the bucket confirms, so a pin the
+  bucket refused exists nowhere, and the command exits 3 (R20); running it
+  again retries. Because nothing else is pushed, a host holding a stale copy,
+  or no copy, can pin or unpin a session another host owns without replacing
+  that host's log or index.
+- **Unpin order.** The release record is written first and the pin removed
+  second, so an unpin interrupted between the two leaves the pin in force
+  (R6).
+- **Bucket truth.** Under the cloud backend the guard of Decision 2 decides
+  from the bucket's objects: a pin object keeps the session whether or not the
+  local copy has it, and a local pin file whose `set_at` equals the `pin.set_at`
+  of the bucket's release record was released on another host and no longer
+  keeps (R22); the guard then deletes it with the session. A whole pull
+  (`koto session resolve --keep remote`) downloads the pin object even when
+  the bucket's index lacks it, and the reader counts an unindexed pin file
+  (R19), so host 1 sees a pin host 2 set.
+
+Removal of `koto/links/pin` is allowed only from `pin.rs`; the generic context
+remove path refuses every `koto/` key already. Because the bucket check reads
+the object, a host 2 push of an index that lacks the pin can't hide it (R22).
 
 `koto session import` adds `koto/links/pin` and `koto/pin-release` to the
 keys `import_links.rs` carries verbatim, an unreadable pin included, beside
-its rule that rewrites held-by links (R25).
+its rule that rewrites held-by links, and nothing else of this feature: an
+anchor's `koto/anchor/authority` is dropped, and the read spool, request store
+and run journal stay on their host as they do today (R25). The migrated
+source's pin is inert: the engine already treats a migrated source as keeping
+nothing, `koto session unpin` refuses it with exit 2, and `koto session prune
+--migrated-from` removes the source with its pin, which is why that delete is
+in the not-guarded table of Decision 2.
 
 #### Alternatives Considered
 
 - **Merging manifests on push.** Fixes the index race for every key, but it
   changes every context write under cloud and its cost profile (koto#439);
   the pin needs only its own object to be authoritative.
+- **Writing the pin through the context path (`ensure_pushed`).** It pushes
+  the session's whole manifest and state, so host 2 pinning a session from a
+  stale copy would replace host 1's index and log.
+- **Recording the pin on the setter's side.** Keeps every write in the
+  setter's own session, but the record wouldn't travel with the pinned
+  session to another host or through import.
 - **Leaving pin writes best-effort, relying on retries.** A pin that silently
   stays local is believed on host 1 and absent on host 2, which is the case
   the feature exists for.
@@ -446,8 +488,9 @@ with its source, and none is stronger than what the owner's ruling asks for.
 The four choices meet in one place each. The pin is a key (Decision 1) that
 the engine reads into a per-session fact and that the removal guard
 (Decision 2) reads again, from disk and from the bucket, at the moment of
-every delete; the bucket read is meaningful because pin and unpin are strict
-and the object, not the index, is the truth (Decision 3); and the only
+every delete; the bucket read is meaningful because pin and unpin write
+their own objects, checked, and the object, not the index, is the truth
+(Decision 3); and the only
 command that removes a pin checks an authority the start recorded in the
 caller's anchor (Decision 4). Because the pin isn't a link or a keeper, the
 engine's component verdict, its release instants and every unpinned
@@ -468,7 +511,7 @@ not as a link.
 ### Overview
 
 A new module, `src/session/pin.rs`, holds the pin's types, its reader, its
-strict writer and remover, the release record, the authority check and the
+object-only writer and remover, the release record, the authority check and the
 removal guard. The engine (`src/session/hierarchy/`) reads pins into
 `SessionFacts` and exposes them on `Judgment`. Each removal point calls the
 guard before its delete and renders the result through `render.rs`. Two new
@@ -495,15 +538,17 @@ that command's environment, and unsets the variable in the session's shells.
   - `caller() -> Caller` (`ByHand` or `Anchor(name)` from `KOTO_ANCHOR`) and
     `authority_of(base, anchor) -> Result<Vec<String>>`.
   - `guard_removal(backend, name) -> Guard`.
-- **`src/session/links.rs`**: `write_reserved_strict` and
-  `remove_reserved_strict`, used only by `pin.rs`; `check_writer_key` keeps
-  refusing agent writes to all of `koto/`, which already covers the new keys
-  (R29).
+- **`src/session/links.rs`**: `write_reserved_record` and
+  `remove_reserved_record`, used only by `pin.rs`: a temp-file write or
+  removal of one `ctx/koto/` file plus its local manifest entry, under the
+  session's lock, logging no event; `check_writer_key` keeps refusing agent
+  writes to all of `koto/`, which already covers the new keys (R29).
 - **`src/session/mod.rs` / `cloud.rs`**: `SessionBackend::bucket_pin(name)
-  -> Result<BucketPin>` (default `NotApplicable`); the cloud implementation
-  lists the pin key's object and reads it when present, outside the probe
-  cache. A `remove_reserved_strict` path deletes the pin object and checks the
-  delete.
+  -> Result<BucketPin>` (default `NotApplicable`), which lists the pin key's
+  object and the release object and reads them when present, outside the
+  probe cache; `put_reserved_object(name, key, bytes)` and
+  `delete_reserved_object(name, key)`, each one checked request on exactly
+  one object and nothing else (no manifest, log, state or version push).
 - **`src/session/hierarchy/facts.rs`**: `SessionFacts.pin`; the pin key is
   read before the link walk and excluded from it.
 - **`src/session/hierarchy/judge.rs`**: `Judgment.pin`,
@@ -584,9 +629,11 @@ koto/anchor/authority   {"v":1,"names":[...],"unknown":[...],"at","source"}
 
 Pinning: the caller runs `koto session pin`; `pin.rs` validates the reason,
 takes the session's lock, checks the session's kind and migration, reads any
-existing pin (idempotent or refusal), and writes `koto/links/pin` locally;
-under cloud it journals the key and `ensure_pushed` uploads the object and
-manifest, or the command exits 3.
+existing pin (idempotent or refusal; under cloud, from the bucket's
+objects), then under cloud PUTs the pin object alone and, once the bucket
+confirms, writes the local record if this host holds a copy; on the local
+backend it writes the local record. A refused PUT writes nothing and exits 3.
+No log event is written and no other object is pushed.
 
 Removing: a removal point decides from its scan as today, then for each
 session it would delete calls `remove_guarded`, which takes the lock, calls
@@ -596,8 +643,11 @@ Every other result becomes a kept entry with the pin's fields.
 
 Releasing: `koto session unpin` resolves the caller from `KOTO_ANCHOR`; under
 an anchor, reads `koto/anchor/authority` from that anchor; on refusal exits 2
-with nothing written; on success writes `koto/pin-release` strictly, then
-removes `koto/links/pin` strictly.
+with nothing written; on success writes the release record, then removes the
+pin, each as its own object under cloud (then locally) or as its own local
+record, with no log event. Reading the anchor's authority is a direct file
+read in `pin.rs`, not a `koto context get`, so it logs no read anywhere and
+writes no read-spool entry (R14a).
 
 Authority at start: the hook runs `koto session anchor open
 --record-authority` with `KOTO_AUTHORITY` in its environment, `open` writes
@@ -653,10 +703,13 @@ Deliverables:
 ### Phase 4: the cloud backend and import
 
 `bucket_pin` on the cloud backend, the bucket half of the guard and of the
-previews, strict pin and unpin writes, `list --pinned` over the bucket, and
-the two-host stand-in tests including the request count, a list-after-write
-check against the stand-in, and a test that no push or pull step deletes the
-pin object. With this phase the verbs and flag stop being hidden.
+previews, object-only pin and unpin writes (`put_reserved_object`,
+`delete_reserved_object`), the stale-local-pin rule, `list --pinned` over the
+bucket, and the two-host stand-in tests including the request count, a pin
+from a stale copy and from no copy that writes only the pin object, a whole
+pull from an index lacking the pin, a list-after-write check against the
+stand-in, and a test that no push or pull step deletes the pin object. With
+this phase the verbs and flag stop being hidden.
 
 Deliverables:
 - `src/session/cloud.rs`, `sync.rs`, `mod.rs`, `pin.rs`, cloud tests
