@@ -5,8 +5,12 @@
 //! test appends through `LocalBackend` writes a workflow file into that
 //! session's `/workflows` directory.
 //!
-//! The first test reads every test file and fails on one that names the
-//! `koto` crate without including the module. The others run this test
+//! The first test reads every test crate, a `tests/*.rs` file or a
+//! `tests/<dir>/main.rs` with every module file it loads, and fails on one
+//! that names the `koto` crate without loading the module. The second reads
+//! every call to `host_env` in `src/` and fails on a variable it reads that
+//! `HOST_SESSION_ENV` doesn't list. Both read Rust tokens, so a comment
+//! neither names the crate nor includes a module. The others run this test
 //! binary again with the variables set and `HOME` in a temporary directory
 //! that holds a transcript for the session id, so a leak lands there and
 //! nowhere else, and check what an in-process append wrote. The control
@@ -22,6 +26,7 @@ mod koto_command;
 use host_session::HOST_SESSION_ENV;
 use koto::session::local::LocalBackend;
 use koto::session::SessionBackend;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Set on a re-run of this binary to the run's root, so the probe runs
@@ -79,44 +84,313 @@ fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-#[test]
-fn every_test_that_names_koto_includes_the_host_session_module() {
-    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
-    let support = tests.join("support");
-    let names_koto = regex::Regex::new(r"\bkoto\s*::").unwrap();
-    // Matched on the file with its whitespace removed, as rustfmt may split
-    // the attribute.
-    let includes = regex::Regex::new(r#"#\[path="support/(\w+)\.rs"\]"#).unwrap();
+/// A token of Rust source, as far as the guards need one. Comments are
+/// dropped, so a commented-out include or `koto::` counts for nothing, and a
+/// string literal keeps its text, so a `#[path]` value can be read while a
+/// `koto::` inside a string names nothing.
+#[derive(Debug, PartialEq)]
+enum Token {
+    Ident(String),
+    Punct(char),
+    Str(String),
+    Other,
+}
 
-    let mut crates: Vec<PathBuf> = std::fs::read_dir(&tests)
+fn ident(word: &str) -> Token {
+    Token::Ident(word.to_string())
+}
+
+/// The body of a string literal whose opening quote is just before `i`, and
+/// the index after its closing quote.
+fn string_body(s: &[char], mut i: usize) -> (String, usize) {
+    let mut text = String::new();
+    while i < s.len() && s[i] != '"' {
+        if s[i] == '\\' {
+            i += 1;
+        }
+        if let Some(&c) = s.get(i) {
+            text.push(c);
+        }
+        i += 1;
+    }
+    (text, i + 1)
+}
+
+/// The body of a raw string literal whose `r` is just before `i`, and the
+/// index after it, or `None` when what follows isn't a raw string.
+fn raw_string_body(s: &[char], mut i: usize) -> Option<(String, usize)> {
+    let hashes = s[i..].iter().take_while(|&&c| c == '#').count();
+    i += hashes;
+    if s.get(i) != Some(&'"') {
+        return None;
+    }
+    let start = i + 1;
+    let end = (start..s.len()).find(|&j| {
+        s[j] == '"' && s.len() - j > hashes && s[j + 1..=j + hashes].iter().all(|&c| c == '#')
+    })?;
+    Some((s[start..end].iter().collect(), end + 1 + hashes))
+}
+
+fn tokens(src: &str) -> Vec<Token> {
+    let s: Vec<char> = src.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        let c = s[i];
+        let next = s.get(i + 1).copied();
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '/' && next == Some('/') {
+            while i < s.len() && s[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            let mut depth = 0;
+            while i < s.len() {
+                if s[i] == '/' && s.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if s[i] == '*' && s.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if c == '"' {
+            let (text, end) = string_body(&s, i + 1);
+            out.push(Token::Str(text));
+            i = end;
+        } else if c == '\'' {
+            // A character literal, or the quote of a lifetime, whose name
+            // comes next as an identifier.
+            if next == Some('\\') {
+                i += 3;
+                while i < s.len() && s[i] != '\'' {
+                    i += 1;
+                }
+                i += 1;
+            } else if s.get(i + 2) == Some(&'\'') {
+                i += 3;
+            } else {
+                i += 1;
+            }
+            out.push(Token::Other);
+        } else if c.is_alphanumeric() || c == '_' {
+            let start = i;
+            while i < s.len() && (s[i].is_alphanumeric() || s[i] == '_') {
+                i += 1;
+            }
+            let word: String = s[start..i].iter().collect();
+            let raw = match word.as_str() {
+                "r" | "br" | "cr" => raw_string_body(&s, i),
+                "b" | "c" if s.get(i) == Some(&'"') => Some(string_body(&s, i + 1)),
+                _ => None,
+            };
+            if let Some((text, end)) = raw {
+                out.push(Token::Str(text));
+                i = end;
+            } else if word == "r" && s.get(i) == Some(&'#') {
+                // A raw identifier, `r#name`: the name comes next.
+                i += 1;
+            } else if c.is_ascii_digit() {
+                out.push(Token::Other);
+            } else {
+                out.push(Token::Ident(word));
+            }
+        } else {
+            out.push(Token::Punct(c));
+            i += 1;
+        }
+    }
+    out
+}
+
+fn path_separator_at(toks: &[Token], i: usize) -> bool {
+    toks.get(i) == Some(&Token::Punct(':')) && toks.get(i + 1) == Some(&Token::Punct(':'))
+}
+
+/// Whether the tokens name the `koto` crate: a path that starts with `koto`
+/// (`koto::x`, `::koto::x`), `use koto;`, or `extern crate koto`. A `koto`
+/// inside another path (`a::koto`) or after a `.` is something else.
+fn names_koto(toks: &[Token]) -> bool {
+    (0..toks.len()).any(|i| {
+        if toks[i] != ident("koto") {
+            return false;
+        }
+        let before = |back: usize| i.checked_sub(back).map(|j| &toks[j]);
+        if before(1) == Some(&Token::Punct('.')) {
+            return false;
+        }
+        let mut start = i;
+        if i >= 2 && path_separator_at(toks, i - 2) {
+            match before(3) {
+                Some(Token::Ident(w)) if w != "use" => return false,
+                Some(Token::Punct('>')) => return false,
+                _ => start = i - 2,
+            }
+        }
+        let prev = start.checked_sub(1).map(|j| &toks[j]);
+        path_separator_at(toks, i + 1)
+            || prev == Some(&ident("use"))
+            || (prev == Some(&ident("crate"))
+                && start
+                    .checked_sub(2)
+                    .is_some_and(|j| toks[j] == ident("extern")))
+    })
+}
+
+/// The `mod name;` items in a file, each with the value of its `#[path]`
+/// attribute, if it has one. Inline `mod name { .. }` blocks are read as
+/// part of the file.
+fn module_items(toks: &[Token]) -> Vec<(String, Option<String>)> {
+    let mut items = Vec::new();
+    let mut path = None;
+    let mut i = 0;
+    while i < toks.len() {
+        match &toks[i] {
+            Token::Punct('#') => {
+                let mut open = i + 1;
+                if toks.get(open) == Some(&Token::Punct('!')) {
+                    open += 1;
+                }
+                if toks.get(open) == Some(&Token::Punct('[')) {
+                    let mut depth = 0;
+                    let mut close = open;
+                    while close < toks.len() {
+                        match toks[close] {
+                            Token::Punct('[') => depth += 1,
+                            Token::Punct(']') => depth -= 1,
+                            _ => {}
+                        }
+                        if depth == 0 {
+                            break;
+                        }
+                        close += 1;
+                    }
+                    if let [Token::Ident(name), Token::Punct('='), Token::Str(value)] =
+                        &toks[open + 1..close.min(toks.len())]
+                    {
+                        if name == "path" {
+                            path = Some(value.clone());
+                        }
+                    }
+                    i = close + 1;
+                    continue;
+                }
+            }
+            Token::Ident(w) if w == "pub" => {
+                i += 1;
+                if toks.get(i) == Some(&Token::Punct('(')) {
+                    while i < toks.len() && toks[i] != Token::Punct(')') {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            Token::Ident(w) if w == "mod" => {
+                if let (Some(Token::Ident(name)), Some(Token::Punct(';'))) =
+                    (toks.get(i + 1), toks.get(i + 2))
+                {
+                    items.push((name.clone(), path.take()));
+                    i += 3;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        path = None;
+        i += 1;
+    }
+    items
+}
+
+/// The files of the test crate whose root is `root`, each with its tokens:
+/// the root and every module file a `mod` item loads, however deep. As
+/// rustc does, a `#[path]` is read from the declaring file's directory, and
+/// a module without one sits beside a crate root, a `mod.rs` or a file
+/// loaded through `#[path]`, and in a directory named after any other file.
+fn crate_files(root: &Path) -> Vec<(PathBuf, Vec<Token>)> {
+    let mut files: Vec<(PathBuf, Vec<Token>)> = Vec::new();
+    let mut todo = vec![(root.to_path_buf(), true)];
+    while let Some((file, owns_dir)) = todo.pop() {
+        let file = std::fs::canonicalize(&file)
+            .unwrap_or_else(|e| panic!("can't read {}: {e}", file.display()));
+        if files.iter().any(|(f, _)| *f == file) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("can't read {}: {e}", file.display()));
+        let toks = tokens(&text);
+        let parent = file.parent().unwrap();
+        for (name, path) in module_items(&toks) {
+            let child = match &path {
+                Some(path) => parent.join(path),
+                None => {
+                    let dir = if owns_dir {
+                        parent.to_path_buf()
+                    } else {
+                        parent.join(file.file_stem().unwrap())
+                    };
+                    [
+                        dir.join(format!("{name}.rs")),
+                        dir.join(name.as_str()).join("mod.rs"),
+                    ]
+                    .into_iter()
+                    .find(|p| p.is_file())
+                    .unwrap_or_else(|| {
+                        panic!("{} declares mod {name}, found in no file", file.display())
+                    })
+                }
+            };
+            let owns = path.is_some() || child.file_name().is_some_and(|n| n == "mod.rs");
+            todo.push((child, owns));
+        }
+        files.push((file, toks));
+    }
+    files
+}
+
+/// The roots of the integration test crates Cargo builds: `tests/*.rs` and
+/// `tests/<dir>/main.rs`.
+fn test_crates(tests: &Path) -> Vec<PathBuf> {
+    let mut crates: Vec<PathBuf> = std::fs::read_dir(tests)
         .unwrap()
         .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+        .filter_map(|p| {
+            if p.is_dir() {
+                Some(p.join("main.rs")).filter(|m| m.is_file())
+            } else {
+                Some(p).filter(|p| p.extension().is_some_and(|e| e == "rs"))
+            }
+        })
         .collect();
     crates.sort();
+    crates
+}
+
+#[test]
+fn every_test_that_names_koto_includes_the_host_session_module() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tests = manifest.join("tests");
+    let module = std::fs::canonicalize(tests.join("support/host_session.rs")).unwrap();
 
     let mut linked = 0;
     let mut found = Vec::new();
-    for file in &crates {
-        let text = std::fs::read_to_string(file).unwrap();
-        let squashed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        let modules: Vec<&str> = includes
-            .captures_iter(&squashed)
-            .map(|c| c.get(1).unwrap().as_str())
-            .collect();
-        let names = names_koto.is_match(&text)
-            || modules.iter().any(|m| {
-                std::fs::read_to_string(support.join(format!("{m}.rs")))
-                    .is_ok_and(|t| names_koto.is_match(&t))
-            });
-        if !names {
+    for root in test_crates(&tests) {
+        let files = crate_files(&root);
+        if !files.iter().any(|(_, toks)| names_koto(toks)) {
             continue;
         }
         linked += 1;
-        if !modules.contains(&"host_session") {
+        if !files.iter().any(|(file, _)| *file == module) {
             found.push(
-                file.strip_prefix(env!("CARGO_MANIFEST_DIR"))
-                    .unwrap_or(file)
+                root.strip_prefix(manifest)
+                    .unwrap_or(&root)
                     .display()
                     .to_string(),
             );
@@ -133,8 +407,106 @@ fn every_test_that_names_koto_includes_the_host_session_module() {
          tests/support/host_session.rs, so a suite run inside Claude Code reads \
          the hosting session's CLAUDE_CODE_SESSION_ID and writes into its \
          /workflows directory; add\n\n#[path = \"support/host_session.rs\"]\n\
-         mod host_session;\n\nto each of:\n  {}",
+         mod host_session;\n\nto each of (with the path from its own directory):\n  {}",
         found.join("\n  ")
+    );
+}
+
+/// `src/host_env.rs` reads every host variable through `host_env`, and
+/// `HOST_SESSION_ENV` must name each one, or an in-process test reads the
+/// new one from the hosting session. A call is read from its argument: a
+/// string literal, or a `&str` constant declared anywhere in `src/`.
+#[test]
+fn every_variable_read_through_host_env_is_in_host_session_env() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = Vec::new();
+    files_under(&manifest.join("src"), &mut sources);
+    sources.retain(|p| p.extension().is_some_and(|e| e == "rs"));
+    sources.sort();
+    let sources: Vec<(PathBuf, Vec<Token>)> = sources
+        .into_iter()
+        .map(|p| {
+            let toks = tokens(&std::fs::read_to_string(&p).unwrap());
+            (p, toks)
+        })
+        .collect();
+
+    // `const NAME: &str = "value";`, and `&'static str` alike.
+    let mut consts: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (_, toks) in &sources {
+        for i in 0..toks.len() {
+            let (Token::Ident(kw), Some(Token::Ident(name))) = (&toks[i], toks.get(i + 1)) else {
+                continue;
+            };
+            if kw != "const" || toks.get(i + 2) != Some(&Token::Punct(':')) {
+                continue;
+            }
+            let Some(eq) = (i + 3..toks.len()).find(|&j| toks[j] == Token::Punct('=')) else {
+                continue;
+            };
+            if !toks[i + 3..eq].contains(&ident("str")) {
+                continue;
+            }
+            if let (Some(Token::Str(value)), Some(Token::Punct(';'))) =
+                (toks.get(eq + 1), toks.get(eq + 2))
+            {
+                consts
+                    .entry(name.as_str())
+                    .or_default()
+                    .push(value.as_str());
+            }
+        }
+    }
+
+    let mut reads = Vec::new();
+    for (file, toks) in &sources {
+        let file = file.strip_prefix(manifest).unwrap_or(file).display();
+        for i in 0..toks.len() {
+            if toks[i] != ident("host_env")
+                || toks.get(i + 1) != Some(&Token::Punct('('))
+                || (i > 0 && toks[i - 1] == ident("fn"))
+            {
+                continue;
+            }
+            let close = (i + 2..toks.len())
+                .find(|&j| toks[j] == Token::Punct(')'))
+                .unwrap_or(toks.len());
+            let arg = &toks[i + 2..close];
+            let names: Vec<&str> = match arg.last() {
+                Some(Token::Str(value)) if arg.len() == 1 => vec![value.as_str()],
+                Some(Token::Ident(name))
+                    if arg[..arg.len() - 1]
+                        .iter()
+                        .all(|t| matches!(t, Token::Ident(_) | Token::Punct(':'))) =>
+                {
+                    consts.get(name.as_str()).cloned().unwrap_or_else(|| {
+                        panic!("{file}: host_env reads {name}, a constant this test can't find")
+                    })
+                }
+                _ => panic!(
+                    "{file}: host_env reads {arg:?}, which this test can't resolve to a \
+                     variable name; pass a string literal or a &str constant"
+                ),
+            };
+            reads.extend(names.into_iter().map(|n| (n, file.to_string())));
+        }
+    }
+
+    assert!(
+        reads.len() > 1,
+        "found no call to host_env in src/, so this check checks nothing"
+    );
+    let missing: Vec<String> = reads
+        .iter()
+        .filter(|(name, _)| !HOST_SESSION_ENV.contains(name))
+        .map(|(name, file)| format!("{name} (read in {file})"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "src/ reads these host variables through host_env, but HOST_SESSION_ENV in \
+         tests/support/host_session.rs doesn't list them, so an in-process test reads \
+         them from the hosting session; add each to the list:\n  {}",
+        missing.join("\n  ")
     );
 }
 
