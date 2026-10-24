@@ -27,8 +27,17 @@
 //! the `koto` crate doesn't include this module, and proves that an
 //! in-process append in a binary that does include it reads neither
 //! variable and writes nothing to the hosting session's `/workflows`.
+//!
+//! It also includes `test_home.rs`, so every in-process test starts with a
+//! `HOME` of its own.
 
 #![allow(dead_code)]
+
+// A crate that also includes `koto_command.rs` loads it twice; the second
+// copy finds the home already redirected and does nothing.
+#[allow(clippy::duplicate_mod)]
+#[path = "test_home.rs"]
+mod test_home;
 
 /// The hosting session's variables that koto's library reads in-process.
 pub const HOST_SESSION_ENV: [&str; 2] = ["CLAUDE_CODE_SESSION_ID", "KOTO_WORKFLOWS_DIR"];

@@ -20,8 +20,17 @@
 //! parent has. `tests/koto_command_env.rs` fails the suite when a test file
 //! names the binary anywhere but here, and proves that a cloud backend in
 //! the environment never reaches a command built here.
+//!
+//! It also includes `test_home.rs`, so every test that runs koto starts with
+//! a `HOME` of its own.
 
 #![allow(dead_code)]
+
+// A crate that also includes `host_session.rs` loads it twice; the second
+// copy finds the home already redirected and does nothing.
+#[allow(clippy::duplicate_mod)]
+#[path = "test_home.rs"]
+mod test_home;
 
 use std::ffi::OsString;
 use std::path::PathBuf;

@@ -19,6 +19,11 @@ pub mod session_view;
 pub mod template;
 pub mod workflows_surface;
 
+// Unit tests run with a `HOME` of their own, as integration tests do.
+#[cfg(test)]
+#[path = "../tests/support/test_home.rs"]
+mod test_home;
+
 // ===== Stage 1 frozen public surface (Issue 19 / Decision 5) =====
 //
 // The re-exports below pin the canonical paths bunki BK2 imports
