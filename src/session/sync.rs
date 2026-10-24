@@ -210,9 +210,18 @@ pub fn push_context_key(
 /// Returns whether it wrote the local store, so the caller can log the
 /// write (a `context_added` with `writer: "sync"`).
 ///
-/// `before_download` runs once a download is due and before it starts; its
-/// error is the only one returned, and nothing is written after it. Every
-/// other failure is a warning and `Ok(false)`, as before.
+/// `before_download` runs once a download is due and before it starts, and
+/// nothing is written after its error.
+///
+/// Once the bucket has said its copy of the key may differ from this host's,
+/// a step that fails is an error, never a fall-back to the local copy, which
+/// may be stale (koto#457): a manifest the session's listing showed
+/// (`manifest_listed`) that can't be fetched, a key whose hash differs and
+/// whose object can't be fetched (a 404 from an object the manifest names
+/// but the bucket lacks, say), or downloaded bytes that can't be written. A
+/// manifest the listing didn't show, or no listing at all (an unreachable
+/// bucket), leaves the local copy standing, `Ok(false)`, as before.
+#[allow(clippy::too_many_arguments)]
 pub fn pull_context_if_newer(
     local: &LocalBackend,
     bucket: &Bucket,
@@ -220,11 +229,18 @@ pub fn pull_context_if_newer(
     session: &str,
     key: &str,
     cache: &ManifestCache,
+    manifest_listed: bool,
     before_download: &dyn Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
     let manifest_key = format!("{}/{}/ctx/manifest.json", prefix, session);
     let remote_manifest = match fetch_remote_manifest(bucket, &manifest_key, session, cache) {
         Some(m) => m,
+        None if manifest_listed => anyhow::bail!(
+            "cloud sync: the bucket lists a context manifest for session '{}' but fetching it \
+             failed, so the local copy of '{}' may be stale; run the command again",
+            session,
+            key
+        ),
         None => return Ok(false),
     };
 
@@ -244,41 +260,43 @@ pub fn pull_context_if_newer(
 
     // Download the content from S3.
     let s3_key = format!("{}/{}/ctx/{}", prefix, session, key);
-    let response = match bucket.get_object(&s3_key) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "warning: cloud sync: failed to download context key '{}': {}",
-                key, e
-            );
-            return Ok(false);
-        }
-    };
+    let response = bucket.get_object(&s3_key).map_err(|e| {
+        anyhow::anyhow!(
+            "cloud sync: the bucket holds a different version of context key '{}' in session \
+             '{}' but fetching it failed, so the local copy may be stale: {}",
+            key,
+            session,
+            crate::session::cloud::without_url_userinfo(&e.to_string())
+        )
+    })?;
     if response.status_code() != 200 {
-        eprintln!(
-            "warning: cloud sync: unexpected status {} for key '{}'",
-            response.status_code(),
-            key
+        anyhow::bail!(
+            "cloud sync: the bucket holds a different version of context key '{}' in session \
+             '{}' but fetching it answered {}, so the local copy may be stale",
+            key,
+            session,
+            response.status_code()
         );
-        return Ok(false);
     }
 
     // Write locally, naming the pull as the writer.
-    match local.add_with_writer(
-        session,
-        key,
-        response.bytes(),
-        crate::session::context_log::WRITER_SYNC,
-    ) {
-        Ok(()) => Ok(true),
-        Err(e) => {
-            eprintln!(
-                "warning: cloud sync: failed to write downloaded key '{}': {}",
-                key, e
-            );
-            Ok(false)
-        }
-    }
+    local
+        .add_with_writer(
+            session,
+            key,
+            response.bytes(),
+            crate::session::context_log::WRITER_SYNC,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cloud sync: failed to write the downloaded context key '{}' of session '{}', \
+                 so the local copy may be stale: {}",
+                key,
+                session,
+                e
+            )
+        })?;
+    Ok(true)
 }
 
 /// The remote manifest's metadata for `key`, if the remote store has it.
