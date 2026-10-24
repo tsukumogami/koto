@@ -5,9 +5,11 @@
 //! the pinned session, holding one JSON object ([`Pin`]) of at most
 //! [`MAX_PIN_BYTES`]. It names no peer, so it is never an edge: the
 //! retention engine reads it as a per-session fact ([`PinFact`]) beside the
-//! links, and it keeps exactly its own session. A koto build from before
-//! pins reads the key as one that isn't a link key, a problem that keeps
-//! the session's hierarchy, so an older build keeps a pinned session too.
+//! links, and it keeps exactly its own session. koto v0.23.0, from before
+//! pins, reads the key as one that isn't a link key, a problem that keeps
+//! the session's hierarchy, so its prunes, terminal tick and replace keep a
+//! session pinned in a local store. Its cleanup, cancel `--cleanup` and
+//! import don't, and under the cloud backend it never sees the pin object.
 //!
 //! The release record, [`RELEASE_KEY`] (`koto/pin-release`), sits outside
 //! `koto/links/` so no build reads it as a link. An unpin writes it before
@@ -1116,10 +1118,11 @@ pub fn reconcile(backend: &Backend, graph: &mut crate::session::hierarchy::Graph
     }
 }
 
-/// Session `name`'s local pin, read from disk now, as a [`Guard`]: what the
-/// reports read (the terminal tick's `retention`, `kept_children`). Unlike
-/// [`guard_removal`] it never reaches beyond this host's copy, so a report
-/// costs no request.
+/// Session `name`'s local pin, read from disk now, as a [`Guard`]: what a
+/// report of sessions nothing is about to remove reads (`kept_children`,
+/// and the terminal tick for a session kept for another reason). Unlike
+/// [`guard_removal`] it never reaches beyond this host's copy, so it costs
+/// no request.
 pub fn local_guard(backend: &dyn SessionBackend, name: &str) -> Guard {
     let dir = backend.session_dir(name);
     let Some(base) = dir.parent() else {
