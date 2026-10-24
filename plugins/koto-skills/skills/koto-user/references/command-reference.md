@@ -754,7 +754,7 @@ koto session cleanup <name>
 
 Removes the entire session directory for the named workflow. Idempotent — succeeds even if the session does not exist.
 
-A pinned session is refused: exit 2, code `pinned` (or `pin_unreadable`), naming the pin's reason, setter and time, and nothing is removed. Unpin it first with `koto session unpin <name>`, and only when the pin's reason says the record can go. A migrated source is the exception: its moved copy holds the pin, so cleanup removes the source and unpin refuses it. Under the cloud backend a bucket that can't be checked for a pin refuses with exit 3, code `bucket_unchecked`. `koto cancel --cleanup` refuses the same way, before it cancels.
+A pinned session is refused: exit 2, code `pinned` (or `pin_unreadable`), naming the pin's reason, setter and time, and nothing is removed. Unpin it first with `koto session unpin <name>`, and only when the pin's reason says the record can go. A migrated source is the exception: its moved copy holds the pin, so cleanup removes the source and unpin refuses it. If an older release ran the import, check that the moved copy is pinned before removing the source. Under the cloud backend a bucket that can't be checked for a pin refuses with exit 3, code `bucket_unchecked`. `koto cancel --cleanup` refuses the same way, before it cancels.
 
 **Success output:**
 ```json

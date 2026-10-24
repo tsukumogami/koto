@@ -911,6 +911,42 @@ fn cleanup_removes_a_pinned_migrated_source_while_the_moved_copy_stays_pinned() 
     assert_bucket_pin(&printed_json(&out.stdout)["error"]);
 }
 
+#[test]
+fn after_a_same_host_import_the_old_workspace_never_clears_the_moved_copys_pin() {
+    // One host, two workspaces: the import takes the name over in the shared
+    // local store, so the copy at the name there is the moved copy, which
+    // holds the pin. The old workspace's removals must keep it.
+    let h = Hosts::new();
+    let dest = h.root.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    h.init(1, "P", &[]);
+    h.done(1, "P");
+    h.pin(1, "P");
+    let in_dest = |args: &[&str]| {
+        let out = h.cmd_at(1, true, &dest).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    in_dest(&["template", "compile", h.template.to_str().unwrap()]);
+    in_dest(&["session", "import", "P", "--from", h.work.to_str().unwrap()]);
+    let local_pin = h.sessions(1).join("P").join(PIN);
+    let pin = std::fs::read(&local_pin).unwrap();
+    let moved = format!("{}/P/{}", prefix_of(&dest), PIN);
+    assert!(h.s3.object(&moved).is_some());
+    settle();
+
+    // From the old workspace: neither a prune nor a cleanup takes the moved
+    // copy, and its pin is where it was, locally and in the bucket.
+    let _ = h.run(1, &["session", "prune", "--apply", "--all"]);
+    let _ = h.run(1, &["session", "cleanup", "P"]);
+    assert_eq!(std::fs::read(&local_pin).unwrap(), pin);
+    assert!(h.s3.object(&moved).is_some());
+}
+
 /// The bucket prefix of the workspace at `dir`.
 fn prefix_of(dir: &std::path::Path) -> String {
     let digest = Sha256::digest(dir.to_string_lossy().as_bytes());

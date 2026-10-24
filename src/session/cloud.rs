@@ -3140,9 +3140,15 @@ impl SessionBackend for CloudBackend {
     }
 
     fn is_migrated_source(&self, id: &str) -> bool {
-        // The write-side check lists for itself. Only its migration refusal
-        // says yes; a failed listing (which warns and lets a write go on)
-        // and the local guard's own refusal say no, so the pin keeps.
+        // Only the bucket's marker says yes. The local guard refuses with
+        // the same error type when the local copy at this name is the moved
+        // copy of a same-host import, which is the copy that holds the pin,
+        // so its refusal says no. The write-side check then lists for
+        // itself; a failed listing warns and lets it pass, which says no
+        // too, so the pin keeps.
+        if self.local_guard(id).is_err() {
+            return false;
+        }
         self.check_not_migrated_to_write(id)
             .is_err_and(|e| e.downcast_ref::<SessionMigrated>().is_some())
     }
