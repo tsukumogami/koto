@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   When a session's work passes to another session (a coordinator's successor,
   a takeover by an unrelated session, or a `koto session import` copy), koto
@@ -26,7 +26,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-koto-session-continues](docs/briefs/BRIEF-koto-session-continues.md); carried in Absorbed Brief.
 
