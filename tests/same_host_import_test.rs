@@ -1257,7 +1257,8 @@ fn last_event_ms(h: &Host, name: &str) -> i64 {
 /// another agent session: the copy's held-by is rewritten to the importer's
 /// anchor, the copy is kept at its terminal step, a prune names the
 /// importer's anchor as why the copy and `b` are kept, the migrated source
-/// keeps nothing and refuses reads, and `b` stays readable from B.
+/// keeps nothing and refuses reads, and `b`, which didn't move, is read from
+/// its own workspace A and refused from B.
 #[test]
 fn an_import_from_an_agent_session_holds_the_moved_copy_and_its_hierarchy() {
     let s3 = FakeS3::start(BUCKET);
@@ -1325,13 +1326,22 @@ fn an_import_from_an_agent_session_holds_the_moved_copy_and_its_hierarchy() {
     assert_eq!(refused.code, Some(2), "{}", refused.describe());
     assert!(format!("{}{}", refused.stdout, refused.stderr).contains("session_migrated"));
 
-    // The reviewer reads b's log and keys from B.
-    let out = ok(&h, &h.b, &["context", "list", "b"], &as_importer);
+    // Only coord moved: b is still bound to A, where it was started, so the
+    // reviewer reads b's log and keys from there. From B, whose prefix isn't
+    // b's, the read refuses rather than sync against it (koto#457).
+    let out = ok(&h, &h.a, &["context", "list", "b"], &as_importer);
     assert!(out.stdout.contains("notes.md"), "{}", out.describe());
-    let out = ok(&h, &h.b, &["status", "b"], &as_importer);
+    let out = ok(&h, &h.a, &["status", "b"], &as_importer);
     assert_eq!(out.json()["is_terminal"], true, "{}", out.describe());
-    let out = ok(&h, &h.b, &["context", "get", "b", "notes.md"], &as_importer);
+    let out = ok(&h, &h.a, &["context", "get", "b", "notes.md"], &as_importer);
     assert_eq!(out.raw, b"the notes\n");
+    let refused = h.koto(&h.b, &["context", "get", "b", "notes.md"], &as_importer);
+    assert_eq!(refused.code, Some(2), "{}", refused.describe());
+    assert!(
+        refused.stdout.contains("session_bound_elsewhere"),
+        "{}",
+        refused.describe()
+    );
 }
 
 /// A held-by link whose anchor is open here is kept as it is, although the
