@@ -1054,7 +1054,7 @@ fn under_the_cloud_backend_apply_removes_the_remote_copy_first_and_keeps_the_mar
     let stuck_state = format!("{prefix}/stuck/koto-stuck.state.jsonl");
     s3.fail("DELETE", &stuck_state, 500);
 
-    let out = env.prune(&["--apply", "--all"]);
+    let out = env.prune(&["--apply", "--all", "--confirm-short-retention"]);
     assert_eq!(out.status.code(), Some(3));
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(names(&v["removed"]), vec!["gone"]);
@@ -1073,9 +1073,246 @@ fn under_the_cloud_backend_apply_removes_the_remote_copy_first_and_keeps_the_mar
     assert!(env.sessions().join("stuck").is_dir());
 
     s3.clear_faults();
-    let out = env.prune_ok(&["--apply", "--all"]);
+    let out = env.prune_ok(&["--apply", "--all", "--confirm-short-retention"]);
     assert_eq!(names(&out["removed"]), vec!["stuck"]);
     assert!(s3.keys_under(&format!("{prefix}/stuck/")).is_empty());
+}
+
+// ===== The short-retention guard =====
+
+/// Every object under the bucket, for a check that nothing was deleted.
+fn bucket_keys(s3: &FakeS3) -> Vec<String> {
+    let mut keys = s3.keys();
+    keys.sort();
+    keys
+}
+
+/// The refusal a short retention gets under the cloud backend, read from a
+/// command that exited 2.
+fn short_retention_refusal(out: &std::process::Output) -> Value {
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let error = if v["error"].is_object() {
+        v["error"].clone()
+    } else {
+        v.clone()
+    };
+    assert_eq!(error["code"], "prune_short_retention", "{v:#}");
+    error
+}
+
+#[test]
+fn under_the_cloud_backend_a_short_retention_refuses_a_direct_apply_and_removes_nothing() {
+    let s3 = FakeS3::start(BUCKET);
+    let env = Env::cloud(&s3);
+    env.done("first");
+    env.done("second");
+    settle();
+    let before = bucket_keys(&s3);
+    assert!(!before.is_empty());
+
+    let dir = env.work.to_str().unwrap().to_string();
+    for args in [
+        vec!["--apply", "--all"],
+        vec!["--apply", "--older-than", "1s"],
+        vec!["--apply", "--execution-dir", dir.as_str()],
+    ] {
+        let out = env.prune(&args);
+        let error = short_retention_refusal(&out);
+        assert_eq!(error["would_remove"], 2, "{args:?}: {error:#}");
+        assert_eq!(error["backend"], "cloud");
+        assert_eq!(error["bucket"], BUCKET);
+        assert_eq!(
+            error["store"],
+            std::fs::canonicalize(env.sessions())
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        assert_eq!(
+            error["retention"],
+            serde_json::json!([{
+                "setting": "retention.keep",
+                "value": "1s",
+                "from": "KOTO_RETENTION_KEEP",
+            }])
+        );
+        let message = error["message"].as_str().unwrap();
+        for part in [
+            "2 finished sessions",
+            "retention.keep is 1s (from KOTO_RETENTION_KEEP)",
+            BUCKET,
+            "without --apply",
+            "koto session prune --apply --plan <token>",
+            "--confirm-short-retention",
+            "nothing was removed",
+        ] {
+            assert!(message.contains(part), "{part:?} missing from: {message}");
+        }
+    }
+    assert!(env.sessions().join("first").is_dir());
+    assert!(env.sessions().join("second").is_dir());
+    assert_eq!(bucket_keys(&s3), before);
+
+    // The preview and its plan are the safe path, and are unchanged.
+    let preview = env.prune_ok(&["--all"]);
+    assert_eq!(names(&preview["remove"]), vec!["first", "second"]);
+    let token = preview["plan"].as_str().unwrap().to_string();
+    let out = env.prune(&["--apply", "--plan", &token]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let applied: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(names(&applied["removed"]), vec!["first", "second"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the cloud store at") && stderr.contains(BUCKET),
+        "{stderr}"
+    );
+    assert!(s3
+        .keys_under(&format!("{}/first/", env.prefix()))
+        .is_empty());
+}
+
+#[test]
+fn under_the_cloud_backend_the_confirm_flag_removes_under_a_short_retention() {
+    let s3 = FakeS3::start(BUCKET);
+    let env = Env::cloud(&s3);
+    env.done("first");
+    settle();
+    let out = env.prune(&["--apply", "--all", "--confirm-short-retention"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(names(&v["removed"]), vec!["first"]);
+    assert!(!env.sessions().join("first").exists());
+    assert!(s3
+        .keys_under(&format!("{}/first/", env.prefix()))
+        .is_empty());
+    // The line naming the store comes before the removal starts.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("koto session prune: removing"), "{stderr}");
+    assert!(stderr.contains(BUCKET), "{stderr}");
+}
+
+#[test]
+fn under_the_cloud_backend_the_guard_leaves_long_retentions_and_old_selections_alone() {
+    let s3 = FakeS3::start(BUCKET);
+    let env = Env::cloud(&s3);
+    env.done("first");
+    settle();
+
+    // A selection of an hour or more runs as it always did: nothing that
+    // just finished is old enough, so nothing goes.
+    let v = env.prune_ok(&["--apply", "--older-than", "1h"]);
+    assert!(names(&v["removed"]).is_empty());
+
+    // An idle period under the floor is named too.
+    let out = env.run_env(
+        &["session", "prune", "--apply", "--all"],
+        &[("KOTO_RETENTION_IDLE_PERIOD", "30m")],
+    );
+    let error = short_retention_refusal(&out);
+    let settings: Vec<_> = error["retention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["setting"].as_str().unwrap())
+        .collect();
+    assert_eq!(settings, ["retention.keep", "retention.idle_period"]);
+    assert_eq!(error["retention"][1]["value"], "30m");
+
+    // With every removal setting at an hour or more, the direct form runs
+    // as it always did: the retention hasn't passed, so it keeps the session.
+    let v = env.ok_env(&["session", "prune", "--apply", "--all"], &LONG);
+    assert!(names(&v["removed"]).is_empty());
+    assert!(env.sessions().join("first").is_dir());
+}
+
+#[test]
+fn the_local_backend_removes_under_a_short_retention_without_confirmation() {
+    let env = Env::new();
+    env.done("first");
+    settle();
+    let out = env.prune(&["--apply", "--all"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(names(&v["removed"]), vec!["first"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("the local store at"), "{stderr}");
+}
+
+#[test]
+fn under_the_cloud_backend_workspace_prune_yes_refuses_a_short_retention() {
+    let s3 = FakeS3::start(BUCKET);
+    let env = Env::cloud(&s3);
+    env.init("root");
+    env.init_child("child", "root");
+    env.finish("child", "yes");
+    env.finish("root", "yes");
+    settle();
+    let before = bucket_keys(&s3);
+
+    let out = env.run_in(
+        &env.work,
+        &["workspace", "prune", "--root", "root", "--yes"],
+    );
+    let error = short_retention_refusal(&out);
+    assert_eq!(error["command"], "workspace prune");
+    assert_eq!(error["would_remove"], 2);
+    assert_eq!(error["backend"], "cloud");
+    assert_eq!(error["bucket"], BUCKET);
+    let message = error["error"].as_str().unwrap();
+    for part in ["without --yes", "--dry-run", "--confirm-short-retention"] {
+        assert!(message.contains(part), "{part:?} missing from: {message}");
+    }
+    assert!(env.sessions().join("root").is_dir());
+    assert!(env.sessions().join("child").is_dir());
+    assert_eq!(bucket_keys(&s3), before);
+
+    // A dry run still previews, and the confirm flag removes.
+    let out = env.run_in(
+        &env.work,
+        &["workspace", "prune", "--root", "root", "--dry-run"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = env.run_in(
+        &env.work,
+        &[
+            "workspace",
+            "prune",
+            "--root",
+            "root",
+            "--yes",
+            "--confirm-short-retention",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!env.sessions().join("root").exists());
+    assert!(!env.sessions().join("child").exists());
 }
 
 /// The store-scale measurement: 1,000 sessions koto created and finished,
