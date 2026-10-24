@@ -155,7 +155,7 @@ After each of S1 to S5 compare P's hash with the recorded one (after S6, hash th
 
 ### Step 4: an agent session unpins only when its start was handed release-pin
 
-**Goal**: The start hook records the authority handed in `KOTO_AUTHORITY` in the agent session's anchor and removes the variable from its shells, and `koto session unpin` under an anchor decides from that record alone, run with synthetic hook inputs and no niwa.
+**Goal**: The start hook records the authority handed in `KOTO_AUTHORITY` in the agent session's anchor and removes the variable from its shells, and `koto session unpin` under an anchor decides from that record alone, run with synthetic hook inputs and no niwa. Pin and unpin still work on the local backend only (the cloud step comes later), so this step's checks run there; it replaces step 1's blanket `authority_required` refusal under an anchor with the real check, and adds the anchor's `authorities` and `unknown_authorities` to `koto session hierarchy`, which step 3 left without them. `koto session anchor open` changes the record only with `--record-authority`, writes nothing when the start was handed nothing and the record is already empty or missing, and never reaches the bucket.
 
 **Acceptance Criteria**:
 
