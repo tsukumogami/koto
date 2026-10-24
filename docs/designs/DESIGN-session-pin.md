@@ -236,6 +236,11 @@ hierarchy rule, not to a member kept only by its pin, so the two prunes
 remove the same sessions. A pin found on an anchor or a close session (one
 that arrived by import or the bucket, since `koto session pin` refuses those
 kinds) still keeps that session, and `koto session unpin` still releases it.
+A pinned child is found and kept by its own name and its own pin, never
+through `parent_workflow` lineage, which import doesn't carry and which can
+dangle; the sweep's `Sweep::enter` and `reclaim` read the child's pin by name.
+Naming a kept child in their output is a read and writes nothing into the
+child or its pin.
 
 #### Alternatives Considered
 
@@ -386,6 +391,12 @@ push of the session's state, log, manifest or version object (R14a, R20).
   pull leaves the bare files alone. On a cloud host, v0.23.0 can't see that
   local pin, as it can't see a pin another host set; the guide's minimum
   release covers it (R26).
+- **A backend switch.** A session pinned under the local backend carries an
+  indexed pin. On its first push under the cloud backend (the adopt path
+  koto#437 added), `pin.rs` uploads the pin and release record with
+  `put_reserved_object` and drops their local index entries, leaving bare
+  files under R20a. Until that push the guard keeps the session from the
+  local pin.
 - **The pin's `id`.** Each pin carries a random 128-bit `id`, set when it's
   written; the release record copies it as `pin.id`. Comparing ids rather
   than `set_at` keeps a pin set, released and set again within one second
@@ -461,7 +472,14 @@ lowercase, at most 16 names of at most 64 characters) and writes
 `{"v":1,"names":[...],"unknown":[...],"at":"<rfc3339>",
 "source":"<start source>"}`, replacing what an earlier start recorded (R8).
 With the flag and no variable it writes an empty list, so a start handed
-nothing clears what an earlier start was handed. Without the flag `open`
+nothing clears what an earlier start was handed; when the anchor already
+records no authority (an empty list or no record), it writes nothing at all,
+so a start with no `KOTO_AUTHORITY` is a no-op for the anchor. The record is a
+local file write in the anchor, never a bucket call: the hook opens anchors
+with `KOTO_SESSION_*` dropped, and where the anchor is in the cloud store the
+record is a bare local file under the same rule as a local pin (R20a), never
+uploaded, which is enough because `unpin` reads it on the anchor's own host.
+Without the flag `open`
 leaves the record alone, so the hook is the only caller that changes it in
 normal use. A successor anchor gets only its own start's list. The hook adds
 `unset KOTO_AUTHORITY` to its block, so the session's shells, and any worker

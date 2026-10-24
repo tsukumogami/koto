@@ -254,7 +254,10 @@ instant, release instant, retention, migrated source.
   reads `KOTO_AUTHORITY` (a comma-separated list; each name trimmed, names
   matched exactly in lowercase) from the agent session's environment,
   records the list in the agent session's anchor, replacing what an earlier
-  start recorded, and removes `KOTO_AUTHORITY` from the shells the session
+  start recorded (a start handed nothing writes nothing when the anchor
+  records no authority already, and clears an earlier grant otherwise; the
+  record is a local write in the anchor, never a bucket call, and never
+  uploaded), and removes `KOTO_AUTHORITY` from the shells the session
   starts, so a worker or `claude -p` child launched from them inherits none.
   A successor anchor records only what its own start was handed. A value of
   `KOTO_AUTHORITY` in the caller's own environment at unpin time is never
@@ -282,7 +285,11 @@ instant, release instant, retention, migrated source.
   siblings the existing rule lets go. A pinned child whose parent was removed
   stays readable by its own name, with its `parent_workflow` naming an absent
   peer as session retention already allows, and no removal treats it as an
-  orphan to clean up: it goes only after an unpin, by the rule.
+  orphan to clean up: it goes only after an unpin, by the rule. A pinned
+  child is found and kept by its own name and its own pin, never through
+  koto's parent-child lineage, which import doesn't carry and which can
+  dangle. Naming a kept child in the sweep's or the subtree removal's output
+  is a read: it writes nothing into the child or its pin.
 - **R10. Every removal keeps a pinned session.** These keep a pinned session:
   the terminal tick, with or without `--no-cleanup` and for a failure
   terminal; the parent sweep; the same-name replace; `koto workspace prune`,
@@ -386,7 +393,12 @@ instant, release instant, retention, migrated source.
   from the same host leaves the bucket's pin and release objects as they are,
   and the host doesn't read its copy as ahead of or diverged from the bucket
   because of them. (On the local backend there is no sync, and the record
-  keeps its index entry, which older releases need to see it, R26.)
+  keeps its index entry, which older releases need to see it, R26.) When a
+  session pinned under the local backend is first pushed under the cloud
+  backend after a switch, its pin and release record are uploaded as their
+  own objects and their local index entries are dropped, so from then on they
+  follow this rule; until that push, a cloud host's removals keep the session
+  from the local pin (R21).
 - **R21. Every removal checks the bucket before deleting.** Under the cloud
   backend, before any removal deletes either copy of a session, it makes a
   bucket check for that session. A pin found in the local copy or in the
@@ -544,18 +556,21 @@ a build without this feature, and S2 to S6 don't apply to it.
   finished; only C2 is pinned and X is not. `koto session pin C2` exits 0
   without X or its siblings being pinned, and X, C1 and C3 hold no pin
   afterwards.
-- [ ] **Sweeps keep a pinned child.** In that fixture, X's terminal tick
+- [ ] **Sweeps keep a pinned child.** In that fixture (also with C2's
+  `parent_workflow` lineage to X removed, so only its name and pin remain), X's terminal tick
   without `--no-cleanup` (the parent sweep) and, in a fresh copy of the
   fixture past the retention, `koto workspace prune --root X --yes` each keep
   C2 and list it with `kept_by_pin: true` and its pin, and remove C1 and C3
   once the rule lets them go. The same holds with X pinned as well, where X
   is also kept and named. A same-name replace of X, released, sweeps C1 and
-  C3 and keeps C2.
+  C3 and keeps C2. C2's files and pin hash the same before and after each of
+  these runs.
 - [ ] **A pinned child outlives its parent.** After X is removed (by
   `koto workspace prune --root X --yes`, or unpinned and pruned), `koto status
   C2` and `koto context get C2 <key>` still read C2 by name, its hierarchy
   query names X as an absent peer, and `koto session prune --apply --all` and
-  every later removal keep C2 with its pin. After `koto session unpin C2` by
+  every later removal keep C2 with its pin, and C2 hashes the same across
+  each of them. After `koto session unpin C2` by
   hand, the next prune past the retention removes it.
 - [ ] **Pin adds no edge.** The hierarchy query JSON for every session in a
   fixture of two hierarchies, one containing the pinning agent session's open
@@ -627,6 +642,11 @@ a build without this feature, and S2 to S6 don't apply to it.
   handed nothing, and a start again of the same agent session handed nothing
   are each refused an unpin. Under an anchor whose start was handed nothing,
   `KOTO_AUTHORITY=release-pin koto session unpin P` is refused.
+- [ ] **A start handed nothing writes nothing.** Run with synthetic hook
+  inputs and no `KOTO_AUTHORITY`, a start whose anchor records no authority
+  leaves the anchor's files hashing the same and, under the cloud backend,
+  makes no bucket request for the authority record; a start handed nothing
+  after one handed `release-pin` clears the record.
 - [ ] **Setter gets no release.** The agent session that pinned P, holding no
   release authority, is refused an unpin of P.
 - [ ] **Pinning needs no authority.** Under an anchor with no handed
@@ -721,6 +741,11 @@ by hand and finishes it; X is P's koto parent.
   `koto context add P <key>` from host 1, which pushes P's index and state,
   leaves the bucket's pin and release objects byte-identical, and host 2 still
   sees the release.
+- [ ] **Backend switch carries the pin.** P is pinned under the local backend
+  (its local index lists the pin); the backend is switched to cloud and P's
+  first push runs. The bucket then holds the pin as its own object, P's local
+  index no longer lists it, the sync cache reads P as current, and host 2
+  keeps P with `source: bucket`.
 - [ ] **Pull from an index without the pin.** With the bucket's index for P
   lacking the pin entry (a host 2 push) and the pin object present, host 1
   pulls P whole (`koto session resolve --keep remote`) and its
