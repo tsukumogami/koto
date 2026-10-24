@@ -10,6 +10,8 @@
 //! non-overridable gate (Issue #251), plus a snapshot proving templates that
 //! don't use the field compile byte-identical to before it existed.
 
+#[path = "support/host_session.rs"]
+mod host_session;
 #[path = "support/koto_command.rs"]
 mod koto_command;
 

@@ -29,6 +29,8 @@
 //! fixtures' value is that they predate the change. The regeneration helpers
 //! at the bottom spell out when they may be used.
 
+#[path = "support/host_session.rs"]
+mod host_session;
 #[path = "support/json_baseline.rs"]
 mod json_baseline;
 #[path = "support/koto_command.rs"]

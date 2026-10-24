@@ -4,6 +4,8 @@
 //! refusal, `--force`/`--yes` interlock, `--dry-run`, descendant walk,
 //! and the no-coordinator-of-record-check property.
 
+#[path = "support/host_session.rs"]
+mod host_session;
 #[path = "support/koto_command.rs"]
 mod koto_command;
 

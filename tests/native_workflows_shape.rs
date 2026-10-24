@@ -8,6 +8,9 @@
 //! shape-change / drift-guard obligation (whenever the emitted shape changes,
 //! this fixture must change with it, deliberately).
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use koto::workflows_surface::{
     HoldingKey, Holdings, Phase, ProgressNode, RenderStatus, WorkflowFile, CONTRACT_VERSION,
 };

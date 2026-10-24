@@ -7,6 +7,9 @@
 //! headers (the JSON form that bunki BK2 already writes) must
 //! deserialize cleanly with all new fields defaulted to `None` / `0`.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use koto::engine::types::{AssignmentClaim, StateFileHeader};
 
 fn full_header() -> StateFileHeader {

@@ -24,6 +24,9 @@
 //! regressions in the envelope shape fail CI even when the unit tests
 //! in `src/cli/batch_error.rs` pass.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use koto::cli::batch_error::{
     BatchError, ChildEligibility, ChildOutcome, DanglingRef, InvalidBatchReason, InvalidNameDetail,
     InvalidRetryReason, LimitKind, MutatedField,

@@ -20,6 +20,9 @@
 //! a follow-up integration file; the library-level tests here are
 //! the load-bearing semantic ones.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

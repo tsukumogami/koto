@@ -17,6 +17,9 @@
 //!   higher-mtime entry; the lower-mtime entry is NOT consulted by
 //!   the scan filter.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};

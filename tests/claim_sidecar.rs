@@ -9,6 +9,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};

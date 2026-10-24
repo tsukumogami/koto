@@ -6,6 +6,9 @@
 //!
 //! docs/designs/DESIGN-koto-value-routing.md, Implementation Approach step 4.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::Path;

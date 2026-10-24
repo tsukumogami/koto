@@ -10,6 +10,9 @@
 //! unlink after wake-delivery; no scan-cursor interaction; no
 //! workspace-scan O(workspace) walk.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

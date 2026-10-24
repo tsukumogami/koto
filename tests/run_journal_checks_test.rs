@@ -25,6 +25,8 @@
 
 #[path = "support/decider_stub.rs"]
 mod decider_stub;
+#[path = "support/host_session.rs"]
+mod host_session;
 #[path = "support/koto_command.rs"]
 mod koto_command;
 
@@ -3816,8 +3818,6 @@ fn a_respawn_cancel_from_another_process_writes_the_open_visits_reads() {
     let env = Env::new();
     let dir = env.context_session("req");
     env.koto_in(&dir, &["next", "req"]);
-    // This process has no driver, as the koto commands above had none.
-    std::env::remove_var("CLAUDE_CODE_SESSION_ID");
     let backend =
         LocalBackend::with_base_dir_and_journal(env.koto_home().join("sessions"), env.koto_home());
     let header = backend.read_header("req").unwrap();

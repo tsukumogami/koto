@@ -18,6 +18,9 @@
 //! deliberately use a per-tempdir HOME so they never write into a real
 //! `~/.koto/coordinators/`.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};

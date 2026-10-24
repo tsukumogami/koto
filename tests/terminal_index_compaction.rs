@@ -15,6 +15,9 @@
 //! - **Compaction is semantics-preserving end-to-end**: read the
 //!   reader's dedup map pre- and post-compact and confirm equality.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::thread;

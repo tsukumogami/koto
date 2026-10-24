@@ -10,6 +10,9 @@
 //! regression, `ConcurrentSubmissionConflict` does not partially
 //! write, hash durability across runs.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

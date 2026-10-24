@@ -23,6 +23,9 @@
 //! `handle_next` will not change -- only the helper's return value
 //! will -- so the integration-level contract encoded here stays valid.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use assert_fs::TempDir;
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread;
