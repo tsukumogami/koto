@@ -490,47 +490,57 @@ fn hub_actions(script: &str, workers: &[&str], latency: Duration) -> (Duration, 
     (local_action, cloud_action)
 }
 
+/// The cloud time of a hub action that makes only `write`, the first write of
+/// its tick, which checks the bucket and marks a batch open whatever the
+/// reads after it cost. The benches below bound their reads on top of it.
+fn write_only_action(write: &str, workers: &[&str], latency: Duration) -> Duration {
+    hub_actions(write, workers, latency).1
+}
+
 /// A hub tick whose action writes its own session and then reads it 40
 /// times, from 40 koto processes, the way a coordinator's record reads go.
 /// The tick checked its own session when it started, and its own writes are
 /// what changed the local copy, so the reads ask the bucket nothing
-/// (koto#439): the action costs at most twice the local one plus one round
-/// trip.
+/// (koto#439): past the action's write, which costs its own requests, the
+/// 40 reads cost at most twice the local action plus one round trip of
+/// slack.
 #[test]
 fn a_hub_reading_its_own_session_after_writing_it_asks_the_bucket_nothing() {
     const LATENCY: Duration = Duration::from_millis(150);
     const READS: usize = 40;
-    let mut script = vec![format!(
-        "printf 'written in the tick' | koto context add {HUB} mine.md"
-    )];
+    let write = format!("printf 'written in the tick' | koto context add {HUB} mine.md");
+    let mut script = vec![write.clone()];
     for _ in 0..READS {
         script.push(format!("koto context get {HUB} mine.md > /dev/null"));
     }
+    let write_only = write_only_action(&write, &[], LATENCY);
     let (local_action, cloud_action) = hub_actions(&script.join("\n"), &[], LATENCY);
     eprintln!(
-        "own write then {READS} own reads at {:?} a request: action local {:?}, cloud {:?}",
-        LATENCY, local_action, cloud_action
+        "own write then {READS} own reads at {:?} a request: action local {:?}, cloud {:?} \
+         (the write alone, cloud {:?})",
+        LATENCY, local_action, cloud_action, write_only
     );
     assert!(
-        cloud_action <= local_action * 2 + LATENCY,
-        "the hub's {READS} reads of its own session took {:?} on the cloud backend, \
-         over twice the local {:?} plus one round trip",
+        cloud_action <= write_only + local_action * 2 + LATENCY,
+        "the hub's {READS} reads of its own session took {:?} on the cloud backend, over the \
+         write alone ({:?}) plus twice the local {:?} plus one round trip",
         cloud_action,
+        write_only,
         local_action
     );
 }
 
 /// The shape of a coordinator hub's wait-target select: it records what it
 /// is about to do, then reads each worker's state and its own record over
-/// and over while it picks. Each worker costs the tick one check, the hub's
-/// own session none.
+/// and over while it picks. Past the action's write, each worker costs the
+/// tick one check and the hub's own session none: the reads cost at most
+/// twice the local action plus one round trip per worker and one of slack.
 #[test]
 fn a_hub_select_over_its_workers_checks_each_session_once() {
     const LATENCY: Duration = Duration::from_millis(150);
     const WORKERS: [&str; 4] = ["worker-a", "worker-b", "worker-c", "worker-d"];
-    let mut script = vec![format!(
-        "printf 'selecting' | koto context add {HUB} mine.md"
-    )];
+    let write = format!("printf 'selecting' | koto context add {HUB} mine.md");
+    let mut script = vec![write.clone()];
     for _ in 0..3 {
         for w in WORKERS {
             script.push(format!("koto context get {w} k.md > /dev/null"));
@@ -538,20 +548,24 @@ fn a_hub_select_over_its_workers_checks_each_session_once() {
             script.push(format!("koto context exists {HUB} mine.md"));
         }
     }
+    let write_only = write_only_action(&write, &WORKERS, LATENCY);
     let (local_action, cloud_action) = hub_actions(&script.join("\n"), &WORKERS, LATENCY);
     eprintln!(
-        "select over {} workers at {:?} a request: action local {:?}, cloud {:?}",
+        "select over {} workers at {:?} a request: action local {:?}, cloud {:?} \
+         (the write alone, cloud {:?})",
         WORKERS.len(),
         LATENCY,
         local_action,
-        cloud_action
+        cloud_action,
+        write_only
     );
     let checks = LATENCY * (WORKERS.len() as u32 + 1);
     assert!(
-        cloud_action <= local_action * 2 + checks,
-        "the select took {:?} on the cloud backend, over twice the local {:?} plus one round \
-         trip per session",
+        cloud_action <= write_only + local_action * 2 + checks,
+        "the select took {:?} on the cloud backend, over the write alone ({:?}) plus twice \
+         the local {:?} plus one round trip per worker and one of slack",
         cloud_action,
+        write_only,
         local_action
     );
 }
