@@ -13,6 +13,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -23,7 +26,7 @@ use assert_fs::TempDir;
 // ===== Harness =====
 
 fn koto_cmd(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("HOME", dir);
@@ -2280,7 +2283,7 @@ fn a_predicate_that_becomes_impossible_mid_wait_is_distinct_from_a_timeout() {
 
     // Start a wait that would otherwise run for a minute, then
     // abandon the leg it is waiting on.
-    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("koto"))
+    let child = koto_command::koto_std()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "request",
@@ -2332,7 +2335,7 @@ fn an_interrupted_wait_exits_transient_with_its_own_code() {
     // A minute-long deadline and a minute-long interval: only the
     // hundred-millisecond sleep slicing lets the signal be noticed
     // promptly.
-    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("koto"))
+    let child = koto_command::koto_std()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "request",
@@ -2378,7 +2381,7 @@ fn an_interrupted_wait_exits_transient_with_its_own_code() {
 #[test]
 fn an_interrupted_watch_names_the_watch() {
     let tmp = TempDir::new().unwrap();
-    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("koto"))
+    let child = koto_command::koto_std()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args([
             "request",

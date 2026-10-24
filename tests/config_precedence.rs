@@ -5,6 +5,9 @@
 //! default. Also covers the `[request_store.recursion]` reserved-but-ignored namespace
 //! warn behavior on `koto config get` and `koto next` startup.
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use assert_fs::TempDir;
 use std::path::{Path, PathBuf};
@@ -13,7 +16,7 @@ use std::path::{Path, PathBuf};
 /// (HOME env var) and run from `cwd_dir` (so `.koto/config.toml` is
 /// discovered relative to that directory).
 fn koto_cmd(home_dir: &Path, cwd_dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(cwd_dir);
     cmd.env("HOME", home_dir);
@@ -198,8 +201,7 @@ fn cli_flag_overrides_env_var_in_koto_next() {
     // The --redelegation-cap CLI flag lives on `koto next` only;
     // assert it parses and is accepted (full behavior is exercised
     // when downstream consumer issues land).
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["next", "--help"])
         .output()
@@ -216,8 +218,7 @@ fn cli_flag_overrides_env_var_in_koto_next() {
 fn only_redelegation_cap_is_cli_overridable() {
     // The six other tunable request-store dimensions must NOT be exposed as CLI
     // flags at V1 (Decision 4: --redelegation-cap is the only one).
-    let output = Command::cargo_bin("koto")
-        .unwrap()
+    let output = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["next", "--help"])
         .output()

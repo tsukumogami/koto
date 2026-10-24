@@ -10,12 +10,15 @@
 //! non-overridable gate (Issue #251), plus a snapshot proving templates that
 //! don't use the field compile byte-identical to before it existed.
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 fn koto_cmd(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));

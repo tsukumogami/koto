@@ -7,6 +7,8 @@
 
 #[path = "support/fake_s3.rs"]
 mod fake_s3;
+#[path = "support/koto_command.rs"]
+mod koto_command;
 #[path = "support/migration_carrier.rs"]
 mod migration_carrier;
 
@@ -21,7 +23,7 @@ use std::path::Path;
 const BUCKET: &str = "koto-dashboard-detail";
 
 fn koto_cmd(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", dir.join("sessions"));

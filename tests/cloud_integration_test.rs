@@ -11,6 +11,8 @@
 
 #![cfg(feature = "cloud-integration-tests")]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
 #[path = "support/migration_carrier.rs"]
 mod migration_carrier;
 
@@ -30,7 +32,7 @@ fn s3_env() -> Option<(String, String)> {
 }
 
 fn koto_cmd(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("HOME", dir.to_str().unwrap());

@@ -4,6 +4,9 @@
 //!
 //! docs/designs/current/DESIGN-jev-decision-offload.md, Decision 1.
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -342,8 +345,7 @@ fn misspelled_key_is_named_by_koto_template_compile() {
             .render(),
     )
     .unwrap();
-    let out = assert_cmd::Command::cargo_bin("koto")
-        .unwrap()
+    let out = koto_command::koto()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env("XDG_CACHE_HOME", dir.path().join("cache"))
         .env("HOME", dir.path())
@@ -1075,8 +1077,7 @@ fn koto_next_and_status_carry_the_descriptions() {
     )
     .unwrap();
     let koto = |args: &[&str]| {
-        let out = assert_cmd::Command::cargo_bin("koto")
-            .unwrap()
+        let out = koto_command::koto()
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .current_dir(d)
             .env("HOME", d)

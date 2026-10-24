@@ -14,6 +14,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -322,6 +325,7 @@ impl Env {
     /// environment.
     fn process(&self, program: &Path, driver: Option<&str>) -> std::process::Command {
         let mut cmd = std::process::Command::new(program);
+        koto_command::scrub(&mut cmd);
         cmd.current_dir(&self.work);
         for (k, v) in self.envs(driver) {
             match v {
@@ -334,7 +338,7 @@ impl Env {
 
     /// A koto command for this home, run under `driver` (or none).
     fn cmd(&self, driver: Option<&str>) -> Command {
-        let mut cmd = Command::cargo_bin("koto").unwrap();
+        let mut cmd = koto_command::koto();
         cmd.current_dir(&self.work);
         for (k, v) in self.envs(driver) {
             match v {
@@ -1220,7 +1224,7 @@ fn the_harness_keeps_an_inherited_driver_out_of_the_journal() {
     let t = env.template("simple.md", SIMPLE);
     let sentinel = "sentinel-driver-0b1d";
     let spawn = |driver: Option<&str>, name: &str| {
-        let mut cmd = Command::cargo_bin("koto").unwrap();
+        let mut cmd = koto_command::koto();
         cmd.env(DRIVER_ENV, sentinel).current_dir(&env.work);
         for (k, v) in env.envs(driver) {
             match v {
@@ -1561,7 +1565,7 @@ Check.
 
 Done.
 "#,
-        koto = env!("CARGO_BIN_EXE_koto"),
+        koto = koto_command::koto_bin().display(),
         note = note.display(),
     );
     let gated = env.template("gated.md", &gated);
@@ -2009,7 +2013,7 @@ fn a_full_journal_file_system_costs_one_warning_and_nothing_else() {
     let filler = format!("{}\n", "#".repeat(1023)).repeat(256);
     std::fs::write(full.journal_path(), &filler).unwrap();
     let t = full.template("simple.md", SIMPLE);
-    let koto = assert_cmd::cargo::cargo_bin("koto");
+    let koto = koto_command::koto_bin();
     let steps: Vec<Vec<String>> = vec![
         vec![
             "init".into(),
@@ -2127,7 +2131,7 @@ fn the_journal_is_written_with_network_access_blocked() {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    let koto = assert_cmd::cargo::cargo_bin("koto");
+    let koto = koto_command::koto_bin();
     for args in [
         vec![
             "init".to_string(),

@@ -15,7 +15,9 @@
 //! unit tests in `src/template/types.rs`, which call the same `validate`; what
 //! lives here is the behaviour a template author actually meets.
 
-use assert_cmd::prelude::*;
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,11 +34,11 @@ fn sessions_base(dir: &Path) -> PathBuf {
 }
 
 fn koto_binary() -> PathBuf {
-    assert_cmd::cargo::cargo_bin("koto")
+    koto_command::koto_bin()
 }
 
 fn koto_cmd(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto_std();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));

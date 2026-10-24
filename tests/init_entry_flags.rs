@@ -8,6 +8,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
@@ -16,7 +19,7 @@ use assert_fs::TempDir;
 // ===== Harness =====
 
 fn koto_cmd(home: &Path, cwd: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(cwd);
     cmd.env("HOME", home);

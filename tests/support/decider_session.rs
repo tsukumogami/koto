@@ -222,7 +222,7 @@ impl Harness {
 
     /// A `koto` command with no decider env set at all.
     pub fn koto(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_koto"));
+        let mut cmd = crate::koto_command::koto_std();
         cmd.env_remove("CLAUDE_CODE_SESSION_ID");
         cmd.current_dir(&self.dir);
         cmd.env("HOME", self.home());
@@ -233,7 +233,8 @@ impl Harness {
         cmd.env_remove("KOTO_DECIDER_API_KEY");
         cmd.env_remove("KOTO_DECIDER_ENDPOINT");
         // Template commands that call `koto` reach this build.
-        let bin_dir = Path::new(env!("CARGO_BIN_EXE_koto")).parent().unwrap();
+        let koto_bin = crate::koto_command::koto_bin();
+        let bin_dir = koto_bin.parent().unwrap();
         let path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{}:{}", bin_dir.display(), path));
         cmd

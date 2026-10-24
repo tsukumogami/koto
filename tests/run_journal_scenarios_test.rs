@@ -9,6 +9,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -89,7 +92,7 @@ impl Env {
 
     /// A koto command in this home, under `driver` (or none), from `cwd`.
     fn cmd(&self, driver: Option<&str>, cwd: &Path) -> Command {
-        let mut cmd = Command::cargo_bin("koto").unwrap();
+        let mut cmd = koto_command::koto();
         cmd.current_dir(cwd)
             .env("HOME", &self.home)
             .env("XDG_CACHE_HOME", self.home.join("cache"));

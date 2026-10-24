@@ -12,6 +12,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use assert_fs::TempDir;
 use std::path::{Path, PathBuf};
@@ -31,7 +34,7 @@ fn sessions_base(home: &Path) -> PathBuf {
 /// A `koto` invocation whose process working directory is `cwd` and
 /// whose session storage is rooted at `home`.
 fn koto_cmd(home: &Path, cwd: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(cwd);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(home));

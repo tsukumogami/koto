@@ -5,11 +5,12 @@
 //! `KOTO_DECIDER` and the key explicitly, with HOME in a temp dir, so no
 //! test can reach a real provider or read a developer's config.
 
-#[path = "support/decider_stub.rs"]
-mod decider_stub;
-
 #[path = "support/decider_session.rs"]
 mod decider_session;
+#[path = "support/decider_stub.rs"]
+mod decider_stub;
+#[path = "support/koto_command.rs"]
+mod koto_command;
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -1977,7 +1978,7 @@ fn validate_feed_accepts_a_log_with_decider_events() {
     let log = produce_applied_session_log(tmp.path());
     let spec =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/reference/session-feed.md");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_koto"))
+    let out = koto_command::koto_std()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["template", "validate-feed"])
         .arg(&log)

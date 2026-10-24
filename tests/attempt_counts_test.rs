@@ -10,6 +10,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -45,7 +48,7 @@ impl Env {
     }
 
     fn koto(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_koto"));
+        let mut cmd = koto_command::koto_std();
         cmd.env_remove("CLAUDE_CODE_SESSION_ID");
         cmd.env_clear()
             .current_dir(self.path())
