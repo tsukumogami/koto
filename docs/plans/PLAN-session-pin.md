@@ -86,7 +86,7 @@ The walkthrough passes when each expect line holds, in order, including the exit
 
 ### Step 2: every other removal keeps a pinned session and says why
 
-**Goal**: The terminal tick, the parent sweep, the same-name replace, `koto workspace prune`, `koto session cleanup` and `koto cancel --cleanup` keep or refuse a pinned session through the one removal guard, and their output carries the pin. After this step a session pinned by hand on the local backend survives every removal koto makes, and each one says why.
+**Goal**: The terminal tick, the parent sweep, the same-name replace, `koto workspace prune`, `koto session cleanup` and `koto cancel --cleanup` keep or refuse a pinned session through the one removal guard, and their output carries the pin. Step 1 left `koto session prune` reading the local pin directly; this step adds the guard (`guard_removal` and `remove_guarded`, local read only for now) and moves the prune's delete onto it too, so every removal decides through one path. After this step a session pinned by hand on the local backend survives every removal koto makes, and each one says why.
 
 **Acceptance Criteria**:
 
