@@ -170,7 +170,7 @@ Check that the directory is the one you meant.
 {"error":"session_migrated: session 'review' was migrated to 'review' in /srv/ws-b; continue it there","command":"status"}
 ```
 
-The remedy is to continue the session where the message says, from that workspace's directory. Don't rebind, re-init or resolve this copy to get past the refusal; advancing both copies would fork the session. If this copy is no longer wanted, `koto session cleanup <name>` in this workspace removes the local copy and the source's objects in the bucket, but keeps the marker. When the import itself is what you're running, its own codes are in `command-reference.md`, "koto session import".
+The remedy is to continue the session where the message says, from that workspace's directory. Don't rebind, re-init or resolve this copy to get past the refusal; advancing both copies would fork the session. If this copy is no longer wanted, `koto session cleanup <name>` in this workspace removes the local copy and the source's objects in the bucket, but keeps the marker. A migrated source's pin is inert and doesn't refuse it; any other pinned session refuses cleanup with `pinned` until `koto session unpin <name>` releases it. When the import itself is what you're running, its own codes are in `command-reference.md`, "koto session import".
 
 ---
 

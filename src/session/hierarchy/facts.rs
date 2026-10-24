@@ -75,6 +75,9 @@ pub struct SessionFacts {
     /// The session's pin (`koto/links/pin`). Never a link and never one of
     /// its `problems`: a pin, readable or not, keeps this session only.
     pub pin: PinFact,
+    /// Whether `pin` is the bucket's rather than this host's copy's: set
+    /// only by a cloud host's check of its scan ([`super::Graph::set_pin`]).
+    pub pin_in_bucket: bool,
     /// What makes this session's own component unreadable: a malformed
     /// link or `chain/parent`, a symlink or special file under `ctx/koto/`.
     pub problems: Vec<String>,
@@ -208,6 +211,15 @@ pub(crate) fn link_file_names(
 }
 
 impl SessionFacts {
+    /// Where [`SessionFacts::pin`] was read: `bucket` or `local`.
+    pub fn pin_source(&self) -> &'static str {
+        if self.pin_in_bucket {
+            crate::session::pin::SOURCE_BUCKET
+        } else {
+            crate::session::pin::SOURCE_LOCAL
+        }
+    }
+
     /// Read session `name` under `base`.
     pub fn read(base: &Path, name: &str) -> SessionFacts {
         let mut facts = SessionFacts {

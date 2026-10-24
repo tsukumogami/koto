@@ -375,3 +375,60 @@ fn the_guard_keeps_a_pinned_session_and_clears_the_rest() {
     });
     assert!(matches!(removal, Ok(Removal::Kept(Guard::Pinned { .. }))));
 }
+
+#[test]
+fn a_bucket_that_cant_be_checked_keeps_and_says_why() {
+    let unchecked = Guard::BucketUnchecked {
+        error: BucketError::Unparseable,
+        local: PinFact::None,
+    };
+    assert!(unchecked.keeps());
+    let fields = unchecked.fields();
+    assert_eq!(fields["bucket_unchecked"]["error"], "unparseable");
+    assert!(!fields.contains_key("kept_by_pin"));
+    assert_eq!(
+        unchecked.text().unwrap(),
+        "kept: bucket not checked for a pin (unparseable)"
+    );
+    let refusal = unchecked.refusal("u").unwrap();
+    assert_eq!((refusal.code, refusal.exit), ("bucket_unchecked", 3));
+    assert_eq!(
+        refusal.to_json()["error"]["bucket_unchecked"]["error"],
+        "unparseable"
+    );
+
+    // A local pin is named beside it, read from this host's copy.
+    let with_pin = Guard::BucketUnchecked {
+        error: BucketError::Unreachable,
+        local: PinFact::Present(pin("keep me")),
+    };
+    let fields = with_pin.fields();
+    assert_eq!(fields["bucket_unchecked"]["error"], "unreachable");
+    assert_eq!(fields["kept_by_pin"], true);
+    assert_eq!(fields["pin"]["source"], "local");
+    assert!(with_pin
+        .text()
+        .unwrap()
+        .ends_with("; pinned: keep me (set by hand at 2026-10-24T00:00:00.000Z)"));
+}
+
+#[test]
+fn a_pin_object_reads_as_a_pin_or_says_why_not() {
+    let bytes = serde_json::to_vec(&pin("keep me")).unwrap();
+    assert_eq!(pin_of_bytes(&bytes), PinFact::Present(pin("keep me")));
+    assert_eq!(
+        pin_of_bytes(b"garbage"),
+        PinFact::Unreadable(PinProblem::Unparseable)
+    );
+    assert_eq!(
+        pin_of_bytes(&vec![b' '; MAX_PIN_BYTES + 1]),
+        PinFact::Unreadable(PinProblem::TooLarge)
+    );
+    assert!(release_of_bytes(b"{}").is_none());
+    // A release record from before the authority's `at` and `source` were
+    // copied still reads.
+    let old = br#"{"v":1,"released_by":null,"authority":null,"reason":null,"released_at":"t","pin":{"id":"i","reason":null,"set_by":null,"set_at":null}}"#;
+    let read = release_of_bytes(old).unwrap();
+    assert_eq!(read.pin.id.as_deref(), Some("i"));
+    assert_eq!(read.authority_at, None);
+}

@@ -109,20 +109,23 @@ pub fn fetch_remote_manifest(
     let mut manifest: Manifest = serde_json::from_slice(response.bytes()).ok()?;
     // A manifest an older koto pushed can list a host-local key, often
     // without its object; this host answers those keys from its own store.
+    // The pin records are objects of their own, read by the pin guard.
     manifest.drop_host_local();
+    manifest.drop_pin_records();
     cache.set(session, manifest.clone());
     Some(manifest)
 }
 
 /// The manifest at `path` as the bucket gets it: the file's bytes, or,
 /// when it lists a host-local key
-/// ([`is_host_local_key`](crate::session::context::is_host_local_key)),
-/// the manifest re-serialized without them. `None` when there is no file.
-/// Bytes that don't parse go up as they are, as every manifest did before:
-/// they name no key this could drop, and refusing would leave a batch open.
+/// ([`is_host_local_key`](crate::session::context::is_host_local_key)) or a
+/// pin record ([`Manifest::drop_pin_records`]), the manifest re-serialized
+/// without them. `None` when there is no file. Bytes that don't parse go up
+/// as they are, as every manifest did before: they name no key this could
+/// drop, and refusing would leave a batch open.
 ///
 /// Every manifest koto uploads from a local store goes through this, so no
-/// manifest koto pushes names a host-local key.
+/// manifest koto pushes names a host-local key or a pin record.
 pub fn bucket_manifest_bytes(path: &std::path::Path) -> anyhow::Result<Option<Vec<u8>>> {
     use anyhow::Context;
     let data = match std::fs::read(path) {
@@ -133,7 +136,8 @@ pub fn bucket_manifest_bytes(path: &std::path::Path) -> anyhow::Result<Option<Ve
     let Ok(mut manifest) = serde_json::from_slice::<Manifest>(&data) else {
         return Ok(Some(data));
     };
-    if !manifest.drop_host_local() {
+    let host_local = manifest.drop_host_local();
+    if !manifest.drop_pin_records() && !host_local {
         return Ok(Some(data));
     }
     Ok(Some(
@@ -153,7 +157,9 @@ pub fn push_context_key(
     key: &str,
     cache: &ManifestCache,
 ) {
-    if crate::session::context::is_host_local_key(key) {
+    if crate::session::context::is_host_local_key(key)
+        || crate::session::context::is_pin_record_key(key)
+    {
         return;
     }
     let ctx_dir = local.session_dir(session).join("ctx");
@@ -386,6 +392,29 @@ mod tests {
         let pushed: Manifest =
             serde_json::from_slice(&bucket_manifest_bytes(&path).unwrap().unwrap()).unwrap();
         assert_eq!(pushed.keys.keys().collect::<Vec<_>>(), ["notes.md"]);
+    }
+
+    /// No manifest koto pushes names a pin record: the pin and the release
+    /// record live in the bucket as objects of their own, and a manifest
+    /// without them removes neither.
+    #[test]
+    fn bucket_manifest_bytes_drops_the_pin_records() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        let entry = r#"{"created_at":"t","size":1,"hash":"h"}"#;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"keys":{{"koto/links/held-by/a":{entry},"koto/links/pin":{entry},"koto/pin-release":{entry},"notes.md":{entry}}}}}"#
+            ),
+        )
+        .unwrap();
+        let pushed: Manifest =
+            serde_json::from_slice(&bucket_manifest_bytes(&path).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            pushed.keys.keys().collect::<Vec<_>>(),
+            ["koto/links/held-by/a", "notes.md"]
+        );
     }
 
     #[test]

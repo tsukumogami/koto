@@ -551,15 +551,15 @@ pub enum SessionCommand {
         #[arg(long)]
         state: bool,
 
-        /// List only the pinned sessions in the local store, sorted by name,
-        /// each with its pin (or `pin_unreadable`) and whether it is running
-        /// or finished; prints text unless `--json` is given. Hidden until
-        /// every removal honours a pin.
-        #[arg(long, hide = true, conflicts_with_all = ["execution_dir", "state"])]
+        /// List only the pinned sessions, sorted by name, each with its pin
+        /// (or `pin_unreadable`), whether it is running or finished, and
+        /// where the pin was read; under the cloud backend, pins in the
+        /// bucket too. Prints text unless `--json` is given.
+        #[arg(long, conflicts_with_all = ["execution_dir", "state"])]
         pinned: bool,
 
         /// With `--pinned`, print JSON instead of text.
-        #[arg(long, hide = true, requires = "pinned")]
+        #[arg(long, requires = "pinned")]
         json: bool,
     },
     /// Remove a session directory (idempotent).
@@ -690,8 +690,9 @@ pub enum SessionCommand {
     /// with no session, an anchor or close record, and a session whose pin
     /// can't be read.
     ///
-    /// Hidden until every removal honours a pin.
-    #[command(hide = true)]
+    /// Under the cloud backend the pin is written to the bucket as its own
+    /// object, and only that; a write the bucket doesn't confirm exits 3
+    /// and leaves no pin anywhere.
     Pin {
         /// The session to pin
         name: String,
@@ -710,8 +711,9 @@ pub enum SessionCommand {
     /// anchor needs the `release-pin` authority its agent session was
     /// handed at its start, and is refused with exit 2 otherwise.
     ///
-    /// Hidden until every removal honours a pin.
-    #[command(hide = true)]
+    /// Under the cloud backend the release record and the pin's removal are
+    /// the bucket's objects, each checked; a failure exits 3 and leaves the
+    /// pin in force.
     Unpin {
         /// The session to release
         name: String,
@@ -3927,6 +3929,13 @@ pub(crate) mod finished_record_hooks {
 /// one header-level pass for the check, and the removal itself goes through
 /// the pin guard ([`finish_terminal_tick`]), which keeps a session pinned
 /// since this check.
+///
+/// Under the cloud backend the bucket's pin counts as well as this host's
+/// copy's: a local pin is confirmed in the bucket (one released on another
+/// host doesn't keep), and a session about to be removed is checked for a
+/// pin object another host wrote, which keeps it as `pinned`; a bucket that
+/// can't be checked then keeps it as `bucket_unchecked`. A session kept for
+/// another reason costs no request.
 fn terminal_retention(
     backend: &dyn SessionBackend,
     name: &str,
@@ -3934,11 +3943,19 @@ fn terminal_retention(
     final_state: &str,
     no_cleanup: bool,
 ) -> Option<next_types::RetentionReason> {
+    use crate::session::pin::{guard_removal, local_guard, Guard};
+    let kept_by = |guard: Guard| match guard {
+        Guard::Clear => None,
+        Guard::BucketUnchecked { .. } => Some(next_types::RetentionReason::BucketUnchecked),
+        _ => Some(next_types::RetentionReason::Pinned),
+    };
     if project_terminal_outcome(compiled, final_state) == TerminalOutcome::Failure {
         return Some(next_types::RetentionReason::FailureTerminal);
     }
-    if crate::session::pin::local_guard(backend, name).keeps() {
-        return Some(next_types::RetentionReason::Pinned);
+    if local_guard(backend, name).keeps() {
+        if let Some(reason) = kept_by(guard_removal(backend, name)) {
+            return Some(reason);
+        }
     }
     let session_dir = backend.session_dir(name);
     let has_edge = match session_dir.parent() {
@@ -3950,7 +3967,7 @@ fn terminal_retention(
     } else if no_cleanup {
         Some(next_types::RetentionReason::NoCleanup)
     } else {
-        None
+        kept_by(guard_removal(backend, name))
     }
 }
 
@@ -3965,7 +3982,13 @@ fn terminal_retention_report(
     reason: Option<next_types::RetentionReason>,
 ) -> next_types::Retention {
     use next_types::RetentionReason;
+    // Kept by its pin, or by a bucket that couldn't be checked: the guard
+    // that decided, so a pin in the bucket is reported with `source:
+    // bucket`. Kept for another reason: this host's copy's pin, if any.
     let pin = match reason {
+        Some(RetentionReason::Pinned | RetentionReason::BucketUnchecked) => {
+            crate::session::pin::guard_removal(backend, name).fields()
+        }
         Some(_) => crate::session::pin::local_guard(backend, name).fields(),
         None => Default::default(),
     };

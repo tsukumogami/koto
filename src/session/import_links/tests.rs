@@ -209,6 +209,7 @@ fn assert_consistent(ctx: &Path, manifest: &Manifest) {
 fn the_reserved_keys_an_import_leaves_behind() {
     for key in [
         "koto/anchor/observed",
+        "koto/anchor/authority",
         "koto/anchor-close",
         "koto/links/closes/anchor-x",
         "koto/imported-from",
@@ -220,6 +221,8 @@ fn the_reserved_keys_an_import_leaves_behind() {
     for key in [
         "koto/links/held-by/anchor-x",
         "koto/links/dispatched-by/coord",
+        "koto/links/pin",
+        "koto/pin-release",
         "notes.md",
         "kotox/a",
     ] {

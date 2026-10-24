@@ -30,6 +30,24 @@ impl Manifest {
         self.keys.retain(|key, _| !is_host_local_key(key));
         self.keys.len() != before
     }
+
+    /// Take out the pin and its release record. Under the cloud backend
+    /// each lives as its own object (DESIGN-session-pin.md, Decision 3), so
+    /// no manifest koto pushes to the bucket names them and none it takes
+    /// from the bucket adds them to a local index: a push of a manifest
+    /// without the pin removes nothing, and the pin object stays the truth.
+    /// Returns whether either was listed.
+    pub fn drop_pin_records(&mut self) -> bool {
+        let before = self.keys.len();
+        self.keys.retain(|key, _| !is_pin_record_key(key));
+        self.keys.len() != before
+    }
+}
+
+/// Whether `key` is the pin or its release record, or lies under the pin's
+/// key (an unreadable pin that is a directory).
+pub fn is_pin_record_key(key: &str) -> bool {
+    crate::session::pin::is_pin_key(key) || key == crate::session::pin::RELEASE_KEY
 }
 
 /// Whether `key` describes the host a session runs on rather than the

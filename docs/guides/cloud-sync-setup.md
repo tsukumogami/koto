@@ -281,7 +281,7 @@ Removing a marker deletes everything under `<prefix>/<name>/` in the old workspa
 
 The plan token and stored plan work as they do for finished sessions (see the [CLI usage guide](cli-usage.md#session-prune)): an unchanged token applies, one whose set changed exits 4 with `prune_plan_stale`, and the stored plan records whether `--source-retired` was given. `--apply` without `--plan` removes what is removable now. Marker removal never touches the local session store: a local copy of the old session on the host you run it from stays, and the only local write is the stored plan.
 
-Remove the old host's local copy first. Once the marker and the old copy in the bucket are gone, nothing is left to refuse for it: a local copy still on the old host reads as an ordinary session there, and the next command that syncs it pushes it back under the old workspace's prefix. Run `koto session cleanup <name>` in the old workspace on that host before you prune (cleanup leaves the marker in place), or retire the host. `--source-retired` says you have done one of these.
+Remove the old host's local copy first. Once the marker and the old copy in the bucket are gone, nothing is left to refuse for it: a local copy still on the old host reads as an ordinary session there, and the next command that syncs it pushes it back under the old workspace's prefix. Run `koto session cleanup <name>` in the old workspace on that host before you prune (cleanup leaves the marker in place), or retire the host. A pinned session refuses cleanup; unpin it first with `koto session unpin <name>`, after checking its pin's reason says it can go. `--source-retired` says you have done one of these.
 
 ### Import errors
 
