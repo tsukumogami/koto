@@ -273,6 +273,16 @@ instant, release instant, retention, migrated source.
   instant. A pin adds no link to its setter or anyone else, so the links,
   lineage and hierarchy membership of every session are the same before and
   after a pin is set or removed.
+- **R9a. Children are pinned on their own.** Any session in a hierarchy can
+  be pinned by itself, a koto child included, whether or not its parent or
+  any other member is pinned. The parent sweep and every subtree removal
+  (`koto workspace prune --root`, and the same-name replace's sweep of a
+  released predecessor's descendants), run on a parent that is pinned or
+  not, keep each pinned child and name it (R15) while removing the unpinned
+  siblings the existing rule lets go. A pinned child whose parent was removed
+  stays readable by its own name, with its `parent_workflow` naming an absent
+  peer as session retention already allows, and no removal treats it as an
+  orphan to clean up: it goes only after an unpin, by the rule.
 - **R10. Every removal keeps a pinned session.** These keep a pinned session:
   the terminal tick, with or without `--no-cleanup` and for a failure
   terminal; the parent sweep; the same-name replace; `koto workspace prune`,
@@ -530,6 +540,23 @@ a build without this feature, and S2 to S6 don't apply to it.
   finish and nothing else is alive. After the retention, the prune keeps A
   with the pin and removes B. Before that prune, the hierarchy query for B
   lists A as a pinned member, and for A states the pin keeps A only.
+- [ ] **A child pinned on its own.** X has koto children C1, C2 and C3, all
+  finished; only C2 is pinned and X is not. `koto session pin C2` exits 0
+  without X or its siblings being pinned, and X, C1 and C3 hold no pin
+  afterwards.
+- [ ] **Sweeps keep a pinned child.** In that fixture, X's terminal tick
+  without `--no-cleanup` (the parent sweep) and, in a fresh copy of the
+  fixture past the retention, `koto workspace prune --root X --yes` each keep
+  C2 and list it with `kept_by_pin: true` and its pin, and remove C1 and C3
+  once the rule lets them go. The same holds with X pinned as well, where X
+  is also kept and named. A same-name replace of X, released, sweeps C1 and
+  C3 and keeps C2.
+- [ ] **A pinned child outlives its parent.** After X is removed (by
+  `koto workspace prune --root X --yes`, or unpinned and pruned), `koto status
+  C2` and `koto context get C2 <key>` still read C2 by name, its hierarchy
+  query names X as an absent peer, and `koto session prune --apply --all` and
+  every later removal keep C2 with its pin. After `koto session unpin C2` by
+  hand, the next prune past the retention removes it.
 - [ ] **Pin adds no edge.** The hierarchy query JSON for every session in a
   fixture of two hierarchies, one containing the pinning agent session's open
   anchor, lists the same members and edges before and after the pin is set
