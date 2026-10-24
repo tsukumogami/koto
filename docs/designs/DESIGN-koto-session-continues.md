@@ -625,6 +625,58 @@ Reading a migrated source: the read command's first backend read refuses with
 prefix with `serve_migrated`, pulls the state and keys into a scratch
 directory, answers, and drops the directory.
 
+### Seams, limits and edge cases
+
+- **Where the bucket answer meets `keeps`.** `Judgment::keeps` stays
+  synchronous and local. A removal site that gets `false` from it, under the
+  cloud backend, then calls `continues_bucket::bucket_keepers(backend, name,
+  &facts) -> RelationVerdict` before it deletes, and keeps the session when
+  that verdict has a keeper or anything unreadable, merging it into the
+  entry's report. Every site that can delete from the bucket makes that call:
+  `apply_component` and the preview in `session_prune.rs`, `judge_subtree` and
+  `reclaim` in `workspace.rs`, `predecessor_disposition` in `init_entry.rs`,
+  the terminal tick's removal in `cli/mod.rs` (when `edge_of` finds no local
+  edge, so a predecessor whose successor lives only in the bucket isn't
+  deleted by its own tick), and `koto session cleanup` and
+  `koto cancel --cleanup` in `cli/session.rs` for their report only.
+- **`BucketRemovalFacts`.** The result of one fresh listing of
+  `<Pp>/<P>/ctx/koto/` (already made for the pin) plus one delimiter listing
+  of `<Pp>/<P>/`: the pin and release keys and sizes, the validated pointer
+  keys, whether `migrated.json` is present, the state object's ETag, and,
+  when P's header names another `origin.store.prefix`, the same `ctx/koto/`
+  listing for the origin.
+- **The memo** lives for one judgment pass. `--apply` starts a fresh one, so
+  its re-judgment reads the bucket again. It is keyed by session id, falling
+  back to (prefix, name) only before the id is known.
+- **Ceilings.** Besides the allowance (2 plus 3 per member), a walk stops at
+  16 members or 50 requests, whichever comes first, and keeps P as
+  `bucket_unchecked`; a listing with more than 64 pointers isn't walked.
+- **The confirmed-pointer mark.** A relation's pointer counts as written only
+  when the session directory holds `.continues-pointer`, a bare file the sync
+  doesn't track, recording the pointer key. Its absence means a pointer is
+  owed, which also covers a relation an earlier build wrote under the local
+  backend. `ensure_backref` writes the owed pointer before the session's next
+  cloud write or push; a failed PUT warns, keeps the relation out of that
+  push, and leaves the session's other writes alone.
+- **The terminal tick and holders.** `edge_of` counts a continues link on the
+  holder's side too, so a successor's own terminal tick leaves it for a prune
+  to judge, as any session holding a link is left today. That is intended:
+  the tick never removes something a prune would keep.
+- **Markers locally.** Markers live only in the bucket, so R6 is answered by
+  the bucket walk. A same-host import with `--as` keeps both sessions local,
+  and the copy's own relation keeps the source there.
+- **The local backend.** Import needs the cloud backend, so a migrated source
+  never exists on a local store and the read fallback never runs there.
+- **The move-aside.** Carrying P's pointers to `<name>_r<N>` copies only keys
+  that pass validation, at most 64, and never deletes an invalid key; anything
+  not carried is reported, and the moved predecessor is still found by the
+  recorded session id in its successors' relations.
+- **A rollback that fails.** If the verb's push fails and the pointer's DELETE
+  also fails, the pointer is left with no relation behind it. The guard reads
+  that as stale and ignores it, so it is accepted.
+- **Shipping.** The three implementation phases ship in one release. Phase 1
+  alone refuses a cloud relation rather than writing one without a pointer.
+
 ### Overlap with other work
 
 koto#477 (bucket copies that fork when one session is written from several
@@ -684,6 +736,11 @@ and a moved-aside predecessor.
 Deliverables:
 - `src/session/continues_bucket.rs`, `src/session/cloud.rs`,
   `src/session/sync.rs`, `src/session/mod.rs`, `src/cli/mod.rs`
+- the `bucket_keepers` call at each site: `src/cli/session_prune.rs`,
+  `src/cli/workspace.rs`, `src/cli/init_entry.rs`, `src/cli/session.rs`
+- the pointer re-point at the rename sites: the same-name replace's
+  move-aside (`src/cli/move_aside.rs`) and the batch rewind's relocate
+  (`src/cli/batch.rs`)
 - tests for the second host, another workspace, the unchecked bucket, the
   unconfirmed write and the bounded cost
 
@@ -714,39 +771,53 @@ body; it uses the key to find the holder's own relation and trusts that
 relation only after matching its recorded session id to the predecessor's. A
 forged, stale or reused-name pointer therefore finds nothing and is ignored,
 finds a mismatch and keeps the session, or finds a real relation and keeps
-the session. No forged object can delete, hide or release anything. Every part
+the session. A forged pointer can add a keeper, never remove one. Every part
 of a key or body that becomes a request, a scratch path or output is validated
-first: workspace ids are 16 lowercase hex digits, names pass the session-name
-grammar, and pointer keys have exactly the expected segments. Anything else is
-reported as unreadable and keeps.
+first: workspace ids and the relation's `prefix` are 16 lowercase hex digits,
+names pass the session-name grammar, session ids match the id format, `at` is
+RFC 3339, `workspace` is an absolute path used only as a hint, and pointer
+keys have exactly the expected segments. Anything else is reported as
+unreadable and keeps. A forged pointer can make a host LIST and GET under a
+prefix of the forger's choosing before the relation is checked; nothing read
+from an unverified holder is printed beyond its validated or placeholder name.
 
 Work is bounded. Every pointer examined, valid or not, draws from the walk's
-request allowance, and a listing with more than 64 pointers isn't walked;
-running out keeps the session and reports `bucket_unchecked`. A listing that
-fails for any reason other than an absent key, a permission error included, is
-`bucket_unchecked` and keeps, so a credentials gap can't become a deletion.
-Relation, pin, state and template reads are size-bounded, and a template
-fetched from the bucket is checked against the hash its session's header
-records and read as data only; nothing in it runs.
+request allowance, a listing with more than 64 pointers isn't walked, and a
+walk stops at 16 members or 50 requests; running out keeps the session and
+reports `bucket_unchecked`. A listing that fails for any reason other than an
+absent key, a permission error included, is `bucket_unchecked` and keeps, so a
+credentials gap can't become a deletion. Relation, pin, state and template
+reads are size-bounded. The template comes from the local cache when it holds
+the hash; one fetched from the bucket is checked against the hash its
+session's header records, which proves it matches that header but not who
+wrote it, and is parsed as data with the compiler's existing depth limits;
+nothing in it runs, and the walk reads only which states are terminal.
 
 The permission this feature adds is the successor's write into its
 predecessor's prefix. It needs PUT and DELETE only on `ctx/koto/continued-by/`
-keys there, and LIST and GET on other workspaces' `ctx/koto/` and state
-objects; without write access the verb exits 3 and writes nothing. A holder
-deletes only the pointer built from its own workspace id, its own name and the
-predecessor its own relation names, never one named by bucket data. The
+keys there, and, on the predecessor's and other successors' prefixes, LIST of
+`<prefix>/<session>/` and its `ctx/koto/`, GET of relations, pins, state files
+and `template.json`, and the same on a session's `origin.store.prefix`;
+without write access the verb exits 3 and writes nothing. Import's marker is
+already a cross-prefix write today (`mark_source` PUTs `migrated.json` under
+the source's prefix from the destination workspace). A holder deletes only the
+pointer built from its own workspace id, its own name and the predecessor its
+own relation names, never one named by bucket data; the move-aside carries
+only validated keys and deletes none it can't validate. The
 `koto/continued-by/` area sits under the reserved `koto/` prefix, so
 `koto context add` and `remove` can't touch it. A successor can keep its
 predecessor for as long as it stands, which is the relation's purpose and
 costs one small object; it can't read, change or remove anything else, and
-explicit `koto session cleanup` still removes the predecessor while a pin
-still refuses.
+explicit `koto session cleanup` still removes the predecessor, pointer flood
+or not, while a pin still refuses. Pointers left by a flood are removed by
+hand with the bucket's own tools; koto never deletes one it can't attribute.
 
 The pointer body carries no workspace path, so no local path is copied into
 another workspace's prefix. Reads of a migrated source are served only for the
 caller's own workspace prefix or a prefix the caller names with
 `--workspace`, under the same prefix checks `--workspace` applies today; they
-write nothing and use a private scratch directory removed afterwards. Names
+write nothing and use a private scratch directory (mode 0700, keys validated
+before any path is joined, as the reader does today) removed afterwards. Names
 and prefixes printed in `relation_keepers`, `relation_unreadable` and
 `bucket_unchecked` come from bucket data, so they go through the retention
 reports' existing `sanitize`/`display_text` rendering, and a value that fails
@@ -756,9 +827,22 @@ The relation grants no authority. The verb reads no anchor, authority or
 request leg; continues links are kept out of the hierarchy graph and out of
 the anchor family's lookup, which reads dispatched-by links only; and pin
 release keeps checking the caller's anchor for `release-pin`, never a link.
-Residual risks accepted: anyone who can write a relation or a pointer can hold
-a session in place until it is removed by hand, and an older release sharing
-the bucket ignores relations.
+Residual risks accepted, and named in the retention guide:
+
+- Anyone who can write a relation or a pointer can hold a session in place
+  until it is removed by hand, and there is no unlink verb. Where
+  `retention.keep` serves data minimization, bucket policy should limit who
+  can write `ctx/koto/` under each workspace prefix.
+- Anyone who can write a successor's own objects (its relation, state or pin)
+  can make it look released and so let its predecessor go, in a workspace that
+  writer may not otherwise reach. The same holds for pins today; bucket policy
+  is the control.
+- Between a removal's final listing and its delete, a pointer written by
+  another host isn't seen, the same window the pin guard accepts.
+- An older release sharing the bucket ignores relations and can delete a
+  predecessor.
+- Pointers left after their predecessor is gone carry holder names and ids in
+  that prefix until each holder is removed.
 
 ## Consequences
 
@@ -799,3 +883,6 @@ the bucket ignores relations.
   pointers), keeps toward safety, and clears on the next run.
 - The changelog and the guide name the first release that honours relations
   and say every host sharing a bucket needs it.
+- The two rename sites that must re-point are named in Phase 2, and the
+  whole-bucket test oracle runs on a renamed successor, so a missed re-point
+  fails a test rather than a prune.
