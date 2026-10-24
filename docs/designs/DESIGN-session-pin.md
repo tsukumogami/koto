@@ -31,8 +31,8 @@ rationale: |
   reap key, is the only reading that can't be granted by an export
   mid-session.
 upstream: docs/prds/PRD-session-pin.md
-decision_provenance: inline-resolved
 user_visible_surface: true
+decision_provenance: inline-resolved
 ---
 
 # DESIGN: Pin a finished session so no removal rule takes it
@@ -198,16 +198,39 @@ readable pin (R19); a manifest entry with no file is `missing_content`; a
 symlink, directory (`koto/links/pin/...`) or special file is `not_a_file`.
 
 The component verdict is unchanged. `Judgment` gains two fields: `pin`, the
-judged session's own `PinFact`, and `pinned_members`, the names of members
-whose `PinFact` isn't `None`. A new method, `Judgment::keeps_session()`,
-answers for the one session: true when `pin` isn't `None` or when the
-component verdict is `Keep`. Every caller that decides whether to delete a
-particular session uses that method, so a pin keeps its session while the
-rest of the component follows the verdict. A pinned session that is running
-is alive and keeps its component as any running session does; once finished
-it contributes its stop instant like any finished member (R2, R9). Nothing
-about the pin enters `keepers`, `unreadable` or the release instant, so an
-unpin restarts no clock (R14).
+judged session's own `PinFact`, and `pinned_members`, a map from each member
+whose `PinFact` isn't `None` to that fact. A new method,
+`Judgment::keeps(member)`, answers for one member: true when the member is in
+`pinned_members` or when the component verdict is `Keep`. The two questions
+stay separate on purpose. A gate that asks "may this component be removed at
+all" keeps reading `verdict.is_kept()`; a decision about deleting one
+particular member asks `keeps(member)`. Mixing them is the failure to avoid:
+asking `keeps` of a component's first member at a component gate would let a
+pinned member keep its whole component. The callers, by question:
+
+| Caller | Asks |
+|---|---|
+| `session_prune.rs` `apply_component` component re-judge | `verdict.is_kept()`, then `keeps(member)` per member |
+| `session_prune.rs` planning (`first_rule`, the preview entries) | `keeps(member)` per entry, rule `p` before `a` and `h` |
+| `workspace.rs` `judge_subtree`, `reclaim` re-judge | `keeps(member)` per member |
+| `init_entry.rs` `predecessor_disposition` | `keeps(predecessor)` |
+| `render.rs` reason for one session | `keeps(member)` and the member's pin |
+
+A pinned session that is running is alive and keeps its component as any
+running session does; once finished it contributes its stop instant like any
+finished member (R2, R9). Nothing about the pin enters `keepers`,
+`unreadable` or the release instant, so an unpin restarts no clock (R14).
+
+Around a kept pinned member, the rest of the tree follows the ordinary rule,
+in both prunes alike. A pinned child keeps neither its parent nor its own
+children: when they're released they go, and the pinned child's
+`parent_workflow` then names an absent peer, as it does today after a parent
+is removed by `koto session cleanup`. `koto workspace prune`'s rule that a
+member goes only after everything below it applies to members kept by the
+hierarchy rule, not to a member kept only by its pin, so the two prunes
+remove the same sessions. A pin found on an anchor or a close session (one
+that arrived by import or the bucket, since `koto session pin` refuses those
+kinds) still keeps that session, and `koto session unpin` still releases it.
 
 #### Alternatives Considered
 
@@ -263,7 +286,7 @@ Each removal point calls the guard and maps the result to its own output:
 
 | Removal | Where the guard runs | On a pin or a failed check |
 |---|---|---|
-| Terminal tick | `terminal_retention`, before `edge_of` | keeps; `retention.reason` `pinned` (or the existing reason plus `pin`) |
+| Terminal tick | `terminal_retention`: local pin read always (for the report); the full guard only when removal would otherwise proceed | keeps; `retention.reason` `pinned` (or the existing reason plus `pin`) |
 | Parent sweep | `Sweep::enter`, per child | skips the child; `kept_children` entry with `kept_by_pin` |
 | Same-name replace | `predecessor_disposition`, before Release | treats as Keep: move aside |
 | `koto workspace prune` | `reclaim`, per member under its lock | lists the member as kept or skipped |
@@ -274,7 +297,25 @@ Each removal point calls the guard and maps the result to its own output:
 The preview paths (prune preview, workspace prune's plan, the hierarchy
 query) read the pin from the scan and, under cloud, call `bucket_pin` for
 each session they would list for removal, so a preview already shows a pin
-another host set; the guard at the delete is the one that decides.
+another host set; the guard at the delete is the one that decides. A
+`koto session prune --apply --plan` whose plan listed a session that has
+since been unpinned refuses as it already does when the fresh judgment would
+remove something the plan didn't name; a pin set since the plan only removes
+less, which the plan check allows.
+
+The guard is reached through one wrapper, `pin::remove_guarded(backend,
+name) -> Result<Removed | Kept(Guard)>`, which takes the lock, calls the
+guard and then `cleanup`, so a future removal point gets the check by
+construction. These deletes deliberately don't go through it, each because it
+removes something koto just made or is moving, not a finished session:
+
+| Delete | Why it isn't guarded |
+|---|---|
+| Batch respawns, `batch.rs` (half-initialised child; reclassified running or skip-marker child) | children koto is driving inside a live run; out of the PRD's scope |
+| Retry respawns, `retry.rs` (skip markers, `spawn_failed` children) | the same |
+| Init rollbacks, `init_entry.rs`, `init_child.rs` | a session created moments earlier in the same command |
+| `delete_remote_checked` in the same-name replace's move-aside | deletes the old prefix only after every object, the pin included, was copied to the new name |
+| `koto session prune --migrated-from` | deletes a migrated source, whose pin travelled with the import |
 
 #### Alternatives Considered
 
@@ -466,12 +507,18 @@ that command's environment, and unsets the variable in the session's shells.
 - **`src/session/hierarchy/facts.rs`**: `SessionFacts.pin`; the pin key is
   read before the link walk and excluded from it.
 - **`src/session/hierarchy/judge.rs`**: `Judgment.pin`,
-  `Judgment.pinned_members`, `Judgment::keeps_session()`. `MemberKind`,
+  `Judgment.pinned_members`, `Judgment::keeps(member)`. `MemberKind`,
   `Keeper` and `Verdict` are unchanged.
 - **`src/session/hierarchy/render.rs`**: `pin_json(&PinFact, source)` and
-  `pin_text`, producing R15's fields and text; `bucket_unchecked_json`; the
-  hierarchy query's `pin`, `release`, `pinned_members`, `authorities` and
-  `unknown_authorities` blocks.
+  `pin_text`, producing R15's fields and text; `bucket_unchecked_json`; a
+  member-aware `reason_for(judgment, member)` beside today's
+  `reason_text(&verdict)`, so a pinned member of a released component reads
+  as kept by its pin and never as released; the hierarchy query's `pin`,
+  `release`, `pinned_members`, `authorities` and `unknown_authorities`
+  blocks. Every stored string (reason, `set_by`, `released_by`, authority
+  names) reaches output through one function, `display_text`, which escapes
+  control, bidirectional, zero-width and line or paragraph separator
+  characters, and renders as a labelled field, never as bare prose.
 - **Removal points**: `src/cli/mod.rs` (`terminal_retention`, cancel
   `--cleanup`, cleanup), `src/cli/workspace.rs` (`Sweep::enter`, `reclaim`,
   `kept_children`), `src/cli/init_entry.rs` (`predecessor_disposition`),
@@ -542,8 +589,9 @@ under cloud it journals the key and `ensure_pushed` uploads the object and
 manifest, or the command exits 3.
 
 Removing: a removal point decides from its scan as today, then for each
-session it would delete takes the lock, calls `guard_removal`, which reads
-the local pin and lists the bucket's pin object, and deletes only on `Clear`.
+session it would delete calls `remove_guarded`, which takes the lock, calls
+`guard_removal` (the local pin, then the bucket's pin object), and deletes
+only on `Clear`.
 Every other result becomes a kept entry with the pin's fields.
 
 Releasing: `koto session unpin` resolves the caller from `KOTO_ANCHOR`; under
@@ -560,23 +608,32 @@ variable.
 
 ### Phase 1: the pin record, its commands and the engine
 
-The record, `koto session pin`/`unpin` (by hand only, local backend), the
-release record, `koto session list --pinned`, `SessionFacts.pin`,
-`Judgment.pin`/`pinned_members`/`keeps_session()`, the hierarchy query's pin
-blocks, and the v0.23.0 compatibility test. Nothing removes differently yet.
+The record, `koto session pin`/`unpin` on the local backend, the release
+record, `koto session list --pinned`, `SessionFacts.pin`,
+`Judgment.pin`/`pinned_members`/`keeps(member)`, `display_text`, the
+hierarchy query's pin blocks, and the import carry (a local behaviour, so a
+pin never silently drops on import). Until Phase 3, `unpin` under an anchor
+refuses with `authority_required`, failing closed; a call by hand releases.
+The new verbs and flag are hidden from `--help` and left out of the
+changelog until Phase 4 lands, because until Phase 2 no removal honours a
+pin; a release cut in between ships them hidden. A unit test asserts the pin
+key fails today's link-key grammar, the rule v0.23.0's reader shares; the
+test against the v0.23.0 release binary is its own CI job (Phase 5).
 
 Deliverables:
 - `src/session/pin.rs`, `links.rs` reserved writers, `facts.rs`, `judge.rs`,
-  `render.rs`, `src/cli/session.rs`
-- tests for the reason rules, idempotence, unreadable cases and the R13
-  golden outputs
+  `render.rs`, `import_links.rs`, `src/cli/session.rs`
+- tests for the reason rules, idempotence, unreadable cases, import and the
+  R13 golden outputs
 
 ### Phase 2: the removal guard at every removal point (local)
 
-`guard_removal` with the local read, wired into the terminal tick, sweep,
-replace, both prunes, cleanup and cancel `--cleanup`; `RetentionReason::Pinned`,
-prune rule `p`; R15's fields on every surface; the late-pin and concurrency
-tests.
+`guard_removal` and `remove_guarded` with the local read, wired into the
+terminal tick, sweep, replace, both prunes, cleanup and cancel `--cleanup`
+by the caller table in Decision 1; `RetentionReason::Pinned`, prune rule `p`,
+`reason_for`; R15's fields on every surface; the late-pin and concurrency
+tests, and a test that walks every R15 surface with a reason holding each
+escaped character class.
 
 Deliverables:
 - `src/cli/mod.rs`, `workspace.rs`, `init_entry.rs`, `session_prune.rs`,
@@ -596,12 +653,13 @@ Deliverables:
 ### Phase 4: the cloud backend and import
 
 `bucket_pin` on the cloud backend, the bucket half of the guard and of the
-previews, strict pin and unpin writes, `list --pinned` over the bucket, the
-import carry, and the two-host stand-in tests including the request count.
+previews, strict pin and unpin writes, `list --pinned` over the bucket, and
+the two-host stand-in tests including the request count, a list-after-write
+check against the stand-in, and a test that no push or pull step deletes the
+pin object. With this phase the verbs and flag stop being hidden.
 
 Deliverables:
-- `src/session/cloud.rs`, `sync.rs`, `mod.rs`, `pin.rs`, `import_links.rs`,
-  cloud tests
+- `src/session/cloud.rs`, `sync.rs`, `mod.rs`, `pin.rs`, cloud tests
 
 ### Phase 5: documentation and the cost test
 
@@ -610,8 +668,10 @@ unpin-first lines in each guide that uses `koto session cleanup` for
 recovery (`docs/guides/cloud-sync-setup.md`, `error-handling.md`,
 `cli-usage.md`, `custom-skill-authoring.md`, `batch-workflows.md`), the
 koto-user skill's command reference and response shapes, how to pass
-`KOTO_AUTHORITY` through a dispatcher, the doc test, and the R28 cost test
-with 200 pins.
+`KOTO_AUTHORITY` through a dispatcher, the koto-user skill's note that pin
+and release text is untrusted data, the doc test, the R28 cost test with 200
+pins, and the CI job that runs the v0.23.0 release binary against a pinned
+store.
 
 Deliverables:
 - `CHANGELOG.md`, `docs/guides/*`, `plugins/koto-skills/skills/koto-user/references/*`,
@@ -637,9 +697,13 @@ wherever it came from, and treats an unknown record version as an
 unreadable pin, which keeps the session. Every text renderer escapes control
 characters, bidirectional overrides, zero-width characters and line and
 paragraph separators in the reason, `set_by`, `released_by` and authority
-names before printing, through the engine's existing sanitizer; JSON output
-keeps the escaped form. Command output therefore can't carry terminal escape
-sequences from a stored record.
+names before printing, through one display function that every surface
+uses, with a test that walks every surface; JSON output keeps the escaped
+form. Command output therefore can't carry terminal escape sequences from a
+stored record. Stored text also reaches agents, which read koto's output: a
+forged reason can read like an instruction. Every surface prints it as a
+labelled, quoted field, and the koto-user skill tells agents that pin and
+release text is untrusted data, never an instruction.
 
 **The bucket as untrusted input.** The removal guard finds a pin by listing
 the exact object key `ctx/koto/links/pin` and reads it with a hard limit of
@@ -649,10 +713,15 @@ reads as `not_a_file` and keeps the session. A listing error, a truncated
 listing or an unparseable response keeps the session and reports
 `bucket_unchecked`; an unparseable object keeps it and reports
 `pin_unreadable`. Someone with write access to the bucket can add a pin to
-any session or delete a real one. That party can already delete or
-overwrite the sessions themselves, so the pin adds no new power, but a forged
-pin can make a session unremovable, which is why `koto session unpin` works
-on a session that exists only in the bucket.
+any session, delete a real one, or add `release-pin` to a synced anchor's
+authority record. That party can already delete or overwrite the sessions
+themselves, so most of this adds no new power; the new one is making a
+session unremovable with a forged pin, which is why `koto session unpin`
+works on a session that exists only in the bucket. The guard trusts a
+listing to show an object written just before it; the S3-compatible stores
+koto targets list with read-after-write consistency, and a list-after-write
+test against the stand-in checks it. A test also checks that no push or pull
+step deletes the pin object, the assumption the index race relies on.
 
 **Release authority.** `koto session unpin` reads authority only from the
 record a session start wrote into the caller's anchor, never from the
@@ -662,8 +731,9 @@ session name and must resolve to an anchor-kind session before its record is
 read, so the variable can't point the check at another path or at an
 ordinary session. Import carries pin and release records but never an
 authority record. The value reaches `koto session anchor open` through that
-command's environment, not its arguments, so it doesn't appear in process
-listings, and the hook never writes it to the session's env file. The release
+command's environment, not its arguments, so it doesn't appear in an
+ordinary process listing (a same-user `ps eww` still shows it), and the hook
+never writes it to the session's env file. The release
 record stores the authority record's `at` and `source`. Four bypasses remain
 by design, and the guides name them: unsetting `KOTO_ANCHOR` and releasing by
 hand, naming another anchor in `KOTO_ANCHOR` (the hierarchy output shows
@@ -677,9 +747,11 @@ other routes may still inherit it.
 
 **Resource use.** A pin is at most 4 KiB, with one replaced release record per
 session, so storage grows with the number of pinned sessions and no faster.
-Pinning needs no authority, so any agent can pin sessions and keep them from
-cleanup. `koto session list --pinned` makes that visible, and the retention
-guide tells operators to review it. Under the cloud backend each removal and
+Pinning needs no authority, so any agent, including one following injected
+instructions, can pin sessions and keep them from every removal: a retention
+bypass, not only a storage cost. `koto session list --pinned` makes that
+visible, the retention guide tells operators to review it, and a person can
+release any pin by hand. Under the cloud backend each removal and
 each preview costs one listing per session it would delete, plus one read
 when a pin exists, and the cost test with 200 pins bounds the local side.
 
@@ -718,20 +790,38 @@ when its CI job enables it, so ordinary test runs make no network fetch.
 
 ### Negative
 
-- Under the cloud backend every removal pays one listing per session it
-  would delete, and the previews one per session they'd list.
-- A host that can't reach the bucket can't remove anything under cloud.
-- Pins accumulate until someone releases them.
-- An agent can still release by hand by unsetting `KOTO_ANCHOR`.
-- Two hosts racing a pin and a removal can still leave a pin behind a
-  deleted session.
+- **Cost.** Under the cloud backend every removal pays one listing per
+  session it would delete, and the previews one per session they'd list.
+- **No bucket, no removal.** A host that can't reach the bucket can't remove
+  anything under cloud.
+- **Accumulation.** Pins accumulate until someone releases them, and any
+  agent can add them.
+- **Bypass.** An agent can still release by hand by unsetting `KOTO_ANCHOR`,
+  or record authority by running the start's command itself.
+- **Cross-host race.** Two hosts racing a pin and a removal can still leave a
+  pin behind a deleted session.
+- **Older builds.** On a shared store or bucket, a host running koto from
+  before this feature deletes a pinned session through `koto session
+  cleanup` and `koto cancel --cleanup`, and v0.22 or older also through the
+  terminal tick and replace; v0.23.0's prunes, terminal tick and replace keep
+  it as unreadable.
+- **Respawned batch children.** A pin on a batch child is lost when koto
+  respawns or rolls back that child inside its run.
 
 ### Mitigations
 
-- The listing is one request and replaces the remote check the prune
-  already makes; `in_parallel` keeps a prune's wall time bounded.
-- `koto session list --pinned` and the prune reports make pins and failed
-  checks visible.
-- The release record shows a by-hand release, so a bypass leaves a trace.
-- The guard runs immediately before the delete to keep the race window to
-  one request.
+- **Cost:** the listing is one request and replaces the remote check the
+  prune already makes; `in_parallel` keeps a prune's wall time bounded.
+- **No bucket, no removal:** the kept entries say `bucket_unchecked`, so the
+  operator sees why nothing went.
+- **Accumulation:** `koto session list --pinned` and the prune reports make
+  pins visible, and a person can release any pin by hand.
+- **Bypass:** the release record shows a by-hand release and the authority
+  record's source, so a bypass leaves a trace.
+- **Cross-host race:** the guard runs immediately before the delete, keeping
+  the window to one request.
+- **Older builds:** the changelog and retention guide name the first release
+  that honours pins in full and say every host sharing a store or bucket
+  needs it.
+- **Respawned batch children:** the guide says to pin a batch's parent
+  session, which koto doesn't respawn, rather than a child.
