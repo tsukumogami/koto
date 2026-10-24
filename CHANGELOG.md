@@ -36,7 +36,7 @@ to `0.9.x`).
   `koto session prune` walks all resolve from one place: `KOTO_HOME` when
   it's set, `~/.koto` otherwise, so with it unset nothing moves. Under
   `KOTO_HOME` the compiled-template cache moves to `$KOTO_HOME/cache`
-  too, and a root koto creates gets mode 0700 as `~/.koto` does. A test or
+  too, and a root created by a session or a cache write gets mode 0700. A test or
   trial can isolate koto with that one variable instead of overriding
   `HOME`. `koto session dir` with no name prints the resolved root without
   reading config or writing anything, and gates and default actions get

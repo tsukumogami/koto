@@ -241,6 +241,16 @@ fn koto_home_holds_every_path_and_home_is_untouched() {
     assert_eq!(dir, env.koto_home.join("sessions/moved"));
     assert!(dir.join("koto-moved.state.jsonl").is_file());
 
+    // The compiled template went to the cache under the root. HOME's cache
+    // already holds the same template from the run above, so the snapshot at
+    // the end can't show this on its own.
+    let cached: Vec<_> = std::fs::read_dir(env.koto_home.join("cache"))
+        .expect("no template cache under KOTO_HOME")
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".json"))
+        .collect();
+    assert_eq!(cached.len(), 1, "{cached:?}");
+
     // A command koto runs is given the same root.
     assert_eq!(
         koto_home_seen(&dir).as_deref(),
@@ -294,8 +304,7 @@ fn koto_home_holds_every_path_and_home_is_untouched() {
     assert_eq!(removed, vec!["moved"], "{pruned:#}");
     assert!(!dir.exists());
 
-    // Nothing above created, changed or removed anything under HOME, the
-    // template cache included.
+    // Nothing above created, changed or removed anything under HOME.
     assert_eq!(
         snapshot(&env.home),
         home_before,
