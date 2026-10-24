@@ -773,7 +773,7 @@ fn koto_root() -> Result<PathBuf, RequestError> {
     crate::koto_home::koto_home().ok_or_else(|| {
         RequestError::new(
             RequestErrorCode::PersistenceError,
-            "could not determine the koto root (KOTO_HOME is unset and there is no home directory)",
+            "could not determine the koto root (neither KOTO_HOME nor a home directory resolves)",
         )
     })
 }

@@ -31,7 +31,8 @@ pub struct LocalBackend {
     base_dir: PathBuf,
     /// The directory this store's run journal is written in (see
     /// `crate::run_journal`). The journal lives with the store it
-    /// describes: [`LocalBackend::new`] sets it to `~/.koto`, the home its
+    /// describes: [`LocalBackend::new`] sets it to the koto root (`~/.koto`
+    /// unless `KOTO_HOME` moves it), the home its
     /// sessions live in, and a store on an explicit base directory
     /// ([`LocalBackend::with_base_dir`]) journals inside that base, so a
     /// redirected store never writes the real home's journal. Session
@@ -100,8 +101,8 @@ impl SessionBackend for LocalBackend {
         validate_session_id(id)?;
         let dir = self.base_dir.join(id);
 
-        // Ensure the koto root (~/.koto/) exists with restricted permissions.
-        // Walk up from base_dir to find the .koto directory and set 0700 on it.
+        // Ensure the koto root (~/.koto/ or KOTO_HOME) exists with
+        // restricted permissions.
         ensure_koto_root(&self.base_dir)?;
 
         fs::create_dir_all(&dir)?;
@@ -1123,36 +1124,24 @@ fn atomic_create_rename(src: &Path, dst: &Path) -> Result<(), SessionError> {
     })
 }
 
-/// Ensure the `.koto` ancestor directory exists with mode 0700.
+/// Ensure the koto root above `base_dir` exists with mode 0700.
 ///
-/// Walks up from `base_dir` to find a component named `.koto` and sets
-/// restrictive permissions on it. Creates all intermediate directories
-/// if needed.
+/// The root is the one `KOTO_HOME` sets when `base_dir` lies under it, and
+/// otherwise the nearest ancestor named `.koto` (`~/.koto` by default).
+/// Creates all intermediate directories if needed, and sets restrictive
+/// permissions on the root when it creates it.
 pub(crate) fn ensure_koto_root(base_dir: &Path) -> anyhow::Result<()> {
-    // Find the .koto directory in the path ancestry.
-    let mut koto_dir = None;
-    let mut current = base_dir.to_path_buf();
-    loop {
-        if current.file_name().map(|n| n == ".koto").unwrap_or(false) {
-            koto_dir = Some(current);
-            break;
-        }
-        if !current.pop() {
-            break;
-        }
-    }
+    let koto_dir = crate::koto_home::koto_home_override()
+        .filter(|root| base_dir.starts_with(root))
+        .or_else(|| {
+            base_dir
+                .ancestors()
+                .find(|p| p.file_name().is_some_and(|n| n == ".koto"))
+                .map(Path::to_path_buf)
+        });
 
     if let Some(koto_path) = koto_dir {
-        let needs_create = !koto_path.exists();
-        fs::create_dir_all(&koto_path)?;
-
-        if needs_create {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&koto_path, fs::Permissions::from_mode(0o700))?;
-            }
-        }
+        crate::koto_home::ensure_private_root(&koto_path)?;
     }
 
     Ok(())

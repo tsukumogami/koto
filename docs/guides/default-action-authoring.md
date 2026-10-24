@@ -262,7 +262,7 @@ These names reach every command by default, with whatever value the ticking proc
 `HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `no_proxy`, `ALL_PROXY`, `all_proxy`.
 
 That's the whole list. `GH_REPO`, every `GIT_*` name, cloud credentials such as `AWS_*`, and
-`KOTO_*` names other than the two koto sets aren't on it. A session stores the list it was
+`KOTO_*` names other than the ones koto sets aren't on it. A session stores the list it was
 created with, so a later koto release that changes the list doesn't change what an existing
 session's commands see.
 

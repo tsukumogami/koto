@@ -3,12 +3,16 @@
 //! Sessions (`<root>/sessions`), the request store (`<root>/requests`), the
 //! user config (`<root>/config.toml`), the terminal index, coordinator cursors,
 //! the decider ledger and the run journal are all built from [`koto_home`].
-//! `KOTO_HOME` moves all of them at once; unset, the root is `~/.koto`.
+//! `KOTO_HOME` moves all of them at once, and the compiled-template cache
+//! with them (`<root>/cache`, see `crate::cache`); unset, the root is
+//! `~/.koto` and the cache stays on `XDG_CACHE_HOME`.
 //!
 //! This is the one place koto asks for the user's home directory.
 //! `clippy.toml` disallows `dirs::home_dir` everywhere else, so a new path
 //! built from the home directory fails `cargo clippy -D warnings` instead of
-//! quietly escaping `KOTO_HOME`.
+//! quietly escaping `KOTO_HOME`. The lint can't see a read of the `HOME`
+//! variable itself; the two that exist are the cache fallback and Claude
+//! Code's own `~/.claude` directory, neither a koto root path.
 //!
 //! `KOTO_SESSIONS_BASE` keeps its meaning: it moves only the local backend's
 //! session directory, and wins over `<root>/sessions` when both are set.
@@ -21,10 +25,11 @@ pub const KOTO_HOME_ENV: &str = "KOTO_HOME";
 
 /// The koto root: `$KOTO_HOME` when it is set and not empty, else `~/.koto`.
 ///
-/// A relative `KOTO_HOME` is taken against the current directory, so the root
-/// doesn't move when a later step changes directory. `None` when `KOTO_HOME`
-/// is unset and there is no home directory, or the current directory can't be
-/// read for a relative value.
+/// A relative `KOTO_HOME` is taken against the current directory of each koto
+/// process, so two runs from different directories resolve different roots;
+/// the commands a tick runs are given the absolute root, so they don't. `None`
+/// when `KOTO_HOME` is unset and there is no home directory, or the current
+/// directory can't be read for a relative value.
 pub fn koto_home() -> Option<PathBuf> {
     #[allow(clippy::disallowed_methods)]
     let home = dirs::home_dir();
@@ -39,7 +44,8 @@ pub fn koto_home() -> Option<PathBuf> {
 pub fn koto_home_or_err() -> anyhow::Result<PathBuf> {
     koto_home().ok_or_else(|| {
         anyhow::anyhow!(
-            "could not determine the koto root: KOTO_HOME is unset and there is no home directory"
+            "could not determine the koto root: KOTO_HOME is unset and there is no home \
+             directory, or KOTO_HOME is relative and the current directory can't be read"
         )
     })
 }
@@ -52,6 +58,21 @@ pub fn koto_home_override() -> Option<PathBuf> {
         Some(v) if !v.is_empty() => koto_home(),
         _ => None,
     }
+}
+
+/// Create `root` (and its parents) if it doesn't exist, giving it mode 0700
+/// when this call creates it, as koto does for `~/.koto`.
+pub fn ensure_private_root(root: &Path) -> std::io::Result<()> {
+    let needs_create = !root.exists();
+    std::fs::create_dir_all(root)?;
+    if needs_create {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
 }
 
 /// The resolution itself, apart from the process environment.

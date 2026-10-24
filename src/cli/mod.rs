@@ -450,7 +450,8 @@ pub enum ConfigCommand {
         key: String,
         /// Value to set
         value: String,
-        /// Write to user config (~/.koto/config.toml) instead of project config
+        /// Write to user config (~/.koto/config.toml, or $KOTO_HOME/config.toml)
+        /// instead of project config
         #[arg(long)]
         user: bool,
     },
@@ -458,7 +459,8 @@ pub enum ConfigCommand {
     Unset {
         /// Dotted key path (e.g., session.backend)
         key: String,
-        /// Remove from user config (~/.koto/config.toml) instead of project config
+        /// Remove from user config (~/.koto/config.toml, or $KOTO_HOME/config.toml)
+        /// instead of project config
         #[arg(long)]
         user: bool,
     },
@@ -1195,7 +1197,7 @@ fn handle_workflows_action(action: WorkflowsAction) -> Result<()> {
 /// Build the local backend, honoring `KOTO_SESSIONS_BASE` for testing.
 ///
 /// The run journal lives with the store it describes. The default store
-/// under `~/.koto/sessions` journals into `~/.koto`; a store whose base
+/// under `<koto root>/sessions` journals into the koto root; a store whose base
 /// `KOTO_SESSIONS_BASE` redirected journals inside that base, so it never
 /// writes the real home's journal (see `crate::run_journal`).
 pub(crate) fn build_local_backend() -> Result<LocalBackend> {
@@ -2393,7 +2395,7 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
             if user {
                 config::resolve::ensure_koto_dir()?;
                 let path = config::resolve::user_config_path()
-                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+                    .ok_or_else(|| anyhow::anyhow!("could not determine the koto root"))?;
                 let mut doc = config::resolve::load_toml_value(&path)?;
                 config::set_value_in_toml(&mut doc, &key, &value)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -2412,7 +2414,7 @@ fn handle_config(subcommand: ConfigCommand) -> Result<()> {
         ConfigCommand::Unset { key, user } => {
             if user {
                 let path = config::resolve::user_config_path()
-                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+                    .ok_or_else(|| anyhow::anyhow!("could not determine the koto root"))?;
                 let mut doc = config::resolve::load_toml_value(&path)?;
                 config::unset_value_in_toml(&mut doc, &key)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;

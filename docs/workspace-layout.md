@@ -12,8 +12,9 @@ Two trees and one file are authoritative and rebuild from nothing:
 `~/.koto/_decider_ledger.jsonl`. Deleting any of them destroys history.
 
 `~/.koto` is the default koto root. When `KOTO_HOME` is set, everything
-below lives under that directory instead, and `koto session dir` with no
-name prints the root in effect.
+below lives under that directory instead, along with the compiled-template
+cache (`cache/`), and `koto session dir` with no name prints the root in
+effect.
 
 Cross-references: `docs/STABILITY.md` for the public crate stability
 contract; `docs/designs/current/DESIGN-request-store-converge.md` for the full

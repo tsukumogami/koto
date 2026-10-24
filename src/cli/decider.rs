@@ -46,8 +46,8 @@ pub enum DeciderCommand {
 /// Flags of `koto decider report`.
 #[derive(Args, Debug, Clone)]
 pub struct ReportArgs {
-    /// Ledger to read (default: _decider_ledger.jsonl in the koto home
-    /// directory, ~/.koto)
+    /// Ledger to read (default: _decider_ledger.jsonl in the koto root,
+    /// ~/.koto or $KOTO_HOME)
     #[arg(long, value_name = "PATH")]
     pub ledger: Option<PathBuf>,
 

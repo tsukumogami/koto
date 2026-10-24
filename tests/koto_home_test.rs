@@ -1,6 +1,7 @@
-//! `KOTO_HOME` moves the whole koto root: sessions, requests, config and the
-//! prune walk land under it, and the home directory's `.koto` is never read
-//! or written. Unset, the root is `~/.koto` as before.
+//! `KOTO_HOME` moves the whole koto root: sessions, requests, config, the
+//! template cache and the prune walk land under it, nothing is written under
+//! the home directory, and the home directory's store is neither listed nor
+//! pruned. Unset, the root is `~/.koto` as before.
 //!
 //! Every command runs with `HOME` and `KOTO_HOME` at scratch directories and
 //! with every variable that could point koto at another store removed, and
@@ -13,6 +14,7 @@
 mod koto_command;
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -65,9 +67,9 @@ struct Env {
     _tmp: TempDir,
     /// What `HOME` points at.
     home: PathBuf,
-    /// What `KOTO_HOME` points at, when it is set.
+    /// What `KOTO_HOME` points at, when it is set. Not created up front, so
+    /// koto creates it.
     koto_home: PathBuf,
-    cache: PathBuf,
     work: PathBuf,
     template: PathBuf,
 }
@@ -79,12 +81,11 @@ impl Env {
         let env = Env {
             home: root.join("home"),
             koto_home: root.join("koto-home"),
-            cache: root.join("cache"),
             work: root.join("work"),
             template: root.join("koto-home.md"),
             _tmp: tmp,
         };
-        for d in [&env.home, &env.koto_home, &env.cache, &env.work] {
+        for d in [&env.home, &env.work] {
             std::fs::create_dir_all(d).unwrap();
         }
         std::fs::write(&env.template, TEMPLATE).unwrap();
@@ -93,11 +94,13 @@ impl Env {
 
     /// A koto command in the scratch work directory with `HOME` at the
     /// scratch home and `KOTO_HOME` at the scratch root when `with_koto_home`.
+    /// `XDG_CACHE_HOME` is removed, so a cache write that ignored `KOTO_HOME`
+    /// would land under `HOME`.
     fn cmd(&self, with_koto_home: bool) -> Command {
         let mut cmd = koto_command::koto();
         cmd.current_dir(&self.work)
             .env("HOME", &self.home)
-            .env("XDG_CACHE_HOME", &self.cache)
+            .env_remove("XDG_CACHE_HOME")
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("KOTO_HOME")
             .env_remove("KOTO_SESSIONS_BASE")
@@ -154,20 +157,31 @@ impl Env {
             &[],
         );
     }
+
+    /// Write the user config, which lands in `<root>/config.toml`.
+    fn set_user_config(&self, with_koto_home: bool) {
+        self.run(
+            with_koto_home,
+            &["config", "set", "--user", "session.backend", "local"],
+            &[],
+        );
+    }
 }
 
-/// Every file under `dir`, by relative path, with its contents.
-fn snapshot(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+/// Every directory and file under `dir`, by relative path, with each file's
+/// contents (`None` for a directory).
+fn snapshot(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     let mut out = BTreeMap::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         for entry in std::fs::read_dir(&d).unwrap() {
             let path = entry.unwrap().path();
+            let rel = path.strip_prefix(dir).unwrap().to_path_buf();
             if path.is_dir() {
+                out.insert(rel, None);
                 stack.push(path);
             } else {
-                let rel = path.strip_prefix(dir).unwrap().to_path_buf();
-                out.insert(rel, std::fs::read(&path).unwrap());
+                out.insert(rel, Some(std::fs::read(&path).unwrap()));
             }
         }
     }
@@ -195,15 +209,16 @@ fn unset_koto_home_keeps_the_root_under_home() {
         None,
         "a command saw KOTO_HOME it wasn't given"
     );
+    env.set_user_config(false);
     assert!(env.home.join(".koto/config.toml").is_file());
-    assert!(snapshot(&env.koto_home).is_empty());
+    assert!(!env.koto_home.exists());
 }
 
 #[test]
 fn koto_home_holds_every_path_and_home_is_untouched() {
     let env = Env::new();
 
-    // A store under HOME that a KOTO_HOME run must neither read nor prune.
+    // A store under HOME that a KOTO_HOME run must neither list nor prune.
     assert_eq!(env.root(false), env.home.join(".koto"));
     env.finish(false, "home-only");
     let home_before = snapshot(&env.home);
@@ -213,22 +228,28 @@ fn koto_home_holds_every_path_and_home_is_untouched() {
 
     // Fail closed: nothing else runs unless the root is the scratch one.
     assert_eq!(env.root(true), env.koto_home);
+    assert!(!env.koto_home.exists(), "reading the root created it");
 
-    // init and the tick.
+    // init and the tick. koto creates the root private, as it does ~/.koto.
     env.finish(true, "moved");
+    let mode = std::fs::metadata(&env.koto_home)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700, "root created with mode {mode:o}");
     let dir = PathBuf::from(env.run(true, &["session", "dir", "moved"], &[]).trim());
     assert_eq!(dir, env.koto_home.join("sessions/moved"));
     assert!(dir.join("koto-moved.state.jsonl").is_file());
-    assert!(
-        env.koto_home.join("config.toml").is_file(),
-        "config.toml not under KOTO_HOME"
-    );
 
     // A command koto runs is given the same root.
     assert_eq!(
         koto_home_seen(&dir).as_deref(),
         Some(env.koto_home.to_str().unwrap())
     );
+
+    // The user config.
+    env.set_user_config(true);
+    assert!(env.koto_home.join("config.toml").is_file());
 
     // session list sees only the KOTO_HOME store.
     let list = env.json(true, &["session", "list"], &[]);
@@ -273,6 +294,8 @@ fn koto_home_holds_every_path_and_home_is_untouched() {
     assert_eq!(removed, vec!["moved"], "{pruned:#}");
     assert!(!dir.exists());
 
+    // Nothing above created, changed or removed anything under HOME, the
+    // template cache included.
     assert_eq!(
         snapshot(&env.home),
         home_before,

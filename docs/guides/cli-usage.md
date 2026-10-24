@@ -17,7 +17,7 @@ export KOTO_HOME=$(mktemp -d)
 koto session dir    # prints the root, here the scratch directory
 ```
 
-A relative `KOTO_HOME` is taken against the current directory; an empty one counts as unset. When `KOTO_HOME` is set, the commands a session's gates and default actions run get it too, so a koto they call uses the same root. `KOTO_SESSIONS_BASE` still moves only the local session directory, and wins over `<root>/sessions` when both are set. The compiled-template cache isn't under the root: it follows `XDG_CACHE_HOME` (or `~/.cache/koto`) as before.
+A relative `KOTO_HOME` is taken against the current directory; an empty one counts as unset. When `KOTO_HOME` is set, the commands a session's gates and default actions run get it too, so a koto they call uses the same root. `KOTO_SESSIONS_BASE` still moves only the local session directory, and wins over `<root>/sessions` when both are set. The compiled-template cache moves to `$KOTO_HOME/cache` when `KOTO_HOME` is set; unset, it stays at `$XDG_CACHE_HOME/koto` (or `~/.cache/koto`).
 
 Older koto versions namespaced sessions by repository (`~/.koto/sessions/<repo-id>/<name>/`). koto migrates that layout on first use. A name that was reused across repositories has several old-layout sources and one flat destination, so only one of them can keep the name; the rest are moved aside into `~/.koto/sessions/.migration-conflicts/<repo-id>/<name>/` and are not listed until you restore them. See [session recover](#session-recover).
 
@@ -543,7 +543,7 @@ koto session dir <name>
 
 The path is printed even if the directory doesn't exist yet (no I/O validation). This lets callers check the path before or after `koto init`.
 
-With no name, it prints the koto root instead: `KOTO_HOME` when it's set, otherwise `~/.koto`. It reads no config and writes nothing, so a test harness can run it first and refuse to go on unless the root is under its scratch directory.
+With no name, it prints the koto root instead: `KOTO_HOME` when it's set, otherwise `~/.koto`. It reads no config and writes nothing, so a test harness can run it first and refuse to go on unless the root is under its scratch directory. The root doesn't cover a `KOTO_SESSIONS_BASE` set elsewhere, so a harness that checks the root should also unset that variable or check it.
 
 ```bash
 koto session dir
