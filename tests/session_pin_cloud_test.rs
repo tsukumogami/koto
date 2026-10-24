@@ -350,7 +350,16 @@ fn a_stale_copy_keeps_the_pinned_session_through_both_prunes() {
     assert!(!names(&preview["remove"]).contains(&"P".to_string()));
 
     // The apply keeps P in the bucket and removes U from it.
-    let applied = h.ok(2, &["session", "prune", "--apply", "--all"]);
+    let applied = h.ok(
+        2,
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
+    );
     assert!(
         !names(&applied["removed"]).contains(&"P".to_string()),
         "{applied:#}"
@@ -368,7 +377,17 @@ fn a_stale_copy_keeps_the_pinned_session_through_both_prunes() {
 fn a_stale_copy_keeps_the_pinned_child_through_a_workspace_prune() {
     let h = stale_copy_fixture();
     let before = h.objects("P");
-    let out = h.ok(2, &["workspace", "prune", "--root", "X", "--yes"]);
+    let out = h.ok(
+        2,
+        &[
+            "workspace",
+            "prune",
+            "--root",
+            "X",
+            "--yes",
+            "--confirm-short-retention",
+        ],
+    );
     assert!(
         !names(&out["removed"]).contains(&"P".to_string()),
         "{out:#}"
@@ -486,8 +505,21 @@ fn a_pin_keeps_its_session_on_a_host_without_the_anchor_that_holds_it() {
     settle();
     let before = h.objects("P");
     for args in [
-        &["session", "prune", "--apply", "--all"][..],
-        &["workspace", "prune", "--root", "P", "--yes"][..],
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ][..],
+        &[
+            "workspace",
+            "prune",
+            "--root",
+            "P",
+            "--yes",
+            "--confirm-short-retention",
+        ][..],
     ] {
         let out = h.ok(2, args);
         let text = out.to_string();
@@ -522,7 +554,16 @@ fn a_context_write_from_a_stale_copy_does_not_unpin() {
         "{manifest:#}"
     );
     assert!(h.s3.object(&h.key("P", PIN)).is_some());
-    let applied = h.ok(2, &["session", "prune", "--apply", "--all"]);
+    let applied = h.ok(
+        2,
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
+    );
     assert_bucket_pin(entry(&applied["skipped"], "P"));
     assert!(h.s3.object(&h.key("P", PIN)).is_some());
 }
@@ -557,7 +598,16 @@ fn a_failed_or_unparseable_bucket_check_keeps_and_says_so() {
     // Both prunes keep an unpinned session whose bucket can't be checked.
     h.s3.fail("LIST", &pin_listing("U"), 500);
     let u_before = h.objects("U");
-    let applied = h.ok(2, &["session", "prune", "--apply", "--all"]);
+    let applied = h.ok(
+        2,
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
+    );
     let u = entry(&applied["skipped"], "U");
     assert_eq!(u["bucket_unchecked"]["error"], "unreachable", "{applied:#}");
     assert!(u.get("kept_by_pin").is_none(), "{u:#}");
@@ -678,7 +728,16 @@ fn an_unpin_on_one_host_frees_the_session_on_another() {
     settle();
     let listed = h.ok(1, &["session", "list", "--pinned", "--json"]);
     assert_eq!(listed, serde_json::json!([]), "{listed:#}");
-    let applied = h.ok(1, &["session", "prune", "--apply", "--all"]);
+    let applied = h.ok(
+        1,
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
+    );
     assert!(
         names(&applied["removed"]).contains(&"P".to_string()),
         "{applied:#}"
@@ -702,7 +761,16 @@ fn a_pin_set_released_and_set_again_at_once_is_told_apart_by_its_id() {
     // Host 1's file is the first pin, which the release record names; the
     // bucket's pin object is the second, which keeps, and the scan's check
     // in the bucket says so before anything is planned.
-    let applied = h.ok(1, &["session", "prune", "--apply", "--all"]);
+    let applied = h.ok(
+        1,
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
+    );
     let kept = entry(&applied["kept"], "P");
     assert_eq!(kept["rule"], "p", "{kept:#}");
     assert_bucket_pin(kept);
@@ -813,7 +881,16 @@ fn a_whole_pull_from_an_index_without_the_pin_still_shows_it() {
     let listed = h.ok(2, &["session", "list", "--pinned", "--json"]);
     assert_eq!(entry(&listed, "P")["pin"]["reason"], REASON, "{listed:#}");
     settle();
-    let applied = h.ok(2, &["session", "prune", "--apply", "--all"]);
+    let applied = h.ok(
+        2,
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
+    );
     assert!(
         !names(&applied["removed"]).contains(&"P".to_string()),
         "{applied:#}"
@@ -834,7 +911,16 @@ fn a_prune_asks_the_bucket_once_per_session_it_would_delete() {
     }
     settle();
     h.s3.clear_requests();
-    let applied = h.ok(1, &["session", "prune", "--apply", "--all"]);
+    let applied = h.ok(
+        1,
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
+    );
     assert_eq!(names(&applied["removed"]).len(), 15, "{applied:#}");
     let requests = h.s3.requests();
     let pin_listings = requests
@@ -942,7 +1028,16 @@ fn after_a_same_host_import_the_old_workspace_never_clears_the_moved_copys_pin()
     // From the old workspace: a prune keeps the moved copy by its pin, a
     // cleanup refuses it as pinned, and its pin is where it was, locally and
     // in the bucket.
-    let applied = h.ok(1, &["session", "prune", "--apply", "--all"]);
+    let applied = h.ok(
+        1,
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
+    );
     assert!(
         !names(&applied["removed"]).contains(&"P".to_string()),
         "{applied:#}"
