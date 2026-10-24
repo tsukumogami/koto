@@ -137,6 +137,51 @@ impl fmt::Display for SessionMigrated {
 
 impl std::error::Error for SessionMigrated {}
 
+/// A cloud read refused because the session belongs to another directory.
+///
+/// The cloud backend finds a session in the bucket under a prefix derived
+/// from the directory the command runs in, while every workspace on a host
+/// shares one local store. A command naming a session from another
+/// directory would sync that shared copy against another workspace's prefix
+/// and could return an older copy that prefix holds under the same name
+/// (koto#457). [`crate::session::cloud::CloudBackend::check_bound_here`]
+/// returns this instead, naming the directory to run from.
+///
+/// The message begins with the error code, `session_bound_elsewhere`, as
+/// [`SessionMigrated`]'s does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBoundElsewhere {
+    /// The session that was named.
+    pub name: String,
+    /// The directory the session is bound to: its execution anchor, when
+    /// its local copy records one.
+    pub anchor: Option<String>,
+}
+
+impl fmt::Display for SessionBoundElsewhere {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.anchor {
+            Some(anchor) => write!(
+                f,
+                "session_bound_elsewhere: session '{}' is bound to {}, not to the directory \
+                 this command ran in; under the cloud backend a session is read only from \
+                 its own workspace, so run the command from {}",
+                self.name, anchor, anchor
+            ),
+            None => write!(
+                f,
+                "session_bound_elsewhere: session '{}' belongs to another workspace, not to \
+                 the directory this command ran in; under the cloud backend a session is \
+                 read only from its own workspace, so run the command from the directory \
+                 the session was started in",
+                self.name
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionBoundElsewhere {}
+
 /// A bounded prefix read of one context key's local content, from
 /// [`Backend::read_context_prefix`].
 #[derive(Debug, Clone)]
@@ -733,6 +778,16 @@ impl Backend {
         match self {
             Backend::Local(_) => Ok(()),
             Backend::Cloud(b) => b.check_not_migrated(id),
+        }
+    }
+
+    /// Refuse with [`SessionBoundElsewhere`] when `id` belongs to another
+    /// directory's workspace. Always `Ok` on the local backend, whose one
+    /// store answers a name the same from every directory.
+    pub fn check_bound_here(&self, id: &str) -> anyhow::Result<()> {
+        match self {
+            Backend::Local(_) => Ok(()),
+            Backend::Cloud(b) => b.check_bound_here(id),
         }
     }
 

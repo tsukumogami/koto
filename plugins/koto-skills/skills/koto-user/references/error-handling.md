@@ -91,6 +91,7 @@ All `koto next` error codes, their exit codes, and what to do:
 | `capture_unset` | 3 | No | A state reads a `capture_stdout_as` name that no state delivered on this run — in its instruction text, in its `default_action`'s `command` or `working_dir`, or in any field of one of its gates. The message names which, the gate where one is involved, the value, and the state that produces it. Nothing is spawned, read or compiled on either path | A template routing problem: the run never entered the producing state. Report it; re-ticking won't help |
 | `import_source_running`, `import_source_unpushed`, `import_source_has_children` | 2 | No | A same-host `koto session import` (no `--as`, run on the host that created the session) found the source still held by another process, ahead of the bucket, or with a local child. `import_source_unpushed` also refuses from any host while a `koto next` on the source stopped before pushing what its commands wrote (the bucket holds the source's `batch-open.json`). Nothing was written | Stop the source, run `koto session resolve <name> --keep local` in its workspace, or deal with the child, as the code says. For a stopped `koto next`, run any koto command on the session in the source workspace on its host, such as `koto status <name>`, which pushes the writes. Then run the same import again. See `command-reference.md`, "koto session import" |
 | `session_migrated` | 2 | No | Under the cloud backend, the session was imported into another workspace with `koto session import`, and this copy carries the marker the import left. The message names the session and workspace it went to | Continue the session where the message says; don't advance this copy. See [session_migrated](#session_migrated) |
+| `session_bound_elsewhere` | 2 | No | Under the cloud backend, the command named a session from a directory that isn't the session's workspace, so it would have synced against another workspace's copy in the bucket. The message names the bound directory | Run the command from the directory the message names. See [session_bound_elsewhere](#session_bound_elsewhere) |
 | `nested_invocation` | 2 | No | The tick was started from inside a command koto is running. The message names the session whose tick is in flight | Don't tick koto from a template's command. Take the `koto next` call out and let the enclosing tick advance the session |
 | `needs_agent_not_dispatched` | 66 | No | `koto next` was called against a `--needs-agent` child that the coordinator has not yet claimed/dispatched | Stop ticking the child directly; route through the coordinator's `koto next` on the parent root instead |
 | `recursion_cap_exceeded` | 64 | No | `koto session start --needs-agent` would push the workflow tree past one of the three recursion caps (`depth`, `fanout`, or `total_unassigned`) | Surface the cap dimension and threshold to the user; restructure the dispatch fanout (collapse a level, batch siblings, or split into separate trees) before retrying |
@@ -171,6 +172,18 @@ Check that the directory is the one you meant.
 ```
 
 The remedy is to continue the session where the message says, from that workspace's directory. Don't rebind, re-init or resolve this copy to get past the refusal; advancing both copies would fork the session. If this copy is no longer wanted, `koto session cleanup <name>` in this workspace removes the local copy and the source's objects in the bucket, but keeps the marker. A migrated source's pin is inert and doesn't refuse it; any other pinned session refuses cleanup with `pinned` until `koto session unpin <name>` releases it. When the import itself is what you're running, its own codes are in `command-reference.md`, "koto session import".
+
+## session_bound_elsewhere
+
+Under the cloud backend a session lives in the bucket under a prefix derived from the directory it was started in, while every workspace on a host shares one local session store. A command that names a session from another directory would sync that shared copy against the other directory's prefix, which can hold an older session of the same name. So `koto status`, the `koto context` commands, `koto decisions record` and `list`, `koto overrides record` and `list`, `koto rewind`, `koto cancel` and `koto session resolve` refuse it first, before any request. A directory counts as the session's workspace when it is the directory the session was created in (recorded with its origin) or its execution anchor; a subdirectory of either doesn't. A session an older koto created has no such record and counts only its anchor. The local backend never refuses.
+
+The error goes to **stdout**, flat, exit 2:
+
+```json
+{"error":"session_bound_elsewhere: session 'review' is bound to /srv/ws-a, not to the directory this command ran in; under the cloud backend a session is read only from its own workspace, so run the command from /srv/ws-a","command":"context get"}
+```
+
+Run the command from the directory the message names. Nothing was read or written on the refused call.
 
 ---
 

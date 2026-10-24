@@ -106,7 +106,7 @@ There are no sync commands. These commands read or write the session's copy in t
 - `koto context add`, `koto context get`, `koto context list`, `koto context exists`, `koto context remove`
 - `koto session list`, `koto session rebind`, `koto session cleanup`, `koto session resolve`, `koto session import`
 
-That list isn't exhaustive: any command that reads a session's state through the cloud backend checks it against the bucket first. If the bucket is unreachable, a command keeps working on the local copy and prints a warning to stderr.
+That list isn't exhaustive: any command that reads a session's state through the cloud backend checks it against the bucket first. If the bucket is unreachable, a command keeps working on the local copy and prints a warning to stderr. Once the bucket has answered that its copy of the state file, the context manifest or a key changed, though, a failure to fetch that copy fails the command instead: a 404 for a key the manifest names, say. The local copy may be behind the bucket's then, so a read never answers from it silently. Run the command again once the bucket serves the object.
 
 ### What a read costs
 
@@ -135,6 +135,16 @@ A `koto context add` or `koto context remove` for any other session, or made out
 A session's remote objects sit under a prefix derived from the workspace that created it: the first 16 hex digits of the SHA-256 of the canonical path of the directory koto ran in. A session named `review` created in `/srv/ws-a` lives under `<hash-of-/srv/ws-a>/review/`, and the commands above find it there when you run them from `/srv/ws-a`.
 
 So the prefix is the session's identity on its host. Running `koto next review` on another machine, or from another directory, doesn't continue it. To continue a session in another workspace or on another host, import it (next section).
+
+Every workspace on a host shares one local session store, so a command naming `review` from another directory would sync that shared copy against the other directory's prefix, where an older session called `review` may be waiting. These commands refuse instead, before they make any request: every `koto context` subcommand, `koto status`, `koto decisions record` and `list`, `koto overrides record` and `list`, `koto rewind`, `koto cancel` and `koto session resolve`. They exit 2 with an error starting `session_bound_elsewhere` that names the directory the session is bound to:
+
+```
+session_bound_elsewhere: session 'review' is bound to /srv/ws-a, not to the directory this command ran in; under the cloud backend a session is read only from its own workspace, so run the command from /srv/ws-a
+```
+
+Run the command from that directory. A command counts as run from the session's own workspace when its directory is the one the session was created in, which the session records with its origin, or the session's execution anchor. The two differ for a session started with `koto init --execution-dir`, and either one works. A session created by an older koto, with no such record, counts only its anchor. A subdirectory of either is another workspace. A session with no local copy on this host is read as before. The local backend answers a name the same from every directory and never refuses.
+
+koto's own reads of a session bound to another directory, such as an agent session's anchor or another member of a hierarchy, use this host's copy and take nothing from the current directory's prefix. `koto next` keeps its own check: it refuses a directory outside the session's execution anchor.
 
 `koto session rebind` is a different thing. It's for a checkout that moved on the same host: stand in the new location and rebind the session's execution anchor there. Don't use it to carry a session to another machine.
 

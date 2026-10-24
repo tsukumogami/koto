@@ -32,7 +32,8 @@ use crate::session::local::{repo_id, LocalBackend};
 use crate::session::sync::{self, ManifestCache};
 use crate::session::sync_stamp::{self, Stamp};
 use crate::session::{
-    state_file_name, SessionBackend, SessionError, SessionInfo, SessionLock, SessionMigrated,
+    state_file_name, SessionBackend, SessionBoundElsewhere, SessionError, SessionInfo, SessionLock,
+    SessionMigrated,
 };
 
 /// File name of the marker `koto session import` leaves beside a source
@@ -373,6 +374,11 @@ impl CloudBackend {
     /// write asks again when the answer it finds was borrowed.
     fn check_migration(&self, id: &str, write: bool) -> anyhow::Result<()> {
         self.local_guard(id)?;
+        // A marker under this prefix belongs to another workspace's session
+        // of the same name, not to `id`'s local copy (koto#457).
+        if self.bound_elsewhere(id).is_some() {
+            return Ok(());
+        }
         let mut checks = self
             .migration_checks
             .lock()
@@ -516,6 +522,93 @@ impl CloudBackend {
             name: id.to_string(),
             target: id.to_string(),
             workspace,
+        })
+    }
+
+    /// Refuse a command that names `id` from a directory other than the
+    /// session's own, before anything syncs it (koto#457).
+    ///
+    /// The local guard answers first: a session this workspace's copy was
+    /// imported into on this host refuses with [`SessionMigrated`], which
+    /// says where it went, rather than as bound elsewhere. Then
+    /// [`CloudBackend::bound_elsewhere`] decides.
+    pub fn check_bound_here(&self, id: &str) -> anyhow::Result<()> {
+        self.local_guard(id)?;
+        match self.bound_elsewhere(id) {
+            Some(refusal) => Err(anyhow::Error::new(refusal)),
+            None => Ok(()),
+        }
+    }
+
+    /// `Some` when `id`'s local copy belongs to another directory's
+    /// workspace than this backend's, asked of the local copy alone with no
+    /// request.
+    ///
+    /// Every workspace on a host shares one local store, but this backend's
+    /// prefix comes from the directory the command runs in. A read of `id`
+    /// from another directory would sync the shared copy against that
+    /// directory's prefix, which can hold an older session of the same name:
+    /// the state pull would overwrite the local log with it, and a key whose
+    /// hash differs would be pulled over the current value.
+    ///
+    /// The session's own prefixes come from its header, in this order:
+    ///
+    /// - `origin.store.prefix`, the prefix it was created under, together
+    ///   with its execution anchor's (`execution_dir`, else `origin.anchor`),
+    ///   since the two differ for a session started with `--execution-dir`
+    ///   and a rebind moves the anchor;
+    /// - for a session recorded before koto named the prefix, its anchor's
+    ///   alone;
+    /// - for one with no anchor either, the prefix of this host's sync stamp.
+    ///
+    /// The stamp comes last because any sync rewrites it to the prefix the
+    /// syncing command ran under, so a run of an older koto from the wrong
+    /// directory leaves it naming that directory; the header is the
+    /// session's own and nothing here rewrites it. A session with no local
+    /// copy, or one recording none of these, is not bound elsewhere.
+    ///
+    /// Resolving the session by name instead, syncing it under its own
+    /// prefix from any directory, would rest on the same records, and for a
+    /// session recorded before the prefix was the only one rewritten by the
+    /// wrong-directory runs this guards against; a wrong guess there is the
+    /// silent stale read itself. A refusal that names the directory is loud
+    /// when it is wrong.
+    fn bound_elsewhere(&self, id: &str) -> Option<SessionBoundElsewhere> {
+        let dir = self.local.session_dir(id);
+        let header: Option<serde_json::Value> = first_line(&dir.join(state_file_name(id)))
+            .and_then(|line| serde_json::from_str(line.trim()).ok());
+        let field = |pointer: &str| {
+            header
+                .as_ref()
+                .and_then(|h| h.pointer(pointer))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        let anchor = field("/execution_dir").or_else(|| field("/origin/anchor"));
+        let anchor_prefix = anchor
+            .as_deref()
+            .and_then(|a| crate::session::local::prefix_for_workspace(Path::new(a)).ok());
+        let origin_prefix = field("/origin/store/prefix");
+        let own: Vec<String> = match (origin_prefix, anchor_prefix) {
+            (Some(origin), anchor) => std::iter::once(origin).chain(anchor).collect(),
+            (None, Some(anchor)) => vec![anchor],
+            (None, None) => Stamp::load(&dir)
+                .and_then(|s| {
+                    s.state_key
+                        .split('/')
+                        .next()
+                        .filter(|p| is_workspace_prefix(p))
+                        .map(str::to_string)
+                })
+                .into_iter()
+                .collect(),
+        };
+        if own.is_empty() || own.contains(&self.prefix) {
+            return None;
+        }
+        Some(SessionBoundElsewhere {
+            name: id.to_string(),
+            anchor,
         })
     }
 
@@ -1036,6 +1129,16 @@ impl CloudBackend {
         if own_tick && !self.mark_pulled(id) {
             return Ok(());
         }
+        // A session whose local copy belongs to another directory's
+        // workspace is read as this host holds it. This prefix's copy, if
+        // there is one, isn't the session's: pulling it would overwrite the
+        // local log with another session's, or an older one, and rewrite the
+        // stamp to this prefix (koto#457). The commands that name a session
+        // refuse before they get here; this covers koto's own reads of
+        // other sessions, such as an anchor or a hierarchy member.
+        if self.bound_elsewhere(id).is_some() {
+            return Ok(());
+        }
         // The state file is fetched only when the bucket's copy moved since
         // this host last pulled or pushed it, or the local file is no longer
         // what it pulled or pushed (`crate::session::sync_stamp`). Inside a
@@ -1064,21 +1167,39 @@ impl CloudBackend {
                 return Ok(());
             }
         }
+        // The listing showed a state file this host doesn't hold, so the
+        // local copy may be behind it. A fetch that fails here (a 404 from
+        // a copy removed since the listing, say) is an error rather than a
+        // fall-back to that copy: a read must not return what may be an
+        // older log without saying so (koto#457). An unreachable bucket
+        // never gets this far; the listing's failure above keeps the local
+        // copy with a warning.
         let key = self.state_key(id);
-        match self.bucket.get_object(&key) {
-            Ok(response) if response.status_code() == 200 => {
-                refuse_cross_import_pull(id, &state_path, response.bytes())?;
-                if let Err(e) = std::fs::write(&state_path, response.bytes()) {
-                    eprintln!("warning: cloud sync: failed to write pulled state: {}", e);
-                } else {
-                    self.record_synced(id, Some(&remote_etag), response.bytes());
-                }
-            }
-            Ok(_) => {} // Not found or other status, use local
-            Err(e) => {
-                eprintln!("warning: cloud sync pull failed: {}", e);
-            }
+        let response = self.bucket.get_object(&key).map_err(|e| {
+            anyhow::anyhow!(
+                "cloud sync: the bucket holds a newer state for session '{}' but fetching \
+                 it failed, so the local copy may be stale: {}; run the command again",
+                id,
+                without_url_userinfo(&e.to_string())
+            )
+        })?;
+        if response.status_code() != 200 {
+            anyhow::bail!(
+                "cloud sync: the bucket holds a newer state for session '{}' but fetching it \
+                 answered {}, so the local copy may be stale; run the command again",
+                id,
+                response.status_code()
+            );
         }
+        refuse_cross_import_pull(id, &state_path, response.bytes())?;
+        std::fs::write(&state_path, response.bytes()).with_context(|| {
+            format!(
+                "cloud sync: failed to write the pulled state of session '{}' to {}",
+                id,
+                state_path.display()
+            )
+        })?;
+        self.record_synced(id, Some(&remote_etag), response.bytes());
         Ok(())
     }
 
@@ -2687,6 +2808,7 @@ impl SessionBackend for CloudBackend {
             kind: "cloud".to_string(),
             base: std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf()),
             bucket: Some(self.bucket.name()),
+            prefix: Some(self.prefix.clone()),
         })
     }
 
@@ -3145,6 +3267,10 @@ impl ContextStore for CloudBackend {
         {
             return None;
         }
+        // Another prefix's manifest isn't this session's (koto#457).
+        if self.bound_elsewhere(session).is_some() {
+            return None;
+        }
         self.prime_manifest(session);
         sync::remote_key_meta(
             &self.bucket,
@@ -3166,12 +3292,25 @@ impl ContextStore for CloudBackend {
         {
             return self.local.get(session, key);
         }
+        // A session bound to another directory's workspace is read as this
+        // host holds it, never pulled from this prefix (koto#457).
+        if self.bound_elsewhere(session).is_some() {
+            return self.local.get(session, key);
+        }
         // Pull from remote if a newer version exists. A pull that wrote the
         // local store is logged as a `sync` write -- before the read the
         // caller is about to log, which it produced. From anything but the
         // session's own tick, `append_event` spools it beside the read
         // instead, so only this host's mirror of the key changes.
         self.prime_manifest(session);
+        // Whether the session's listing showed a manifest the priming
+        // couldn't fetch: the pull then fails rather than reading a local
+        // copy the bucket may have moved past (koto#457). The listing is
+        // the one the priming made, so this asks the bucket nothing.
+        let manifest_listed = self.manifest_cache.get(session).is_none()
+            && self
+                .probe(session)
+                .is_ok_and(|probe| probe.manifest_etag.is_some());
         let pulled = sync::pull_context_if_newer(
             &self.local,
             &self.bucket,
@@ -3179,6 +3318,7 @@ impl ContextStore for CloudBackend {
             session,
             key,
             &self.manifest_cache,
+            manifest_listed,
             &|| self.check_context_pull(session),
         )?;
         if pulled {
@@ -3211,6 +3351,10 @@ impl ContextStore for CloudBackend {
                 .pending_keys(session)
                 .is_some_and(|pending| pending.touches(key))
         {
+            return false;
+        }
+        // Another prefix's manifest isn't this session's (koto#457).
+        if self.bound_elsewhere(session).is_some() {
             return false;
         }
         // Fall back to checking remote manifest.
@@ -3283,6 +3427,11 @@ impl ContextStore for CloudBackend {
         self.check_not_migrated(session)?;
         let mut keys = self.local.list_keys(session, prefix)?;
         let pending = self.pending_keys(session).unwrap_or_default();
+        // Another prefix's manifest isn't this session's (koto#457).
+        if self.bound_elsewhere(session).is_some() {
+            keys.sort();
+            return Ok(keys);
+        }
         // Merge in remote-only keys, leaving out those an open batch
         // removed here.
         self.prime_manifest(session);
@@ -4802,6 +4951,16 @@ fn header_anchor(state: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The first line of the file at `path`, without reading the rest: a state
+/// log can run to megabytes and only its header is wanted.
+fn first_line(path: &Path) -> Option<String> {
+    use std::io::BufRead as _;
+    let file = std::fs::File::open(path).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(file).read_line(&mut line).ok()?;
+    Some(line)
+}
+
 /// The `session_id` in a state file's header line (its first non-empty
 /// line), or `None` when the header doesn't parse or has none.
 ///
@@ -5103,7 +5262,18 @@ pub(crate) mod test_support {
             parent_workflow: None,
             template_source_dir: None,
             template_source_file: None,
-            origin: None,
+            // Created under the test backend's own prefix, as `koto init`
+            // under `cloud_backend_at` would record it, so its reads sync
+            // whatever its anchor names (koto#457).
+            origin: Some(crate::engine::types::SessionOrigin {
+                anchor: base_dir.to_path_buf(),
+                store: crate::engine::types::SessionStoreIdentity {
+                    kind: "cloud".to_string(),
+                    base: base_dir.to_path_buf(),
+                    bucket: None,
+                    prefix: Some(PREFIX.to_string()),
+                },
+            }),
             execution_dir,
             session_id: String::new(),
             intent: None,
@@ -5646,7 +5816,8 @@ mod tests {
         fs::create_dir_all(tmp.path().join("sess")).unwrap();
 
         backend.add("sess", "scope.md", b"local").unwrap();
-        // pull attempt fails silently, local data is unaffected.
+        // An unreachable bucket listed no manifest: the pull leaves the
+        // local copy standing, and local data is unaffected.
         let pulled = sync::pull_context_if_newer(
             &backend.local,
             &backend.bucket,
@@ -5654,6 +5825,7 @@ mod tests {
             "sess",
             "scope.md",
             &backend.manifest_cache,
+            false,
             &|| Ok(()),
         )
         .unwrap();
@@ -6518,7 +6690,9 @@ mod tests {
             "template_hash": "a".repeat(64),
             "created_at": "2026-01-01T00:00:00Z",
             "session_id": sid,
-            "origin": {"anchor": "/srv/ws-b", "store": {"kind": "cloud", "base": "/x"}},
+            // Created under the test backend's own prefix, so the pull
+            // tests reach the pull's own checks (koto#457).
+            "origin": {"anchor": "/srv/ws-b", "store": {"kind": "cloud", "base": "/x", "prefix": test_support::PREFIX}},
         });
         let mut lines = vec![header.to_string(), event_json(1).to_string()];
         if let Some((ws, from, from_sid)) = imported {
