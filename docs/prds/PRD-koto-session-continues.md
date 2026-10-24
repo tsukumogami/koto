@@ -64,12 +64,13 @@ anything alive and deletes it from the bucket for every host.
 - **Later members** of a session are its successors, their successors, and so
   on. **Earlier members** are its predecessor, that one's predecessor, and so
   on.
-- **Standing.** Whether today's rules keep a session, the relation aside. A
-  session has standing while it is alive (running, its log unreadable, or an
-  open anchor), while its hierarchy's verdict keeps it (as
-  `koto session hierarchy` reports it today: a live member, `retention.keep`
-  not yet passed since the hierarchy's release instant, or a member or record
-  that can't be read), or while it holds a pin, readable or not.
+- **Standing.** What a session's own state says about keeping it, judged
+  from that session alone. A session has standing while it holds a pin
+  (readable or not), while it is alive (running, or its log can't be read),
+  or while `retention.keep` has not yet passed since its own stop instant
+  (the instant it reached a terminal state or was cancelled). Standing never
+  reads the session's hierarchy, so every host that can read the session
+  judges it the same.
 - **Kept by the relation.** A session is kept by the relation while at least
   one later member has standing. Each later member with standing is a
   **keeper**, and the members between the kept session and a keeper are its
@@ -82,9 +83,11 @@ the relation keeps carries `kept_by_relation: true` and `relation_keepers`, a
 list with one object per keeper, ordered by the keeper's name:
 
 - `keeper`: the keeper's name.
-- `standing`: `alive`, `hierarchy` or `pin`.
-- `retention_passes_at`: for `hierarchy` standing whose retention is
-  counting down, the RFC 3339 instant it passes; absent otherwise.
+- `standing`: `pin` when the keeper holds a pin, else `alive` when it is
+  alive, else `retention`. One value per keeper, in that order of precedence.
+- `retention_passes_at`: for `retention` standing, the RFC 3339 instant the
+  keeper's retention passes (its stop instant plus `retention.keep`); absent
+  otherwise.
 - `pin`: for `pin` standing, the keeper's pin as the existing `pin` field
   shows it (`reason`, `set_by`, `set_at`, `source`); absent otherwise.
 - `path`: the names from the kept session's successor to the member just
@@ -196,10 +199,10 @@ entry where it would be empty or false.
   hierarchy's members, keepers and release instant are the same with and
   without the relation.
 - **R8. Release follows the later members.** Once no later member has
-  standing, the relation keeps nothing, so each earlier member goes when its
-  own standing ends. A predecessor whose own retention passed long ago is
-  removed by the first removal of R9 that judges it after the last of its
-  later members loses standing, and by none before.
+  standing, the relation keeps nothing, and each earlier member is kept or
+  released by today's rules alone. A predecessor that today's rules would
+  release is removed by the first removal of R9 that judges it after the last
+  of its later members loses standing, and by none before.
 - **R9. Every removal by rule counts it.** These keep a session the relation
   keeps, with standing judged at the moment of each removal's own judgment
   (including the re-judgment `--apply` makes before it deletes): the terminal
@@ -267,8 +270,9 @@ entry where it would be empty or false.
   stderr, and exits as it would without them. A target that is absent,
   replaced, unverified or unknown keeps the marker, as today.
 - **R16. The source's pin.** A pin the source held travels to the copy as
-  today, and the source's own pin keeps nothing; what keeps the source is the
-  relation.
+  today. The source's own pin keeps nothing for any removal (every removal of
+  R9, `koto session cleanup` and `koto cancel --cleanup`), as today; what
+  keeps the source is the relation.
 
 ### Cloud backend
 
@@ -277,7 +281,7 @@ entry where it would be empty or false.
   the bucket the relations naming that session, including R6's markers, and
   judges each later member's standing from the bucket where this host holds no
   local copy of it: alive from its state log (not terminal, or its log
-  unreadable), hierarchy retention from the stop instant its log records plus
+  unreadable), retention from the stop instant its log records plus
   `retention.keep`, and its pin from its pin object. A later member under
   another workspace's prefix in the same bucket counts. A second host that
   never pulled the later members keeps the same sessions and names the same
@@ -366,7 +370,7 @@ S4, `koto workspace prune --yes`.
   fresh `--apply --all` removes all three.
 - [ ] **Release.** With `KOTO_RETENTION_KEEP=20s`, v3 then finishes. Within
   20 seconds of v3's stop, S2 keeps all three, and v1's and v2's entries name
-  v3 with `standing: hierarchy` and `retention_passes_at` equal to v3's stop
+  v3 with `standing: retention` and `retention_passes_at` equal to v3's stop
   plus 20 seconds. After that instant, the next `koto session prune --apply
   --all` removes v1, v2 and v3.
 - [ ] **Direction, forward.** v3 is pinned after it finishes, and the
@@ -500,7 +504,7 @@ S4, `koto workspace prune --yes`.
   runs `koto session prune --apply --all` in W1: v1 is kept with the same
   `relation_keepers` host A reports. With v3 pinned and finished, host B names
   `standing: pin`; with v3 finished inside its retention, host B names
-  `standing: hierarchy` and the same `retention_passes_at` as host A.
+  `standing: retention` and the same `retention_passes_at` as host A.
 - [ ] **Bounded cost.** The stand-in counts requests. A prune over 100 and
   over 10,000 finished sessions with no relation, nothing about to be deleted,
   makes no request for relations. A prune deleting 50 sessions that nothing
@@ -575,11 +579,15 @@ S4, `koto workspace prune --yes`.
   that member. Keeping the relation out of the hierarchy and checking it per
   member, like a pin, is the only reading that passes both direction
   criteria.
-- **A keeper's standing includes its own hierarchy.** A successor kept by a
-  live member of its own hierarchy keeps its predecessors too. Counting only
-  the successor's own state would let a chain go while its newest member is
-  still kept, which "no sooner than that member's own retention allows" rules
-  out.
+- **A keeper's standing is its own state, not its hierarchy's.** A keeper
+  counts while it is pinned, alive, or within `retention.keep` of its own
+  stop, which is what "no sooner than that member's own retention allows"
+  asks. Counting the keeper's whole hierarchy (say, a live anchor that held
+  it) would keep chains longer, but a host holding only the bucket can't
+  judge another workspace's hierarchy, so two hosts would name different
+  keepers. Judging the keeper alone gives every host the same answer from
+  the keeper's log and pin object. A successor that should outlive its own
+  retention is pinned.
 - **One predecessor per session.** A session continues one session. Several
   would make a keeper's path ambiguous and add nothing a story here needs; a
   predecessor may still have many successors.
