@@ -19,7 +19,8 @@ decision: |
   session's pin object in the bucket. `koto session pin` and `unpin` write
   strictly to the bucket. Release authority is `release-pin`, handed in
   `KOTO_AUTHORITY`, recorded in the anchor by the start hook through
-  `koto session anchor open --authority`, and read from the caller's anchor.
+  `koto session anchor open --record-authority`, and read from the caller's
+  anchor.
 rationale: |
   A peerless key is the only layout that both avoids joining hierarchies and
   makes v0.23 builds keep a pinned session; a per-session overlay on the
@@ -133,8 +134,10 @@ session's own anchor, and `koto context add`/`remove` refusing every new key
   copies under cloud (R21), and a failed bucket read keeps (R23).
 - **Bucket truth by object.** A host 2 push must not be able to hide a pin
   (R22), and a pin that didn't reach the bucket must fail loudly (R20).
-- **Authority can't be self-granted mid-session.** It's read from what a
-  start recorded, never from the caller's environment at unpin (R8).
+- **Exporting the variable grants nothing.** Authority is read from what a
+  start recorded, never from the caller's environment at unpin (R8). Re-running
+  the start's own command by hand can still record authority; that is within
+  the owner's "format over enforcement" ruling, and it leaves a trace.
 - **Unpinned output unchanged.** Every existing surface prints the same bytes
   for a session with no pin (R13), so new fields appear only on pinned
   entries.
@@ -350,27 +353,41 @@ Key assumptions:
   by session retention's one-writer rule, as the start events and the
   observed marker already are.
 
-#### Chosen: `koto session anchor open --authority`, recorded in the anchor
+#### Chosen: `koto session anchor open --record-authority`, recorded in the anchor
 
-The hook reads `KOTO_AUTHORITY` and passes it as
-`--authority=<value>` to `koto session anchor open`, which validates it
-(comma-separated, each name trimmed, lowercase, at most 16 names of at most
-64 characters) and writes `koto/anchor/authority` in the anchor it opens or
-reuses: `{"v":1,"names":[...],"unknown":[...],"at":"<rfc3339>",
+The hook passes `--record-authority` to `koto session anchor open` and leaves
+`KOTO_AUTHORITY` in that one command's environment, so the value never
+appears in a process listing. With the flag, `open` reads `KOTO_AUTHORITY`
+from its own environment, validates it (comma-separated, each name trimmed,
+lowercase, at most 16 names of at most 64 characters) and writes
+`koto/anchor/authority` in the anchor it opens or reuses:
+`{"v":1,"names":[...],"unknown":[...],"at":"<rfc3339>",
 "source":"<start source>"}`, replacing what an earlier start recorded (R8).
-With no `--authority`, it writes an empty list, so a start handed nothing
-clears what an earlier start was handed. A successor anchor gets only its
-own start's list. The hook adds `unset KOTO_AUTHORITY` to its block, so the
-session's shells, and any worker or `claude -p` child launched from them,
-carry none.
+With the flag and no variable it writes an empty list, so a start handed
+nothing clears what an earlier start was handed. Without the flag `open`
+leaves the record alone, so the hook is the only caller that changes it in
+normal use. A successor anchor gets only its own start's list. The hook adds
+`unset KOTO_AUTHORITY` to its block, so the session's shells, and any worker
+or `claude -p` child launched from them, carry none.
 
 `koto session unpin` resolves the caller: no `KOTO_ANCHOR` (or an empty one)
-is by hand; otherwise it reads `koto/anchor/authority` from the named
-anchor, open or closed, and allows the release only when `names` holds
-`release-pin`. A missing or unreadable anchor, or a missing key, is a refusal
-that says the anchor's authority couldn't be read (R7). The process's own
-`KOTO_AUTHORITY` is never read by `unpin`. `koto session hierarchy` shows an
-anchor's `names` and `unknown` (R16).
+is by hand; otherwise the name must pass the session-name check and resolve
+to an anchor-kind session, and `unpin` reads `koto/anchor/authority` from it,
+open or closed, and allows the release only when `names` holds
+`release-pin`. A missing, unreadable or non-anchor session, or a missing key,
+is a refusal that says the anchor's authority couldn't be read (R7). The
+process's own `KOTO_AUTHORITY` is never read by `unpin`. The release record
+copies the authority record's `at` and `source`, so a reader sees how the
+authority arrived. `koto session hierarchy` shows an anchor's `names` and
+`unknown` (R16). Import never carries `koto/anchor/authority`, as it already
+drops an anchor's observed marker.
+
+What this does and doesn't stop: exporting the variable mid-session grants
+nothing, and a child launched from the session's shells inherits nothing. An
+agent that runs `koto session anchor open --record-authority` itself with the
+variable set, or names another anchor in `KOTO_ANCHOR`, or unsets
+`KOTO_ANCHOR` to act by hand, can still release. Each leaves a release record
+with its source, and none is stronger than what the owner's ruling asks for.
 
 #### Alternatives Considered
 
@@ -416,8 +433,8 @@ removal guard. The engine (`src/session/hierarchy/`) reads pins into
 guard before its delete and renders the result through `render.rs`. Two new
 CLI verbs, `koto session pin` and `koto session unpin`, and a flag,
 `koto session list --pinned`, sit in `src/cli/session.rs`. The start hook
-passes `KOTO_AUTHORITY` to `koto session anchor open --authority` and unsets
-it in the session's shells.
+runs `koto session anchor open --record-authority` with `KOTO_AUTHORITY` in
+that command's environment, and unsets the variable in the session's shells.
 
 ### Components
 
@@ -465,13 +482,16 @@ it in the session's shells.
   shape with codes `pinned`, `pin_unreadable`, `invalid_reason`,
   `not_pinnable`, `no_session`, `authority_required`, `bucket_unchecked`,
   `pin_not_pushed`.
-- **`src/cli/session_anchor.rs` / `src/session/anchor.rs`**: `--authority` on
-  `open`, writing `koto/anchor/authority`.
+- **`src/cli/session_anchor.rs` / `src/session/anchor.rs`**:
+  `--record-authority` on `open`, reading `KOTO_AUTHORITY` from the command's
+  environment and writing `koto/anchor/authority`.
 - **`src/session/import_links.rs`**: carries `koto/links/pin` and
-  `koto/pin-release` verbatim.
-- **`plugins/koto-skills/hooks/session-start.sh`**: passes
-  `--authority="$KOTO_AUTHORITY"` when set and writes `unset KOTO_AUTHORITY`
-  in its block.
+  `koto/pin-release` verbatim, and drops `koto/anchor/authority` beside the
+  observed marker it already drops.
+- **`plugins/koto-skills/hooks/session-start.sh`**: adds
+  `--record-authority` to its `koto session anchor open` call, keeping
+  `KOTO_AUTHORITY` in that call's environment, and writes
+  `unset KOTO_AUTHORITY` in its block.
 
 ### Key Interfaces
 
@@ -491,7 +511,7 @@ koto session list --pinned [--json]
   [{"name", "state": "running"|"finished", "pin": {...} | "pin_unreadable": "<problem>",
     "source": "local"|"bucket"}]
 
-koto session anchor open ... --authority=<comma list>
+koto session anchor open ... --record-authority      (reads KOTO_AUTHORITY)
 ```
 
 On every kept entry for a pinned session (terminal tick `retention`,
@@ -531,9 +551,10 @@ an anchor, reads `koto/anchor/authority` from that anchor; on refusal exits 2
 with nothing written; on success writes `koto/pin-release` strictly, then
 removes `koto/links/pin` strictly.
 
-Authority at start: the hook reads `KOTO_AUTHORITY`, passes
-`--authority`, `koto session anchor open` writes `koto/anchor/authority` in
-the anchor, and the hook's env block unsets the variable.
+Authority at start: the hook runs `koto session anchor open
+--record-authority` with `KOTO_AUTHORITY` in its environment, `open` writes
+`koto/anchor/authority` in the anchor, and the hook's env block unsets the
+variable.
 
 ## Implementation Approach
 
@@ -563,9 +584,10 @@ Deliverables:
 
 ### Phase 3: release authority
 
-`koto session anchor open --authority`, `koto/anchor/authority`, the hook's
-`--authority` and `unset KOTO_AUTHORITY`, the caller resolution and authority
-check in `unpin`, and the hierarchy query's authority blocks.
+`koto session anchor open --record-authority`, `koto/anchor/authority`, the
+hook's `--record-authority` and `unset KOTO_AUTHORITY`, the caller resolution
+and authority check in `unpin`, import dropping the authority record, and the
+hierarchy query's authority blocks.
 
 Deliverables:
 - `src/session/anchor.rs`, `src/cli/session_anchor.rs`, `pin.rs`,
@@ -597,7 +619,89 @@ Deliverables:
 
 ## Security Considerations
 
-To be written after the security review.
+A pin keeps data; it removes nothing and grants nothing, so the main risks
+are a pin that is wrongly absent, a pin that can't be released, and stored
+text that reaches an operator's terminal. The owner's ruling that this
+feature records and tracks, and doesn't enforce beyond today's level, sets
+the threat model. A process running as the same user can already edit
+anything under `~/.koto` directly, and the design doesn't try to stop that.
+It aims to stop accidents, cross-host gaps, and an agent that misreads its
+own authority.
+
+**Stored text from outside the session.** The reason is checked when
+`koto session pin` runs (500 scalars, no Unicode Cc characters), but pin,
+release and authority records also arrive from the bucket, from other koto
+builds and from imported sessions, none of which pass through that check.
+The reader applies the 4 KiB cap and strict parsing to every such record
+wherever it came from, and treats an unknown record version as an
+unreadable pin, which keeps the session. Every text renderer escapes control
+characters, bidirectional overrides, zero-width characters and line and
+paragraph separators in the reason, `set_by`, `released_by` and authority
+names before printing, through the engine's existing sanitizer; JSON output
+keeps the escaped form. Command output therefore can't carry terminal escape
+sequences from a stored record.
+
+**The bucket as untrusted input.** The removal guard finds a pin by listing
+the exact object key `ctx/koto/links/pin` and reads it with a hard limit of
+4 KiB plus one byte, so a forged oversized object can't exhaust memory. Keys
+that only share the prefix (`pin-old`) don't count, while a `pin/...` entry
+reads as `not_a_file` and keeps the session. A listing error, a truncated
+listing or an unparseable response keeps the session and reports
+`bucket_unchecked`; an unparseable object keeps it and reports
+`pin_unreadable`. Someone with write access to the bucket can add a pin to
+any session or delete a real one. That party can already delete or
+overwrite the sessions themselves, so the pin adds no new power, but a forged
+pin can make a session unremovable, which is why `koto session unpin` works
+on a session that exists only in the bucket.
+
+**Release authority.** `koto session unpin` reads authority only from the
+record a session start wrote into the caller's anchor, never from the
+`KOTO_AUTHORITY` in its own environment, so exporting the variable
+mid-session grants nothing. The name in `KOTO_ANCHOR` is validated as a
+session name and must resolve to an anchor-kind session before its record is
+read, so the variable can't point the check at another path or at an
+ordinary session. Import carries pin and release records but never an
+authority record. The value reaches `koto session anchor open` through that
+command's environment, not its arguments, so it doesn't appear in process
+listings, and the hook never writes it to the session's env file. The release
+record stores the authority record's `at` and `source`. Four bypasses remain
+by design, and the guides name them: unsetting `KOTO_ANCHOR` and releasing by
+hand, naming another anchor in `KOTO_ANCHOR` (the hierarchy output shows
+which anchors hold `release-pin`), running `koto session anchor open
+--record-authority` by hand with the variable set, and editing files under
+`~/.koto`. Each release writes a release record, so the trail shows that one
+happened, though not always who really did it. The authority is a convention
+that the start hook carries, not a security boundary. The hook unsets
+`KOTO_AUTHORITY` for the session's shells; processes the harness starts by
+other routes may still inherit it.
+
+**Resource use.** A pin is at most 4 KiB, with one replaced release record per
+session, so storage grows with the number of pinned sessions and no faster.
+Pinning needs no authority, so any agent can pin sessions and keep them from
+cleanup. `koto session list --pinned` makes that visible, and the retention
+guide tells operators to review it. Under the cloud backend each removal and
+each preview costs one listing per session it would delete, plus one read
+when a pin exists, and the cost test with 200 pins bounds the local side.
+
+**Races.** Pin, unpin and the removal guard share the per-session lock on one
+host. Between hosts a window remains between the guard's bucket listing and
+the delete, and a pin written inside it is lost with the session. The guard
+runs immediately before the first delete to keep that window to one request.
+An unpin interrupted after the release record and before the pin removal
+leaves the pin in force.
+
+**Data exposure.** Under the cloud backend the reason, the anchor name that
+set the pin, the timestamps and, on release, the release record (including
+the earlier pin's reason) are uploaded to the user's own bucket and stay
+there after unpin. The guides tell users not to put secrets or customer
+details in a reason. Authority names are labels, not credentials.
+
+**Fetching the v0.23.0 binary in a test.** The compatibility test downloads a
+released binary and runs it. It verifies a SHA-256 digest checked into the
+repository before executing, downloads over HTTPS into its own empty
+directory, runs the binary with a scrubbed environment and an isolated
+sessions directory, and fails when the digest doesn't match. It runs only
+when its CI job enables it, so ordinary test runs make no network fetch.
 
 ## Consequences
 
