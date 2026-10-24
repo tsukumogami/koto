@@ -858,6 +858,59 @@ fn a_prune_asks_the_bucket_once_per_session_it_would_delete() {
     assert_eq!(release_reads, 0);
 }
 
+#[test]
+fn cleanup_removes_a_pinned_migrated_source_while_the_moved_copy_stays_pinned() {
+    let h = Hosts::new();
+    let dest = h.root.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    h.init(1, "P", &[]);
+    h.done(1, "P");
+    h.pin(1, "P");
+    let pin = h.s3.object(&h.key("P", PIN)).unwrap();
+    let in_dest = |args: &[&str]| {
+        let out = h.cmd_at(2, true, &dest).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    in_dest(&["template", "compile", h.template.to_str().unwrap()]);
+    in_dest(&["session", "import", "P", "--from", h.work.to_str().unwrap()]);
+    let moved = format!("{}/P/{}", prefix_of(&dest), PIN);
+    assert_eq!(h.s3.object(&moved).as_ref(), Some(&pin));
+
+    // In the old workspace the source still holds its pin, locally and in
+    // the bucket, and the pin keeps nothing: cleanup removes the source,
+    // everything but its migration marker, and unpin refuses it.
+    assert!(h.sessions(1).join("P").join(PIN).is_file());
+    let out = h.fails(1, &["session", "unpin", "P"], 2);
+    assert_eq!(out["error"]["code"], "not_pinnable", "{out}");
+    assert!(
+        out["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("koto session cleanup P"),
+        "{out}"
+    );
+    h.ok(1, &["session", "cleanup", "P"]);
+    assert!(!h.sessions(1).join("P").exists());
+    assert_eq!(
+        h.objects("P").into_keys().collect::<Vec<_>>(),
+        [h.key("P", "migrated.json")]
+    );
+    // The moved copy is untouched, and its pin still keeps it.
+    assert_eq!(h.s3.object(&moved), Some(pin));
+    let out = h
+        .cmd_at(3, true, &dest)
+        .args(["session", "cleanup", "P"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_bucket_pin(&printed_json(&out.stdout)["error"]);
+}
+
 /// The bucket prefix of the workspace at `dir`.
 fn prefix_of(dir: &std::path::Path) -> String {
     let digest = Sha256::digest(dir.to_string_lossy().as_bytes());

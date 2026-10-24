@@ -430,7 +430,11 @@ fn check_session(backend: &Backend, name: &str) -> Result<(), PinError> {
     if let Err(e) = migrated {
         return Err(PinError::refusal(
             "not_pinnable",
-            format!("{e:#}; its moved copy holds what it held"),
+            format!(
+                "{e:#}; its moved copy holds its pin, and a pin here keeps nothing: \
+                 `koto session cleanup {}` in this workspace removes this copy",
+                crate::session::hierarchy::display_text(name)
+            ),
         ));
     }
     Ok(())
@@ -1070,15 +1074,15 @@ impl Guard {
 /// release record names was released on another host and no longer keeps;
 /// a local pin the bucket has never seen (set under the local backend,
 /// not yet pushed) keeps from here. A bucket that can't be checked keeps
-/// ([`Guard::BucketUnchecked`]). On the local backend it is
-/// [`local_guard`].
+/// ([`Guard::BucketUnchecked`]). A migrated source's pin keeps nothing: the
+/// moved copy holds it. On the local backend it is [`local_guard`].
 pub fn guard_removal(backend: &dyn SessionBackend, name: &str) -> Guard {
     let local = local_guard(backend, name);
     let local_id = match &local {
         Guard::Pinned { pin, .. } => Some(pin.id.clone()),
         _ => None,
     };
-    match backend.bucket_pin(name, local_id.as_deref()) {
+    let guard = match backend.bucket_pin(name, local_id.as_deref()) {
         BucketPin::NotApplicable => local,
         BucketPin::Unchecked(error) => Guard::BucketUnchecked {
             error,
@@ -1087,6 +1091,16 @@ pub fn guard_removal(backend: &dyn SessionBackend, name: &str) -> Guard {
         BucketPin::Pin(fact) => Guard::of(fact, SOURCE_BUCKET),
         BucketPin::NoPin { released: true } if local_id.is_some() => Guard::Clear,
         BucketPin::NoPin { .. } => local,
+    };
+    // A migrated source's pin is inert (R25): `koto session import` carried
+    // it to the moved copy, which keeps it there, so this copy goes like any
+    // other migrated source and unpin refuses it. Asked only when a pin
+    // would keep, and a check that can't be made keeps.
+    match guard {
+        Guard::Pinned { .. } | Guard::PinUnreadable { .. } if backend.is_migrated_source(name) => {
+            Guard::Clear
+        }
+        guard => guard,
     }
 }
 

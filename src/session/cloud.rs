@@ -3139,6 +3139,14 @@ impl SessionBackend for CloudBackend {
         self.bucket_pin_of(id, local_pin_id)
     }
 
+    fn is_migrated_source(&self, id: &str) -> bool {
+        // The write-side check lists for itself. Only its migration refusal
+        // says yes; a failed listing (which warns and lets a write go on)
+        // and the local guard's own refusal say no, so the pin keeps.
+        self.check_not_migrated_to_write(id)
+            .is_err_and(|e| e.downcast_ref::<SessionMigrated>().is_some())
+    }
+
     fn lock_state_file(&self, id: &str) -> Result<SessionLock, SessionError> {
         // `flock` is strictly a local, per-host primitive. Cloud
         // instances running on different hosts cannot observe each

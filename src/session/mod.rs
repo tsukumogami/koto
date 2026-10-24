@@ -642,6 +642,19 @@ pub trait SessionBackend: Send + Sync {
         crate::session::pin::BucketPin::NotApplicable
     }
 
+    /// # Stability: additive-only
+    ///
+    /// Whether `id` is a migrated source: `koto session import` moved it to
+    /// another workspace and left a migration marker under its prefix. Its
+    /// pin is inert, since the moved copy holds it. Asked by a fresh
+    /// listing, never an answer another process lent; a check that can't be
+    /// made answers `false`, so the pin keeps.
+    ///
+    /// The default, for a backend with no remote half, is `false`.
+    fn is_migrated_source(&self, _id: &str) -> bool {
+        false
+    }
+
     /// Acquire a non-blocking advisory `flock(LOCK_EX | LOCK_NB)` on
     /// the session's state file.
     ///
@@ -979,6 +992,13 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.bucket_pin(id, local_pin_id),
             Backend::Cloud(b) => b.bucket_pin(id, local_pin_id),
+        }
+    }
+
+    fn is_migrated_source(&self, id: &str) -> bool {
+        match self {
+            Backend::Local(b) => b.is_migrated_source(id),
+            Backend::Cloud(b) => b.is_migrated_source(id),
         }
     }
 

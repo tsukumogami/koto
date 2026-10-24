@@ -73,6 +73,11 @@ copy, or none, can pin or unpin a session another host owns without replacing
 anything. A write the bucket doesn't confirm exits 3 and leaves no pin
 anywhere; run it again.
 
+Nothing orders two hosts. A pin that host B writes after host A's removal has
+listed the session's objects, and before A deletes them, goes with the
+session: A's delete takes the whole prefix, the new pin object included. The
+window is the time between that listing and the delete.
+
 A local copy of the pin or release record is a file the sync doesn't track: no
 manifest entry, nothing pushed. A host whose local pin was released on another
 host sees the release in the bucket and treats its file as released. A session
@@ -83,8 +88,12 @@ and reports `bucket_unchecked` with `unreachable` or `unparseable`;
 
 `koto session import` carries a pin and its release record to the moved copy,
 an unreadable pin included. An anchor's recorded authority never travels. The
-migrated source's pin is inert: `koto session unpin` refuses it, and
-`koto session prune --migrated-from` removes the source with it.
+migrated source's pin is inert, since the moved copy holds it: no removal keeps
+the source for it, so `koto session cleanup` in the old workspace and
+`koto session prune --migrated-from` both remove the source, and
+`koto session unpin` refuses it. A source an older release imported may have
+lost its pin on the way; check that the moved copy is pinned before removing
+the source.
 
 ## Which releases honour pins
 

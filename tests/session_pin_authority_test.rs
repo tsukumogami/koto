@@ -256,6 +256,15 @@ fn a_start_handed_release_pin_lets_its_anchor_unpin() {
         serde_json::from_slice(&std::fs::read(env.release_file("P")).unwrap()).unwrap();
     assert_eq!(record["released_by"], "anchor-h1");
     assert_eq!(record["authority"], "release-pin");
+    // The release copies when, and from which start, the anchor was handed
+    // the authority: its authority record's `at` and `source`.
+    let granted: Value =
+        serde_json::from_slice(&std::fs::read(env.authority_file(&anchor)).unwrap()).unwrap();
+    assert_eq!(granted["source"], "startup");
+    for shown in [&released["released"], &record] {
+        assert_eq!(shown["authority_at"], granted["at"], "{shown}");
+        assert_eq!(shown["authority_source"], "startup", "{shown}");
+    }
     assert!(!env.pin_file("P").exists());
     // The check read the anchor's file directly: its log and every other
     // file are unchanged, and no read spool appeared anywhere.
@@ -269,6 +278,8 @@ fn a_start_handed_release_pin_lets_its_anchor_unpin() {
     let by_hand = env.ok(&["session", "unpin", "P"]);
     assert_eq!(by_hand["released"]["released_by"], Value::Null);
     assert_eq!(by_hand["released"]["authority"], Value::Null);
+    assert_eq!(by_hand["released"]["authority_at"], Value::Null);
+    assert_eq!(by_hand["released"]["authority_source"], Value::Null);
     assert!(!env.pin_file("P").exists());
 }
 
