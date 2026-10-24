@@ -8,6 +8,9 @@
 //! consumer that omits `EvidenceSubmitted` and falls through to an
 //! `Unknown` catch-all on the wire payload.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};

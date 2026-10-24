@@ -44,6 +44,9 @@
 //! Run it: `cargo test --test doc_names`. Point it at another tree with
 //! `KOTO_DOC_NAMES_ROOT=<path> cargo test --test doc_names`.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use clap::CommandFactory;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;

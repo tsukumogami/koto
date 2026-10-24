@@ -28,6 +28,8 @@
 
 #[path = "support/fake_s3.rs"]
 mod fake_s3;
+#[path = "support/host_session.rs"]
+mod host_session;
 #[path = "support/koto_command.rs"]
 mod koto_command;
 

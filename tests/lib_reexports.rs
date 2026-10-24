@@ -15,6 +15,9 @@
 //! resolution, MSRV, feature flags — lands in Issue 20's external
 //! crate fixture.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 

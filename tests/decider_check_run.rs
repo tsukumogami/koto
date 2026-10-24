@@ -7,6 +7,8 @@
 
 #[path = "support/decider_stub.rs"]
 mod decider_stub;
+#[path = "support/host_session.rs"]
+mod host_session;
 
 #[path = "support/decider_session.rs"]
 mod decider_session;

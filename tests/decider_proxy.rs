@@ -6,6 +6,8 @@
 
 #[path = "support/decider_stub.rs"]
 mod decider_stub;
+#[path = "support/host_session.rs"]
+mod host_session;
 
 use std::collections::HashMap;
 use std::time::Duration;

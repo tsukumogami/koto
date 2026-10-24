@@ -7,6 +7,9 @@
 //! point the clap dispatch in `src/cli/mod.rs` calls into; the only
 //! thing this skips is the clap layer's flag-name parsing.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use assert_fs::TempDir;
 
 use koto::cli::session;

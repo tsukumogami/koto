@@ -6,6 +6,9 @@
 //!
 //! docs/designs/DESIGN-koto-value-routing.md, Decisions 1, 2 and 4.
 
+#[path = "support/host_session.rs"]
+mod host_session;
+
 use std::io::Write as _;
 
 use koto::template::compile::compile;

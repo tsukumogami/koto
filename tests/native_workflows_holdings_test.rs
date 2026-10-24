@@ -6,6 +6,8 @@
 
 #[path = "support/fake_s3.rs"]
 mod fake_s3;
+#[path = "support/host_session.rs"]
+mod host_session;
 
 use fake_s3::FakeS3;
 use koto::session::cloud::CloudBackend;
