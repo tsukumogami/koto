@@ -13,10 +13,12 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use assert_cmd::Command;
 use koto::session::context::ContextStore;
 use koto::session::hierarchy::{Graph, Judge, RetentionSettings, Scope};
 use koto::session::local::LocalBackend;
@@ -204,14 +206,9 @@ fn the_engine_answers_within_its_bounds_on_a_large_store() {
     // freshly built binary can pay for the OS checking it (macOS scans a new
     // executable once), which isn't the query's cost, so one throwaway run
     // goes first.
-    Command::cargo_bin("koto")
-        .unwrap()
-        .arg("version")
-        .output()
-        .unwrap();
+    koto_command::koto().arg("version").output().unwrap();
     let started = Instant::now();
-    let out = Command::cargo_bin("koto")
-        .unwrap()
+    let out = koto_command::koto()
         .env_remove("KOTO_SESSION_BACKEND")
         .env_remove("KOTO_RETENTION_KEEP")
         .env_remove("KOTO_RETENTION_IDLE_PERIOD")

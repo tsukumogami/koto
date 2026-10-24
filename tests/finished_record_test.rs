@@ -3,9 +3,11 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use std::path::{Path, PathBuf};
 
-use assert_cmd::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -83,8 +85,7 @@ impl Env {
     }
 
     fn run_env(&self, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
-        Command::cargo_bin("koto")
-            .unwrap()
+        koto_command::koto()
             .envs(env.iter().copied())
             .current_dir(&self.work)
             .env("HOME", &self.home)

@@ -11,6 +11,9 @@
 //! `KOTO_SESSIONS_BASE` is deliberately not set. That override bypasses
 //! `migrate_if_needed`, and the migration is what creates the condition.
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +21,7 @@ use std::path::{Path, PathBuf};
 /// A `koto` command rooted at a throwaway HOME, so the real local backend
 /// and its migration run against a controlled `~/.koto/sessions/`.
 fn koto_at_home(home: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.env("HOME", home);
     cmd.env_remove("KOTO_SESSIONS_BASE");

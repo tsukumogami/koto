@@ -14,6 +14,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Stdio};
 use std::time::Duration;
@@ -62,7 +65,7 @@ fn log_path(dir: &Path) -> PathBuf {
 }
 
 fn koto(dir: &Path) -> StdCommand {
-    let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_koto"));
+    let mut cmd = koto_command::koto_std();
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
     // Keep the user's ~/.koto/config.toml (which may select the cloud
@@ -410,9 +413,18 @@ fn a_timed_out_commands_children_never_write_after_it_returns() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     setup(dir);
-    let env = CommandEnv::inherited(
+    // A cleared environment, so the writers' koto inherits no
+    // `KOTO_SESSION_*` from the shell running the tests.
+    let env = CommandEnv::cleared(
         vec![
-            ("KOTO".to_string(), env!("CARGO_BIN_EXE_koto").to_string()),
+            (
+                "PATH".to_string(),
+                std::env::var("PATH").unwrap_or_default(),
+            ),
+            (
+                "KOTO".to_string(),
+                koto_command::koto_bin().to_string_lossy().into_owned(),
+            ),
             (
                 "KOTO_SESSIONS_BASE".to_string(),
                 sessions_base(dir).to_string_lossy().into_owned(),

@@ -6,6 +6,9 @@
 //! back. The atomicity test makes the store unwritable across the transition
 //! and checks that the next read still sees the value.
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use assert_fs::TempDir;
 use std::path::{Path, PathBuf};
@@ -17,7 +20,7 @@ fn sessions_base(dir: &Path) -> PathBuf {
 }
 
 fn koto_cmd(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));

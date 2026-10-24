@@ -1214,6 +1214,7 @@ mod tests {
         // Run in a temp dir and override HOME to avoid picking up real user/project config.
         let tmp = TempDir::new().unwrap();
         let _lock = process_env_lock();
+        let _session_env = NoSessionEnv::new();
         let _guard = SetCwd::new(tmp.path());
         let _home_guard = SetEnv::new("HOME", tmp.path().to_str().unwrap());
 
@@ -1433,6 +1434,7 @@ mod tests {
     fn test_env_var_override() {
         let tmp = TempDir::new().unwrap();
         let _lock = process_env_lock();
+        let _session_env = NoSessionEnv::new();
         let _guard = SetCwd::new(tmp.path());
         let _home_guard = SetEnv::new("HOME", tmp.path().to_str().unwrap());
 
@@ -1459,6 +1461,7 @@ mod tests {
     fn test_project_config_overrides_user() {
         let tmp = TempDir::new().unwrap();
         let _lock = process_env_lock();
+        let _session_env = NoSessionEnv::new();
         let _guard = SetCwd::new(tmp.path());
         let _home_guard = SetEnv::new("HOME", tmp.path().to_str().unwrap());
         env::remove_var("AWS_ACCESS_KEY_ID");
@@ -1482,6 +1485,7 @@ mod tests {
     fn secrets_from_every_config_layer_are_redaction_keys() {
         let tmp = TempDir::new().unwrap();
         let _lock = process_env_lock();
+        let _session_env = NoSessionEnv::new();
         let _guard = SetCwd::new(tmp.path());
         // The user layer gets its own HOME, apart from the project directory.
         let user_home = tmp.path().join("user-home");
@@ -2193,6 +2197,33 @@ mod tests {
             match &self.prev {
                 Some(val) => env::set_var(&self.key, val),
                 None => env::remove_var(&self.key),
+            }
+        }
+    }
+
+    /// RAII guard that removes every `KOTO_SESSION_*` variable and restores
+    /// them on drop, so a shell with a session backend configured isn't a
+    /// layer of the config a test loads. Taken under `process_env_lock`.
+    struct NoSessionEnv {
+        prev: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    }
+
+    impl NoSessionEnv {
+        fn new() -> Self {
+            let prev: Vec<_> = env::vars_os()
+                .filter(|(k, _)| k.to_string_lossy().starts_with("KOTO_SESSION_"))
+                .collect();
+            for (k, _) in &prev {
+                env::remove_var(k);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for NoSessionEnv {
+        fn drop(&mut self) {
+            for (k, v) in &self.prev {
+                env::set_var(k, v);
             }
         }
     }

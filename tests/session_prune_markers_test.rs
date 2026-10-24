@@ -8,6 +8,8 @@
 
 #[path = "support/fake_s3.rs"]
 mod fake_s3;
+#[path = "support/koto_command.rs"]
+mod koto_command;
 #[path = "support/migration_carrier.rs"]
 mod migration_carrier;
 

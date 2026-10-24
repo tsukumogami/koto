@@ -9,6 +9,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
@@ -24,7 +27,7 @@ fn sessions_base(dir: &Path) -> PathBuf {
 }
 
 fn koto_cmd(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
@@ -32,7 +35,7 @@ fn koto_cmd(dir: &Path) -> Command {
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.env_remove("KOTO_WORKFLOWS_DIR");
     // The `default_action` shells out to this build's `koto`.
-    let bin = PathBuf::from(env!("CARGO_BIN_EXE_koto"));
+    let bin = koto_command::koto_bin();
     cmd.env(
         "PATH",
         format!(

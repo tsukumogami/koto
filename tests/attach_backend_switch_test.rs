@@ -12,8 +12,9 @@
 
 #[path = "support/fake_s3.rs"]
 mod fake_s3;
+#[path = "support/koto_command.rs"]
+mod koto_command;
 
-use assert_cmd::Command;
 use fake_s3::FakeS3;
 use std::path::{Path, PathBuf};
 
@@ -104,7 +105,7 @@ impl Host {
     }
 
     fn koto_in(&self, cwd: &Path, args: &[&str], env: &[(&str, String)]) -> Out {
-        let mut cmd = Command::cargo_bin("koto").unwrap();
+        let mut cmd = koto_command::koto();
         for k in CLEARED {
             cmd.env_remove(k);
         }

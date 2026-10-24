@@ -8,6 +8,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
@@ -23,7 +26,7 @@ fn sessions_base(dir: &Path) -> PathBuf {
 }
 
 fn koto_cmd(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("koto").unwrap();
+    let mut cmd = koto_command::koto();
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.current_dir(dir);
     cmd.env("KOTO_SESSIONS_BASE", sessions_base(dir));
@@ -455,7 +458,7 @@ fn a_hold_starts_no_run_past_the_deadline() {
 fn a_signal_ends_the_hold() {
     let poll = "          interval_secs: 1\n          timeout_secs: 600\n          hold_secs: 60\n";
     let (_tmp, dir) = setup(&[75; 100], poll);
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_koto"))
+    let mut child = koto_command::koto_std()
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .args(["next", "wf", "--no-cleanup"])
         .current_dir(&dir)

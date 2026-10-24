@@ -7,6 +7,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use assert_cmd::Command;
 use assert_fs::TempDir;
 use std::path::{Path, PathBuf};
@@ -43,7 +46,7 @@ impl Env {
     /// A `koto` invocation with nothing inherited from the test process:
     /// `PATH`, `HOME` and the session store are set here, plus `extra`.
     fn koto(&self, extra: &[(&str, &str)]) -> Command {
-        let mut cmd = Command::cargo_bin("koto").unwrap();
+        let mut cmd = koto_command::koto();
         cmd.env_remove("CLAUDE_CODE_SESSION_ID");
         cmd.env_clear();
         cmd.current_dir(&self.cwd);

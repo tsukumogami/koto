@@ -25,6 +25,8 @@
 
 #[path = "support/decider_stub.rs"]
 mod decider_stub;
+#[path = "support/koto_command.rs"]
+mod koto_command;
 
 use assert_cmd::Command;
 use decider_stub::{DeciderStub, Reply};
@@ -143,7 +145,7 @@ impl Env {
     /// variables that would redirect the store, the config, the workflows
     /// directory, the decider or the driver.
     fn std_cmd(&self, cwd: &Path) -> std::process::Command {
-        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("koto"));
+        let mut cmd = koto_command::koto_std();
         cmd.current_dir(cwd)
             .env("HOME", &self.home)
             .env("XDG_CACHE_HOME", self.tmp.path().join("cache"));

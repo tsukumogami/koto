@@ -10,11 +10,13 @@
 
 #![cfg(unix)]
 
+#[path = "support/koto_command.rs"]
+mod koto_command;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use assert_cmd::Command;
 use assert_fs::TempDir;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -90,7 +92,7 @@ impl Ws {
     }
 
     fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Out {
-        let mut cmd = Command::cargo_bin("koto").unwrap();
+        let mut cmd = koto_command::koto();
         for var in [
             "CLAUDE_CODE_SESSION_ID",
             "KOTO_SESSION_BACKEND",
