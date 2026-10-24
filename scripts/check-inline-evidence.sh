@@ -25,11 +25,10 @@
 # the Cursor rule), outside evals/, whose fixtures are data. docs/ and the
 # README are not; no skill loads them.
 #
-# One kind of line is let through on purpose: `"invocation": "koto ..."`, a
-# response example quoting the retry command koto itself prints in
-# `reserved_actions` (src/cli/retry.rs). The skill text around it tells the
-# agent to submit that payload from a file (koto#405). `koto request` lines
-# get no exemption: its verbs read `@<file>` like `koto next` (koto#404).
+# No kind of line is let through. A `reserved_actions` example shows the
+# retry's `evidence` object, which the agent submits from a file, not the
+# `invocation` string with its inline JSON (koto#405). `koto request` lines
+# are checked too: its verbs read `@<file>` like `koto next` (koto#404).
 #
 # Not seen, and left to review: a command split over lines with `\` where
 # `koto` and `--with-data` land on different lines, and inline JSON handed to
@@ -90,7 +89,6 @@ fi
 if ! SITES=$(printf '%s\n' "$LIST" | tr '\n' '\0' | xargs -0 awk -v q="'" '
   BEGIN { inline = "--with-data([ \t]+|=)[" q "\"$]" }
   /(^|[^A-Za-z0-9_-])koto[ \t]/ && $0 ~ inline {
-    if ($0 ~ /"invocation":[ \t]*"koto[ \t]/) next
     line = $0
     sub(/^[ \t]+/, "", line)
     printf "%s:%d: %s\n", FILENAME, FNR, line

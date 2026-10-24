@@ -98,6 +98,8 @@ refused request-create "$S/references/r.md" \
   "koto request create --with-data '{\"legs\":[]}' --requested-by a --coordinator-of-record a"
 refused next-beside-request "$S/SKILL.md" \
   "koto request get <id>; koto next s --with-data '{\"k\": \"v\"}'"
+refused reserved-action-invocation "$S/references/r.md" \
+  "      \"invocation\": \"koto next 'coord' --with-data '{\\\"retry_failed\\\":{}}'\""
 
 allowed file-form "$S/SKILL.md" \
   'koto next <name> --with-data @"$EV/evidence.json"'
@@ -109,8 +111,6 @@ allowed json-written-to-file "$S/SKILL.md" \
   "printf '%s\\n' '{\"field_name\": \"value\"}' > \"\$EV/evidence.json\""
 allowed request-file-form "$S/SKILL.md" \
   'koto request resolve <request-id> <leg> --with-data @<file>'
-allowed reserved-action-invocation "$S/references/r.md" \
-  "      \"invocation\": \"koto next 'coord' --with-data '{\\\"retry_failed\\\":{}}'\""
 allowed not-koto "$S/SKILL.md" \
   "some-tool --with-data '{\"k\": \"v\"}'"
 allowed evals-fixture "$S/evals/fixtures/f.md" \

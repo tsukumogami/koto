@@ -30,6 +30,14 @@ to `0.9.x`).
 
 ### Added
 
+- **A `reserved_actions` retry carries its evidence as a field (koto#405).**
+  Each entry has `evidence`, the `{"retry_failed": {...}}` object its
+  `invocation` submits. An agent writes it to a file and submits it with
+  `koto next <parent> --with-data @<file>`, with no shell string to take
+  apart; that matters behind a token-stripping prefix, where a quoted
+  argument is refused. `invocation` is unchanged. koto-skills' batch
+  references now point at `evidence`, and `scripts/check-inline-evidence.sh`
+  no longer lets an inline `"invocation":` line through.
 - **Each agent session with the koto-skills plugin opens its own anchor.**
   The plugin's start hook runs `koto session anchor open` for
   `anchor-<session id>`, linked to the anchor it inherited, and exports

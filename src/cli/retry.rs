@@ -743,6 +743,12 @@ pub struct ReservedAction {
     pub label: String,
     pub description: String,
     pub applies_to: Vec<String>,
+    /// The evidence object the action submits, `{"retry_failed": {...}}`.
+    /// An agent writes it to a file and passes `--with-data @<file>`,
+    /// with no shell string to take apart (Issue #405).
+    pub evidence: serde_json::Value,
+    /// The same submission as a ready-to-run command, with `evidence`
+    /// inline as single-quoted JSON.
     pub invocation: String,
 }
 
@@ -753,7 +759,8 @@ pub struct ReservedAction {
 ///
 /// Round-3 polish: the `invocation` string uses POSIX-safe single-quote
 /// wrapping so agent shells (including non-bash shells like fish) can
-/// paste-and-run without quoting surprises.
+/// paste-and-run without quoting surprises. It is built from `evidence`,
+/// so the two always submit the same JSON.
 pub fn synthesize_reserved_actions(
     parent_name: &str,
     retryable_children: &[String],
@@ -761,14 +768,14 @@ pub fn synthesize_reserved_actions(
     if retryable_children.is_empty() {
         return Vec::new();
     }
-    let payload = serde_json::json!({
+    let evidence = serde_json::json!({
         "retry_failed": {
             "children": retryable_children,
         }
     });
     // Serialize compactly. Single-quote wrap the whole JSON string so
     // shell interpolation is disabled; escape any embedded `'`.
-    let payload_str = serde_json::to_string(&payload).unwrap_or_default();
+    let payload_str = serde_json::to_string(&evidence).unwrap_or_default();
     let quoted_payload = shell_single_quote(&payload_str);
     let quoted_parent = shell_single_quote(parent_name);
     let invocation = format!("koto next {} --with-data {}", quoted_parent, quoted_payload);
@@ -778,6 +785,7 @@ pub fn synthesize_reserved_actions(
         description: "Re-run children whose outcome is failure, skipped, or spawn_failed."
             .to_string(),
         applies_to: retryable_children.to_vec(),
+        evidence,
         invocation,
     }]
 }
@@ -936,6 +944,38 @@ mod tests {
         // It must contain both child names.
         assert!(entry.invocation.contains("\"A\""));
         assert!(entry.invocation.contains("\"B\""));
+    }
+
+    #[test]
+    fn synthesize_carries_the_evidence_the_invocation_submits() {
+        let out = synthesize_reserved_actions("pa'rent", &["A".to_string(), "B".to_string()]);
+        let entry = &out[0];
+        assert_eq!(
+            entry.evidence,
+            serde_json::json!({"retry_failed": {"children": ["A", "B"]}})
+        );
+        // The invocation is the evidence's compact JSON, quoted: the two
+        // submit the same bytes.
+        let compact = serde_json::to_string(&entry.evidence).unwrap();
+        assert_eq!(
+            entry.invocation,
+            format!(
+                "koto next {} --with-data {}",
+                shell_single_quote("pa'rent"),
+                shell_single_quote(&compact)
+            )
+        );
+    }
+
+    #[test]
+    fn reserved_action_serializes_evidence_as_an_object() {
+        let out = synthesize_reserved_actions("parent", &["A".to_string()]);
+        let json = serde_json::to_value(&out[0]).unwrap();
+        assert_eq!(
+            json["evidence"],
+            serde_json::json!({"retry_failed": {"children": ["A"]}})
+        );
+        assert!(json["invocation"].is_string());
     }
 
     #[test]
