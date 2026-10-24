@@ -2,17 +2,15 @@
 schema: brief/v1
 status: Draft
 problem: |
-  When a session's work passes to another session (a successor taking over,
-  or an import into another workspace), koto keeps no record that the new
-  session carries on the old one. Retention judges the predecessor alone and
-  removes it while the successor still depends on it, and import retires its
-  source outright.
+  When a session's work passes to a successor or an import copy, koto keeps
+  no record that the new session carries on the old one, so retention
+  removes the predecessor while the successor still depends on it, and
+  import retires its source outright.
 outcome: |
-  A session that takes over another's work says so once, at open, and the
-  predecessor and the chain behind it stay readable for as long as anything
-  later in that chain is kept, on every host sharing the bucket. An import's
-  source stays as a read-only predecessor, and the relation grants no
-  authority.
+  A successor says once, at open, which session it continues; the chain
+  behind it stays readable while anything later in it is kept, on every
+  host sharing the bucket. An import's source stays as a read-only
+  predecessor, and the relation grants no authority.
 ---
 
 # BRIEF: koto-session-continues
@@ -88,11 +86,13 @@ its retention passes, the next prune removes all of them together.
 
 ### A stranger takes over stalled work
 
-A session's agent is gone and nobody who dispatched it is around. An operator,
-or an agent session launched by neither the original session nor anything it
-dispatched, opens a session that continues it. The relation keeps the stalled
-session readable exactly as it would for a coordinator's successor, and gives
-the new session no authority it didn't already have.
+A session's agent is gone, and neither it nor anything it dispatched is around
+to hand the work on. An operator starts a fresh agent session, unrelated to the
+stalled one, and opens a session that continues it. Nothing dispatched the new
+session and nothing authorized the takeover, yet a prune run afterwards keeps
+the stalled session and names the new one as the reason. When the new session
+asks to do something only the stalled session's dispatcher could allow, the
+answer is the same as if the relation didn't exist.
 
 ### An operator moves a session to another workspace
 
@@ -155,6 +155,7 @@ go, because an older session never keeps a newer one.
   on `koto init` or a `koto session` subcommand. The PRD fixes the behaviour;
   the design picks the surface.
 - How much of the bucket a removal reads to find a successor that only
-  another host holds, and what that costs per prune.
+  another host holds. That is a design and cost question; no answer to it
+  changes the framing here.
 
 None of these block the brief.
