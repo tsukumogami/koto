@@ -197,6 +197,7 @@ impl SessionBackend for LocalBackend {
             kind: "local".to_string(),
             base: fs::canonicalize(&self.base_dir).unwrap_or_else(|_| self.base_dir.clone()),
             bucket: None,
+            prefix: None,
         })
     }
 
