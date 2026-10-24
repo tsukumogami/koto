@@ -3922,7 +3922,7 @@ fn terminal_retention(
     if project_terminal_outcome(compiled, final_state) == TerminalOutcome::Failure {
         return Some(next_types::RetentionReason::FailureTerminal);
     }
-    if crate::session::pin::guard_removal(backend, name).keeps() {
+    if crate::session::pin::local_guard(backend, name).keeps() {
         return Some(next_types::RetentionReason::Pinned);
     }
     let session_dir = backend.session_dir(name);
@@ -3951,7 +3951,7 @@ fn terminal_retention_report(
 ) -> next_types::Retention {
     use next_types::RetentionReason;
     let pin = match reason {
-        Some(_) => crate::session::pin::guard_removal(backend, name).fields(),
+        Some(_) => crate::session::pin::local_guard(backend, name).fields(),
         None => Default::default(),
     };
     let kept_children = if matches!(

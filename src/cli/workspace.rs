@@ -799,8 +799,13 @@ pub(crate) fn sweep_if_parent(
 /// A descendant holding a pin, readable or not, is never removed: each
 /// removal goes through the pin guard, and the pinned descendants it kept
 /// are returned, each with its pin, for the caller to list. A pin keeps its
-/// own session only, so the sweep still descends into a pinned child and
-/// removes what is released under it.
+/// own session only: the walk enters a pinned child like any terminal one
+/// and removes what is released under it, and a pinned child counts as
+/// cleared for the sessions above it, so its own parent still goes and the
+/// child stays with a `parent_workflow` naming an absent peer. The sweep
+/// walks `parent_workflow` lineage, so a pinned session whose lineage to
+/// `parent` was removed is outside the walk: nothing here removes it, and
+/// nothing here lists it.
 pub(crate) fn sweep_terminal_descendants(
     backend: &dyn SessionBackend,
     context_store: &dyn crate::session::context::ContextStore,
@@ -855,7 +860,9 @@ impl DescendantVisitor for Sweep<'_> {
                 #[cfg(unix)]
                 super::forget_finished_record(backend, child);
                 self.pinned.push(pinned_child(child, &guard.fact()));
-                false
+                // Kept by its own pin, which keeps nothing above it: the
+                // parent is judged as if this child had gone.
+                true
             }
             Err(e) => {
                 eprintln!("warning: could not remove kept session {child}: {e}");

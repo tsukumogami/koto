@@ -685,6 +685,15 @@ impl Guard {
 /// before the first delete of that session. A name with no session is
 /// [`Guard::Clear`]. This build reads the local copy only.
 pub fn guard_removal(backend: &dyn SessionBackend, name: &str) -> Guard {
+    // The cloud step adds the bucket's pin object here, and only here.
+    local_guard(backend, name)
+}
+
+/// Session `name`'s local pin, read from disk now, as a [`Guard`]: what the
+/// reports read (the terminal tick's `retention`, `kept_children`, the
+/// replace's disposition). Unlike [`guard_removal`] it never reaches beyond
+/// this host's copy, so a report costs no request.
+pub fn local_guard(backend: &dyn SessionBackend, name: &str) -> Guard {
     let dir = backend.session_dir(name);
     let Some(base) = dir.parent() else {
         return Guard::Clear;
@@ -722,9 +731,10 @@ const REMOVAL_LOCK_WAIT: Duration = Duration::from_secs(2);
 /// A pin and an unpin hold the lock only for the moment they write, so a
 /// lock still held after the wait belongs to a longer koto command (a tick);
 /// the guard then reads the pin without the lock, as the removal never
-/// waited on a tick before, and still keeps a pinned session. A name whose
-/// state file is gone is guarded and cleaned up without the lock, as
-/// `cleanup` always was idempotent.
+/// waited on a tick before, and still keeps a pinned session; a pin that
+/// lands between that read and the delete is the narrow window the design
+/// accepts. A name whose state file is gone is guarded and cleaned up
+/// without the lock, as `cleanup` always was idempotent.
 pub fn remove_guarded(backend: &dyn SessionBackend, name: &str) -> anyhow::Result<Removal> {
     let started = Instant::now();
     let lock = loop {

@@ -354,9 +354,11 @@ fn the_removal_set_keeps_a_pinned_session_and_names_its_pin() {
     assert_eq!(s6["moved_reason"], pin_text(&pin));
     let moved_hashes = env.hashes(&moved);
     let pin_key = PathBuf::from("ctx/koto/links/pin");
+    // Every key the moved copy holds, the pin included, is unchanged.
+    for (path, hash) in held.iter().filter(|(p, _)| p.starts_with("ctx")) {
+        assert_eq!(moved_hashes.get(path), Some(hash), "{}", path.display());
+    }
     assert_eq!(moved_hashes.get(&pin_key), held.get(&pin_key));
-    let log = PathBuf::from("koto-P.state.jsonl");
-    assert!(held.contains_key(&log));
     // The new run holds the original name, unpinned.
     assert!(!env.sessions().join("P/ctx/koto/links/pin").exists());
     let h = env.ok(&["session", "hierarchy", &moved, "--json"]);
@@ -434,9 +436,18 @@ fn workspace_prune_keeps_a_pinned_child_and_removes_its_released_siblings() {
     for c in ["C1", "C2", "C3"] {
         env.done(c, Some("X"));
     }
+    let mut add = env.cmd();
+    add.args(["context", "add", "C2", "note.md"])
+        .write_stdin("kept\n");
+    assert!(add.output().unwrap().status.success());
     let pin = env.pin("C2");
     let c2 = env.hashes("C2");
     settle();
+
+    // The text preview names the pin.
+    let preview = env.run(&["workspace", "prune", "--root", "X", "--dry-run"]);
+    let text = String::from_utf8_lossy(&preview.stdout);
+    assert!(text.contains(&format!("C2: {}", pin_text(&pin))), "{text}");
 
     let out = env.run(&["workspace", "prune", "--root", "X", "--yes"]);
     assert!(out.status.success(), "{out:?}");
@@ -452,9 +463,15 @@ fn workspace_prune_keeps_a_pinned_child_and_removes_its_released_siblings() {
     assert_eq!(status["current_state"], "done", "{status}");
     let h = env.ok(&["session", "hierarchy", "C2", "--json"]);
     assert_names_pin(&h, &pin);
+    assert!(h.to_string().contains("\"X\""), "{h}");
     let pruned = env.ok(&["session", "prune", "--apply", "--all"]);
     assert_names_pin(entry(&pruned["kept"], "C2"), &pin);
     assert_eq!(env.hashes("C2"), c2);
+
+    // Its keys still read by its name (a read, logged in its read log).
+    let note = env.run(&["context", "get", "C2", "note.md"]);
+    assert!(note.status.success(), "{note:?}");
+    assert_eq!(String::from_utf8_lossy(&note.stdout), "kept\n");
 
     // Unpinned by hand, the next prune takes it.
     env.ok(&["session", "unpin", "C2"]);
@@ -570,4 +587,24 @@ fn unpinned_entries_are_the_same_beside_a_pinned_sibling() {
         (c1, out["retention"].clone())
     };
     assert_eq!(entries(true), entries(false));
+}
+
+#[test]
+fn a_pinned_grandchild_keeps_neither_its_parent_nor_its_grandparent() {
+    // X, M, C in one line of lineage, all finished, only C pinned: the
+    // released replace of X sweeps M and keeps C alone.
+    let env = Env::new();
+    env.done("X", None);
+    env.done("M", Some("X"));
+    env.done("C", Some("M"));
+    let pin = env.pin("C");
+    let c = env.hashes("C");
+    settle();
+
+    let template = env.template.to_str().unwrap();
+    let out = env.ok(&["init", "X", "--template", template, "--replace-terminal"]);
+    assert!(out.get("moved_to").is_none(), "{out}");
+    assert_names_pin(entry(&out["kept_children"], "C"), &pin);
+    assert!(!env.exists("M"), "{out}");
+    assert_eq!(env.hashes("C"), c);
 }
