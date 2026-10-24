@@ -20,6 +20,15 @@
 //! to session retention's one-writer rule (koto#445): they write into the
 //! named session, whoever it belongs to, and only these two records.
 //!
+//! Every removal koto makes of a finished session decides through one
+//! guard, [`guard_removal`], read under the session's lock just before the
+//! delete, and most reach it through [`remove_guarded`] or
+//! [`remove_guarded_with`]: the terminal tick, the parent sweep, the
+//! same-name replace, both prunes, `koto session cleanup` and `koto cancel
+//! --cleanup`. Deletes of sessions koto just made or is moving (batch and
+//! retry respawns, init rollbacks, the replace's move-aside, a migrated
+//! source) don't go through it.
+//!
 //! This build supports pins on the local backend. Under the cloud backend
 //! both verbs refuse, since a pin that reached only one host's copy would
 //! be believed there and missed everywhere else.
@@ -576,6 +585,183 @@ pub fn unpin(
         )
     })?;
     Ok(Some(record))
+}
+
+/// Where a pin the guard found was read. This build reads the local copy
+/// only.
+pub const SOURCE_LOCAL: &str = "local";
+
+/// What [`guard_removal`] found: the one answer every removal point
+/// decides a delete by. Only [`Guard::Clear`] lets the delete run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Guard {
+    /// No pin: the removal may go on.
+    Clear,
+    /// A readable pin keeps the session.
+    Pinned { pin: Pin, source: &'static str },
+    /// A pin that can't be read keeps the session, like a readable one.
+    PinUnreadable {
+        problem: PinProblem,
+        source: &'static str,
+    },
+}
+
+impl Guard {
+    /// Whether the guard keeps the session.
+    pub fn keeps(&self) -> bool {
+        !matches!(self, Guard::Clear)
+    }
+
+    /// The pin as the engine's fact, for the renderers.
+    pub fn fact(&self) -> PinFact {
+        match self {
+            Guard::Clear => PinFact::None,
+            Guard::Pinned { pin, .. } => PinFact::Present(pin.clone()),
+            Guard::PinUnreadable { problem, .. } => PinFact::Unreadable(*problem),
+        }
+    }
+
+    /// Where the pin was read; `local` for [`Guard::Clear`].
+    pub fn source(&self) -> &'static str {
+        match self {
+            Guard::Clear => SOURCE_LOCAL,
+            Guard::Pinned { source, .. } | Guard::PinUnreadable { source, .. } => source,
+        }
+    }
+
+    /// The fields a kept entry carries: `kept_by_pin` and `pin` or
+    /// `pin_unreadable`; empty for [`Guard::Clear`].
+    pub fn fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        crate::session::hierarchy::pin_fields(&self.fact(), self.source())
+    }
+
+    /// The text a kept entry prints (`pinned: ...` or `pin unreadable:
+    /// ...`); `None` for [`Guard::Clear`].
+    pub fn text(&self) -> Option<String> {
+        crate::session::hierarchy::pin_text(&self.fact())
+    }
+
+    /// The refusal `koto session cleanup` and `koto cancel --cleanup` print
+    /// for a session this guard keeps: exit 2, code `pinned` (or
+    /// `pin_unreadable`), naming the pin's reason, setter and time and
+    /// saying to unpin first. `None` for [`Guard::Clear`].
+    pub fn refusal(&self, name: &str) -> Option<PinError> {
+        let shown = crate::session::hierarchy::display_text(name);
+        let error = match self {
+            Guard::Clear => return None,
+            Guard::Pinned { pin, .. } => PinError::refusal(
+                "pinned",
+                format!(
+                    "session '{shown}' is pinned (reason: {}; set by {} at {}); nothing was \
+                     removed. Unpin it first with `koto session unpin {shown}`",
+                    crate::session::hierarchy::display_text(&pin.reason),
+                    pin.set_by
+                        .as_deref()
+                        .map(crate::session::hierarchy::display_text)
+                        .unwrap_or_else(|| "hand".to_string()),
+                    crate::session::hierarchy::display_text(&pin.set_at),
+                ),
+            ),
+            Guard::PinUnreadable { problem, .. } => PinError::refusal(
+                "pin_unreadable",
+                format!(
+                    "session '{shown}' holds a pin that can't be read ({}), which keeps it; \
+                     nothing was removed. Unpin it first with `koto session unpin {shown}`",
+                    problem.as_str()
+                ),
+            ),
+        };
+        let mut error = error.with("name", serde_json::json!(shown));
+        for (k, v) in self.fields() {
+            error = error.with(&k, v);
+        }
+        Some(error)
+    }
+}
+
+/// The removal guard: session `name`'s pin, read from disk now (not from a
+/// scan), so a pin set since the caller decided keeps the session. Called
+/// with the session's lock held, after any confirmation prompt, immediately
+/// before the first delete of that session. A name with no session is
+/// [`Guard::Clear`]. This build reads the local copy only.
+pub fn guard_removal(backend: &dyn SessionBackend, name: &str) -> Guard {
+    let dir = backend.session_dir(name);
+    let Some(base) = dir.parent() else {
+        return Guard::Clear;
+    };
+    match read_local(base, name) {
+        PinFact::None => Guard::Clear,
+        PinFact::Present(pin) => Guard::Pinned {
+            pin,
+            source: SOURCE_LOCAL,
+        },
+        PinFact::Unreadable(problem) => Guard::PinUnreadable {
+            problem,
+            source: SOURCE_LOCAL,
+        },
+    }
+}
+
+/// What a guarded removal did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Removal {
+    /// The guard was clear and the delete ran.
+    Removed,
+    /// The guard kept the session; nothing was deleted.
+    Kept(Guard),
+}
+
+/// How long [`remove_guarded`] waits for a session's lock.
+const REMOVAL_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Remove session `name` through the guard: take its lock (waiting up to a
+/// couple of seconds for a koto command that holds it), call
+/// [`guard_removal`], and `cleanup` only on [`Guard::Clear`]. A future
+/// removal point gets the pin check by construction.
+///
+/// A pin and an unpin hold the lock only for the moment they write, so a
+/// lock still held after the wait belongs to a longer koto command (a tick);
+/// the guard then reads the pin without the lock, as the removal never
+/// waited on a tick before, and still keeps a pinned session. A name whose
+/// state file is gone is guarded and cleaned up without the lock, as
+/// `cleanup` always was idempotent.
+pub fn remove_guarded(backend: &dyn SessionBackend, name: &str) -> anyhow::Result<Removal> {
+    let started = Instant::now();
+    let lock = loop {
+        match backend.lock_state_file(name) {
+            Ok(lock) => break Some(lock),
+            Err(SessionError::Locked { .. }) if started.elapsed() < REMOVAL_LOCK_WAIT => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(SessionError::Locked { .. }) => break None,
+            Err(SessionError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => break None,
+            Err(e) => anyhow::bail!("session '{name}' can't be locked: {e}"),
+        }
+    };
+    let guard = guard_removal(backend, name);
+    if guard.keeps() {
+        return Ok(Removal::Kept(guard));
+    }
+    backend.cleanup(name)?;
+    drop(lock);
+    Ok(Removal::Removed)
+}
+
+/// [`remove_guarded`] for a caller that already holds session `name`'s
+/// lock (`_held`) and deletes in its own way (`delete`): the guard, then
+/// the delete only on [`Guard::Clear`].
+pub fn remove_guarded_with<E>(
+    backend: &dyn SessionBackend,
+    name: &str,
+    _held: &SessionLock,
+    delete: impl FnOnce() -> Result<(), E>,
+) -> Result<Removal, E> {
+    let guard = guard_removal(backend, name);
+    if guard.keeps() {
+        return Ok(Removal::Kept(guard));
+    }
+    delete()?;
+    Ok(Removal::Removed)
 }
 
 #[cfg(test)]

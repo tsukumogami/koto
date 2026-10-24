@@ -325,12 +325,17 @@ fn first_rule(
 ) -> Option<KeptEntry> {
     // Rule p: the session's own pin, before anything else; it keeps this
     // session only, so it never reaches the hierarchy rules of the others.
+    // A hierarchy kept besides (a live anchor, the retention not yet
+    // passed) rides along, so the entry names the pin and the keeper.
     if let Some(detail) = hierarchy::pin_text(judgment.pin_of(name)) {
         return Some(KeptEntry {
             name: name.to_string(),
             rule: 'p',
             detail,
-            hierarchy: None,
+            hierarchy: judgment
+                .verdict
+                .is_kept()
+                .then(|| hierarchy::to_json(judgment, settings)),
             pin: hierarchy::pin_fields(judgment.pin_of(name), PIN_SOURCE),
         });
     }
@@ -1007,11 +1012,19 @@ fn apply_component(
     };
     let mut removed = BTreeSet::new();
     let mut cache = TemplateCache::new();
-    for (entry, _lock) in &locked {
+    for (entry, lock) in &locked {
         let result = if judgment.keeps(&entry.name) {
             Err(Refusal::Pinned(judgment.pin_of(&entry.name).clone()))
         } else {
-            remove_member(backend, inv, engine.graph, entry, &removed, &mut cache)
+            remove_member(
+                backend,
+                inv,
+                engine.graph,
+                entry,
+                lock,
+                &removed,
+                &mut cache,
+            )
         };
         if result.is_ok() {
             removed.insert(entry.name.clone());
@@ -1062,14 +1075,16 @@ fn lock(backend: &Backend, name: &str) -> std::result::Result<SessionLock, Refus
     }
 }
 
-/// Remove one member of a hierarchy just judged released, under its lock,
-/// after checking it is still the session the judgment saw and still
-/// stopped.
+/// Remove one member of a hierarchy just judged released, under its lock
+/// (`held`), after checking it is still the session the judgment saw and
+/// still stopped. The delete goes through the pin guard, the last thing
+/// before it.
 fn remove_member(
     backend: &Backend,
     inv: &Inventory,
     graph: &Graph,
     entry: &RemoveEntry,
+    held: &SessionLock,
     removed: &BTreeSet<String>,
     cache: &mut TemplateCache,
 ) -> std::result::Result<(), Refusal> {
@@ -1113,23 +1128,23 @@ fn remove_member(
             "now kept by rule {rule}: {detail}"
         )));
     }
-    // The pin, read from disk under the session's lock, the last thing
-    // before the delete: a pin set since the scan keeps the session.
-    let pin = crate::session::pin::read_local(base, name);
-    if pin.is_pinned() {
-        return Err(Refusal::Pinned(pin));
+    // The pin guard, under the session's lock, the last thing before the
+    // delete: a pin set since the scan keeps the session.
+    let removal = crate::session::pin::remove_guarded_with(backend, name, held, || {
+        // The remote copy goes first, so a failure leaves the local copy
+        // for a later prune to retry.
+        if let Backend::Cloud(cloud) = backend {
+            cloud
+                .delete_remote_session_checked(name)
+                .map_err(|e| Refusal::Failed(format!("the remote copy wasn't removed: {e:#}")))?;
+        }
+        std::fs::remove_dir_all(base.join(name))
+            .map_err(|e| Refusal::Failed(format!("the local directory wasn't removed: {e}")))
+    })?;
+    match removal {
+        crate::session::pin::Removal::Removed => Ok(()),
+        crate::session::pin::Removal::Kept(guard) => Err(Refusal::Pinned(guard.fact())),
     }
-
-    // The remote copy goes first, so a failure leaves the local copy for a
-    // later prune to retry.
-    if let Backend::Cloud(cloud) = backend {
-        cloud
-            .delete_remote_session_checked(name)
-            .map_err(|e| Refusal::Failed(format!("the remote copy wasn't removed: {e:#}")))?;
-    }
-    std::fs::remove_dir_all(base.join(name))
-        .map_err(|e| Refusal::Failed(format!("the local directory wasn't removed: {e}")))?;
-    Ok(())
 }
 
 /// Remove a finished record, after reading it again: a record rewritten

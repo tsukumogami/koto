@@ -274,11 +274,14 @@ struct ReleasedMember {
     kind: MemberKind,
 }
 
-/// One subtree member the rule keeps, with why.
+/// One subtree member the rule or its own pin keeps, with why.
 struct KeptMember {
     name: String,
     reason: String,
     hierarchy: Option<serde_json::Value>,
+    /// For a pinned member: `kept_by_pin` and `pin` or `pin_unreadable`.
+    /// Empty for every other member, whose entry is unchanged.
+    pin: serde_json::Map<String, serde_json::Value>,
 }
 
 impl KeptMember {
@@ -286,6 +289,9 @@ impl KeptMember {
         let mut v = json!({"name": self.name, "reason": self.reason});
         if let Some(h) = &self.hierarchy {
             v["hierarchy"] = h.clone();
+        }
+        for (k, value) in &self.pin {
+            v[k] = value.clone();
         }
         v
     }
@@ -341,11 +347,22 @@ fn judge_subtree(
                             .or_insert_with(|| hierarchy::keeper_json(k));
                     }
                 }
-                if j.verdict.is_kept() {
+                // A member's own pin keeps it, whatever its hierarchy's
+                // verdict, and keeps nothing else: the other members are
+                // judged by the rule alone.
+                if let Some(pinned) = hierarchy::pin_text(&j.pin) {
+                    plan.kept.push(KeptMember {
+                        name: member.to_string(),
+                        reason: pinned,
+                        hierarchy: Some(hierarchy::to_json(&j, settings)),
+                        pin: hierarchy::pin_fields(&j.pin, crate::session::pin::SOURCE_LOCAL),
+                    });
+                } else if j.verdict.is_kept() {
                     plan.kept.push(KeptMember {
                         name: member.to_string(),
                         reason: hierarchy::reason_text(&j.verdict),
                         hierarchy: Some(hierarchy::to_json(&j, settings)),
+                        pin: Default::default(),
                     });
                 } else {
                     let facts = graph.facts(member);
@@ -365,6 +382,7 @@ fn judge_subtree(
                 name: member.to_string(),
                 reason: format!("kept: it can't be judged: {e:#}"),
                 hierarchy: None,
+                pin: Default::default(),
             }),
         }
     }
@@ -466,7 +484,7 @@ fn reclaim(
         }
     }
 
-    for (member, _lock) in cleared {
+    for (member, lock) in cleared {
         let name = member.name.as_str();
         if let Some(below) = left.iter().find(|l| descends_from(graph, l, name)) {
             let reason = format!(
@@ -476,8 +494,24 @@ fn reclaim(
             skip(&mut out, &mut left, name, reason);
             continue;
         }
-        match backend.cleanup(name) {
-            Ok(()) => out.removed.push(name.to_string()),
+        // Through the pin guard, under the lock held since the judgment: a
+        // pin set during the prompt keeps the member, which is listed as
+        // skipped with its pin. Like a member planned as kept by its pin, it
+        // keeps nothing above it.
+        match crate::session::pin::remove_guarded_with(backend, name, &lock, || {
+            backend.cleanup(name)
+        }) {
+            Ok(crate::session::pin::Removal::Removed) => out.removed.push(name.to_string()),
+            Ok(crate::session::pin::Removal::Kept(guard)) => {
+                let mut entry = json!({
+                    "name": name,
+                    "reason": format!("now kept by its pin: {}", guard.text().unwrap_or_default()),
+                });
+                for (k, v) in guard.fields() {
+                    entry[k] = v;
+                }
+                out.skipped.push(entry);
+            }
             Err(e) => {
                 out.failed
                     .push(json!({"name": name, "error": format!("{e:#}")}));
@@ -761,23 +795,31 @@ pub(crate) fn sweep_if_parent(
 ///   the window in which a concurrent `koto rewind` could bring it back;
 /// - a failed removal warns and the walk continues; the caller removes the
 ///   parent either way, and a leftover shows in `koto workflows --orphaned`.
+///
+/// A descendant holding a pin, readable or not, is never removed: each
+/// removal goes through the pin guard, and the pinned descendants it kept
+/// are returned, each with its pin, for the caller to list. A pin keeps its
+/// own session only, so the sweep still descends into a pinned child and
+/// removes what is released under it.
 pub(crate) fn sweep_terminal_descendants(
     backend: &dyn SessionBackend,
     context_store: &dyn crate::session::context::ContextStore,
     parent: &str,
-) {
+) -> Vec<KeptChild> {
     let sessions = match backend.list() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("warning: could not list sessions to remove {parent}'s kept children: {e}");
-            return;
+            return Vec::new();
         }
     };
     let mut sweep = Sweep {
         backend,
         context_store,
+        pinned: Vec::new(),
     };
     LineageTree::from_sessions(&sessions).walk(parent, &mut sweep);
+    sweep.pinned
 }
 
 /// The sweep's half of the shared walk: it skips a branch it can't clear
@@ -786,6 +828,8 @@ pub(crate) fn sweep_terminal_descendants(
 struct Sweep<'a> {
     backend: &'a dyn SessionBackend,
     context_store: &'a dyn crate::session::context::ContextStore,
+    /// The descendants the pin guard kept, each with its pin.
+    pinned: Vec<KeptChild>,
 }
 
 impl DescendantVisitor for Sweep<'_> {
@@ -805,8 +849,14 @@ impl DescendantVisitor for Sweep<'_> {
         if let Some(record) = super::finished_record_for_child(backend, self.context_store, child) {
             super::write_finished_record(backend, &record);
         }
-        match backend.cleanup(child) {
-            Ok(()) => true,
+        match crate::session::pin::remove_guarded(backend, child) {
+            Ok(crate::session::pin::Removal::Removed) => true,
+            Ok(crate::session::pin::Removal::Kept(guard)) => {
+                #[cfg(unix)]
+                super::forget_finished_record(backend, child);
+                self.pinned.push(pinned_child(child, &guard.fact()));
+                false
+            }
             Err(e) => {
                 eprintln!("warning: could not remove kept session {child}: {e}");
                 #[cfg(unix)]
@@ -814,6 +864,17 @@ impl DescendantVisitor for Sweep<'_> {
                 false
             }
         }
+    }
+}
+
+/// The `kept_children` entry for a child its own pin keeps: reason
+/// `pinned`, the pin's text as its detail, and the pin's fields.
+fn pinned_child(name: &str, pin: &crate::session::pin::PinFact) -> KeptChild {
+    KeptChild {
+        name: name.to_string(),
+        reason: super::next_types::RetentionReason::Pinned.as_str(),
+        detail: hierarchy::pin_text(pin).unwrap_or_default(),
+        pin: hierarchy::pin_fields(pin, crate::session::pin::SOURCE_LOCAL),
     }
 }
 
@@ -865,6 +926,9 @@ pub(crate) fn kept_children(
         .into_iter()
         .map(|child| {
             let facts = hierarchy::SessionFacts::read(&base, &child);
+            if facts.pin.is_pinned() {
+                return pinned_child(&child, &facts.pin);
+            }
             let mut via: Vec<String> = facts
                 .links
                 .iter()
@@ -893,6 +957,7 @@ pub(crate) fn kept_children(
                     via.join("; ")
                 ),
                 name: child,
+                pin: Default::default(),
             }
         })
         .collect()

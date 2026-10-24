@@ -727,6 +727,11 @@ pub enum RetentionReason {
     /// or without `--no-cleanup`; `koto session prune` reclaims it once its
     /// hierarchy is released.
     Hierarchy,
+    /// The session holds a pin, readable or not (`koto session pin`), which
+    /// keeps it from every removal until it is unpinned. Checked after a
+    /// failure terminal, which is reported as such with the pin beside it,
+    /// and before the hierarchy.
+    Pinned,
 }
 
 impl RetentionReason {
@@ -735,6 +740,7 @@ impl RetentionReason {
             RetentionReason::FailureTerminal => "failure_terminal",
             RetentionReason::NoCleanup => "no_cleanup",
             RetentionReason::Hierarchy => "hierarchy",
+            RetentionReason::Pinned => "pinned",
         }
     }
 }
@@ -745,8 +751,13 @@ pub struct KeptChild {
     pub name: String,
     /// The retention reason code, as `retention.reason` spells it.
     pub reason: &'static str,
-    /// The links and lineage that keep it, naming the sessions they name.
+    /// The links and lineage that keep it, naming the sessions they name;
+    /// for a pinned child, its pin.
     pub detail: String,
+    /// For a pinned child: `kept_by_pin` and `pin` or `pin_unreadable`.
+    /// Empty, and absent from the JSON, for every other child.
+    #[serde(flatten)]
+    pub pin: serde_json::Map<String, serde_json::Value>,
 }
 
 /// What koto does with a session after a terminal tick, as the `retention`
@@ -760,15 +771,24 @@ pub struct KeptChild {
 pub struct Retention {
     /// `Some` when the session is kept, carrying why.
     pub reason: Option<RetentionReason>,
+    /// For a pinned session: `kept_by_pin` and `pin` or `pin_unreadable`,
+    /// beside whichever reason keeps it. Empty, and absent from the JSON,
+    /// for a session with no pin.
+    pub pin: serde_json::Map<String, serde_json::Value>,
     pub kept_children: Vec<KeptChild>,
 }
 
 impl Serialize for Retention {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(1 + usize::from(self.reason.is_some())))?;
+        let mut map = serializer.serialize_map(Some(
+            1 + usize::from(self.reason.is_some()) + self.pin.len(),
+        ))?;
         map.serialize_entry("retained", &self.reason.is_some())?;
         if let Some(reason) = self.reason {
             map.serialize_entry("reason", reason.as_str())?;
+        }
+        for (k, v) in &self.pin {
+            map.serialize_entry(k, v)?;
         }
         map.end()
     }

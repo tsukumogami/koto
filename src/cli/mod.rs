@@ -3610,6 +3610,9 @@ fn finish_terminal_tick(
     // it is kept. It is the same value the response's `retention` reports.
     retention: Option<next_types::RetentionReason>,
     record: &TerminalRecord,
+    // The session's own lock, when the tick already holds it (a batching
+    // state's tick lock), so the guarded removal decides under it.
+    held: Option<&crate::session::SessionLock>,
 ) {
     let pointer = crate::engine::leg_pointer::read_pointer_best_effort(&backend.session_dir(name));
     let result = &record.result;
@@ -3696,10 +3699,30 @@ fn finish_terminal_tick(
         // with a child has lineage, so this finds nothing in practice. It
         // stays as the safety net `sweep_if_parent` describes.
         workspace::sweep_if_parent(backend, context_store, name, compiled);
-        if let Err(e) = backend.cleanup(name) {
-            eprintln!("warning: session cleanup failed: {}", e);
-            // The session stays, so its record must not answer for it later.
-            forget_finished_record(backend, name);
+        // Through the pin guard: a pin set since the retention check keeps
+        // the session. A tick that holds the session's lock already (a
+        // batching state's) decides under that lock.
+        let removal = match held {
+            Some(lock) => crate::session::pin::remove_guarded_with(backend, name, lock, || {
+                backend.cleanup(name)
+            }),
+            None => crate::session::pin::remove_guarded(backend, name),
+        };
+        match removal {
+            Ok(crate::session::pin::Removal::Removed) => {}
+            Ok(crate::session::pin::Removal::Kept(guard)) => {
+                eprintln!(
+                    "warning: session {name} was pinned since its terminal was reached, so it \
+                     is kept: {}",
+                    guard.text().unwrap_or_default()
+                );
+                forget_finished_record(backend, name);
+            }
+            Err(e) => {
+                eprintln!("warning: session cleanup failed: {}", e);
+                // The session stays, so its record must not answer for it later.
+                forget_finished_record(backend, name);
+            }
         }
     }
 }
@@ -3870,7 +3893,12 @@ pub(crate) mod finished_record_hooks {
 ///    record survives for a retry, a rewind, or a read (koto issue 240). It
 ///    reads the same projection `ChildCompleted` carries, so the parent's
 ///    view of the outcome and the retention rule can't disagree.
-/// 2. A session with a link or lineage is kept (`hierarchy`), with or
+/// 2. A pinned session is kept (`pinned`), with or without `--no-cleanup`:
+///    its pin, readable or not, read from disk now, so a session pinned
+///    while it ran is kept at its terminal. A failure terminal that is also
+///    pinned reports `failure_terminal`, and the report carries the pin
+///    beside it ([`terminal_retention_report`]).
+/// 3. A session with a link or lineage is kept (`hierarchy`), with or
 ///    without `--no-cleanup`: [`crate::session::hierarchy::edge_of`] finds a
 ///    link of its own, a `parent_workflow`, a `chain/parent`, or another
 ///    session naming it, in one pass over the local sessions directory that
@@ -3878,10 +3906,12 @@ pub(crate) mod finished_record_hooks {
 ///    judges no retention, so a malformed setting can never fail a tick;
 ///    `koto session prune` reclaims the session once its hierarchy is
 ///    released. Anything it can't read answers "edge" and keeps.
-/// 3. `--no-cleanup` keeps any other terminal.
+/// 4. `--no-cleanup` keeps any other terminal.
 ///
 /// Otherwise the session is removed, as it always was: a lone session pays
-/// one header-level pass for the check.
+/// one header-level pass for the check, and the removal itself goes through
+/// the pin guard ([`finish_terminal_tick`]), which keeps a session pinned
+/// since this check.
 fn terminal_retention(
     backend: &dyn SessionBackend,
     name: &str,
@@ -3891,6 +3921,9 @@ fn terminal_retention(
 ) -> Option<next_types::RetentionReason> {
     if project_terminal_outcome(compiled, final_state) == TerminalOutcome::Failure {
         return Some(next_types::RetentionReason::FailureTerminal);
+    }
+    if crate::session::pin::guard_removal(backend, name).keeps() {
+        return Some(next_types::RetentionReason::Pinned);
     }
     let session_dir = backend.session_dir(name);
     let has_edge = match session_dir.parent() {
@@ -3907,21 +3940,31 @@ fn terminal_retention(
 }
 
 /// The `retention` a terminal tick reports: the reason it keeps the
-/// session, and, for a parent kept with its hierarchy, the terminal
-/// children it keeps too.
+/// session, its pin when it holds one (whatever the reason), and, for a
+/// parent kept with its hierarchy or by its pin, the terminal children it
+/// keeps too.
 fn terminal_retention_report(
     backend: &dyn SessionBackend,
     name: &str,
     compiled: &CompiledTemplate,
     reason: Option<next_types::RetentionReason>,
 ) -> next_types::Retention {
-    let kept_children = if reason == Some(next_types::RetentionReason::Hierarchy) {
+    use next_types::RetentionReason;
+    let pin = match reason {
+        Some(_) => crate::session::pin::guard_removal(backend, name).fields(),
+        None => Default::default(),
+    };
+    let kept_children = if matches!(
+        reason,
+        Some(RetentionReason::Hierarchy | RetentionReason::Pinned)
+    ) {
         workspace::kept_children(backend, name, compiled)
     } else {
         Vec::new()
     };
     next_types::Retention {
         reason,
+        pin,
         kept_children,
     }
 }
@@ -5804,6 +5847,7 @@ fn handle_next(
                         final_state,
                         retention,
                         record,
+                        _batch_lock.as_ref(),
                     );
                 }
                 flush_before_exit();
@@ -7400,6 +7444,7 @@ fn handle_next(
                     final_state,
                     retention,
                     record,
+                    _batch_lock.as_ref(),
                 );
             }
             flush_before_exit();
@@ -8386,6 +8431,15 @@ fn handle_cancel(
         }));
     }
 
+    // `--cleanup` of a pinned session, running or finished, is refused
+    // before anything is written: the session is neither cancelled nor
+    // removed. Without `--cleanup` a pin changes nothing here.
+    if cleanup {
+        if let Some(refusal) = crate::session::pin::guard_removal(backend, name).refusal(name) {
+            exit_with_error_code(refusal.to_json(), refusal.exit);
+        }
+    }
+
     let (header, events) = match backend.read_events(name) {
         Ok(result) => result,
         Err(err) => {
@@ -8483,8 +8537,18 @@ fn handle_cancel(
     // them so the caller has the same visibility regardless of --cleanup.
     let live = cleanup.then(|| session::live_members(sessions_base, name));
     let cleaned = if cleanup {
-        match backend.cleanup(name) {
-            Ok(()) => {
+        match crate::session::pin::remove_guarded(backend, name) {
+            Ok(crate::session::pin::Removal::Kept(guard)) => {
+                // Pinned since the check above: the cancel stands, the
+                // session stays.
+                let refusal = guard
+                    .refusal(name)
+                    .expect("a guard that keeps has a refusal");
+                let mut json = refusal.to_json();
+                json["error"]["cancelled"] = serde_json::json!(true);
+                exit_with_error_code(json, refusal.exit);
+            }
+            Ok(crate::session::pin::Removal::Removed) => {
                 // As for `koto session cleanup`: a person's removal leaves no
                 // finished record, including one a crash left behind.
                 #[cfg(unix)]
@@ -10528,6 +10592,7 @@ Done.
             "done",
             None,
             &record,
+            None,
         );
         finished_record_hooks::set_before_removal(None);
 

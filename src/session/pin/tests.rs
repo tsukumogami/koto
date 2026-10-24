@@ -291,3 +291,87 @@ fn an_unreadable_pin_refuses_pinning_and_is_cleared_by_unpin() {
     );
     assert_eq!(read_local(&base, "a"), PinFact::None);
 }
+
+#[test]
+fn the_guard_keeps_a_pinned_session_and_clears_the_rest() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let base = tmp.path().join("sessions");
+    fs::create_dir_all(&base).unwrap();
+    session(&base, "p", &[]);
+    session(&base, "u", &[]);
+    session(&base, "bad", &[PIN_KEY]);
+    fs::write(base.join("bad/ctx").join(PIN_KEY), b"garbage").unwrap();
+    let backend = Backend::Local(crate::session::local::LocalBackend::with_base_dir(
+        base.clone(),
+    ));
+    let set = super::pin(&backend, "p", "keep me").unwrap();
+
+    assert_eq!(guard_removal(&backend, "u"), Guard::Clear);
+    assert_eq!(guard_removal(&backend, "nosuch"), Guard::Clear);
+    assert_eq!(
+        guard_removal(&backend, "p"),
+        Guard::Pinned {
+            pin: set.pin().clone(),
+            source: SOURCE_LOCAL
+        }
+    );
+    let bad = guard_removal(&backend, "bad");
+    assert_eq!(
+        bad,
+        Guard::PinUnreadable {
+            problem: PinProblem::Unparseable,
+            source: SOURCE_LOCAL
+        }
+    );
+
+    // The refusal names the reason, the setter and the time, and says to
+    // unpin first; it carries the pin's fields.
+    let refusal = guard_removal(&backend, "p").refusal("p").unwrap();
+    assert_eq!((refusal.code, refusal.exit), ("pinned", 2));
+    assert!(refusal.message.contains("keep me"));
+    assert!(refusal.message.contains("set by hand"));
+    assert!(refusal.message.contains(&set.pin().set_at));
+    assert!(refusal.message.contains("koto session unpin p"));
+    let json = refusal.to_json();
+    assert_eq!(json["error"]["kept_by_pin"], true);
+    assert_eq!(json["error"]["pin"]["source"], "local");
+    let refusal = bad.refusal("bad").unwrap();
+    assert_eq!((refusal.code, refusal.exit), ("pin_unreadable", 2));
+    assert_eq!(refusal.to_json()["error"]["pin_unreadable"], "unparseable");
+    assert!(Guard::Clear.refusal("u").is_none());
+    assert!(Guard::Clear.fields().is_empty());
+
+    // A guarded removal deletes only what the guard clears.
+    assert!(matches!(
+        remove_guarded(&backend, "p").unwrap(),
+        Removal::Kept(Guard::Pinned { .. })
+    ));
+    assert!(base.join("p").is_dir());
+    assert!(matches!(
+        remove_guarded(&backend, "bad").unwrap(),
+        Removal::Kept(Guard::PinUnreadable { .. })
+    ));
+    assert!(base.join("bad").is_dir());
+    assert_eq!(remove_guarded(&backend, "u").unwrap(), Removal::Removed);
+    assert!(!base.join("u").exists());
+    assert_eq!(
+        remove_guarded(&backend, "nosuch").unwrap(),
+        Removal::Removed
+    );
+
+    // A caller holding the lock deletes its own way, only when clear.
+    session(&base, "v", &[]);
+    let lock = backend.lock_state_file("v").unwrap();
+    let mut ran = false;
+    let removal = remove_guarded_with(&backend, "v", &lock, || {
+        ran = true;
+        Ok::<(), ()>(())
+    });
+    assert_eq!(removal, Ok(Removal::Removed));
+    assert!(ran);
+    let lock = backend.lock_state_file("p").unwrap();
+    let removal = remove_guarded_with(&backend, "p", &lock, || -> Result<(), ()> {
+        panic!("a pinned session's delete must not run")
+    });
+    assert!(matches!(removal, Ok(Removal::Kept(Guard::Pinned { .. }))));
+}

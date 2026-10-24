@@ -1230,7 +1230,16 @@ pub fn handle_cleanup(backend: &dyn SessionBackend, name: &str) -> Result<()> {
     // and on a name koto already removed itself the record is the answer
     // `koto status` gives, so it must stay.
     let had_session = backend.session_dir(name).is_dir();
-    backend.cleanup(name)?;
+    // Through the pin guard: a pinned session is refused with exit 2 and
+    // nothing removed, naming the pin and saying to unpin first.
+    if let crate::session::pin::Removal::Kept(guard) =
+        crate::session::pin::remove_guarded(backend, name)?
+    {
+        let refusal = guard
+            .refusal(name)
+            .expect("a guard that keeps has a refusal");
+        super::exit_with_error_code(refusal.to_json(), refusal.exit);
+    }
     // A person's removal leaves no finished record: one a crash left beside
     // the session (written just before a removal that never happened) must
     // not answer for it as removed by koto.
