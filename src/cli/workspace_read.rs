@@ -17,7 +17,7 @@ use anyhow::Result;
 
 use super::{
     context, exit_with_error_code, handle_status, Command, ContextCommand, EXIT_CALLER_ERROR,
-    EXIT_FLUSH, EXIT_INFRASTRUCTURE,
+    EXIT_FLUSH,
 };
 use crate::session::cloud::workspace_read::{WorkspaceId, WorkspaceReadError, WorkspaceReader};
 use crate::session::Backend;
@@ -155,10 +155,7 @@ pub(super) fn run(workspace: &str, command: Command) -> Result<()> {
                 &key,
                 to_file.as_deref(),
             ) {
-                exit_with_error_code(
-                    serde_json::json!({ "error": e.to_string(), "command": verb }),
-                    EXIT_INFRASTRUCTURE,
-                );
+                context::exit_with_failed_read(verb, &e);
             }
         }
         ContextCommand::Exists { session, key } => {
@@ -183,10 +180,7 @@ pub(super) fn run(workspace: &str, command: Command) -> Result<()> {
         }
         ContextCommand::List { session, prefix } => {
             if let Err(e) = context::handle_list(&backend, &session, prefix.as_deref()) {
-                exit_with_error_code(
-                    serde_json::json!({ "error": e.to_string(), "command": verb }),
-                    EXIT_INFRASTRUCTURE,
-                );
+                context::exit_with_failed_read(verb, &e);
             }
         }
         ContextCommand::Add { .. } | ContextCommand::Remove { .. } => {

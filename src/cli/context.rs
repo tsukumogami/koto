@@ -372,6 +372,27 @@ pub fn handle_list(store: &dyn ContextStore, session: &str, prefix: Option<&str>
     Ok(())
 }
 
+/// The error envelope `command` (`context get` or `context list`) prints
+/// when its read fails. The error's text goes through
+/// [`without_url_userinfo`], as the cloud backend's own errors do, so a URL
+/// it names never prints its credentials (koto#469); text naming no URL is
+/// printed as it is.
+///
+/// [`without_url_userinfo`]: crate::session::cloud::without_url_userinfo
+pub(super) fn failed_read_envelope(command: &str, e: &anyhow::Error) -> serde_json::Value {
+    serde_json::json!({
+        "error": crate::session::cloud::without_url_userinfo(&e.to_string()),
+        "command": command,
+    })
+}
+
+/// Print [`failed_read_envelope`] and exit 3. Both the reads in this
+/// workspace and the `--workspace` reads end here when `context get` or
+/// `context list` fails.
+pub(super) fn exit_with_failed_read(command: &str, e: &anyhow::Error) -> ! {
+    super::exit_with_error_code(failed_read_envelope(command, e), super::EXIT_INFRASTRUCTURE);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,5 +818,27 @@ mod tests {
             .filter(|(p, _)| !p.ends_with("out.txt"))
             .collect();
         assert_eq!(after, before);
+    }
+
+    /// A failed read's envelope leaves out the userinfo of a URL its error
+    /// names, and prints an error naming no URL as it is.
+    #[test]
+    fn a_failed_reads_envelope_prints_no_url_credentials() {
+        let e = anyhow::anyhow!("endpoint http://user:secret@host/bucket refused the read");
+        assert_eq!(
+            failed_read_envelope("context get", &e),
+            serde_json::json!({
+                "error": "endpoint http://host/bucket refused the read",
+                "command": "context get",
+            })
+        );
+        let e = anyhow::anyhow!("failed to read context key 'k' for session 's': not found");
+        assert_eq!(
+            failed_read_envelope("context list", &e),
+            serde_json::json!({
+                "error": "failed to read context key 'k' for session 's': not found",
+                "command": "context list",
+            })
+        );
     }
 }
