@@ -442,3 +442,244 @@ bucket judgments resolve a moved-aside predecessor the same way. Decision 4's
 walk is the one bucket answer every removal point asks, including Decision 3's
 `prune --migrated-from` and the second-host prune, so the same chain produces
 the same `relation_keepers` wherever it is judged.
+
+## Solution Architecture
+
+### Overview
+
+Three layers change. The link layer gains a kind and a verb. The retention
+engine gains a directed overlay that every removal point consults through
+`Judgment::keeps`. The cloud backend gains a back-reference object, a bounded
+walk over it, and a read path for migrated sources. Nothing changes for a
+store with no relation and no marker (R23).
+
+### Components
+
+- `src/session/links.rs`: `LinkKind::Continues` (`as_str` is `continues`,
+  listed in `ALL`); `LinkBody` gains optional `prefix` and
+  `holder_session_id`; `write_continues(store, session, pred, hints)` wraps
+  `write_link` with the one-relation check and lets a same-name peer through
+  only when its prefix differs from the holder's (import).
+- `src/cli/mod.rs` and `src/cli/session.rs`: `Init` gains `--continues` and
+  `--continues-from`; `SessionCommand::Link` takes `--continues` as the
+  alternative to `--dispatched-by`; a shared `record_continues` resolves the
+  predecessor (local store, then the named workspace's prefix through
+  `WorkspaceReader`), refuses anchors and close records, and maps errors to
+  exit 2 or 3. `ensure_backref` runs beside `refuse_if_bound_elsewhere`.
+- `src/session/hierarchy/facts.rs`, `graph.rs`, `judge.rs`, `render.rs`: the
+  scan reads unlisted `continues` files; `Graph` keeps a `directed` list
+  outside `components()` and `joined_by`; `Judge::relation` and
+  `Judgment::relation_of`; `relation_json` and `relation_text` render
+  `kept_by_relation`, `relation_keepers` and `relation_unreadable`;
+  `query_json` and `query_text` add `predecessor` and `successors`.
+- `src/session/hierarchy.rs`: `edge_of` is unchanged, since it already counts a
+  link of any kind in both directions; a new `relation_probe` tells the
+  terminal tick whether a continues link names the session, so it judges the
+  session only then.
+- Removal sites: `first_rule` (a new rule `r`, plus the relation fields on any
+  kept entry) and `apply_component` (per-entry `keeps`, no group gate) in
+  `src/cli/session_prune.rs`; `judge_subtree` and `reclaim` in
+  `src/cli/workspace.rs`; `predecessor_disposition` in
+  `src/cli/init_entry.rs`; `terminal_retention` in `src/cli/mod.rs`
+  (`retention.relation_keepers`); `live_members` in `src/cli/session.rs` for
+  cleanup's and cancel's report.
+- `src/session/continues_bucket.rs` (new): the walk, its request counter, a
+  per-process memo keyed by (prefix, name), and `standing_from_bytes`.
+- `src/session/cloud.rs`: `put_backref`, `delete_backref` and
+  `is_backref_key`; `bucket_removal_facts` beside `bucket_pin`, with its
+  `SessionBackend` default in `src/session/mod.rs`;
+  `delete_remote_session_checked`, `sync_delete_session` and
+  `delete_migrated_source` skip `ctx/koto/continued-by/`; the filters that keep
+  pin records out of a push (`src/session/sync.rs`, `force_push_session`,
+  `flush_batch`) also keep out a relation whose pointer is owed.
+- `src/session/import_links.rs` and the import in `cloud.rs`:
+  `dropped_on_import` drops continues links; `Settlement::apply` writes the
+  copy's relation; `import_session` PUTs the pointer before pushing the copy
+  and checks the re-run paths for `relation_conflict`.
+- `src/session/cloud_workspace_read.rs` and `src/cli/workspace_read.rs`:
+  `serve_migrated` on `WorkspaceReader`; `decisions list` and
+  `overrides list` join the reader's verbs; the read handlers in
+  `src/cli/mod.rs` and `src/cli/context.rs` fall back to the reader on
+  `SessionMigrated`.
+- `src/cli/session_prune/markers.rs`: `evaluate` runs the walk after
+  `Present`, and reports the age setting and `--source-retired` as `ignored`.
+
+### Key Interfaces
+
+```text
+koto init <name> --continues <PRED> [--continues-from <WORKSPACE>] ...
+koto session link <SESSION> (--dispatched-by <NAME> | --continues <PRED>) [--continues-from <WORKSPACE>]
+
+context key  koto/links/continues/<PRED>
+body         {"v":1,"session":"<PRED>","session_id":"<id>","workspace":"<path>",
+              "prefix":"<16 hex>|null","holder_session_id":"<id>","at":"<rfc3339>"}
+bucket       <Pp>/<PRED>/ctx/koto/continued-by/<Sp>/<SUCC>   (body: the relation's bytes)
+```
+
+```rust
+pub enum Standing { Pin, Alive, Retention }
+pub struct RelationKeeper {
+    keeper: String, standing: Standing, retention_passes_at: Option<String>,
+    pin: Option<Pin>, path: Vec<String>,
+}
+pub struct RelationVerdict { keepers: Vec<RelationKeeper>, unreadable: Vec<Unreadable> }
+impl Judge<'_> { pub fn relation(&mut self, name: &str) -> RelationVerdict }
+impl Judgment {
+    pub fn relation_of(&self, member: &str) -> &RelationVerdict;
+    pub fn keeps(&self, member: &str) -> bool; // pin || verdict || relation
+}
+pub fn walk(backend: &CloudBackend, pred: &str, facts: &BucketRemovalFacts) -> RelationVerdict;
+```
+
+Kept entries carry the PRD's fields: `kept_by_relation`, `relation_keepers`
+(`keeper`, `standing`, `retention_passes_at`, `pin`, `path`),
+`relation_unreadable` (`holder`, `reason`), and `ignored` on
+`prune --migrated-from`; the text line is `kept: continued by <keeper>
+(<standing>) via <path>`. Empty fields are omitted.
+
+### Data Flow
+
+Writing: the verb resolves the predecessor, PUTs the pointer under the
+predecessor's prefix (cloud only), writes the relation key into the successor
+through the context store with writer `koto`, and pushes the successor
+strictly. Import does the same for the copy, then writes the marker.
+
+Judging locally: `Graph::scan` reads every session's links once; the
+`directed` list feeds `Judge::relation`, which reads each later member's state
+through the judge's cache. A removal point asks `keeps(member)`, and an entry
+kept by the relation carries the rendered fields.
+
+Judging against the bucket: at a removal point that would delete P, after the
+pin guard is clear, `bucket_removal_facts` returns P's `ctx/koto/` listing
+(shared with the pin check) and a delimiter listing of `<Pp>/<P>/`. The walk
+verifies each pointer and marker target, reads each member's standing,
+follows each member's own pointers, and returns a `RelationVerdict` merged with
+the local one. Anything unaffordable or unreadable keeps P.
+
+Reading a migrated source: the read command's first backend read refuses with
+`SessionMigrated`; the handler opens a `WorkspaceReader` on the session's own
+prefix with `serve_migrated`, pulls the state and keys into a scratch
+directory, answers, and drops the directory.
+
+### Overlap with other work
+
+koto#477 (bucket copies that fork when one session is written from several
+directories) is open work on the prefix and push/pull code. This design
+touches that area in three places: `ensure_backref` beside
+`refuse_if_bound_elsewhere` in `src/cli/mod.rs`; one predicate in each of the
+three places pin records are kept out of a push (`src/session/sync.rs`, and
+`force_push_session` and `flush_batch` in `src/session/cloud.rs`); and the new
+cross-prefix `put_backref` and `delete_backref` in `cloud.rs`. No push
+function is reordered and nothing here depends on #477 being fixed. A later
+#477 fix that sweeps stray copies must carry pointers to the session's origin
+rather than delete them. `handle_rebind`, `sync_pull_state` and `put_state`
+are untouched.
+
+The pins and anchors code shares more files. `src/session/pin.rs` is where the
+walk sits beside, not inside, `guard_removal`; `SessionBackend` in
+`src/session/mod.rs` gains `bucket_removal_facts` beside `bucket_pin`;
+`src/session/hierarchy/*` and `src/session/links.rs` change as above;
+`src/session/import_links.rs` gains the continues rules; and the removal sites
+in `src/cli/session_prune.rs`, `src/cli/workspace.rs` and
+`src/cli/init_entry.rs` move from the verdict to `keeps`.
+`src/session/anchor.rs` is untouched: `current_of_family` reads only
+dispatched-by links, and the anchor authority path reads no links.
+
+## Implementation Approach
+
+### Phase 1: The relation and local retention
+
+The link kind, the body fields, both verb forms, the graph's directed list,
+`Judge::relation`, `Judgment::keeps`, every removal site, the report fields,
+`koto session hierarchy`'s new fields, and the failure cases (`unparseable`,
+`too_large`, `mismatch`, `cycle`, `unlistable`). Under the cloud backend this
+phase's verb refuses with exit 2 when it would need a pointer it can't yet
+write (a cloud session or `--continues-from` another workspace), so no
+relation reaches a bucket without one. Property tests: `reference()` in
+`hierarchy/tests.rs` skips continues links in its adjacency, a second,
+directed reference checks the overlay, and the hint test runs for continues
+links.
+
+Deliverables:
+- `src/session/links.rs`, `src/session/hierarchy/{facts,graph,judge,render}.rs`
+- `src/cli/mod.rs` (init flags, terminal tick), `src/cli/session.rs` (link,
+  hierarchy, live members), `src/cli/session_prune.rs`,
+  `src/cli/workspace.rs`, `src/cli/init_entry.rs`
+- tests for the chain, release, both directions, two successors, the replace,
+  cleanup and cancel, refusals and authority
+
+### Phase 2: The bucket walk
+
+Back-reference writes (the verb, the local-backend carry, renames), delete
+paths that skip pointers, `bucket_removal_facts`, the bounded walk with its
+counter and memo, and its use at every removal point; the cloud verb opens up.
+Tests use the in-process stand-in with paging at 1000 keys and a request
+counter, and a whole-bucket oracle on fixtures with a rename, a second host
+and a moved-aside predecessor.
+
+Deliverables:
+- `src/session/continues_bucket.rs`, `src/session/cloud.rs`,
+  `src/session/sync.rs`, `src/session/mod.rs`, `src/cli/mod.rs`
+- tests for the second host, another workspace, the unchecked bucket, the
+  unconfirmed write and the bounded cost
+
+### Phase 3: Import keeps its source
+
+The copy's relation and pointer, re-run and conflict handling, the read path
+through `serve_migrated`, `prune --migrated-from` waiting on the walk with the
+`ignored` report, and the docs: the changelog, the session retention guide
+(what keeps a session, the cross-session writer list, older releases), the CLI
+guide and the koto-user skill's error tables.
+
+Deliverables:
+- `src/session/import_links.rs`, `src/session/cloud.rs` (import),
+  `src/session/cloud_workspace_read.rs`, `src/cli/workspace_read.rs`,
+  `src/cli/context.rs`, `src/cli/session_prune/markers.rs`
+- `CHANGELOG.md`, `docs/guides/session-retention.md`,
+  `docs/guides/cli-usage.md`, the koto-user skill
+- tests for import across workspaces and on one host, migrated-from, earlier
+  imports, the absent target, re-run and pin travel
+
+## Security Considerations
+
+To be completed by the security review.
+
+## Consequences
+
+### Positive
+
+- A predecessor survives every removal by rule while its lineage needs it, on
+  every host, with one reason printed wherever it is kept.
+- Pins and hierarchies keep their meaning, and a store with no relation
+  behaves as before.
+- Import no longer throws away the record its copy came from, and the source
+  stays readable without becoming writable.
+- One bucket walk answers every removal point, so the local and remote answers
+  can't drift apart by site.
+
+### Negative
+
+- A new cross-session writer: the successor writes a pointer into its
+  predecessor's prefix, which needs write access to another workspace's part
+  of the bucket.
+- Pointers outlive their predecessor until each holder is removed, leaving
+  small ghost prefixes.
+- The budget cap can make one host report `bucket_unchecked` where another
+  names keepers.
+- An older release sharing the bucket ignores relations under the cloud
+  backend and can delete a predecessor.
+- Renames of a successor must re-point, and delete paths must skip one more
+  object kind.
+
+### Mitigations
+
+- The pointer's body is the relation's own bytes and is trusted only after
+  the holder's relation is read and matched by session id, so a forged or
+  stale pointer can only over-keep; the retention guide lists it with koto's
+  other cross-session writers (#445).
+- A ghost prefix holds one small object per holder and goes when the holder
+  does.
+- The cap engages only in corners (uncached templates, piles of stale
+  pointers), keeps toward safety, and clears on the next run.
+- The changelog and the guide name the first release that honours relations
+  and say every host sharing a bucket needs it.
