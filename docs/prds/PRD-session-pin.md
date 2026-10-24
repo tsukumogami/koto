@@ -369,6 +369,14 @@ instant, release instant, retention, migrated source.
   and exits 0 only once both are confirmed; otherwise it exits 3 and the
   bucket's pin stays in force. On a host with a local copy, the local pin and
   release record follow the bucket's (R22).
+- **R20a. Local pin records stay out of sync.** Under the cloud backend, the
+  local copy of a pin or release record is a file the sync doesn't track: it
+  gets no entry in the local index, marks nothing in the sync cache as changed
+  or ahead, and triggers no push. A later whole push or pull of that session
+  from the same host leaves the bucket's pin and release objects as they are,
+  and the host doesn't read its copy as ahead of or diverged from the bucket
+  because of them. (On the local backend there is no sync, and the record
+  keeps its index entry, which older releases need to see it, R26.)
 - **R21. Every removal checks the bucket before deleting.** Under the cloud
   backend, before any removal deletes either copy of a session, it makes a
   bucket check for that session. A pin found in the local copy or in the
@@ -382,7 +390,7 @@ instant, release instant, retention, migrated source.
   another host pushed an index without it. No context write, index push or
   state push removes or overwrites a pin object; only unpin removes one.
   Under the cloud backend the bucket's objects decide: a local pin whose
-  `set_at` matches the bucket's latest release record was released on another
+  `id` (a random value each pin gets when it's set) matches the `pin.id` of the bucket's latest release record was released on another
   host and no longer keeps, and a pin object the local copy lacks keeps.
 - **R23. A failed bucket check keeps.** When the bucket check can't be made
   (an error or timeout talking to the bucket) or returns a listing koto can't
@@ -678,7 +686,14 @@ by hand and finishes it; X is P's koto parent.
   the retention, host 2's prune removes P from the bucket. Host 2 unpinning a
   pinned session it holds no local copy of exits 0 and host 1 sees no pin:
   host 1's local copy still holds the old pin file, which its prune treats as
-  released because the bucket's release record names its `set_at`.
+  released because the bucket's release record names its `id`. A pin set,
+  released and set again within one second is told apart by its `id`.
+- [ ] **Local pin records stay out of sync.** After host 1 pins and then
+  unpins P with a local copy, its sync cache reads P as current (not ahead
+  or diverged) and its local index has no pin or release entry; a later
+  `koto context add P <key>` from host 1, which pushes P's index and state,
+  leaves the bucket's pin and release objects byte-identical, and host 2 still
+  sees the release.
 - [ ] **Pull from an index without the pin.** With the bucket's index for P
   lacking the pin entry (a host 2 push) and the pin object present, host 1
   pulls P whole (`koto session resolve --keep remote`) and its

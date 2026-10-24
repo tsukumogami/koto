@@ -190,7 +190,7 @@ replace keep a pinned session, and the reason names the pin's record (R26).
 
 The release record is a separate key, `koto/pin-release`, outside
 `koto/links/` so that no build reads it as a link: `{"v":1,"released_by",
-"authority","reason","released_at","pin":{"reason","set_by","set_at"}}`,
+"authority","reason","released_at","pin":{"id","reason","set_by","set_at"}}`,
 replaced at each release (R6).
 
 In the new engine, `SessionFacts` gains `pin: PinFact`, one of `None`,
@@ -361,12 +361,12 @@ records are standalone. Neither goes through the context write path, so
 neither appends an event to the session's log, journals a key, or triggers a
 push of the session's state, log, manifest or version object (R14a, R20).
 
-- **Local store.** `pin.rs` writes `ctx/koto/links/pin` (or
+- **Local backend.** `pin.rs` writes `ctx/koto/links/pin` (or
   `ctx/koto/pin-release`) by temp file and rename, under the session's lock,
   and adds or removes the key's entry in the local manifest, also under the
   lock, with writer `koto`. The manifest entry is what lets v0.23.0's reader,
   which reads `koto/links/*` only when the manifest lists it, see the pin and
-  keep the session (R26). No event is logged.
+  keep the session (R26). No event is logged. There is no sync to disturb.
 - **Cloud backend.** A new backend method, `put_reserved_object(name, key,
   bytes)`, PUTs exactly the object `<repo_id>/<name>/ctx/<key>` and checks the
   response; `delete_reserved_object(name, key)` deletes exactly one object and
@@ -376,12 +376,26 @@ push of the session's state, log, manifest or version object (R14a, R20).
   again retries. Because nothing else is pushed, a host holding a stale copy,
   or no copy, can pin or unpin a session another host owns without replacing
   that host's log or index.
+- **Local copies under cloud stay out of sync (R20a).** On a cloud host that
+  holds a local copy, the local pin or release record is written as a bare
+  file with no manifest entry, so `cloud-manifest.json` and `cloud-sync.json`
+  see no change, nothing is marked dirty or ahead, and no push follows. The
+  reader counts an unindexed pin file (R19), so this host still sees it. A
+  later whole push from this host uploads a manifest without a pin entry,
+  which removes no object (Decision 2's bucket check reads the object), and a
+  pull leaves the bare files alone. On a cloud host, v0.23.0 can't see that
+  local pin, as it can't see a pin another host set; the guide's minimum
+  release covers it (R26).
+- **The pin's `id`.** Each pin carries a random 128-bit `id`, set when it's
+  written; the release record copies it as `pin.id`. Comparing ids rather
+  than `set_at` keeps a pin set, released and set again within one second
+  from reading as released.
 - **Unpin order.** The release record is written first and the pin removed
   second, so an unpin interrupted between the two leaves the pin in force
   (R6).
 - **Bucket truth.** Under the cloud backend the guard of Decision 2 decides
   from the bucket's objects: a pin object keeps the session whether or not the
-  local copy has it, and a local pin file whose `set_at` equals the `pin.set_at`
+  local copy has it, and a local pin file whose `id` equals the `pin.id`
   of the bucket's release record was released on another host and no longer
   keeps (R22); the guard then deletes it with the session. A whole pull
   (`koto session resolve --keep remote`) downloads the pin object even when
@@ -619,9 +633,9 @@ sessions carry none of these fields.
 Stored records (each at most 4 KiB, written with writer `koto`):
 
 ```text
-koto/links/pin          {"v":1,"reason","set_by","set_at"}
+koto/links/pin          {"v":1,"id","reason","set_by","set_at"}
 koto/pin-release        {"v":1,"released_by","authority","reason","released_at",
-                         "pin":{"reason","set_by","set_at"}}
+                         "pin":{"id","reason","set_by","set_at"}}
 koto/anchor/authority   {"v":1,"names":[...],"unknown":[...],"at","source"}
 ```
 
