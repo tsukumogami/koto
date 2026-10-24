@@ -486,10 +486,14 @@ fn passed_names<'a>(
     let from_record = record.pass.iter().map(|n| (true, n.as_str()));
     let from_template = pass_env.iter().map(|n| (false, n.as_str()));
     from_record.chain(from_template).filter(move |&(_, name)| {
+        // `KOTO_HOME` is left out too: when the tick has it set, koto passes
+        // the root it resolved (absolute) with the session variables, and a
+        // raw relative value must not reach a command that runs elsewhere.
         if seen.contains(&name)
             || is_refused(name)
             || FIXED_NAMES.contains(&name)
             || KOTO_SET_NAMES.contains(&name)
+            || name == crate::koto_home::KOTO_HOME_ENV
         {
             return false;
         }
@@ -538,7 +542,8 @@ where
 /// template's `pass_env` that `lookup` finds, leaving out refused names and the
 /// names koto sets; the three fixed values, `PATH` becoming [`UNSET_PATH`] when
 /// the record has none; then `KOTO_TICK_SESSION` and, when given,
-/// `KOTO_SESSIONS_BASE`. Nothing else reaches a command.
+/// `KOTO_SESSIONS_BASE`, and the `session_vars` (which carry `KOTO_HOME` when
+/// the tick has it set). Nothing else reaches a command.
 ///
 /// The result always carries the tick's known set ([`known_credentials`]
 /// over `config_keys` and `lookup`), so every command run under it has its

@@ -46,8 +46,8 @@ pub enum DeciderCommand {
 /// Flags of `koto decider report`.
 #[derive(Args, Debug, Clone)]
 pub struct ReportArgs {
-    /// Ledger to read (default: _decider_ledger.jsonl in the koto home
-    /// directory, ~/.koto)
+    /// Ledger to read (default: _decider_ledger.jsonl in the koto root,
+    /// ~/.koto or $KOTO_HOME)
     #[arg(long, value_name = "PATH")]
     pub ledger: Option<PathBuf>,
 
@@ -95,11 +95,11 @@ pub fn handle(cmd: DeciderCommand) -> anyhow::Result<()> {
 }
 
 fn default_ledger() -> PathBuf {
-    match dirs::home_dir() {
-        Some(home) => ledger_path(&home.join(".koto")),
+    match crate::koto_home::koto_home() {
+        Some(root) => ledger_path(&root),
         None => fail(
             EXIT_CALLER_ERROR,
-            "no home directory to find the ledger in; pass --ledger",
+            "no koto root (KOTO_HOME or a home directory) to find the ledger in; pass --ledger",
         ),
     }
 }

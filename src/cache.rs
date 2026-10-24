@@ -8,11 +8,17 @@ use tempfile::Builder;
 
 use crate::template::compile::compile;
 
-/// Return the koto cache directory: `$XDG_CACHE_HOME/koto` or `~/.cache/koto`.
+/// Return the koto cache directory: `$KOTO_HOME/cache` when `KOTO_HOME` is
+/// set, else `$XDG_CACHE_HOME/koto` or `~/.cache/koto`.
 ///
 /// `koto session import` looks here for a session's compiled template by
-/// its hash, the file `koto template compile` writes.
+/// its hash, the file `koto template compile` writes. Under `KOTO_HOME` the
+/// cache moves with the rest of the koto root, so a run isolated by that one
+/// variable writes nothing into the home directory.
 pub(crate) fn cache_dir() -> PathBuf {
+    if let Some(root) = crate::koto_home::koto_home_override() {
+        return root.join("cache");
+    }
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -58,6 +64,12 @@ pub fn compile_cached_into(
         return Ok((cache_path, hash));
     }
 
+    // A cache under a KOTO_HOME root may be the first thing written there;
+    // create the root private, as a session would.
+    if let Some(root) = crate::koto_home::koto_home_override().filter(|r| dir.starts_with(r)) {
+        crate::koto_home::ensure_private_root(&root)
+            .with_context(|| format!("failed to create the koto root: {}", root.display()))?;
+    }
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create cache directory: {}", dir.display()))?;
 

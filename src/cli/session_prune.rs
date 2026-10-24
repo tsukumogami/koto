@@ -443,8 +443,8 @@ fn leg_keeps(session_dir: &Path) -> Option<String> {
             ))
         }
     };
-    let Some(root) = dirs::home_dir().map(|h| h.join(".koto")) else {
-        return Some("the request store can't be found (no home directory)".to_string());
+    let Some(root) = crate::koto_home::koto_home() else {
+        return Some("the request store can't be found (no koto root)".to_string());
     };
     let view = match request_store::read_view(&root, &id) {
         Ok(view) => view,

@@ -1,0 +1,10 @@
+# Every path koto keeps for itself is built from the koto root, which
+# `KOTO_HOME` can move. `src/koto_home.rs` is the one place allowed to ask
+# for the home directory; a path built from it anywhere else would ignore
+# `KOTO_HOME` and reach the real `~/.koto`. The lint can't see a read of the
+# `HOME` variable itself (`std::env::var_os("HOME")`): don't build a koto
+# path that way either.
+disallowed-methods = [
+    { path = "dirs::home_dir", reason = "build koto paths from crate::koto_home::koto_home(), which honours KOTO_HOME" },
+    { path = "std::env::home_dir", reason = "build koto paths from crate::koto_home::koto_home(), which honours KOTO_HOME" },
+]

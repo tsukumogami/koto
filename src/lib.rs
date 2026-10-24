@@ -12,6 +12,7 @@ pub mod findings;
 #[cfg(unix)]
 pub mod gate;
 pub(crate) mod host_env;
+pub(crate) mod koto_home;
 pub mod redact;
 pub(crate) mod run_journal;
 pub mod session;

@@ -257,12 +257,11 @@ pub fn handle_prune(
     //     non-fatal — the prune already succeeded, we surface the
     //     count as 0 on error and let `koto next` startup retry.
     let cursors_gc = match (|| -> anyhow::Result<usize> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+        let root = crate::koto_home::koto_home_or_err()?;
         let rs = crate::config::resolve::load_config()
             .unwrap_or_default()
             .request_store;
-        crate::engine::discovery::gc_stale_cursors(&home.join(".koto"), &rs)
+        crate::engine::discovery::gc_stale_cursors(&root, &rs)
     })() {
         Ok(n) => n,
         Err(e) => {
@@ -1209,13 +1208,13 @@ pub(crate) fn awaits_leg_promotion(backend: &dyn SessionBackend, id: &str) -> bo
     else {
         return false;
     };
-    let (Some(home), Ok(request_id)) = (
-        dirs::home_dir(),
+    let (Some(root), Ok(request_id)) = (
+        crate::koto_home::koto_home(),
         ValidatedRequestId::new(&pointer.request_id),
     ) else {
         return false;
     };
-    match request_store::read_view(&home.join(".koto"), &request_id) {
+    match request_store::read_view(&root, &request_id) {
         Ok(view) => {
             view.request_state == RequestState::Open
                 && view

@@ -1122,9 +1122,10 @@ pub fn resolve_decider(cfg: &DeciderConfig) -> (DeciderSettings, Vec<String>) {
     )
 }
 
-/// Path to the user config file: ~/.koto/config.toml
+/// Path to the user config file: `<koto root>/config.toml`, which is
+/// ~/.koto/config.toml unless `KOTO_HOME` moves the root.
 pub fn user_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".koto").join("config.toml"))
+    crate::koto_home::koto_home().map(|root| root.join("config.toml"))
 }
 
 /// Path to the project config file: .koto/config.toml (relative to cwd)
@@ -1132,23 +1133,11 @@ pub fn project_config_path() -> PathBuf {
     PathBuf::from(".koto").join("config.toml")
 }
 
-/// Ensure ~/.koto/ exists with 0700 permissions.
-/// This is independent of the session module's ensure_koto_root.
+/// Ensure the koto root (~/.koto/ unless `KOTO_HOME` moves it) exists with
+/// 0700 permissions when this call creates it.
 pub fn ensure_koto_dir() -> Result<PathBuf> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
-    let koto_dir = home.join(".koto");
-    let needs_create = !koto_dir.exists();
-    fs::create_dir_all(&koto_dir)?;
-
-    if needs_create {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&koto_dir, fs::Permissions::from_mode(0o700))?;
-        }
-    }
-
+    let koto_dir = crate::koto_home::koto_home_or_err()?;
+    crate::koto_home::ensure_private_root(&koto_dir)?;
     Ok(koto_dir)
 }
 

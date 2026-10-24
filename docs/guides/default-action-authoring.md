@@ -240,7 +240,9 @@ command. Standard input is at end of file, so a command can't read whatever a ca
 2. `PATH`, `HOME` and `XDG_CONFIG_HOME` **as recorded when the session was created**. A value
    recorded unset stays unset, except `PATH`: an unset recorded `PATH` becomes `/usr/bin:/bin`.
 3. `KOTO_TICK_SESSION`, the session being ticked, and `KOTO_SESSIONS_BASE`, the directory that
-   holds the session directories, **set by koto**.
+   holds the session directories, **set by koto**. When the koto running the tick has `KOTO_HOME`
+   set, koto also sets `KOTO_HOME` to the root it resolved, so a koto the command calls uses the
+   same root; otherwise `KOTO_HOME` is absent.
 
 The first step skips the recorded names and the ones koto sets, so neither a declared name nor
 the caller's own value can replace them. Nothing else reaches the command.
@@ -260,7 +262,7 @@ These names reach every command by default, with whatever value the ticking proc
 `HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `no_proxy`, `ALL_PROXY`, `all_proxy`.
 
 That's the whole list. `GH_REPO`, every `GIT_*` name, cloud credentials such as `AWS_*`, and
-`KOTO_*` names other than the two koto sets aren't on it. A session stores the list it was
+`KOTO_*` names other than the ones koto sets aren't on it. A session stores the list it was
 created with, so a later koto release that changes the list doesn't change what an existing
 session's commands see.
 
