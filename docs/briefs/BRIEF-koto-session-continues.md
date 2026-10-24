@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Draft
+status: Accepted
 problem: |
   When a session's work passes to a successor or an import copy, koto keeps
   no record that the new session carries on the old one, so retention
@@ -17,7 +17,7 @@ outcome: |
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
@@ -148,14 +148,3 @@ go, because an older session never keeps a newer one.
   relation correctly.
 - Retiring workarounds callers built for the missing relation; they can drop
   them once this ships.
-
-## Open Questions
-
-- What the verb a successor uses at open is called, and whether it is a flag
-  on `koto init` or a `koto session` subcommand. The PRD fixes the behaviour;
-  the design picks the surface.
-- How much of the bucket a removal reads to find a successor that only
-  another host holds. That is a design and cost question; no answer to it
-  changes the framing here.
-
-None of these block the brief.
