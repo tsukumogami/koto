@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 problem: |
   koto's retention engine joins sessions into undirected hierarchies and
   judges each one alone, so a session that carries on another's work has no
@@ -37,7 +37,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
@@ -592,7 +592,8 @@ impl Judgment {
     pub fn relation_of(&self, member: &str) -> &RelationVerdict;
     pub fn keeps(&self, member: &str) -> bool; // pin || verdict || relation
 }
-pub fn walk(backend: &CloudBackend, pred: &str, facts: &BucketRemovalFacts) -> RelationVerdict;
+// continues_bucket: the entry point each removal site calls; `walk` is its internal loop
+pub fn bucket_keepers(backend: &CloudBackend, pred: &str, facts: &BucketRemovalFacts) -> RelationVerdict;
 ```
 
 Kept entries carry the PRD's fields: `kept_by_relation`, `relation_keepers`
