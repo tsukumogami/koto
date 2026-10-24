@@ -676,19 +676,28 @@ pub fn handle_hierarchy(backend: &Backend, name: &str, json: bool) -> Result<()>
         .judge(name, &Scope::Whole)
         .unwrap_or_else(|e| fail(format!("{e:#}"), super::EXIT_INFRASTRUCTURE));
     let release = crate::session::pin::read_release(base, name);
+    // An anchor's authority record, read from its file like `unpin` reads
+    // it; an anchor with none, or an unreadable one, shows no block.
+    let authority = crate::session::anchor::is_anchor(backend, name)
+        .then(|| crate::session::anchor::read_authority(&base.join(name)))
+        .and_then(|read| match read {
+            crate::session::anchor::AuthorityRead::Record(r) => Some(r),
+            _ => None,
+        });
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&hierarchy::query_json(
                 &judgment,
                 &settings,
-                release.as_ref()
+                release.as_ref(),
+                authority.as_ref()
             ))?
         );
     } else {
         print!(
             "{}",
-            hierarchy::query_text(&judgment, &settings, release.as_ref())
+            hierarchy::query_text(&judgment, &settings, release.as_ref(), authority.as_ref())
         );
     }
     Ok(())

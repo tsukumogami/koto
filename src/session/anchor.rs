@@ -651,6 +651,10 @@ pub struct OpenRequest {
     pub workspace: Option<PathBuf>,
     /// The harness's transcript path.
     pub transcript_path: Option<String>,
+    /// `--record-authority`: the authority this start was handed, the
+    /// `KOTO_AUTHORITY` value (empty when unset), recorded in the anchor the
+    /// open resolves to. `None` leaves the anchor's record as it is.
+    pub authority: Option<String>,
 }
 
 /// What an open did to the anchor it names.
@@ -890,7 +894,20 @@ pub fn open<S: ContextStore + SessionBackend>(
     }
 
     let _lock = lock_family(store, &base)?;
+    let outcome = open_locked(store, req, base)?;
+    if let Some(raw) = &req.authority {
+        record_start_authority(store, &outcome.anchor, raw, req.source);
+    }
+    Ok(outcome)
+}
 
+/// The body of [`open`], run under the family's lock: continue the anchor
+/// family `base` names, or create its first anchor or a successor.
+fn open_locked<S: ContextStore + SessionBackend>(
+    store: &S,
+    req: &OpenRequest,
+    base: String,
+) -> anyhow::Result<OpenOutcome> {
     let mut started = AnchorStarted {
         source: req.source.as_str().to_string(),
         harness_session: req.harness_session.clone(),
@@ -1030,6 +1047,174 @@ fn create_anchor<S: ContextStore + SessionBackend>(
     if let Some(key) = req.observed_key.clone().or(inherited) {
         write_marker(store, name, &key)?;
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Release authority
+// ---------------------------------------------------------------------
+
+/// The variable an agent session's start is handed authority in. Only
+/// `koto session anchor open --record-authority` reads it; the start hook
+/// unsets it in the session's shells, and `koto session unpin` never reads
+/// it (DESIGN-session-pin.md, Decision 4).
+pub const AUTHORITY_ENV: &str = "KOTO_AUTHORITY";
+
+/// The anchor's record of the authorities its agent session's latest start
+/// was handed.
+pub const AUTHORITY_KEY: &str = "koto/anchor/authority";
+
+/// The most names a record keeps; the rest of a longer list is dropped.
+pub const MAX_AUTHORITY_NAMES: usize = 16;
+
+/// The most characters a name keeps; a longer one is cut.
+pub const MAX_AUTHORITY_NAME: usize = 64;
+
+/// The largest authority record read; a larger one is unreadable.
+const MAX_AUTHORITY_BYTES: u64 = 4 * 1024;
+
+/// What [`AUTHORITY_KEY`] holds: the names koto knows (`names`), the ones
+/// it doesn't (`unknown`), when the start recorded them and what kind of
+/// start it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityRecord {
+    pub v: u32,
+    pub names: Vec<String>,
+    pub unknown: Vec<String>,
+    pub at: String,
+    pub source: String,
+}
+
+impl AuthorityRecord {
+    /// Whether the record holds no name at all.
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty() && self.unknown.is_empty()
+    }
+}
+
+/// What an anchor's authority record reads as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthorityRead {
+    /// No record: no start of this anchor was handed anything.
+    Missing,
+    Record(AuthorityRecord),
+    /// A record is there and can't be read, for the reason given.
+    Unreadable(&'static str),
+}
+
+/// Split a `KOTO_AUTHORITY` value into the names koto knows and the ones it
+/// doesn't: comma-separated, each trimmed and lowercased, empty ones and
+/// repeats dropped, at most [`MAX_AUTHORITY_NAMES`] of at most
+/// [`MAX_AUTHORITY_NAME`] characters. Nothing is refused: a start that
+/// can't open its anchor runs with no anchor at all, so a malformed value
+/// is kept, cut to size, among the unknown names for the hierarchy query
+/// to show.
+pub fn parse_authority(raw: &str) -> (Vec<String>, Vec<String>) {
+    let mut seen: Vec<String> = Vec::new();
+    for name in raw.split(',') {
+        let name: String = name
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .take(MAX_AUTHORITY_NAME)
+            .collect();
+        if name.is_empty() || seen.contains(&name) {
+            continue;
+        }
+        if seen.len() == MAX_AUTHORITY_NAMES {
+            break;
+        }
+        seen.push(name);
+    }
+    seen.into_iter()
+        .partition(|n| n == crate::session::pin::RELEASE_PIN)
+}
+
+/// The authority record of the session whose directory is `session_dir`,
+/// read straight from its file with `lstat` first, so a symlink is never
+/// followed. It logs no read and touches no manifest, so reading it leaves
+/// the session's log and the host's read spool as they were.
+pub fn read_authority(session_dir: &Path) -> AuthorityRead {
+    let path = session_dir.join("ctx").join(AUTHORITY_KEY);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return AuthorityRead::Missing,
+        Err(_) => return AuthorityRead::Unreadable("its record can't be read"),
+    };
+    if !meta.file_type().is_file() {
+        return AuthorityRead::Unreadable("its record isn't a file");
+    }
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(&path)
+        .and_then(|f| f.take(MAX_AUTHORITY_BYTES + 1).read_to_end(&mut bytes));
+    if read.is_err() {
+        return AuthorityRead::Unreadable("its record can't be read");
+    }
+    if bytes.len() as u64 > MAX_AUTHORITY_BYTES {
+        return AuthorityRead::Unreadable("its record is too large");
+    }
+    match serde_json::from_slice::<AuthorityRecord>(&bytes) {
+        Ok(record) if record.v == 1 => AuthorityRead::Record(record),
+        _ => AuthorityRead::Unreadable("its record isn't one this koto knows"),
+    }
+}
+
+/// Record the authority a start was handed (`raw`, the `KOTO_AUTHORITY`
+/// value) in `anchor`, replacing what an earlier start recorded. A start
+/// handed nothing writes an empty record, so it clears an earlier start's
+/// authority, and writes nothing at all when the anchor already records
+/// none.
+///
+/// The record is a bare local file, written by temp file and rename: no
+/// manifest entry, no event, and no store call, so it never reaches a
+/// bucket. `unpin` reads it on the anchor's own host. A write that fails
+/// removes the record, so the anchor holds no authority rather than a
+/// stale one, and warns; the open itself still succeeds, since a start
+/// with no anchor would release by hand anyway.
+fn record_start_authority<S: SessionBackend + ?Sized>(
+    store: &S,
+    anchor: &str,
+    raw: &str,
+    source: Source,
+) {
+    let dir = store.session_dir(anchor);
+    let (names, unknown) = parse_authority(raw);
+    if names.is_empty() && unknown.is_empty() {
+        match read_authority(&dir) {
+            AuthorityRead::Missing => return,
+            AuthorityRead::Record(r) if r.is_empty() => return,
+            _ => {}
+        }
+    }
+    let record = AuthorityRecord {
+        v: 1,
+        names,
+        unknown,
+        at: now_iso8601(),
+        source: source.as_str().to_string(),
+    };
+    let path = dir.join("ctx").join(AUTHORITY_KEY);
+    if let Err(e) = write_authority(&path, &record) {
+        let _ = std::fs::remove_file(&path);
+        eprintln!("warning: could not record the authority of anchor '{anchor}': {e:#}");
+    }
+}
+
+fn write_authority(path: &Path, record: &AuthorityRecord) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".koto-record-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to create a temp file in {}", parent.display()))?;
+    tmp.write_all(&serde_json::to_vec(record)?)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {}", path.display(), e.error))?;
     Ok(())
 }
 

@@ -441,6 +441,66 @@ fn setter(base: &Path, caller: &Caller) -> Option<String> {
         .map(|_| name.clone())
 }
 
+/// Allow a release of session `name`'s pin by a caller under `anchor`
+/// (`KOTO_ANCHOR`) only when that anchor, open or closed, records
+/// `release-pin` among the authorities its agent session's latest start
+/// was handed (`koto session anchor open --record-authority`). The record
+/// is read straight from the anchor's file, so the check logs nothing and
+/// writes no read-spool entry; the process's own `KOTO_AUTHORITY` is never
+/// read, so a value exported after the start grants nothing. Anything else
+/// is refused with `authority_required`, naming the authority, the anchor
+/// and why: the anchor records none, records only names koto doesn't know,
+/// or its authority couldn't be read (no such session, not an anchor, an
+/// unreadable header or record).
+fn check_release_authority(base: &Path, name: &str, anchor: &str) -> Result<(), PinError> {
+    use crate::session::anchor::{read_authority, AuthorityRead};
+    let shown = crate::session::hierarchy::display_text(anchor);
+    let unreadable = |what: &str| format!("whose authority couldn't be read: {what}");
+    let why = if crate::discover::validate_workflow_name(anchor).is_err() {
+        unreadable("that isn't a session name")
+    } else {
+        let state = base.join(anchor).join(state_file_name(anchor));
+        match crate::engine::persistence::read_header(&state) {
+            Err(_) if !state.exists() => unreadable("no session has that name"),
+            Err(_) => unreadable("its header can't be read"),
+            Ok(h) if h.session_kind() != SessionKind::Anchor => {
+                unreadable("the session isn't an agent session's anchor")
+            }
+            Ok(_) => match read_authority(&base.join(anchor)) {
+                AuthorityRead::Record(r) if r.names.iter().any(|n| n == RELEASE_PIN) => {
+                    return Ok(())
+                }
+                AuthorityRead::Record(r) if !r.unknown.is_empty() => {
+                    let names: Vec<String> = r
+                        .unknown
+                        .iter()
+                        .map(|n| crate::session::hierarchy::display_text(n))
+                        .collect();
+                    format!(
+                        "which records only authorities koto doesn't know ({})",
+                        names.join(", ")
+                    )
+                }
+                AuthorityRead::Record(_) | AuthorityRead::Missing => {
+                    "which records no authority".to_string()
+                }
+                AuthorityRead::Unreadable(what) => unreadable(what),
+            },
+        }
+    };
+    Err(PinError::refusal(
+        "authority_required",
+        format!(
+            "releasing the pin on '{name}' needs the {RELEASE_PIN} authority; KOTO_ANCHOR names \
+             anchor '{shown}', {why}. Authority is handed to an agent session at its start, \
+             through KOTO_AUTHORITY, and a value exported later grants nothing; nothing was \
+             written"
+        ),
+    )
+    .with("authority", serde_json::json!(RELEASE_PIN))
+    .with("anchor", serde_json::json!(shown)))
+}
+
 /// A new pin id: 128 random bits, as 32 lowercase hex digits.
 fn new_id() -> String {
     let mut buf = [0u8; 16];
@@ -517,9 +577,10 @@ pub fn pin(backend: &Backend, name: &str, reason: &str) -> Result<PinOutcome, Pi
 /// session with no pin changes nothing (`Ok(None)`), whoever the caller is.
 ///
 /// A caller by hand (no `KOTO_ANCHOR`) may release. A caller under an
-/// anchor needs the `release-pin` authority its agent session's start
-/// recorded in the anchor; this build records none, so it refuses every
-/// such caller with `authority_required` and writes nothing.
+/// anchor may release only when that anchor records `release-pin` among
+/// the authorities its agent session's start was handed
+/// ([`check_release_authority`]); otherwise the unpin is refused with
+/// `authority_required` and writes nothing.
 pub fn unpin(
     backend: &Backend,
     name: &str,
@@ -547,24 +608,17 @@ pub fn unpin(
             set_at: None,
         },
     };
-    if let Caller::Anchor(anchor) = caller() {
-        let shown = crate::session::hierarchy::display_text(&anchor);
-        return Err(PinError::refusal(
-            "authority_required",
-            format!(
-                "releasing the pin on '{name}' needs the {RELEASE_PIN} authority: KOTO_ANCHOR \
-                 names anchor '{shown}', and the authority it was handed couldn't be read from \
-                 it. Authority is handed to an agent session at its start, through \
-                 KOTO_AUTHORITY; nothing was written"
-            ),
-        )
-        .with("authority", serde_json::json!(RELEASE_PIN))
-        .with("anchor", serde_json::json!(shown)));
-    }
+    let released_by = match caller() {
+        Caller::ByHand => None,
+        Caller::Anchor(anchor) => {
+            check_release_authority(base, name, &anchor)?;
+            Some(anchor)
+        }
+    };
     let record = ReleaseRecord {
         v: RECORD_VERSION,
-        released_by: None,
-        authority: None,
+        authority: released_by.as_ref().map(|_| RELEASE_PIN.to_string()),
+        released_by,
         reason: reason.map(str::to_string),
         released_at: crate::engine::types::now_iso8601(),
         pin: released,

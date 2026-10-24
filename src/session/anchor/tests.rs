@@ -68,6 +68,7 @@ fn req(harness: &str, source: Source) -> OpenRequest {
         observed_key: None,
         workspace: None,
         transcript_path: None,
+        authority: None,
     }
 }
 
@@ -1421,4 +1422,55 @@ fn names_and_suffixes() {
     assert_eq!(close_name("anchor-x-s2"), "anchor-x-s2-closed");
     assert!(valid_token("abc-DEF_123"));
     assert!(!valid_token("a.b"));
+}
+
+// ===== Release authority =====
+
+#[test]
+fn authority_names_are_trimmed_lowercased_deduped_and_bounded() {
+    let s = |v: &[&str]| v.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    assert_eq!(parse_authority(""), (s(&[]), s(&[])));
+    assert_eq!(parse_authority(" , ,"), (s(&[]), s(&[])));
+    assert_eq!(
+        parse_authority(" Release-Pin ,bogus,release-pin, BOGUS"),
+        (s(&["release-pin"]), s(&["bogus"]))
+    );
+    let long = "x".repeat(MAX_AUTHORITY_NAME + 10);
+    let (_, unknown) = parse_authority(&long);
+    assert_eq!(unknown, vec!["x".repeat(MAX_AUTHORITY_NAME)]);
+    let many: Vec<String> = (0..MAX_AUTHORITY_NAMES + 4)
+        .map(|i| format!("n{i}"))
+        .collect();
+    let (names, unknown) = parse_authority(&format!("{},release-pin", many.join(",")));
+    assert!(names.is_empty(), "release-pin past the cap is dropped");
+    assert_eq!(unknown.len(), MAX_AUTHORITY_NAMES);
+}
+
+#[test]
+fn an_open_records_the_authority_it_was_handed_and_only_with_the_flag() {
+    let (_t, b) = backend();
+    let with = |authority: Option<&str>| OpenRequest {
+        authority: authority.map(str::to_string),
+        ..req("a1", Source::Startup)
+    };
+    let anchor = open(&b, &with(None)).unwrap().anchor;
+    let dir = b.session_dir(&anchor);
+    assert_eq!(read_authority(&dir), AuthorityRead::Missing);
+    open(&b, &with(Some(""))).unwrap();
+    assert_eq!(read_authority(&dir), AuthorityRead::Missing);
+    open(&b, &with(Some("release-pin,bogus"))).unwrap();
+    let AuthorityRead::Record(r) = read_authority(&dir) else {
+        panic!("no record");
+    };
+    assert_eq!(r.names, vec!["release-pin".to_string()]);
+    assert_eq!(r.unknown, vec!["bogus".to_string()]);
+    assert_eq!(r.source, "startup");
+    // No flag: the record stays.
+    open(&b, &with(None)).unwrap();
+    assert!(matches!(read_authority(&dir), AuthorityRead::Record(r) if !r.is_empty()));
+    // The flag with nothing handed clears it. The record is a bare file the
+    // manifest doesn't list.
+    open(&b, &with(Some(""))).unwrap();
+    assert!(matches!(read_authority(&dir), AuthorityRead::Record(r) if r.is_empty()));
+    assert!(b.meta(&anchor, AUTHORITY_KEY).is_none());
 }

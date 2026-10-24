@@ -321,7 +321,7 @@ test_block() {
   local want
   want="$(printf '%s\n' "$before" '# >>> koto-skills' \
     "export KOTO_ANCHOR='anchor-S1'" "export KOTO_DISPATCHER_ANCHOR='anchor-S1'" \
-    'unset NIWA_REAP_KEY' ':' '# <<< koto-skills')"
+    'unset NIWA_REAP_KEY' 'unset KOTO_AUTHORITY' ':' '# <<< koto-skills')"
   check "env file holds the lines before it and one block" [ "$(cat "$e")" = "$want" ]
   p="$(payload S1 compact)"
   hook "$p" "$e"
@@ -725,6 +725,94 @@ test_injection() {
   agent_stop
 }
 
+# ===== Release authority =====
+
+# The authorities an anchor's hierarchy query shows, as compact JSON, or
+# `null` when it records none.
+authorities() {
+  koto session hierarchy "$1" --json | jq -c '[.authorities, .unknown_authorities]'
+}
+
+# Whether sourcing an env file leaves KOTO_AUTHORITY unset, in a shell that
+# had it.
+sourced_unsets_authority() {
+  KOTO_AUTHORITY=release-pin bash -c '. "$1" && [ -z "${KOTO_AUTHORITY+x}" ]' sh "$1"
+}
+
+# unpin_rc <session> <anchor> [VAR=value ...]: the exit code of an unpin
+# under that anchor.
+unpin_rc() {
+  local name="$1" anchor="$2"
+  shift 2
+  env KOTO_ANCHOR="$anchor" "$@" koto session unpin "$name" >"$T/unpin.out"
+  echo $?
+}
+
+test_authority() {
+  local e p rc
+  init P
+  koto next P --with-data '{"go": "yes"}' --no-cleanup >/dev/null
+  koto session pin P --reason keep >/dev/null
+  check "P is pinned" [ -f "$T/base/P/ctx/koto/links/pin" ]
+
+  # A start handed release-pin records it in its anchor, and the session's
+  # shells don't carry it.
+  e="$(envfile A1)"
+  p="$(payload A1 startup)"
+  KOTO_AUTHORITY=release-pin hook "$p" "$e"
+  check "exit 0" [ "$(rc_of "$p")" = 0 ]
+  check "nothing on stderr" [ ! -s "$p.err" ]
+  check "the anchor records release-pin" [ "$(authorities anchor-A1)" = '[["release-pin"],[]]' ]
+  check "the env file unsets KOTO_AUTHORITY" grep -qx 'unset KOTO_AUTHORITY' "$e"
+  check "a shell that sources it carries no KOTO_AUTHORITY" sourced_unsets_authority "$e"
+
+  # A `claude -p` child launched from that shell: its start sees the env
+  # file's environment, so it is handed nothing, and its anchor can't unpin.
+  local child
+  child="$(envfile C1)"
+  KOTO_AUTHORITY=release-pin bash -c '. "$1" && printf "%s\t%s\n" "$2" "$3" | perl -e "$4"' \
+    sh "$e" "$(payload C1 startup)" "$child" "$AGENT_PL"
+  check "the child's anchor records nothing" [ "$(authorities anchor-C1)" = '[null,null]' ]
+  rc="$(unpin_rc P anchor-C1)"
+  check "unpin under the child's anchor exits 2 (got $rc)" [ "$rc" = 2 ]
+  check "and names release-pin" grep -q release-pin "$T/unpin.out"
+  check "P stays pinned" sh -c 'koto session list --pinned --json | jq -e "map(.name) == [\"P\"]" >/dev/null'
+
+  # A start handed nothing whose anchor records nothing leaves its context
+  # as it was.
+  local before
+  before="$(hash_dir "$T/base/anchor-C1/ctx")"
+  hook "$(payload C1 compact)" "$child"
+  check "a start handed nothing changes no context file" [ "$(hash_dir "$T/base/anchor-C1/ctx")" = "$before" ]
+
+  # The anchor handed release-pin unpins; a later start handed nothing
+  # clears it.
+  rc="$(unpin_rc P anchor-A1)"
+  check "unpin under the handed anchor exits 0 (got $rc)" [ "$rc" = 0 ]
+  check "the release names the anchor and the authority" [ "$(jq -c \
+    '[.released.released_by, .released.authority]' "$T/unpin.out")" = '["anchor-A1","release-pin"]' ]
+  koto session pin P --reason again >/dev/null
+  hook "$(payload A1 resume)" "$e"
+  check "a later start handed nothing clears the record" [ "$(authorities anchor-A1)" = '[[],[]]' ]
+  rc="$(unpin_rc P anchor-A1 KOTO_AUTHORITY=release-pin)"
+  check "and its anchor can't unpin, even with the variable exported (got $rc)" [ "$rc" = 2 ]
+
+  # An unknown name is recorded as unknown.
+  KOTO_AUTHORITY=bogus hook "$(payload B1 startup)" "$(envfile B1)"
+  check "bogus is unknown" [ "$(authorities anchor-B1)" = '[[],["bogus"]]' ]
+
+  # A koto from before --record-authority refuses the flag: the hook opens
+  # the anchor without it.
+  mkdir -p "$T/old"
+  printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = --record-authority ] && exit 2; done\nexec %s "$@"\n' \
+    "$(command -v koto)" >"$T/old/koto"
+  chmod +x "$T/old/koto"
+  e="$(envfile O1)"
+  PATH="$T/old:$PATH" KOTO_AUTHORITY=release-pin hook "$(payload O1 startup)" "$e"
+  check "an older koto still opens the anchor" [ "$(anchor_in "$e")" = anchor-O1 ]
+  check "and records no authority" [ "$(authorities anchor-O1)" = '[null,null]' ]
+}
+
 # ===== The synchronous part's time =====
 
 test_timing() {
@@ -747,7 +835,7 @@ test_timing() {
 
 ALL="test_block test_env_file_cases test_one_anchor_per_session test_resume_cases
 test_no_koto test_late_marker test_inherited_key test_first_dispatch
-test_idle_close test_bare_shell test_no_niwa_hierarchy test_injection test_timing"
+test_idle_close test_bare_shell test_no_niwa_hierarchy test_injection test_authority test_timing"
 
 selected="${*:-$ALL}"
 for t in $selected; do

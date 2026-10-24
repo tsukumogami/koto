@@ -9,7 +9,7 @@ use super::graph::Edge;
 use super::judge::{Judgment, Keeper, Member, MemberKind, Retention, Unreadable, Verdict};
 use super::settings::RetentionSettings;
 use crate::config::session_env::Origin;
-use crate::session::anchor::valid_token;
+use crate::session::anchor::{valid_token, AuthorityRecord};
 use crate::session::pin::{Pin, PinFact, ReleaseRecord, SOURCE_LOCAL};
 
 /// `s` with every control character removed.
@@ -289,14 +289,17 @@ pub fn to_json(j: &Judgment, settings: &RetentionSettings) -> Value {
 /// The JSON `koto session hierarchy <name> --json` prints: [`to_json`],
 /// plus what only the query reports. Each anchor member carries its
 /// `last_activity`; `pinned_members` names every other member a pin keeps,
-/// when there is one; and `pin_release` is the judged session's latest
-/// release record, when it has one. A prune's `hierarchy` object is
-/// [`to_json`] alone, so a prune entry for a session with no pin prints
+/// when there is one; `pin_release` is the judged session's latest
+/// release record, when it has one; and `authorities` and
+/// `unknown_authorities` are what the judged anchor's latest start was
+/// handed (`authority`), when it records any. A prune's `hierarchy` object
+/// is [`to_json`] alone, so a prune entry for a session with no pin prints
 /// what it printed before pins existed.
 pub fn query_json(
     j: &Judgment,
     settings: &RetentionSettings,
     release: Option<&ReleaseRecord>,
+    authority: Option<&AuthorityRecord>,
 ) -> Value {
     let mut out = to_json(j, settings);
     if let Some(members) = out["members"].as_array_mut() {
@@ -313,7 +316,34 @@ pub fn query_json(
     if let Some(r) = release {
         out["pin_release"] = release_json(r);
     }
+    if let Some(a) = authority {
+        let shown = |names: &[String]| names.iter().map(|n| display_text(n)).collect::<Vec<_>>();
+        out["authorities"] = json!(shown(&a.names));
+        out["unknown_authorities"] = json!(shown(&a.unknown));
+    }
     out
+}
+
+/// The line the hierarchy query prints for an anchor's authority record.
+fn authority_text(a: &AuthorityRecord) -> String {
+    let list = |names: &[String]| {
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names
+                .iter()
+                .map(|n| display_text(n))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    format!(
+        "authorities handed at its latest start ({}, {}): {}; unknown: {}",
+        display_text(&a.source),
+        display_text(&a.at),
+        list(&a.names),
+        list(&a.unknown)
+    )
 }
 
 fn keeper_text(k: &Keeper) -> String {
@@ -426,16 +456,18 @@ fn edge_text(e: &Edge, member: &str) -> String {
 /// The text `koto session hierarchy` prints for a session with no release
 /// record.
 pub fn render_text(j: &Judgment, settings: &RetentionSettings) -> String {
-    query_text(j, settings, None)
+    query_text(j, settings, None, None)
 }
 
 /// The text `koto session hierarchy` prints: the verdict, the session's own
-/// pin, its latest release record (`release`) and the hierarchy's other
-/// pinned members, then the keepers, members and settings.
+/// pin, its latest release record (`release`), an anchor's authority
+/// record (`authority`) and the hierarchy's other pinned members, then the
+/// keepers, members and settings.
 pub fn query_text(
     j: &Judgment,
     settings: &RetentionSettings,
     release: Option<&ReleaseRecord>,
+    authority: Option<&AuthorityRecord>,
 ) -> String {
     let mut out = String::new();
     match pin_text(&j.pin) {
@@ -453,6 +485,9 @@ pub fn query_text(
     }
     if let Some(r) = release {
         out.push_str(&format!("{}\n", release_text(r)));
+    }
+    if let Some(a) = authority {
+        out.push_str(&format!("{}\n", authority_text(a)));
     }
     let others = other_pinned(j);
     if !others.is_empty() {

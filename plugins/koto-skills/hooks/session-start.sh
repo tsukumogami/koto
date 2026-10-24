@@ -16,15 +16,21 @@
 #      reap key (`NIWA_REAP_KEY`): a process launched from another agent
 #      session's shell carries that session's `KOTO_ANCHOR`, and its parent's
 #      key must not mark it;
-#   4. runs `koto session anchor open` with those (see koto_clean for its
-#      environment);
+#   4. runs `koto session anchor open` with those and `--record-authority`
+#      (see koto_clean for its environment), which records the authority
+#      the start was handed in `KOTO_AUTHORITY` in the anchor, or clears an
+#      earlier start's; the variable stays in that one call's environment,
+#      never on a command line. A koto from before the flag refuses it, and
+#      the open runs again without it, recording nothing;
 #   5. replaces its block of `CLAUDE_ENV_FILE`, which Claude Code sources
 #      before every shell command, when that file can be written safely:
 #      `export KOTO_ANCHOR` and `export KOTO_DISPATCHER_ANCHOR`, both naming
 #      its own anchor, or `unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR` when the
 #      open failed, so the shells never keep the dispatcher's anchor; then
 #      `unset NIWA_REAP_KEY`, since the key is this hook's to record and must
-#      not reach a child, and `:`, because each env file is one link of an
+#      not reach a child, `unset KOTO_AUTHORITY`, so no shell of the session
+#      and no worker or `claude -p` it launches carries the start's
+#      authority, and `:`, because each env file is one link of an
 #      `&&` chain and must end with status 0. When the file can't be written
 #      safely it returns the `KOTO_ANCHOR` export line as additionalContext
 #      instead; a failure writing it leaves the file as it was;
@@ -254,7 +260,18 @@ args=(session anchor open "--harness-session=$session_id" "--source=$start_sourc
 [ -n "$transcript_path" ] && args+=("--transcript-path=$transcript_path")
 [ -n "$payload_cwd" ] && [ -d "$payload_cwd" ] && args+=("--workspace=$payload_cwd")
 
-out="$(koto_clean "${args[@]}")"
+out="$(koto_clean "${args[@]}" --record-authority)"
+status=$?
+# Exit 2 with no anchor is a refusal, or a koto from before
+# --record-authority that doesn't know the flag: open again without it, so
+# such a koto still opens the anchor (recording no authority). A call cut
+# off by the watchdog exits otherwise and isn't run twice.
+if [ "$status" -eq 2 ]; then
+  case "$out" in
+    anchor=* | *$'\n'anchor=*) ;;
+    *) out="$(koto_clean "${args[@]}")" ;;
+  esac
+fi
 
 anchor=""
 opened=""
@@ -308,6 +325,7 @@ if [ -n "$env_dir" ]; then
       printf 'unset KOTO_ANCHOR KOTO_DISPATCHER_ANCHOR\n'
     fi
     printf 'unset NIWA_REAP_KEY\n'
+    printf 'unset KOTO_AUTHORITY\n'
     printf ':\n'
     printf '%s\n' "$BLOCK_END"
   } >"$tmp" || {

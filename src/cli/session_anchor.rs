@@ -67,6 +67,12 @@ pub enum AnchorCommand {
         /// The harness's transcript path; only a digest of it is stored
         #[arg(long = "transcript-path", value_name = "PATH")]
         transcript_path: Option<String>,
+
+        /// Record the authority this start was handed in KOTO_AUTHORITY in
+        /// the anchor, replacing an earlier start's. Hidden, like the pin
+        /// verbs whose release it governs, until every pin step lands.
+        #[arg(long = "record-authority", hide = true)]
+        record_authority: bool,
     },
 
     /// Write an observed marker into one anchor.
@@ -125,6 +131,7 @@ pub fn handle(backend: &Backend, command: AnchorCommand) -> Result<()> {
             observed_key,
             workspace,
             transcript_path,
+            record_authority,
         } => {
             let source = Source::parse(&source).unwrap_or(Source::Other);
             let workspace = workspace
@@ -138,6 +145,9 @@ pub fn handle(backend: &Backend, command: AnchorCommand) -> Result<()> {
                 observed_key: observed_key.filter(|k| !k.is_empty()),
                 workspace,
                 transcript_path: transcript_path.filter(|t| !t.is_empty()),
+                // An unset or non-UTF-8 variable hands nothing.
+                authority: record_authority
+                    .then(|| std::env::var(anchor::AUTHORITY_ENV).unwrap_or_default()),
             };
             let outcome = anchor::open(backend, &req).unwrap_or_else(|e| fail("open", e));
             println!("anchor={}", outcome.anchor);
