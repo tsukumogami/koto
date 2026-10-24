@@ -2134,13 +2134,7 @@ pub fn run(app: App) -> Result<()> {
                         &key,
                         to_file.as_deref(),
                     ) {
-                        exit_with_error_code(
-                            serde_json::json!({
-                                "error": e.to_string(),
-                                "command": "context get"
-                            }),
-                            EXIT_INFRASTRUCTURE,
-                        );
+                        context::exit_with_failed_read("context get", &e);
                     }
                     Ok(())
                 }
@@ -2197,13 +2191,7 @@ pub fn run(app: App) -> Result<()> {
                 }
                 ContextCommand::List { session, prefix } => {
                     if let Err(e) = context::handle_list(store, &session, prefix.as_deref()) {
-                        exit_with_error_code(
-                            serde_json::json!({
-                                "error": e.to_string(),
-                                "command": "context list"
-                            }),
-                            EXIT_INFRASTRUCTURE,
-                        );
+                        context::exit_with_failed_read("context list", &e);
                     }
                     Ok(())
                 }
