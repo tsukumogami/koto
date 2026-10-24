@@ -766,13 +766,14 @@ fn validate_contract(pin: Option<&str>) -> Result<(), RequestError> {
 
 /// The workspace root the request store lives under.
 ///
-/// `~/.koto`, matching every other workspace-scoped path in the crate
-/// (the terminal index, coordinator cursors, workspace prune).
+/// The koto root (`~/.koto` unless `KOTO_HOME` moves it), matching every
+/// other workspace-scoped path in the crate (the terminal index, coordinator
+/// cursors, workspace prune).
 fn koto_root() -> Result<PathBuf, RequestError> {
-    dirs::home_dir().map(|h| h.join(".koto")).ok_or_else(|| {
+    crate::koto_home::koto_home().ok_or_else(|| {
         RequestError::new(
             RequestErrorCode::PersistenceError,
-            "could not determine the home directory",
+            "could not determine the koto root (KOTO_HOME is unset and there is no home directory)",
         )
     })
 }

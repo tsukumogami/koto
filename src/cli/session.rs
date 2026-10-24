@@ -255,14 +255,13 @@ pub fn handle_start(
         // `<koto_root>/_terminal_index.jsonl`. `koto_root` is the
         // workspace root the SessionBackend uses; for the LocalBackend
         // that's `<base_dir>/..` (the `.koto` directory containing the
-        // `sessions/` subdir). Fall back to `~/.koto` when the home
-        // directory is resolvable; on substrates that don't have a
-        // standard home we leave `koto_root` as the literal `.koto`
+        // `sessions/` subdir). Use the koto root (`~/.koto` unless
+        // `KOTO_HOME` moves it) when it resolves; on substrates that
+        // don't have one we leave `koto_root` as the literal `.koto`
         // path which simply means the terminal-index filter sees an
         // empty index (safe over-count, never an under-count).
-        let koto_root = dirs::home_dir()
-            .map(|h| h.join(".koto"))
-            .unwrap_or_else(|| std::path::PathBuf::from(".koto"));
+        let koto_root =
+            crate::koto_home::koto_home().unwrap_or_else(|| std::path::PathBuf::from(".koto"));
         let outcome = crate::engine::caps::validate_recursion_caps(
             backend,
             validated_parent.as_str(),

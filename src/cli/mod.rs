@@ -529,9 +529,13 @@ pub enum SessionCommand {
     },
 
     /// Print the absolute session directory path
+    ///
+    /// With no name, print the koto root instead: `$KOTO_HOME` when set,
+    /// else `~/.koto`. It builds no backend and writes nothing, so a test
+    /// harness can check the root before running anything else.
     Dir {
-        /// Session name
-        name: String,
+        /// Session name; omit it to print the koto root
+        name: Option<String>,
     },
     /// List all sessions as JSON
     ///
@@ -1054,10 +1058,11 @@ fn validate_compiled_template(path: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
-/// The root the decider ledger is written under (`~/.koto`), or `None` when
-/// there is no home directory, in which case each ledger write warns.
+/// The root the decider ledger is written under (the koto root, `~/.koto`
+/// unless `KOTO_HOME` moves it), or `None` when there is none, in which case
+/// each ledger write warns.
 pub(super) fn ledger_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".koto"))
+    crate::koto_home::koto_home()
 }
 
 /// Load a compiled template from a cache path.
@@ -1881,6 +1886,12 @@ pub fn run(app: App) -> Result<()> {
             println!("{}", serde_json::to_string(&metadata)?);
             Ok(())
         }
+        Command::Session {
+            subcommand: SessionCommand::Dir { name: None },
+        } => {
+            println!("{}", crate::koto_home::koto_home_or_err()?.display());
+            Ok(())
+        }
         Command::Session { subcommand } => {
             let backend = build_backend()?;
             match subcommand {
@@ -1902,7 +1913,8 @@ pub fn run(app: App) -> Result<()> {
                     inputs.as_deref(),
                     coordinator_of_record.as_deref(),
                 ),
-                SessionCommand::Dir { name } => session::handle_dir(&backend, &name),
+                SessionCommand::Dir { name: Some(name) } => session::handle_dir(&backend, &name),
+                SessionCommand::Dir { name: None } => unreachable!("handled before the backend"),
                 SessionCommand::List {
                     pinned: true, json, ..
                 } => session::handle_list_pinned(&backend, json),
@@ -3562,11 +3574,10 @@ fn append_terminal_index_for_session(
         "completed"
     };
 
-    let Some(home) = dirs::home_dir() else {
-        eprintln!("warning: terminal-index append skipped: no home directory");
+    let Some(koto_root) = crate::koto_home::koto_home() else {
+        eprintln!("warning: terminal-index append skipped: no koto root");
         return;
     };
-    let koto_root = home.join(".koto");
     let state_path = backend
         .session_dir(session_id)
         .join(crate::session::state_file_name(session_id));
@@ -4050,11 +4061,10 @@ fn promote_leg_result(
 ) -> bool {
     use crate::engine::request_store::{self, RequestStoreError};
 
-    let Some(home) = dirs::home_dir() else {
-        eprintln!("warning: leg result promotion skipped: no home directory");
+    let Some(root) = crate::koto_home::koto_home() else {
+        eprintln!("warning: leg result promotion skipped: no koto root");
         return false;
     };
-    let root = home.join(".koto");
     let request_id = match request_store::ValidatedRequestId::new(&pointer.request_id) {
         Ok(id) => id,
         Err(e) => {
@@ -4213,8 +4223,7 @@ fn discover_abandoned_leg(
         return Some(delivered);
     }
 
-    let home = dirs::home_dir()?;
-    let root = home.join(".koto");
+    let root = crate::koto_home::koto_home()?;
     let request_id = crate::engine::request_store::ValidatedRequestId::new(&pointer.request_id)
         .map_err(|e| eprintln!("warning: ignoring a leg pointer with an unusable id: {e}"))
         .ok()?;
@@ -4795,7 +4804,9 @@ fn handle_next(
     //
     // And the session settings that came from KOTO_SESSION_* variables, which
     // the tick's commands get so a koto they call reaches the same backend.
-    let (request_store_cfg, decider_settings, config_keys, session_vars) = {
+    // A koto root set by KOTO_HOME goes with them, so a nested koto uses the
+    // same root; with KOTO_HOME unset the commands' environment is unchanged.
+    let (request_store_cfg, decider_settings, config_keys, mut session_vars) = {
         let base = crate::config::resolve::load_config().unwrap_or_default();
         crate::config::warn_if_request_store_recursion_reserved(&base);
         let cli_overrides = crate::config::resolve::RequestStoreOverrides {
@@ -4814,6 +4825,12 @@ fn handle_next(
             crate::config::session_env::command_vars(&base),
         )
     };
+    if let Some(root) = crate::koto_home::koto_home_override() {
+        session_vars.push((
+            crate::koto_home::KOTO_HOME_ENV.to_string(),
+            root.to_string_lossy().into_owned(),
+        ));
+    }
 
     // Issue 7: cursor GC fires on every coordinator tick boot so
     // abandoned coordinators' cursor state is reclaimed eventually.
@@ -4828,8 +4845,7 @@ fn handle_next(
     // Both are best-effort: a failure logs a warning and the tick
     // proceeds. The current workflow's session id doubles as the
     // coord_id, matching the Issue 7 wiring at the scan call site.
-    if let Some(home) = dirs::home_dir() {
-        let koto_root = home.join(".koto");
+    if let Some(koto_root) = crate::koto_home::koto_home() {
         if let Err(e) = crate::engine::discovery::gc_stale_cursors(&koto_root, &request_store_cfg) {
             eprintln!("warning: cursor GC failed at koto next startup: {}", e);
         }
@@ -5437,7 +5453,7 @@ fn handle_next(
         command_env: &command_env,
         context_store,
         session: &name,
-        request_root: dirs::home_dir().map(|home| home.join(".koto")),
+        request_root: crate::koto_home::koto_home(),
         checks: check_evaluator.as_ref(),
     };
 
@@ -6758,8 +6774,7 @@ fn handle_next(
             // that doesn't pass ValidatedCoordId's regex) is also
             // non-fatal: scan returns empty.
             let unassigned_children: Vec<crate::cli::next_types::UnassignedChild> = (|| {
-                let home = dirs::home_dir()?;
-                let koto_root = home.join(".koto");
+                let koto_root = crate::koto_home::koto_home()?;
                 let coord_id = crate::engine::types::ValidatedCoordId::new(&name).ok()?;
                 match crate::engine::discovery::scan(&koto_root, &coord_id, &request_store_cfg) {
                     Ok(v) => Some(v),

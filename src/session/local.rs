@@ -41,14 +41,13 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
-    /// Create a backend rooted at `~/.koto/sessions/`.
+    /// Create a backend rooted at `<koto root>/sessions/` (`~/.koto/sessions/`
+    /// unless `KOTO_HOME` moves the root; see [`crate::koto_home`]).
     ///
     /// Sessions from the old per-repo layout (`~/.koto/sessions/<repo-id>/`)
     /// are migrated to the flat layout on first use.
     pub fn new() -> anyhow::Result<Self> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
-        let koto_home = home.join(".koto");
+        let koto_home = crate::koto_home::koto_home_or_err()?;
         let base_dir = koto_home.join("sessions");
         migrate_if_needed(&base_dir);
         Ok(Self {

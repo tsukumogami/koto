@@ -240,7 +240,9 @@ command. Standard input is at end of file, so a command can't read whatever a ca
 2. `PATH`, `HOME` and `XDG_CONFIG_HOME` **as recorded when the session was created**. A value
    recorded unset stays unset, except `PATH`: an unset recorded `PATH` becomes `/usr/bin:/bin`.
 3. `KOTO_TICK_SESSION`, the session being ticked, and `KOTO_SESSIONS_BASE`, the directory that
-   holds the session directories, **set by koto**.
+   holds the session directories, **set by koto**. When the koto running the tick has `KOTO_HOME`
+   set, koto also sets `KOTO_HOME` to the root it resolved, so a koto the command calls uses the
+   same root; otherwise `KOTO_HOME` is absent.
 
 The first step skips the recorded names and the ones koto sets, so neither a declared name nor
 the caller's own value can replace them. Nothing else reaches the command.

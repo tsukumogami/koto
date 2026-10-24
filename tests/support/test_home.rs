@@ -48,6 +48,8 @@ extern "C" fn redirect_home() {
         }
     };
     std::env::set_var("HOME", &dir);
+    // A KOTO_HOME from the shell would move the koto root past this HOME.
+    std::env::remove_var("KOTO_HOME");
     std::env::remove_var("XDG_CACHE_HOME");
     std::env::set_var(TEST_HOME_ENV, &dir);
     let _ = CREATED.set(dir);

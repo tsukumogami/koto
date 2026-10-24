@@ -30,6 +30,18 @@ to `0.9.x`).
 
 ### Added
 
+- **`KOTO_HOME` moves the whole koto root (koto#459).** Sessions, the
+  request store, `config.toml`, the terminal index, coordinator cursors,
+  wake files, the decider ledger, the run journal and the root
+  `koto session prune` walks all resolve from one place: `KOTO_HOME` when
+  it's set, `~/.koto` otherwise, so with it unset nothing moves. A test or
+  trial can isolate koto with that one variable instead of overriding
+  `HOME`. `koto session dir` with no name prints the resolved root without
+  reading config or writing anything, and gates and default actions get
+  `KOTO_HOME` when the ticking koto has it set, so a nested koto uses the
+  same root. `KOTO_SESSIONS_BASE` keeps its meaning. `clippy.toml` now
+  disallows `dirs::home_dir` outside `src/koto_home.rs`, so a new path built
+  from the home directory fails the lint check.
 - **A `reserved_actions` retry carries its evidence as a field (koto#405).**
   Each entry has `evidence`, the `{"retry_failed": {...}}` object its
   `invocation` submits. An agent writes it to a file and submits it with

@@ -10,6 +10,15 @@ koto's CLI manages workflow state for AI coding agents. All commands output JSON
 
 Each workflow's state lives in a dedicated session directory under `~/.koto/sessions/<name>/`. The namespace is flat and shared across repositories: a session name identifies a session on this machine, wherever it was started.
 
+`~/.koto` is the koto root, and everything koto keeps for itself lives under it: sessions, the request store, the user config (`config.toml`), the terminal index, coordinator cursors, wake files, the decider ledger and the run journal. Set `KOTO_HOME` to move the whole root at once, for example to run a test or a trial against a scratch directory without touching your real store:
+
+```bash
+export KOTO_HOME=$(mktemp -d)
+koto session dir    # prints the root, here the scratch directory
+```
+
+A relative `KOTO_HOME` is taken against the current directory; an empty one counts as unset. When `KOTO_HOME` is set, the commands a session's gates and default actions run get it too, so a koto they call uses the same root. `KOTO_SESSIONS_BASE` still moves only the local session directory, and wins over `<root>/sessions` when both are set. The compiled-template cache isn't under the root: it follows `XDG_CACHE_HOME` (or `~/.cache/koto`) as before.
+
 Older koto versions namespaced sessions by repository (`~/.koto/sessions/<repo-id>/<name>/`). koto migrates that layout on first use. A name that was reused across repositories has several old-layout sources and one flat destination, so only one of them can keep the name; the rest are moved aside into `~/.koto/sessions/.migration-conflicts/<repo-id>/<name>/` and are not listed until you restore them. See [session recover](#session-recover).
 
 The state file inside each session directory is named `koto-<name>.state.jsonl` and uses an event log format:
@@ -65,7 +74,7 @@ Every new session's header carries an **origin record**, `origin`: the session's
 
 #### Command environment
 
-`koto init` also records the environment the session's gates and default actions will run with. It records `PATH` (with empty and relative entries dropped), `HOME` and `XDG_CONFIG_HOME` from its own process, plus koto's default list of variable names whose values are read live on each tick. Every command then runs as `/bin/sh -c` in a cleared environment holding those names' live values, the names the template declares in `pass_env:`, the three recorded values, and `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE`. Nothing else from your shell reaches it. A child, whether spawned by a batch, `koto init --parent` or `koto session start`, copies its parent's record, and records from its own process only when the parent has none yet. The default-action guide's [What a command's environment is](default-action-authoring.md#what-a-commands-environment-is) publishes the lists.
+`koto init` also records the environment the session's gates and default actions will run with. It records `PATH` (with empty and relative entries dropped), `HOME` and `XDG_CONFIG_HOME` from its own process, plus koto's default list of variable names whose values are read live on each tick. Every command then runs as `/bin/sh -c` in a cleared environment holding those names' live values, the names the template declares in `pass_env:`, the three recorded values, and `KOTO_TICK_SESSION` and `KOTO_SESSIONS_BASE` (plus `KOTO_HOME` when it's set). Nothing else from your shell reaches it. A child, whether spawned by a batch, `koto init --parent` or `koto session start`, copies its parent's record, and records from its own process only when the parent has none yet. The default-action guide's [What a command's environment is](default-action-authoring.md#what-a-commands-environment-is) publishes the lists.
 
 When recording drops a `PATH` entry, or leaves a value unset because it was relative or contained a token's or proxy URL's value, the response carries an `environment` report naming them:
 
@@ -533,6 +542,12 @@ koto session dir <name>
 ```
 
 The path is printed even if the directory doesn't exist yet (no I/O validation). This lets callers check the path before or after `koto init`.
+
+With no name, it prints the koto root instead: `KOTO_HOME` when it's set, otherwise `~/.koto`. It reads no config and writes nothing, so a test harness can run it first and refuse to go on unless the root is under its scratch directory.
+
+```bash
+koto session dir
+```
 
 #### session list
 
@@ -1112,7 +1127,7 @@ Unlike other template subcommands, export errors go to stderr as plain text (not
 The `config` subcommand group reads and writes koto's configuration. koto looks for config in two places, merged in this order (later wins):
 
 1. **Project config** -- `.koto/config.toml` in the current repository. Checked into version control and shared with collaborators.
-2. **User config** -- `~/.koto/config.toml`. Machine-specific settings and credentials.
+2. **User config** -- `~/.koto/config.toml` (`$KOTO_HOME/config.toml` when `KOTO_HOME` is set). Machine-specific settings and credentials.
 
 Project config uses an allowlist. Only non-secret keys are allowed -- credential keys like `session.cloud.access_key` and `session.cloud.secret_key` are rejected with an error if you try to set them in project config.
 
@@ -1387,7 +1402,7 @@ koto decider report --fixtures <path> --template <path> --state <state> [--field
 ```
 
 **Optional flags:**
-- `--ledger <path>` -- Ledger to read. Defaults to `_decider_ledger.jsonl` in the koto home directory (`~/.koto/_decider_ledger.jsonl`, resolved from `HOME`). A missing ledger is an empty report, not an error.
+- `--ledger <path>` -- Ledger to read. Defaults to `_decider_ledger.jsonl` in the koto root (`~/.koto/_decider_ledger.jsonl`, or under `KOTO_HOME` when it's set). A missing ledger is an empty report, not an error.
 - `--state <state>` -- Report only questions on this state, in the table and in JSON. With `--fixtures`, it's also the state whose declaration the fixtures exercise.
 - `--json` -- Print the report as JSON instead of a table.
 - `--include-custom-endpoints` -- Count consultations and fixture runs sent to a user-config or `KOTO_DECIDER_ENDPOINT` endpoint toward promotion eligibility. Without it, only the default endpoint counts, so stub and redirected runs can't reach the bar. Metrics include custom-endpoint consultations either way.
