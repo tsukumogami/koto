@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Proposed
+status: Accepted
 problem: |
   koto's retention engine keeps a session only while a member of its
   hierarchy is alive, and every removal point either asks that engine or
@@ -39,7 +39,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context and Problem Statement
 
