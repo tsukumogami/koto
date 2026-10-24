@@ -158,7 +158,10 @@ impl Host {
                 .env("KOTO_SESSION_CLOUD_REGION", "us-east-1")
                 .env("KOTO_SESSION_CLOUD_PATH_STYLE", "true")
                 .env("KOTO_SESSION_CLOUD_ACCESS_KEY", "test-access-key")
-                .env("KOTO_SESSION_CLOUD_SECRET_KEY", "test-secret-key");
+                .env("KOTO_SESSION_CLOUD_SECRET_KEY", "test-secret-key")
+                // Each process checks for itself, so a test's requests
+                // are its own; the tests of the window set it themselves.
+                .env("KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS", "0");
         } else {
             cmd.env("KOTO_SESSION_BACKEND", "local");
         }
@@ -509,6 +512,247 @@ fn a_forty_read_action_on_the_cloud_backend_is_within_twice_local() {
         "a {READS}-read action took {:?} on the cloud backend, over twice the local {:?} plus one round trip",
         cloud_action,
         local_action
+    );
+}
+
+/// `script` between the action-start and action-end stamps that
+/// [`action_time`] reads.
+fn timed(script: &str) -> String {
+    let stamp = |file: &str| format!("perl -MTime::HiRes=time -e 'printf \"%.6f\", time' > {file}");
+    format!(
+        "set -e\n{}\n{}\n{}",
+        stamp("action-start"),
+        script,
+        stamp("action-end")
+    )
+}
+
+/// Run `next HUB` on a cloud and a local host whose hub runs `script`, with
+/// every bucket request taking `latency`, and return each action's own time.
+fn hub_actions(script: &str, workers: &[&str], latency: Duration) -> (Duration, Duration) {
+    let s3 = FakeS3::start(BUCKET);
+    let cloud = Host::new(&s3, true);
+    let local = Host::new(&s3, false);
+    for h in [&cloud, &local] {
+        for w in workers {
+            h.init(w, "true");
+            h.add(w, "k.md", b"the value");
+            h.ok(&["context", "get", w, "k.md"]);
+        }
+        h.init(HUB, &timed(script));
+        h.add(HUB, "mine.md", b"the hub's own key");
+    }
+    s3.set_latency(latency);
+    let local_action = {
+        local.ok(&["next", HUB]);
+        action_time(&local)
+    };
+    let cloud_action = {
+        cloud.ok(&["next", HUB]);
+        action_time(&cloud)
+    };
+    s3.set_latency(Duration::ZERO);
+    (local_action, cloud_action)
+}
+
+/// The cloud time of a hub action that makes only `write`, the first write of
+/// its tick, which checks the bucket and marks a batch open whatever the
+/// reads after it cost. The benches below bound their reads on top of it.
+fn write_only_action(write: &str, workers: &[&str], latency: Duration) -> Duration {
+    hub_actions(write, workers, latency).1
+}
+
+/// A hub tick whose action writes its own session and then reads it 40
+/// times, from 40 koto processes, the way a coordinator's record reads go.
+/// The tick checked its own session when it started, and its own writes are
+/// what changed the local copy, so the reads ask the bucket nothing
+/// (koto#439): past the action's write, which costs its own requests, the
+/// 40 reads cost at most twice the local action plus one round trip of
+/// slack.
+#[test]
+fn a_hub_reading_its_own_session_after_writing_it_asks_the_bucket_nothing() {
+    const LATENCY: Duration = Duration::from_millis(150);
+    const READS: usize = 40;
+    let write = format!("printf 'written in the tick' | koto context add {HUB} mine.md");
+    let mut script = vec![write.clone()];
+    for _ in 0..READS {
+        script.push(format!("koto context get {HUB} mine.md > /dev/null"));
+    }
+    let write_only = write_only_action(&write, &[], LATENCY);
+    let (local_action, cloud_action) = hub_actions(&script.join("\n"), &[], LATENCY);
+    eprintln!(
+        "own write then {READS} own reads at {:?} a request: action local {:?}, cloud {:?} \
+         (the write alone, cloud {:?})",
+        LATENCY, local_action, cloud_action, write_only
+    );
+    assert!(
+        cloud_action <= write_only + local_action * 2 + LATENCY,
+        "the hub's {READS} reads of its own session took {:?} on the cloud backend, over the \
+         write alone ({:?}) plus twice the local {:?} plus one round trip",
+        cloud_action,
+        write_only,
+        local_action
+    );
+}
+
+/// The shape of a coordinator hub's wait-target select: it records what it
+/// is about to do, then reads each worker's state and its own record over
+/// and over while it picks. Past the action's write, each worker costs the
+/// tick one check and the hub's own session none: the reads cost at most
+/// twice the local action plus one round trip per worker and one of slack.
+#[test]
+fn a_hub_select_over_its_workers_checks_each_session_once() {
+    const LATENCY: Duration = Duration::from_millis(150);
+    const WORKERS: [&str; 4] = ["worker-a", "worker-b", "worker-c", "worker-d"];
+    let write = format!("printf 'selecting' | koto context add {HUB} mine.md");
+    let mut script = vec![write.clone()];
+    for _ in 0..3 {
+        for w in WORKERS {
+            script.push(format!("koto context get {w} k.md > /dev/null"));
+            script.push(format!("koto context get {HUB} mine.md > /dev/null"));
+            script.push(format!("koto context exists {HUB} mine.md"));
+        }
+    }
+    let write_only = write_only_action(&write, &WORKERS, LATENCY);
+    let (local_action, cloud_action) = hub_actions(&script.join("\n"), &WORKERS, LATENCY);
+    eprintln!(
+        "select over {} workers at {:?} a request: action local {:?}, cloud {:?} \
+         (the write alone, cloud {:?})",
+        WORKERS.len(),
+        LATENCY,
+        local_action,
+        cloud_action,
+        write_only
+    );
+    let checks = LATENCY * (WORKERS.len() as u32 + 1);
+    assert!(
+        cloud_action <= write_only + local_action * 2 + checks,
+        "the select took {:?} on the cloud backend, over the write alone ({:?}) plus twice \
+         the local {:?} plus one round trip per worker and one of slack",
+        cloud_action,
+        write_only,
+        local_action
+    );
+}
+
+/// Outside any tick, separate koto processes reading a session share one
+/// check of it while the check window lasts, and a window of 0 turns the
+/// sharing off.
+#[test]
+fn reads_from_separate_processes_share_one_check_inside_the_window() {
+    const READS: usize = 10;
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    worker_with_a_key(&h);
+    let listings = |window: Option<&str>| {
+        // Start each run with no check on file, so the setup's own read
+        // doesn't stand in for the first listing.
+        let _ = std::fs::remove_file(h.session_dir(WORKER).join("cloud-check.json"));
+        let reqs = requests_during(&s3, &h.prefix(), || {
+            for _ in 0..READS {
+                let mut cmd = h.cmd(&["context", "get", WORKER, "k.md"]);
+                match window {
+                    Some(w) => cmd.env("KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS", w),
+                    None => cmd.env_remove("KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS"),
+                };
+                let out = cmd.output().unwrap();
+                assert!(out.status.success(), "context get: {out:?}");
+            }
+        });
+        reqs.iter()
+            .filter(|r| *r == &format!("LIST {WORKER}/"))
+            .count()
+    };
+    // With nothing set, the first read lists and the other nine reuse its
+    // check: the default window outlasts ten reads.
+    assert_eq!(listings(None), 1, "{READS} reads in the default window");
+    assert_eq!(
+        listings(Some("0")),
+        READS,
+        "{READS} reads with the window off"
+    );
+}
+
+/// The window's cost: inside it, a read from this host doesn't see another
+/// host's write; once it passes, the next read lists and does.
+#[test]
+fn another_hosts_write_is_seen_once_the_window_passes() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    worker_with_a_key(&h);
+    let read = || {
+        let out = h
+            .cmd(&["context", "get", WORKER, "k.md"])
+            .env("KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "context get: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(read(), "the value");
+    // Another host's push of `k.md`, made straight into the bucket.
+    {
+        use sha2::{Digest, Sha256};
+        let value = b"changed elsewhere";
+        let key = |rest: &str| format!("{}/{WORKER}/{rest}", h.prefix());
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&s3.object(&key("ctx/manifest.json")).unwrap()).unwrap();
+        manifest["keys"]["k.md"]["hash"] = hex::encode(Sha256::digest(value)).into();
+        s3.put(&key("ctx/k.md"), value);
+        s3.put(
+            &key("ctx/manifest.json"),
+            &serde_json::to_vec(&manifest).unwrap(),
+        );
+    }
+    assert_eq!(read(), "the value", "inside the window the check is reused");
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(
+        read(),
+        "changed elsewhere",
+        "after the window the read lists"
+    );
+}
+
+/// The window is for reads. A write checks the bucket itself, so a session
+/// imported elsewhere a moment after this host read it refuses the write
+/// even while a read would still reuse the earlier check.
+#[test]
+fn a_write_inside_the_window_still_sees_a_new_migration_marker() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    worker_with_a_key(&h);
+    let with_window = |args: &[&str]| {
+        let mut cmd = h.cmd(args);
+        cmd.env("KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS", "60");
+        cmd
+    };
+    assert!(with_window(&["context", "get", WORKER, "k.md"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    s3.put(
+        &format!("{}/{WORKER}/migrated.json", h.prefix()),
+        br#"{"target":{"prefix":"elsewhere","session":"worker","workspace":"/elsewhere"}}"#,
+    );
+    let read = with_window(&["context", "get", WORKER, "k.md"])
+        .output()
+        .unwrap();
+    assert!(read.status.success(), "the read reuses the check: {read:?}");
+    let write = with_window(&["context", "add", WORKER, "k.md"])
+        .write_stdin(b"after the import".to_vec())
+        .output()
+        .unwrap();
+    assert!(!write.status.success(), "the write must refuse: {write:?}");
+    assert!(
+        String::from_utf8_lossy(&write.stdout).contains("session_migrated")
+            || String::from_utf8_lossy(&write.stderr).contains("session_migrated"),
+        "{write:?}"
+    );
+    assert_eq!(
+        s3.object(&format!("{}/{WORKER}/ctx/k.md", h.prefix()))
+            .unwrap(),
+        b"the value"
     );
 }
 

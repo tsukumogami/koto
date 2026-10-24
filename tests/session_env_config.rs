@@ -225,8 +225,8 @@ fn config_list_reports_every_source() {
         ],
     );
     let o = list["origins"].as_object().expect("an origins object");
-    // Eight session settings and the three retention settings.
-    assert_eq!(o.len(), 11, "{list}");
+    // Nine session settings and the three retention settings.
+    assert_eq!(o.len(), 12, "{list}");
     assert_eq!(
         origin(&list, "session.backend"),
         ("env".into(), Some("KOTO_SESSION_BACKEND".into()))
@@ -288,7 +288,7 @@ fn toml_output_parses_to_the_same_tables_with_origin_comments() {
         .lines()
         .filter(|l| l.starts_with("# origin: "))
         .collect();
-    assert_eq!(lines.len(), 11, "{text}");
+    assert_eq!(lines.len(), 12, "{text}");
     assert!(
         lines.contains(&"# origin: session.backend = user"),
         "{text}"

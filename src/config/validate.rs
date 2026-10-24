@@ -37,6 +37,12 @@ pub fn validate_project_key(key: &str) -> Result<(), String> {
             "key '{}' guards a deletion from the bucket and can only be set in user config (--user)",
             key
         ))
+    } else if key == "session.cloud.check_window_secs" {
+        Err(format!(
+            "key '{}' sets how long a read may miss another host's writes and can only be set \
+             in user config (--user) or KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS",
+            key
+        ))
     } else if key == "decider.endpoint" {
         Err(format!(
             "key '{}' can only be set in user config (--user) or KOTO_DECIDER_ENDPOINT",

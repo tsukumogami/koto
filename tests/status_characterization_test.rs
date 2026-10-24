@@ -426,6 +426,9 @@ fn a_migrated_session_exits_two_with_the_exact_error_object() {
 
     let mut status = koto_command::koto();
     status.env_remove("CLAUDE_CODE_SESSION_ID");
+    // The marker landed a moment after the init's check, which a read
+    // inside the check window would reuse; this asks the bucket itself.
+    status.env("KOTO_SESSION_CLOUD_CHECK_WINDOW_SECS", "0");
     status.current_dir(&ws);
     status.env("HOME", tmp.path());
     status.env("AWS_ACCESS_KEY_ID", "k");

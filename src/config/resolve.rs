@@ -74,6 +74,7 @@ pub fn load_config() -> Result<KotoConfig> {
             mark_file_origins(&mut config, &user_config, Origin::User, true);
             merge_run_journal(&mut config, &user_config);
             merge_marker_retention(&mut config, &user_config);
+            merge_check_window(&mut config, &user_config);
             config
                 .retention
                 .merge_file(&user_config.config.retention, Origin::User);
@@ -155,8 +156,9 @@ where
 /// value. A file with a `[session]` table but no `backend` key still sets
 /// the backend to `local` through serde's default (and still replaces an
 /// earlier layer's value, as it always has); that value is koto's default,
-/// so the origin reads `default`. `marker_retain_days` merges from the user
-/// file only, so only that layer can be its origin.
+/// so the origin reads `default`. `marker_retain_days` and
+/// `check_window_secs` merge from the user file only, so only that layer
+/// can be their origin.
 fn mark_file_origins(
     config: &mut KotoConfig,
     loaded: &LoadedConfig,
@@ -164,7 +166,7 @@ fn mark_file_origins(
     user_layer: bool,
 ) {
     for setting in session_env::SETTINGS {
-        if setting == "session.cloud.marker_retain_days" && !user_layer {
+        if USER_ONLY_SESSION_SETTINGS.contains(&setting) && !user_layer {
             continue;
         }
         let named = loaded.session_keys.iter().any(|k| k == setting);
@@ -192,7 +194,8 @@ where
     F: Fn(&str) -> EnvValue,
 {
     use session_env::{
-        InvalidEnv, ENV_BACKEND, ENV_BUCKET, ENV_ENDPOINT, ENV_PATH_STYLE, ENV_REGION,
+        InvalidEnv, ENV_BACKEND, ENV_BUCKET, ENV_CHECK_WINDOW, ENV_ENDPOINT, ENV_PATH_STYLE,
+        ENV_REGION,
     };
     for (setting, var) in [
         ("session.backend", ENV_BACKEND),
@@ -200,6 +203,7 @@ where
         ("session.cloud.bucket", ENV_BUCKET),
         ("session.cloud.region", ENV_REGION),
         ("session.cloud.path_style", ENV_PATH_STYLE),
+        ("session.cloud.check_window_secs", ENV_CHECK_WINDOW),
     ] {
         let Some(value) = session_var(&lookup, var) else {
             continue;
@@ -219,12 +223,20 @@ where
                 cloud.path_style = None;
                 config.session_env.invalid.push(invalid(Some(v)));
             }
+            ("session.cloud.check_window_secs", Ok(v)) => match v.parse::<u64>() {
+                Ok(secs) => cloud.check_window_secs = Some(secs),
+                Err(_) => {
+                    cloud.check_window_secs = None;
+                    config.session_env.invalid.push(invalid(Some(v)));
+                }
+            },
             (_, Err(())) => {
                 match setting {
                     "session.backend" => config.session.backend = String::new(),
                     "session.cloud.endpoint" => cloud.endpoint = None,
                     "session.cloud.bucket" => cloud.bucket = None,
                     "session.cloud.region" => cloud.region = None,
+                    "session.cloud.check_window_secs" => cloud.check_window_secs = None,
                     _ => cloud.path_style = None,
                 }
                 config.session_env.invalid.push(invalid(None));
@@ -671,6 +683,23 @@ fn merge_config(target: &mut KotoConfig, source: &LoadedConfig) {
 fn merge_marker_retention(target: &mut KotoConfig, source: &LoadedConfig) {
     if source.config.session.cloud.marker_retain_days.is_some() {
         target.session.cloud.marker_retain_days = source.config.session.cloud.marker_retain_days;
+    }
+}
+
+/// The session settings only the user file (or, for some, the environment)
+/// may set: a project file in a cloned repository must not change them.
+const USER_ONLY_SESSION_SETTINGS: [&str; 2] = [
+    "session.cloud.marker_retain_days",
+    "session.cloud.check_window_secs",
+];
+
+/// Apply `session.cloud.check_window_secs` from a config file. Called for
+/// the user layer only: the window is how long a read may miss another
+/// host's writes, so a project file in a cloned repository must not widen it
+/// (`koto config set` refuses the key without `--user`).
+fn merge_check_window(target: &mut KotoConfig, source: &LoadedConfig) {
+    if source.config.session.cloud.check_window_secs.is_some() {
+        target.session.cloud.check_window_secs = source.config.session.cloud.check_window_secs;
     }
 }
 
@@ -2289,6 +2318,7 @@ mod session_env_tests {
             merge_config(&mut config, &loaded);
             if user_layer {
                 merge_marker_retention(&mut config, &loaded);
+                merge_check_window(&mut config, &loaded);
             }
             mark_file_origins(&mut config, &loaded, origin, user_layer);
         }
@@ -2459,6 +2489,42 @@ mod session_env_tests {
         assert_eq!(
             c.session_env.origin("session.cloud.marker_retain_days"),
             Origin::User
+        );
+    }
+
+    #[test]
+    fn check_window_comes_from_the_user_file_or_its_variable_never_the_project() {
+        use super::super::session_env::ENV_CHECK_WINDOW;
+        let setting = "session.cloud.check_window_secs";
+        let unset = resolve("", "", &[]);
+        assert_eq!(unset.session.cloud.check_window_secs(), 5);
+        assert_eq!(unset.session_env.origin(setting), Origin::Default);
+
+        let project = resolve("", "[session.cloud]\ncheck_window_secs = 600\n", &[]);
+        assert_eq!(project.session.cloud.check_window_secs(), 5);
+        assert_eq!(project.session_env.origin(setting), Origin::Default);
+
+        let user = resolve("[session.cloud]\ncheck_window_secs = 2\n", "", &[]);
+        assert_eq!(user.session.cloud.check_window_secs(), 2);
+        assert_eq!(user.session_env.origin(setting), Origin::User);
+
+        let env = resolve(
+            "[session.cloud]\ncheck_window_secs = 2\n",
+            "",
+            &[(ENV_CHECK_WINDOW, "0")],
+        );
+        assert_eq!(env.session.cloud.check_window_secs(), 0);
+        assert_eq!(
+            env.session_env.origin(setting),
+            Origin::Env(ENV_CHECK_WINDOW)
+        );
+
+        let bad = resolve("", "", &[(ENV_CHECK_WINDOW, "five")]);
+        assert_eq!(bad.session.cloud.check_window_secs, None);
+        let err = session_env::check(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains(ENV_CHECK_WINDOW) && err.contains("\"five\""),
+            "{err}"
         );
     }
 
