@@ -582,6 +582,21 @@ pub trait SessionBackend: Send + Sync {
         Ok(())
     }
 
+    /// # Stability: additive-only
+    ///
+    /// What the store's remote half holds of `id`'s pin: the bucket check
+    /// the removal guard makes before every delete
+    /// ([`crate::session::pin::guard_removal`]). A fresh listing of the
+    /// session's `ctx/koto/` objects, never a cached one, then a read of the
+    /// pin object when it is there, or of the release record when there is
+    /// none and `local_pin_id` names this host's pin, to tell whether that
+    /// pin was released on another host.
+    ///
+    /// The default, for a backend with no remote half, is `NotApplicable`.
+    fn bucket_pin(&self, _id: &str, _local_pin_id: Option<&str>) -> crate::session::pin::BucketPin {
+        crate::session::pin::BucketPin::NotApplicable
+    }
+
     /// Acquire a non-blocking advisory `flock(LOCK_EX | LOCK_NB)` on
     /// the session's state file.
     ///
@@ -902,6 +917,13 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.relocate_local_only(from, to),
             Backend::Cloud(b) => b.relocate_local_only(from, to),
+        }
+    }
+
+    fn bucket_pin(&self, id: &str, local_pin_id: Option<&str>) -> crate::session::pin::BucketPin {
+        match self {
+            Backend::Local(b) => b.bucket_pin(id, local_pin_id),
+            Backend::Cloud(b) => b.bucket_pin(id, local_pin_id),
         }
     }
 

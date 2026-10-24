@@ -323,11 +323,17 @@ fn is_standalone_record(key: &str) -> bool {
 /// and every clock read from it stay as they were. Only the pin and the
 /// release record are written this way, and only by
 /// [`crate::session::pin`], which holds the session's lock around it.
+///
+/// With `indexed` false the record is a bare file instead: the copy a cloud
+/// host keeps of an object the bucket holds, which the sync must not track
+/// (R20a). No manifest entry is written, and one an earlier local-backend
+/// write left is dropped; a manifest that lists no such key isn't touched.
 pub(crate) fn write_reserved_record(
     store: &crate::session::local::LocalBackend,
     session: &str,
     key: &str,
     content: &[u8],
+    indexed: bool,
 ) -> anyhow::Result<()> {
     use std::io::Write;
     anyhow::ensure!(
@@ -353,6 +359,18 @@ pub(crate) fn write_reserved_record(
         .map_err(|e| anyhow::anyhow!("failed to write {key}: {e}"))?;
     tmp.persist(&path)
         .map_err(|e| anyhow::anyhow!("failed to write {}: {}", path.display(), e.error))?;
+    if !indexed {
+        let listed = store
+            .read_manifest(session)
+            .is_ok_and(|m| m.keys.contains_key(key));
+        return if listed {
+            store.update_manifest_locked(session, |m| {
+                m.keys.remove(key);
+            })
+        } else {
+            Ok(())
+        };
+    }
     let meta = crate::session::context::KeyMeta {
         created_at: crate::engine::types::now_iso8601(),
         size: content.len() as u64,
@@ -380,9 +398,17 @@ pub(crate) fn remove_reserved_record(
     );
     crate::session::validate::validate_context_key(key)?;
     let under = format!("{key}/");
-    store.update_manifest_locked(session, |m| {
-        m.keys.retain(|k, _| k != key && !k.starts_with(&under));
-    })?;
+    let listed = |k: &String| k == key || k.starts_with(&under);
+    // A manifest that lists none of it is left alone: a cloud host's bare
+    // copy (R20a) has no entry to drop.
+    if store
+        .read_manifest(session)
+        .map_or(true, |m| m.keys.keys().any(listed))
+    {
+        store.update_manifest_locked(session, |m| {
+            m.keys.retain(|k, _| !listed(k));
+        })?;
+    }
     let path = store.session_dir(session).join("ctx").join(key);
     match std::fs::symlink_metadata(&path) {
         Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path),

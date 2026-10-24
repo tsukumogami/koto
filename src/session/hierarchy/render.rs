@@ -10,7 +10,7 @@ use super::judge::{Judgment, Keeper, Member, MemberKind, Retention, Unreadable, 
 use super::settings::RetentionSettings;
 use crate::config::session_env::Origin;
 use crate::session::anchor::{valid_token, AuthorityRecord};
-use crate::session::pin::{Pin, PinFact, ReleaseRecord, SOURCE_LOCAL};
+use crate::session::pin::{Pin, PinFact, ReleaseRecord};
 
 /// `s` with every control character removed.
 pub fn sanitize(s: &str) -> String {
@@ -52,7 +52,8 @@ pub fn display_text(s: &str) -> String {
 }
 
 /// A readable pin as every kept entry carries it: `reason`, `set_by`,
-/// `set_at`, and `source`, where the pin was read (`local` in this build).
+/// `set_at`, and `source`, where the pin was read: `local`, this host's
+/// copy, or `bucket`, the bucket's pin object under the cloud backend.
 pub fn pin_json(pin: &Pin, source: &str) -> Value {
     json!({
         "reason": display_text(&pin.reason),
@@ -109,6 +110,8 @@ pub fn release_json(r: &ReleaseRecord) -> Value {
     json!({
         "released_by": text(&r.released_by),
         "authority": text(&r.authority),
+        "authority_at": text(&r.authority_at),
+        "authority_source": text(&r.authority_source),
         "reason": text(&r.reason),
         "released_at": display_text(&r.released_at),
         "pin": {
@@ -278,7 +281,7 @@ pub fn to_json(j: &Judgment, settings: &RetentionSettings) -> Value {
     // this session only: `kept` stays the hierarchy's verdict. Nothing is
     // added for a session with no pin.
     if j.pin.is_pinned() {
-        for (k, v) in pin_fields(&j.pin, SOURCE_LOCAL) {
+        for (k, v) in pin_fields(&j.pin, j.pin_source) {
             out[k] = v;
         }
         out["pin_keeps"] = json!([sanitize(&j.session)]);

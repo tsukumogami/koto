@@ -188,6 +188,9 @@ pub struct Judgment {
     pub now: String,
     /// The judged session's own pin.
     pub pin: PinFact,
+    /// Where that pin was read: `local`, or `bucket` when a cloud host's
+    /// check of its scan found it there.
+    pub pin_source: &'static str,
     /// Each present member holding a pin, readable or not, by name.
     pub pinned_members: BTreeMap<String, PinFact>,
 }
@@ -414,6 +417,10 @@ impl<'g> Judge<'g> {
             clamped,
             now: iso8601_at(self.now),
             pin: pinned_members.get(name).cloned().unwrap_or_default(),
+            pin_source: self
+                .graph
+                .facts(name)
+                .map_or(crate::session::pin::SOURCE_LOCAL, |f| f.pin_source()),
             pinned_members,
         })
     }

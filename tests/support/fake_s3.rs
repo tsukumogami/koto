@@ -13,7 +13,9 @@
 //! (`?list-type=2&prefix=..&delimiter=..`) answered in the XML rust-s3
 //! parses. Every request is recorded as (method, key) in arrival order, so a
 //! test can assert exactly what a command wrote where. [`FakeS3::fail`]
-//! makes every matching request answer with a given status instead, and
+//! makes every matching request answer with a given status instead,
+//! [`FakeS3::garble_listing`] answers a listing with a body that isn't one,
+//! and
 //! [`FakeS3::put_after`] stores an object as soon as a given request has
 //! been handled, the way another writer racing the command would.
 //! [`FakeS3::set_latency`] holds every reply for a fixed time, so a test can
@@ -63,6 +65,8 @@ struct Fault {
     /// Store a PUT's body before answering with the failure, as an
     /// endpoint that wrote the object and lost the reply would.
     store: bool,
+    /// Answer 200 with a body that isn't a listing, instead of `status`.
+    garble: bool,
     /// How many more matching requests fail; `None` fails them all.
     remaining: Option<usize>,
 }
@@ -187,6 +191,21 @@ impl FakeS3 {
             key: key.to_string(),
             status,
             store: false,
+            garble: false,
+            remaining: None,
+        });
+    }
+
+    /// Answer every listing with exactly `prefix` with 200 and a body that
+    /// isn't a ListObjectsV2 result, as an endpoint that answered with
+    /// something else would.
+    pub fn garble_listing(&self, prefix: &str) {
+        lock(&self.state).faults.push(Fault {
+            method: "LIST".to_string(),
+            key: prefix.to_string(),
+            status: 200,
+            store: false,
+            garble: true,
             remaining: None,
         });
     }
@@ -200,6 +219,7 @@ impl FakeS3 {
             key: key.to_string(),
             status,
             store: false,
+            garble: false,
             remaining: Some(times),
         });
     }
@@ -212,6 +232,7 @@ impl FakeS3 {
             key: key.to_string(),
             status,
             store: true,
+            garble: false,
             remaining: None,
         });
     }
@@ -475,6 +496,9 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
         }
         if fault.store {
             st.objects.insert(key.clone(), req.body.clone());
+        }
+        if fault.garble {
+            return Reply::ok(b"<ListBucketResult><Contents><Key>".to_vec());
         }
         return Reply::error(fault.status, "InternalError", "injected failure");
     }

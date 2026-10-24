@@ -732,6 +732,10 @@ pub enum RetentionReason {
     /// failure terminal, which is reported as such with the pin beside it,
     /// and before the hierarchy.
     Pinned,
+    /// Under the cloud backend, the session would have been removed and the
+    /// bucket couldn't be checked for a pin, which keeps it (R23). The
+    /// report carries `bucket_unchecked` with its `error`.
+    BucketUnchecked,
 }
 
 impl RetentionReason {
@@ -741,6 +745,7 @@ impl RetentionReason {
             RetentionReason::NoCleanup => "no_cleanup",
             RetentionReason::Hierarchy => "hierarchy",
             RetentionReason::Pinned => "pinned",
+            RetentionReason::BucketUnchecked => "bucket_unchecked",
         }
     }
 }
