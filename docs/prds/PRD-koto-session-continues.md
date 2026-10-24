@@ -18,7 +18,8 @@ goals: |
   keeps anything later. An import's source stays as a read-only predecessor.
   Every removal on every host sharing the bucket judges the same lineage and
   names what keeps a session, and the relation grants no authority.
-upstream: docs/briefs/BRIEF-koto-session-continues.md
+absorbed:
+  - docs/briefs/BRIEF-koto-session-continues.md
 ---
 
 # PRD: A session names the session it continues
@@ -26,6 +27,40 @@ upstream: docs/briefs/BRIEF-koto-session-continues.md
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-koto-session-continues](docs/briefs/BRIEF-koto-session-continues.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+The brief named in Status is folded into this section and its file was
+removed when this PRD absorbed it; this section is the brief's framing, and
+there is no separate file to look for.
+
+The feature was framed before these requirements existed. Work in koto passes
+from one session to another: a coordinator's successor takes over, an
+unrelated session picks up stalled work, or `koto session import` moves a
+session to another workspace. koto kept no record that the new session
+carries on the old one, so retention removed the predecessor while the
+successor still read it, import retired its source on purpose, and a host
+sharing the bucket that never pulled the successor couldn't see the
+relationship at all. The framed outcome: a successor says once, at open and
+whoever launched it, which session it continues; the chain behind it stays
+readable while anything later in it is kept, on every host; a pin on the
+newest session keeps the chain, and an older session never keeps a newer one;
+an import's source stays as a read-only predecessor; and the relation grants
+no authority. The framing's four journeys (a coordinator's successor picking
+up the run, a stranger taking over stalled work, an operator moving a session
+to another workspace, and an operator keeping a finished chain as a record)
+are among the User Stories below. Its boundary put in: the directed relation
+held by the successor, the verb that writes it at open, import writing it in
+the copy, retention counting it one way only with pins reaching back, the new
+import contract, removals reading it from the bucket with unreadable relations
+keeping, and reports naming the keeper. It put out: any authority, trusted
+removal guards such as #458, the coordinator-name rule and read-by-name
+fixes, the takeover flow in workflow skills, instance lifetimes outside koto,
+the multi-directory bucket fork (#477) beyond what reading the relation
+needs, and retiring caller workarounds; the Out of Scope section below
+carries each.
 
 ## Problem Statement
 
