@@ -428,6 +428,8 @@ fn check_session(backend: &Backend, name: &str) -> Result<(), PinError> {
         Backend::Cloud(cloud) => cloud.check_not_migrated_to_write(name),
     };
     if let Err(e) = migrated {
+        // The removal guard treats this copy's pin as inert, so the way out
+        // is cleanup, not an unpin: say so, or the refusal is a dead end.
         return Err(PinError::refusal(
             "not_pinnable",
             format!(

@@ -3140,12 +3140,13 @@ impl SessionBackend for CloudBackend {
     }
 
     fn is_migrated_source(&self, id: &str) -> bool {
-        // Only the bucket's marker says yes. The local guard refuses with
-        // the same error type when the local copy at this name is the moved
-        // copy of a same-host import, which is the copy that holds the pin,
-        // so its refusal says no. The write-side check then lists for
-        // itself; a failed listing warns and lets it pass, which says no
-        // too, so the pin keeps.
+        // Only the bucket's marker says yes. The local guard refuses, with
+        // the same error type, when the local copy at this name is the moved
+        // copy of a same-host import, which is the copy that holds the pin;
+        // it refuses with a plain error while such an import is pending. Any
+        // refusal of it says no. The write-side check then answers from this
+        // process's own listing; a failed listing warns and lets it pass,
+        // which says no too, so the pin keeps.
         if self.local_guard(id).is_err() {
             return false;
         }

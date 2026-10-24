@@ -646,9 +646,10 @@ pub trait SessionBackend: Send + Sync {
     ///
     /// Whether `id` is a migrated source: `koto session import` moved it to
     /// another workspace and left a migration marker under its prefix. Its
-    /// pin is inert, since the moved copy holds it. Asked by a fresh
-    /// listing, never an answer another process lent; a check that can't be
-    /// made answers `false`, so the pin keeps.
+    /// pin is inert, since the moved copy holds it. Answered the way a write
+    /// is checked: from this process's own listing, or a tick's check its
+    /// local copy still matches, never from an answer another process lent.
+    /// A check that can't be made answers `false`, so the pin keeps.
     ///
     /// The default, for a backend with no remote half, is `false`.
     fn is_migrated_source(&self, _id: &str) -> bool {
