@@ -284,8 +284,9 @@ continues it.
 
 - **R21.** A read from a directory other than the session's own makes no more
   bucket requests than the same read from the session's own directory with
-  the same cache state, plus at most one listing when the location came from
-  R12's fallback.
+  the same cache state, plus, when the location came from R12's fallback, one
+  listing per distinct candidate location (at most two), since telling one
+  confirmed location from two needs both looked at.
 - **R22.** Sessions created before koto recorded `origin.store.prefix` keep
   working from their own directory as they do today: the existing tests for
   those sessions pass unchanged.
@@ -410,8 +411,8 @@ Refusal wording:
 Non-functional:
 - [ ] With the same cache state on both sides (cold, then warm), the
   stand-in's request log for `koto context get S k` from B has no more
-  entries than from A, plus at most one listing for a session located
-  through R12's fallback.
+  entries than from A, plus one listing per distinct candidate location (at
+  most two) for a session located through R12's fallback.
 - [ ] The existing tests for sessions without `origin.store.prefix` pass
   unchanged.
 
