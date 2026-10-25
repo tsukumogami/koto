@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Accepted
+status: In Progress
 problem: |
   On a host where many workflows share one koto store and one bucket, koto's
   removals and reads can't be trusted enough to use: a short-retention bulk
@@ -26,7 +26,7 @@ absorbed:
 
 ## Status
 
-Accepted
+In Progress
 
 Absorbed [BRIEF-koto-trusted-removal](docs/briefs/BRIEF-koto-trusted-removal.md); carried in Absorbed Brief.
 
