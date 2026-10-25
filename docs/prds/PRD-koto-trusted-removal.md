@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: Draft
+status: Accepted
 problem: |
   On a host where many workflows share one koto store and one bucket, koto's
   removals and reads can't be trusted enough to use: a short-retention bulk
@@ -25,7 +25,7 @@ upstream: docs/briefs/BRIEF-koto-trusted-removal.md
 
 ## Status
 
-Draft
+Accepted
 
 ## Problem Statement
 
