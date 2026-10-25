@@ -579,6 +579,208 @@ pub fn handle_link(backend: &Backend, session: &str, dispatched_by: &str) -> Res
     Ok(())
 }
 
+/// A predecessor `--continues` named, checked before anything is written:
+/// its name and what the relation will record about it (R2).
+pub(crate) struct ContinuesTarget {
+    pub pred: String,
+    hints: crate::session::links::LinkHints,
+}
+
+/// Why `--continues` was refused: the message and the exit code (2 for
+/// what the caller named, 3 for a store that couldn't be read or written).
+pub(crate) struct ContinuesError {
+    pub message: String,
+    pub exit: i32,
+}
+
+impl ContinuesError {
+    fn caller(message: String) -> Self {
+        Self {
+            message,
+            exit: super::EXIT_CALLER_ERROR,
+        }
+    }
+}
+
+/// Check `--continues <pred> [--continues-from <workspace>]` for session
+/// `successor` before anything is written (R1, R3): `pred` passes the
+/// session-name rule and isn't `successor`; `--continues-from` names a
+/// workspace (an absolute path or a 16-hex workspace id, as `koto
+/// --workspace` takes it); `pred` is a session in the local store, and not
+/// an anchor or an anchor's close record. A running, finished or pinned
+/// predecessor may be named. Nothing here reads `KOTO_ANCHOR`,
+/// `KOTO_AUTHORITY`, a request leg or a dispatcher (R20): a coordinator's
+/// successor, an operator by hand and an unrelated agent session record the
+/// relation the same way.
+///
+/// Under the cloud backend it refuses (exit 2): the relation needs a
+/// back-reference in the predecessor's bucket prefix, which this build
+/// doesn't write, and a relation in the bucket without one would be one a
+/// host that never pulled the successor can't find. On the local backend
+/// there is one store, so `--continues-from` is checked and the predecessor
+/// is looked up there.
+pub(crate) fn resolve_continues(
+    backend: &Backend,
+    successor: &str,
+    pred: &str,
+    from: Option<&str>,
+) -> std::result::Result<ContinuesTarget, ContinuesError> {
+    use crate::engine::types::SessionKind;
+    use crate::session::links::{self, LinkHints, LinkKind};
+
+    links::validate_peer(LinkKind::Continues, pred)
+        .map_err(|e| ContinuesError::caller(format!("--continues: {e}")))?;
+    if pred == successor {
+        return Err(ContinuesError::caller(format!(
+            "--continues: session '{successor}' can't continue itself"
+        )));
+    }
+    if let Some(from) = from {
+        crate::session::cloud::workspace_read::WorkspaceId::parse(from)
+            .map_err(|e| ContinuesError::caller(format!("--continues-from: {}", e.message)))?;
+    }
+    if backend.is_cloud() {
+        return Err(ContinuesError::caller(
+            "--continues: the cloud backend can't record a continues relation in this release: \
+             it needs a back-reference beside the predecessor in the bucket, which this koto \
+             doesn't write yet; nothing was written"
+                .to_string(),
+        ));
+    }
+    if !backend.exists(pred) {
+        return Err(ContinuesError::caller(format!(
+            "--continues: no session named '{pred}' in this store"
+        )));
+    }
+    if let Ok(header) = backend.read_header(pred) {
+        match header.session_kind() {
+            SessionKind::Anchor => {
+                return Err(ContinuesError::caller(format!(
+                    "--continues: '{pred}' is an agent session's anchor, which no session \
+                     continues"
+                )))
+            }
+            SessionKind::AnchorClose => {
+                return Err(ContinuesError::caller(format!(
+                    "--continues: '{pred}' is an anchor's close record, which no session \
+                     continues"
+                )))
+            }
+            SessionKind::Ordinary => {}
+        }
+    }
+    Ok(ContinuesTarget {
+        pred: pred.to_string(),
+        hints: LinkHints::for_peer(backend, pred),
+    })
+}
+
+/// Write the continues relation `target` names into `successor`, and only
+/// there (Decision 1). Returns whether it was written; a relation the
+/// session already holds changes nothing. A session already continuing
+/// another predecessor is refused with exit 2, writing nothing; a store
+/// that can't be read or written exits 3.
+pub(crate) fn record_continues(
+    backend: &Backend,
+    successor: &str,
+    target: &ContinuesTarget,
+) -> std::result::Result<crate::session::links::LinkWrite, ContinuesError> {
+    use crate::session::links::{self, ContinuesHints, ContinuesRefusal};
+    let holder_session_id = backend
+        .read_header(successor)
+        .ok()
+        .map(|h| h.session_id)
+        .filter(|id| !id.is_empty());
+    let hints = ContinuesHints {
+        peer: target.hints.clone(),
+        prefix: None,
+        holder_session_id,
+        holder_prefix: None,
+    };
+    links::write_continues(backend, successor, &target.pred, &hints).map_err(|e| {
+        match e.downcast_ref::<ContinuesRefusal>() {
+            Some(refusal) => ContinuesError::caller(format!("--continues: {refusal}")),
+            None => ContinuesError {
+                message: format!(
+                    "could not record that '{successor}' continues '{}': {e:#}",
+                    target.pred
+                ),
+                exit: super::EXIT_INFRASTRUCTURE,
+            },
+        }
+    })
+}
+
+/// Record `koto init --continues` in the session just opened, before the
+/// command reports it: the session never exists without its relation
+/// unless this write fails, and then the command fails (exit 3, or 2 when
+/// an attached session already continues another one) naming the
+/// `koto session link` that records it.
+pub(crate) fn record_continues_at_init(backend: &Backend, name: &str, target: &ContinuesTarget) {
+    if let Err(e) = record_continues(backend, name, target) {
+        super::exit_with_error_code(
+            serde_json::json!({
+                "error": format!(
+                    "{}; session '{name}' was opened without it: run `koto session link {name} \
+                     --continues {}` to record it",
+                    e.message, target.pred
+                ),
+                "command": "init",
+            }),
+            e.exit,
+        )
+    }
+}
+
+/// `koto session link <session> --continues <pred> [--continues-from
+/// <workspace>]`: record that `session` continues `pred`, in `session` only.
+///
+/// Every check runs before anything is written: the session name, that the
+/// session exists and wasn't imported elsewhere, and
+/// [`resolve_continues`]'s checks of the predecessor. A refusal exits 2
+/// with `{"error", "command"}`; a write that fails exits 3. Prints
+/// `{"name", "kind": "continues", "peer", "written"}`, `written: false`
+/// when the session already held this relation and nothing changed.
+pub fn handle_link_continues(
+    backend: &Backend,
+    session: &str,
+    pred: &str,
+    from: Option<&str>,
+) -> Result<()> {
+    let refuse = |error: String, code: i32| -> ! {
+        super::exit_with_error_code(
+            serde_json::json!({ "error": error, "command": "session link" }),
+            code,
+        )
+    };
+    if let Err(e) = ValidatedSessionId::new(session) {
+        refuse(e.to_string(), super::EXIT_CALLER_ERROR);
+    }
+    let target = resolve_continues(backend, session, pred, from)
+        .unwrap_or_else(|e| refuse(e.message, e.exit));
+    if !backend.exists(session) {
+        refuse(
+            format!("session '{session}' does not exist"),
+            super::EXIT_CALLER_ERROR,
+        );
+    }
+    if let Err(e) = backend.check_not_migrated(session) {
+        refuse(e.to_string(), super::EXIT_CALLER_ERROR);
+    }
+    let outcome =
+        record_continues(backend, session, &target).unwrap_or_else(|e| refuse(e.message, e.exit));
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "name": session,
+            "kind": crate::session::links::LinkKind::Continues.as_str(),
+            "peer": pred,
+            "written": outcome.written(),
+        }))?
+    );
+    Ok(())
+}
+
 /// `koto session pin <name> --reason <reason>`: record a pin in `name`.
 ///
 /// Prints `{"name", "pin": {"reason", "set_by", "set_at"}, "store"}`, the
@@ -874,18 +1076,37 @@ pub(crate) struct LiveMembers {
     /// Why the hierarchy couldn't be judged, when it couldn't; `members` is
     /// then empty and says nothing.
     pub error: Option<String>,
+    /// What the continues relation would have kept the session for:
+    /// `relation_keepers` and `relation_unreadable`
+    /// (`hierarchy::relation_report_json`). Empty when nothing continuing
+    /// it has standing.
+    pub relation: serde_json::Map<String, serde_json::Value>,
+    /// The same as text lines (`kept: continued by <keeper> (<standing>)
+    /// via <path>`), for stderr.
+    pub relation_lines: Vec<String>,
 }
 
 /// Judge `name`'s hierarchy in the local store `base` and list its other
-/// live members. Never fails: the removal goes ahead whatever this finds.
-/// A malformed retention setting falls back to the defaults (it only moves
+/// live members, and what the continues relation would have kept it for
+/// (with, under the cloud backend, the bucket's answer when nothing local
+/// keeps it). Never fails: the removal goes ahead whatever this finds. A
+/// malformed retention setting falls back to the defaults (it only moves
 /// when an unobserved anchor idles out), with a warning.
-pub(crate) fn live_members(base: &std::path::Path, name: &str) -> LiveMembers {
-    use crate::session::hierarchy::{sanitize, Graph, Judge, RetentionSettings, Scope, Verdict};
+pub(crate) fn live_members(
+    backend: &dyn SessionBackend,
+    base: &std::path::Path,
+    name: &str,
+) -> LiveMembers {
+    use crate::session::hierarchy::{
+        relation_report_json, relation_text, sanitize, Graph, Judge, RetentionSettings, Scope,
+        Verdict,
+    };
 
     let none = |error: Option<String>| LiveMembers {
         members: Vec::new(),
         error,
+        relation: Default::default(),
+        relation_lines: Vec::new(),
     };
     if ValidatedSessionId::new(name).is_err() {
         return none(None);
@@ -908,9 +1129,10 @@ pub(crate) fn live_members(base: &std::path::Path, name: &str) -> LiveMembers {
     }
     let mut judge = Judge::new(&graph, settings, std::time::SystemTime::now());
     match judge.judge(name, &Scope::Whole) {
-        Ok(j) => match j.verdict {
-            Verdict::Keep { keepers, .. } => LiveMembers {
-                members: keepers
+        Ok(j) => {
+            let related = crate::session::continues_bucket::relation_at_removal(backend, &j, name);
+            let members = match &j.verdict {
+                Verdict::Keep { keepers, .. } => keepers
                     .iter()
                     .filter(|k| k.name != name)
                     .map(|k| {
@@ -921,10 +1143,15 @@ pub(crate) fn live_members(base: &std::path::Path, name: &str) -> LiveMembers {
                         })
                     })
                     .collect(),
+                Verdict::Release { .. } => Vec::new(),
+            };
+            LiveMembers {
+                members,
                 error: None,
-            },
-            Verdict::Release { .. } => none(None),
-        },
+                relation: relation_report_json(&related),
+                relation_lines: relation_text(&related),
+            }
+        }
         Err(e) => none(Some(format!("{e:#}"))),
     }
 }
@@ -934,6 +1161,14 @@ pub(crate) fn warn_live_members(name: &str, live: &LiveMembers) {
     use crate::session::hierarchy::sanitize;
     if let Some(e) = &live.error {
         eprintln!("warning: removed '{}'; {}", sanitize(name), sanitize(e));
+    }
+    // What the continues relation would have kept it for, one line per
+    // keeper, as every removal by rule prints it.
+    for line in &live.relation_lines {
+        eprintln!(
+            "warning: removed '{}', which the retention rule would have {line}",
+            sanitize(name)
+        );
     }
     if live.members.is_empty() {
         return;

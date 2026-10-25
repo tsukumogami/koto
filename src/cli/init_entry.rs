@@ -520,6 +520,8 @@ pub(crate) struct InitArgs<'a> {
     pub intent: Option<&'a str>,
     /// `--dispatched-by`, already validated.
     pub dispatched_by: Option<&'a str>,
+    /// `--continues`, already checked.
+    pub continues: Option<&'a crate::cli::session::ContinuesTarget>,
     pub execution_dir: Option<&'a Path>,
     pub legacy_environment: bool,
 }
@@ -638,6 +640,13 @@ enum Disposition {
         reason: String,
         fields: serde_json::Map<String, serde_json::Value>,
     },
+    /// A later session continuing it has standing: it moves aside with its
+    /// session id, which its successors' relations resolve by, and the
+    /// answer carries the relation's `fields`.
+    Related {
+        reason: String,
+        fields: serde_json::Map<String, serde_json::Value>,
+    },
 }
 
 impl Disposition {
@@ -678,7 +687,20 @@ fn predecessor_disposition(backend: &Backend, name: &str) -> Disposition {
         Ok(j) if j.verdict.is_kept() => Disposition::Keep {
             reason: reason_text(&j.verdict),
         },
-        Ok(_) => Disposition::Release,
+        // A later session continuing it has standing: it moves aside with
+        // its session id, so the relation, which resolves by that id, still
+        // names the moved session and keeps it.
+        Ok(j) => {
+            let related = crate::session::continues_bucket::relation_at_removal(backend, &j, name);
+            if related.keeps() {
+                Disposition::Related {
+                    reason: crate::session::hierarchy::relation_text(&related).join("; "),
+                    fields: crate::session::hierarchy::relation_json(&related),
+                }
+            } else {
+                Disposition::Release
+            }
+        }
         Err(e) => keep(format!("its hierarchy can't be judged: {e:#}")),
     }
 }
@@ -768,6 +790,9 @@ fn create(
             Disposition::Release => (None, "", Default::default()),
             Disposition::Keep { reason } => (Some(reason), "by its hierarchy", Default::default()),
             Disposition::Pinned { reason, fields } => (Some(reason), "by its pin", fields),
+            Disposition::Related { reason, fields } => {
+                (Some(reason), "by the continues relation", fields)
+            }
         };
         if let Some(reason) = reason {
             match super::move_aside::move_aside(backend, name) {
@@ -870,6 +895,9 @@ fn create(
 
     // The links come last, into this session only: `--dispatched-by`, and a
     // leg-bound session's requester once the leg is its own.
+    if let Some(target) = args.continues {
+        crate::cli::session::record_continues_at_init(backend, name, target);
+    }
     if let Some(dispatcher) = args.dispatched_by {
         crate::cli::session::record_dispatched_by(backend, name, dispatcher);
     }
@@ -895,7 +923,8 @@ fn create(
     if let Some((m, reason, pin)) = moved {
         out["moved_to"] = m.moved_to.into();
         out["moved_reason"] = reason.into();
-        // The moved run's pin, when its pin is what kept it.
+        // The moved run's pin, when its pin is what kept it, or the
+        // relation's report, when a later session continuing it did.
         for (k, v) in pin {
             out[k] = v;
         }
@@ -1112,6 +1141,9 @@ fn attach(
         );
     }
 
+    if let Some(target) = args.continues {
+        crate::cli::session::record_continues_at_init(backend, name, target);
+    }
     if let Some(dispatcher) = args.dispatched_by {
         crate::cli::session::record_dispatched_by(backend, name, dispatcher);
     }

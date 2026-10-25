@@ -57,6 +57,9 @@ koto init <name> --template <path>
 **Dispatcher:**
 - `--dispatched-by <name>` -- Record that session `<name>` dispatched this one: a dispatched-by link in the new (or attached, or replacement) session's own context, the same link [`koto session link`](#session-link) writes. Nothing is written into `<name>`, which need not exist. A name that fails the session-name rule, or that is the session's own, exits 2 with `invalid_usage` before anything is created. A link that can't be written after the session was created prints a warning on stderr and leaves the session in place; `koto session link` records it later. Works with every init path, `--from-stdin` and `--parent` included.
 
+**Predecessor:**
+- `--continues <pred> [--continues-from <workspace>]` -- Record that this session continues session `<pred>`: the continues relation [`koto session link --continues`](#continuing-a-session) writes, in the new (or attached, or replacement) session's own context, before the command reports the session. `<pred>` is checked before anything is created, and a refused one (a name that fails the session-name rule or is the session's own, a name with no session, an anchor or close record, or the cloud backend in this release) exits 2 with nothing written.
+
 **Agent-session anchor:**
 - `KOTO_ANCHOR` -- When this variable names an anchor (see [session anchor](#session-anchor)) other than the session being created, init writes a held-by link, `koto/links/held-by/<anchor>`, into the new session's context, unless it already holds one, and appends an `anchor_activity` event to that anchor. When the anchor reads closed by an observed close and its family has a later anchor (`<anchor>-s2` and so on), the session also gets a held-by link to that one, and the activity goes there. Activity is throttled: at most one event per tenth of the idle period (`retention.idle_period`, default `7d`, see [config](#config-keys-reference)), judged from the anchor's last event; a malformed value falls back to the default here and never fails the command. A variable that is unset, empty, or names no anchor does nothing and prints nothing. koto reads only `KOTO_ANCHOR`, never `KOTO_DISPATCHER_ANCHOR`. No other session is written.
 
@@ -654,11 +657,14 @@ Under a cloud backend, recovery works on the local session store. Recovered sess
 
 #### session link
 
-Records that another session dispatched this one.
+Records that another session dispatched this one, or that this one continues another.
 
 ```bash
 koto session link <session> --dispatched-by <name>
+koto session link <session> --continues <pred> [--continues-from <workspace>]
 ```
+
+Exactly one of `--dispatched-by` and `--continues` is required; `--continues` is described under [continuing a session](#continuing-a-session) below.
 
 For example, a run started with no request leg records the coordinator that dispatched it, either afterwards or as it is created:
 
@@ -678,6 +684,27 @@ The link's value is one JSON object:
 `session_id` and `workspace` are hints taken from the dispatcher's header when it is in the local store, and `null` when it isn't. The key is written with writer `koto`, and a `context_added` event naming that writer goes into the session's log.
 
 Prints `{"name", "kind", "peer", "written"}`. Recording a link the session already holds changes nothing, prints `"written": false` and exits 0. A dispatcher name that fails the session-name rule (`~` included), makes a key longer than 255 characters, or is `<session>` itself, exits 2 and writes nothing, as does a session that doesn't exist. A failed write exits 3.
+
+##### Continuing a session
+
+A session that carries on another's work names it once, so the earlier session isn't removed while the work goes on:
+
+```bash
+koto init coord-2 --template ./coordinate.md --continues coord-1
+koto session link takeover-7 --continues stalled-3
+```
+
+`--continues <pred>` writes one relation, the context key `koto/links/continues/<pred>`, into the successor's own context and nowhere else, in the command that creates the session (`koto init`, before the session is reported) or later on an open session (`koto session link`). Nothing reads `KOTO_ANCHOR`, `KOTO_AUTHORITY`, a request leg or a dispatcher, so a coordinator's successor, an operator by hand and an unrelated agent session record it the same way, and the relation grants no authority. Its value records the predecessor's name, session id and workspace path, its bucket prefix (`null` under the local backend) and the successor's own session id:
+
+```json
+{"v":1,"session":"coord-1","session_id":"3f2c...","workspace":"/home/me/repo","prefix":null,"holder_session_id":"9a1b...","at":"2026-10-25T18:01:02.000Z"}
+```
+
+`--continues-from <workspace>` names the workspace the predecessor lives in, as its absolute path or its 16-hex workspace id, the way `koto --workspace` takes it; it defaults to the successor's own workspace. The local backend has one store, so there the predecessor is looked up in it either way.
+
+A session continues at most one predecessor; a predecessor can have any number of successors. Recording the relation the session already holds changes nothing and exits 0 (`"written": false`). It exits 2 and writes nothing for a name that fails the session-name rule or is the successor's own, a name with no session, an anchor or an anchor's close record, and a successor that already continues another session. A running, finished or pinned predecessor may be named. `koto init --continues` checks the predecessor before it creates anything, so a refused one leaves no session behind. Under the cloud backend this release refuses the relation with exit 2: it needs a back-reference beside the predecessor in the bucket, which this koto doesn't write yet.
+
+What the relation keeps, and how each removal reports it, is in the [session retention guide](session-retention.md#the-continues-relation).
 
 #### session anchor
 
@@ -778,6 +805,8 @@ The text form says kept or released and why, then lists the keepers (a stale anc
 }
 ```
 
+A session holding a continues relation (see [continuing a session](#continuing-a-session)) also carries `predecessor`, the session it names; one that relations name carries `successors`, the sessions holding them; and one the relation keeps carries `kept_by_relation` and `relation_keepers` (and `relation_unreadable`), as a prune entry does. The text form prints `continues: <pred>`, `continued by: <names>` and one `kept: continued by <keeper> (<standing>)` line per keeper. The relation joins no hierarchy, so `members`, `keepers` and `retention` are what they'd be without it.
+
 When nothing is alive, `keepers` is empty and `retention` is `{"release": {"at", "member", "close_kind"}, "passes_at"}`, with `close_kind` one of `terminal`, `cancelled`, `observed` or `idle`; `kept` stays `true` until `passes_at`. A stale keeper whose marker or harness session id fails the pattern carries `"malformed_marker": true` and no `close_command`. Each anchor member also carries `last_activity`, the instant its idle close and stale report count from (`null` when it can't be read); the `hierarchy` object a prune entry carries leaves it out.
 
 The command reads the local sessions directory directly and writes nothing; under the cloud backend it asks the bucket only about the pins the scan found, and lists and reads no other session through it. A malformed retention setting, a malformed name, or a name with no session exits 2; a sessions directory that can't be listed exits 3. koto assumes `~/.koto` is private to its user: anyone who can write the store can forge the records this command reads.
@@ -800,6 +829,8 @@ An explicit removal still removes when the retention rule would keep the session
 ```
 
 `koto cancel --cleanup <name>` does the same after appending the cancel: its output gains `live_members` (and `live_members_error` when the judgment failed), naming every other live member of the cancelled session's hierarchy, such as a dispatcher that is still running. A `koto cancel` without `--cleanup` removes nothing and carries neither field.
+
+Both also remove a session the [continues relation](#continuing-a-session) keeps, exit 0, and say what they passed over: the output carries `relation_keepers` (and `relation_unreadable`) as a prune entry does, and stderr prints one `kept: continued by <keeper> (<standing>)` line per keeper.
 
 A pinned session is refused: both commands exit 2 with code `pinned` (or `pin_unreadable`), name the pin's reason, setter and time, and change nothing, so `koto cancel --cleanup` doesn't cancel it either. Unpin it first with `koto session unpin <name>`. A migrated source is the exception: `koto session import` carried its pin to the moved copy, so the source's pin keeps nothing and cleanup removes it, while `koto session unpin` refuses it. If an older release ran the import, check that the moved copy is pinned before removing the source. Under the cloud backend a bucket that can't be checked for a pin refuses with exit 3, code `bucket_unchecked`.
 
@@ -846,6 +877,7 @@ Every session is judged by the retention rule over one scan of the store, with o
 | `p` | holds a pin, readable or not (see [session pin](#session-pin)). The entry carries `kept_by_pin` and `pin` or `pin_unreadable`, and a `hierarchy` object when the hierarchy is kept as well. A pin keeps its own session only. Under the cloud backend a preview checks the bucket for each session it would remove, and the apply checks again just before each delete: a pin object there keeps the session (`source: bucket`), and a bucket that can't be checked keeps it with `bucket_unchecked` |
 | `a` | is alive: a koto session that runs, or can't be read (its header, log or template is unreadable, or its directory is a symlink), or an anchor that is open |
 | `h` | belongs to a hierarchy the retention rule keeps: another member is alive, `retention.keep` hasn't passed since the hierarchy's release instant, or something in it can't be read (a malformed link, close record or `chain/parent`, an unreadable log, a timestamp more than five minutes in the future, or any session's header, which could name any other) |
+| `r` | is continued by a later session ([continuing a session](#continuing-a-session)) that has standing of its own, directly or through the sessions continuing it: a pin, alive, or `retention.keep` not yet passed since its own stop; or a relation naming it can't be judged. The `detail` is `kept: continued by <keeper> (<standing>)`, with `via <path>` when the keeper is further down the chain, and the entry carries `kept_by_relation`, `relation_keepers` and `relation_unreadable`. An entry kept by `p`, `a` or `h` that the relation keeps too carries the same fields |
 | `d` | has a `chain/parent` context key that isn't exactly one session name |
 | `e` | is bound to a request leg that is still waiting, or whose leg pointer or request can't be read |
 | `f` | is a coordinator's session (its name starts with `coordinate-`) |
