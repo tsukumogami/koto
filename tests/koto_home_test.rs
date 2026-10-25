@@ -327,3 +327,259 @@ fn relative_koto_home_is_taken_against_the_current_directory() {
         env.work.join("rel-root")
     );
 }
+
+// ===== A scratch root and a cloud backend it didn't select =====
+
+#[path = "support/fake_s3.rs"]
+mod fake_s3;
+
+use fake_s3::FakeS3;
+
+/// A cloud backend configured through the environment alone, on `s3`.
+fn cloud_env(s3: &FakeS3) -> Vec<(&'static str, String)> {
+    vec![
+        ("KOTO_SESSION_BACKEND", "cloud".to_string()),
+        ("KOTO_SESSION_CLOUD_ENDPOINT", s3.endpoint()),
+        ("KOTO_SESSION_CLOUD_BUCKET", s3.bucket().to_string()),
+        ("KOTO_SESSION_CLOUD_REGION", "us-east-1".to_string()),
+        ("KOTO_SESSION_CLOUD_PATH_STYLE", "true".to_string()),
+        (
+            "KOTO_SESSION_CLOUD_ACCESS_KEY",
+            "koto-access-key-id".to_string(),
+        ),
+        (
+            "KOTO_SESSION_CLOUD_SECRET_KEY",
+            "koto-secret-key-value".to_string(),
+        ),
+    ]
+}
+
+impl Env {
+    /// Run with extra environment and return the whole output, whatever the
+    /// exit status.
+    fn output(
+        &self,
+        with_koto_home: bool,
+        args: &[&str],
+        env: &[(&str, String)],
+    ) -> std::process::Output {
+        let mut cmd = self.cmd(with_koto_home);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        cmd.args(args).output().unwrap()
+    }
+
+    /// Run with extra environment, require success, and return stderr.
+    fn ok_with(&self, with_koto_home: bool, args: &[&str], env: &[(&str, String)]) -> String {
+        let out = self.output(with_koto_home, args, env);
+        assert!(
+            out.status.success(),
+            "koto {args:?} failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stderr).to_string()
+    }
+
+    /// `koto session dir --json` under `KOTO_HOME`, read with `env`.
+    fn dir_report(&self, env: &[(&str, String)]) -> Value {
+        let out = self.output(true, &["session", "dir", "--json"], env);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+}
+
+#[test]
+fn a_scratch_koto_home_ignores_a_cloud_backend_from_the_environment() {
+    let env = Env::new();
+    let s3 = FakeS3::start("koto-home-guard");
+    let cloud = cloud_env(&s3);
+
+    // A populated store under HOME: a finished session, a request and a user
+    // config, which the scratch run must leave exactly as they are.
+    env.finish(false, "home-only");
+    env.set_user_config(false);
+    env.json(
+        false,
+        &[
+            "request",
+            "create",
+            "--with-data",
+            r#"{"legs":[{"name":"a","role":"r","template":"t","inputs":{}}],"inputs":{}}"#,
+            "--requested-by",
+            "coord",
+            "--coordinator-of-record",
+            "coord",
+        ],
+        &[],
+    );
+    let home_before = snapshot(&env.home);
+    assert!(home_before.keys().any(|p| p.starts_with(".koto/requests")));
+    assert!(home_before.contains_key(Path::new(".koto/config.toml")));
+
+    // Fail closed: the report says local, under scratch, before anything runs.
+    let report = env.dir_report(&cloud);
+    assert_eq!(report["root"], env.koto_home.to_str().unwrap());
+    assert_eq!(report["backend"], "local");
+    assert_eq!(report["backend_source"], "default");
+    assert_eq!(report["backend_ignored"], "KOTO_SESSION_BACKEND");
+    assert!(report.get("bucket").is_none(), "{report}");
+    assert!(!env.koto_home.exists(), "the report wrote the root");
+    assert!(s3.requests().is_empty(), "the report reached the bucket");
+
+    let template = env.template.to_str().unwrap();
+    let mut fast: Vec<(&str, String)> = cloud.clone();
+    for (k, v) in FAST {
+        fast.push((k, v.to_string()));
+    }
+    let stderr = env.ok_with(true, &["init", "scratch", "--template", template], &fast);
+    assert_eq!(
+        stderr.matches("KOTO_SESSION_BACKEND").count(),
+        1,
+        "one warning naming the ignored variable: {stderr}"
+    );
+    env.ok_with(true, &["next", "scratch"], &fast);
+    env.ok_with(
+        true,
+        &[
+            "next",
+            "scratch",
+            "--with-data",
+            r#"{"go": "yes"}"#,
+            "--no-cleanup",
+        ],
+        &fast,
+    );
+    env.ok_with(true, &["init", "doomed", "--template", template], &fast);
+    std::thread::sleep(Duration::from_millis(1300));
+    env.ok_with(
+        true,
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
+        &fast,
+    );
+    env.ok_with(true, &["session", "cleanup", "doomed"], &fast);
+
+    assert!(s3.requests().is_empty(), "{:?}", s3.requests());
+    assert!(s3.keys().is_empty());
+    assert_eq!(snapshot(&env.home), home_before, "HOME changed");
+    assert!(env.koto_home.join("sessions").is_dir());
+}
+
+#[test]
+fn only_the_roots_own_config_selects_the_cloud_backend_under_koto_home() {
+    let env = Env::new();
+    let s3 = FakeS3::start("koto-home-opt-in");
+    // The bucket, endpoint and credentials stay in the environment; only the
+    // backend choice comes from a file.
+    let located: Vec<(&str, String)> = cloud_env(&s3)
+        .into_iter()
+        .filter(|(k, _)| *k != "KOTO_SESSION_BACKEND")
+        .collect();
+    let template = env.template.to_str().unwrap();
+
+    // A project config asking for cloud is ignored under KOTO_HOME.
+    std::fs::create_dir_all(env.work.join(".koto")).unwrap();
+    std::fs::write(
+        env.work.join(".koto/config.toml"),
+        "[session]\nbackend = \"cloud\"\n",
+    )
+    .unwrap();
+    let report = env.dir_report(&located);
+    assert_eq!(report["backend"], "local");
+    assert_eq!(report["backend_ignored"], "project config");
+    env.ok_with(
+        true,
+        &["init", "from-project", "--template", template],
+        &located,
+    );
+    assert!(s3.requests().is_empty(), "{:?}", s3.requests());
+    std::fs::remove_file(env.work.join(".koto/config.toml")).unwrap();
+
+    // The root's own config is the opt-in.
+    std::fs::create_dir_all(&env.koto_home).unwrap();
+    std::fs::write(
+        env.koto_home.join("config.toml"),
+        "[session]\nbackend = \"cloud\"\n",
+    )
+    .unwrap();
+    let report = env.dir_report(&located);
+    assert_eq!(report["backend"], "cloud");
+    assert_eq!(report["backend_source"], "user-config");
+    assert_eq!(report["bucket"], "koto-home-opt-in");
+    assert!(report.get("backend_ignored").is_none(), "{report}");
+    let text = report.to_string();
+    for secret in ["koto-access-key-id", "koto-secret-key-value"] {
+        assert!(!text.contains(secret), "{text}");
+    }
+    env.ok_with(
+        true,
+        &["init", "opted-in", "--template", template],
+        &located,
+    );
+    assert!(
+        !s3.requests().is_empty(),
+        "the opt-in never reached the bucket"
+    );
+}
+
+#[test]
+fn bare_session_dir_still_prints_the_root_alone() {
+    let env = Env::new();
+    let s3 = FakeS3::start("koto-home-bare");
+    let out = env.output(true, &["session", "dir"], &cloud_env(&s3));
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        env.koto_home.to_str().unwrap()
+    );
+}
+
+#[test]
+fn a_gate_under_koto_home_reports_the_same_root_and_backend() {
+    let env = Env::new();
+    let s3 = FakeS3::start("koto-home-gate");
+    let cloud = cloud_env(&s3);
+    let koto = koto_command::koto_bin();
+    let template = env.work.join("report.md");
+    std::fs::write(
+        &template,
+        TEMPLATE.replace(
+            "env > {{SESSION_DIR}}/env.txt",
+            &format!(
+                "{} session dir --json > {{{{SESSION_DIR}}}}/report.json",
+                koto.display()
+            ),
+        ),
+    )
+    .unwrap();
+
+    let outer = env.dir_report(&cloud);
+    env.ok_with(
+        true,
+        &["init", "gated", "--template", template.to_str().unwrap()],
+        &cloud,
+    );
+    env.ok_with(true, &["next", "gated"], &cloud);
+    let dir = PathBuf::from(env.run(true, &["session", "dir", "gated"], &[]).trim());
+    let inner: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("report.json")).unwrap()).unwrap();
+    for field in ["root", "backend", "bucket"] {
+        assert_eq!(
+            inner.get(field),
+            outer.get(field),
+            "{field}: {inner} vs {outer}"
+        );
+    }
+    assert_eq!(inner["backend"], "local");
+}

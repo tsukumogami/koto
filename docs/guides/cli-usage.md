@@ -17,7 +17,23 @@ export KOTO_HOME=$(mktemp -d)
 koto session dir    # prints the root, here the scratch directory
 ```
 
-A relative `KOTO_HOME` is taken against the current directory; an empty one counts as unset. When `KOTO_HOME` is set, the commands a session's gates and default actions run get it too, so a koto they call uses the same root. `KOTO_SESSIONS_BASE` still moves only the local session directory, and wins over `<root>/sessions` when both are set. The compiled-template cache moves to `$KOTO_HOME/cache` when `KOTO_HOME` is set; unset, it stays at `$XDG_CACHE_HOME/koto` (or `~/.cache/koto`).
+A relative `KOTO_HOME` is taken against the current directory; an empty one counts as unset. When `KOTO_HOME` is set, the commands a session's gates and default actions run get it too, so a koto they call uses the same root.
+
+Under `KOTO_HOME`, only the root's own config file can select the cloud backend. A `KOTO_SESSION_BACKEND=cloud` inherited from the environment, or `session.backend = "cloud"` in a project's `.koto/config.toml`, is ignored: koto runs on the local backend under the root and prints one warning naming the setting it ignored (never its value). That keeps a scratch run off a bucket the shell it was started from happens to configure. To use the cloud backend under a moved root on purpose, put one line in the root's config:
+
+```bash
+printf '[session]\nbackend = "cloud"\n' > "$KOTO_HOME/config.toml"
+```
+
+The bucket, endpoint and credentials still come from the environment or the other config layers as usual, so no secret has to be written into the root. Keep credentials out of that file.
+
+`koto session dir --json`, with no session name, reports what koto resolved without building a backend, making a request or writing anything:
+
+```json
+{"root": "/tmp/tmp.x1/koto", "backend": "local", "backend_source": "default", "backend_ignored": "KOTO_SESSION_BACKEND"}
+```
+
+`root` is the koto root. `backend` is `local` or `cloud`. `backend_source` says where the backend came from: `default`, `user-config` (the root's `config.toml`), `project-config` or `env`. `bucket` appears for the cloud backend. `backend_ignored` appears when `KOTO_HOME` kept the run off a cloud backend another layer asked for, and names that layer. A test harness can check `root` and `backend` before running anything else. Bare `koto session dir` still prints the root alone. `KOTO_SESSIONS_BASE` still moves only the local session directory, and wins over `<root>/sessions` when both are set. The compiled-template cache moves to `$KOTO_HOME/cache` when `KOTO_HOME` is set; unset, it stays at `$XDG_CACHE_HOME/koto` (or `~/.cache/koto`).
 
 Older koto versions namespaced sessions by repository (`~/.koto/sessions/<repo-id>/<name>/`). koto migrates that layout on first use. A name that was reused across repositories has several old-layout sources and one flat destination, so only one of them can keep the name; the rest are moved aside into `~/.koto/sessions/.migration-conflicts/<repo-id>/<name>/` and are not listed until you restore them. See [session recover](#session-recover).
 

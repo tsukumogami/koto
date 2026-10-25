@@ -718,6 +718,8 @@ Prints the absolute path of the session directory to stdout (plain text, not JSO
 
 The path always ends with the session name as the last component. This is the same path that `{{SESSION_DIR}}` resolves to everywhere koto substitutes it (see Variable substitution below). Always exits 0 — the path is computed from the name, not read from disk.
 
+With no name, `koto session dir` prints the koto root instead: `$KOTO_HOME` when it is set, else `~/.koto`. `koto session dir --json` (no name) prints the root with the backend koto resolved: `root`, `backend` (`local` or `cloud`), `backend_source` (`default`, `user-config`, `project-config` or `env`), `bucket` for the cloud backend, and `backend_ignored` when `KOTO_HOME` kept the run off a cloud backend another layer asked for. Under `KOTO_HOME` only the root's own `config.toml` selects the cloud backend; a `KOTO_SESSION_BACKEND` from the environment or a project config's `session.backend` is ignored with one warning. Neither form builds a backend or writes anything, so a harness can check where koto will act before it runs anything else.
+
 ---
 
 ## koto session list

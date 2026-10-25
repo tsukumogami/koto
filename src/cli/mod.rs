@@ -573,10 +573,18 @@ pub enum SessionCommand {
     ///
     /// With no name, print the koto root instead: `$KOTO_HOME` when set,
     /// else `~/.koto`. It builds no backend and writes nothing, so a test
-    /// harness can check the root before running anything else.
+    /// harness can check the root before running anything else. With
+    /// `--json` it prints the root with the backend koto resolved, where that
+    /// came from and, for the cloud backend, the bucket.
     Dir {
         /// Session name; omit it to print the koto root
         name: Option<String>,
+
+        /// With no name: print `root`, `backend`, `backend_source`, `bucket`
+        /// (cloud only) and `backend_ignored` (when `KOTO_HOME` kept the run
+        /// off a cloud backend another layer asked for) as JSON
+        #[arg(long, conflicts_with = "name")]
+        json: bool,
     },
     /// List all sessions as JSON
     ///
@@ -1254,6 +1262,7 @@ fn build_backend() -> Result<Backend> {
     // project file choosing where that pair is sent: refused here, before any
     // session is opened or any request made (DESIGN-koto-cloud-session-config).
     crate::config::session_env::check(&config)?;
+    warn_koto_home_backend_ignored(&config);
 
     match config.session.backend.as_str() {
         "local" => Ok(Backend::Local(build_local_backend()?)),
@@ -1266,6 +1275,50 @@ fn build_backend() -> Result<Backend> {
         other => {
             anyhow::bail!("unknown backend: {other}")
         }
+    }
+}
+
+/// What `koto session dir --json` prints: the koto root, the backend the
+/// config resolved and where that came from, the bucket for the cloud
+/// backend, and the setting `KOTO_HOME` ignored, if any. Built from the
+/// loaded config alone: no backend, no request, nothing written.
+fn session_dir_report(
+    root: &std::path::Path,
+    config: &crate::config::KotoConfig,
+) -> serde_json::Value {
+    use crate::config::session_env::Origin;
+    let source = match config.session_env.origin("session.backend") {
+        Origin::User => "user-config",
+        Origin::Project => "project-config",
+        Origin::Env(_) => "env",
+        Origin::Default | Origin::Unset => "default",
+    };
+    let mut out = serde_json::json!({
+        "root": root.display().to_string(),
+        "backend": config.session.backend,
+        "backend_source": source,
+    });
+    if config.session.backend == "cloud" {
+        out["bucket"] = serde_json::json!(config.session.cloud.bucket);
+    }
+    if let Some(ignored) = &config.session_env.backend_ignored {
+        out["backend_ignored"] = serde_json::json!(ignored);
+    }
+    out
+}
+
+/// Say once per process that `KOTO_HOME` kept the run off a cloud backend some
+/// other layer asked for, naming that layer and never its value.
+fn warn_koto_home_backend_ignored(config: &crate::config::KotoConfig) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if let Some(ignored) = &config.session_env.backend_ignored {
+        ONCE.call_once(|| {
+            eprintln!(
+                "warning: KOTO_HOME is set, so the cloud backend {ignored} asked for is ignored \
+                 and koto runs on the local backend under the koto root; to use the cloud \
+                 backend there, set session.backend = \"cloud\" in the root's config.toml"
+            );
+        });
     }
 }
 
@@ -2008,9 +2061,18 @@ pub fn run(app: App) -> Result<()> {
             Ok(())
         }
         Command::Session {
-            subcommand: SessionCommand::Dir { name: None },
+            subcommand: SessionCommand::Dir { name: None, json },
         } => {
-            println!("{}", crate::koto_home::koto_home_or_err()?.display());
+            let root = crate::koto_home::koto_home_or_err()?;
+            if !json {
+                println!("{}", root.display());
+                return Ok(());
+            }
+            let config = crate::config::resolve::load_config()?;
+            println!(
+                "{}",
+                serde_json::to_string(&session_dir_report(&root, &config))?
+            );
             Ok(())
         }
         Command::Session { subcommand } => {
@@ -2034,8 +2096,12 @@ pub fn run(app: App) -> Result<()> {
                     inputs.as_deref(),
                     coordinator_of_record.as_deref(),
                 ),
-                SessionCommand::Dir { name: Some(name) } => session::handle_dir(&backend, &name),
-                SessionCommand::Dir { name: None } => unreachable!("handled before the backend"),
+                SessionCommand::Dir {
+                    name: Some(name), ..
+                } => session::handle_dir(&backend, &name),
+                SessionCommand::Dir { name: None, .. } => {
+                    unreachable!("handled before the backend")
+                }
                 SessionCommand::List {
                     pinned: true, json, ..
                 } => session::handle_list_pinned(&backend, json),
