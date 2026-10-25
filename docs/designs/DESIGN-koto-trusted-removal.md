@@ -1,8 +1,6 @@
 ---
 schema: design/v1
 status: Proposed
-upstream: docs/prds/PRD-koto-trusted-removal.md
-decision_provenance: inline-resolved
 problem: |
   koto's removals and reads aren't safe on a host where many workflows share
   one store and one bucket. A scratch KOTO_HOME still reaches a bucket the
@@ -31,6 +29,8 @@ rationale: |
   fact the name rule only approximated, and dropping the rule before the
   relation works on the cloud backend would release every coordinator on a
   cloud host with nothing in its place.
+upstream: docs/prds/PRD-koto-trusted-removal.md
+decision_provenance: inline-resolved
 ---
 
 # DESIGN: Removal a lineage can trust
@@ -228,8 +228,12 @@ verb and every koto a tick starts gets the same answer from the same root.
 network, no cache write) and prints
 `{"root": ..., "backend": "local"|"cloud", "backend_source": "default"|"user-config"|"project-config"|"env", "bucket": ...}`,
 with `bucket` only for the cloud backend and no credential or endpoint
-userinfo. The bare `koto session dir` output is unchanged, so the scripts
-and tests that parse it keep working.
+userinfo. When the rule above set the backend back to local, the object also
+carries `backend_ignored` naming the setting it ignored (the variable or the
+file, never its value), so a harness sees the downgrade without reading
+stderr. The bare `koto session dir` output is unchanged, so the scripts
+and tests that parse it keep working. The rule compares the user file's path
+with `<root>/config.toml`, not only the origin tag.
 
 The isolation test extends `tests/koto_home_test.rs`: a sentinel `HOME` with
 a populated `.koto` (sessions, `requests/`, `config.toml`), a scratch
@@ -286,13 +290,29 @@ per process in a `RefCell<HashMap>`. It reads the session's local header
 (no request). With `origin.store.prefix` present and of the shape `repo_id`
 produces (16 lowercase hex, checked with the existing `is_workspace_prefix`),
 that prefix is the home; a value of any other shape is treated as missing.
+With no local copy on this host, the only candidate is the caller's own
+prefix: when the bucket holds the session there, the read goes ahead as it
+does today from the session's own workspace on a second host, and otherwise
+the result is `Unlocated` with `NoLocalCopy`.
+
+`home_prefix` is resolved once per public backend method and the `Home` is
+passed down to the key builders, so the builders stay infallible and a
+command touching several sessions resolves each one separately. The
+`SessionBackend` trait gains `home_of(id) -> Result<HomeInfo, Unlocated>`,
+which the local backend answers with "own workspace" for every session, so
+`refuse_if_bound_elsewhere` keeps taking the `Backend` enum and calls one
+method for both backends.
 Without it, the candidates are the hash of the execution anchor
 (`execution_dir`, else `origin.anchor`) and the prefix the host's sync stamp
-names, deduplicated, in that order. Each distinct candidate is confirmed with
-one delimiter listing of `<candidate>/<id>/`, and a candidate counts only
-when its state object exists and the state GET the read makes anyway returns
-a header whose `session_id` equals the local header's; the pull refuses
-rather than replaces on a mismatch. No confirmed candidate, two confirmed
+names, deduplicated, in that order. `home_prefix` itself makes one delimiter
+listing per distinct candidate (at most two, which is what the PRD's request
+bound allows) and keeps the candidates whose state object exists. The
+`session_id` check then happens in the state pull the read makes anyway: the
+pull reads the fetched header and refuses, writing nothing, when its
+`session_id` differs from the local header's, so the memoized `Home` for a
+fallback session is confirmed by the first pull rather than by an extra GET.
+`session_id` is a random UUIDv4 minted at creation
+(`generate_session_id`), so a match identifies one creation, not a name. No confirmed candidate, two confirmed
 candidates, a recorded prefix whose copy is missing or carries another
 `session_id`, or no local copy at all produce `Unlocated` with a reason, which
 the CLI maps to `session_unlocated` (exit 2) naming the session, the reason
@@ -305,11 +325,19 @@ context-key, batch and marker keys, and the `sync.rs` helpers, which already
 take the prefix as an argument. The same applies to the delete paths
 (`sync_delete_session`, `delete_remote_session_checked`), so a prune run from
 any directory deletes the session's own copy rather than a copy under the
-caller's prefix. Before any bucket delete, the delete path reads the state
-object's header at the home prefix and deletes only when its `session_id`
-matches the local header's; a mismatch or a missing object leaves the bucket
-alone and reports the session as skipped, whichever way the home prefix was
-found. `self.prefix` stays for what is genuinely about the caller's
+caller's prefix. Before any bucket delete, and before the local copy is
+removed, the delete path reads the first line of the state object at the
+home prefix (one ranged GET per session, on top of today's listing) and
+deletes only when its `session_id` matches the local header's; a mismatch or
+a missing object leaves both copies alone and reports the session as
+skipped, whichever way the home prefix was found.
+
+Pushes keep koto#480's conditional writes, with one narrowing: koto#480
+replaces a bucket copy whose header names a different `session_id` (an
+earlier session of the same name). That replacement now happens only when
+the home is the caller's own prefix; a push to a home found any other way
+refuses with the `session conflict` error instead, so a header that names
+the wrong prefix can never overwrite another workspace's live session. `self.prefix` stays for what is genuinely about the caller's
 workspace: the prefix a new session records at `koto init`, a child spawn or
 an import, `try_list_sessions`, and the pin scan of the caller's workspace.
 
@@ -430,17 +458,25 @@ Key assumptions:
 `restore_assigned` stops calling `reconcile` on the read path. Instead
 `context get` and `exists` compute `outstanding_assignments(events)` for the
 key, and when the store's value differs from the assigned one they answer
-with the assigned value without storing it; `context list` does the same for
-the keys it lists. The repair moves to the session's own next tick: the
-engine already reads the log at the start of a tick, and it runs
-`reconcile` there, inside the session's own writer. The `--workspace` reader
-already skips the restore, so all reads agree.
+with the assigned value without storing it. `context list` doesn't call the
+restore today; it gains the same log-served answer for the keys it lists, a
+new behaviour that keeps the three reads consistent. The repair needs no new
+home: `koto next` already runs `reconcile` before its advancement loop
+(`src/cli/mod.rs`), so deleting the call in `restore_assigned` leaves the
+session's own next tick as the one place a lost value is restored. The
+`--workspace` reader already skips the restore, so all reads agree. The unit
+tests in `src/cli/context.rs` that pin the old write-back flip to assert
+that the store is untouched and the answer is the assigned value.
 
 `read_log_target` keeps `Session` only for a read inside the session's own
-tick (`enclosing_tick()` names it). A reader whose anchor is the session or
-holds it now gets `Anchor(<anchor>)` when the anchor is another session, and
-the anchorless spool otherwise, so a read outside the tick never appends to
-the session it reads.
+tick (`enclosing_tick()` names it). Outside it, a reader whose
+`KOTO_ANCHOR` names an existing anchor other than the session gets
+`Anchor(<anchor>)`, as today for anchors that don't hold the session; a
+reader whose anchor is the session itself, or holds it, or names no existing
+anchor, goes to the anchorless spool. A read outside the tick therefore never
+appends to the session it reads. The held-by probe that decides this is
+itself a read of the session and goes through the home-prefix resolver like
+any other.
 
 The `origin_mismatch` message for a session from another worktree or store
 becomes: session `<name>` belongs to another worktree or session store
@@ -541,10 +577,10 @@ Five changes, four of them independent of the continues relation:
    form of the no-name `koto session dir`.
 3. Home-prefix resolution in `src/session/cloud.rs` and `src/session/sync.rs`,
    with the CLI guard in `src/cli/mod.rs` narrowed to unlocated sessions.
-4. Read purity in `src/cli/context.rs` and the tick start in the engine.
+4. Read purity in `src/cli/context.rs`.
 5. Refusal wording in `src/cli/init_entry.rs`, with tests and four documents.
 
-The sixth change, deleting rule f in `src/cli/session_prune.rs`, waits for
+The last change, deleting rule f in `src/cli/session_prune.rs`, waits for
 the relation's cloud support.
 
 ### Components
@@ -565,7 +601,7 @@ CLI read (context get/exists/list, status)
      ├─ outstanding_assignments(log) -> answer, no store write
      └─ read_log_target -> Session only inside own tick; else anchor or spool
 
-engine tick start -> reconcile(store, log)   (moved from the read path)
+koto next, before advancing -> reconcile(store, log)   (already there; the read-path call goes)
 
 session_prune later_rule: rule f deleted (after the relation's cloud support)
 ```
@@ -644,22 +680,36 @@ running and finished sessions with and without `KOTO_ANCHOR`, plus the
 lost-write test. Independent of Phase 5, though Phase 5's cross-directory
 byte-identity test runs after both land.
 
-### Phase 5: Home-prefix resolution
+### Phase 5: Home-prefix resolution from the record
 
-`home_prefix`, the key builders, the delete paths, the narrowed guard and
-`session_unlocated`, the strict foreign pull and the stamp comparison, with
-tests for each acceptance criterion in the PRD's reads-by-name group and the
-request-count comparison. This closes koto#465 and koto#466. The cloud sync
-guide and the koto-user error tables document `session_unlocated` and the
-lifted refusal. Largest phase; independent of the relation, but it touches
-the files the relation's bucket walk also changes, so whichever merges
-second rebases.
+`home_prefix` for sessions with `origin.store.prefix` and for the no-local-copy
+case, the trait method, the key builders, the push narrowing, the delete
+paths with their identity check, the narrowed guard and `session_unlocated`,
+the strict foreign pull and the stamp comparison, with tests for the PRD's
+reads-by-name criteria that involve recorded sessions and the request-count
+comparison. This closes koto#465 and koto#466. The cloud sync guide and the
+koto-user error tables document `session_unlocated` and the lifted refusal.
+Largest phase; independent of the relation. It touches files the relation's
+bucket walk also changes, and the walk computes another session's prefix
+itself, so landing this phase first lets the walk call `home_prefix` instead
+of rebuilding prefix handling that would have to be unified later.
 
-### Phase 6: Remove the name rule
+### Phase 6: The fallback for sessions with no recorded prefix
+
+The anchor-hash and stamp candidates, their listing, the confirmation in the
+pull, and the ambiguous and mismatch refusals, with their tests. It serves
+only sessions created before koto recorded the prefix, so it lands after
+Phase 5 as its own change and can be dropped if those sessions are gone by
+then; until it lands, such a session read from a foreign directory refuses as
+`session_unlocated`.
+
+### Phase 7: Remove the name rule
 
 Delete rule f, update the tests, the guides, the skill reference and the
-release notes paragraph. Depends on the continues relation working on the
-cloud backend.
+release notes paragraph. It merges only once a test on the cloud backend
+shows a running successor holding a continues relation keeps its finished
+predecessor through `koto session prune --apply --all`; that test is part of
+this phase and fails until the relation's bucket walk is on main.
 
 ## Security Considerations
 
@@ -691,11 +741,36 @@ matches the local one, and a recorded prefix of the wrong shape counts as
 missing. A tampered header can then at worst make a read refuse; it can't
 point a delete at another session's copy.
 
+**Identity means one creation.** The delete check, the push narrowing and the
+fallback confirmation all compare `session_id`, a random UUIDv4 minted when
+the session is created, never derived from its name. A push to a home found
+any way other than the caller's own prefix refuses rather than replacing a
+copy with another `session_id`, so a header that names the wrong prefix can't
+overwrite another workspace's live session either.
+
+**Writes from other directories are now effective.** Before this change a
+write from the wrong directory forked a harmless copy; now it lands on the
+session's own copy. That's the requirement (a successor writes into the
+lineage it continues), and the protections that apply to the session's own
+directory apply here too: koto#480's conditional push, the rebind fence on
+retired anchors, and `koto next`'s anchor check for ticks.
+
+**A prune from any directory deletes the right copy.** Prune already walks the
+whole local store whatever the directory; before this change its bucket
+deletes landed under the caller's prefix and left the session's real copy
+behind. Now they reach the real copy, behind the same guard, the same
+judgment and, for a plan, the same re-judgment at apply that refuses a plan
+the store no longer matches (`prune_plan_stale`), plus the identity check
+above.
+
 **The cloud opt-in under `KOTO_HOME` doesn't widen where credentials go.**
 Once the root's config selects the cloud backend, the endpoint and bucket
-still pass `session_env::check`, which already refuses a project file that
-chooses the credential endpoint, so inherited credentials can't be sent to an
-endpoint a checked-out repository names.
+still pass `session_env::check`, which already refuses an endpoint or bucket
+from a project file when koto's credential pair supplies the credentials, so
+inherited credentials can't be sent to a bucket or endpoint a checked-out
+repository names. The documented opt-in is the single line
+`backend = "cloud"`; credentials stay in the environment, and the CLI guide
+says not to put them in the root's file.
 
 **Reads stop writing into other sessions.** Removing the read-path
 `reconcile` and the held-by own-read append removes a write a reader could
