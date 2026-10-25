@@ -97,6 +97,13 @@ impl Stamp {
         bytes.len() as u64 == self.state_len && sha256_hex(bytes) == self.state_sha256
     }
 
+    /// Whether `bytes` are the stamped bytes with more appended: a local log
+    /// that has written events since this host last synced it (koto#477).
+    pub fn extended_by(&self, bytes: &[u8]) -> bool {
+        let len = self.state_len as usize;
+        bytes.len() > len && sha256_hex(&bytes[..len]) == self.state_sha256
+    }
+
     /// A stamp for `bytes`, stored under `state_key` with `etag`, keeping the
     /// cached manifest's ETag when the key is the same.
     pub fn for_bytes(previous: Option<&Stamp>, state_key: &str, etag: &str, bytes: &[u8]) -> Self {
