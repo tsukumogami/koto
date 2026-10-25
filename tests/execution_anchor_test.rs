@@ -295,6 +295,16 @@ fn a_tick_from_a_different_tree_is_refused_and_names_the_anchor() {
         "refusal must name the bound directory, got {}",
         message
     );
+    // The way forward removes nothing: move to the anchor, or rebind.
+    assert!(message.contains("koto session rebind wf"), "{message}");
+    for removal in [
+        "session cleanup",
+        "--cleanup",
+        "session prune",
+        "workspace prune",
+    ] {
+        assert!(!message.contains(removal), "names {removal}: {message}");
+    }
 
     // Nothing ran, nothing moved: no action, no gate, no transition.
     assert!(

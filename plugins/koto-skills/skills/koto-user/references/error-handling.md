@@ -69,6 +69,11 @@ Fields:
 - `replace_held_live` (exit 2) — the finished session is still kept by the retention rule, so it would be moved aside, but a session under it is still running, waits to promote its result to a request leg, or can't be read. Carries `live`, naming them. Nothing changed; finish or cancel those first.
 - `replace_failed` (exit 1) — removing or moving aside the finished session failed partway. koto undid the move, so nothing was replaced; when even the undo failed, `stranded` lists the renames left in place, which stay readable under their new names.
 
+`koto init --attach-live` refuses a running session it can't confirm as the caller's with `origin_mismatch` (exit 2). Nothing changes, and the way forward never takes the session away from the run that owns it:
+
+- The session was started in another worktree or session store. `recorded` names where it was started and `requested` where this invocation runs. Use another session name, or run the command from the directory the message names, where the session belongs. When only the store differs, run it against the session store the session was started in.
+- The session has no origin record, because a koto release older than the record started it. Finish it with the koto version that started it, or use another session name.
+
 ---
 
 ## NextErrorCode table

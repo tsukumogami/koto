@@ -466,8 +466,7 @@ fn check_origin(
                 format!(
                     "session '{name}' has no origin record: it was created before koto recorded \
                  where a session was started, so it can't be confirmed as this caller's; finish \
-                 it with the koto version that started it, or remove it with `koto session \
-                 cleanup {name}`"
+                 it with the koto version that started it, or use another session name"
                 ),
                 2,
             )
@@ -481,13 +480,22 @@ fn check_origin(
     let requested = caller
         .map(describe_origin)
         .unwrap_or_else(|| "(unknown)".to_string());
+    // The way forward removes nothing: the caller goes to where the session
+    // belongs. Same anchor means only the store differs, so name the store.
+    let belongs = if caller.is_some_and(|caller| caller.anchor == recorded.anchor) {
+        "run the command against the session store it was started in".to_string()
+    } else {
+        format!(
+            "run the command from {}, where the session belongs",
+            recorded.anchor.display()
+        )
+    };
     Err(Box::new(
         Refusal::new(
             Some("origin_mismatch"),
             format!(
                 "session '{name}' belongs to another worktree or session store: it was started in \
-             {}, and this invocation runs in {requested}; use another session name, or remove \
-             it with `koto session cleanup {name}`",
+             {}, and this invocation runs in {requested}; use another session name, or {belongs}",
                 describe_origin(recorded)
             ),
             2,
@@ -1261,7 +1269,9 @@ mod tests {
         let r = check_origin("s", None, Some(&caller)).err().unwrap();
         let msg = r.body["error"].as_str().unwrap();
         assert!(msg.contains("no origin record"), "{msg}");
-        assert!(msg.contains("koto session cleanup s"), "{msg}");
+        assert!(msg.contains("koto version that started it"), "{msg}");
+        assert!(msg.contains("another session name"), "{msg}");
+        assert_names_no_removal(msg);
         assert_eq!(r.reason, "origin-mismatch");
 
         let mut other = caller.clone();
@@ -1271,10 +1281,40 @@ mod tests {
             .unwrap();
         let msg = r.body["error"].as_str().unwrap();
         assert!(!msg.contains("no origin record"), "{msg}");
+        assert!(msg.contains("another session name"), "{msg}");
+        assert!(
+            msg.contains("run the command from /elsewhere, where the session belongs"),
+            "{msg}"
+        );
+        assert_names_no_removal(msg);
+
+        // Only the store differs: the anchor is the caller's own, so the
+        // message names the store instead of a directory to move to.
+        let mut other = caller.clone();
+        other.store.base = "/other-sessions".into();
+        let r = check_origin("s", Some(&other), Some(&caller))
+            .err()
+            .unwrap();
+        let msg = r.body["error"].as_str().unwrap();
+        assert!(msg.contains("/other-sessions"), "{msg}");
+        assert!(msg.contains("the session store it was started in"), "{msg}");
+        assert_names_no_removal(msg);
         assert_eq!(
             check_origin("s", Some(&caller), Some(&caller)).ok(),
             Some(OriginMatch::Same)
         );
+    }
+
+    /// Neither `origin_mismatch` message names a removal as the way forward.
+    fn assert_names_no_removal(msg: &str) {
+        for removal in [
+            "session cleanup",
+            "--cleanup",
+            "session prune",
+            "workspace prune",
+        ] {
+            assert!(!msg.contains(removal), "names {removal}: {msg}");
+        }
     }
 
     fn origin(kind: &str, anchor: &str, base: &str, bucket: Option<&str>) -> SessionOrigin {
