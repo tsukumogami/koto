@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Proposed
+status: Accepted
 problem: |
   koto's removals and reads aren't safe on a host where many workflows share
   one store and one bucket. A scratch KOTO_HOME still reaches a bucket the
@@ -37,7 +37,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context and Problem Statement
 
