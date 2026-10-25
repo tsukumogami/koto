@@ -443,6 +443,8 @@ fn a_scratch_koto_home_ignores_a_cloud_backend_from_the_environment() {
         1,
         "one warning naming the ignored variable: {stderr}"
     );
+    // The name only, never the value it was set to.
+    assert!(!stderr.contains("KOTO_SESSION_BACKEND="), "{stderr}");
     env.ok_with(true, &["next", "scratch"], &fast);
     env.ok_with(
         true,
@@ -498,10 +500,15 @@ fn only_the_roots_own_config_selects_the_cloud_backend_under_koto_home() {
     let report = env.dir_report(&located);
     assert_eq!(report["backend"], "local");
     assert_eq!(report["backend_ignored"], "project config");
-    env.ok_with(
+    let stderr = env.ok_with(
         true,
         &["init", "from-project", "--template", template],
         &located,
+    );
+    assert_eq!(
+        stderr.matches("project config").count(),
+        1,
+        "one warning naming the ignored setting: {stderr}"
     );
     assert!(s3.requests().is_empty(), "{:?}", s3.requests());
     std::fs::remove_file(env.work.join(".koto/config.toml")).unwrap();
@@ -513,15 +520,31 @@ fn only_the_roots_own_config_selects_the_cloud_backend_under_koto_home() {
         "[session]\nbackend = \"cloud\"\n",
     )
     .unwrap();
+    // The report itself builds no backend: no request, and nothing written
+    // under the root beyond the config placed there.
+    let root_before = snapshot(&env.koto_home);
     let report = env.dir_report(&located);
+    assert!(s3.requests().is_empty(), "the report reached the bucket");
+    assert_eq!(
+        snapshot(&env.koto_home),
+        root_before,
+        "the report wrote the root"
+    );
     assert_eq!(report["backend"], "cloud");
     assert_eq!(report["backend_source"], "user-config");
     assert_eq!(report["bucket"], "koto-home-opt-in");
     assert!(report.get("backend_ignored").is_none(), "{report}");
+    assert!(report.get("endpoint").is_none(), "{report}");
     let text = report.to_string();
     for secret in ["koto-access-key-id", "koto-secret-key-value"] {
         assert!(!text.contains(secret), "{text}");
     }
+    // An inherited cloud backend beside the root's own choice takes nothing
+    // away from it.
+    let report = env.dir_report(&cloud_env(&s3));
+    assert_eq!(report["backend"], "cloud");
+    assert_eq!(report["backend_source"], "user-config");
+    assert!(report.get("backend_ignored").is_none(), "{report}");
     env.ok_with(
         true,
         &["init", "opted-in", "--template", template],
@@ -564,22 +587,46 @@ fn a_gate_under_koto_home_reports_the_same_root_and_backend() {
     )
     .unwrap();
 
-    let outer = env.dir_report(&cloud);
-    env.ok_with(
-        true,
-        &["init", "gated", "--template", template.to_str().unwrap()],
-        &cloud,
-    );
-    env.ok_with(true, &["next", "gated"], &cloud);
-    let dir = PathBuf::from(env.run(true, &["session", "dir", "gated"], &[]).trim());
-    let inner: Value =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("report.json")).unwrap()).unwrap();
-    for field in ["root", "backend", "bucket"] {
-        assert_eq!(
-            inner.get(field),
-            outer.get(field),
-            "{field}: {inner} vs {outer}"
+    let located: Vec<(&str, String)> = cloud
+        .iter()
+        .filter(|(k, _)| *k != "KOTO_SESSION_BACKEND")
+        .cloned()
+        .collect();
+
+    // First the inherited cloud backend the root ignores, then the root's own
+    // opt-in, where the gate has to name the same bucket as the tick.
+    for (name, vars, backend) in [
+        ("gated", &cloud, "local"),
+        ("gated-cloud", &located, "cloud"),
+    ] {
+        if backend == "cloud" {
+            std::fs::write(
+                env.koto_home.join("config.toml"),
+                "[session]\nbackend = \"cloud\"\n",
+            )
+            .unwrap();
+        }
+        let outer = env.dir_report(vars);
+        env.ok_with(
+            true,
+            &["init", name, "--template", template.to_str().unwrap()],
+            vars,
         );
+        env.ok_with(true, &["next", name], vars);
+        let out = env.output(true, &["session", "dir", name], vars);
+        assert!(out.status.success(), "{out:?}");
+        let dir = PathBuf::from(String::from_utf8(out.stdout).unwrap().trim());
+        let inner: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("report.json")).unwrap())
+                .unwrap();
+        for field in ["root", "backend", "bucket"] {
+            assert_eq!(
+                inner.get(field),
+                outer.get(field),
+                "{field}: {inner} vs {outer}"
+            );
+        }
+        assert_eq!(inner["backend"], backend);
     }
-    assert_eq!(inner["backend"], "local");
+    assert!(!s3.requests().is_empty(), "the opt-in tick never synced");
 }

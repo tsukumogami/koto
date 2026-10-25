@@ -85,6 +85,10 @@ pub fn load_config() -> Result<KotoConfig> {
             );
         }
     }
+    // What the user config alone chose, before a later layer can override
+    // it: under `KOTO_HOME` this is the root's own opt-in.
+    let root_selects_cloud = config.session.backend == "cloud"
+        && config.session_env.origin("session.backend") == Origin::User;
 
     // Layer 2: project config
     let project_path = project_config_path();
@@ -123,6 +127,7 @@ pub fn load_config() -> Result<KotoConfig> {
     keep_koto_home_local(
         &mut config,
         crate::koto_home::koto_home_override().is_some(),
+        root_selects_cloud,
     );
 
     Ok(config)
@@ -138,9 +143,20 @@ pub fn load_config() -> Result<KotoConfig> {
 /// warns about and `koto session dir --json` reports. The bucket, endpoint and
 /// credentials still resolve from every layer, so a root that selects the
 /// cloud backend keeps its credentials in the environment.
-fn keep_koto_home_local(config: &mut KotoConfig, koto_home_set: bool) {
+///
+/// `root_selects_cloud` is whether the root's config chose `cloud` on its
+/// own. When it did, a later layer that also asks for `cloud` takes nothing
+/// away from it: the backend stays `cloud`, credited to the root's file,
+/// and nothing is reported as ignored.
+fn keep_koto_home_local(config: &mut KotoConfig, koto_home_set: bool, root_selects_cloud: bool) {
     use crate::config::session_env::Origin;
     if !koto_home_set || config.session.backend != "cloud" {
+        return;
+    }
+    if root_selects_cloud {
+        config
+            .session_env
+            .set_origin("session.backend", Origin::User);
         return;
     }
     let ignored = match config.session_env.origin("session.backend") {
@@ -2741,7 +2757,7 @@ mod session_env_tests {
     #[test]
     fn under_koto_home_an_environment_cloud_backend_is_ignored() {
         let mut c = resolve("", "", &[(ENV_BACKEND, "cloud"), (ENV_BUCKET, "b")]);
-        keep_koto_home_local(&mut c, true);
+        keep_koto_home_local(&mut c, true, false);
         assert_eq!(c.session.backend, "local");
         assert_eq!(c.session_env.origin("session.backend"), Origin::Default);
         assert_eq!(c.session_env.backend_ignored.as_deref(), Some(ENV_BACKEND));
@@ -2752,7 +2768,7 @@ mod session_env_tests {
     #[test]
     fn under_koto_home_a_project_cloud_backend_is_ignored() {
         let mut c = resolve("", CLOUD_USER, &[]);
-        keep_koto_home_local(&mut c, true);
+        keep_koto_home_local(&mut c, true, false);
         assert_eq!(c.session.backend, "local");
         assert_eq!(
             c.session_env.backend_ignored.as_deref(),
@@ -2763,7 +2779,22 @@ mod session_env_tests {
     #[test]
     fn under_koto_home_the_root_config_selects_the_cloud_backend() {
         let mut c = resolve(CLOUD_USER, "", &[(ENV_BUCKET, "b")]);
-        keep_koto_home_local(&mut c, true);
+        keep_koto_home_local(&mut c, true, true);
+        assert_eq!(c.session.backend, "cloud");
+        assert_eq!(c.session_env.origin("session.backend"), Origin::User);
+        assert_eq!(c.session_env.backend_ignored, None);
+    }
+
+    /// The environment asking for `cloud` too doesn't override the root's
+    /// own opt-in: the backend stays `cloud`, credited to the root's file.
+    #[test]
+    fn under_koto_home_an_environment_cloud_backend_leaves_the_roots_opt_in() {
+        let mut c = resolve(CLOUD_USER, "", &[(ENV_BACKEND, "cloud"), (ENV_BUCKET, "b")]);
+        assert_eq!(
+            c.session_env.origin("session.backend"),
+            Origin::Env(ENV_BACKEND)
+        );
+        keep_koto_home_local(&mut c, true, true);
         assert_eq!(c.session.backend, "cloud");
         assert_eq!(c.session_env.origin("session.backend"), Origin::User);
         assert_eq!(c.session_env.backend_ignored, None);
@@ -2772,7 +2803,7 @@ mod session_env_tests {
     #[test]
     fn without_koto_home_nothing_changes() {
         let mut c = resolve("", CLOUD_USER, &[(ENV_BACKEND, "cloud")]);
-        keep_koto_home_local(&mut c, false);
+        keep_koto_home_local(&mut c, false, false);
         assert_eq!(c.session.backend, "cloud");
         assert_eq!(c.session_env.backend_ignored, None);
     }
