@@ -940,12 +940,15 @@ impl CloudBackend {
             // The copy moved, or appeared, since this host synced it.
             let current = self.fetch_state_with_etag(&key)?;
             if let Some((remote, _)) = &current {
-                // Another session's copy under the name (a re-created
-                // session) is replaced, as every push did before.
+                // The push holds every event the copy has: more of them, or
+                // the same under a header this host rewrote. Another
+                // session's copy under the name (a re-created session) is
+                // replaced too, as every push did before.
                 if !matches!(
                     state_log::compare(data, remote),
                     state_log::LogOrder::Same
                         | state_log::LogOrder::LocalExtends
+                        | state_log::LogOrder::HeaderOnly
                         | state_log::LogOrder::Unrelated
                 ) {
                     return Err(refused(remote));
@@ -1164,6 +1167,10 @@ impl CloudBackend {
     /// state file after the keys its events name. A flush that fails leaves
     /// the state file unpushed too: on its own it would name keys the
     /// bucket doesn't hold.
+    ///
+    /// A push refused as a `session conflict` is only printed here. After a
+    /// write of the log, use [`CloudBackend::push_state_after_write`], which
+    /// returns that refusal as the write's error (koto#477).
     fn sync_push_state(&self, id: &str) {
         if let Err(e) = self.strict_push_state(id) {
             if is_hard_sync_error(&e) {
@@ -1259,13 +1266,25 @@ impl CloudBackend {
         }
     }
 
-    /// Download the state file from S3 to the local session directory.
-    /// Non-fatal on failure: if S3 is unreachable, local state is used as-is.
+    /// Download the state file from S3 to the local session directory, when
+    /// the bucket's copy holds every local event. Non-fatal when S3 is
+    /// unreachable: local state is used as-is.
     ///
-    /// The one error is [`refuse_cross_import_pull`]'s: the bucket's copy
-    /// and the local one are the two sides of an import, which only a
-    /// same-host import can bring together, and writing one over the other
-    /// would destroy a session.
+    /// Two refusals are errors, and both leave the local file as it was.
+    /// [`refuse_cross_import_pull`]'s: the bucket's copy and the local one
+    /// are the two sides of an import, which only a same-host import can
+    /// bring together, and writing one over the other would destroy a
+    /// session. And a `session conflict` ([`state_log::conflict`]): the two
+    /// copies each hold an event the other lacks (koto#477).
+    ///
+    /// A fetched copy doesn't always replace the local file
+    /// ([`state_log::compare`]). It does when it holds every local event,
+    /// when it is another session's under the same name (as before koto#477),
+    /// or when only its header differs and the local file is still what this
+    /// host last synced. Otherwise, when the local log holds every event of
+    /// the copy and more, or only its own header differs, the local log is
+    /// kept and stamped with the copy's ETag, so the next push goes up
+    /// conditional on that copy.
     ///
     /// Four cases make no request. A command a tick on `id` runs reads the
     /// local copy as it is: the tick pulled it, and the writes it and its
@@ -1279,7 +1298,8 @@ impl CloudBackend {
     ///
     /// Otherwise the session's probe lists its prefix, and the state file is
     /// fetched only when the bucket's ETag moved since this host's stamp, or
-    /// the local file is no longer the stamped bytes.
+    /// the local file is neither the stamped bytes nor those bytes with more
+    /// appended.
     ///
     /// A batch begun and never opened (its process killed, or its marker
     /// PUT failed) is cleared first ([`CloudBackend::clear_unopened_batch`]):
