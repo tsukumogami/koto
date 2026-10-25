@@ -200,7 +200,7 @@ support lands. Issue 7 has to wait for it.
 - [ ] `docs/guides/cli-usage.md`, `docs/guides/session-retention.md` and the koto-user command reference no longer describe a `coordinate-` name rule; the retention guide's paragraph on the change names `koto session prune` without `--apply` as the preview, and `koto session pin` and `koto session link --continues` as the ways to keep one before upgrading.
 - [ ] The pull request body carries a release-notes paragraph saying the same.
 
-**Dependencies**: None
+**Dependencies**: Issue 6 (ordering only); the real gate is the continues relation working on the cloud backend (merge gate)
 
 **Complexity**: testable
 
@@ -219,6 +219,7 @@ graph TD
     I7["I7: keep a finished session by its successor, not by a coordinate- name"]
     I4 --> I5
     I5 --> I6
+    I6 -.-> I7
 
     classDef done fill:#c8e6c9
     classDef ready fill:#bbdefb
@@ -231,7 +232,9 @@ graph TD
 **Legend**: Green = done, Blue = ready, Yellow = blocked
 
 Issue 7 is shown blocked by the continues relation's cloud support, which is
-outside this plan.
+outside this plan. Its edge from issue 6 (dotted) is ordering only, so no
+tool lists it as startable while the buildable issues are in flight; the
+real gate is the relation's cloud support.
 
 ## Implementation Sequence
 
@@ -244,4 +247,6 @@ cloud backend files the relation's bucket walk also changes; landing it first
 lets the walk call `home_prefix` instead of building its own prefix handling.
 
 **Waits for the continues relation's cloud support:** issue 7. Its cloud test
-fails until that support is on main, and it must not merge before then.
+fails until that support is on main, and it must not merge before then. It
+also carries an ordering edge on issue 6, so it is never offered as the next
+startable item while issues 1 to 6 are being built.
