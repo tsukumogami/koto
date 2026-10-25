@@ -1316,7 +1316,10 @@ fn under_the_cloud_backend_workspace_prune_yes_refuses_a_short_retention() {
 }
 
 /// Every file in the local session store, by path relative to it, with each
-/// session's state log hashed: what a refused removal must leave alone.
+/// session's state log hashed: what a refused removal must leave alone. The
+/// path set catches a removed file and the log hash a rewritten session;
+/// the other files are host-local sync caches the judgment's own bucket
+/// reads may refresh, so their contents are left out on purpose.
 fn local_store(env: &Env) -> BTreeMap<PathBuf, String> {
     let root = env.sessions();
     let mut out = BTreeMap::new();
@@ -1368,6 +1371,31 @@ fn under_the_cloud_backend_a_refused_apply_leaves_the_local_store_as_it_was() {
 }
 
 #[test]
+fn under_the_cloud_backend_a_retention_just_under_an_hour_still_refuses() {
+    let s3 = FakeS3::start(BUCKET);
+    let env = Env::cloud(&s3);
+    env.done("first");
+    settle();
+    let before = bucket_keys(&s3);
+
+    // With a 59-minute keep nothing has passed it yet; the guard is checked
+    // against the retention setting, so a backdated session stands in for
+    // one that would go.
+    env.set_all_event_times(
+        "first",
+        std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600),
+    );
+    let out = env.run_env(
+        &["session", "prune", "--apply", "--all"],
+        &[("KOTO_RETENTION_KEEP", "59m")],
+    );
+    let error = short_retention_refusal(&out);
+    assert_eq!(error["retention"][0]["value"], "59m", "{error:#}");
+    assert!(env.sessions().join("first").is_dir());
+    assert_eq!(bucket_keys(&s3), before);
+}
+
+#[test]
 fn under_the_cloud_backend_a_short_retention_with_nothing_to_remove_runs() {
     let s3 = FakeS3::start(BUCKET);
     let env = Env::cloud(&s3);
@@ -1386,6 +1414,7 @@ fn under_the_cloud_backend_the_confirm_flag_removes_only_what_no_keeper_holds() 
     let s3 = FakeS3::start(BUCKET);
     let env = Env::cloud(&s3);
     env.done("loose");
+    env.done("loose-too");
     env.done("pinned");
     env.ok(&["session", "pin", "pinned", "--reason", "kept by a test"]);
     env.init("root");
@@ -1402,10 +1431,15 @@ fn under_the_cloud_backend_the_confirm_flag_removes_only_what_no_keeper_holds() 
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(names(&v["removed"]), vec!["loose"], "{v:#}");
+    assert_eq!(names(&v["removed"]), vec!["loose", "loose-too"], "{v:#}");
 
-    assert!(!env.sessions().join("loose").exists());
-    assert!(s3.keys_under(&format!("{prefix}/loose/")).is_empty());
+    for gone in ["loose", "loose-too"] {
+        assert!(!env.sessions().join(gone).exists(), "{gone} kept locally");
+        assert!(
+            s3.keys_under(&format!("{prefix}/{gone}/")).is_empty(),
+            "{gone} kept in the bucket"
+        );
+    }
     for kept in ["pinned", "child", "root"] {
         assert!(env.sessions().join(kept).is_dir(), "{kept} lost locally");
         assert!(
@@ -1415,28 +1449,74 @@ fn under_the_cloud_backend_the_confirm_flag_removes_only_what_no_keeper_holds() 
     }
 }
 
+/// The store line is on stderr before the first removal: the bucket delete
+/// of the session's state is held open, and stderr is read while koto still
+/// waits on it, so a line printed after the removals would not be there yet.
 #[test]
-fn under_the_cloud_backend_the_store_line_comes_first_in_a_confirmed_apply() {
+fn under_the_cloud_backend_the_store_line_is_printed_before_the_first_removal() {
     let s3 = FakeS3::start(BUCKET);
     let env = Env::cloud(&s3);
     env.done("first");
     settle();
+    let state_key = format!("{}/first/koto-first.state.jsonl", env.prefix());
+    s3.hold("DELETE", &state_key, std::time::Duration::from_secs(5));
+    s3.clear_requests();
 
-    let out = env.prune(&["--apply", "--all", "--confirm-short-retention"]);
+    let stderr_path = env.root.join("prune-stderr.txt");
+    let mut cmd = koto_command::koto_std();
+    cmd.current_dir(&env.work)
+        .env("HOME", &env.home)
+        .env("XDG_CACHE_HOME", &env.cache)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("KOTO_HOME")
+        .env_remove("KOTO_SESSIONS_BASE")
+        .env_remove("KOTO_WORKFLOWS_DIR")
+        .env_remove("KOTO_ANCHOR")
+        .env_remove("KOTO_DISPATCHER_ANCHOR")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env("AWS_ACCESS_KEY_ID", "test-access-key")
+        .env("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+        .args([
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&stderr_path).unwrap());
+    for (k, v) in FAST {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap();
+
+    // Wait for the held delete to arrive: from here koto is paused inside
+    // the removal until the hold lets the reply go.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !s3
+        .requests()
+        .iter()
+        .any(|r| r.method == "DELETE" && r.key == state_key)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the state delete never arrived"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let during = std::fs::read_to_string(&stderr_path).unwrap();
     assert!(
-        out.status.success(),
+        during.contains("koto session prune: removing from") && during.contains(BUCKET),
+        "no store line while the first removal was in flight: {during:?}"
+    );
+
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
         "{}",
-        String::from_utf8_lossy(&out.stderr)
+        std::fs::read_to_string(&stderr_path).unwrap()
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let first = stderr
-        .lines()
-        .find(|l| l.starts_with("koto session prune:"))
-        .unwrap_or_default();
-    assert!(
-        first.starts_with("koto session prune: removing from") && first.contains(BUCKET),
-        "{stderr}"
-    );
+    assert!(!env.sessions().join("first").exists());
 }
 
 /// The store-scale measurement: 1,000 sessions koto created and finished,
