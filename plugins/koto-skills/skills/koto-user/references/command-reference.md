@@ -877,6 +877,10 @@ The target is canonicalized before it is recorded, so what lands on the header i
 
 Under the cloud backend the rewritten header is pushed to the bucket, like the event. A failed push doesn't fail the rebind: it succeeds locally, prints a warning to stderr, and the session's next successful push carries the new anchor.
 
+Under the cloud backend, run it from the new directory, or from the session's own workspace with `--to`. From a third directory it refuses with `session_bound_elsewhere` (exit 2, error JSON on stdout), naming the bound directory and the exact `koto session rebind <name> --to <dir>` to run. From the new directory it works even when every directory the session records is gone.
+
+A rebind fences the old anchor: it raises `origin.anchor_epoch` and lists the old anchor in `origin.retired_anchors`. Under the cloud backend, a later write to the session from the old anchor, or from a command that read the session before the rebind, refuses with `session_rebound` and writes nothing.
+
 Which refusal you are repairing matters. On the same host, `execution_anchor_unresolvable` leaves rebinding as the only way out short of restoring the tree. `execution_anchor_mismatch` on a checkout that did *not* move means you are simply standing in the wrong place — change directory instead of rebinding, or you will point the session at the wrong tree.
 
 `rebind` is for a checkout that moved on one host. A session that has to continue on another machine, or in another workspace, is moved with `koto session import`, not rebound.

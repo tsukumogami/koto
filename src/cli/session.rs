@@ -1216,6 +1216,44 @@ pub(crate) fn record_requester_link(backend: &Backend, session: &str, requested_
     record_dispatched_by(backend, session, requested_by);
 }
 
+/// Refuse `koto session rebind <name>` from a directory that is neither the
+/// session's own workspace nor the one the rebind moves it to (koto#477).
+///
+/// Under the cloud backend a rebind run from a third directory pushes the
+/// moved session under that directory's prefix, where neither the old
+/// workspace nor the new one reads it. Run from the target (the usual
+/// `koto session rebind <name>` stood in the new checkout) it is accepted
+/// even when every directory the session records is gone, as for a session
+/// whose instance was torn down; the rebind's fence makes any writer left at
+/// the old anchor refuse. The local backend never refuses.
+pub fn rebind_guard(backend: &Backend, name: &str, to: Option<&str>) -> Result<()> {
+    use std::path::{Path, PathBuf};
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let here = canonical(&std::env::current_dir()?);
+    let target = to.map_or_else(|| here.clone(), |dir| canonical(&PathBuf::from(dir)));
+    if target == here {
+        return Ok(());
+    }
+    let Err(e) = backend.check_bound_here(name) else {
+        return Ok(());
+    };
+    let Some(bound) = e.downcast_ref::<crate::session::SessionBoundElsewhere>() else {
+        return Err(e);
+    };
+    let at = bound
+        .anchor
+        .as_deref()
+        .unwrap_or("the directory the session was started in");
+    anyhow::bail!(
+        "session_bound_elsewhere: session '{name}' is bound to {at}, not to the directory this \
+         command ran in, and a rebind runs from the session's own workspace or from the \
+         directory it moves to: run `koto session rebind {name} --to {}` from {at}, or \
+         `koto session rebind {name}` from {}",
+        target.display(),
+        target.display()
+    )
+}
+
 /// Move a session's execution anchor to `to`, defaulting to the
 /// current working directory.
 ///
@@ -1303,8 +1341,14 @@ pub fn handle_rebind(backend: &dyn SessionBackend, name: &str, to: Option<&str>)
         // `koto init --attach-live` from the new checkout still finds
         // its own session. A session with no origin record gets none:
         // nothing backfills one.
+        //
+        // The rebind also fences the anchor it leaves (koto#477): the epoch
+        // goes up and the old anchor is retired, so a process still writing
+        // from there gets `session_rebound` instead of forking the log.
         if let Some(origin) = h.origin.as_mut() {
+            let left = from.clone().unwrap_or_else(|| origin.anchor.clone());
             origin.anchor = target.clone();
+            crate::session::rebind_fence::advance(origin, Some(&left), &target);
         }
         h.execution_dir = Some(target.clone());
         h

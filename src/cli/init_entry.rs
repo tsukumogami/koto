@@ -1255,6 +1255,8 @@ mod tests {
                 bucket: None,
                 prefix: None,
             },
+            anchor_epoch: 0,
+            retired_anchors: Vec::new(),
         };
         let r = check_origin("s", None, Some(&caller)).err().unwrap();
         let msg = r.body["error"].as_str().unwrap();
@@ -1284,6 +1286,8 @@ mod tests {
                 bucket: bucket.map(str::to_string),
                 prefix: None,
             },
+            anchor_epoch: 0,
+            retired_anchors: Vec::new(),
         }
     }
 

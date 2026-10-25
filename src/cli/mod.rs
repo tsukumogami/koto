@@ -2152,6 +2152,15 @@ pub fn run(app: App) -> Result<()> {
                     session::handle_hierarchy(&backend, &name, json)
                 }
                 SessionCommand::Rebind { name, to } => {
+                    if let Err(e) = session::rebind_guard(&backend, &name, to.as_deref()) {
+                        exit_with_error_code(
+                            serde_json::json!({
+                                "error": e.to_string(),
+                                "command": "session rebind"
+                            }),
+                            EXIT_CALLER_ERROR,
+                        );
+                    }
                     session::handle_rebind(&backend, &name, to.as_deref())
                 }
                 SessionCommand::Import {
