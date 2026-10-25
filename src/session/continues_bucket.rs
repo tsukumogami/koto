@@ -152,6 +152,19 @@ pub fn is_backref_key(session_prefix: &str, key: &str) -> Option<Pointer> {
     })
 }
 
+/// Whether `key` is a whole back-reference key (`<Pp>/<P>/ctx/koto/
+/// continued-by/<Sp>/<S>`, every part valid) whose holder is `holder`: what
+/// a session may take back from a key it recorded itself.
+pub fn is_own_pointer_key(key: &str, holder: &str) -> bool {
+    let mut parts = key.splitn(3, '/');
+    let (Some(pp), Some(pred), Some(_)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    is_workspace_prefix(pp)
+        && valid_name(pred)
+        && is_backref_key(&format!("{pp}/{pred}/"), key).is_some_and(|p| p.name == holder)
+}
+
 /// Whether `key` lies in a session's `ctx/koto/continued-by/` area under
 /// `session_prefix`, valid or not: the objects every delete path leaves.
 pub fn in_backref_area(session_prefix: &str, key: &str) -> bool {

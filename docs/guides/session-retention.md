@@ -206,7 +206,14 @@ until it does, the relation stays out of every push. A session directory's
 `.continues-pointer` file, which the sync doesn't track, records the
 back-reference the bucket confirmed. A session renamed by a same-name replace
 or a batch rewind writes its back-reference under the new name before it
-moves, and takes the old one back after.
+moves, and takes the old one back after. A successor rebound to another
+checkout (`koto session rebind`) keeps its relation; the next command from the
+new checkout pushes the relation under the new prefix, writes the
+back-reference that names it there, and only then takes the old one back. A
+rebound predecessor keeps the back-references beside its first prefix, which
+its header still names, and every removal reads them there. A command the
+rebind fenced off (one still running from the old anchor) writes no
+back-reference.
 
 **What a removal reads.** Before any removal by rule deletes a session from
 the bucket, and only when nothing local keeps it, it walks the

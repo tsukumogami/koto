@@ -501,16 +501,44 @@ impl CloudBackend {
         let Some(owed) = owed_pointer(&dir, &self.prefix, id) else {
             return;
         };
+        // A pointer confirmed before under another prefix (the session was
+        // rebound to another checkout since) is replaced, not doubled: the
+        // relation goes up under this prefix first, so the new pointer
+        // finds it, and only then is the old one, which this host wrote and
+        // recorded, taken back. Until all of that went through, the mark
+        // keeps the old pointer and the next command tries again.
+        let previous = continues_bucket::confirmed_pointer(&dir)
+            .filter(|p| *p != owed.key && continues_bucket::is_own_pointer_key(p, id));
         let result = self
             .check_fence(id)
             .and_then(|()| self.put_backref(&owed))
+            .and_then(|()| match &previous {
+                Some(_) => crate::session::sync::try_push_context_key(
+                    &self.local,
+                    &self.bucket,
+                    &self.prefix,
+                    id,
+                    &owed.relation_key,
+                    &[],
+                )
+                .map(|()| {
+                    self.manifest_cache.invalidate();
+                    self.forget_remote_manifest(id);
+                }),
+                None => Ok(()),
+            })
             .and_then(|()| {
                 continues_bucket::mark_confirmed(&dir, &owed.key).map_err(anyhow::Error::from)
+            })
+            .and_then(|()| match &previous {
+                Some(old) => self.delete_pointer(old),
+                None => Ok(()),
             });
         if let Err(e) = result {
             eprintln!(
-                "warning: cloud sync: the back-reference '{}' continues '{}' wasn't written, so \
-                 its relation stays out of the bucket until a later command writes it: {e:#}",
+                "warning: cloud sync: the back-reference '{}' continues '{}' couldn't be brought \
+                 up to date, and a later command tries again; until it is written, the \
+                 relation stays out of the bucket: {e:#}",
                 id, owed.pred
             );
         }

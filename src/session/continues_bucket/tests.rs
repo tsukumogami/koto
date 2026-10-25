@@ -266,6 +266,16 @@ fn a_pointer_key_must_have_exactly_its_parts() {
     );
     assert!(in_backref_area(&p, &key("anything/at/all")));
     assert!(!in_backref_area(&p, &format!("{p}ctx/koto/links/pin")));
+
+    // A key a session may take back: whole, valid, and naming it.
+    let own = pointer_key(WS1, "v1", WS2, "v2");
+    assert!(is_own_pointer_key(&own, "v2"));
+    assert!(!is_own_pointer_key(&own, "v3"));
+    assert!(!is_own_pointer_key(&format!("{own}/x"), "v2"));
+    assert!(!is_own_pointer_key(
+        &pointer_key("nothex", "v1", WS2, "v2"),
+        "v2"
+    ));
 }
 
 #[test]

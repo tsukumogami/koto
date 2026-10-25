@@ -928,3 +928,161 @@ fn the_walk_agrees_with_a_whole_bucket_scan_through_renames() {
         .collect();
     assert_eq!(walked, oracle);
 }
+
+/// The back-references beside `pred` under `ws`, as `<prefix>/<holder>`.
+fn pointers_beside(h: &Hosts, ws: &Path, pred: &str) -> Vec<String> {
+    let area = format!("{}/{pred}/ctx/koto/continued-by/", prefix_of(ws));
+    h.s3.keys_under(&area)
+        .into_iter()
+        .map(|k| k[area.len()..].to_string())
+        .collect()
+}
+
+/// A checkout moved to `m`, beside W1.
+fn moved_dir(h: &Hosts) -> PathBuf {
+    let m = h.root.join("moved");
+    std::fs::create_dir_all(&m).unwrap();
+    m
+}
+
+#[test]
+fn a_rebound_successor_keeps_its_relation_and_its_back_reference() {
+    let h = Hosts::new();
+    let m = moved_dir(&h);
+    h.init(1, &h.w1, "p", &[]);
+    h.init(1, &h.w1, "s", &["--continues", "p"]);
+    h.done(1, &h.w1, "p");
+    let rebound = h.ok(
+        1,
+        &m,
+        &["session", "rebind", "s", "--to", m.to_str().unwrap()],
+    );
+    assert_eq!(rebound["rebound"], true, "{rebound:#}");
+    // Until a command runs from the new checkout, the back-reference names
+    // the old prefix, where the relation still is.
+    assert_eq!(
+        pointers_beside(&h, &h.w1, "p"),
+        [format!("{}/s", prefix_of(&h.w1))]
+    );
+    // The next command from there moves it: the relation goes up under the
+    // new prefix and one back-reference names it, the old one taken back.
+    h.ok(1, &m, &["status", "s"]);
+    assert_eq!(
+        pointers_beside(&h, &h.w1, "p"),
+        [format!("{}/s", prefix_of(&m))]
+    );
+    assert!(h.s3.object(&relation_object(&m, "s", "p")).is_some());
+    // Running again changes nothing.
+    h.ok(1, &m, &["status", "s"]);
+    assert_eq!(pointers_beside(&h, &h.w1, "p").len(), 1);
+    // The relation stays, once, in the successor's own copy.
+    let held: Vec<String> = std::fs::read_dir(h.sessions(1).join("s/ctx/koto/links/continues"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.ends_with(".lock"))
+        .collect();
+    assert_eq!(held, ["p"]);
+    settle();
+    // Host 1 keeps p by the local relation; host 2, holding only p, by the
+    // bucket's.
+    let on1 = h.ok(1, &h.w1, &["session", "prune", "--all"]);
+    assert_eq!(
+        kept(&on1, "p")["relation_keepers"][0]["keeper"],
+        "s",
+        "{on1:#}"
+    );
+    h.compile(2);
+    h.pull(2, &h.w1, "p");
+    let on2 = h.ok(
+        2,
+        &h.w1,
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
+    );
+    assert_eq!(
+        kept(&on2, "p")["relation_keepers"][0]["keeper"],
+        "s",
+        "{on2:#}"
+    );
+    assert_eq!(
+        kept(&on2, "p")["relation_keepers"][0]["standing"],
+        "alive",
+        "{on2:#}"
+    );
+}
+
+#[test]
+fn a_writer_the_rebind_fence_refuses_writes_no_back_reference() {
+    let h = Hosts::new();
+    let m = moved_dir(&h);
+    h.init(1, &h.w1, "p", &[]);
+    h.init(1, &h.w1, "t", &[]);
+    h.ok(
+        1,
+        &m,
+        &["session", "rebind", "t", "--to", m.to_str().unwrap()],
+    );
+    // From the anchor the rebind retired, the write is fenced off.
+    let refused = h.fails(1, &h.w1, &["session", "link", "t", "--continues", "p"], 3);
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("session_rebound"),
+        "{refused:#}"
+    );
+    assert!(pointers_beside(&h, &h.w1, "p").is_empty());
+    assert!(!h.sessions(1).join("t/ctx/koto/links/continues/p").exists());
+}
+
+#[test]
+fn a_rebound_predecessor_is_still_kept_naming_its_successor() {
+    let h = Hosts::new();
+    let m = moved_dir(&h);
+    h.init(1, &h.w1, "p", &[]);
+    h.init(1, &h.w1, "s", &["--continues", "p"]);
+    h.done(1, &h.w1, "p");
+    h.ok(
+        1,
+        &m,
+        &["session", "rebind", "p", "--to", m.to_str().unwrap()],
+    );
+    // The back-reference stays where the successor wrote it, beside the
+    // predecessor's first prefix, which its header still names.
+    assert_eq!(
+        pointers_beside(&h, &h.w1, "p"),
+        [format!("{}/s", prefix_of(&h.w1))]
+    );
+    assert!(pointers_beside(&h, &m, "p").is_empty());
+    settle();
+    let on1 = h.ok(1, &m, &["session", "prune", "--all"]);
+    assert_eq!(
+        kept(&on1, "p")["relation_keepers"][0]["keeper"],
+        "s",
+        "{on1:#}"
+    );
+    h.compile(2);
+    h.pull(2, &m, "p");
+    let on2 = h.ok(
+        2,
+        &m,
+        &[
+            "session",
+            "prune",
+            "--apply",
+            "--all",
+            "--confirm-short-retention",
+        ],
+    );
+    assert_eq!(
+        kept(&on2, "p")["relation_keepers"][0]["keeper"],
+        "s",
+        "{on2:#}"
+    );
+    assert!(h.sessions(2).join("p").is_dir());
+}
