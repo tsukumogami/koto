@@ -446,6 +446,13 @@ impl Memo {
         }
     }
 
+    fn forget(&mut self, loc: &Loc) {
+        if let Some(id) = self.ids.remove(loc) {
+            self.by_id.remove(&id);
+        }
+        self.by_loc.remove(loc);
+    }
+
     fn put(&mut self, loc: Loc, id: Option<&str>, read: MemberRead) {
         match id {
             Some(id) => {
@@ -642,6 +649,7 @@ pub fn walk(reads: &dyn BucketReads, memo: &mut Memo, start: &Start<'_>, clock: 
     // doesn't count as reaching its holder.
     let mut visited: BTreeSet<Pointer> = BTreeSet::from([me.clone()]);
     let mut reached: Vec<Reached> = Vec::new();
+    let mut stale: BTreeSet<Pointer> = BTreeSet::new();
     while let Some(visit) = queue.pop_front() {
         if visited.contains(&visit.at) {
             verdict.unreadable.push(Unreadable {
@@ -678,6 +686,14 @@ pub fn walk(reads: &dyn BucketReads, memo: &mut Memo, start: &Start<'_>, clock: 
                 continue;
             }
             Match::Stale => {
+                // A pointer beside the judged session that leads nowhere yet
+                // may be one written just before its relation: the final
+                // guard reads it again.
+                if visit.path.is_empty() {
+                    stale.insert(visit.at.clone());
+                }
+                // Nor is what it read kept: the next read lists it afresh.
+                memo.forget(&loc);
                 budget.allowance -= MEMBER_ALLOWANCE;
                 if budget.used > budget.allowance {
                     verdict
@@ -767,7 +783,7 @@ pub fn walk(reads: &dyn BucketReads, memo: &mut Memo, start: &Start<'_>, clock: 
     memo.judged
         .entry((me.prefix.clone(), me.name.clone()))
         .or_default()
-        .extend(seen.iter().cloned());
+        .extend(seen.difference(&stale).cloned());
     Walked {
         verdict,
         pointers: seen,

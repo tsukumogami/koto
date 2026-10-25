@@ -19,6 +19,8 @@ struct MemBucket {
     fail_list: HashSet<String>,
     cached: BTreeMap<String, Vec<u8>>,
     requests: Cell<usize>,
+    /// What a migration marker beside the judged session names.
+    marker: Option<Result<Option<Pointer>, UncheckedError>>,
 }
 
 impl MemBucket {
@@ -62,6 +64,14 @@ impl BucketReads for MemBucket {
 
     fn cached_template(&self, hash: &str) -> Option<Vec<u8>> {
         self.cached.get(hash).cloned()
+    }
+
+    fn marker_target(
+        &self,
+        _prefix: &str,
+        _name: &str,
+    ) -> (Result<Option<Pointer>, UncheckedError>, usize) {
+        (self.marker.clone().unwrap_or(Ok(None)), 1)
     }
 }
 
@@ -821,4 +831,127 @@ fn standing_from_bytes_follows_the_inventory_rules() {
     // No template: it can't be judged, so it keeps.
     assert!(alive(&standing_from_bytes(&done, |_| None)));
     let _ = SystemTime::now();
+}
+
+#[test]
+fn the_final_guard_reads_again_a_pointer_the_judgment_found_stale() {
+    let b = MemBucket {
+        cached: BTreeMap::from([(hash(), template())]),
+        ..Default::default()
+    };
+    session(&b, WS1, "v1", &id(1), "done", NOW - 9 * DAY, None);
+    // A pointer written before its relation: stale at the judgment.
+    session(&b, WS2, "s", &id(2), "work", NOW, None);
+    b.put(&pointer_key(WS1, "v1", WS2, "s"), &pointer_body(&id(2)));
+    let mut memo = Memo::default();
+    let facts = facts_of(&b, WS1, "v1", Some(&id(1)), false);
+    let judged = walk(
+        &b,
+        &mut memo,
+        &Start {
+            facts: &facts,
+            skip: None,
+            extra: &[],
+        },
+        &clock(),
+    );
+    assert!(!judged.verdict.keeps(), "{:?}", judged.verdict);
+    let seen = memo.judged(WS1, "v1").cloned().unwrap();
+    assert!(seen.is_empty(), "a stale pointer isn't counted as judged");
+
+    // Its relation lands before the delete: the final guard finds it.
+    b.put(
+        &format!("{WS2}/s/ctx/koto/links/continues/v1"),
+        &relation("v1", &id(1), &id(2), WS1),
+    );
+    let facts = facts_of(&b, WS1, "v1", Some(&id(1)), true);
+    let last = walk(
+        &b,
+        &mut memo,
+        &Start {
+            facts: &facts,
+            skip: Some(&seen),
+            extra: &[],
+        },
+        &clock(),
+    );
+    assert_eq!(
+        last.verdict
+            .keepers
+            .iter()
+            .map(|k| k.keeper.as_str())
+            .collect::<Vec<_>>(),
+        ["s"]
+    );
+}
+
+#[test]
+fn a_migration_marker_beside_the_session_counts_its_target_or_keeps() {
+    let facts_with_marker = |b: &MemBucket| BucketRemovalFacts {
+        migrated: Ok(true),
+        ..facts_of(b, WS1, "v1", Some(&id(1)), false)
+    };
+    // A verified target that runs keeps the source, named, with no
+    // relation needed.
+    let b = MemBucket {
+        cached: BTreeMap::from([(hash(), template())]),
+        marker: Some(Ok(Some(Pointer {
+            prefix: WS2.to_string(),
+            name: "copy".to_string(),
+        }))),
+        ..Default::default()
+    };
+    session(&b, WS1, "v1", &id(1), "done", NOW - 9 * DAY, None);
+    session(&b, WS2, "copy", &id(3), "work", NOW, None);
+    let v = run(&b, &facts_with_marker(&b));
+    assert_eq!(
+        v.keepers
+            .iter()
+            .map(|k| k.keeper.as_str())
+            .collect::<Vec<_>>(),
+        ["copy"]
+    );
+    // The same target finished long ago: nothing keeps.
+    let b2 = MemBucket {
+        cached: BTreeMap::from([(hash(), template())]),
+        marker: b.marker.clone(),
+        ..Default::default()
+    };
+    session(&b2, WS1, "v1", &id(1), "done", NOW - 9 * DAY, None);
+    session(&b2, WS2, "copy", &id(3), "done", NOW - 9 * DAY, None);
+    assert!(!run(&b2, &facts_with_marker(&b2)).keeps());
+    // A marker whose target can't be read or verified keeps, unchecked.
+    let b3 = MemBucket {
+        marker: Some(Err(UncheckedError::Unparseable)),
+        ..Default::default()
+    };
+    session(&b3, WS1, "v1", &id(1), "done", NOW - 9 * DAY, None);
+    let v = run(&b3, &facts_with_marker(&b3));
+    assert_eq!(
+        v.unchecked,
+        vec![Unchecked {
+            name: "v1".to_string(),
+            error: UncheckedError::Unparseable
+        }]
+    );
+    // A target passed in by the caller (`prune --migrated-from`) counts the
+    // same way.
+    let mut memo = Memo::default();
+    let facts = facts_of(&b, WS1, "v1", Some(&id(1)), false);
+    let extra = [Pointer {
+        prefix: WS2.to_string(),
+        name: "copy".to_string(),
+    }];
+    let v = walk(
+        &b,
+        &mut memo,
+        &Start {
+            facts: &facts,
+            skip: None,
+            extra: &extra,
+        },
+        &clock(),
+    )
+    .verdict;
+    assert_eq!(v.keepers.len(), 1, "{v:?}");
 }

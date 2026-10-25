@@ -80,11 +80,9 @@ impl BucketReads for CloudBackend {
     }
 
     fn get(&self, key: &str, max: usize) -> Result<Option<Vec<u8>>, UncheckedError> {
-        let response = if max <= crate::session::links::MAX_LINK_BODY_BYTES {
-            self.bucket.get_object(key)
-        } else {
-            self.bucket.get_object_range(key, 0, Some(max as u64))
-        };
+        // A ranged GET, so no read takes more than one byte past `max`
+        // whatever the object's size; the caller refuses what is over.
+        let response = self.bucket.get_object_range(key, 0, Some(max as u64));
         match response {
             Ok(r) => match r.status_code() {
                 200 | 206 => Ok(Some(r.bytes().to_vec())),
@@ -131,12 +129,13 @@ impl BucketReads for CloudBackend {
         };
         let field = |f: &str| super::marker_target_field(&marker, f);
         let (t_prefix, t_session, t_id) = (field("prefix"), field("session"), field("session_id"));
-        // A marker that names no target this koto can read points at no
-        // later session: the session's own back-references still count.
+        // A marker whose target can't be read may name a later session this
+        // walk can't check: it keeps, reported unchecked, as the
+        // migrated-from prune keeps a marker whose target is unknown.
         if !is_workspace_prefix(&t_prefix)
             || crate::session::validate::validate_session_id(&t_session).is_err()
         {
-            return (Ok(None), requests);
+            return (Err(UncheckedError::Unparseable), requests);
         }
         // The source copy is listed and read, and the target too.
         requests += 4;
@@ -483,6 +482,10 @@ impl CloudBackend {
                  removed, and is left for walks to read as stale: {e:#}"
             );
         }
+        // Should the removal stop part way and leave the session, its
+        // pointer is owed again: the next command writes it, and until then
+        // its relation stays out of every push.
+        continues_bucket::clear_mark(&self.local.session_dir(id));
     }
 
     /// PUT the pointer session `id`'s relation calls for when it is owed
