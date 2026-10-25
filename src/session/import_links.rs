@@ -281,6 +281,8 @@ impl Settlement<'_> {
                             session: to.to_string(),
                             session_id: hints.session_id,
                             workspace: hints.workspace,
+                            prefix: Default::default(),
+                            holder_session_id: None,
                             at: crate::engine::types::now_iso8601(),
                             was: Some(anchor.clone()),
                         };

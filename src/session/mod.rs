@@ -3,6 +3,7 @@ pub mod batch;
 pub mod cloud;
 pub mod context;
 pub mod context_log;
+pub mod continues_bucket;
 pub mod duration;
 pub mod finished;
 pub mod hierarchy;

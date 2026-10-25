@@ -754,13 +754,18 @@ impl RetentionReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct KeptChild {
     pub name: String,
-    /// The retention reason code, as `retention.reason` spells it.
+    /// The retention reason code, as `retention.reason` spells it, or
+    /// `relation` for a child the sweep kept because a later session
+    /// continuing it has standing.
     pub reason: &'static str,
     /// The links and lineage that keep it, naming the sessions they name;
-    /// for a pinned child, its pin.
+    /// for a pinned child, its pin; for a child the relation keeps, its
+    /// keepers.
     pub detail: String,
-    /// For a pinned child: `kept_by_pin` and `pin` or `pin_unreadable`.
-    /// Empty, and absent from the JSON, for every other child.
+    /// For a pinned child: `kept_by_pin` and `pin` or `pin_unreadable`; for
+    /// a child the relation keeps: `kept_by_relation`, `relation_keepers`
+    /// and `relation_unreadable`. Empty, and absent from the JSON, for
+    /// every other child.
     #[serde(flatten)]
     pub pin: serde_json::Map<String, serde_json::Value>,
 }
@@ -780,19 +785,24 @@ pub struct Retention {
     /// beside whichever reason keeps it. Empty, and absent from the JSON,
     /// for a session with no pin.
     pub pin: serde_json::Map<String, serde_json::Value>,
+    /// For a kept session a continues link names: `relation_keepers` (and
+    /// `relation_unreadable`), the later sessions whose standing keeps it,
+    /// beside the reason (`hierarchy`, since the link is an edge). Empty,
+    /// and absent from the JSON, for a session no continues link names.
+    pub relation: serde_json::Map<String, serde_json::Value>,
     pub kept_children: Vec<KeptChild>,
 }
 
 impl Serialize for Retention {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(
-            1 + usize::from(self.reason.is_some()) + self.pin.len(),
+            1 + usize::from(self.reason.is_some()) + self.pin.len() + self.relation.len(),
         ))?;
         map.serialize_entry("retained", &self.reason.is_some())?;
         if let Some(reason) = self.reason {
             map.serialize_entry("reason", reason.as_str())?;
         }
-        for (k, v) in &self.pin {
+        for (k, v) in self.pin.iter().chain(&self.relation) {
             map.serialize_entry(k, v)?;
         }
         map.end()

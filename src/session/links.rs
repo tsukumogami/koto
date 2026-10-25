@@ -59,11 +59,22 @@ pub enum LinkKind {
     /// The peer is the anchor the session holding the link closes; only a
     /// close session holds one.
     Closes,
+    /// The session holding the link continues the peer: it is the peer's
+    /// successor (DESIGN-koto-session-continues.md, Decision 2). Unlike the
+    /// other kinds it joins no hierarchy: retention reads it as a directed
+    /// overlay that keeps the peer while the holder, or anything later, has
+    /// standing. A session holds at most one.
+    Continues,
 }
 
 impl LinkKind {
     /// Every kind koto knows.
-    pub const ALL: [LinkKind; 3] = [LinkKind::DispatchedBy, LinkKind::HeldBy, LinkKind::Closes];
+    pub const ALL: [LinkKind; 4] = [
+        LinkKind::DispatchedBy,
+        LinkKind::HeldBy,
+        LinkKind::Closes,
+        LinkKind::Continues,
+    ];
 
     /// The kind's key component, as it appears in `koto/links/<kind>/`.
     pub const fn as_str(self) -> &'static str {
@@ -71,6 +82,7 @@ impl LinkKind {
             LinkKind::DispatchedBy => "dispatched-by",
             LinkKind::HeldBy => "held-by",
             LinkKind::Closes => "closes",
+            LinkKind::Continues => "continues",
         }
     }
 
@@ -214,15 +226,72 @@ impl LinkHints {
 /// A link's value. `session_id` and `workspace` are `null` when unknown.
 /// `was` is present only on a held-by link `koto session import` rewrote to
 /// the importing agent session's anchor: the anchor it named before.
+///
+/// A continues link also carries `prefix`, the predecessor's bucket prefix
+/// under the cloud backend (`null` otherwise), and `holder_session_id`, the
+/// successor's own session id, which lets a reader of the bucket match the
+/// relation without reading the successor's state. Both are absent from
+/// every other kind's body, and `v` stays 1: an older reader ignores them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkBody {
     pub v: u32,
     pub session: String,
     pub session_id: Option<String>,
     pub workspace: Option<String>,
+    /// The predecessor's bucket prefix: written on continues links only,
+    /// and there always, `null` under the local backend.
+    #[serde(default, skip_serializing_if = "Prefix::is_absent")]
+    pub prefix: Prefix,
+    /// The holder's own session id: continues links only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_session_id: Option<String>,
     pub at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub was: Option<String>,
+}
+
+/// A link body's `prefix`: absent from every kind but continues, `null`
+/// when the predecessor has no bucket prefix (the local backend), or the
+/// prefix's 16 lowercase hex digits. Kept apart from `Option` so a
+/// continues body always writes the field and every other body never does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Prefix {
+    #[default]
+    Absent,
+    Null,
+    Value(String),
+}
+
+impl Prefix {
+    fn is_absent(&self) -> bool {
+        matches!(self, Prefix::Absent)
+    }
+
+    /// The prefix, when the body records one.
+    pub fn value(&self) -> Option<&str> {
+        match self {
+            Prefix::Value(p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for Prefix {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Prefix::Value(p) => serializer.serialize_str(p),
+            _ => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Prefix {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match Option::<String>::deserialize(deserializer)? {
+            Some(p) => Prefix::Value(p),
+            None => Prefix::Null,
+        })
+    }
 }
 
 /// One link a session holds.
@@ -299,9 +368,140 @@ where
         session: peer.to_string(),
         session_id: hints.session_id.clone(),
         workspace: hints.workspace.clone(),
+        prefix: Prefix::Absent,
+        holder_session_id: None,
         at: crate::engine::types::now_iso8601(),
         was: None,
     };
+    let content = serde_json::to_vec(&body)?;
+    store.add_with_writer(session, &key, &content, WRITER_KOTO)?;
+    append_to_session_best_effort(store, session, &added_event(&key, &content, WRITER_KOTO));
+    Ok(LinkWrite::Written)
+}
+
+/// Where a session's continues link lives: `koto/links/continues/`.
+pub fn continues_prefix() -> String {
+    format!("{LINKS_PREFIX}{}/", LinkKind::Continues.as_str())
+}
+
+/// The predecessors `session` names in a continues link, by the key's
+/// peer, in key order. A session holds at most one; more is a store
+/// written by hand. A key whose shape isn't `continues/<peer>` is skipped.
+pub fn continues_of(store: &dyn ContextStore, session: &str) -> anyhow::Result<Vec<String>> {
+    let prefix = continues_prefix();
+    Ok(store
+        .list_keys(session, Some(&prefix))?
+        .into_iter()
+        .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
+        .filter(|peer| !peer.is_empty() && !peer.contains('/'))
+        .collect())
+}
+
+/// What a continues link records beside the predecessor's name (R2), and
+/// what [`write_continues`] checks a same-name predecessor against.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContinuesHints {
+    /// The predecessor's session id and workspace path.
+    pub peer: LinkHints,
+    /// The predecessor's bucket prefix; `None` under the local backend.
+    pub prefix: Option<String>,
+    /// The successor's own session id.
+    pub holder_session_id: Option<String>,
+    /// The successor's own bucket prefix, when it has one. A predecessor
+    /// with the successor's own name is accepted only when `prefix` is set
+    /// and differs from this.
+    pub holder_prefix: Option<String>,
+}
+
+/// Why [`write_continues`] refused. Nothing was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContinuesRefusal {
+    /// The predecessor name fails the session-name rule or the key grammar,
+    /// or is the successor's own name in its own workspace.
+    InvalidPeer(InvalidPeerError),
+    /// The successor already continues another session (R3, R4).
+    OtherPredecessor { existing: String },
+    /// The successor doesn't exist.
+    NoSuchSession,
+}
+
+impl std::fmt::Display for ContinuesRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ContinuesRefusal::InvalidPeer(e) => e.fmt(f),
+            ContinuesRefusal::OtherPredecessor { existing } => write!(
+                f,
+                "the session already continues '{existing}', and a session continues at most \
+                 one predecessor"
+            ),
+            ContinuesRefusal::NoSuchSession => f.write_str("the session does not exist"),
+        }
+    }
+}
+
+impl std::error::Error for ContinuesRefusal {}
+
+/// Record in `session`, and only there, that it continues `pred`: the
+/// continues link `koto/links/continues/<pred>` (Decision 2).
+///
+/// Refuses with a [`ContinuesRefusal`], writing nothing: a name
+/// [`validate_peer`] refuses; the session's own name, unless `hints` give
+/// the predecessor a bucket prefix that differs from the holder's (a
+/// same-host import's copy naming its source in another workspace); a
+/// session that doesn't exist; and a session that already continues
+/// another predecessor. A relation the session already holds is left
+/// alone, body included ([`LinkWrite::Unchanged`]). Otherwise the body
+/// records `pred`'s name, session id, workspace and prefix and the holder's
+/// own session id, written with writer `koto` and a `context_added` event,
+/// as [`write_link`] writes. Nothing here reads an anchor, an authority or
+/// a request leg (R1, R20).
+pub fn write_continues<S>(
+    store: &S,
+    session: &str,
+    pred: &str,
+    hints: &ContinuesHints,
+) -> anyhow::Result<LinkWrite>
+where
+    S: ContextStore + SessionBackend,
+{
+    let kind = LinkKind::Continues;
+    validate_peer(kind, pred).map_err(ContinuesRefusal::InvalidPeer)?;
+    let other_prefix = matches!(
+        (&hints.prefix, &hints.holder_prefix),
+        (Some(p), Some(h)) if p != h
+    );
+    if pred == session && !other_prefix {
+        return Err(ContinuesRefusal::InvalidPeer(InvalidPeerError {
+            peer: pred.to_string(),
+            reason: "a session can't continue itself".to_string(),
+        })
+        .into());
+    }
+    if !store.exists(session) {
+        return Err(ContinuesRefusal::NoSuchSession.into());
+    }
+    let held = continues_of(store, session)?;
+    if held.iter().any(|p| p == pred) {
+        return Ok(LinkWrite::Unchanged);
+    }
+    if let Some(existing) = held.into_iter().next() {
+        return Err(ContinuesRefusal::OtherPredecessor { existing }.into());
+    }
+
+    let body = LinkBody {
+        v: LINK_BODY_VERSION,
+        session: pred.to_string(),
+        session_id: hints.peer.session_id.clone(),
+        workspace: hints.peer.workspace.clone(),
+        prefix: match &hints.prefix {
+            Some(p) => Prefix::Value(p.clone()),
+            None => Prefix::Null,
+        },
+        holder_session_id: hints.holder_session_id.clone(),
+        at: crate::engine::types::now_iso8601(),
+        was: None,
+    };
+    let key = link_key(kind, pred);
     let content = serde_json::to_vec(&body)?;
     store.add_with_writer(session, &key, &content, WRITER_KOTO)?;
     append_to_session_best_effort(store, session, &added_event(&key, &content, WRITER_KOTO));
@@ -712,6 +912,100 @@ mod tests {
         )
         .is_err());
         assert_eq!(snapshot(tmp.path()), before);
+    }
+
+    #[test]
+    fn write_continues_records_the_relation_once_and_refuses_a_second() {
+        let (tmp, b) = backend();
+        make_session(&b, "v1", "id-v1", Some("/work/one"));
+        make_session(&b, "v2", "id-v2", None);
+        make_session(&b, "other", "id-other", None);
+        assert_eq!(LinkKind::parse("continues"), Some(LinkKind::Continues));
+        let hints = ContinuesHints {
+            peer: LinkHints::for_peer(&b, "v1"),
+            prefix: None,
+            holder_session_id: Some("id-v2".to_string()),
+            holder_prefix: None,
+        };
+        let v1_before = snapshot(&b.session_dir("v1"));
+        assert_eq!(
+            write_continues(&b, "v2", "v1", &hints).unwrap(),
+            LinkWrite::Written
+        );
+        assert_eq!(snapshot(&b.session_dir("v1")), v1_before);
+        let key = "koto/links/continues/v1";
+        let raw: serde_json::Value = serde_json::from_slice(&b.get("v2", key).unwrap()).unwrap();
+        let mut fields: Vec<&String> = raw.as_object().unwrap().keys().collect();
+        fields.sort();
+        assert_eq!(
+            fields,
+            [
+                "at",
+                "holder_session_id",
+                "prefix",
+                "session",
+                "session_id",
+                "v",
+                "workspace"
+            ]
+        );
+        assert_eq!(raw["session_id"], "id-v1");
+        assert_eq!(raw["workspace"], "/work/one");
+        assert!(raw["prefix"].is_null());
+        assert_eq!(raw["holder_session_id"], "id-v2");
+        assert_eq!(b.meta("v2", key).unwrap().writer.as_deref(), Some("koto"));
+        assert_eq!(continues_of(&b, "v2").unwrap(), vec!["v1".to_string()]);
+        // The body round-trips, and other kinds never carry the new fields.
+        let body: LinkBody = serde_json::from_value(raw).unwrap();
+        assert_eq!(body.prefix, Prefix::Null);
+        let plain = serde_json::to_value(LinkBody {
+            v: 1,
+            session: "p".to_string(),
+            session_id: None,
+            workspace: None,
+            prefix: Prefix::Absent,
+            holder_session_id: None,
+            at: "x".to_string(),
+            was: None,
+        })
+        .unwrap();
+        assert!(plain.get("prefix").is_none() && plain.get("holder_session_id").is_none());
+
+        // Again: nothing changes. Another predecessor, the session itself
+        // and a session that doesn't exist: refused, nothing written.
+        let before = snapshot(tmp.path());
+        assert_eq!(
+            write_continues(&b, "v2", "v1", &hints).unwrap(),
+            LinkWrite::Unchanged
+        );
+        for (session, pred) in [("v2", "other"), ("v2", "v2"), ("nope", "v1"), ("v2", "a~1")] {
+            let err = write_continues(&b, session, pred, &hints).unwrap_err();
+            assert!(
+                err.downcast_ref::<ContinuesRefusal>().is_some(),
+                "{session} {pred}: {err}"
+            );
+        }
+        assert_eq!(snapshot(tmp.path()), before);
+    }
+
+    #[test]
+    fn a_same_name_predecessor_needs_another_prefix() {
+        let (_tmp, b) = backend();
+        make_session(&b, "s", "id-s", None);
+        let mut hints = ContinuesHints {
+            prefix: Some("0123456789abcdef".to_string()),
+            holder_prefix: Some("0123456789abcdef".to_string()),
+            ..Default::default()
+        };
+        assert!(write_continues(&b, "s", "s", &hints).is_err());
+        hints.holder_prefix = Some("fedcba9876543210".to_string());
+        assert_eq!(
+            write_continues(&b, "s", "s", &hints).unwrap(),
+            LinkWrite::Written
+        );
+        let raw: serde_json::Value =
+            serde_json::from_slice(&b.get("s", "koto/links/continues/s").unwrap()).unwrap();
+        assert_eq!(raw["prefix"], "0123456789abcdef");
     }
 
     #[test]

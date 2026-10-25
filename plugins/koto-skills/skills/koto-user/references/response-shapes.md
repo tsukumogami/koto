@@ -521,7 +521,9 @@ agents encounter today for any state that uses `integration:`.
   "reason": "hierarchy"}` (the session has a
   link or lineage: a dispatcher, a koto parent, a `chain/parent`, or another
   session naming it; kept with or without `--no-cleanup` until `koto session
-  prune` finds its hierarchy released), or `{"retained": true, "reason":
+  prune` finds its hierarchy released; a session a later session continues
+  adds `relation_keepers`, each `{keeper, standing, path}`, naming the later
+  sessions whose standing keeps it), or `{"retained": true, "reason":
   "no_cleanup"}` (a lone session kept because the tick passed `--no-cleanup`). A
   parent kept for `hierarchy` also carries `kept_children`, beside `retention`:
   each terminal child it would once have removed, as `{"name", "reason",

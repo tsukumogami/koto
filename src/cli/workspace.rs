@@ -32,6 +32,7 @@ use serde_json::json;
 
 use crate::engine::persistence::derive_machine_state;
 use crate::engine::types::{EventPayload, StateFileHeader};
+use crate::session::continues_bucket::relation_at_removal;
 use crate::session::hierarchy::{
     self, Graph, Judge, MemberKind, RetentionSettings, Scope, Verdict,
 };
@@ -178,7 +179,15 @@ pub fn handle_prune(
     // record names was released on another host, and no longer keeps.
     crate::session::pin::reconcile(backend, &mut graph);
     let now = std::time::SystemTime::now();
-    let mut plan = judge_subtree(&graph, &settings, now, &root, &descendants, &by_name);
+    let mut plan = judge_subtree(
+        backend,
+        &graph,
+        &settings,
+        now,
+        &root,
+        &descendants,
+        &by_name,
+    );
     // A preview someone reads before deciding shows a pin another host set:
     // under the cloud backend each member it would remove is checked in the
     // bucket. With `--yes` nobody reads it first, and the guard at each
@@ -306,6 +315,10 @@ struct KeptMember {
     /// For a pinned member: `kept_by_pin` and `pin` or `pin_unreadable`.
     /// Empty for every other member, whose entry is unchanged.
     pin: serde_json::Map<String, serde_json::Value>,
+    /// For a member the continues relation keeps, whatever else keeps it:
+    /// `kept_by_relation`, `relation_keepers` and `relation_unreadable`.
+    /// Empty for every other member.
+    relation: serde_json::Map<String, serde_json::Value>,
 }
 
 impl KeptMember {
@@ -314,7 +327,7 @@ impl KeptMember {
         if let Some(h) = &self.hierarchy {
             v["hierarchy"] = h.clone();
         }
-        for (k, value) in &self.pin {
+        for (k, value) in self.pin.iter().chain(&self.relation) {
             v[k] = value.clone();
         }
         v
@@ -380,8 +393,11 @@ fn scope_for(root: &str, member: &str) -> Scope {
 /// Judge the root and each descendant (listed each after its parent), then
 /// list each of `by_name`, the pinned children the subtree's logs name
 /// outside its lineage, as kept by its pin (as the scan read it), never for
-/// removal.
+/// removal. A member the continues relation keeps (a later session
+/// continuing it has standing) is kept too, with the keepers named, and
+/// keeps only itself, as a pin does.
 fn judge_subtree(
+    backend: &crate::session::Backend,
     graph: &Graph,
     settings: &RetentionSettings,
     now: std::time::SystemTime,
@@ -412,13 +428,18 @@ fn judge_subtree(
                 }
                 // A member's own pin keeps it, whatever its hierarchy's
                 // verdict, and keeps nothing else: the other members are
-                // judged by the rule alone.
+                // judged by the rule alone. The continues relation is the
+                // same kind of overlay, asked last; a member kept besides
+                // carries its report too.
+                let related = relation_at_removal(backend, &j, member);
+                let relation = hierarchy::relation_json(&related);
                 if let Some(pinned) = hierarchy::pin_text(&j.pin) {
                     plan.kept.push(KeptMember {
                         name: member.to_string(),
                         reason: pinned,
                         hierarchy: Some(hierarchy::to_json(&j, settings)),
                         pin: hierarchy::pin_fields(&j.pin, j.pin_source),
+                        relation,
                     });
                 } else if j.verdict.is_kept() {
                     plan.kept.push(KeptMember {
@@ -426,6 +447,15 @@ fn judge_subtree(
                         reason: hierarchy::reason_text(&j.verdict),
                         hierarchy: Some(hierarchy::to_json(&j, settings)),
                         pin: Default::default(),
+                        relation,
+                    });
+                } else if related.keeps() {
+                    plan.kept.push(KeptMember {
+                        name: member.to_string(),
+                        reason: hierarchy::relation_text(&related).join("; "),
+                        hierarchy: Some(hierarchy::to_json(&j, settings)),
+                        pin: Default::default(),
+                        relation,
                     });
                 } else {
                     let facts = graph.facts(member);
@@ -446,6 +476,7 @@ fn judge_subtree(
                 reason: format!("kept: it can't be judged: {e:#}"),
                 hierarchy: None,
                 pin: Default::default(),
+                relation: Default::default(),
             }),
         }
     }
@@ -457,14 +488,16 @@ fn judge_subtree(
         let Some(reason) = hierarchy::pin_text(pin) else {
             continue;
         };
+        let judged = judge.judge(member, &Scope::Whole).ok();
         plan.kept.push(KeptMember {
             name: member.to_string(),
             reason,
-            hierarchy: judge
-                .judge(member, &Scope::Whole)
-                .ok()
-                .map(|j| hierarchy::to_json(&j, settings)),
+            hierarchy: judged.as_ref().map(|j| hierarchy::to_json(j, settings)),
             pin: hierarchy::pin_fields(pin, facts.pin_source()),
+            relation: judged
+                .as_ref()
+                .map(|j| hierarchy::relation_json(j.relation_of(member)))
+                .unwrap_or_default(),
         });
     }
     plan
@@ -491,6 +524,7 @@ fn keep_bucket_pinned(backend: &crate::session::Backend, plan: &mut SubtreePlan)
             reason: guard.text().unwrap_or_default(),
             hierarchy: None,
             pin: guard.fields(),
+            relation: Default::default(),
         });
     }
     plan.remove = remove;
@@ -561,10 +595,24 @@ fn reclaim(
     let mut cleared = Vec::new();
     for (member, lock) in locked {
         let name = member.name.as_str();
-        let refusal = match judge.judge(name, &scope_for(root, name)) {
-            Ok(j) if j.verdict.is_kept() => {
+        let judged = judge.judge(name, &scope_for(root, name)).map(|j| {
+            // Whether a later session continuing it has standing now. Its
+            // pin is the guard's, at the delete.
+            let related = (!j.verdict.is_kept()).then(|| relation_at_removal(backend, &j, name));
+            (j, related.filter(|r| r.keeps()))
+        });
+        let relation = match &judged {
+            Ok((_, Some(related))) => hierarchy::relation_json(related),
+            _ => serde_json::Map::new(),
+        };
+        let refusal = match judged {
+            Ok((j, _)) if j.verdict.is_kept() => {
                 Some(format!("now {}", hierarchy::reason_text(&j.verdict)))
             }
+            Ok((_, Some(related))) => Some(format!(
+                "now {}",
+                hierarchy::relation_text(&related).join("; ")
+            )),
             Ok(_) => match backend.read_header(name) {
                 Err(e) => Some(format!("its header can't be read: {e:#}")),
                 Ok(h)
@@ -586,7 +634,14 @@ fn reclaim(
             Err(e) => Some(format!("it can't be judged again: {e:#}")),
         };
         match refusal {
-            Some(reason) => skip(&mut out, &mut left, name, reason),
+            Some(reason) => {
+                skip(&mut out, &mut left, name, reason);
+                if let Some(entry) = out.skipped.last_mut() {
+                    for (k, v) in relation {
+                        entry[k] = v;
+                    }
+                }
+            }
             None => cleared.push((member, lock)),
         }
     }
@@ -975,6 +1030,12 @@ impl DescendantVisitor for Sweep<'_> {
         if !below_cleared || !is_terminal_session(backend, child) {
             return false;
         }
+        // A later session continuing it has standing: kept, and, like a
+        // pinned child, it keeps nothing above it.
+        if let Some(kept) = relation_kept_child(backend, child) {
+            self.pinned.push(kept);
+            return true;
+        }
         // Its finished record first, so `koto status` can answer for it once
         // it is gone.
         #[cfg(unix)]
@@ -999,6 +1060,52 @@ impl DescendantVisitor for Sweep<'_> {
             }
         }
     }
+}
+
+/// The `kept_children` entry for a descendant the sweep keeps because the
+/// continues relation keeps it (DESIGN-koto-session-continues.md, R9):
+/// reason `relation`, the keepers as its detail, and the relation's fields.
+/// `None` when no relation keeps it. Judged only when a continues link may
+/// name the child ([`hierarchy::relation_probe`]), so a sweep of children
+/// nothing continues reads what it read before; anything that stops the
+/// judgment keeps the child.
+fn relation_kept_child(backend: &dyn SessionBackend, child: &str) -> Option<KeptChild> {
+    let dir = backend.session_dir(child);
+    let base = dir.parent()?;
+    if !hierarchy::relation_probe(base, child) {
+        return None;
+    }
+    let kept = |detail: String, fields| KeptChild {
+        name: child.to_string(),
+        reason: "relation",
+        detail,
+        pin: fields,
+    };
+    let settings = match RetentionSettings::load() {
+        Ok(s) => s,
+        Err(e) => {
+            return Some(kept(
+                format!("kept: the relation naming it can't be judged: {e:#}"),
+                Default::default(),
+            ))
+        }
+    };
+    let graph = match Graph::scan(base) {
+        Ok(g) => g,
+        Err(e) => {
+            return Some(kept(
+                format!("kept: the relation naming it can't be judged: {e:#}"),
+                Default::default(),
+            ))
+        }
+    };
+    let related = Judge::new(&graph, settings, std::time::SystemTime::now()).relation(child);
+    related.keeps().then(|| {
+        kept(
+            hierarchy::relation_text(&related).join("; "),
+            hierarchy::relation_json(&related),
+        )
+    })
 }
 
 /// Every descendant of `root` by koto lineage, whatever state it is in.

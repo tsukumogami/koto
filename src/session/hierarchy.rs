@@ -29,6 +29,13 @@
 //! instant is the latest stop among its members, and it is released when the
 //! retention (`retention.keep`) has passed since then.
 //!
+//! A continues link (`koto/links/continues/<pred>`) is no edge. The scan
+//! keeps it out of every component and resolves it into a directed list
+//! that [`Judge::relation`] reads as an overlay beside the pin: a session
+//! is kept while a later member continuing it has standing of its own
+//! ([`relation`]). [`Judgment::keeps`] asks the pin, the verdict and that
+//! overlay.
+//!
 //! Everything fails toward keeping: a malformed link, close record or
 //! `chain/parent`, an unreadable log, a symlink under `ctx/koto/`, or a
 //! timestamp more than five minutes ahead of `now` taints its component; an
@@ -42,6 +49,7 @@
 mod facts;
 mod graph;
 mod judge;
+pub mod relation;
 mod render;
 mod settings;
 
@@ -50,15 +58,17 @@ mod tests;
 
 use std::path::Path;
 
-pub use facts::{ImportedFrom, LinkFact, SessionFacts, IMPORTED_FROM_KEY};
-pub use graph::{Edge, Graph, Scope, Via};
+pub use facts::{ContinuesFact, ImportedFrom, LinkFact, SessionFacts, IMPORTED_FROM_KEY};
+pub use graph::{Directed, Edge, Graph, Scope, Via};
 pub use judge::{
     CloseKind, Judge, Judgment, Keeper, Member, MemberKind, ReleaseInstant, Retention, Unreadable,
     Verdict,
 };
+pub use relation::{RelationKeeper, RelationVerdict, Standing};
 pub use render::{
     close_command, display_text, keeper_json, keeper_line, pin_fields, pin_json, pin_text,
-    query_json, query_text, reason_text, release_json, render_text, sanitize, to_json,
+    query_json, query_text, reason_text, relation_json, relation_report_json, relation_text,
+    release_json, render_text, sanitize, to_json,
 };
 pub use settings::{RetentionSettings, Setting, SettingError};
 
@@ -108,6 +118,54 @@ fn chain_parent_names(dir: &Path, probes: &[&str]) -> bool {
     }
 }
 
+/// Whether a continues link in another session under `base` may name
+/// session `name`: a continues file under its name, or one whose body
+/// records its session id under another name (a predecessor the same-name
+/// replace moved aside). The terminal tick asks this beside [`edge_of`] and
+/// judges the relation only when it answers yes, so a session no relation
+/// names costs what it cost before (DESIGN-koto-session-continues.md,
+/// Decision 5). Anything it can't read answers yes, which only costs a
+/// judgment.
+pub fn relation_probe(base: &Path, name: &str) -> bool {
+    let own_id = facts::read_header_line(&base.join(name), name)
+        .ok()
+        .map(|h| h.session_id)
+        .filter(|id| !id.is_empty());
+    let names = match graph::session_names(base) {
+        Ok(names) => names,
+        Err(_) => return true,
+    };
+    for other in names.iter().filter(|n| n.as_str() != name) {
+        let dir = base
+            .join(other)
+            .join("ctx")
+            .join("koto")
+            .join("links")
+            .join(crate::session::links::LinkKind::Continues.as_str());
+        let files = match std::fs::read_dir(&dir) {
+            Ok(files) => files,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return true,
+        };
+        for file in files {
+            let Ok(file) = file else { return true };
+            if file.file_name().to_str() == Some(name) {
+                return true;
+            }
+            match facts::link_file_names(&file.path()) {
+                Ok(Some((_, session_id))) => {
+                    if own_id.is_some() && session_id == own_id {
+                        return true;
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => return true,
+            }
+        }
+    }
+    false
+}
+
 /// Whether session `name` under `base` has any edge at all: a link of its
 /// own, a `parent_workflow`, a `chain/parent`, or another session naming it
 /// through lineage, a link or a `chain/parent`.
@@ -139,7 +197,15 @@ pub fn edge_of(base: &Path, name: &str) -> bool {
     if !own.problems.is_empty() || !own.store_problems.is_empty() {
         return true;
     }
-    if !own.links.is_empty() || own.parent_workflow.is_some() || own.chain_parent.is_some() {
+    // A continues link counts on the holder's side too: the tick leaves a
+    // successor for a prune to judge, as it leaves any session holding a
+    // link (DESIGN-koto-session-continues.md, "The terminal tick and
+    // holders").
+    if !own.links.is_empty()
+        || !own.continues.is_empty()
+        || own.parent_workflow.is_some()
+        || own.chain_parent.is_some()
+    {
         return true;
     }
     let names = match graph::session_names(base) {
