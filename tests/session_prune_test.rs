@@ -1315,6 +1315,130 @@ fn under_the_cloud_backend_workspace_prune_yes_refuses_a_short_retention() {
     assert!(!env.sessions().join("child").exists());
 }
 
+/// Every file in the local session store, by path relative to it, with each
+/// session's state log hashed: what a refused removal must leave alone.
+fn local_store(env: &Env) -> BTreeMap<PathBuf, String> {
+    let root = env.sessions();
+    let mut out = BTreeMap::new();
+    let mut stack = vec![root.clone()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let meta = std::fs::symlink_metadata(&p).unwrap();
+            if meta.is_dir() {
+                stack.push(p);
+            } else if meta.is_file() {
+                let rel = p.strip_prefix(&root).unwrap().to_path_buf();
+                let is_log = rel.to_string_lossy().ends_with(".state.jsonl");
+                let digest = if is_log {
+                    hex::encode(Sha256::digest(std::fs::read(&p).unwrap()))
+                } else {
+                    String::new()
+                };
+                out.insert(rel, digest);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn under_the_cloud_backend_a_refused_apply_leaves_the_local_store_as_it_was() {
+    let s3 = FakeS3::start(BUCKET);
+    let env = Env::cloud(&s3);
+    env.done("first");
+    env.done("second");
+    settle();
+
+    let dir = env.work.to_str().unwrap().to_string();
+    for args in [
+        vec!["--apply", "--all"],
+        vec!["--apply", "--older-than", "1s"],
+        vec!["--apply", "--execution-dir", dir.as_str()],
+    ] {
+        let before = local_store(&env);
+        assert!(!before.is_empty());
+        let out = env.prune(&args);
+        short_retention_refusal(&out);
+        assert_eq!(local_store(&env), before, "{args:?}");
+    }
+}
+
+#[test]
+fn under_the_cloud_backend_a_short_retention_with_nothing_to_remove_runs() {
+    let s3 = FakeS3::start(BUCKET);
+    let env = Env::cloud(&s3);
+    env.init("running");
+    settle();
+    let before = bucket_keys(&s3);
+
+    let v = env.prune_ok(&["--apply", "--all"]);
+    assert!(names(&v["removed"]).is_empty(), "{v:#}");
+    assert!(env.sessions().join("running").is_dir());
+    assert_eq!(bucket_keys(&s3), before);
+}
+
+#[test]
+fn under_the_cloud_backend_the_confirm_flag_removes_only_what_no_keeper_holds() {
+    let s3 = FakeS3::start(BUCKET);
+    let env = Env::cloud(&s3);
+    env.done("loose");
+    env.done("pinned");
+    env.ok(&["session", "pin", "pinned", "--reason", "kept by a test"]);
+    env.init("root");
+    env.init_child("child", "root");
+    env.finish("child", "yes");
+    settle();
+    let prefix = env.prefix();
+
+    let out = env.prune(&["--apply", "--all", "--confirm-short-retention"]);
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(names(&v["removed"]), vec!["loose"], "{v:#}");
+
+    assert!(!env.sessions().join("loose").exists());
+    assert!(s3.keys_under(&format!("{prefix}/loose/")).is_empty());
+    for kept in ["pinned", "child", "root"] {
+        assert!(env.sessions().join(kept).is_dir(), "{kept} lost locally");
+        assert!(
+            !s3.keys_under(&format!("{prefix}/{kept}/")).is_empty(),
+            "{kept} lost in the bucket"
+        );
+    }
+}
+
+#[test]
+fn under_the_cloud_backend_the_store_line_comes_first_in_a_confirmed_apply() {
+    let s3 = FakeS3::start(BUCKET);
+    let env = Env::cloud(&s3);
+    env.done("first");
+    settle();
+
+    let out = env.prune(&["--apply", "--all", "--confirm-short-retention"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let first = stderr
+        .lines()
+        .find(|l| l.starts_with("koto session prune:"))
+        .unwrap_or_default();
+    assert!(
+        first.starts_with("koto session prune: removing from") && first.contains(BUCKET),
+        "{stderr}"
+    );
+}
+
 /// The store-scale measurement: 1,000 sessions koto created and finished,
 /// previewed with no filter. Run it with
 /// `cargo test --release --test session_prune_test -- --ignored --nocapture`;
