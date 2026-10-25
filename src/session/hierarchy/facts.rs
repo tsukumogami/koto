@@ -46,6 +46,20 @@ pub struct LinkFact {
     pub session_id: Option<String>,
 }
 
+/// One continues link a session holds (DESIGN-koto-session-continues.md,
+/// Decision 2). Never a [`LinkFact`] and never an edge: retention reads it
+/// as a directed overlay, so a body that can't be read is the relation's
+/// problem (`relation_unreadable`), never a problem of the holder's
+/// hierarchy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuesFact {
+    /// The predecessor the key names.
+    pub peer: String,
+    /// The predecessor's session id the body recorded (`Ok(None)` when it
+    /// recorded none), or why the body can't be read.
+    pub body: Result<Option<String>, super::relation::Reason>,
+}
+
 /// What `koto/imported-from` says the session was copied from.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ImportedFrom {
@@ -64,8 +78,14 @@ pub struct SessionFacts {
     pub session_id: Option<String>,
     pub parent_workflow: Option<String>,
     pub created_at: Option<String>,
-    /// Every link the session holds, in key order.
+    /// Every link the session holds, in key order, continues links aside.
     pub links: Vec<LinkFact>,
+    /// The continues links the session holds, in key order: at most one
+    /// unless written by hand.
+    pub continues: Vec<ContinuesFact>,
+    /// Whether this session's reserved area couldn't be listed, so it may
+    /// hold a continues link naming any session (`unlistable`).
+    pub relations_unlistable: bool,
     /// A well-formed `chain/parent`.
     pub chain_parent: Option<String>,
     /// A readable `koto/imported-from`.
@@ -210,6 +230,44 @@ pub(crate) fn link_file_names(
         .map(|b| (b.session, b.session_id)))
 }
 
+/// The predecessor a continues key names, when the key is
+/// `koto/links/continues/<peer>` with a session-name peer. A key of any
+/// other shape under the kind is read as an ordinary link key, whose
+/// reader reports it as a problem of its holder.
+pub(crate) fn continues_peer(key: &str) -> Option<&str> {
+    let peer = key
+        .strip_prefix(LINKS_PREFIX)?
+        .strip_prefix(LinkKind::Continues.as_str())?
+        .strip_prefix('/')?;
+    (!peer.contains('/') && crate::discover::validate_workflow_name(peer).is_ok()).then_some(peer)
+}
+
+/// Read a continues link's body: the session id it recorded, or why it
+/// can't be read. A body is `too_large` past [`MAX_LINK_BODY_BYTES`] and
+/// `unparseable` when it is missing, isn't a link body, or (at today's
+/// version) names a session other than the key's peer. A body of a version
+/// this koto doesn't know counts by its `session_id` when it names a
+/// session at all.
+fn continues_body(
+    peer: &str,
+    body: Option<&Vec<u8>>,
+) -> Result<Option<String>, super::relation::Reason> {
+    use super::relation::Reason;
+    let body = body.ok_or(Reason::Unparseable)?;
+    if body.len() > MAX_LINK_BODY_BYTES {
+        return Err(Reason::TooLarge);
+    }
+    let parsed = serde_json::from_slice::<AnyLinkBody>(body).map_err(|_| Reason::Unparseable)?;
+    let current = parsed.v.as_ref().and_then(|v| v.as_u64()) == Some(u64::from(LINK_BODY_VERSION));
+    match (current, parsed.session) {
+        (true, Some(session)) if session == peer => Ok(parsed.session_id),
+        (false, Some(session)) if crate::discover::validate_workflow_name(&session).is_ok() => {
+            Ok(parsed.session_id)
+        }
+        _ => Err(Reason::Unparseable),
+    }
+}
+
 impl SessionFacts {
     /// Where [`SessionFacts::pin`] was read: `bucket` or `local`.
     pub fn pin_source(&self) -> &'static str {
@@ -233,6 +291,7 @@ impl SessionFacts {
                 facts
                     .store_problems
                     .push("its session directory is gone".to_string());
+                facts.relations_unlistable = true;
                 return facts;
             }
             _ => {
@@ -240,6 +299,7 @@ impl SessionFacts {
                     "its session directory is a symlink, not a directory, or can't be read"
                         .to_string(),
                 );
+                facts.relations_unlistable = true;
                 return facts;
             }
         }
@@ -264,8 +324,17 @@ impl SessionFacts {
     }
 
     /// Read the `koto/` area: the manifest's entries and the files under
-    /// `ctx/koto/`.
+    /// `ctx/koto/`. Any store problem it records leaves the session's
+    /// continues links unknown too (`relations_unlistable`).
     fn read_context(&mut self, dir: &Path) {
+        let before = self.store_problems.len();
+        self.read_context_inner(dir);
+        if self.store_problems.len() > before {
+            self.relations_unlistable = true;
+        }
+    }
+
+    fn read_context_inner(&mut self, dir: &Path) {
         let ctx = dir.join("ctx");
         match entry_at(&ctx) {
             Entry::Missing => return,
@@ -339,24 +408,26 @@ impl SessionFacts {
         }
 
         // The links: every key the manifest lists in the links area, plus
-        // the non-empty dispatched-by and held-by files it doesn't list yet
-        // (a write that landed its file but not its manifest entry). An
-        // unlisted `closes` file never counts: only a whole close session
-        // may close an anchor. Empty unlisted files are the store's own
-        // per-key lock files.
+        // the non-empty dispatched-by, held-by and continues files it
+        // doesn't list yet (a write that landed its file but not its
+        // manifest entry). An unlisted `closes` file never counts: only a
+        // whole close session may close an anchor. Empty unlisted files are
+        // the store's own per-key lock files.
         let mut keys: BTreeSet<String> = listed
             .iter()
             .filter(|k| k.starts_with(LINKS_PREFIX) && !pin::is_pin_key(k))
             .map(|k| k.to_string())
             .collect();
         let mut bodies: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut unreadable: BTreeSet<String> = BTreeSet::new();
         for (key, path) in &files {
             let Some(rest) = key.strip_prefix(LINKS_PREFIX) else {
                 continue;
             };
             let kind = rest.split('/').next().unwrap_or("");
-            let unlisted_ok =
-                kind == LinkKind::DispatchedBy.as_str() || kind == LinkKind::HeldBy.as_str();
+            let unlisted_ok = kind == LinkKind::DispatchedBy.as_str()
+                || kind == LinkKind::HeldBy.as_str()
+                || kind == LinkKind::Continues.as_str();
             if !keys.contains(key) && !unlisted_ok {
                 continue;
             }
@@ -367,11 +438,29 @@ impl SessionFacts {
                     }
                     bodies.insert(key.clone(), body);
                 }
+                // A relation that can't be read keeps what it names.
+                Err(_) if continues_peer(key).is_some() => {
+                    keys.insert(key.clone());
+                    unreadable.insert(key.clone());
+                }
                 Err(e) => self.problems.push(format!("{key} can't be read: {e}")),
             }
         }
         for key in keys {
-            self.read_link(&key, bodies.get(&key));
+            match continues_peer(&key) {
+                Some(peer) => {
+                    let body = if unreadable.contains(&key) {
+                        Err(super::relation::Reason::Unparseable)
+                    } else {
+                        continues_body(peer, bodies.get(&key))
+                    };
+                    self.continues.push(ContinuesFact {
+                        peer: peer.to_string(),
+                        body,
+                    });
+                }
+                None => self.read_link(&key, bodies.get(&key)),
+            }
         }
     }
 

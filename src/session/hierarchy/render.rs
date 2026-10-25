@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use super::graph::Edge;
 use super::judge::{Judgment, Keeper, Member, MemberKind, Retention, Unreadable, Verdict};
+use super::relation::{RelationKeeper, RelationVerdict};
 use super::settings::RetentionSettings;
 use crate::config::session_env::Origin;
 use crate::session::anchor::{valid_token, AuthorityRecord};
@@ -151,6 +152,100 @@ fn release_text(r: &ReleaseRecord) -> String {
         _ => text.push_str("; the pin it released couldn't be read"),
     }
     text
+}
+
+/// One keeper as `relation_keepers` lists it: `keeper`, `standing`,
+/// `retention_passes_at` for retention standing, `pin` (or
+/// `pin_unreadable`) for pin standing, and `path`, nearest first.
+fn relation_keeper_json(k: &RelationKeeper) -> Value {
+    let mut v = json!({
+        "keeper": sanitize(&k.keeper),
+        "standing": k.standing.as_str(),
+    });
+    if let Some(at) = &k.retention_passes_at {
+        v["retention_passes_at"] = json!(at);
+    }
+    match &k.pin {
+        PinFact::None => {}
+        PinFact::Present(p) => v["pin"] = pin_json(p, k.pin_source),
+        PinFact::Unreadable(problem) => v["pin_unreadable"] = json!(problem.as_str()),
+    }
+    v["path"] = json!(k.path.iter().map(|n| sanitize(n)).collect::<Vec<_>>());
+    v
+}
+
+/// The fields a kept entry carries when the continues relation keeps it:
+/// `kept_by_relation: true`, `relation_keepers` (one per keeper, ordered by
+/// name) and `relation_unreadable` (`holder` and `reason`), each omitted
+/// when empty. Empty for a session the relation doesn't keep, so its entry
+/// is the one it was before the relation existed (R23). A merged bucket
+/// verdict renders through this unchanged.
+pub fn relation_json(r: &RelationVerdict) -> serde_json::Map<String, Value> {
+    let mut fields = relation_report_json(r);
+    if r.keeps() {
+        fields.insert("kept_by_relation".to_string(), json!(true));
+    }
+    fields
+}
+
+/// [`relation_json`] less `kept_by_relation`: what an explicit removal
+/// (`koto session cleanup`, `koto cancel --cleanup`) reports it passed
+/// over.
+pub fn relation_report_json(r: &RelationVerdict) -> serde_json::Map<String, Value> {
+    let mut fields = serde_json::Map::new();
+    if !r.keepers.is_empty() {
+        fields.insert(
+            "relation_keepers".to_string(),
+            json!(r
+                .keepers
+                .iter()
+                .map(relation_keeper_json)
+                .collect::<Vec<_>>()),
+        );
+    }
+    if !r.unreadable.is_empty() {
+        fields.insert(
+            "relation_unreadable".to_string(),
+            json!(r
+                .unreadable
+                .iter()
+                .map(|u| json!({"holder": sanitize(&u.holder), "reason": u.reason.as_str()}))
+                .collect::<Vec<_>>()),
+        );
+    }
+    fields
+}
+
+/// The text lines for a session the relation keeps: `kept: continued by
+/// <keeper> (<standing>)`, with ` via <path joined by ", ">` when the path
+/// isn't empty, one per keeper; then `kept: relation unreadable: <holder>
+/// (<reason>)` per relation that couldn't be judged. Empty when the
+/// relation doesn't keep it.
+pub fn relation_text(r: &RelationVerdict) -> Vec<String> {
+    let mut lines: Vec<String> = r
+        .keepers
+        .iter()
+        .map(|k| {
+            let mut line = format!(
+                "kept: continued by {} ({})",
+                sanitize(&k.keeper),
+                k.standing.as_str()
+            );
+            if !k.path.is_empty() {
+                let path: Vec<String> = k.path.iter().map(|n| sanitize(n)).collect();
+                line.push_str(&format!(" via {}", path.join(", ")));
+            }
+            line
+        })
+        .collect();
+    lines.extend(r.unreadable.iter().map(|u| {
+        format!(
+            "kept: relation unreadable: {} ({})",
+            sanitize(&u.holder),
+            u.reason.as_str()
+        )
+    }));
+    lines
 }
 
 /// The pinned members of `j`'s hierarchy other than the judged session,
@@ -315,6 +410,18 @@ pub fn query_json(
     let others = other_pinned(j);
     if !others.is_empty() {
         out["pinned_members"] = json!(others);
+    }
+    // The continues relation (R13): the predecessor this session names,
+    // the sessions naming it, and what keeps it through them. Each is
+    // omitted when there is none.
+    if let Some(p) = &j.predecessor {
+        out["predecessor"] = json!(sanitize(p));
+    }
+    if !j.successors.is_empty() {
+        out["successors"] = json!(j.successors.iter().map(|n| sanitize(n)).collect::<Vec<_>>());
+    }
+    for (k, v) in relation_json(j.relation_of(&j.session)) {
+        out[k] = v;
     }
     if let Some(r) = release {
         out["pin_release"] = release_json(r);
@@ -498,6 +605,16 @@ pub fn query_text(
             "pinned members, each kept by its own pin: {}\n",
             others.join(", ")
         ));
+    }
+    if let Some(p) = &j.predecessor {
+        out.push_str(&format!("continues: {}\n", sanitize(p)));
+    }
+    if !j.successors.is_empty() {
+        let names: Vec<String> = j.successors.iter().map(|n| sanitize(n)).collect();
+        out.push_str(&format!("continued by: {}\n", names.join(", ")));
+    }
+    for line in relation_text(j.relation_of(&j.session)) {
+        out.push_str(&format!("{line}\n"));
     }
     if let Verdict::Keep { keepers, .. } = &j.verdict {
         if !keepers.is_empty() {
