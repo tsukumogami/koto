@@ -126,7 +126,15 @@ pub fn fetch_remote_manifest(
 ///
 /// Every manifest koto uploads from a local store goes through this, so no
 /// manifest koto pushes names a host-local key or a pin record.
-pub fn bucket_manifest_bytes(path: &std::path::Path) -> anyhow::Result<Option<Vec<u8>>> {
+///
+/// `withheld` names keys the push leaves out besides: a continues relation
+/// whose back-reference beside its predecessor isn't confirmed yet
+/// ([`crate::session::continues_bucket::unpushable_keys`]), which reaches
+/// the bucket only once the pointer does.
+pub fn bucket_manifest_bytes(
+    path: &std::path::Path,
+    withheld: &[String],
+) -> anyhow::Result<Option<Vec<u8>>> {
     use anyhow::Context;
     let data = match std::fs::read(path) {
         Ok(data) => data,
@@ -137,12 +145,22 @@ pub fn bucket_manifest_bytes(path: &std::path::Path) -> anyhow::Result<Option<Ve
         return Ok(Some(data));
     };
     let host_local = manifest.drop_host_local();
-    if !manifest.drop_pin_records() && !host_local {
+    let before = manifest.keys.len();
+    manifest.keys.retain(|key, _| !withheld.contains(key));
+    let withheld_any = manifest.keys.len() != before;
+    if !manifest.drop_pin_records() && !host_local && !withheld_any {
         return Ok(Some(data));
     }
     Ok(Some(
         serde_json::to_vec_pretty(&manifest).context("failed to serialize manifest")?,
     ))
+}
+
+/// The keys a push of `session` leaves out of the bucket for now: its
+/// continues relation while the back-reference it calls for isn't
+/// confirmed.
+pub fn withheld_keys(local: &LocalBackend, prefix: &str, session: &str) -> Vec<String> {
+    crate::session::continues_bucket::unpushable_keys(&local.session_dir(session), prefix, session)
 }
 
 /// Push a single context key and the manifest to S3.
@@ -157,54 +175,67 @@ pub fn push_context_key(
     key: &str,
     cache: &ManifestCache,
 ) {
+    let withheld = withheld_keys(local, prefix, session);
+    match try_push_context_key(local, bucket, prefix, session, key, &withheld) {
+        Ok(()) => cache.invalidate(),
+        Err(e) => eprintln!("warning: {e:#}"),
+    }
+}
+
+/// [`push_context_key`] for a caller that must know the bucket took the
+/// key and the manifest: the first upload that fails is returned. A key
+/// the push leaves out (host-local, a pin record, or in `withheld`), or
+/// one with no content file, pushes nothing and succeeds. The caller
+/// invalidates the manifest cache.
+pub fn try_push_context_key(
+    local: &LocalBackend,
+    bucket: &Bucket,
+    prefix: &str,
+    session: &str,
+    key: &str,
+    withheld: &[String],
+) -> anyhow::Result<()> {
     if crate::session::context::is_host_local_key(key)
         || crate::session::context::is_pin_record_key(key)
+        || withheld.iter().any(|w| w == key)
     {
-        return;
+        return Ok(());
     }
     let ctx_dir = local.session_dir(session).join("ctx");
 
     // Upload the content file.
     let content_path = ctx_dir.join(key);
     if !content_path.exists() {
-        return;
+        return Ok(());
     }
-    let data = match std::fs::read(&content_path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!(
-                "warning: cloud sync: failed to read context key '{}': {}",
-                key, e
-            );
-            return;
-        }
-    };
+    let data = std::fs::read(&content_path)
+        .map_err(|e| anyhow::anyhow!("cloud sync: failed to read context key '{}': {}", key, e))?;
     let s3_key = format!("{}/{}/ctx/{}", prefix, session, key);
-    if let Err(e) = bucket.put_object(&s3_key, &data) {
-        eprintln!(
-            "warning: cloud sync failed for context upload '{}': {}",
-            key, e
-        );
-        return;
-    }
+    bucket.put_object(&s3_key, &data).map_err(|e| {
+        anyhow::anyhow!(
+            "cloud sync failed for context upload '{}': {}",
+            key,
+            crate::session::cloud::without_url_userinfo(&e.to_string())
+        )
+    })?;
 
     // Upload the manifest.
-    let manifest_data = match bucket_manifest_bytes(&ctx_dir.join("manifest.json")) {
-        Ok(Some(d)) => d,
-        Ok(None) => return,
-        Err(e) => {
-            eprintln!("warning: cloud sync: failed to read manifest: {:#}", e);
-            return;
-        }
+    let manifest_data = match bucket_manifest_bytes(&ctx_dir.join("manifest.json"), withheld)
+        .map_err(|e| anyhow::anyhow!("cloud sync: failed to read manifest: {:#}", e))?
+    {
+        Some(d) => d,
+        None => return Ok(()),
     };
     let manifest_s3_key = format!("{}/{}/ctx/manifest.json", prefix, session);
-    if let Err(e) = bucket.put_object(&manifest_s3_key, &manifest_data) {
-        eprintln!("warning: cloud sync failed for manifest upload: {}", e);
-        return;
-    }
-
-    // Invalidate the cache since we just changed the remote manifest.
-    cache.invalidate();
+    bucket
+        .put_object(&manifest_s3_key, &manifest_data)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cloud sync failed for manifest upload: {}",
+                crate::session::cloud::without_url_userinfo(&e.to_string())
+            )
+        })?;
+    Ok(())
 }
 
 /// Pull a context key from S3 if the remote version differs from local.
@@ -339,7 +370,8 @@ pub fn delete_context_key(
 
     // Upload the updated manifest (the local remove already happened).
     let manifest_path = local.session_dir(session).join("ctx").join("manifest.json");
-    if let Ok(Some(data)) = bucket_manifest_bytes(&manifest_path) {
+    let withheld = withheld_keys(local, prefix, session);
+    if let Ok(Some(data)) = bucket_manifest_bytes(&manifest_path, &withheld) {
         let manifest_s3_key = format!("{}/{}/ctx/manifest.json", prefix, session);
         if let Err(e) = bucket.put_object(&manifest_s3_key, &data) {
             eprintln!("warning: cloud sync failed for manifest upload: {}", e);
@@ -394,13 +426,13 @@ mod tests {
     fn bucket_manifest_bytes_drops_only_host_local_keys() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("manifest.json");
-        assert!(bucket_manifest_bytes(&path).unwrap().is_none());
+        assert!(bucket_manifest_bytes(&path, &[]).unwrap().is_none());
 
         let entry = r#"{"created_at":"t","size":1,"hash":"h"}"#;
         let plain = format!(r#"{{"keys":{{"notes.md":{entry}}}}}"#);
         std::fs::write(&path, &plain).unwrap();
         assert_eq!(
-            bucket_manifest_bytes(&path).unwrap().unwrap(),
+            bucket_manifest_bytes(&path, &[]).unwrap().unwrap(),
             plain.as_bytes()
         );
 
@@ -408,7 +440,7 @@ mod tests {
             format!(r#"{{"keys":{{"notes.md":{entry},"workflows/publish-location":{entry}}}}}"#);
         std::fs::write(&path, &with_location).unwrap();
         let pushed: Manifest =
-            serde_json::from_slice(&bucket_manifest_bytes(&path).unwrap().unwrap()).unwrap();
+            serde_json::from_slice(&bucket_manifest_bytes(&path, &[]).unwrap().unwrap()).unwrap();
         assert_eq!(pushed.keys.keys().collect::<Vec<_>>(), ["notes.md"]);
     }
 
@@ -428,7 +460,7 @@ mod tests {
         )
         .unwrap();
         let pushed: Manifest =
-            serde_json::from_slice(&bucket_manifest_bytes(&path).unwrap().unwrap()).unwrap();
+            serde_json::from_slice(&bucket_manifest_bytes(&path, &[]).unwrap().unwrap()).unwrap();
         assert_eq!(
             pushed.keys.keys().collect::<Vec<_>>(),
             ["koto/links/held-by/a", "notes.md"]

@@ -647,6 +647,47 @@ pub trait SessionBackend: Send + Sync {
 
     /// # Stability: additive-only
     ///
+    /// What the store's remote half holds beside `id` that the continues
+    /// relation's check of a removal reads
+    /// ([`crate::session::continues_bucket`]): the session's `ctx/koto/`
+    /// listing, shared with [`SessionBackend::bucket_pin`] when the pin guard
+    /// just made one (the pin and release keys and sizes, and the
+    /// validated back-references its successors keep there), one delimiter
+    /// listing of the session's prefix (a migration marker, the state
+    /// object's ETag), and the same `ctx/koto/` listing under the session's
+    /// `origin.store.prefix` when that differs.
+    ///
+    /// The default, for a backend with no remote half, is `None`.
+    fn bucket_removal_facts(
+        &self,
+        _id: &str,
+    ) -> Option<crate::session::continues_bucket::BucketRemovalFacts> {
+        None
+    }
+
+    /// # Stability: additive-only
+    ///
+    /// The cloud backend this is, for the continues relation's bucket walk;
+    /// `None` for a backend with no bucket.
+    fn as_cloud(&self) -> Option<&cloud::CloudBackend> {
+        None
+    }
+
+    /// # Stability: additive-only
+    ///
+    /// After `old` moved to `new` for good (the same-name replace's
+    /// move-aside, once every rename and push went through): carry the
+    /// back-references `old`'s successors keep beside it to `new`, and take
+    /// back the one `new`'s own relation named under its old name. Returns
+    /// what wasn't carried or taken back, for the caller to report.
+    ///
+    /// The default, for a backend with no remote half, does nothing.
+    fn repoint_after_move(&self, _old: &str, _new: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// # Stability: additive-only
+    ///
     /// Whether `id` is a migrated source: `koto session import` moved it to
     /// another workspace and left a migration marker under its prefix. Its
     /// pin is inert, since the moved copy holds it. Answered the way a write
@@ -750,6 +791,18 @@ impl Backend {
     pub fn begin_tick(&self, id: &str) {
         if let Backend::Cloud(b) = self {
             b.begin_tick(id);
+        }
+    }
+
+    /// Before a command writes or pushes `id` under the cloud backend: PUT
+    /// the back-reference its continues relation calls for when one is owed
+    /// (a relation recorded under the local backend, or by an earlier
+    /// build, or under another name). A failure warns and keeps the
+    /// relation out of the session's pushes. The local backend writes no
+    /// back-reference.
+    pub fn ensure_backref(&self, id: &str) {
+        if let Backend::Cloud(b) = self {
+            b.ensure_backref(id);
         }
     }
 
@@ -1003,6 +1056,30 @@ impl SessionBackend for Backend {
         match self {
             Backend::Local(b) => b.is_migrated_source(id),
             Backend::Cloud(b) => b.is_migrated_source(id),
+        }
+    }
+
+    fn bucket_removal_facts(
+        &self,
+        id: &str,
+    ) -> Option<crate::session::continues_bucket::BucketRemovalFacts> {
+        match self {
+            Backend::Local(b) => b.bucket_removal_facts(id),
+            Backend::Cloud(b) => b.bucket_removal_facts(id),
+        }
+    }
+
+    fn as_cloud(&self) -> Option<&cloud::CloudBackend> {
+        match self {
+            Backend::Local(_) => None,
+            Backend::Cloud(b) => Some(b),
+        }
+    }
+
+    fn repoint_after_move(&self, old: &str, new: &str) -> Vec<String> {
+        match self {
+            Backend::Local(b) => b.repoint_after_move(old, new),
+            Backend::Cloud(b) => b.repoint_after_move(old, new),
         }
     }
 

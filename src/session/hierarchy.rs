@@ -64,7 +64,7 @@ pub use judge::{
     CloseKind, Judge, Judgment, Keeper, Member, MemberKind, ReleaseInstant, Retention, Unreadable,
     Verdict,
 };
-pub use relation::{RelationKeeper, RelationVerdict, Standing};
+pub use relation::{RelationKeeper, RelationVerdict, Standing, Unchecked, UncheckedError};
 pub use render::{
     close_command, display_text, keeper_json, keeper_line, pin_fields, pin_json, pin_text,
     query_json, query_text, reason_text, relation_json, relation_report_json, relation_text,

@@ -225,6 +225,10 @@ pub struct CloudBackend {
     /// each session, which [`CloudBackend::check_fence`] holds its writes to
     /// (koto#477). Boxed for the same reason as `local_migration_checks`.
     epochs_read: Box<Mutex<HashMap<String, u64>>>,
+    /// The continues relation's bucket walk: its judgment-pass memo and the
+    /// pin guard's last listing of each session. Boxed for the same reason
+    /// as `local_migration_checks`.
+    walk: Box<Mutex<continues::WalkState>>,
 }
 
 /// One probe answer: the listing, and whether it was another koto
@@ -288,6 +292,7 @@ impl CloudBackend {
                 read_only: false,
             }),
             epochs_read: Box::new(Mutex::new(HashMap::new())),
+            walk: Box::default(),
         }
     }
 
@@ -1444,11 +1449,15 @@ impl CloudBackend {
     }
 
     /// Delete all objects under a session's S3 prefix except its migration
-    /// marker. Non-fatal on failure.
+    /// marker and the back-references its successors keep beside it.
+    /// Non-fatal on failure.
     ///
     /// The marker stays because it is what makes every other host refuse
     /// the session once it has been imported elsewhere: a cleanup or a
-    /// terminal tick on the old host must not be able to lift it.
+    /// terminal tick on the old host must not be able to lift it. The
+    /// back-references stay because they are their holders', and outlive
+    /// the session they name, so a session that later takes its name reads
+    /// as a `mismatch` on every host; each goes when its holder does.
     fn sync_delete_session(&self, id: &str) {
         let prefix = self.session_prefix(id);
         // List and delete objects under the prefix.
@@ -1456,7 +1465,9 @@ impl CloudBackend {
             Ok(results) => {
                 for list in &results {
                     for obj in &list.contents {
-                        if is_migration_marker(&prefix, &obj.key) {
+                        if is_migration_marker(&prefix, &obj.key)
+                            || crate::session::continues_bucket::in_backref_area(&prefix, &obj.key)
+                        {
                             continue;
                         }
                         if let Err(e) = self.delete_object(&obj.key) {
@@ -1476,10 +1487,13 @@ impl CloudBackend {
 
     /// [`CloudBackend::sync_delete_session`] for a caller that must know
     /// whether the remote copy is gone: every object under the session's
-    /// prefix except its migration marker is deleted, and the first failure
-    /// (the listing, or any delete) is returned after the rest were tried.
-    /// `koto session prune` removes the local copy only after this succeeds,
-    /// so a failure leaves something a later prune can retry.
+    /// prefix except its migration marker and its successors'
+    /// back-references is deleted, and the first failure (the listing, or
+    /// any delete) is returned after the rest were tried. `koto session
+    /// prune` removes the local copy only after this succeeds, so a failure
+    /// leaves something a later prune can retry. A session holding a
+    /// relation takes its own back-reference out first, best-effort, while
+    /// its local copy still says which one it is.
     pub fn delete_remote_session_checked(&self, id: &str) -> anyhow::Result<()> {
         let prefix = self.session_prefix(id);
         let results = self.bucket.list(prefix.clone(), None).map_err(|e| {
@@ -1489,10 +1503,13 @@ impl CloudBackend {
                 without_url_userinfo(&e.to_string())
             )
         })?;
+        self.drop_own_backref(id);
         let mut first: Option<anyhow::Error> = None;
         for list in &results {
             for obj in &list.contents {
-                if is_migration_marker(&prefix, &obj.key) {
+                if is_migration_marker(&prefix, &obj.key)
+                    || crate::session::continues_bucket::in_backref_area(&prefix, &obj.key)
+                {
                     continue;
                 }
                 if let Err(e) = self.delete_object(&obj.key) {
@@ -1651,6 +1668,21 @@ impl CloudBackend {
             Ok(pages) => pages,
             Err(e) => return BucketPin::Unchecked(listing_error(&e)),
         };
+        // The same listing answers the continues relation's check of the
+        // removal that follows ([`crate::session::continues_bucket`]), so
+        // that check lists nothing again.
+        self.stash_ctx_listing(
+            id,
+            pages
+                .iter()
+                .flat_map(|page| page.contents.iter())
+                .map(|o| crate::session::continues_bucket::ListedObject {
+                    key: o.key.clone(),
+                    size: o.size,
+                    etag: o.e_tag.clone(),
+                })
+                .collect(),
+        );
         let pin_key = format!("{session}ctx/{PIN_KEY}");
         let release_key = format!("{session}ctx/{RELEASE_KEY}");
         let under_pin = format!("{pin_key}/");
@@ -1701,25 +1733,33 @@ impl CloudBackend {
         use crate::session::version::{check_sync, SessionVersion, SyncCheck};
 
         let prefix = self.session_prefix(id);
-        let listing = match self.bucket.list(prefix.clone(), None) {
-            Ok(listing) => listing,
-            Err(e) => {
-                return RemoteCopy::Unlisted(
-                    listing_error(&e),
-                    format!(
-                        "listing {} failed: {}",
-                        prefix,
-                        without_url_userinfo(&e.to_string())
-                    ),
-                )
-            }
+        // The continues relation's check of the same removal may have just
+        // listed the prefix whole; that listing serves here too.
+        let listing: Vec<(String, u64)> = match self.take_prefix_listing(id) {
+            Some(listing) => listing,
+            None => match self.bucket.list(prefix.clone(), None) {
+                Ok(pages) => pages
+                    .into_iter()
+                    .flat_map(|page| page.contents.into_iter())
+                    .map(|obj| (obj.key, obj.size))
+                    .collect(),
+                Err(e) => {
+                    return RemoteCopy::Unlisted(
+                        listing_error(&e),
+                        format!(
+                            "listing {} failed: {}",
+                            prefix,
+                            without_url_userinfo(&e.to_string())
+                        ),
+                    )
+                }
+            },
         };
         let size_of = |key: &str| {
             listing
                 .iter()
-                .flat_map(|page| page.contents.iter())
-                .find(|obj| obj.key == key)
-                .map(|obj| obj.size)
+                .find(|(k, _)| k == key)
+                .map(|(_, size)| *size)
         };
 
         if let Some(remote_len) = size_of(&self.state_key(id)) {
@@ -2018,8 +2058,13 @@ impl CloudBackend {
             for obj in &page.contents {
                 // The listing's prefix already holds every key under
                 // `session`; the check keeps a key some endpoint returned
-                // anyway from ever reaching a delete.
-                if obj.key == marker || !obj.key.starts_with(&session) {
+                // anyway from ever reaching a delete. The back-references
+                // the source's successors keep beside it are theirs, and
+                // stay.
+                if obj.key == marker
+                    || !obj.key.starts_with(&session)
+                    || crate::session::continues_bucket::in_backref_area(&session, &obj.key)
+                {
                     continue;
                 }
                 delete(&obj.key)?;
@@ -2484,10 +2529,13 @@ impl CloudBackend {
         }
 
         let manifest = self.local.read_manifest(id).unwrap_or_default();
+        // A continues relation whose pointer isn't confirmed stays out, as
+        // the pin records do.
+        let withheld = self.withheld_keys(id);
         let (present, gone): (Vec<&String>, Vec<&String>) = pending
             .keys
             .iter()
-            .filter(|key| !is_host_local_key(key))
+            .filter(|key| !is_host_local_key(key) && !withheld.contains(key))
             .partition(|key| manifest.keys.contains_key(key.as_str()));
         let ctx_dir = self.local.session_dir(id).join("ctx");
         let ctx_key = |key: &str| format!("{}/{}/ctx/{}", self.prefix, id, key);
@@ -2498,7 +2546,9 @@ impl CloudBackend {
             self.put_object(&ctx_key(key), &data)
         })?;
         if !pending.keys.is_empty() {
-            if let Some(data) = sync::bucket_manifest_bytes(&ctx_dir.join("manifest.json"))? {
+            if let Some(data) =
+                sync::bucket_manifest_bytes(&ctx_dir.join("manifest.json"), &withheld)?
+            {
                 self.put_object(&ctx_key("manifest.json"), &data)?;
             }
         }
@@ -2908,13 +2958,15 @@ impl CloudBackend {
             .unwrap_or_default();
         let ctx_dir = session_dir.join("ctx");
         let manifest = self.local.read_manifest(id)?;
+        let withheld = self.withheld_keys(id);
         let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
         for (key, meta) in &manifest.keys {
             let held = listed.contains(&format!("{}ctx/{}", prefix, key))
                 && remote.keys.get(key).is_some_and(|r| r.hash == meta.hash);
             // A pin record this copy indexes goes up as its own object,
-            // below, and leaves the index.
-            if is_host_local_key(key) || is_pin_record_key(key) || held {
+            // below, and leaves the index. A continues relation whose
+            // pointer isn't confirmed stays here until it is.
+            if is_host_local_key(key) || is_pin_record_key(key) || withheld.contains(key) || held {
                 continue;
             }
             let data = std::fs::read(ctx_dir.join(key))
@@ -2929,7 +2981,8 @@ impl CloudBackend {
             Ok(())
         });
         self.carry_pin_records(id);
-        if let Some(data) = sync::bucket_manifest_bytes(&ctx_dir.join("manifest.json"))? {
+        if let Some(data) = sync::bucket_manifest_bytes(&ctx_dir.join("manifest.json"), &withheld)?
+        {
             let s3_key = format!("{}/{}/ctx/manifest.json", self.prefix, id);
             if let Err(e) = self.put_object(&s3_key, &data) {
                 eprintln!(
@@ -3111,6 +3164,9 @@ impl SessionBackend for CloudBackend {
         // A workspace whose copy was imported on this host must not delete
         // the imported session that now holds the name.
         self.local_guard(id)?;
+        // Its own back-reference first, while its local copy still says
+        // which one it is.
+        self.drop_own_backref(id);
         self.local.cleanup(id)?;
         self.sync_delete_session(id);
         Ok(())
@@ -3313,11 +3369,27 @@ impl SessionBackend for CloudBackend {
         // Local rename is authoritative; S3 propagation is best-effort.
         self.local.relocate(from, to)?;
 
+        // A session continuing another one names its new self beside its
+        // predecessor before its objects move, and takes the old name's
+        // pointer back after.
+        let renamed = match self.put_renamed_backref(to) {
+            Ok(owed) => owed,
+            Err(e) => {
+                eprintln!(
+                    "warning: cloud sync: the back-reference of '{to}' wasn't written under its \
+                     new name, and its relation stays out of the bucket until a later command \
+                     writes it: {e:#}"
+                );
+                None
+            }
+        };
+
         // Propagate to S3: copy objects from old prefix to new, then
         // delete the old objects. Mirrors the pattern in
         // sync_delete_session. Failures are logged but don't fail the
         // operation since local state is the source of truth.
         let old_prefix = self.session_prefix(from);
+        let mut backrefs_carried = 0usize;
         match self.bucket.list(old_prefix.clone(), None) {
             Ok(results) => {
                 for list in &results {
@@ -3333,6 +3405,28 @@ impl SessionBackend for CloudBackend {
                         // the name the other hosts know the session by.
                         if is_migration_marker(&old_prefix, &obj.key) {
                             continue;
+                        }
+                        // A back-reference moves only when its key checks
+                        // out, at most 64 of them; any other stays where
+                        // it is, never deleted.
+                        if crate::session::continues_bucket::in_backref_area(&old_prefix, &obj.key)
+                        {
+                            let valid = crate::session::continues_bucket::is_backref_key(
+                                &old_prefix,
+                                &obj.key,
+                            )
+                            .is_some();
+                            if !valid
+                                || backrefs_carried
+                                    >= crate::session::continues_bucket::MAX_POINTERS
+                            {
+                                eprintln!(
+                                    "warning: cloud sync: {} wasn't carried to '{}'",
+                                    obj.key, to
+                                );
+                                continue;
+                            }
+                            backrefs_carried += 1;
                         }
                         let new_key = format!("{}{}", self.session_prefix(to), suffix);
 
@@ -3375,6 +3469,22 @@ impl SessionBackend for CloudBackend {
         // Push the updated local state file to S3 under the new key.
         self.sync_push_state(to);
 
+        if let Some(owed) = renamed {
+            let old = crate::session::continues_bucket::pointer_key(
+                &owed.pred_prefix,
+                &owed.pred,
+                &self.prefix,
+                from,
+            );
+            if let Err(e) = self.bucket.delete_object(&old) {
+                eprintln!(
+                    "warning: cloud sync: the back-reference {old} wasn't taken back; with no \
+                     relation behind it, walks read it as stale: {}",
+                    without_url_userinfo(&e.to_string())
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -3407,16 +3517,28 @@ impl SessionBackend for CloudBackend {
             )
         })?;
         self.local.relocate(from, to)?;
+        // A session continuing another one names its new self beside its
+        // predecessor before anything moves in the bucket; the old pointer
+        // goes once the move is final ([`SessionBackend::repoint_after_move`]).
+        self.put_renamed_backref(to)
+            .with_context(|| format!("writing the back-reference of '{to}'"))?;
         // The state log's object name embeds the session name, so it is
         // not copied: the caller pushes it under the new name. The marker
-        // stays where it is, as it does through a cleanup.
+        // stays where it is, as it does through a cleanup. The
+        // back-references its successors keep beside it are carried
+        // separately, only those that check out.
         let old_state = self.state_key(from);
+        let mut listed: Vec<(String, u64)> = Vec::new();
         for page in &results {
             for obj in &page.contents {
                 let Some(suffix) = obj.key.strip_prefix(&old_prefix) else {
                     continue;
                 };
-                if obj.key == old_state || is_migration_marker(&old_prefix, &obj.key) {
+                listed.push((obj.key.clone(), obj.size));
+                if obj.key == old_state
+                    || is_migration_marker(&old_prefix, &obj.key)
+                    || crate::session::continues_bucket::in_backref_area(&old_prefix, &obj.key)
+                {
                     continue;
                 }
                 let bytes = self.fetch_object(&obj.key)?.ok_or_else(|| {
@@ -3426,6 +3548,8 @@ impl SessionBackend for CloudBackend {
                     .with_context(|| format!("copying {} under {}", obj.key, new_prefix))?;
             }
         }
+        self.copy_backrefs(from, to, &listed)
+            .with_context(|| format!("carrying the back-references of '{from}' to '{to}'"))?;
         Ok(())
     }
 
@@ -3441,6 +3565,21 @@ impl SessionBackend for CloudBackend {
 
     fn bucket_pin(&self, id: &str, local_pin_id: Option<&str>) -> crate::session::pin::BucketPin {
         self.bucket_pin_of(id, local_pin_id)
+    }
+
+    fn bucket_removal_facts(
+        &self,
+        id: &str,
+    ) -> Option<crate::session::continues_bucket::BucketRemovalFacts> {
+        Some(self.removal_facts(id, true))
+    }
+
+    fn as_cloud(&self) -> Option<&CloudBackend> {
+        Some(self)
+    }
+
+    fn repoint_after_move(&self, old: &str, new: &str) -> Vec<String> {
+        self.finish_backref_move(old, new)
     }
 
     fn is_migrated_source(&self, id: &str) -> bool {
@@ -4208,6 +4347,9 @@ mod takeover;
 
 #[path = "cloud_workspace_read.rs"]
 pub mod workspace_read;
+
+#[path = "cloud_continues.rs"]
+mod continues;
 
 impl CloudBackend {
     /// Import session `req.name` from the workspace at `req.from` into this

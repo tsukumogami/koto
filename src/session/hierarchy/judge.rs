@@ -187,6 +187,12 @@ pub struct Judgment {
     pub clamped: Vec<String>,
     /// The `now` the judgment was made at.
     pub now: String,
+    /// The same instant, for a judgment the bucket's answer is merged into
+    /// (`crate::session::continues_bucket`), which compares a later
+    /// member's stop against it.
+    pub now_at: SystemTime,
+    /// `retention.keep` as the judgment read it.
+    pub keep: std::time::Duration,
     /// The judged session's own pin.
     pub pin: PinFact,
     /// Where that pin was read: `local`, or `bucket` when a cloud host's
@@ -445,6 +451,8 @@ impl<'g> Judge<'g> {
             members,
             clamped,
             now: iso8601_at(self.now),
+            now_at: self.now,
+            keep: self.settings.keep.value,
             pin: pinned_members.get(name).cloned().unwrap_or_default(),
             pin_source: self
                 .graph

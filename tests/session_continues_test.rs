@@ -1,8 +1,9 @@
-//! The continues relation through the real binary
-//! (DESIGN-koto-session-continues.md, Phase 1): `--continues` on `koto init`
-//! and `koto session link`, every local removal point keeping a predecessor
-//! while a later session has standing, the report each one prints, and the
-//! refusals.
+//! The continues relation through the real binary on the local backend:
+//! `--continues` on `koto init` and `koto session link`, every local
+//! removal point keeping a predecessor while a later session has standing,
+//! the report each one prints, and the refusals. The cloud backend's half,
+//! the back-reference and the bucket walk, is in
+//! `session_continues_cloud_test.rs`.
 //!
 //! The **chain** is v1, v2 and v3 in one workspace: v2 created continuing v1
 //! in its creating command, v3 continuing v2 the same way, v1 and v2
@@ -11,8 +12,6 @@
 
 #![cfg(unix)]
 
-#[path = "support/fake_s3.rs"]
-mod fake_s3;
 #[path = "support/koto_command.rs"]
 mod koto_command;
 
@@ -65,7 +64,6 @@ struct Env {
     template: PathBuf,
     work: PathBuf,
     keep: &'static str,
-    cloud: Option<String>,
 }
 
 impl Env {
@@ -87,7 +85,6 @@ impl Env {
             template,
             work,
             keep: "1s",
-            cloud: None,
         }
     }
 
@@ -106,10 +103,6 @@ impl Env {
             .env("KOTO_RETENTION_KEEP", self.keep)
             .env("KOTO_RETENTION_IDLE_PERIOD", "1h")
             .env("KOTO_RETENTION_STALE_AFTER", "2h");
-        if self.cloud.is_some() {
-            cmd.env("AWS_ACCESS_KEY_ID", "test-access-key")
-                .env("AWS_SECRET_ACCESS_KEY", "test-secret-key");
-        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -956,47 +949,4 @@ fn the_relation_grants_no_authority() {
         ));
     }
     assert_eq!(shown[0], shown[1]);
-}
-
-#[test]
-fn the_cloud_backend_refuses_the_relation_in_this_release() {
-    let s3 = fake_s3::FakeS3::start("koto-continues");
-    let env = Env {
-        cloud: Some(s3.endpoint()),
-        ..Env::new()
-    };
-    std::fs::create_dir_all(env.work.join(".koto")).unwrap();
-    std::fs::write(
-        env.work.join(".koto/config.toml"),
-        format!(
-            "[session]\nbackend = \"cloud\"\n\n[session.cloud]\nendpoint = {:?}\n\
-             bucket = \"koto-continues\"\nregion = \"us-east-1\"\npath_style = true\n",
-            s3.endpoint()
-        ),
-    )
-    .unwrap();
-    env.init("v1", &[]);
-    let out = env.run(&[
-        "init",
-        "v2",
-        "--template",
-        env.template.to_str().unwrap(),
-        "--continues",
-        "v1",
-    ]);
-    assert_eq!(out.status.code(), Some(2), "{out:?}");
-    assert!(!env.exists("v2"));
-    assert!(
-        s3.keys().iter().all(|k| !k.contains("/v2/")),
-        "{:?}",
-        s3.keys()
-    );
-    env.init("v2", &[]);
-    let v = env.fails(&["session", "link", "v2", "--continues", "v1"], 2);
-    assert!(
-        v["error"].as_str().unwrap().contains("cloud backend"),
-        "{v:#}"
-    );
-    assert!(s3.keys().iter().all(|k| !k.contains("continues")));
-    assert!(!env.relation_path("v2", "v1").exists());
 }

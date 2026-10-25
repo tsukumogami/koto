@@ -1201,6 +1201,11 @@ pub(super) fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
 /// another workspace's prefix, where the session's own workspace never
 /// reads it. The message names the directory to run from. The local backend
 /// never refuses.
+///
+/// A session bound here whose continues relation still owes its
+/// back-reference beside the predecessor (recorded under the local backend,
+/// by an earlier build, or under another name) gets it now, before the
+/// command writes or pushes anything ([`Backend::ensure_backref`]).
 fn refuse_if_bound_elsewhere(backend: &Backend, session: &str, command: &str) {
     if let Err(e) = backend.check_bound_here(session) {
         exit_with_error_code(
@@ -1211,6 +1216,7 @@ fn refuse_if_bound_elsewhere(backend: &Backend, session: &str, command: &str) {
             EXIT_CALLER_ERROR,
         );
     }
+    backend.ensure_backref(session);
 }
 
 /// What `koto next` runs on its way out, however it exits: the flush of
@@ -1919,6 +1925,9 @@ pub fn run(app: App) -> Result<()> {
                 // A new id for this tick, which its commands' reads of other
                 // sessions are fresh for (`crate::session::sync_stamp`).
                 backend.begin_tick(&name);
+                // A back-reference its continues relation still owes goes
+                // up before the tick pushes anything.
+                backend.ensure_backref(&name);
             }
             let context_store: &dyn ContextStore = backend;
             let result = handle_next(
@@ -3923,12 +3932,14 @@ fn finish_terminal_tick(
         workspace::sweep_if_parent(backend, context_store, name, compiled);
         // Through the pin guard: a pin set since the retention check keeps
         // the session. A tick that holds the session's lock already (a
-        // batching state's) decides under that lock.
+        // batching state's) decides under that lock. Under the cloud
+        // backend a back-reference written beside it since the check is
+        // walked last, and a later session with standing keeps it too.
         let removal = match held {
-            Some(lock) => crate::session::pin::remove_guarded_with(backend, name, lock, || {
+            Some(lock) => crate::session::pin::remove_by_rule_with(backend, name, lock, || {
                 backend.cleanup(name)
             }),
-            None => crate::session::pin::remove_guarded(backend, name),
+            None => crate::session::pin::remove_by_rule(backend, name),
         };
         match removal {
             Ok(crate::session::pin::Removal::Removed) => {}
@@ -3937,6 +3948,13 @@ fn finish_terminal_tick(
                     "warning: session {name} was pinned since its terminal was reached, so it \
                      is kept: {}",
                     guard.text().unwrap_or_default()
+                );
+                forget_finished_record(backend, name);
+            }
+            Ok(crate::session::pin::Removal::KeptByRelation(related)) => {
+                eprintln!(
+                    "warning: session {name} is kept: {}",
+                    crate::session::hierarchy::relation_text(&related).join("; ")
                 );
                 forget_finished_record(backend, name);
             }
@@ -4140,7 +4158,11 @@ pub(crate) mod finished_record_hooks {
 /// host doesn't keep), and a session about to be removed is checked for a
 /// pin object another host wrote, which keeps it as `pinned`; a bucket that
 /// can't be checked then keeps it as `bucket_unchecked`. A session kept for
-/// another reason costs no request.
+/// another reason costs no request. A session about to be removed whose pin
+/// guard is clear is then asked about the continues relation in the bucket
+/// (a successor this host never pulled), sharing the guard's listing; one
+/// the bucket's walk keeps is kept as `hierarchy`, and the report names its
+/// keepers.
 ///
 /// Returns the reason with the guard that read the pin, which the report
 /// prints ([`terminal_retention_report`]), so the decision and the report
@@ -4181,21 +4203,38 @@ fn terminal_retention(
         Some(base) => crate::session::hierarchy::edge_of(base, name),
         None => true,
     };
-    // A session with no local edge may still be continued by a session
-    // only the bucket holds: the bucket's answer about the continues
-    // relation is asked here, at the one point the tick would remove it
-    // (DESIGN-koto-session-continues.md, "Where the bucket answer meets
-    // `keeps`").
-    let has_edge = has_edge
-        || (!no_cleanup && crate::session::continues_bucket::bucket_keepers(backend, name).keeps());
     if has_edge {
         (Some(next_types::RetentionReason::Hierarchy), guard)
     } else if no_cleanup {
         (Some(next_types::RetentionReason::NoCleanup), guard)
     } else {
         let guard = guard_removal(backend, name);
-        (kept_by(&guard), guard)
+        if kept_by(&guard).is_some() {
+            return (kept_by(&guard), guard);
+        }
+        // A session with no local edge may still be continued by a session
+        // only the bucket holds: the bucket's answer about the continues
+        // relation is asked here, at the one point the tick would remove
+        // it, after the pin guard, whose listing it shares. It keeps the
+        // session as `hierarchy`, and the report names the keepers.
+        let related = crate::session::continues_bucket::bucket_keepers(
+            backend,
+            name,
+            &crate::session::continues_bucket::Clock::configured(),
+        );
+        if related.keeps() {
+            BUCKET_RELATION.with(|r| *r.borrow_mut() = Some(related));
+            return (Some(next_types::RetentionReason::Hierarchy), guard);
+        }
+        (None, guard)
     }
+}
+
+thread_local! {
+    /// What the bucket said continues a session this tick keeps for it,
+    /// from [`terminal_retention`] to the report it prints.
+    static BUCKET_RELATION: std::cell::RefCell<Option<crate::session::hierarchy::RelationVerdict>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The `retention` a terminal tick reports: the reason it keeps the
@@ -4246,6 +4285,10 @@ fn terminal_relation(
     name: &str,
 ) -> serde_json::Map<String, serde_json::Value> {
     use crate::session::hierarchy::{self, Graph, Judge, RetentionSettings};
+    // Kept for what only the bucket holds: the tick already asked it.
+    if let Some(related) = BUCKET_RELATION.with(|r| r.borrow_mut().take()) {
+        return hierarchy::relation_report_json(&related);
+    }
     let dir = backend.session_dir(name);
     let Some(base) = dir.parent() else {
         return Default::default();
@@ -8852,6 +8895,9 @@ fn handle_cancel(
                 forget_finished_record(backend, name);
                 true
             }
+            // An explicit removal: the relation never stops it, so the
+            // guard never answers this.
+            Ok(crate::session::pin::Removal::KeptByRelation(_)) => false,
             Err(e) => {
                 // The cancel event is already persisted; surface the
                 // cleanup failure without rolling back.
