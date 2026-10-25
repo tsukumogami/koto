@@ -267,8 +267,9 @@ Guard:
   the store path and the would-remove count; the local session directories
   and the bucket's object listing are identical before and after.
 - [ ] `KOTO_RETENTION_KEEP=1h` with `--all`, and `KOTO_RETENTION_KEEP=1s`
-  with `--older-than 1h`, don't refuse; neither do `--apply --plan <token>`
-  nor the same command on the local backend.
+  with `--older-than 1h`, don't refuse; neither do `--apply --plan <token>`,
+  the same command on the local backend, nor `--apply --all` with
+  `KOTO_RETENTION_KEEP=1s` on a store where nothing would be removed.
 - [ ] With `--confirm-short-retention`, on a store holding finished unpinned
   sessions past retention, a pinned finished session, and a finished session
   whose hierarchy has a running member, exactly the first group is removed,
@@ -324,7 +325,9 @@ Reads by name:
   prefix carries the matching `session_id`, reads from B. With that copy
   missing, or carrying another `session_id`, the read from B exits non-zero
   with `session_unlocated`, names S and the reason, and prints no value.
-  With matching copies under two prefixes it refuses and names both.
+  With matching copies under two prefixes it refuses and names both. With no
+  copy under the anchor's prefix and a matching copy under the prefix the
+  sync record names, the read from B uses the latter.
 - [ ] On a second store with no local copy of S, a read of S refuses with
   `session_unlocated`.
 - [ ] From B, `koto context add S k2 v`, `koto context remove S k2` and a
@@ -357,7 +360,9 @@ Refusal wording:
 - [ ] `koto init --attach-live` against a running session started in another
   worktree exits 2 with `origin_mismatch`, the session's files hash the same
   before and after, and the message names another session name and the
-  directory the session belongs to.
+  directory the session belongs to. Against a running session whose header
+  has no origin record, the message names another session name and finishing
+  it with the koto version that started it.
 - [ ] A test asserts that both `origin_mismatch` messages and the
   `execution_anchor_mismatch` message contain none of `session cleanup`,
   `--cleanup`, `session prune` and `workspace prune`.
