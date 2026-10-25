@@ -131,10 +131,12 @@ impl BucketReads for CloudBackend {
         };
         let field = |f: &str| super::marker_target_field(&marker, f);
         let (t_prefix, t_session, t_id) = (field("prefix"), field("session"), field("session_id"));
+        // A marker that names no target this koto can read points at no
+        // later session: the session's own back-references still count.
         if !is_workspace_prefix(&t_prefix)
             || crate::session::validate::validate_session_id(&t_session).is_err()
         {
-            return (Err(UncheckedError::Unparseable), requests);
+            return (Ok(None), requests);
         }
         // The source copy is listed and read, and the target too.
         requests += 4;
@@ -162,7 +164,7 @@ impl BucketReads for CloudBackend {
 
 impl CloudBackend {
     fn walk_state(&self) -> std::sync::MutexGuard<'_, WalkState> {
-        self.walk.lock().unwrap_or_else(|e| e.into_inner())
+        self.probes.walk.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// This backend's workspace prefix in the bucket.
@@ -620,10 +622,8 @@ impl CloudBackend {
                 &dir.join("ctx").join("manifest.json"),
                 &[],
             ) {
-                let _ = self.bucket.put_object(
-                    &format!("{}ctx/manifest.json", self.session_prefix(session)),
-                    &data,
-                );
+                let manifest = format!("{}ctx/manifest.json", self.session_prefix(session));
+                let _ = self.bucket.put_object(manifest, &data);
             }
         }
         if let Err(e) = self.delete_pointer(&owed.key) {
@@ -733,5 +733,106 @@ impl CloudBackend {
             }
         }
         notes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{cloud_backend_at, serve, Endpoint, PREFIX};
+    use super::*;
+
+    const PRED_WS: &str = "0123456789abcdef";
+
+    fn holder_id() -> String {
+        "00000002-0000-4000-8000-000000000000".to_string()
+    }
+
+    /// Local session `name` under `base`, holding a relation naming `pred`
+    /// under `PRED_WS`.
+    fn holder(base: &std::path::Path, name: &str, pred: &str) {
+        let dir = base.join(name).join("ctx/koto/links/continues");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = serde_json::json!({
+            "v": 1, "session": pred, "session_id": "00000001-0000-4000-8000-000000000000",
+            "workspace": "/w", "prefix": PRED_WS, "holder_session_id": holder_id(),
+            "at": "2026-10-25T00:00:00.000Z",
+        });
+        std::fs::write(dir.join(pred), serde_json::to_vec(&body).unwrap()).unwrap();
+    }
+
+    fn deletes(endpoint: &Endpoint) -> Vec<String> {
+        endpoint
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "DELETE")
+            .map(|r| r.path)
+            .collect()
+    }
+
+    #[test]
+    fn delete_backref_builds_its_key_from_the_holders_own_relation_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The bucket holds pointers naming the holder beside other
+        // sessions: none of them is the holder's to delete.
+        let planted = [
+            format!("/{PRED_WS}/other/ctx/koto/continued-by/{PREFIX}/s"),
+            format!("/{PRED_WS}/v1/ctx/koto/continued-by/fedcba9876543210/s"),
+        ];
+        let endpoint = serve(
+            planted
+                .iter()
+                .map(|k| (k.clone(), b"{}".to_vec()))
+                .collect(),
+        );
+        let backend = cloud_backend_at(tmp.path(), endpoint.url.clone());
+
+        // No relation here: nothing is deleted, whatever the bucket holds.
+        std::fs::create_dir_all(tmp.path().join("s")).unwrap();
+        backend.delete_backref("s").unwrap();
+        assert!(deletes(&endpoint).is_empty(), "{:?}", deletes(&endpoint));
+
+        // A relation naming v1: exactly the key its own parts build.
+        holder(tmp.path(), "s", "v1");
+        backend.delete_backref("s").unwrap();
+        assert_eq!(
+            deletes(&endpoint),
+            vec![format!(
+                "/test-bucket/{}",
+                pointer_key(PRED_WS, "v1", PREFIX, "s")
+            )]
+        );
+    }
+
+    #[test]
+    fn a_walk_reads_and_never_writes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let planted = format!("/{PREFIX}/v1/ctx/koto/continued-by/{PRED_WS}/s");
+        let endpoint = serve(vec![(planted, b"{}".to_vec())]);
+        let backend = cloud_backend_at(tmp.path(), endpoint.url.clone());
+        let clock = Clock::configured();
+        let _ = backend.relation_walk("v1", &clock, false);
+        let _ = backend.relation_walk("v1", &clock, true);
+        let requests = endpoint.requests();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|r| r.method == "GET"), "{requests:?}");
+    }
+
+    #[test]
+    fn a_pointer_whose_key_does_not_check_out_is_never_put() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let endpoint = serve(Vec::new());
+        let backend = cloud_backend_at(tmp.path(), endpoint.url.clone());
+        let mut owed = backend.pointer_for("s", PRED_WS, "v1", &holder_id());
+        owed.key = format!("{PRED_WS}/v1/ctx/koto/continued-by/{PRED_WS}/s/../../x");
+        assert!(backend.put_backref(&owed).is_err());
+        let owed = backend.pointer_for("s", "not-a-prefix", "v1", &holder_id());
+        assert!(backend.put_backref(&owed).is_err());
+        let owed = backend.pointer_for("s", PRED_WS, "v1", "not-an-id");
+        assert!(backend.put_backref(&owed).is_err());
+        // This test backend's own prefix isn't a workspace prefix, so even a
+        // well-formed pointer naming it is refused.
+        let owed = backend.pointer_for("s", PRED_WS, "v1", &holder_id());
+        assert!(backend.put_backref(&owed).is_err());
+        assert!(endpoint.requests().iter().all(|r| r.method != "PUT"));
     }
 }

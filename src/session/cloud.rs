@@ -225,10 +225,6 @@ pub struct CloudBackend {
     /// each session, which [`CloudBackend::check_fence`] holds its writes to
     /// (koto#477). Boxed for the same reason as `local_migration_checks`.
     epochs_read: Box<Mutex<HashMap<String, u64>>>,
-    /// The continues relation's bucket walk: its judgment-pass memo and the
-    /// pin guard's last listing of each session. Boxed for the same reason
-    /// as `local_migration_checks`.
-    walk: Box<Mutex<continues::WalkState>>,
 }
 
 /// One probe answer: the listing, and whether it was another koto
@@ -252,6 +248,11 @@ struct Probes {
     /// tick in the reader's own workspace never runs a session in this
     /// prefix. Kept here, in the box, so the backend stays small.
     read_only: bool,
+    /// The continues relation's bucket walk: its judgment-pass memo and the
+    /// listings of a session the removal check that follows a pin guard or
+    /// a remote-copy check shares. Kept here, in the box, for the same
+    /// reason.
+    walk: Mutex<continues::WalkState>,
 }
 
 impl CloudBackend {
@@ -290,9 +291,9 @@ impl CloudBackend {
                 answers: Mutex::new(HashMap::new()),
                 window: std::time::Duration::ZERO,
                 read_only: false,
+                walk: Mutex::default(),
             }),
             epochs_read: Box::new(Mutex::new(HashMap::new())),
-            walk: Box::default(),
         }
     }
 

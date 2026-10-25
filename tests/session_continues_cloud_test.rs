@@ -824,8 +824,7 @@ fn oracle_keepers(h: &Hosts, pred_id: &str, keep: Duration) -> BTreeSet<String> 
         let text = String::from_utf8_lossy(log);
         let last = text
             .lines()
-            .filter(|l| l.contains("\"type\":\"transitioned\""))
-            .last()
+            .rfind(|l| l.contains("\"type\":\"transitioned\""))
             .map(|l| serde_json::from_str::<Value>(l).unwrap());
         match last {
             Some(e) if e["payload"]["to"] == "done" => {

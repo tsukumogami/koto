@@ -617,10 +617,9 @@ fn list_xml(
         let Some(after) = key.strip_prefix(prefix) else {
             break;
         };
-        let entry = match delimiter.and_then(|d| after.find(d).map(|i| (d, i))) {
-            Some((d, i)) => Some(format!("{}{}", prefix, &after[..i + d.len()])),
-            None => None,
-        };
+        let entry = delimiter
+            .and_then(|d| after.find(d).map(|i| (d, i)))
+            .map(|(d, i)| format!("{}{}", prefix, &after[..i + d.len()]));
         let name = entry.clone().unwrap_or_else(|| key.clone());
         if after_token.is_some_and(|t| name.as_str() <= t) {
             continue;
