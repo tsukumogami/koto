@@ -29,6 +29,7 @@ use crate::engine::reentrancy;
 use crate::session::batch::{self, BatchLock, Journal, Pending};
 use crate::session::context::{is_host_local_key, is_pin_record_key, ContextStore};
 use crate::session::local::{repo_id, LocalBackend};
+use crate::session::state_log;
 use crate::session::sync::{self, ManifestCache};
 use crate::session::sync_stamp::{self, Stamp};
 use crate::session::{
@@ -220,6 +221,10 @@ pub struct CloudBackend {
     /// whether the backend only reads. Boxed for the same reason as
     /// `local_migration_checks`.
     probes: Box<Probes>,
+    /// The rebind epoch (`origin.anchor_epoch`) this process last read of
+    /// each session, which [`CloudBackend::check_fence`] holds its writes to
+    /// (koto#477). Boxed for the same reason as `local_migration_checks`.
+    epochs_read: Box<Mutex<HashMap<String, u64>>>,
 }
 
 /// One probe answer: the listing, and whether it was another koto
@@ -282,6 +287,7 @@ impl CloudBackend {
                 window: std::time::Duration::ZERO,
                 read_only: false,
             }),
+            epochs_read: Box::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -653,6 +659,37 @@ impl CloudBackend {
         })
     }
 
+    /// Record `header`'s rebind epoch as the one this process read of `id`.
+    fn note_epoch_read(&self, id: &str, header: &crate::engine::types::StateFileHeader) {
+        let epoch = header.origin.as_ref().map_or(0, |o| o.anchor_epoch);
+        self.epochs_read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), epoch);
+    }
+
+    /// Refuse a write of `id` that a rebind fenced off: the session was
+    /// rebound after this process read it, or this command runs from an
+    /// anchor a rebind retired (`crate::session::rebind_fence`). Asked of
+    /// the local header line, before anything is written.
+    fn check_fence(&self, id: &str) -> anyhow::Result<()> {
+        if self.probes.read_only {
+            return Ok(());
+        }
+        let path = self.local.session_dir(id).join(state_file_name(id));
+        let Some(line) = first_line(&path) else {
+            return Ok(());
+        };
+        let seen = self
+            .epochs_read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .copied();
+        crate::session::rebind_fence::check(id, &line, &self.prefix, seen)?;
+        Ok(())
+    }
+
     /// S3 key of a session's migration marker under this backend's prefix.
     fn marker_key(&self, id: &str) -> String {
         format!("{}{}", self.session_prefix(id), MIGRATED_MARKER)
@@ -869,8 +906,112 @@ impl CloudBackend {
         stamp.save(&dir);
     }
 
-    /// PUT `id`'s state file and stamp what went up.
+    /// PUT `id`'s state file and stamp what went up, only over the copy
+    /// this host last synced (koto#477).
+    ///
+    /// The PUT carries `If-Match` on the stamp's ETag when the stamp is for
+    /// this key, else `If-None-Match: *`, so a copy that moved underneath the
+    /// push is never overwritten. When the precondition fails, the bucket's
+    /// copy is fetched: if `data` holds every event it has
+    /// ([`state_log::compare`]), or the copy is another session's under the
+    /// same name, the PUT is sent once more on that copy's ETag; otherwise
+    /// the push refuses with a `session conflict`.
     fn put_state(&self, id: &str, data: &[u8]) -> anyhow::Result<()> {
+        let key = self.state_key(id);
+        self.refuse_if_read_only(&format!("S3 PUT of {}", key))?;
+        let refused =
+            |remote: &[u8]| state_log::conflict(id, &key, "the push was refused", data, remote);
+        let stamped = self.stamp(id).and_then(|s| s.state_etag);
+        let mut sent = self.put_state_if(&key, data, stamped.as_deref());
+        if sent
+            .as_ref()
+            .is_err_and(|e| matches!(e, S3Error::HttpFailWithBody(501, _)))
+        {
+            // A provider that doesn't implement conditional writes: push as
+            // before, without the check, and say so.
+            eprintln!(
+                "warning: cloud sync: the bucket doesn't support conditional writes, so the push \
+                 of session '{}' couldn't check that its copy hadn't moved",
+                id
+            );
+            sent = self.bucket.put_object(&key, data);
+        }
+        if sent.as_ref().is_err_and(is_precondition_failed) {
+            // The copy moved, or appeared, since this host synced it.
+            let current = self.fetch_state_with_etag(&key)?;
+            if let Some((remote, _)) = &current {
+                // Another session's copy under the name (a re-created
+                // session) is replaced, as every push did before.
+                if !matches!(
+                    state_log::compare(data, remote),
+                    state_log::LogOrder::Same
+                        | state_log::LogOrder::LocalExtends
+                        | state_log::LogOrder::Unrelated
+                ) {
+                    return Err(refused(remote));
+                }
+            }
+            let etag = current.as_ref().map(|(_, etag)| etag.as_str());
+            sent = self.put_state_if(&key, data, etag);
+            if sent.as_ref().is_err_and(is_precondition_failed) {
+                let remote = self
+                    .fetch_state_with_etag(&key)?
+                    .map(|(remote, _)| remote)
+                    .unwrap_or_default();
+                return Err(refused(&remote));
+            }
+        }
+        let response = sent.with_context(|| format!("S3 PUT failed for key: {}", key))?;
+        self.forget_probe(id);
+        self.record_synced(id, response_etag(&response).as_deref(), data);
+        Ok(())
+    }
+
+    /// One PUT of a state file: on `etag` when given, else only where no
+    /// object is.
+    fn put_state_if(
+        &self,
+        key: &str,
+        data: &[u8],
+        etag: Option<&str>,
+    ) -> Result<s3::request::ResponseData, S3Error> {
+        let mut headers = http::HeaderMap::new();
+        let (name, value) = match etag.filter(|e| !e.is_empty()) {
+            Some(etag) => (http::header::IF_MATCH, format!("\"{}\"", etag)),
+            None => (http::header::IF_NONE_MATCH, "*".to_string()),
+        };
+        if let Ok(value) = http::HeaderValue::from_str(&value) {
+            headers.insert(name, value);
+        }
+        self.bucket
+            .put_object_with_headers(key, data, Some(headers))
+    }
+
+    /// GET a state file and its ETag, for a push whose precondition failed;
+    /// `None` when the object is gone.
+    fn fetch_state_with_etag(&self, key: &str) -> anyhow::Result<Option<(Vec<u8>, String)>> {
+        match self.bucket.get_object(key) {
+            Ok(response) if response.status_code() == 200 => Ok(Some((
+                response.bytes().to_vec(),
+                response_etag(&response).unwrap_or_default(),
+            ))),
+            Ok(response) if response.status_code() == 404 => Ok(None),
+            Err(e) if is_not_found(&e) => Ok(None),
+            failed => anyhow::bail!(
+                "cloud sync: the bucket's copy at {} changed under this push and fetching it \
+                 failed: {}",
+                key,
+                match failed {
+                    Ok(response) => format!("status {}", response.status_code()),
+                    Err(e) => without_url_userinfo(&e.to_string()),
+                }
+            ),
+        }
+    }
+
+    /// PUT `id`'s state file whatever the bucket holds, and stamp it: for a
+    /// caller that chose this host's copy over the bucket's.
+    fn put_state_over(&self, id: &str, data: &[u8]) -> anyhow::Result<()> {
         let key = self.state_key(id);
         self.refuse_if_read_only(&format!("S3 PUT of {}", key))?;
         let response = self
@@ -1203,7 +1344,11 @@ impl CloudBackend {
         if let Some(stamp) = stamp {
             if !remote_etag.is_empty()
                 && stamp.state_etag.as_deref() == Some(remote_etag.as_str())
-                && std::fs::read(&state_path).is_ok_and(|local| stamp.matches(&local))
+                // The bucket still holds what this host synced, and the
+                // local file is those bytes or appends to them (a push that
+                // hasn't gone up yet): nothing to fetch (koto#477).
+                && std::fs::read(&state_path)
+                    .is_ok_and(|local| stamp.matches(&local) || stamp.extended_by(&local))
             {
                 self.mark_verified(id, stamp);
                 return Ok(());
@@ -1234,6 +1379,39 @@ impl CloudBackend {
             );
         }
         refuse_cross_import_pull(id, &state_path, response.bytes())?;
+        // The fetched copy replaces the local log only when it holds every
+        // local event (koto#477). Another directory's copy, or one pushed
+        // before this host's last append went up, may lack some: the local
+        // log is kept then, stamped with the copy it extends so the next
+        // push goes up conditional on it, and a copy that holds events the
+        // local log lacks as well refuses rather than drop either side.
+        if let Ok(local) = std::fs::read(&state_path) {
+            let keep_local = match state_log::compare(&local, response.bytes()) {
+                state_log::LogOrder::Same
+                | state_log::LogOrder::RemoteExtends
+                | state_log::LogOrder::Unrelated => false,
+                // The same events under another header line: the bucket's
+                // header is newer only when the local file is still what this
+                // host last synced under this key.
+                state_log::LogOrder::HeaderOnly => {
+                    !self.stamp(id).is_some_and(|s| s.matches(&local))
+                }
+                state_log::LogOrder::LocalExtends => true,
+                state_log::LogOrder::Diverged => {
+                    return Err(state_log::conflict(
+                        id,
+                        &key,
+                        "the pull was refused",
+                        &local,
+                        response.bytes(),
+                    ))
+                }
+            };
+            if keep_local {
+                self.record_synced(id, Some(&remote_etag), response.bytes());
+                return Ok(());
+            }
+        }
         std::fs::write(&state_path, response.bytes()).with_context(|| {
             format!(
                 "cloud sync: failed to write the pulled state of session '{}' to {}",
@@ -2062,14 +2240,34 @@ impl CloudBackend {
         timestamp: &str,
     ) -> anyhow::Result<()> {
         self.refuse_if_read_only(&format!("appending to the log of '{}'", id))?;
+        self.check_fence(id)?;
         if self.defers(id) {
             if let Some((_journal, _lock)) = self.open_batch(id)? {
                 return self.local.append_event(id, payload, timestamp);
             }
         }
         self.local.append_event(id, payload, timestamp)?;
-        self.sync_push_state(id);
-        Ok(())
+        self.push_state_after_write(id)
+    }
+
+    /// Push `id`'s state file after a write of its log, as
+    /// [`CloudBackend::sync_push_state`] does, except that a push refused as
+    /// a `session conflict` is an error (koto#477): the write is in this
+    /// host's log, and the bucket's copy holds events it lacks, so the
+    /// caller must not report the write as synced.
+    fn push_state_after_write(&self, id: &str) -> anyhow::Result<()> {
+        match self.strict_push_state(id) {
+            Err(e) if e.to_string().starts_with("session conflict:") => Err(e),
+            Err(e) if is_hard_sync_error(&e) => {
+                eprintln!("error: cloud sync: {:#}", e);
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("warning: cloud sync failed for state upload: {:#}", e);
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
     }
 
     /// Record that this process pulled `id`; false when it already had.
@@ -2622,7 +2820,7 @@ impl CloudBackend {
         let path = self.local.session_dir(id).join(state_file_name(id));
         let data = std::fs::read(&path)
             .with_context(|| format!("reading local state file: {}", path.display()))?;
-        self.put_state(id, &data)
+        self.put_state_over(id, &data)
     }
 
     /// Return true if cloud sync is available for callers that want to
@@ -2984,7 +3182,9 @@ impl SessionBackend for CloudBackend {
         // exactly as it was.
         self.check_not_migrated(id)?;
         self.sync_pull_state(id)?;
-        self.local.read_events(id)
+        let read = self.local.read_events(id)?;
+        self.note_epoch_read(id, &read.0);
+        Ok(read)
     }
 
     /// Read the local state file only: no pull from S3. The decider reads
@@ -2998,13 +3198,17 @@ impl SessionBackend for CloudBackend {
         Vec<crate::engine::types::Event>,
     )> {
         self.local_guard(id)?;
-        self.local.read_events(id)
+        let read = self.local.read_events(id)?;
+        self.note_epoch_read(id, &read.0);
+        Ok(read)
     }
 
     fn read_header(&self, id: &str) -> anyhow::Result<crate::engine::types::StateFileHeader> {
         self.check_not_migrated(id)?;
         self.sync_pull_state(id)?;
-        self.local.read_header(id)
+        let header = self.local.read_header(id)?;
+        self.note_epoch_read(id, &header);
+        Ok(header)
     }
 
     /// Rewrite the local header, then push the state file through
@@ -3019,23 +3223,34 @@ impl SessionBackend for CloudBackend {
     /// The risk is accepted, not handled: when the push fails (offline, or
     /// the bucket refuses it) the rewrite stays local and a warning goes to
     /// stderr. The next successful push of this session carries it; until
-    /// then, a pull from another command can restore the old header. Rebind
-    /// and anchor adoption take that risk; a caller that can't follows up
-    /// with `ensure_pushed`, as the command-environment adoption does.
+    /// then, a pull keeps it, since the local file no longer matches what
+    /// this host last synced (koto#477). Rebind and anchor adoption take that
+    /// risk; a caller that can't follows up with `ensure_pushed`, as the
+    /// command-environment adoption does. A push refused as a `session
+    /// conflict` is an error, as for an append.
+    ///
+    /// The rewrite is fenced like an append, and the epoch it leaves is the
+    /// one this process has read from then on, so a rebind's own process
+    /// isn't fenced off by the epoch it just bumped.
     fn rewrite_header(
         &self,
         id: &str,
         f: &dyn Fn(crate::engine::types::StateFileHeader) -> crate::engine::types::StateFileHeader,
     ) -> anyhow::Result<()> {
         self.local_guard(id)?;
+        self.check_fence(id)?;
+        let rewrite = || -> anyhow::Result<()> {
+            self.local.rewrite_header(id, f)?;
+            self.note_epoch_read(id, &self.local.read_header(id)?);
+            Ok(())
+        };
         if self.defers(id) {
             if let Some((_journal, _lock)) = self.open_batch(id)? {
-                return self.local.rewrite_header(id, f);
+                return rewrite();
             }
         }
-        self.local.rewrite_header(id, f)?;
-        self.sync_push_state(id);
-        Ok(())
+        rewrite()?;
+        self.push_state_after_write(id)
     }
 
     fn init_state_file(
@@ -3272,6 +3487,7 @@ impl CloudBackend {
         if is_host_local_key(key) {
             return write();
         }
+        self.check_fence(session)?;
 
         // Inside a tick on this session: record the key, then write it, and
         // leave the push to the tick. Recorded first, so a write that stops
@@ -3460,6 +3676,7 @@ impl ContextStore for CloudBackend {
         if is_host_local_key(key) {
             return self.local.remove(session, key);
         }
+        self.check_fence(session)?;
         if self.defers(session) {
             if let Some((journal, lock)) = self.open_batch(session)? {
                 journal.record(
@@ -4593,6 +4810,8 @@ impl CloudBackend {
         header.origin = self.store_identity().map(|store| SessionOrigin {
             anchor: req.anchor.to_path_buf(),
             store,
+            anchor_epoch: 0,
+            retired_anchors: Vec::new(),
         });
         header.command_environment = Some(crate::engine::command_env::record_from_process(false).0);
 
@@ -4933,6 +5152,12 @@ fn create_bucket(config: &CloudConfig) -> anyhow::Result<Box<Bucket>> {
 /// Whether an S3 error is a 404: the object (or bucket) isn't there.
 fn is_not_found(e: &S3Error) -> bool {
     matches!(e, S3Error::HttpFailWithBody(404, _))
+}
+
+/// Whether an S3 error is a 412: a conditional request's `If-Match` or
+/// `If-None-Match` didn't hold.
+fn is_precondition_failed(e: &S3Error) -> bool {
+    matches!(e, S3Error::HttpFailWithBody(412, _))
 }
 
 /// A response's `ETag` header, without its quotes; `None` when it has none.
@@ -5362,6 +5587,8 @@ pub(crate) mod test_support {
                     bucket: None,
                     prefix: Some(PREFIX.to_string()),
                 },
+                anchor_epoch: 0,
+                retired_anchors: Vec::new(),
             }),
             execution_dir,
             session_id: String::new(),

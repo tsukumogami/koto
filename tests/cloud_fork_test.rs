@@ -299,7 +299,12 @@ fn a_pull_of_a_diverged_copy_refuses_and_names_both_sides() {
     let last_seq = events(&local).last().unwrap()["seq"].as_u64().unwrap();
 
     let out = host.koto(&root, &["status", WF]);
-    assert_ne!(out.code, Some(0), "the read must refuse: {}", out.describe());
+    assert_ne!(
+        out.code,
+        Some(0),
+        "the read must refuse: {}",
+        out.describe()
+    );
     let text = format!("{}{}", out.stdout, out.stderr);
     assert!(text.contains("session conflict"), "{}", out.describe());
     assert!(
@@ -339,7 +344,12 @@ fn a_push_over_a_copy_that_moved_refuses_and_keeps_the_copy() {
     s3.put_after("PUT", &manifest, &state_key(&anchor), other.as_bytes());
 
     let out = host.add(&anchor, "k2");
-    assert_ne!(out.code, Some(0), "the push must refuse: {}", out.describe());
+    assert_ne!(
+        out.code,
+        Some(0),
+        "the push must refuse: {}",
+        out.describe()
+    );
     assert!(
         format!("{}{}", out.stdout, out.stderr).contains("session conflict"),
         "{}",
@@ -402,7 +412,11 @@ fn the_old_anchors_next_write_errors_on_the_rebind_fence() {
     let rebound: serde_json::Value = serde_json::from_str(out.stdout.trim()).unwrap();
     assert_eq!(rebound["rebound"], serde_json::json!(true));
     let log = host.local_log();
-    assert_eq!(header(&log)["anchor_epoch"], serde_json::json!(1));
+    assert_eq!(header(&log)["origin"]["anchor_epoch"], serde_json::json!(1));
+    assert_eq!(
+        header(&log)["origin"]["retired_anchors"],
+        serde_json::json!([old.to_str().unwrap()])
+    );
 
     let out = host.add(&old, "k2");
     assert_ne!(out.code, Some(0), "{}", out.describe());
