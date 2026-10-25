@@ -1,6 +1,6 @@
 ---
 schema: brief/v1
-status: Draft
+status: Accepted
 problem: |
   On a host where many workflows share one koto store and bucket, a bulk prune
   can empty the store, a test that looks isolated can reach it, prune keeps
@@ -17,7 +17,7 @@ outcome: |
 
 ## Status
 
-Draft
+Accepted
 
 Frames the work that makes koto's removals and reads safe enough for a host
 to stop freezing them. Part of it has already landed on main; the Problem
