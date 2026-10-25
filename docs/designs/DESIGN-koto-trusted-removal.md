@@ -283,7 +283,9 @@ Key assumptions:
 
 `CloudBackend` gains `home_prefix(id) -> Result<Home, Unlocated>`, memoized
 per process in a `RefCell<HashMap>`. It reads the session's local header
-(no request). With `origin.store.prefix` present, that prefix is the home.
+(no request). With `origin.store.prefix` present and of the shape `repo_id`
+produces (16 lowercase hex, checked with the existing `is_workspace_prefix`),
+that prefix is the home; a value of any other shape is treated as missing.
 Without it, the candidates are the hash of the execution anchor
 (`execution_dir`, else `origin.anchor`) and the prefix the host's sync stamp
 names, deduplicated, in that order. Each distinct candidate is confirmed with
@@ -303,7 +305,11 @@ context-key, batch and marker keys, and the `sync.rs` helpers, which already
 take the prefix as an argument. The same applies to the delete paths
 (`sync_delete_session`, `delete_remote_session_checked`), so a prune run from
 any directory deletes the session's own copy rather than a copy under the
-caller's prefix. `self.prefix` stays for what is genuinely about the caller's
+caller's prefix. Before any bucket delete, the delete path reads the state
+object's header at the home prefix and deletes only when its `session_id`
+matches the local header's; a mismatch or a missing object leaves the bucket
+alone and reports the session as skipped, whichever way the home prefix was
+found. `self.prefix` stays for what is genuinely about the caller's
 workspace: the prefix a new session records at `koto init`, a child spawn or
 an import, `try_list_sessions`, and the pin scan of the caller's workspace.
 
@@ -674,11 +680,22 @@ with a matching `session_id` under a candidate prefix of an older session;
 that is the same trust boundary the bucket already has, since such a writer
 can rewrite the session's own copy directly.
 
-**Deletes follow the resolver.** Prune's bucket deletes move from the
-caller's prefix to each session's home prefix. That makes a prune from the
-wrong directory delete the session's real copy where it used to delete
-nothing useful, which is the point, and it's why the guard's refusal and the
-relation's keep both run before any delete.
+**Deletes follow the resolver, and check identity first.** Prune's bucket
+deletes move from the caller's prefix to each session's home prefix. That
+makes a prune from the wrong directory delete the session's real copy where it
+used to delete nothing useful, which is the point, and it's why the guard's
+refusal and the relation's keep both run before any delete. Because a home
+prefix can come from a local header someone could edit, every delete first
+reads the header at the home prefix and proceeds only when its `session_id`
+matches the local one, and a recorded prefix of the wrong shape counts as
+missing. A tampered header can then at worst make a read refuse; it can't
+point a delete at another session's copy.
+
+**The cloud opt-in under `KOTO_HOME` doesn't widen where credentials go.**
+Once the root's config selects the cloud backend, the endpoint and bucket
+still pass `session_env::check`, which already refuses a project file that
+chooses the credential endpoint, so inherited credentials can't be sent to an
+endpoint a checked-out repository names.
 
 **Reads stop writing into other sessions.** Removing the read-path
 `reconcile` and the held-by own-read append removes a write a reader could
