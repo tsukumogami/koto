@@ -18,7 +18,8 @@ goals: |
   copy, and the read leaves it unchanged; no refusal advises deleting a
   session. The part that needs the continues relation waits for it, and the
   rest can ship before it.
-upstream: docs/briefs/BRIEF-koto-trusted-removal.md
+absorbed:
+  - docs/briefs/BRIEF-koto-trusted-removal.md
 ---
 
 # PRD: Removal a lineage can trust
@@ -26,6 +27,43 @@ upstream: docs/briefs/BRIEF-koto-trusted-removal.md
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-koto-trusted-removal](docs/briefs/BRIEF-koto-trusted-removal.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+The brief named in Status is folded into this section and its file was
+removed when this PRD absorbed it; this section is the brief's framing, and
+there is no separate file to look for.
+
+The feature was framed after the 2026-10-24 prune emptied a shared host's
+store, as the work that makes koto's removals and reads safe enough for that
+host to stop freezing them. The framed problem: whoever removes or reads
+sessions on a host where many workflows share one store and one bucket can't
+know a command won't destroy what a lineage still needs, or that a read
+returns the truth without changing anything, because of six gaps (a bulk
+removal that didn't ask, isolation that followed the home directory, a keep
+rule based on a name, a read that depends on its directory, a read that can
+write, and refusals that advise deletion). The Problem Statement below
+carries the gaps and says which already closed. The framed outcome: an
+operator prunes without risking a store or a live lineage and every kept
+session names its keeper; a test confined to a scratch root can't touch the
+real store; a successor reads its predecessor by name from its own directory
+and leaves it unchanged; no refusal advises deletion; and the host needs no
+freeze. The framing's journeys (an operator's prune of the shared store, a
+test harness in a scratch root, a prune that keeps what a successor needs, a
+successor reading its predecessor from its own directory, and an agent
+hitting a mismatched origin) are the User Stories below. Its boundary put in
+the delivered guard and `KOTO_HOME` work plus what they leave open, the name
+rule's replacement by the continues relation, reads by name from any
+directory with writes following them, reads that write nothing, and refusal
+wording. It put out the relation itself, succession on the workflow side,
+lifting the freeze, a local-backend or marker-mode guard, explicit
+single-session removal, restoring the removed sessions, other cross-session
+writers, and the import's moved-copy prune; Out of Scope carries each. It
+left one question to these requirements, whether a scratch `KOTO_HOME` stops
+an environment-configured cloud backend or only reports it, which Decisions
+and Trade-offs settles.
 
 ## Problem Statement
 
