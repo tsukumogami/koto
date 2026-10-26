@@ -125,7 +125,27 @@ Steps 1 and 2 left most of the per-unit grading path in `src/cli/check_evaluator
 
 ### Step 4: templates that would overrun the unit bound are refused at compile time
 
-`E-DECIDER-CHECK-UNITS` and `E-DECIDER-CHECK-RULE` refuse bad bounds, labels and text lengths, `max_units` defaults divide the 32-consultation state bound, and templates without the new fields compile byte-identically.
+**Goal**: A state's unit-mode checks can't be declared past the 32-consultation bound: the compiler sums `max_units` times criteria over them and refuses more than 32, gives a check without `max_units` its share of the bound, and accepts the `unit_document` and `unit_section` labels the run journal will use. Templates without the new fields compile exactly as before.
+
+Steps 2 and 3 left part of this in place. `E-DECIDER-CHECK-RULE` already refuses an empty, whitespace-only or over-long `summary` or `rule_text` (step 2). `max_units` already parses in `src/template/compile.rs` and is refused below 1 with `E-DECIDER-CHECK-UNITS`, and the evaluator reads `spec.max_units` as a per-check cap, treating no value as no cap, so today such a check is bounded only by the 32-slot `UnitBudget` (step 3). `max_units` on a check without `units: jsonl` is accepted and ignored. `validate_state_decider_checks` in `src/template/types.rs` checks the per-state criteria limit, duplicates and routing, but no unit bound. Nothing parses `unit_document` or `unit_section`.
+
+**Acceptance Criteria**:
+
+- [ ] A state whose unit-mode checks declare `max_units` times criteria summing to 33 is refused with `E-DECIDER-CHECK-UNITS`, naming the state and the sum; one summing to exactly 32 compiles.
+- [ ] A check without `max_units` gets 32 divided by the number of criteria across the state's unit-mode checks, rounded down, written into the compiled spec: a two-criterion check defaults to 16, a three-criterion one to 10, and two one-criterion unit-mode checks in one state default to 16 each and compile. When some checks in the state declare `max_units` and others don't, the default divides what the declared ones leave, and a state where nothing is left is refused with `E-DECIDER-CHECK-UNITS`.
+- [ ] At run time a check whose `max_units` came from the default caps its units at that value, as a declared one does: with the default 16 and twenty units, units seventeen to twenty fall back with `unit_limit`.
+- [ ] `max_units`, `unit_document` or `unit_section` on a check without `units: jsonl` is refused with `E-DECIDER-CHECK-UNITS` naming the field.
+- [ ] `unit_document` and `unit_section` accept a value in koto's name shape (letters, digits and `._:/@-`, 1 to 128 bytes, not starting with `/`, `~` or `-`) and refuse anything else with `E-DECIDER-CHECK-UNITS`; accepted values are carried in the compiled spec and in the declaration hash only when set.
+- [ ] A template with no decider check, and one whose decider checks use none of `units`, `max_units`, `unit_document`, `unit_section`, `summary` and `rule_text`, compiles to the same bytes and the same declaration hash as on the previous release; a compile-compatibility snapshot pins a decider-check fixture to show it.
+- [ ] `docs/reference/error-codes.md` lists each new `E-DECIDER-CHECK-UNITS` case.
+
+**Check**: Run `cargo test --test decider_check_compile` (extended with this step, through the repo's usual test setup). It compiles the 33 and 32 sums, the defaults for one, two and three criteria and for two checks in a state, a mixed declared-and-default state, each refused field on a non-unit check, label values inside and outside the name shape, and the no-new-fields fixture against its pinned compiled bytes and hash. A stub-driven case in `tests/decider_units_fallback.rs` runs twenty units under a defaulted 16 and asserts four `unit_limit` fallbacks.
+
+**Dependencies**: Step 3
+
+**Files**: `src/template/compile.rs`, `src/template/types.rs`, `src/template/decider_check.rs`, `docs/reference/error-codes.md`, `tests/decider_check_compile.rs`, `tests/decider_units_fallback.rs`
+
+**Complexity**: testable
 
 ### Step 5: the run journal carries unit digests, confidence and rule deliveries
 
