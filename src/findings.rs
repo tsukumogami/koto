@@ -21,6 +21,11 @@ use crate::redact::{fold_one_line, redact_str, safe_cut_len, RedactedText, Redac
 /// The bytes a finding line starts with.
 pub const FINDING_PREFIX: &str = "::koto-finding::";
 
+/// The bytes a line starts with when a check says its input wasn't ready to
+/// judge. Read only at the start of a stdout line, and only as telemetry: it
+/// never changes the check's outcome, its routing or its fallback finding.
+pub const NOT_READY_PREFIX: &str = "::koto-not-ready::";
+
 /// Most findings a failed check returns in a `koto next` response, the
 /// koto-written finding included.
 pub const RESPONSE_FINDINGS_CAP: usize = 100;
@@ -196,18 +201,48 @@ pub struct CheckOutput {
     pub findings: Vec<Finding>,
     pub captured: Captured,
     pub stderr_ends_with_note: bool,
+    /// The telemetry markers stdout carries.
+    pub markers: CheckMarkers,
 }
 
 impl CheckOutput {
-    /// Parse the findings out of `captured`'s stdout.
+    /// Parse the findings and the telemetry markers out of `captured`'s
+    /// stdout.
     pub fn parse(captured: Captured, stderr_ends_with_note: bool, redactor: &Redactor) -> Self {
         let findings = parse_findings(&captured.stdout, captured.stdout_truncated, redactor);
+        let markers = CheckMarkers {
+            not_ready: printed_not_ready(captured.stdout.as_str(), captured.stdout_truncated),
+        };
         CheckOutput {
             findings,
             captured,
             stderr_ends_with_note,
+            markers,
         }
     }
+}
+
+/// What a check reported for telemetry beside its findings. Nothing here
+/// reaches the check's outcome, its `output`, routing or the fallback
+/// finding: the advance loop only logs it on the check's event, and the run
+/// journal relays it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CheckMarkers {
+    /// The check said its input wasn't ready to judge: it printed a
+    /// [`NOT_READY_PREFIX`] line, or (for a command gate) exited with a code
+    /// its gate lists in `not_ready_exit_codes`. koto never sets it on its
+    /// own.
+    pub not_ready: bool,
+}
+
+/// Whether a stdout line starts with [`NOT_READY_PREFIX`]. The marker counts
+/// only as the first bytes of a line: indented, or anywhere later in a line,
+/// it is ordinary output. Like a finding line, the unterminated last
+/// fragment of a stdout cut at the capture bound is never read.
+pub fn printed_not_ready(stdout: &str, stdout_truncated: bool) -> bool {
+    stdout_lines(stdout, stdout_truncated)
+        .into_iter()
+        .any(|(line, parseable)| parseable && line.starts_with(NOT_READY_PREFIX))
 }
 
 /// What koto adds to a failed corrective check beyond the findings it
@@ -1053,5 +1088,28 @@ mod tests {
         fill_effect_landed(o.findings.iter_mut(), false);
         assert_eq!(o.findings[0].effect_landed, Some(true));
         assert_eq!(o.findings[1].effect_landed, Some(false));
+    }
+
+    #[test]
+    fn the_not_ready_marker_counts_only_at_the_start_of_a_line() {
+        assert!(printed_not_ready("::koto-not-ready::\n", false));
+        assert!(printed_not_ready(
+            "checking\n::koto-not-ready::\nbye\n",
+            false
+        ));
+        assert!(printed_not_ready("::koto-not-ready::", false));
+        assert!(!printed_not_ready("x ::koto-not-ready::\n", false));
+        assert!(!printed_not_ready("  ::koto-not-ready::\n", false));
+        assert!(!printed_not_ready("\t::koto-not-ready::\n", false));
+        assert!(!printed_not_ready("nothing to see\n", false));
+        // The unterminated fragment of a stdout cut at the capture bound
+        // isn't read.
+        assert!(!printed_not_ready("a\n::koto-not-ready::", true));
+        // Parsed with the findings, and leaves them alone.
+        let finding = line(r#"{"rule_id":"pr-body/pr-missing","level":"error","message":"m"}"#);
+        let o = output(&format!("{finding}\n::koto-not-ready::\n"), "");
+        assert!(o.markers.not_ready);
+        assert_eq!(o.findings.len(), 1);
+        assert!(!output(&format!("{finding}\n"), "").markers.not_ready);
     }
 }

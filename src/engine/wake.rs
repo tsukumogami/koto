@@ -329,6 +329,7 @@ fn emit_one_wake_batch(
         fields,
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     };
     let timestamp = format_rfc3339_millis(now);
     append_event(coord_state_file, &payload, &timestamp)
@@ -693,6 +694,7 @@ mod tests {
                 fields,
                 submitter_cwd: None,
                 source: None,
+                exported_fields: None,
             },
             idempotency_hash: None,
         }
@@ -737,6 +739,7 @@ mod tests {
                 fields,
                 submitter_cwd: None,
                 source: None,
+                exported_fields: None,
             },
             idempotency_hash: None,
         }
@@ -903,6 +906,7 @@ mod tests {
                 fields: legacy_wake_fields,
                 submitter_cwd: None,
                 source: None,
+                exported_fields: None,
             },
             idempotency_hash: None,
         };

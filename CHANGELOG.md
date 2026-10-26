@@ -50,6 +50,21 @@ to `0.9.x`).
 
 ### Added
 
+- **Check and evidence telemetry in the run journal.** `check_evaluated`
+  gains `koto.check.reason` (why a check didn't pass: `rule_failed`,
+  `undecided`, `no_finding`, `timed_out`, `spawn_failed` or `error`),
+  `koto.check.not_ready` and `koto.check.pre_directive`, and
+  `check_finding` gains `koto.finding.source` (`check` or `fallback`). A
+  check says "not ready" by printing a line that starts with
+  `::koto-not-ready::`, or, on a command gate, by exiting with a code the
+  new optional `not_ready_exit_codes` field lists; it is telemetry only and
+  changes no outcome, route or fallback finding. A new `evidence_field`
+  record carries each enum or boolean field of the agent's evidence (a
+  declared value, its digest, `other`, or `true`/`false`), never string or
+  number values. In the session log, `instructions_delivered` is now
+  appended for every printed directive with an additive
+  `details_included`, which details suppression reads, and
+  `evidence_submitted` gains an additive `exported_fields` map.
 - **`KOTO_HOME` moves the whole koto root (koto#459).** Sessions, the
   request store, `config.toml`, the terminal index, coordinator cursors,
   wake files, the decider ledger, the run journal and the root

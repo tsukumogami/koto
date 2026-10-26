@@ -860,6 +860,23 @@ The prefix must start the line and the object must be the only thing after it. A
 
 Emit these lines from a wrapper -- `jq` over a linter's JSON output, a few lines of Python -- rather than hand-built `echo`, so the JSON is always valid. Caps, ordering past 100 findings, `message_source` and `effect_landed` are in the [`default_action` authoring guide's Reporting findings section](../../../../../docs/guides/default-action-authoring.md#reporting-findings), which applies to gates as well as actions. You own what your checks print: koto redacts only the credentials it knows about, and the agent reads findings as data, not instructions.
 
+#### Saying "not ready" (telemetry only)
+
+A check whose input wasn't there to judge yet (no pull request open, no body written) can say so, for telemetry, in either of two ways:
+
+- print a line that starts with `::koto-not-ready::` on **stdout**; anywhere else in a line, or indented, it's ordinary output;
+- on a `command` gate, list the exit codes that mean it in `not_ready_exit_codes` (1 to 255; refused on other gate types):
+
+```yaml
+gates:
+  pr_body:
+    type: command
+    command: ./check-pr-body.sh
+    not_ready_exit_codes: [2]
+```
+
+Either one marks the evaluation `not_ready` in its run-journal record and nothing more: the outcome, routing, overrides and the fallback finding are exactly what they'd be without it. A check that echoes text it didn't write (a PR body, a commit message) should prefix those lines so none starts with `::`.
+
 ### Routing on gate output (`gates.*` paths)
 
 Reference gate output in `when` conditions using `gates.<gate_name>.<field>`. When at least one `when` clause on a state references a `gates.*` key, the engine injects gate outputs and resolves transitions automatically -- no agent action is needed.

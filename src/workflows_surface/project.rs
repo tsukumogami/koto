@@ -731,6 +731,7 @@ mod tests {
                     fields,
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 idempotency_hash: None,
             },

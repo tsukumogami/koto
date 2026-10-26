@@ -834,9 +834,18 @@ fn init_next_rewind_sequence() {
     // Verify the last event in the state file is a rewound event.
     let state_path = session_state_path(dir.path(), "seq-wf");
     let state_content = std::fs::read_to_string(&state_path).unwrap();
-    let last_line = state_content.lines().last().unwrap().to_string();
-    let last_event: serde_json::Value =
-        serde_json::from_str(&last_line).expect("last event should be valid JSON");
+    // The `koto next` after the rewind printed a directive, which appends
+    // its `instructions_delivered`; the event before it is the rewind.
+    let events: Vec<serde_json::Value> = state_content
+        .lines()
+        .skip(1)
+        .map(|l| serde_json::from_str(l).expect("each event should be valid JSON"))
+        .collect();
+    let last_event = events
+        .iter()
+        .rev()
+        .find(|e| e["type"] != "instructions_delivered")
+        .unwrap();
     assert_eq!(
         last_event["type"].as_str(),
         Some("rewound"),

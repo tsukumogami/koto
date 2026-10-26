@@ -991,6 +991,7 @@ d
                 .collect(),
             submitter_cwd: None,
             source: None,
+            exported_fields: None,
         };
         let left = EventPayload::Transitioned {
             from: Some("review".to_string()),

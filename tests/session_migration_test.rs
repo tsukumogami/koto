@@ -1340,8 +1340,14 @@ fn the_marker_check_adds_one_request_to_next_and_none_on_the_local_backend() {
     // One listing of the session's prefix, for the marker check and the
     // tick's pull of its own session alike, answered once for the whole
     // tick though the gate reads a context key; then the pushes of the
-    // events the tick appends.
-    let expected = vec![format!("LIST {}", session), put.clone(), put.clone(), put];
+    // events the tick appends, the last its `instructions_delivered`.
+    let expected = vec![
+        format!("LIST {}", session),
+        put.clone(),
+        put.clone(),
+        put.clone(),
+        put,
+    ];
     assert_eq!(seen, expected, "koto next made {:?}", seen);
 
     // The local backend, with the same cloud settings still in the config,

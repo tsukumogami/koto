@@ -135,6 +135,9 @@ events:
         type: string
         required: false
         nullable: true
+      exported_fields:
+        type: object
+        required: false
 
   workflow_cancelled:
     tier: 1
@@ -269,6 +272,9 @@ events:
       state:
         type: string
         required: true
+      details_included:
+        type: boolean
+        required: false
 
   default_action_executed:
     tier: 2
@@ -311,6 +317,16 @@ events:
         required: false
       duration_ms:
         type: integer
+        required: false
+      reason:
+        type: string
+        required: false
+        enum: ["rule_failed", "undecided", "no_finding", "timed_out", "spawn_failed", "error"]
+      not_ready:
+        type: boolean
+        required: false
+      fallback_logged:
+        type: boolean
         required: false
 
   decision_recorded:
@@ -378,6 +394,16 @@ events:
         required: false
       poll:
         type: object
+        required: false
+      reason:
+        type: string
+        required: false
+        enum: ["rule_failed", "undecided", "no_finding", "timed_out", "spawn_failed", "error"]
+      not_ready:
+        type: boolean
+        required: false
+      fallback_logged:
+        type: boolean
         required: false
 
   child_completed:
@@ -1056,6 +1082,7 @@ Records what an agent submitted for a state.
 | `fields` | object | Yes | Agent-provided key-value evidence. Values are arbitrary JSON. |
 | `submitter_cwd` | string | No | Working directory of the submitting process. Used internally by the batch scheduler. Consumers MAY ignore this field. |
 | `source` | string | No | Who produced the evidence when it wasn't the agent. `"decider"` marks an answer koto applied from an opted-in decider; absent means the agent submitted it. Only koto sets it: a `source` key in `--with-data` lands in `fields`. Consumers MUST tolerate values they don't recognize. |
+| `exported_fields` | object | No | The submission's enum and boolean fields as telemetry may carry them, keyed by field name: an enum value the state's `accepts` declares (its digest when it isn't name-shaped), `other` for one it doesn't, and `true` or `false` for a boolean. String, number and task-list fields have no entry. Written by `koto next --with-data` when there is at least one entry; the run journal relays each entry as an `evidence_field` record. |
 
 ---
 
@@ -1434,8 +1461,8 @@ The consumers handle these reads this way:
 
 #### `instructions_delivered`
 
-Records that a `koto next` response carried a phase's instructions to whoever
-called it. A phase's delivery window runs from the state-entry event by which the
+Records that a `koto next` response printed a phase's directive, and whether
+it also carried the phase's instructions (`details`). A phase's delivery window runs from the state-entry event by which the
 workflow *arrived* at it — an entry recording a different source phase, an entry
 recording no source at all, as `koto init`'s does, or any rewind — to the end of
 the log. With no such entry anywhere in the log, every event is in scope. A delivery recorded inside that window is what
@@ -1447,26 +1474,35 @@ self-transition, or a directed transition into the phase the workflow already
 occupies — closes the epoch but does not open a delivery window, so an agent
 going around a loop it is already in is not re-sent instructions it holds.
 
-Both `koto next` response-construction paths append this event, after the
-response has been printed. The ordering is deliberate: a crash between printing
-and appending re-delivers on the next tick, which is the benign direction.
+Both `koto next` response-construction paths append this event for every
+response that prints a non-terminal directive, after the response has been
+printed. The ordering is deliberate: a crash between printing and appending
+re-delivers on the next tick, which is the benign direction. Only an event whose
+`details_included` is `true`, or absent (as on every event written before the
+field existed, when koto appended one only for a response that carried the
+details), counts as a delivery of the instructions; one whose value is `false`
+records a directive printed with its details left out. The run journal reads
+any of them as "the directive was shown in this visit" (its
+`koto.check.pre_directive`).
 
 Nothing else in the feed can stand in for it. A non-advancing tick on a phase
-that is only waiting for evidence appends nothing at all, so two sessions
-differing only in whether the instructions went out produce identical feeds.
+that is only waiting for evidence appends nothing else, so two sessions
+differing only in whether the instructions went out differ only here.
 
 ```json
 {
   "type": "instructions_delivered",
   "payload": {
-    "state": "implement"
+    "state": "implement",
+    "details_included": true
   }
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `state` | string | Yes | The phase whose instructions the response carried. |
+| `state` | string | Yes | The phase whose directive the response printed. |
+| `details_included` | boolean | No | Whether the response also carried the phase's `details`. Absent on events written before the field existed, which a reader treats as `true`. |
 
 The phase is named rather than left implicit because a tick can advance through
 several phases at once, and a reader has to be able to tell a record left by a
@@ -1511,6 +1547,9 @@ Records when a state's automatic shell command ran.
 | `rule_counts` | object | No | On a failed action: per-rule attempt counts for the rules it reported at `error`, under the check name `__action__`. At most 50 keys. |
 | `rule_counts_truncated` | boolean | No | `true` when the action reported more distinct rule ids at `error` than `rule_counts` holds. Absent means `false`. |
 | `duration_ms` | integer | No | The command's wall-clock run time in milliseconds. For an action with `polling:`, it covers the whole polling loop. |
+| `reason` | string | No | Why a judged check didn't pass: `rule_failed` (it printed an `error` finding of its own), `undecided` (exit 2 with none), `no_finding` (any other failure with none), `timed_out`, `spawn_failed` or `error`. Absent when it passed or is pending. Telemetry only; nothing routes on it. |
+| `not_ready` | boolean | No | `true` when the check said its input wasn't ready to judge: it printed a line starting with `::koto-not-ready::`, or exited with a code its gate lists in `not_ready_exit_codes`. Telemetry only: the outcome, routing and fallback finding are unchanged. Absent means `false`. |
+| `fallback_logged` | boolean | No | `true` when `findings` holds koto's fallback finding, which is then the one `error` finding whose `rule_id` is the check's name. Absent means `false`. |
 
 The fields from `attempt` down are described in
 [Check Findings and Attempts](#check-findings-and-attempts). They're absent on
@@ -1629,6 +1668,9 @@ same gate in the same state (e.g., during a polling sequence).
 | `stdout_truncated` | boolean | No | `true` when `stdout` holds less than the command printed, whether koto's 64 KiB capture bound or the 4,096-byte log cut removed it. Absent means `false`. |
 | `stderr_truncated` | boolean | No | The same for `stderr`. |
 | `poll` | object | No | On a polling gate's evaluation: where the poll stood. See [Polling gates](#polling-gates). |
+| `reason` | string | No | Why a judged check didn't pass: `rule_failed` (it printed an `error` finding of its own), `undecided` (exit 2 with none), `no_finding` (any other failure with none), `timed_out`, `spawn_failed` or `error`. Absent when it passed or is pending. Telemetry only; nothing routes on it. |
+| `not_ready` | boolean | No | `true` when the check said its input wasn't ready to judge: it printed a line starting with `::koto-not-ready::`, or exited with a code its gate lists in `not_ready_exit_codes`. Telemetry only: the outcome, routing and fallback finding are unchanged. Absent means `false`. |
+| `fallback_logged` | boolean | No | `true` when `findings` holds koto's fallback finding, which is then the one `error` finding whose `rule_id` is the check's name. Absent means `false`. |
 
 The fields from `attempt` down are described in
 [Check Findings and Attempts](#check-findings-and-attempts). They're absent on

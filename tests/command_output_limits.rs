@@ -337,6 +337,7 @@ fn gate_evaluator_does_not_report_a_loud_gate_as_timed_out() {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 

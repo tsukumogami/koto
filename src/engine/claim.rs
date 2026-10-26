@@ -625,6 +625,7 @@ fn append_redelegated_audit(
         fields,
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     };
     if let Some(parent) = coord_log.parent() {
         fs::create_dir_all(parent)
@@ -677,6 +678,7 @@ pub fn claim_and_dispatch(
         fields,
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     };
     if let Some(parent) = coord_state_file.parent() {
         fs::create_dir_all(parent)

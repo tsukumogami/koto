@@ -483,6 +483,7 @@ mod tests {
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         }
     }
 
@@ -544,6 +545,7 @@ mod tests {
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         };
         let result = resolve_override_applied(None, &gate);
         assert!(result.is_err());
