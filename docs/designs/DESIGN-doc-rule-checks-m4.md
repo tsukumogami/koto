@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Accepted
+status: Planned
 upstream: docs/prds/PRD-doc-rule-checks-m4.md
 problem: |
   koto's check evaluator sends a decider check's whole extraction output to
@@ -34,7 +34,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Accepted
+Planned
 
 ## Context and Problem Statement
 
@@ -350,7 +350,7 @@ Key assumptions:
 | `decider_checked` | each (unit, criterion) consultation, or early unit outcome, that isn't a reuse | `koto.unit.key`, `koto.unit.document`, `koto.unit.section` (unit mode only); `koto.decider.confidence_bp` whenever an answer was read, unit mode or not |
 | `decider_fallback` | each (unit, criterion) handed to the agent | `koto.unit.key`, `koto.unit.document`, `koto.unit.section` |
 | `decider_check_answered` | each `koto decider answer` for a unit | `koto.unit.key`, `koto.unit.document`, `koto.unit.section` |
-| `rule_delivered` (new) | once per `rules` object, after the response prints | `koto.state`, `koto.check`, `koto.rule.id`, `koto.rule.delivery` (`summary` or `full`), `koto.rule.unit_count` (unit mode only), with `koto.seq` and `koto.visit.seq` like every check record |
+| `rule_delivered` (new) | once per `rules` object, after the response prints | `koto.state`, `koto.check.name` (the check, under the name `check_finding` uses, since an exporter that nests dotted names collides a scalar `koto.check` with `koto.check.*` fields), `koto.rule.id`, `koto.rule.extent` (`summary` or `full`), `koto.rule.unit_count` (unit mode only), with `koto.seq` and `koto.visit.seq` like every check record |
 
 The journal's values and their shapes:
 
@@ -360,7 +360,7 @@ The journal's values and their shapes:
 | `koto.unit.document` | the check's declared `unit_document`; else the digest of the printed `document`; absent when neither | name or digest |
 | `koto.unit.section` | the check's declared `unit_section`; else the digest of the printed `section`; absent when neither | name or digest |
 | `koto.decider.confidence_bp` | integer 0 to 10,000 | integer |
-| `koto.rule.delivery` | `summary` or `full`, a closed vocabulary | name |
+| `koto.rule.extent` | `summary` or `full`, a closed vocabulary | name |
 | `koto.rule.unit_count` | integer 1 to 32 | integer |
 
 No raw value an extraction printed reaches the journal: paths and headings
@@ -382,8 +382,10 @@ answer itself is `koto.decider.outcome`, which the record already carries.
 Every new name is checked in `tests/run_journal_doc_test.rs`'s collision
 tests: none equals or is a dot-prefix of an existing name, `koto.unit`
 and `koto.rule` exist only as prefixes, and the delivery level is named
-`koto.rule.delivery` so it can't be read as a severity beside
-`koto.finding.level`.
+`koto.rule.extent` so it can't be read as a severity beside
+`koto.finding.level`, and leaves `koto.rule.delivery` free for whether a
+delivery was printed or refused, which later command-gate work adds to this
+same record kind.
 
 The session feed declares `rule_delivered` and the optional `unit` object
 on the three events. Optional fields need no version bump, and koto

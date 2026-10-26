@@ -290,7 +290,8 @@ leave shadow.
 - **R18. Rule deliveries.** Each `rules` entry delivered in a response is
   recorded once, after the response is printed, as a `rule_delivered` event
   relayed to the run journal as a `rule_delivered` record with `koto.state`,
-  `koto.check`, `koto.rule.id`, `koto.rule.delivery` (a closed vocabulary:
+  `koto.check.name` (the check's name, written under the same name
+  `check_finding` uses), `koto.rule.id`, `koto.rule.extent` (a closed vocabulary:
   `summary` or `full`) and, in unit mode, `koto.rule.unit_count` (how many
   units failed that rule). koto has one rule-delivery record kind: any other check that
   delivers rule text, now or later, writes this kind with these fields.
@@ -323,7 +324,7 @@ leave shadow.
   | koto-author template-format reference | `units`, `max_units`, `unit_document`, `unit_section`, `summary`, `rule_text` |
   | decider authoring guide | `units`, `max_units`, `summary`, `rule_text`, `rules` |
   | error-code reference | `E-DECIDER-CHECK-UNITS`, `E-DECIDER-CHECK-RULE`, `unit_required`, `unit_not_expected`, `unknown_unit` |
-  | run-journal reference | `koto.unit.key`, `koto.decider.confidence_bp`, `rule_delivered`, `koto.rule.delivery` |
+  | run-journal reference | `koto.unit.key`, `koto.decider.confidence_bp`, `rule_delivered`, `koto.rule.extent` |
   | session-feed reference | `rule_delivered`, the optional `unit` fields |
   | koto-user skill and its command and response references | `--unit`, `rules`, `units` |
 
@@ -422,7 +423,7 @@ Telemetry and compatibility:
   agent's `fail` answer to it is recorded and the gate then passes. (R8,
   R10)
 - [ ] Each delivered `rules` entry produces exactly one `rule_delivered`
-  record with `koto.rule.delivery`, and in unit mode `koto.rule.unit_count`
+  record with `koto.rule.extent`, and in unit mode `koto.rule.unit_count`
   equal to the entry's key count; twenty failing units of one rule produce
   one record. (R18)
 - [ ] The run journal's doc tests and collision tests pass listing every new
