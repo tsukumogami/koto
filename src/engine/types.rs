@@ -229,24 +229,6 @@ pub struct SessionOrigin {
     pub anchor: PathBuf,
     /// The session store the session was created in.
     pub store: SessionStoreIdentity,
-    /// How many times `koto session rebind` has moved the anchor: the
-    /// rebind's fence (koto#477). A cloud write from a process that read a
-    /// lower epoch refuses with `session_rebound` instead of forking the log.
-    /// `0`, and omitted, until the first rebind; an origin written before the
-    /// field existed reads as `0`, and an older koto ignores the field.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub anchor_epoch: u64,
-    /// The anchors a rebind moved the session away from, canonical. A cloud
-    /// write run from one of them (and not from the current anchor) refuses
-    /// with `session_rebound`, so a predecessor still working in the old
-    /// anchor gets an error rather than a second history. A rebind back to
-    /// one of them takes it off the list.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub retired_anchors: Vec<PathBuf>,
-}
-
-fn is_zero_u64(n: &u64) -> bool {
-    *n == 0
 }
 
 /// Which session store holds a session: the backend kind and its

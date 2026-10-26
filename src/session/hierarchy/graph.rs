@@ -74,19 +74,7 @@ impl Scope {
     }
 }
 
-/// One continues link, resolved: `holder` continues `target`, the session
-/// the link's recorded session id (or, with none, its name `named`)
-/// resolves to. Never an [`Edge`]: retention reads these as a directed
-/// overlay ([`super::Judge::relation`]).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Directed {
-    pub holder: String,
-    pub named: String,
-    pub target: String,
-}
-
-/// The store as one undirected graph, plus the directed continues links
-/// kept out of it.
+/// The store as one undirected graph.
 #[derive(Debug)]
 pub struct Graph {
     pub(super) base: PathBuf,
@@ -97,14 +85,6 @@ pub struct Graph {
     pub(super) migrated: BTreeMap<String, Vec<String>>,
     /// `(session, reason)` for every problem that taints every component.
     pub(super) store_problems: Vec<(String, String)>,
-    /// Every continues link that resolved to a session, sorted.
-    pub(super) directed: Vec<Directed>,
-    /// Each continues link that names a session in the store but can't be
-    /// judged, by the session it keeps.
-    pub(super) broken: BTreeMap<String, Vec<super::relation::Unreadable>>,
-    /// The sessions whose reserved area can't be listed: each may hold a
-    /// continues link naming any session.
-    pub(super) unlistable: Vec<String>,
 }
 
 /// The names of every session under `base`: each directory entry whose
@@ -206,133 +186,9 @@ impl Graph {
             edges: Vec::new(),
             migrated,
             store_problems,
-            directed: Vec::new(),
-            broken: BTreeMap::new(),
-            unlistable: Vec::new(),
         };
         graph.build_edges();
-        graph.build_directed();
         Ok(graph)
-    }
-
-    /// Resolve every continues link, outside the undirected edges and the
-    /// session-id-hint loop. A link resolves by its recorded session id
-    /// first, so a predecessor the same-name replace moved aside to
-    /// `<name>_r<N>` stays the one it names; with no session of that id, a
-    /// session holding the name with another id reads as `mismatch` (a new
-    /// session that took a removed predecessor's name), and with no id
-    /// recorded the link resolves by name. A migrated name is not
-    /// redirected to its copies: the predecessor is the source itself. A
-    /// link naming the holder's own name (a same-host import's copy naming
-    /// its source in another workspace) names nothing in this store, and a
-    /// link naming no session here keeps nothing.
-    fn build_directed(&mut self) {
-        use super::relation::{Reason, Unreadable};
-        let mut by_id: HashMap<&str, Vec<&str>> = HashMap::new();
-        for f in self.facts.values() {
-            if let Some(id) = &f.session_id {
-                by_id.entry(id.as_str()).or_default().push(f.name.as_str());
-            }
-        }
-        let mut directed = Vec::new();
-        let mut broken: BTreeMap<String, Vec<Unreadable>> = BTreeMap::new();
-        let mut unlistable = Vec::new();
-        for f in self.facts.values() {
-            if f.relations_unlistable {
-                unlistable.push(f.name.clone());
-            }
-            for c in &f.continues {
-                if c.peer == f.name {
-                    continue;
-                }
-                let mut keep = |reason: Reason| {
-                    if self.facts.contains_key(&c.peer) {
-                        broken.entry(c.peer.clone()).or_default().push(Unreadable {
-                            holder: f.name.clone(),
-                            reason,
-                        });
-                    }
-                };
-                let id = match &c.body {
-                    Err(reason) => {
-                        keep(*reason);
-                        continue;
-                    }
-                    Ok(id) => id,
-                };
-                let found: Vec<&str> = match id {
-                    Some(id) => by_id
-                        .get(id.as_str())
-                        .into_iter()
-                        .flatten()
-                        .copied()
-                        .filter(|n| *n != f.name)
-                        .collect(),
-                    None => Vec::new(),
-                };
-                if !found.is_empty() {
-                    for target in found {
-                        directed.push(Directed {
-                            holder: f.name.clone(),
-                            named: c.peer.clone(),
-                            target: target.to_string(),
-                        });
-                    }
-                } else if id.is_some() {
-                    keep(Reason::Mismatch);
-                } else if self.facts.contains_key(&c.peer) {
-                    directed.push(Directed {
-                        holder: f.name.clone(),
-                        named: c.peer.clone(),
-                        target: c.peer.clone(),
-                    });
-                }
-            }
-        }
-        directed.sort();
-        directed.dedup();
-        for list in broken.values_mut() {
-            list.sort();
-            list.dedup();
-        }
-        self.directed = directed;
-        self.broken = broken;
-        self.unlistable = unlistable;
-    }
-
-    /// Every continues link that resolved to a session, sorted by holder.
-    pub fn directed(&self) -> &[Directed] {
-        &self.directed
-    }
-
-    /// The sessions holding a continues link that names `name`: those that
-    /// resolve to it and those that keep it unjudged, sorted.
-    pub fn successors_of(&self, name: &str) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .directed
-            .iter()
-            .filter(|d| d.target == name)
-            .map(|d| d.holder.clone())
-            .chain(
-                self.broken
-                    .get(name)
-                    .into_iter()
-                    .flatten()
-                    .map(|u| u.holder.clone()),
-            )
-            .collect();
-        out.sort();
-        out.dedup();
-        out
-    }
-
-    /// The predecessor `name` names in its continues link, when it holds
-    /// one: by the key, whatever the link resolves to.
-    pub fn predecessor_of(&self, name: &str) -> Option<&str> {
-        self.facts
-            .get(name)
-            .and_then(|f| f.continues.first())
-            .map(|c| c.peer.as_str())
     }
 
     /// The migrated set. Session X counts as migrated only when a local

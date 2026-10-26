@@ -10,7 +10,6 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use super::graph::{Components, Edge, Graph, Scope};
-use super::relation::{Reason, RelationKeeper, RelationVerdict, Standing};
 use super::settings::RetentionSettings;
 use super::FUTURE_TOLERANCE;
 use crate::engine::types::{iso8601_at, SessionKind, ANCHOR_ACTIVITY, ANCHOR_STARTED};
@@ -194,34 +193,13 @@ pub struct Judgment {
     pub pin_source: &'static str,
     /// Each present member holding a pin, readable or not, by name.
     pub pinned_members: BTreeMap<String, PinFact>,
-    /// Each present member the continues relation keeps, with its
-    /// keepers and what couldn't be judged ([`Judge::relation`]). Like a
-    /// pin, an overlay asked about one member at a time: the verdict knows
-    /// nothing of it.
-    pub relations: BTreeMap<String, RelationVerdict>,
-    /// The predecessor the judged session's continues link names, when it
-    /// holds one.
-    pub predecessor: Option<String>,
-    /// The sessions holding a continues link that names the judged
-    /// session, sorted.
-    pub successors: Vec<String>,
 }
 
 impl Judgment {
-    /// Whether `member` is kept: by its own pin, because the component's
-    /// verdict keeps every member, or because a later member continuing
-    /// it has standing (or a relation naming it can't be judged).
+    /// Whether `member` is kept: by its own pin, or because the component's
+    /// verdict keeps every member.
     pub fn keeps(&self, member: &str) -> bool {
-        self.pinned_members.contains_key(member)
-            || self.verdict.is_kept()
-            || self.relation_of(member).keeps()
-    }
-
-    /// What the continues relation says about present member `member`:
-    /// empty when nothing keeps it through a relation.
-    pub fn relation_of(&self, member: &str) -> &RelationVerdict {
-        static EMPTY: RelationVerdict = RelationVerdict::EMPTY;
-        self.relations.get(member).unwrap_or(&EMPTY)
+        self.pinned_members.contains_key(member) || self.verdict.is_kept()
     }
 
     /// `member`'s pin, as the scan read it.
@@ -407,13 +385,6 @@ impl<'g> Judge<'g> {
                 close_kind,
             },
         });
-        let mut relations = BTreeMap::new();
-        for m in &present {
-            let r = self.relation(m);
-            if r.keeps() {
-                relations.insert(m.clone(), r);
-            }
-        }
         let unreadable: Vec<Unreadable> = unreadable.into_iter().collect();
         let verdict = if !keepers.is_empty() {
             Verdict::Keep {
@@ -451,109 +422,7 @@ impl<'g> Judge<'g> {
                 .facts(name)
                 .map_or(crate::session::pin::SOURCE_LOCAL, |f| f.pin_source()),
             pinned_members,
-            relations,
-            predecessor: self.graph.predecessor_of(name).map(str::to_string),
-            successors: self.graph.successors_of(name),
         })
-    }
-
-    /// What the continues relation says about session `name`
-    /// (DESIGN-koto-session-continues.md, Decision 2): every later member
-    /// with standing, each with the path to it, and every relation on the
-    /// way that can't be judged.
-    ///
-    /// The walk follows the graph's directed list backwards, breadth-first
-    /// from `name` with a visited set, so it reaches only later members:
-    /// nothing earlier than `name` is read, and nothing earlier keeps it.
-    /// Each member's standing comes from that member alone, never its
-    /// hierarchy ([`Self::standing`]); the walk goes on past a member with
-    /// no standing, since something later may have some. A member reached
-    /// again is a `cycle`, which keeps. Every session whose reserved area
-    /// can't be listed is `unlistable`, which keeps too: it may hold a
-    /// relation naming anything.
-    pub fn relation(&mut self, name: &str) -> RelationVerdict {
-        use std::collections::VecDeque;
-        let mut verdict = RelationVerdict::default();
-        for holder in &self.graph.unlistable {
-            if holder != name {
-                verdict.unreadable.push(super::relation::Unreadable {
-                    holder: holder.clone(),
-                    reason: Reason::Unlistable,
-                });
-            }
-        }
-        let mut visited: BTreeSet<String> = BTreeSet::from([name.to_string()]);
-        let mut queue: VecDeque<(String, Vec<String>)> =
-            VecDeque::from([(name.to_string(), Vec::new())]);
-        while let Some((node, path)) = queue.pop_front() {
-            if let Some(broken) = self.graph.broken.get(&node) {
-                verdict.unreadable.extend(broken.iter().cloned());
-            }
-            let holders: Vec<String> = self
-                .graph
-                .directed
-                .iter()
-                .filter(|d| d.target == node)
-                .map(|d| d.holder.clone())
-                .collect();
-            for holder in holders {
-                if !visited.insert(holder.clone()) {
-                    verdict.unreadable.push(super::relation::Unreadable {
-                        holder,
-                        reason: Reason::Cycle,
-                    });
-                    continue;
-                }
-                if let Some(keeper) = self.standing(&holder, &path) {
-                    verdict.keepers.push(keeper);
-                }
-                let mut next = path.clone();
-                next.push(holder.clone());
-                queue.push_back((holder, next));
-            }
-        }
-        verdict.normalize();
-        verdict
-    }
-
-    /// Later member `name`'s standing, judged from it alone: its pin
-    /// (readable or not, as the scan read it or a cloud host's check found
-    /// it), then alive (it runs, or can't be read), then within
-    /// `retention.keep` of its own stop. `None` for no standing: a
-    /// migrated member, whose records live in its copy, and a member whose
-    /// session directory is gone (removed earlier in the same run).
-    fn standing(&mut self, name: &str, path: &[String]) -> Option<RelationKeeper> {
-        let graph = self.graph;
-        let facts = graph.facts(name)?;
-        let gone = matches!(
-            fs::symlink_metadata(graph.base().join(name)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound
-        );
-        if gone {
-            return None;
-        }
-        let keeper = |standing, retention_passes_at, pin: PinFact| RelationKeeper {
-            keeper: name.to_string(),
-            standing,
-            retention_passes_at,
-            pin,
-            pin_source: facts.pin_source(),
-            path: path.to_vec(),
-        };
-        if facts.pin.is_pinned() {
-            return Some(keeper(Standing::Pin, None, facts.pin.clone()));
-        }
-        if graph.is_migrated(name) {
-            return None;
-        }
-        let state = self.state_of(name);
-        if state.alive {
-            return Some(keeper(Standing::Alive, None, PinFact::None));
-        }
-        let (stop, _) = state.stop?;
-        let passes = stop + self.settings.keep.value;
-        (passes > self.now)
-            .then(|| keeper(Standing::Retention, Some(iso8601_at(passes)), PinFact::None))
     }
 
     /// Whether session `name` is in the store and alive, by the same full

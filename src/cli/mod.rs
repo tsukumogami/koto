@@ -193,29 +193,6 @@ pub enum Command {
         #[arg(long = "dispatched-by", value_name = "NAME")]
         dispatched_by: Option<String>,
 
-        /// Record that this session continues session PRED, its
-        /// predecessor: a continues relation in the new, attached or
-        /// replacement session's own context, written before the command
-        /// reports the session, as `koto session link --continues` writes
-        /// it. The relation keeps PRED from every removal by rule while
-        /// this session, or a session continuing it, is pinned, alive or
-        /// within its own retention. PRED is checked before anything is
-        /// written: a name that fails the session-name rule or is this
-        /// session's own, a name with no session, an anchor or close
-        /// record, and, in this release, the cloud backend exit 2.
-        #[arg(long = "continues", value_name = "PRED")]
-        continues: Option<String>,
-
-        /// The workspace PRED lives in: its absolute path or its workspace
-        /// id (16 lowercase hex digits). Defaults to this session's own
-        /// workspace.
-        #[arg(
-            long = "continues-from",
-            value_name = "WORKSPACE",
-            requires = "continues"
-        )]
-        continues_from: Option<String>,
-
         /// Directory this session's commands run in (its execution
         /// anchor). Defaults to the directory `koto init` is run in,
         /// or to the parent session's anchor when `--parent` is given.
@@ -610,9 +587,7 @@ pub enum SessionCommand {
     /// Remove a session directory (idempotent).
     ///
     /// Removes the session even when the retention rule would keep it, and
-    /// names every other live member of its hierarchy in `live_members`,
-    /// and every later session continuing it that would have kept it in
-    /// `relation_keepers`. A pin still refuses it.
+    /// names every other live member of its hierarchy in `live_members`.
     Cleanup {
         /// Session name
         name: String,
@@ -633,12 +608,8 @@ pub enum SessionCommand {
     /// `koto session hierarchy`), its `chain/parent` context key is malformed
     /// (d), it is bound to a request leg still waiting (e), it is a
     /// coordinator's session (f), or, under the cloud backend, its remote
-    /// copy may be newer (g). A session a later session continues (`koto
-    /// session link --continues`) is kept while that session, or one
-    /// continuing it, is pinned, alive or within its own retention (r), with
-    /// `kept_by_relation` and `relation_keepers` naming each keeper. A
-    /// failed removal, or a sessions directory that can't be read, exits 3;
-    /// a malformed retention setting exits 2.
+    /// copy may be newer (g). A failed removal, or a sessions directory that
+    /// can't be read, exits 3; a malformed retention setting exits 2.
     ///
     /// `--migrated-from <workspace-path>` (cloud backend only) previews and
     /// removes instead the migration markers `koto session import` left
@@ -720,57 +691,22 @@ pub enum SessionCommand {
         intent: String,
     },
 
-    /// Record that another session dispatched this one, or that this one
-    /// continues another.
+    /// Record that another session dispatched this one.
     ///
-    /// With `--dispatched-by NAME`, writes a dispatched-by link,
-    /// `koto/links/dispatched-by/<NAME>`, into SESSION's own context and
-    /// nowhere else: the dispatcher is not written, and need not exist.
-    /// Meant to be run by the session's own driver when a dispatch had no
-    /// request leg to record it. A dispatcher name that fails the
-    /// session-name rule, or names SESSION itself, exits 2 and writes
-    /// nothing.
-    ///
-    /// With `--continues PRED`, records that SESSION continues PRED: the
-    /// relation `koto/links/continues/<PRED>`, in SESSION only, which keeps
-    /// PRED from every removal by rule while SESSION, or a session
-    /// continuing it, is pinned, alive or within its own retention. It
-    /// needs no anchor, authority, request leg or dispatcher, and grants no
-    /// authority. A session continues at most one predecessor. Exits 2 and
-    /// writes nothing for a name that fails the session-name rule or is
-    /// SESSION's own, a name with no session, an anchor or close record, a
-    /// SESSION already continuing another session, and, in this release,
-    /// the cloud backend.
-    ///
-    /// Recording a link the session already holds changes nothing and
-    /// exits 0. Exactly one of `--dispatched-by` and `--continues` is
-    /// required.
+    /// Writes a dispatched-by link, `koto/links/dispatched-by/<NAME>`, into
+    /// SESSION's own context and nowhere else: the dispatcher is not
+    /// written, and need not exist. Meant to be run by the session's own
+    /// driver when a dispatch had no request leg to record it. Recording a
+    /// link the session already holds changes nothing and exits 0. A
+    /// dispatcher name that fails the session-name rule, or names SESSION
+    /// itself, exits 2 and writes nothing.
     Link {
         /// The session to record the link in
         session: String,
 
         /// Name of the session that dispatched SESSION
-        #[arg(
-            long = "dispatched-by",
-            value_name = "NAME",
-            required_unless_present = "continues",
-            conflicts_with = "continues"
-        )]
-        dispatched_by: Option<String>,
-
-        /// Name of the session SESSION continues (its predecessor)
-        #[arg(long = "continues", value_name = "PRED")]
-        continues: Option<String>,
-
-        /// The workspace PRED lives in: its absolute path or its workspace
-        /// id (16 lowercase hex digits). Defaults to SESSION's own
-        /// workspace.
-        #[arg(
-            long = "continues-from",
-            value_name = "WORKSPACE",
-            requires = "continues"
-        )]
-        continues_from: Option<String>,
+        #[arg(long = "dispatched-by", value_name = "NAME")]
+        dispatched_by: String,
     },
 
     /// Pin a session so no removal by rule takes it.
@@ -831,11 +767,7 @@ pub enum SessionCommand {
     /// closes it by hand) or the release instant and when the retention
     /// passes, anything unreadable, every member with its kind, liveness,
     /// stop and the edge that joined it, and the three retention settings
-    /// with their origins. A session holding a continues relation shows
-    /// its `predecessor`, one a relation names shows its `successors`, and
-    /// one the relation keeps shows `relation_keepers`; the relation joins
-    /// no hierarchy, so none of these change the members. Reads the local
-    /// sessions directory only and
+    /// with their origins. Reads the local sessions directory only and
     /// writes nothing. A malformed retention setting exits 2 naming it; a
     /// sessions directory that can't be read exits 3.
     Hierarchy {
@@ -1691,8 +1623,6 @@ pub fn run(app: App) -> Result<()> {
             parent,
             intent,
             dispatched_by,
-            continues,
-            continues_from,
             execution_dir,
             legacy_environment,
         } => {
@@ -1748,19 +1678,6 @@ pub fn run(app: App) -> Result<()> {
             };
 
             let backend = build_backend()?;
-            // `--continues` is checked before anything is written, so a
-            // refused predecessor leaves no session behind (R3); the
-            // relation itself is written once the session exists, before
-            // the command reports it.
-            let continues = continues.as_deref().map(|pred| {
-                session::resolve_continues(&backend, &name, pred, continues_from.as_deref())
-                    .unwrap_or_else(|e| {
-                        exit_with_error_code(
-                            serde_json::json!({"error": e.message, "command": "init"}),
-                            e.exit,
-                        )
-                    })
-            });
             // Resolve `--execution-dir` once, before either init path:
             // a directory that does not resolve is a caller error, and
             // both paths record the canonical form.
@@ -1823,11 +1740,6 @@ pub fn run(app: App) -> Result<()> {
                     intent.as_deref(),
                     execution_dir.as_deref(),
                     legacy_environment,
-                    &|| {
-                        if let Some(target) = &continues {
-                            session::record_continues_at_init(&backend, &name, target);
-                        }
-                    },
                 )?;
                 // The inline path's helper sees the store only as a
                 // `SessionBackend`, so `--dispatched-by` is recorded here,
@@ -1856,7 +1768,6 @@ pub fn run(app: App) -> Result<()> {
                             vars: &vars,
                             intent: intent.as_deref(),
                             dispatched_by: dispatched_by.as_deref(),
-                            continues: continues.as_ref(),
                             execution_dir: execution_dir.as_deref(),
                             legacy_environment,
                         },
@@ -1873,7 +1784,6 @@ pub fn run(app: App) -> Result<()> {
                         execution_dir.as_deref(),
                         legacy_environment,
                         dispatched_by.as_deref(),
-                        continues.as_ref(),
                     )
                 };
                 // The agent session that ran this init holds the session
@@ -2048,7 +1958,7 @@ pub fn run(app: App) -> Result<()> {
                     // Query children before cleanup so the parent is still visible.
                     let children = query_children(&backend, &name);
                     // And judge the hierarchy while the session is still in it.
-                    let live = session::live_members(&backend, backend.local_base_dir(), &name);
+                    let live = session::live_members(backend.local_base_dir(), &name);
                     session::handle_cleanup(&backend, &name)?;
                     session::warn_live_members(&name, &live);
                     let mut out = serde_json::json!({
@@ -2059,9 +1969,6 @@ pub fn run(app: App) -> Result<()> {
                     });
                     if let Some(e) = live.error {
                         out["live_members_error"] = serde_json::json!(e);
-                    }
-                    for (k, v) in live.relation {
-                        out[k] = v;
                     }
                     println!("{}", serde_json::to_string(&out)?);
                     Ok(())
@@ -2127,20 +2034,7 @@ pub fn run(app: App) -> Result<()> {
                 SessionCommand::Link {
                     session,
                     dispatched_by,
-                    continues,
-                    continues_from,
-                } => match (dispatched_by, continues) {
-                    (Some(dispatched_by), None) => {
-                        session::handle_link(&backend, &session, &dispatched_by)
-                    }
-                    (None, Some(pred)) => session::handle_link_continues(
-                        &backend,
-                        &session,
-                        &pred,
-                        continues_from.as_deref(),
-                    ),
-                    _ => unreachable!("clap requires exactly one of the two"),
-                },
+                } => session::handle_link(&backend, &session, &dispatched_by),
                 SessionCommand::Anchor { action } => session_anchor::handle(&backend, action),
                 SessionCommand::Pin { name, reason } => {
                     session::handle_pin(&backend, &name, &reason)
@@ -2152,15 +2046,6 @@ pub fn run(app: App) -> Result<()> {
                     session::handle_hierarchy(&backend, &name, json)
                 }
                 SessionCommand::Rebind { name, to } => {
-                    if let Err(e) = session::rebind_guard(&backend, &name, to.as_deref()) {
-                        exit_with_error_code(
-                            serde_json::json!({
-                                "error": e.to_string(),
-                                "command": "session rebind"
-                            }),
-                            EXIT_CALLER_ERROR,
-                        );
-                    }
                     session::handle_rebind(&backend, &name, to.as_deref())
                 }
                 SessionCommand::Import {
@@ -2752,7 +2637,6 @@ fn handle_init(
     execution_dir: Option<&Path>,
     legacy_environment: bool,
     dispatched_by: Option<&str>,
-    continues: Option<&session::ContinuesTarget>,
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation.
     if let Err(msg) = crate::discover::validate_workflow_name(name) {
@@ -2886,11 +2770,6 @@ fn handle_init(
         record_default_intent(backend, name);
     }
 
-    // `--continues`, checked before anything was written: the relation, in
-    // the new session only, before the session is reported.
-    if let Some(target) = continues {
-        session::record_continues_at_init(backend, name, target);
-    }
     // `--dispatched-by`, validated before anything was written: a link in
     // the new session only.
     if let Some(dispatcher) = dispatched_by {
@@ -2941,10 +2820,6 @@ fn handle_init(
 /// - strict-validation / compile failure → exit 1; the message is the
 ///   compiler's verbatim error, which names the failing element (state /
 ///   transition / gate) rather than a generic "invalid template".
-///
-/// `created` runs once the session exists and before it is reported: the
-/// caller's `--continues` relation.
-#[allow(clippy::too_many_arguments)]
 fn handle_init_inline(
     backend: &dyn SessionBackend,
     name: &str,
@@ -2953,7 +2828,6 @@ fn handle_init_inline(
     intent: Option<&str>,
     execution_dir: Option<&Path>,
     legacy_environment: bool,
-    created: &dyn Fn(),
 ) -> Result<()> {
     // Validate workflow name before any filesystem operation. Guards
     // `<name>` against path traversal (no `/`, `..`, or `~`).
@@ -3029,9 +2903,6 @@ fn handle_init_inline(
     } else {
         record_default_intent(backend, name);
     }
-    // The caller's links (`--continues`), written before the session is
-    // reported.
-    created();
 
     // Recover the initial state for the `{ name, state }` stdout line,
     // identical to the file path.
@@ -4181,13 +4052,6 @@ fn terminal_retention(
         Some(base) => crate::session::hierarchy::edge_of(base, name),
         None => true,
     };
-    // A session with no local edge may still be continued by a session
-    // only the bucket holds: the bucket's answer about the continues
-    // relation is asked here, at the one point the tick would remove it
-    // (DESIGN-koto-session-continues.md, "Where the bucket answer meets
-    // `keeps`").
-    let has_edge = has_edge
-        || (!no_cleanup && crate::session::continues_bucket::bucket_keepers(backend, name).keeps());
     if has_edge {
         (Some(next_types::RetentionReason::Hierarchy), guard)
     } else if no_cleanup {
@@ -4222,42 +4086,11 @@ fn terminal_retention_report(
     } else {
         Vec::new()
     };
-    let relation = match reason {
-        Some(_) => terminal_relation(backend, name),
-        None => Default::default(),
-    };
     next_types::Retention {
         reason,
         pin,
-        relation,
         kept_children,
     }
-}
-
-/// The continues relation's report for a session a terminal tick keeps:
-/// `relation_keepers` (and `relation_unreadable`) when a later session
-/// continuing it has standing. Judged only when a continues link may name
-/// the session ([`crate::session::hierarchy::relation_probe`]), so a tick
-/// of a session no relation names reads no more than it did
-/// (DESIGN-koto-session-continues.md, Decision 5). A judgment that can't
-/// be made reports nothing: the session is kept either way.
-fn terminal_relation(
-    backend: &dyn SessionBackend,
-    name: &str,
-) -> serde_json::Map<String, serde_json::Value> {
-    use crate::session::hierarchy::{self, Graph, Judge, RetentionSettings};
-    let dir = backend.session_dir(name);
-    let Some(base) = dir.parent() else {
-        return Default::default();
-    };
-    if !hierarchy::relation_probe(base, name) {
-        return Default::default();
-    }
-    let (Ok(settings), Ok(graph)) = (RetentionSettings::load(), Graph::scan(base)) else {
-        return Default::default();
-    };
-    let related = Judge::new(&graph, settings, std::time::SystemTime::now()).relation(name);
-    hierarchy::relation_report_json(&related)
 }
 
 /// Promote a bound leg's result onto its request log.
@@ -8832,7 +8665,7 @@ fn handle_cancel(
     // Capture children before cleanup — once the session is removed the
     // relationship disappears from the backend listing. We still report
     // them so the caller has the same visibility regardless of --cleanup.
-    let live = cleanup.then(|| session::live_members(backend, sessions_base, name));
+    let live = cleanup.then(|| session::live_members(sessions_base, name));
     let cleaned = if cleanup {
         match crate::session::pin::remove_guarded(backend, name) {
             Ok(crate::session::pin::Removal::Kept(guard)) => {
@@ -8880,9 +8713,6 @@ fn handle_cancel(
         out["live_members"] = serde_json::json!(live.members);
         if let Some(e) = live.error {
             out["live_members_error"] = serde_json::json!(e);
-        }
-        for (k, v) in live.relation {
-            out[k] = v;
         }
     }
     println!("{}", serde_json::to_string(&out)?);
@@ -9296,7 +9126,6 @@ Done.
             None,
             None,
             false,
-            &|| {},
         )
         .expect("inline init");
 
@@ -9323,7 +9152,6 @@ Done.
             Some("My explicit intent"),
             None,
             false,
-            &|| {},
         )
         .expect("inline init");
 
@@ -9360,7 +9188,6 @@ Done.
             None,
             false,
             None,
-            None,
         )
         .expect("init should succeed");
 
@@ -9391,7 +9218,6 @@ Done.
             None,
             None,
             false,
-            None,
             None,
         )
         .expect("init should succeed");
@@ -9427,7 +9253,6 @@ Done.
             None,
             None,
             false,
-            &|| {},
         )
         .expect("inline init should succeed");
 
@@ -9480,7 +9305,6 @@ Done.
             None,
             None,
             false,
-            None,
             None,
         )
         .expect("init should succeed");

@@ -23,10 +23,6 @@
 //! [`FakeS3::hold`] holds one request's reply after handling it, so a test
 //! can stop the command waiting on it at that exact point.
 //!
-//! A PUT honours `If-Match` and `If-None-Match: *` as S3 does: when the
-//! stored object's ETag isn't the one named, or an object is there for
-//! `If-None-Match: *`, it answers 412 PreconditionFailed and stores nothing.
-//!
 //! Authentication is ignored. A missing object or bucket answers 404 with an
 //! S3 XML error body, as a real endpoint does. Each connection is read and
 //! answered in full on its own thread and then closed, so it holds up under
@@ -295,10 +291,6 @@ struct Incoming {
     query: Vec<(String, String)>,
     body: Vec<u8>,
     access_key: Option<String>,
-    /// The `If-Match` header, when the request carried one.
-    if_match: Option<String>,
-    /// The `If-None-Match` header, when the request carried one.
-    if_none_match: Option<String>,
 }
 
 fn read_request(stream: &TcpStream) -> Option<Incoming> {
@@ -311,8 +303,6 @@ fn read_request(stream: &TcpStream) -> Option<Incoming> {
 
     let mut content_length = 0usize;
     let mut access_key = None;
-    let mut if_match = None;
-    let mut if_none_match = None;
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).ok()? == 0 {
@@ -333,12 +323,6 @@ fn read_request(stream: &TcpStream) -> Option<Incoming> {
                     .and_then(|rest| rest.split('/').next())
                     .map(str::to_string);
             }
-            if name.trim().eq_ignore_ascii_case("if-match") {
-                if_match = Some(value.trim().to_string());
-            }
-            if name.trim().eq_ignore_ascii_case("if-none-match") {
-                if_none_match = Some(value.trim().to_string());
-            }
         }
     }
     let mut body = vec![0u8; content_length];
@@ -357,8 +341,6 @@ fn read_request(stream: &TcpStream) -> Option<Incoming> {
         query,
         body,
         access_key,
-        if_match,
-        if_none_match,
     })
 }
 
@@ -549,20 +531,6 @@ fn answer(req: &Incoming, bucket: &str, state: &Mutex<State>) -> Reply {
             },
         },
         "PUT" => {
-            let current = st.objects.get(&key).map(|bytes| etag(bytes));
-            let unquote = |t: &str| t.trim().trim_matches('"').to_string();
-            let failed = match (&req.if_match, &req.if_none_match) {
-                (Some(want), _) => current.as_deref().map(unquote) != Some(unquote(want)),
-                (None, Some(any)) if any.trim() == "*" => current.is_some(),
-                _ => false,
-            };
-            if failed {
-                return Reply::error(
-                    412,
-                    "PreconditionFailed",
-                    "At least one of the pre-conditions you specified did not hold",
-                );
-            }
             let tag = etag(&req.body);
             st.objects.insert(key, req.body.clone());
             Reply {

@@ -637,8 +637,6 @@ pub(crate) fn origin_record(
     Some(crate::engine::types::SessionOrigin {
         anchor: anchor?.to_path_buf(),
         store: backend.store_identity()?,
-        anchor_epoch: 0,
-        retired_anchors: Vec::new(),
     })
 }
 

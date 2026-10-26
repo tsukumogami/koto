@@ -150,10 +150,6 @@ koto's own reads of a session bound to another directory, such as an agent sessi
 
 Under the cloud backend, rebind pushes the rewritten header to the bucket along with its `execution_anchor_rebound` event. If that push fails, the rebind still succeeds locally and prints a warning to stderr; the session's next successful push carries the new anchor.
 
-Run the rebind from the new location (`koto session rebind <name>`), or from the session's own workspace with `--to <new location>`. From any other directory it refuses with `session_bound_elsewhere`, naming the directory the session is bound to and the exact command to run, because its push would land under a prefix neither workspace reads. Running it from the new location works even when every directory the session records is gone, as for a session whose old checkout was deleted.
-
-A rebind also fences the anchor it leaves. It raises the session's `origin.anchor_epoch` and lists the old anchor in `origin.retired_anchors`, and from then on a write to the session (an event, a header rewrite, a context key) refuses with `session_rebound` when it runs from the old anchor, or when its command read the session before the rebind. A process still working from the old checkout gets that error instead of writing a second history of the session. A rebind back to a retired anchor takes it off the list. A session with no origin record has no fence. An older koto ignores both fields, and reads such a header as before.
-
 ### Reading a session in another workspace
 
 A finished session is often the record of what a run did, and a later reader, say on a fresh checkout on another machine that shares the bucket, wants to read it without importing it. Name the workspace before the verb:
@@ -362,14 +358,6 @@ koto session resolve <name> --keep remote  # download the bucket's version
 
 `--keep local` uploads in one pass: it reads the bucket's manifest once and uploads only the context keys whose content the bucket doesn't already hold, several at a time, then the manifest, the state file and the version. The response's `elapsed_ms` says how long the session took.
 
-The state log is checked the same way on every sync. A pull replaces this host's log with the bucket's copy only when the copy holds every local event (or is another session's under the same name, which it replaces as before); a copy that lacks some, such as another directory's older copy, leaves the local log as it is. A push goes up only over the copy this host last synced (an `If-Match` on its ETag, or `If-None-Match: *` for a first push), and when that copy moved, only if the push holds every event the copy has. When the two sides each hold an event the other lacks, the command refuses and overwrites nothing:
-
-```
-session conflict: session 'review' has diverged between this host's log (14 events, 5210 bytes, last seq 14) and the bucket's copy at 3f9a1c0d2b4e6f81/review/koto-review.state.jsonl (14 events, 5198 bytes, last seq 14); the pull was refused. Nothing was overwritten. ...
-```
-
-Resolve it with `koto session resolve` as above, run from the session's directory. A push that refuses this way after an append leaves the event in this host's log, and the command exits non-zero.
-
 ## Config reference
 
 | Key | Variable | Description | Default | Project config |
@@ -399,8 +387,6 @@ Any S3-compatible storage works:
 | Backblaze B2 | `https://s3.<region>.backblazeb2.com` | |
 
 Set `session.cloud.endpoint` to your provider's S3-compatible URL.
-
-State pushes are conditional writes (`If-Match`, `If-None-Match`), which AWS S3, Cloudflare R2 and MinIO support. A provider that answers them with `501 Not Implemented` gets the push without the check and a warning on stderr, as before conditional pushes.
 
 ## Verifying sync
 
