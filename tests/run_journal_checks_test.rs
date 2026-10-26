@@ -1871,7 +1871,10 @@ fn a_chained_koto_next_waits_out_a_held_lock_once_not_once_per_batch() {
     let before_free = lines();
     let free = env.ok_in(&dir, &[&["next", "free"][..], &go].concat());
     let records = lines() - before_free;
-    assert_eq!(records, 5, "four state entries and one response");
+    assert_eq!(
+        records, 6,
+        "the evidence's field, four state entries and one response"
+    );
     let journal_before = std::fs::read_to_string(env.journal_path()).unwrap();
 
     let holder = hold_journal_lock(&env);
@@ -2176,12 +2179,15 @@ fn koto_next_gives_up_at_the_bound_behind_a_slow_rotation_that_still_finishes() 
     let fresh = env.journal();
     assert_eq!(
         kinds(&fresh),
-        vec!["state_entered", "response"],
+        vec!["evidence_field", "state_entered", "response"],
         "{fresh:#?}"
     );
     assert!(fresh.iter().all(|r| r["session"] == "slow"), "{fresh:#?}");
+    // The evidence's field belongs to the state it was submitted in; the
+    // records of the arrival name the state arrived at.
+    assert_eq!(fresh[0]["koto.state"], "wait", "{fresh:#?}");
     assert!(
-        fresh.iter().all(|r| r["koto.state"] == "start"),
+        fresh[1..].iter().all(|r| r["koto.state"] == "start"),
         "{fresh:#?}"
     );
 }

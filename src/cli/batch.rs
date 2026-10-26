@@ -4478,6 +4478,7 @@ mod tests {
                 fields,
                 submitter_cwd: None,
                 source: None,
+                exported_fields: None,
             },
             idempotency_hash: None,
         }
@@ -5267,6 +5268,7 @@ mod tests {
                     )]),
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -5436,6 +5438,7 @@ mod tests {
                     )]),
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -5706,6 +5709,7 @@ mod tests {
                     )]),
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -5829,6 +5833,7 @@ mod tests {
                     )]),
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -5953,6 +5958,7 @@ mod tests {
                     )]),
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
                 "2026-01-01T00:00:01Z",
             )
@@ -6776,6 +6782,7 @@ mod tests {
                 fields: HashMap::new(),
                 submitter_cwd: cwd.map(PathBuf::from),
                 source: source.map(str::to_string),
+                exported_fields: None,
             },
             idempotency_hash: None,
         };

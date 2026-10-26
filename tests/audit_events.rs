@@ -36,6 +36,7 @@ fn evidence_event(seq: u64, fields: HashMap<String, serde_json::Value>) -> Event
         fields,
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     };
     Event {
         seq,

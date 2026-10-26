@@ -809,7 +809,42 @@ pub struct CheckEventFields {
     /// Wall-clock run time of the check's command, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Why a judged check didn't pass, one of [`CHECK_REASONS`]: written on
+    /// every evaluation whose outcome is neither `passed` nor `pending`.
+    /// Telemetry only; nothing routes on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The check said its input wasn't ready to judge: it printed a
+    /// `::koto-not-ready::` line, or exited with a code its gate lists in
+    /// `not_ready_exit_codes`. Telemetry only: the outcome, routing and
+    /// fallback finding are the same either way.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub not_ready: bool,
+    /// `findings` holds koto's fallback finding. The fallback is written
+    /// only when the check printed no `error` finding of its own, so it is
+    /// then the one `error` finding whose rule id is the check's name.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fallback_logged: bool,
 }
+
+/// The values a check event's `reason` takes:
+///
+/// - `rule_failed`: the check printed at least one `error` finding of its
+///   own (a decider check's failed criterion counts).
+/// - `undecided`: it exited 2 with no `error` finding of its own.
+/// - `no_finding`: any other failure with no `error` finding of its own.
+/// - `timed_out`: the command, or a polling gate's window, ran out of time.
+/// - `spawn_failed`: the command could not be started.
+/// - `error`: anything else that kept the check from answering, such as a
+///   failed wait or a decider check's error.
+pub const CHECK_REASONS: &[&str] = &[
+    "rule_failed",
+    "undecided",
+    "no_finding",
+    "timed_out",
+    "spawn_failed",
+    "error",
+];
 
 impl CheckEventFields {
     /// Read the fields out of a raw event payload, keeping each one that
@@ -837,6 +872,9 @@ impl CheckEventFields {
             rule_counts: field(payload, "rule_counts"),
             rule_counts_truncated: field(payload, "rule_counts_truncated").unwrap_or(false),
             duration_ms: field(payload, "duration_ms"),
+            reason: field(payload, "reason"),
+            not_ready: field(payload, "not_ready").unwrap_or(false),
+            fallback_logged: field(payload, "fallback_logged").unwrap_or(false),
         }
     }
 }
@@ -1046,6 +1084,20 @@ pub enum EventPayload {
         /// serializes byte-identically to logs written before it existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+        /// The submission's enum and boolean fields as telemetry may carry
+        /// them, keyed by field name: an enum field's value when the state's
+        /// `accepts` block declares it (as its digest when it doesn't fit
+        /// the run journal's name shape), `other` when it doesn't, and a
+        /// boolean as `true` or `false`. String and number fields, and
+        /// fields the submission left out, have no entry. Written by
+        /// `koto next --with-data`, which has the compiled template; the
+        /// run journal relays one `evidence_field` record per entry.
+        ///
+        /// Additive field: omitted when `None`, so evidence written before
+        /// it existed, and evidence koto writes itself, serializes as
+        /// before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exported_fields: Option<BTreeMap<String, String>>,
     },
     IntegrationInvoked {
         state: String,
@@ -1621,9 +1673,19 @@ pub enum EventPayload {
     /// recorded at most once per tenth of the idle period. Additive, and
     /// degrades like `anchor_started`.
     AnchorActivity(AnchorActivity),
+    /// A `koto next` response printed a non-terminal state's directive.
+    /// Appended after the response prints, on every such response.
     InstructionsDelivered {
-        /// The phase whose instructions the response carried.
+        /// The phase whose directive the response carried.
         state: String,
+        /// Whether the response also carried the phase's `details`. Only an
+        /// event whose value is `true`, or absent (every event written before
+        /// the field existed, when the event was appended only for a
+        /// response with details), counts as a delivery of the details.
+        ///
+        /// Additive field: omitted when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details_included: Option<bool>,
     },
     /// Catch-all for event type strings not recognized by this koto version.
     ///
@@ -2130,6 +2192,11 @@ impl<'de> Deserialize<'de> for Event {
                         .as_ref()
                         .and_then(|v| v.as_str())
                         .map(str::to_string),
+                    // Lenient like `source`: a map that doesn't read as
+                    // strings is absent rather than failing the log.
+                    exported_fields: p
+                        .exported_fields
+                        .and_then(|v| serde_json::from_value(v).ok()),
                 }
             }
             "directed_transition" => {
@@ -2501,7 +2568,10 @@ impl<'de> Deserialize<'de> for Event {
             "instructions_delivered" => {
                 let p: InstructionsDeliveredPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
-                EventPayload::InstructionsDelivered { state: p.state }
+                EventPayload::InstructionsDelivered {
+                    state: p.state,
+                    details_included: p.details_included,
+                }
             }
             other => EventPayload::Unknown {
                 type_name: other.to_string(),
@@ -2558,6 +2628,8 @@ struct EvidenceSubmittedPayload {
     submitter_cwd: Option<PathBuf>,
     #[serde(default)]
     source: Option<serde_json::Value>,
+    #[serde(default)]
+    exported_fields: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -2633,6 +2705,8 @@ fn lenient_string(v: Option<serde_json::Value>) -> Option<String> {
 #[derive(Deserialize)]
 struct InstructionsDeliveredPayload {
     state: String,
+    #[serde(default)]
+    details_included: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -3701,6 +3775,7 @@ mod tests {
                 },
                 submitter_cwd: Some(PathBuf::from("/work/repo")),
                 source: None,
+                exported_fields: None,
             },
             idempotency_hash: None,
         };
@@ -3840,6 +3915,7 @@ mod tests {
                 fields,
                 submitter_cwd: None,
                 source: source.map(str::to_string),
+                exported_fields: None,
             },
             idempotency_hash: None,
         }
@@ -5307,6 +5383,7 @@ mod tests {
             },
             EventPayload::InstructionsDelivered {
                 state: "implement".to_string(),
+                details_included: None,
             },
         ] {
             let e = Event {
@@ -5330,6 +5407,7 @@ mod tests {
             event_type: "instructions_delivered".to_string(),
             payload: EventPayload::InstructionsDelivered {
                 state: "implement".to_string(),
+                details_included: None,
             },
             idempotency_hash: None,
         };

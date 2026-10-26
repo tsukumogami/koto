@@ -340,6 +340,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let output = to_mermaid(&t);
@@ -384,6 +385,7 @@ mod tests {
                             expect: None,
                             poll: None,
                             decider_check: None,
+                            not_ready_exit_codes: Vec::new(),
                         },
                     );
                     g

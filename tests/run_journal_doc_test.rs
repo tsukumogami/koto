@@ -107,6 +107,7 @@ fn every_kind_the_reference_names_is_one_koto_writes_and_the_reverse() {
             "decider_fallback",
             "decider_field",
             "driver_seen",
+            "evidence_field",
             "response",
             "rule_delivered",
             "session_started",

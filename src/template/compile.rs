@@ -510,6 +510,10 @@ struct SourceGate {
     unit_document: Option<serde_yaml_ng::Value>,
     #[serde(default)]
     unit_section: Option<serde_yaml_ng::Value>,
+    /// A `command` gate's "not ready" exit codes. The compiled-template
+    /// validator checks the gate type and the range.
+    #[serde(default)]
+    not_ready_exit_codes: Vec<i32>,
     /// Every key the fields above don't name. `SourceState` uses
     /// `deny_unknown_fields`, but serde's error for it surfaces only as the
     /// outer "failed to parse front-matter" context, which names neither the
@@ -556,6 +560,7 @@ const SOURCE_GATE_KEYS: &[&str] = &[
     "max_units",
     "unit_document",
     "unit_section",
+    "not_ready_exit_codes",
 ];
 
 /// The keys a decider-check criterion may carry.
@@ -993,6 +998,14 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
             gate_name
         ));
     }
+    if !source.not_ready_exit_codes.is_empty() && source.gate_type != GATE_TYPE_COMMAND {
+        return Err(anyhow!(
+            "state {:?} gate {:?}: not_ready_exit_codes is only allowed on a command gate, not on {:?}",
+            state_name,
+            gate_name,
+            source.gate_type
+        ));
+    }
     if source.gate_type == GATE_TYPE_DECIDER_CHECK {
         return compile_decider_check(state_name, gate_name, source, overridable);
     }
@@ -1055,6 +1068,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                     pending_exit_code: p.pending_exit_code.unwrap_or(DEFAULT_PENDING_EXIT_CODE),
                 }),
                 decider_check: None,
+                not_ready_exit_codes: source.not_ready_exit_codes.clone(),
             })
         }
         GATE_TYPE_CONTEXT_EXISTS => {
@@ -1080,6 +1094,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             })
         }
         GATE_TYPE_CONTEXT_MATCHES => {
@@ -1112,6 +1127,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             })
         }
         GATE_TYPE_CHILDREN_COMPLETE => {
@@ -1153,6 +1169,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             })
         }
         GATE_TYPE_REQUEST_LEG => {
@@ -1175,6 +1192,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
                 expect,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             };
             super::types::validate_request_leg_gate(state_name, gate_name, &gate)
                 .map_err(|e| anyhow!(e))?;
@@ -1480,6 +1498,7 @@ fn compile_decider_check(
             unit_document,
             unit_section,
         }),
+        not_ready_exit_codes: Vec::new(),
     })
 }
 
@@ -3598,6 +3617,63 @@ Done.
     }
 
     const CMD: &str = "        command: ./ci-status.sh\n";
+
+    fn not_ready_template(gate_type: &str, gate_body: &str) -> String {
+        assignment_template(
+            &format!("    gates:\n      ci:\n        type: {gate_type}\n{gate_body}"),
+            "      - target: done\n        when:\n          gates.ci.exit_code: 0",
+        )
+    }
+
+    #[test]
+    fn not_ready_exit_codes_compile_onto_a_command_gate_and_are_omitted_when_absent() {
+        let src = not_ready_template(
+            "command",
+            &format!("{CMD}        not_ready_exit_codes: [2, 4]\n"),
+        );
+        let compiled = compile_src(&src).unwrap();
+        let gate = compiled
+            .states
+            .values()
+            .find_map(|s| s.gates.get("ci"))
+            .unwrap();
+        assert_eq!(gate.not_ready_exit_codes, vec![2, 4]);
+
+        let plain = compile_src(&not_ready_template("command", CMD)).unwrap();
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("not_ready_exit_codes"), "{json}");
+    }
+
+    #[test]
+    fn not_ready_exit_codes_are_refused_off_a_command_gate_and_out_of_range() {
+        let cases = [
+            (
+                not_ready_template(
+                    "context-exists",
+                    "        key: notes\n        not_ready_exit_codes: [2]\n",
+                ),
+                "not_ready_exit_codes is only allowed on a command gate",
+            ),
+            (
+                not_ready_template(
+                    "command",
+                    &format!("{CMD}        not_ready_exit_codes: [0]\n"),
+                ),
+                "must hold exit codes between 1 and 255, found 0",
+            ),
+            (
+                not_ready_template(
+                    "command",
+                    &format!("{CMD}        not_ready_exit_codes: [2, 256]\n"),
+                ),
+                "must hold exit codes between 1 and 255, found 256",
+            ),
+        ];
+        for (src, want) in cases {
+            let err = format!("{:#}", compile_src(&src).unwrap_err());
+            assert!(err.contains(want), "want {want:?} in {err}");
+        }
+    }
 
     #[test]
     fn poll_compiles_onto_a_command_gate_with_defaults_filled() {

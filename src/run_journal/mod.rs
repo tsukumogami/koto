@@ -55,23 +55,34 @@
 //!   `default_action_executed` (check `__action__`), with the outcome,
 //!   attempt numbers, rule count, logged finding count (and whether the
 //!   findings were cut) and run time; a decider check's also carries its
-//!   awaiting and agent-answered criterion counts.
+//!   awaiting and agent-answered criterion counts. When the outcome isn't
+//!   `passed` it carries `koto.check.reason`, why (see `CHECK_REASONS`),
+//!   and every one carries `koto.check.not_ready` (the check said its input
+//!   wasn't ready) and `koto.check.pre_directive` (no `koto next` had
+//!   printed the state's directive in the visit yet; see [`pre_directive`]).
 //! - `check_rule`: one per key of that event's `rule_counts`, after its
 //!   `check_evaluated`, with the rule's visit and session counts. A rule id
 //!   outside the name shape is written as its digest ([`name_or_digest`]).
 //! - `check_finding`: one per distinct (rule id, level) among that event's
 //!   logged findings, passing or failing, after its `check_rule` records,
-//!   with the gate as `koto.check.name` and how many findings had the pair
-//!   (see [`with_findings`]).
+//!   with the gate as `koto.check.name`, how many findings had the pair
+//!   (see [`with_findings`]) and `koto.finding.source`: `check` when the
+//!   check printed them, `fallback` for the finding koto wrote.
 //! - `check_pending`: one per pending `gate_evaluated` of a polling gate or
 //!   of a decider check waiting on the agent, never an outcome. A polling
 //!   gate's carries the poll's run count and elapsed seconds; a decider
 //!   check's carries the two criterion counts instead.
 //!
-//! Nine more are relayed the same way, with the same two sequence
+//! Ten more are relayed the same way, with the same two sequence
 //! numbers, from decider, evidence, override, dispute and rule-delivery
 //! events:
 //!
+//! - `evidence_field`: one per entry of an agent's `evidence_submitted`
+//!   `exported_fields`, with the state, the field's name as
+//!   `koto.evidence.field` and its value as `koto.evidence.value`: a value
+//!   the state's `accepts` declares for an enum field (or its digest),
+//!   `other` for one it doesn't, or `true` or `false` for a boolean. String
+//!   and number fields are never relayed (see [`exported_fields`]).
 //! - `decider_consulted`: one per `decider_consulted` event, with the
 //!   provider, model, outcome, token counts and timings, the field count,
 //!   an `input_unavailable` consultation's reason and its input's label
@@ -173,9 +184,9 @@
 //!   `default_action_executed`, and the decider and override kinds for
 //!   `decider_consulted`, `decider_checked`, `decider_fallback`,
 //!   `decider_check_answered`, `gate_override_recorded`,
-//!   `finding_disputed` and `rule_delivered`, and `decider_answered` for an
-//!   agent's
-//!   `evidence_submitted` that answers a consultation.
+//!   `finding_disputed` and `rule_delivered`, `evidence_field` for an
+//!   agent's `evidence_submitted` that carries `exported_fields`, and
+//!   `decider_answered` for one that answers a consultation.
 //!   A commit that ends a visit (an arrival, a rewind, a cancel, or the
 //!   terminal tick's `request_store.result`) writes the visit's
 //!   `context_reads` just before its own record. A `context_read` an
@@ -387,13 +398,18 @@ impl Record {
         self
     }
 
-    /// Whether this is one of the five identity kinds, which are flushed to
-    /// disk with the batch that carries them.
-    fn is_identity(&self) -> bool {
+    /// The record's kind.
+    fn kind(&self) -> &str {
         self.fields
             .first()
             .and_then(|(_, kind)| kind.as_str())
-            .is_some_and(|kind| IDENTITY_KINDS.contains(&kind))
+            .unwrap_or_default()
+    }
+
+    /// Whether this is one of the five identity kinds, which are flushed to
+    /// disk with the batch that carries them.
+    fn is_identity(&self) -> bool {
+        IDENTITY_KINDS.contains(&self.kind())
     }
 
     fn to_line(&self) -> String {
@@ -742,6 +758,10 @@ fn relays(payload: &EventPayload) -> bool {
             | EventPayload::GateOverrideRecorded { .. }
             | EventPayload::FindingDisputed(_)
             | EventPayload::RuleDelivered(_)
+            | EventPayload::EvidenceSubmitted {
+                exported_fields: Some(_),
+                ..
+            }
     )
 }
 
@@ -773,6 +793,18 @@ const FINDING_LEVEL_FIELD: &str = "koto.finding.level";
 const FINDING_PAIR_COUNT_FIELD: &str = "koto.finding.count";
 /// On `check_disputed`: who disputed the finding.
 const DISPUTE_SOURCE_FIELD: &str = "koto.dispute.source";
+/// On `check_finding`: `check` when the check printed the findings,
+/// `fallback` when koto wrote its fallback finding.
+const FINDING_SOURCE_FIELD: &str = "koto.finding.source";
+/// On `check_evaluated` whose outcome isn't `passed`: why, one of
+/// [`CHECK_REASONS`](crate::engine::types::CHECK_REASONS).
+const CHECK_REASON_FIELD: &str = "koto.check.reason";
+/// On every `check_evaluated`: whether the check said its input wasn't
+/// ready to judge.
+const CHECK_NOT_READY_FIELD: &str = "koto.check.not_ready";
+/// On every `check_evaluated`: whether the check ran before any `koto next`
+/// had printed the state's directive in the current visit.
+const CHECK_PRE_DIRECTIVE_FIELD: &str = "koto.check.pre_directive";
 /// The most `check_finding` records one evaluation writes.
 const MAX_FINDING_RECORDS: usize = 50;
 
@@ -971,6 +1003,11 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
         // The reason stays in the log. The attempt numbers are the disputed
         // evaluation's, which the event carries, so a reader joins the
         // dispute to exactly that `check_evaluated`.
+        EventPayload::EvidenceSubmitted {
+            state,
+            exported_fields: Some(exported),
+            ..
+        } => evidence_fields(relay, state, exported),
         EventPayload::FindingDisputed(d) => vec![relay
             .record(CHECK_DISPUTED)
             .name("koto.state", Some(d.state.as_str()))
@@ -1191,6 +1228,67 @@ fn agent_answer(submitted: &Value, fc: &crate::decider::FieldConsultation) -> St
         .map_or(OTHER_ANSWER.to_string(), |v| name_or_digest(&v))
 }
 
+/// The `exported_fields` map an agent's evidence submission carries: for
+/// each enum or boolean field `accepts` declares and `submitted` includes,
+/// the value telemetry may carry. An enum value is the declared value
+/// (digested like a rule id when outside the name shape) when `accepts`
+/// declares it, and `other` when it doesn't, the rule
+/// `koto.decider.agent_answer` follows; a boolean is `true` or `false`.
+/// String, number and task-list fields, fields `accepts` doesn't declare,
+/// and fields left out of the submission have no entry. `None` when no
+/// entry is left, so such a submission is logged exactly as before.
+pub(crate) fn exported_fields(
+    accepts: &std::collections::BTreeMap<String, crate::template::types::FieldSchema>,
+    submitted: &serde_json::Map<String, Value>,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for (field, schema) in accepts {
+        let Some(value) = submitted.get(field) else {
+            continue;
+        };
+        let exported = match schema.field_type.as_str() {
+            "enum" => match value {
+                Value::String(v) if schema.values.iter().any(|d| d == v) => name_or_digest(v),
+                _ => OTHER_ANSWER.to_string(),
+            },
+            "boolean" => match value {
+                Value::Bool(b) => b.to_string(),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        out.insert(field.clone(), exported);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// One record per entry of an agent's evidence submission's
+/// `exported_fields` (see [`exported_fields`]).
+const EVIDENCE_FIELD: &str = "evidence_field";
+
+/// The `evidence_field` records of an evidence submission: one per entry of
+/// its `exported_fields`, in field-name order, each with the state, the
+/// field's name (digested like a rule id when outside the name shape) and
+/// the exported value. The value is checked again here, so only the name
+/// shape (or its digest) ever reaches the journal. Nothing else of the
+/// submission is copied.
+fn evidence_fields(
+    relay: &Relay<'_>,
+    state: &str,
+    exported: &std::collections::BTreeMap<String, String>,
+) -> Vec<Record> {
+    exported
+        .iter()
+        .map(|(field, value)| {
+            relay
+                .record(EVIDENCE_FIELD)
+                .name("koto.state", Some(state))
+                .name("koto.evidence.field", Some(name_or_digest(field).as_str()))
+                .name("koto.evidence.value", Some(name_or_digest(value).as_str()))
+        })
+        .collect()
+}
+
 /// A `decider_checked` record: one decider-check criterion's verdict, under
 /// its gate as `koto.check` and its id (or the id's digest) as
 /// `koto.rule.id`, with its unit for a unit-mode check (see [`with_unit`]).
@@ -1275,7 +1373,16 @@ fn check_evaluated(
     if check.findings_truncated {
         record = record.flag(FINDINGS_TRUNCATED_FIELD, true);
     }
-    record.int("koto.check.duration_ms", check.duration_ms)
+    // The reason is koto's own word from a closed set, written only when
+    // the check didn't pass; anything else the log holds is left out.
+    let reason = check
+        .reason
+        .as_deref()
+        .filter(|r| outcome != "passed" && crate::engine::types::CHECK_REASONS.contains(r));
+    record
+        .int("koto.check.duration_ms", check.duration_ms)
+        .name(CHECK_REASON_FIELD, reason)
+        .flag(CHECK_NOT_READY_FIELD, check.not_ready)
 }
 
 /// `evaluated`, followed by one `check_rule` per error rule.
@@ -1343,8 +1450,68 @@ fn with_findings(
                 .name("koto.rule.id", Some(name_or_digest(rule_id).as_str()))
                 .name(FINDING_LEVEL_FIELD, Some(level.as_str()))
                 .int(FINDING_PAIR_COUNT_FIELD, Some(count))
+                .name(
+                    FINDING_SOURCE_FIELD,
+                    Some(finding_source(check, check_name, rule_id, level)),
+                )
         })
         .collect()
+}
+
+/// Who wrote the findings of one (rule id, level) pair: `fallback` for
+/// koto's fallback finding, `check` for every finding the check printed. A
+/// fallback is written only when the check printed no `error` finding, so
+/// when the event logged one it is the only `error` finding named after the
+/// check, and no finding the check printed shares its pair.
+fn finding_source(
+    check: &CheckEventFields,
+    check_name: &str,
+    rule_id: &str,
+    level: &crate::findings::FindingLevel,
+) -> &'static str {
+    let fallback = check.fallback_logged
+        && *level == crate::findings::FindingLevel::Error
+        && rule_id == check_name;
+    if fallback {
+        "fallback"
+    } else {
+        "check"
+    }
+}
+
+/// Whether the check event `payload` ran before the state's directive was
+/// shown in its visit: `prior_log` (the log before the event) holds no
+/// `instructions_delivered` for the event's state after `visit_seq`, the
+/// event that opened the visit. Every printed directive appends one, so
+/// this is true on arrival in the same invocation, on the first tick after
+/// `koto init` (which prints none), and after a rewind or a loop back, each
+/// of which opens a visit with no directive shown yet. `None` for a payload
+/// that isn't a check event.
+fn pre_directive(payload: &EventPayload, prior_log: &str, visit_seq: Option<u64>) -> Option<bool> {
+    let state = match payload {
+        EventPayload::GateEvaluated { state, .. }
+        | EventPayload::DefaultActionExecuted { state, .. } => state,
+        _ => return None,
+    };
+    #[derive(serde::Deserialize)]
+    struct Delivered {
+        seq: u64,
+        #[serde(rename = "type")]
+        event_type: String,
+        payload: DeliveredState,
+    }
+    #[derive(serde::Deserialize)]
+    struct DeliveredState {
+        state: String,
+    }
+    let shown = prior_log
+        .lines()
+        .rev()
+        .filter(|line| line.contains("\"instructions_delivered\""))
+        .filter_map(|line| serde_json::from_str::<Delivered>(line.trim()).ok())
+        .take_while(|d| visit_seq.is_none_or(|v| d.seq > v))
+        .any(|d| d.event_type == "instructions_delivered" && d.payload.state == *state);
+    Some(!shown)
 }
 
 fn session_started(
@@ -1569,7 +1736,16 @@ pub(crate) fn after_commit(
             seq: commit.seq,
             visit_seq: commit.visit_seq_for(payload),
         };
-        records.extend(relayed(payload, &relay));
+        let mut relayed_records = relayed(payload, &relay);
+        if let Some(pre) = pre_directive(payload, &commit.prior_log, relay.visit_seq) {
+            for r in relayed_records
+                .iter_mut()
+                .filter(|r| r.kind() == "check_evaluated")
+            {
+                r.fields.push((CHECK_PRE_DIRECTIVE_FIELD, Value::from(pre)));
+            }
+        }
+        records.extend(relayed_records);
         records.extend(paired(payload, &relay, &commit.prior_log));
     }
     write(root, &records);

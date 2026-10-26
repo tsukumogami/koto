@@ -385,6 +385,14 @@ pub struct Gate {
     /// without it keeps its template hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decider_check: Option<super::decider_check::DeciderCheckSpec>,
+    /// Exit codes of a `command` gate that mean "my input wasn't ready to
+    /// judge". An evaluation that exits with one is logged as not ready, the
+    /// same as one whose command printed a `::koto-not-ready::` line. It is
+    /// telemetry only: the outcome, routing and fallback finding stay as
+    /// they are. Empty on every other gate, and omitted from the compiled
+    /// JSON when empty, so a template without it keeps its template hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_ready_exit_codes: Vec<i32>,
 }
 
 /// How koto re-evaluates a polling command gate.
@@ -594,6 +602,38 @@ fn validate_poll_gates(state_name: &str, state: &TemplateState) -> Result<(), St
     Ok(())
 }
 
+/// Validate every gate's `not_ready_exit_codes` on one state: allowed on a
+/// `command` gate only, each code a real exit status (1 to 255; 0 is a
+/// pass, and a gate that passed was judged).
+fn validate_not_ready_exit_codes(state_name: &str, state: &TemplateState) -> Result<(), String> {
+    for (gate_name, gate) in &state.gates {
+        if gate.not_ready_exit_codes.is_empty() {
+            continue;
+        }
+        let at = format!(
+            "state {:?} gate {:?}: not_ready_exit_codes",
+            state_name, gate_name
+        );
+        if gate.gate_type != GATE_TYPE_COMMAND {
+            return Err(format!(
+                "{at} is only allowed on a command gate, not on {:?}",
+                gate.gate_type
+            ));
+        }
+        if let Some(code) = gate
+            .not_ready_exit_codes
+            .iter()
+            .find(|c| !(1..=255).contains(*c))
+        {
+            return Err(format!(
+                "{at} must hold exit codes between 1 and 255, found {}",
+                code
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `EX_TEMPFAIL`: the conventional "try again later" status.
 pub const DEFAULT_PENDING_EXIT_CODE: i32 = 75;
 
@@ -654,6 +694,8 @@ impl Gate {
             // reads as its question, never substituted: only its `command`
             // is.
             decider_check: _,
+            // Exit codes are numbers only; they carry no references.
+            not_ready_exit_codes: _,
         } = self;
         let mut fields = vec![
             ("command", command.as_str()),
@@ -1771,6 +1813,7 @@ impl CompiledTemplate {
 
             self.validate_clear_on_entry(state_name, state)?;
             validate_poll_gates(state_name, state)?;
+            validate_not_ready_exit_codes(state_name, state)?;
 
             // Validate a declared terminal result map.
             if let Some(result) = &state.result {
@@ -3661,6 +3704,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3689,6 +3733,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -3718,6 +3763,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when = BTreeMap::new();
@@ -3812,6 +3858,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when = BTreeMap::new();
@@ -3849,6 +3896,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -4359,6 +4407,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         t.validate(false).unwrap();
@@ -4417,6 +4466,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4459,6 +4509,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         t.validate(false).unwrap();
@@ -4485,6 +4536,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4518,6 +4570,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         t.validate(false).unwrap();
@@ -4553,6 +4606,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4700,6 +4754,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4731,6 +4786,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4782,6 +4838,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let err = t.validate(true).unwrap_err();
@@ -4817,6 +4874,7 @@ mod tests {
                     expect: None,
                     poll: None,
                     decider_check: None,
+                    not_ready_exit_codes: Vec::new(),
                 },
             );
             let err = t.validate(true).unwrap_err();
@@ -4863,6 +4921,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         state.transitions = vec![Transition {
@@ -5283,6 +5342,7 @@ command: "./check.sh"
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         }
     }
 
@@ -5302,6 +5362,7 @@ command: "./check.sh"
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         }
     }
 
@@ -5321,6 +5382,7 @@ command: "./check.sh"
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         }
     }
 
@@ -5514,6 +5576,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         t
@@ -5652,6 +5715,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when = BTreeMap::new();
@@ -5689,6 +5753,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when = BTreeMap::new();
@@ -5761,6 +5826,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when_pass = BTreeMap::new();
@@ -5945,6 +6011,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when_a = BTreeMap::new();
@@ -6010,6 +6077,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut accepts = BTreeMap::new();
@@ -6070,6 +6138,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         // Dead-end transitions (would trigger D4 if D2 didn't block first).
@@ -6169,6 +6238,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         t
@@ -6476,6 +6546,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();
@@ -6665,6 +6736,7 @@ command: "./check.sh"
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let mut when: BTreeMap<String, serde_json::Value> = BTreeMap::new();

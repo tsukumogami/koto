@@ -81,13 +81,14 @@ their digest (see
 | `terminal` | `koto.terminal` | The session arrives at a terminal state. |
 | `cancelled` | none | The session is cancelled. |
 | `driver_seen` | `koto.driver.session.id` | A command runs under a driving session other than the last one recorded for it. |
-| `check_evaluated` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.check.outcome`, `koto.attempt`, `koto.visit_attempt`, `koto.check.rule_count`, `koto.check.rule_counts_truncated`, `koto.check.finding_count`, `koto.check.findings_truncated`, `koto.check.duration_ms`, `koto.poll.status`, `koto.check.unanswered_count`, `koto.check.error`, `koto.decider.awaiting_count`, `koto.decider.agent_answered_count` | koto evaluates a gate and the result isn't pending, or runs a state's default action. |
+| `check_evaluated` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.check.outcome`, `koto.attempt`, `koto.visit_attempt`, `koto.check.rule_count`, `koto.check.rule_counts_truncated`, `koto.check.finding_count`, `koto.check.findings_truncated`, `koto.check.duration_ms`, `koto.poll.status`, `koto.check.unanswered_count`, `koto.check.error`, `koto.decider.awaiting_count`, `koto.decider.agent_answered_count`, `koto.check.reason`, `koto.check.not_ready`, `koto.check.pre_directive` | koto evaluates a gate and the result isn't pending, or runs a state's default action. |
 | `check_rule` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.rule.visit_count`, `koto.rule.session_count` | Once for each error rule of a check evaluation, after its `check_evaluated`. |
-| `check_finding` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check.name`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.finding.level`, `koto.finding.count` | Once for each distinct rule id and level among a check evaluation's logged findings, passing or failing, after its `check_rule` records. |
+| `check_finding` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check.name`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.finding.level`, `koto.finding.count`, `koto.finding.source` | Once for each distinct rule id and level among a check evaluation's logged findings, passing or failing, after its `check_rule` records. |
 | `check_pending` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.poll.status`, `koto.poll.evaluations`, `koto.poll.elapsed_secs`, `koto.decider.awaiting_count`, `koto.decider.agent_answered_count` | A polling gate's evaluation is still pending, or a decider check is waiting on the agent. |
 | `check_disputed` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check.name`, `koto.attempt`, `koto.visit_attempt`, `koto.rule.id`, `koto.dispute.source` | `koto disputes record` records a dispute of a rule's finding at a gate. |
 | `decider_consulted` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.outcome`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.latency_ms`, `koto.decider.directive_bytes`, `koto.decider.reason`, `koto.decider.input_label`, `koto.decider.input_bytes`, `koto.decider.field_count`, `koto.decider.field`, `koto.decider.answer`, `koto.decider.mode`, `koto.decider.threshold_met` | koto consults the decider about a state's evidence. |
 | `decider_field` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.decider.consulted_seq`, `koto.decider.field`, `koto.decider.answer`, `koto.decider.mode`, `koto.decider.threshold_met` | Once for each field of a consultation that asked about more than one, after its `decider_consulted`. |
+| `evidence_field` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.evidence.field`, `koto.evidence.value` | Once for each enum or boolean field of the agent's evidence submission (see [Evidence fields](#evidence-fields)). |
 | `decider_answered` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.decider.field`, `koto.decider.agent_answer`, `koto.decider.consulted_seq` | The agent submits evidence for a field the decider was consulted about and didn't decide. |
 | `decider_checked` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.unit.key`, `koto.unit.document`, `koto.unit.section`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.mode`, `koto.decider.outcome`, `koto.decider.confidence_bp`, `koto.decider.reason`, `koto.decider.blocked`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.attempts`, `koto.decider.latency_ms`, `koto.decider.input_bytes` | koto grades one criterion of a decider check, on one unit for a unit-mode check. |
 | `decider_fallback` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.unit.key`, `koto.unit.document`, `koto.unit.section`, `koto.decider.mode`, `koto.decider.reason`, `koto.decider.input_bytes` | A decider-check criterion that got no verdict is handed to the agent. |
@@ -98,9 +99,10 @@ their digest (see
 | `context_reads` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.context.key`, `koto.context.reader`, `koto.context.access`, `koto.context.overflow`, `koto.context.read_count`, `koto.context.present_count`, `koto.context.first_hash`, `koto.context.last_hash`, `koto.context.read_by` | A state visit that read context keys ends, or a reader's anchor records a read of another session. |
 
 The first five are the identity kinds. The next five are the check kinds,
-described in [Check records](#check-records), the eight after them are the
-decider, rule-delivery and override kinds, described in
-[Decider and override records](#decider-and-override-records), `response`
+described in [Check records](#check-records), the nine after them are the
+decider, evidence, rule-delivery and override kinds, described in
+[Decider and override records](#decider-and-override-records) and
+[Evidence fields](#evidence-fields), `response`
 is described in [Response records](#response-records), and `context_reads`
 in [Context reads](#context-reads).
 
@@ -192,6 +194,23 @@ One record per check evaluation: a `gate_evaluated` whose outcome isn't
 | `koto.check.error` | string | decider checks, when set | Why no criterion could be graded, such as `log_unreadable` or `missing_spec`. |
 | `koto.decider.awaiting_count` | integer | decider checks | How many criteria are waiting on the agent's answer (the length of the check's `awaiting` output list), 0 included. Non-zero here only beside a failed criterion; a check that only waits writes `check_pending`. |
 | `koto.decider.agent_answered_count` | integer | decider checks | How many criteria this evaluation took from an answer the agent recorded (its `agent_answered` output list), 0 included. |
+| `koto.check.reason` | string | when the outcome isn't `passed` | Why the check didn't pass (see the list below). Left out by a koto that predates the field. |
+| `koto.check.not_ready` | boolean | always, from this koto on | The check said its input wasn't ready to judge: its command printed a line starting with `::koto-not-ready::`, or exited with a code its gate lists in `not_ready_exit_codes`. koto never sets it on its own. It is telemetry only: the outcome, routing and fallback finding are the same either way. |
+| `koto.check.pre_directive` | boolean | always, from this koto on | No `koto next` had printed the state's directive in the current visit when the check ran: the check ran on arrival in the same invocation, on the first tick after `koto init` (which prints no directive), or after a rewind or a loop back. `false` once a `koto next` has printed the directive in the visit, with or without its details. |
+
+`koto.check.reason` takes one of these values:
+
+| Value | Meaning |
+|-------|---------|
+| `rule_failed` | The check printed at least one `error` finding of its own. A decider check's failed criterion counts. |
+| `undecided` | The command exited 2 and printed no `error` finding of its own. |
+| `no_finding` | Any other failure with no `error` finding of its own: another non-zero exit, a context gate whose key is missing or doesn't match, a default action whose capture couldn't be delivered. |
+| `timed_out` | The command, or a polling gate's window, ran out of time. |
+| `spawn_failed` | The command couldn't be started. |
+| `error` | Anything else that kept the check from answering, such as a failed wait or a decider check's error. |
+
+Unlike `koto.check.outcome`, the reason tells a default action's timeout or
+spawn failure apart from a non-zero exit.
 
 ### `check_rule`
 
@@ -239,6 +258,7 @@ left out. A pending evaluation writes none.
 | `koto.rule.id` | string | always | The rule id, or its digest (see [Rule ids](#rule-ids)). |
 | `koto.finding.level` | string | always | The findings' level: `error`, `warning` or `info` from this koto. The vocabulary is open, so a reader keeps a level it doesn't know rather than rejecting the record. |
 | `koto.finding.count` | integer | always | How many of the logged findings had this rule id and level, at least 1. |
+| `koto.finding.source` | string | always, from this koto on | `check` when the check printed the findings, `fallback` for the finding koto wrote because the check printed no `error` finding of its own. |
 
 The counts of one evaluation's records sum to its `koto.check.finding_count`
 unless more than 50 pairs were logged. A finding's message, path, location
@@ -659,6 +679,30 @@ A unit-mode check that declares `unit_document: prd` and no
 
 ```json
 {"kind":"decider_checked","v":1,"at":"2026-10-10T03:20:11.502Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":31,"koto.visit.seq":28,"koto.state":"review","koto.check":"ac_binary","koto.rule.id":"ac_binary","koto.unit.key":"sha256:5f1d0c2a9e7b4c3d8a6f0e1b2c3d4e5f","koto.unit.document":"prd","koto.unit.section":"sha256:0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d","koto.decider.provider":"jev","koto.decider.model":"jev-1.2.3","koto.decider.mode":"veto","koto.decider.outcome":"pass","koto.decider.confidence_bp":9712,"koto.decider.blocked":false,"koto.decider.input_tokens":240,"koto.decider.output_tokens":3,"koto.decider.unread_usage_attempts":0,"koto.decider.attempts":1,"koto.decider.latency_ms":410,"koto.decider.input_bytes":61}
+```
+
+## Evidence fields
+
+When the agent submits evidence with `koto next --with-data`, koto reads the
+state's `accepts` block and keeps, on the `evidence_submitted` event, the
+values telemetry may carry: its `exported_fields`. The journal relays one
+`evidence_field` record per entry, after the event commits, with `koto.seq`
+and `koto.visit.seq` as a check record has them.
+
+| Field | Type | Present | Description |
+|-------|------|---------|-------------|
+| `koto.state` | string | always | The state the evidence was submitted to. |
+| `koto.evidence.field` | string | always | The field's name, as `accepts` declares it, or its digest when outside the name shape. |
+| `koto.evidence.value` | string | always | For an enum field, the submitted value when `accepts` declares it (as its digest when outside the name shape) and `other` when it doesn't; for a boolean field, `true` or `false`. |
+
+Only enum and boolean fields the submission includes are relayed, in field
+name order. String, number and task-list fields are never relayed, so a URL
+or free text submitted as evidence stays in the session's log. Evidence koto
+writes itself, such as an answer the decider applied, carries no
+`exported_fields` and writes no `evidence_field`.
+
+```json
+{"kind":"evidence_field","v":1,"at":"2026-10-10T03:20:11.402Z","session":"issue_42","koto.session.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.run.id":"b43af83c-5948-4cf2-8424-563d8436f02e","koto.seq":27,"koto.visit.seq":26,"koto.state":"pr_creation","koto.evidence.field":"pr_status","koto.evidence.value":"shared"}
 ```
 
 ## Response records

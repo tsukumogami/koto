@@ -4685,6 +4685,7 @@ fn record_notice_delivery(backend: &dyn SessionBackend, name: &str, abandoned: &
         ),
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     };
     if let Err(e) = backend.append_event(name, &payload, &timestamp) {
         // Losing the audit costs an operator the ability to tell "never
@@ -6272,10 +6273,15 @@ fn handle_next(
                 // see the natural-advancement path for the crash-
                 // direction rationale. Non-fatal on error: the response
                 // has already shipped.
-                if resp.carries_details() {
+                // Every response that prints a directive is recorded, with
+                // whether it carried the details: details suppression counts
+                // only the records that did, and the run journal reads any
+                // record as "the directive was shown".
+                if resp.directive_parts().is_some() {
                     let ts = now_iso8601();
                     let delivery_payload = EventPayload::InstructionsDelivered {
                         state: target.clone(),
+                        details_included: Some(resp.carries_details()),
                     };
                     if let Err(e) = backend.append_event(&name, &delivery_payload, &ts) {
                         eprintln!(
@@ -6580,11 +6586,20 @@ fn handle_next(
             // a failure here (deleted cwd, permission issues) leaves the
             // field `None` and the resolver tolerates the absence.
             let submitter_cwd = std::env::current_dir().ok();
+            // The enum and boolean values telemetry may carry, read against
+            // the state's declared `accepts` while the compiled template is
+            // at hand; the run journal relays them as `evidence_field`.
+            let exported_fields = crate::run_journal::exported_fields(
+                accepts,
+                data.as_object()
+                    .expect("validate_evidence guarantees object input"),
+            );
             let payload = EventPayload::EvidenceSubmitted {
                 state: current_state.clone(),
                 fields,
                 submitter_cwd,
                 source: None,
+                exported_fields,
             };
             if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
                 let ne = NextError {
@@ -6866,6 +6881,7 @@ fn handle_next(
                             ..Default::default()
                         },
                         stderr_ends_with_note: true,
+                        markers: Default::default(),
                     };
                     return ActionResult::Failed {
                         command,
@@ -7889,10 +7905,13 @@ fn handle_next(
             // advancement path", step 4). Non-fatal on error, matching
             // the SchedulerRan/BatchFinalized append idiom above: the
             // response has already shipped and cannot be un-printed.
-            if resp.carries_details() {
+            // Every response that prints a directive is recorded, with
+            // whether it carried the details (see the directed path).
+            if resp.directive_parts().is_some() {
                 let ts = now_iso8601();
                 let payload = EventPayload::InstructionsDelivered {
                     state: final_state.clone(),
+                    details_included: Some(resp.carries_details()),
                 };
                 if let Err(e) = backend.append_event(&name, &payload, &ts) {
                     eprintln!(
@@ -10057,6 +10076,7 @@ Done.
                     .collect(),
                 submitter_cwd: None,
                 source: None,
+                exported_fields: None,
             },
             idempotency_hash: None,
         }
@@ -10517,6 +10537,7 @@ Done.
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let substituted =
@@ -10585,6 +10606,7 @@ Done.
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -10660,6 +10682,7 @@ Done.
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         };
         for (field, raw) in authored.substitutable_fields() {
             assert!(
@@ -10825,6 +10848,7 @@ Done.
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -10906,6 +10930,7 @@ Done.
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let expected_command = {
