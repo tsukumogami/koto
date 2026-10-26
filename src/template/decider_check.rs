@@ -196,6 +196,13 @@ pub struct DeciderCheckSpec {
     /// serializes exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub units: Option<UnitsMode>,
+    /// In unit mode, the most units an evaluation grades: the first
+    /// `max_units` printed are graded and every later one falls back with
+    /// `unit_limit`, whatever its size. Absent, the check is bounded only by
+    /// the per-call unit budget. Left out of the declaration hash, so
+    /// changing it keeps the evidence gathered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_units: Option<u32>,
 }
 
 /// Whether `label` is a usable input label.
@@ -393,6 +400,7 @@ mod tests {
             label: DEFAULT_CHECK_LABEL.into(),
             criteria: vec![criterion()],
             units: None,
+            max_units: None,
         }
     }
 

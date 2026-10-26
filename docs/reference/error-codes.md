@@ -329,7 +329,7 @@ for real on every tick. The same gate reports `agent_actionable: false` in
 the decider gave no verdict on. A missing session prints the flat format with
 exit 1. A session log that can't be read exits with the code its read error
 carries, and an unreadable template exits 3, as `koto overrides record` does.
-Three refusals carry a typed code, each with exit code 2 and nothing appended
+Six refusals carry a typed code, each with exit code 2 and nothing appended
 to the state log. The `error` object names the `gate`, the
 `criterion` and, once the session is loaded, the `state`.
 
@@ -355,6 +355,33 @@ answer:
 
 ```json
 {"error":{"code":"no_fallback","message":"criterion 'comment_reason' of 'comments' has not fallen back to you in this visit to 'review': only a criterion the decider gave no verdict on takes your answer","gate":"comments","criterion":"comment_reason","state":"review"},"command":"decider answer"}
+```
+
+For a check that grades units, `no_fallback` also means the `--unit` key was
+printed by the check's latest evaluation but has no pending fallback for the
+criterion there: the decider gave that unit a verdict.
+
+**`unit_required`** -- the criterion's pending fallbacks in the check's latest
+evaluation name units, and no `--unit` was given. Answer one unit at a time,
+with the `--unit <key>` the waiting finding's command carries:
+
+```json
+{"error":{"code":"unit_required","message":"criterion 'ac_binary' of 'ac_binary' is waiting on your answer for units; name the unit with --unit, as the waiting finding does","gate":"ac_binary","criterion":"ac_binary","state":"review"},"command":"decider answer"}
+```
+
+**`unit_not_expected`** -- `--unit` was given, but the check doesn't grade
+units, or the criterion's pending fallbacks in its latest evaluation name none
+(an extraction that failed, say). Answer without `--unit`:
+
+```json
+{"error":{"code":"unit_not_expected","message":"criterion 'comment_reason' of 'comments' isn't waiting on a unit; answer without --unit","gate":"comments","criterion":"comment_reason","state":"review"},"command":"decider answer"}
+```
+
+**`unknown_unit`** -- the `--unit` key isn't one the check's latest evaluation
+printed, including a unit that has since left the extraction's output:
+
+```json
+{"error":{"code":"unknown_unit","message":"the latest evaluation of 'ac_binary' printed no unit 'ac-99'; run koto next and answer a unit its waiting findings name","gate":"ac_binary","criterion":"ac_binary","state":"review"},"command":"decider answer"}
 ```
 
 ### disputes record
@@ -635,7 +662,7 @@ E-DECIDER-CHECK-LABEL: state "review" check "g": label "has space" must be 1 to 
   remedy: rename the label, or omit it for "artifact"
 ```
 
-**E-DECIDER-CHECK-UNITS (error)**: `units` is set to something other than `jsonl`, the one way a check's extraction can print units.
+**E-DECIDER-CHECK-UNITS (error)**: `units` is set to something other than `jsonl`, the one way a check's extraction can print units, or `max_units` isn't a whole number of at least 1.
 
 ```
 E-DECIDER-CHECK-UNITS: state "review" check "g": units must be one of jsonl, found String("csv")

@@ -634,24 +634,34 @@ impl<'a> CliCheckEvaluator<'a> {
         duration_ms: Option<u64>,
     ) -> StructuredGateResult {
         // One request per (unit, criterion). Each unit's input hash is taken
-        // from its own request, so two units' verdicts never collide.
+        // from its own request, so two units' verdicts never collide. A unit
+        // past the check's `max_units` is decided first, whatever its size,
+        // so it is never sent; then an empty unit, then one over budget.
+        let limit = spec.max_units.map_or(usize::MAX, |n| n as usize);
         let per_unit: Vec<UnitRequests> = units
             .iter()
             .flatten()
-            .map(|u| {
+            .enumerate()
+            .map(|(index, u)| {
                 let requests: Vec<DecisionRequest> = spec
                     .criteria
                     .iter()
                     .map(|c| build_check_request(c, &spec.label, &u.text))
                     .collect();
-                if u.text.trim().is_empty() {
-                    return (requests, Some(CheckOutcome::NotGraded), None);
-                }
+                let empty = u.text.trim().is_empty();
                 let input = requests
                     .first()
+                    .filter(|_| !empty)
                     .map(|r| (input_sha256(&r.inputs), u.text.len() as u64));
-                let early = (u.text.len() > spec.max_bytes as usize)
-                    .then_some(CheckOutcome::Unanswered(UnansweredReason::OverBudget));
+                let early = if index >= limit {
+                    Some(CheckOutcome::Unanswered(UnansweredReason::UnitLimit))
+                } else if empty {
+                    Some(CheckOutcome::NotGraded)
+                } else if u.text.len() > spec.max_bytes as usize {
+                    Some(CheckOutcome::Unanswered(UnansweredReason::OverBudget))
+                } else {
+                    None
+                };
                 (requests, early, input)
             })
             .collect();
@@ -1101,12 +1111,15 @@ fn waiting_finding(
     let on_unit = unit
         .map(|u| format!(" on unit {}", u.key))
         .unwrap_or_default();
+    let unit_flag = unit
+        .map(|u| format!(" --unit {}", shell_word(&u.key)))
+        .unwrap_or_default();
     Finding {
         rule_id: criterion.rule_id.clone(),
         level: FindingLevel::Warning,
         message: capped(format!(
             "criterion {}{} is waiting on your answer: the decider gave no verdict ({}). \
-             Record it with `koto decider answer {} --gate {} --criterion {} --answer \
+             Record it with `koto decider answer {} --gate {} --criterion {}{} --answer \
              <pass|fail|unclear>`, then run `koto next {}` again. {} Answer pass if: {} \
              Answer fail if: {} Answer unclear if: {}",
             criterion.rule_id,
@@ -1115,6 +1128,7 @@ fn waiting_finding(
             shell_word(session),
             shell_word(gate),
             shell_word(&criterion.rule_id),
+            unit_flag,
             shell_word(session),
             criterion.question,
             criterion.pass,
@@ -1412,6 +1426,7 @@ mod tests {
                 })
                 .collect(),
             units: None,
+            max_units: None,
         });
         gate
     }

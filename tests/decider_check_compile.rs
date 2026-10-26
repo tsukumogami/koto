@@ -318,6 +318,45 @@ fn units_on_another_gate_type_is_refused() {
 }
 
 #[test]
+fn max_units_compiles_and_values_below_one_are_refused() {
+    let t = expect_ok(&template(
+        &check(
+            "g",
+            &[criterion("r")],
+            "        units: jsonl\n        max_units: 3\n",
+        ),
+        PLAIN_TRANSITIONS,
+    ));
+    let gate = &t.states["review"].gates["g"];
+    assert_eq!(gate.decider_check.as_ref().unwrap().max_units, Some(3));
+    let json = serde_json::to_value(gate).unwrap();
+    assert_eq!(json["decider_check"]["max_units"], 3);
+    // Without it nothing is added, so the compiled JSON is unchanged.
+    let plain = expect_ok(&template(
+        &check("g", &[criterion("r")], "        units: jsonl\n"),
+        PLAIN_TRANSITIONS,
+    ));
+    let json = serde_json::to_value(&plain.states["review"].gates["g"]).unwrap();
+    assert!(json["decider_check"].get("max_units").is_none(), "{}", json);
+    for v in ["0", "-1", "1.5", "three", "[3]"] {
+        expect_err(
+            &template(
+                &check(
+                    "g",
+                    &[criterion("r")],
+                    &format!("        units: jsonl\n        max_units: {}\n", v),
+                ),
+                PLAIN_TRANSITIONS,
+            ),
+            "E-DECIDER-CHECK-UNITS",
+        );
+    }
+    let gates =
+        "      g:\n        type: command\n        command: \"true\"\n        max_units: 3\n";
+    expect_err(&template(gates, PLAIN_TRANSITIONS), "E-DECIDER-CHECK-FIELD");
+}
+
+#[test]
 fn bad_labels_are_refused() {
     for l in ["\"has space\"", "\"\"", "42"] {
         expect_err(

@@ -498,6 +498,11 @@ struct SourceGate {
     /// `jsonl` is refused with `E-DECIDER-CHECK-UNITS` naming the check.
     #[serde(default)]
     units: Option<serde_yaml_ng::Value>,
+    /// A `decider-check` gate's per-evaluation unit cap, kept raw so a value
+    /// that isn't a whole number of at least 1 is refused with
+    /// `E-DECIDER-CHECK-UNITS` naming the check.
+    #[serde(default)]
+    max_units: Option<serde_yaml_ng::Value>,
     /// Every key the fields above don't name. `SourceState` uses
     /// `deny_unknown_fields`, but serde's error for it surfaces only as the
     /// outer "failed to parse front-matter" context, which names neither the
@@ -541,6 +546,7 @@ const SOURCE_GATE_KEYS: &[&str] = &[
     "label",
     "criteria",
     "units",
+    "max_units",
 ];
 
 /// The keys a decider-check criterion may carry.
@@ -985,6 +991,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
         ("label", source.label.is_some()),
         ("criteria", source.criteria.is_some()),
         ("units", source.units.is_some()),
+        ("max_units", source.max_units.is_some()),
     ] {
         if present {
             return Err(anyhow!(
@@ -1284,6 +1291,22 @@ fn compile_decider_check(
             }
         },
     };
+    let max_units = match &source.max_units {
+        None => None,
+        Some(v) => match v.as_u64() {
+            Some(n) if (1..=u64::from(u32::MAX)).contains(&n) => Some(n as u32),
+            _ => {
+                return Err(err(
+                    "E-DECIDER-CHECK-UNITS",
+                    format!(
+                        ": max_units must be a whole number of units, at least 1, found {:?}",
+                        v
+                    ),
+                    "set max_units to the most units one evaluation grades, or omit it",
+                ))
+            }
+        },
+    };
     let mut criteria = Vec::new();
     match &source.criteria {
         None => {}
@@ -1428,6 +1451,7 @@ fn compile_decider_check(
             label,
             criteria,
             units,
+            max_units,
         }),
     })
 }
