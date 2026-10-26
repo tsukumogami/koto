@@ -75,6 +75,8 @@ readout that reads it all from exported records (step 7).
 
 **Goal**: A criterion can declare a `summary` and a `rule_text`. When a veto criterion fails, the blocking condition in `koto next` carries a `rules` entry (`rule_id`, `level`, `text`, `units`) at level `summary` on the first failing evaluation of that check and rule in the visit, and at level `full` on every one after it. A `rule_delivered` event is appended once the response has printed, and it never holds the text.
 
+Step 1 left the surface this builds on: in unit mode each failing unit already produces an error finding whose `unit.key` names it (`UnitRef` in `src/decider/check.rs`), so a `rules` entry's `units` are the keys of that criterion's failing findings in print order. The `rule_delivered` journal record's exported field names (`koto.check.name`, `koto.rule.extent`) are step 5's; this step adds the session event and the response field.
+
 **Acceptance Criteria**:
 
 - [ ] With a veto criterion that declares both `summary` and `rule_text`, the first failing `koto next` in a visit prints a `rules` entry with `level` "summary", the summary text, and the keys of the failing units; the next failing `koto next` in the same visit, even one with nothing changed, prints `level` "full" with the `rule_text`.
