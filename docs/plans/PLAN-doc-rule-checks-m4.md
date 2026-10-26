@@ -6,7 +6,7 @@ split_mode_source: none
 tracking_level: none
 upstream: docs/designs/DESIGN-doc-rule-checks-m4.md
 milestone: "Per-unit decider checks and rule delivery"
-step_count: 6
+step_count: 7
 ---
 
 # PLAN: per-unit decider checks that hand back the broken rule
@@ -27,11 +27,13 @@ separate from the shared four-consultation cap, and names the failing units in
 the agent answers it with `koto decider answer --unit`. A failing veto
 criterion hands back its rule, summary first and full text on a repeat, and
 the run journal carries unit digests, the decider's confidence and each rule
-delivery. All of it lands in one pull request here.
+delivery. Steps 1 to 6 land in one pull request here.
 
 The telemetry definitions, their test cases, the exporter's field lists and
 the readout's text are maintained with the telemetry pipeline outside this
-repository and land beside step 5; they are not steps in this plan.
+repository. Step 7 is that companion pull request; it is named here so the
+run that carries this plan carries it too, and its repository is named only
+in that run's own instructions.
 
 ## Decomposition Strategy
 
@@ -42,7 +44,8 @@ per-unit consultation, the gate output and findings, and the `koto next`
 response, and shows the two failing units named. Each later step adds one
 behaviour on top of that path: the rule coming back (step 2), per-unit
 fallback and answers (step 3), compile-time bounds (step 4), the run
-journal's records (step 5), and older readers, docs and skills (step 6).
+journal's records (step 5), older readers, docs and skills (step 6), and the
+readout that reads it all from exported records (step 7).
 
 ## Steps
 
@@ -108,9 +111,16 @@ Unit-mode `decider_checked`, `decider_fallback` and `decider_check_answered` rec
 
 The koto v0.14.1 compatibility job reads logs and ledgers holding the new records, the session feed declares them, and the reference docs and koto-author and koto-user skills name every term the PRD's docs table lists.
 
+### Step 7: the telemetry readout returns this feature's per-unit rows from exported records
+
+A companion pull request in the telemetry definitions repository admits every new name and the confidence exception, adds a test case per new record shape, lists the new kind and fields for export, and holds the readout's query text, reviewed by the telemetry lane before it is reported ready and merged after this pull request.
+
 ## Implementation Sequence
 
-The steps run in order in one pull request. Steps 3 and 4 need only step 1,
-so either can run beside step 2; step 5 needs step 2's `rule_delivered`
-event, and step 6 comes last because the compatibility job and the docs
-cover everything before it.
+Steps 1 to 6 run in order in this repository's one pull request. Steps 3
+and 4 need only step 1, so either can run beside step 2; step 5 needs step
+2's `rule_delivered` event, and step 6 comes last because the compatibility
+job and the docs cover everything before it. Step 7 is the companion pull
+request outside this repository: it can be written once step 5 fixes the
+record shapes, and it merges after this one, so the exporter never lists a
+field koto doesn't write yet.
