@@ -1309,10 +1309,16 @@ The `[decider]` keys opt the user in to consulting a decider on declared templat
 ## koto decider answer
 
 ```bash
-koto decider answer <name> --gate <check> --criterion <criterion id> --answer <pass|fail|unclear>
+koto decider answer <name> --gate <check> --criterion <criterion id> [--unit <key>] --answer <pass|fail|unclear>
 ```
 
-Records your answer to a decider-check criterion the decider couldn't grade. Run it when a `koto next` response has a decider check with status `pending`, the criterion under its output's `awaiting` list, and a `warning` finding that gives this exact command; then run `koto next` again. The answer applies to the work as the check last saw it: `pass` and `unclear` let the criterion through, `fail` blocks in veto mode until the work changes or you answer again. It prints `{"status":"recorded",...}`. It refuses, with exit 2 and a JSON `error.code`, an answer other than the three words (`invalid_answer`), a check or criterion the current state doesn't declare (`unknown_criterion`), and a criterion that isn't waiting on you in this visit (`no_fallback`).
+Records your answer to a decider-check criterion the decider couldn't grade. Run it when a `koto next` response has a decider check with the criterion under its output's `awaiting` list (the check is `pending`, or `failed` when another unit failed) and a `warning` finding that gives this exact command; then run `koto next` again. The answer applies to the work as the check last saw it: `pass` and `unclear` let the criterion through, `fail` blocks in veto mode until the work changes or you answer again. It prints `{"status":"recorded",...}`. It refuses, with exit 2 and a JSON `error.code`, an answer other than the three words (`invalid_answer`), a check or criterion the current state doesn't declare (`unknown_criterion`), and a criterion that isn't waiting on you in this visit (`no_fallback`).
+
+| Flag | Meaning |
+|---|---|
+| `--unit <key>` | For a check that grades units (its output has `units`): the one unit this answer is for, as the waiting finding's command names it. The answer applies to that unit only, and the success JSON carries `unit`. Answer each waiting unit with its own call. |
+
+A unit check adds three refusals: `unit_required` (the criterion waits on units and no `--unit` was given), `unit_not_expected` (`--unit` was given but nothing waits on a unit; answer without it), and `unknown_unit` (the key isn't one the latest evaluation printed; run `koto next` and answer a unit its findings name). A `--unit` for a printed unit that isn't waiting is `no_fallback`.
 
 ---
 
