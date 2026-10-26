@@ -198,7 +198,25 @@ Steps 1 to 5 left the session events (`decider_checked`, `decider_fallback` and 
 
 ### Step 7: the telemetry readout returns this feature's per-unit rows from exported records
 
-A companion pull request in the telemetry definitions repository admits every new name and the confidence exception, adds a test case per new record shape, lists the new kind and fields for export, and holds the readout's query text, reviewed by the telemetry lane before it is reported ready and merged after this pull request.
+**Goal**: The telemetry pipeline admits and exports every record field steps 1 to 6 write, and the milestone's readout query exists beside the telemetry definitions. All of it lands in a companion pull request in the telemetry definitions repository; nothing in this repository changes for this step.
+
+Step 5 fixed the record shapes: `koto.unit.key`, `koto.unit.document` and `koto.unit.section` on unit-mode `decider_checked`, `decider_fallback` and `decider_check_answered`, `koto.decider.confidence_bp` on `decider_checked`, and the `rule_delivered` record with `koto.check.name`, `koto.rule.id`, `koto.rule.extent` and `koto.rule.unit_count`. The telemetry definitions already admit `rule_delivered` with those fields. The companion pull request is open as a draft, holding the rest.
+
+**Acceptance Criteria**:
+
+- [ ] The companion pull request admits `koto.unit.key`, `koto.unit.document`, `koto.unit.section` and `koto.decider.confidence_bp` in the telemetry definitions, amends their no-probability rule to name the confidence as its one exception, and adds one test case per changed record shape; the definitions check passes on it.
+- [ ] The exporter's field lists carry the four attributes on the three record kinds, and its tests cover a unit-mode record, a record without units and a malformed value; they pass on it.
+- [ ] The readout's query text sits with the telemetry definitions, reads only exported records, and takes template identity from each record's session, not from any per-template series.
+- [ ] The telemetry lane reviews the export change before the companion pull request is marked ready, and it merges after this pull request.
+- [ ] No file in this repository changes for this step.
+
+**Check**: The companion pull request is open with its checks running, and `git diff` of this step against the shared branch's head before it is empty.
+
+**Dependencies**: Step 6
+
+**Files**: none in this repository
+
+**Complexity**: simple
 
 ## Implementation Sequence
 
