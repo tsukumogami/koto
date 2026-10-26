@@ -127,7 +127,7 @@ pub const MAX_UNIT_NAME_BYTES: usize = 128;
 pub fn unit_name_is_valid(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= MAX_UNIT_NAME_BYTES
-        && !s.starts_with(['/', '~', '-'])
+        && !s.starts_with(['/', '-'])
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._:@/-".contains(&b))
 }
@@ -727,6 +727,8 @@ impl<'a> CliCheckEvaluator<'a> {
             }
         }
         drop(lock);
+        // A failed extraction and one that printed nothing both list no
+        // units: in neither case did the extraction name a unit.
         let printed: Vec<UnitRef> = units
             .iter()
             .flatten()
@@ -1129,7 +1131,10 @@ fn waiting_finding(
     }
 }
 
-/// `message` cut to the finding bound, never splitting a character.
+/// `message` cut to the finding bound, never splitting a character. A unit
+/// finding adds the unit's key to the template's text, so the cut is made
+/// here rather than left to whoever reads the finding; a message already
+/// within the bound comes back unchanged.
 fn capped(mut message: String) -> String {
     let n = crate::redact::safe_cut_len(message.as_bytes(), crate::findings::MESSAGE_MAX_BYTES);
     message.truncate(n);
