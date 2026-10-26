@@ -99,7 +99,29 @@ Step 1 left the surface this builds on: in unit mode each failing unit already p
 
 ### Step 3: units the decider can't grade go to the agent one by one, and the agent answers with --unit
 
-Over-budget, past-bound, empty, busy and malformed-output units fall back or grade per unit, and `koto decider answer --unit` records per-unit answers with `unit_required`, `unit_not_expected` and `unknown_unit` refusals.
+**Goal**: Every (unit, criterion) the decider gives no verdict for falls back to the agent on its own while the other units keep their verdicts, a check can cap how many units it grades with `max_units`, and the agent answers one unit at a time with `koto decider answer --unit <key>`.
+
+Steps 1 and 2 left most of the per-unit grading path in `src/cli/check_evaluator.rs`: an empty unit is `not_graded`, a unit over `max_bytes` is `unanswered` with `over_budget`, a lock wait that runs out is `busy`, a spent `UnitBudget` is `unit_limit`, and reuse and recorded answers already match on the unit. `DeciderFallback` and `DeciderCheckAnswered` already carry an optional `unit`, and `koto decider answer` already binds an answer to its fallback's unit, but it has no `--unit` flag and `latest_fallback` (`src/cli/decider_answer.rs`) ignores units. The waiting finding names the unit but its command has no `--unit`. No check can declare `max_units` yet. This step adds the missing pieces; compile-time bounds, the per-state sum and the default value are step 4's, so here a check without `max_units` is bounded only by the 32-slot `UnitBudget`.
+
+**Acceptance Criteria**:
+
+- [ ] With one of ten units one byte over `max_bytes`, that unit falls back with `over_budget` (a `decider_fallback` event naming its key) and its waiting finding's command carries `--unit <key>`; the other nine carry the stub's verdicts, and a unit at exactly `max_bytes` is graded.
+- [ ] A check declaring `max_units: 3` over five units sends the stub exactly three requests per criterion; units four and five fall back with `unit_limit` for every criterion, whatever their size, and are not sent.
+- [ ] An empty or whitespace-only unit is `not_graded` with no fallback, and an extraction that prints no units passes with every criterion `not_graded`.
+- [ ] A stub reply the decider can't read, or a provider error, on one unit falls back that unit alone with the existing reason; the other units keep their verdicts.
+- [ ] A `koto next` whose lock wait runs out marks every unit it would have consulted `unanswered` with `busy`, each with its own fallback, and none passes.
+- [ ] `koto decider answer --unit <key>` records an answer for that unit only; the next `koto next` uses it for that unit and still waits on the others. Editing that unit's text makes the next evaluation grade it afresh.
+- [ ] `koto decider answer` refuses with `unit_required` when the criterion's pending fallbacks in the latest evaluation name units and no `--unit` was given, `unit_not_expected` when they name none and one was given, `unknown_unit` when the key wasn't printed by the latest evaluation, and `no_fallback` when the unit was printed but has no pending fallback for that criterion. The success JSON carries `unit`. Each new code is listed in `docs/reference/error-codes.md`.
+- [ ] Combining holds: all units passing passes; one unit waiting and none failing is pending; a unit the agent answered `fail` on a veto criterion fails the gate; one failing unit and one waiting unit fails.
+- [ ] A check without `units` behaves as before: its waiting finding's command has no `--unit`, and `koto decider answer` without `--unit` works on it as it did.
+
+**Check**: Run `cargo test --test decider_units_fallback` (the integration test added with this step, through the repo's usual test setup, against the stub decider). It drives a ten-unit fixture with one unit over budget, a five-unit `max_units: 3` fixture, an empty unit, an unreadable stub reply on one unit, and a held lock, and asserts the per-unit fallbacks and verdicts above. It then answers one waiting unit with `--unit`, ticks again, and checks that unit's answer applies while the others still wait, and drives each of the four refusals.
+
+**Dependencies**: Step 1
+
+**Files**: `src/cli/check_evaluator.rs`, `src/cli/decider_answer.rs`, `src/template/decider_check.rs`, `src/template/compile.rs`, `src/decider/check.rs`, `docs/reference/error-codes.md`, `tests/`
+
+**Complexity**: testable
 
 ### Step 4: templates that would overrun the unit bound are refused at compile time
 
