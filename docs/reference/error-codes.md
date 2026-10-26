@@ -662,11 +662,28 @@ E-DECIDER-CHECK-LABEL: state "review" check "g": label "has space" must be 1 to 
   remedy: rename the label, or omit it for "artifact"
 ```
 
-**E-DECIDER-CHECK-UNITS (error)**: `units` is set to something other than `jsonl`, the one way a check's extraction can print units, or `max_units` isn't a whole number of at least 1.
+**E-DECIDER-CHECK-UNITS (error)**: a check's unit declaration is refused. The cases:
+
+- `units` is set to something other than `jsonl`, the one way a check's extraction can print units.
+- `max_units` isn't a whole number of at least 1.
+- `max_units`, `unit_document` or `unit_section` is set on a check without `units: jsonl`. The error names the field.
+- `unit_document` or `unit_section` isn't a string in koto's name shape: 1 to 128 bytes of letters, digits and `._:/@-`, not starting with `/`, `~` or `-`.
+- A state's unit-mode checks declare `max_units` times criteria summing to more than 32, the most unit consultations one `koto next` sends. The error names the state and the sum.
+- A unit-mode check without `max_units` is compiled with 32 divided by the criteria across the state's unit-mode checks, rounded down; when some checks declare `max_units`, it divides what they leave. A state whose declared checks leave less than one unit per remaining criterion is refused, naming the state and the checks without `max_units`.
 
 ```
 E-DECIDER-CHECK-UNITS: state "review" check "g": units must be one of jsonl, found String("csv")
   remedy: set units to jsonl, or omit it to grade the whole output as one slice
+```
+
+```
+E-DECIDER-CHECK-UNITS: state "review": its unit-mode checks' max_units times criteria sum to 33; a state may declare at most 32
+  remedy: lower max_units, or move a check to another state
+```
+
+```
+E-DECIDER-CHECK-UNITS: state "review" check "g": max_units is only allowed on a check with units: jsonl
+  remedy: set units: jsonl, or remove max_units
 ```
 
 **E-DECIDER-CHECK-RULE (error)**: a criterion's `summary` is empty or over 300 bytes, or its `rule_text` is empty or over 4,096 bytes. Either text is handed back in `koto next` when the criterion fails, so it has to fit a response.

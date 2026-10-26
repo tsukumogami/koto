@@ -31,6 +31,14 @@ pub const MAX_CHECK_LABEL_BYTES: usize = 64;
 /// equals the per-call consultation cap, so a state's criteria fit one call.
 pub const MAX_CRITERIA_PER_STATE: usize = 4;
 
+/// Most (unit, criterion) consultations one state's unit-mode checks may
+/// declare: each check's `max_units` times its criteria, summed. It equals
+/// the per-call unit budget, so a state's units fit one `koto next`.
+pub const MAX_UNIT_CONSULTATIONS_PER_STATE: u32 = 32;
+
+/// Longest `unit_document` or `unit_section`, in bytes.
+pub const MAX_UNIT_LABEL_BYTES: usize = 128;
+
 /// Longest `rule_id`, in bytes. Matches the finding bound.
 pub const MAX_RULE_ID_BYTES: usize = crate::findings::RULE_ID_MAX_BYTES;
 
@@ -198,11 +206,122 @@ pub struct DeciderCheckSpec {
     pub units: Option<UnitsMode>,
     /// In unit mode, the most units an evaluation grades: the first
     /// `max_units` printed are graded and every later one falls back with
-    /// `unit_limit`, whatever its size. Absent, the check is bounded only by
-    /// the per-call unit budget. Left out of the declaration hash, so
-    /// changing it keeps the evidence gathered.
+    /// `unit_limit`, whatever its size. A unit-mode check that declares
+    /// none is compiled with its share of the state's bound (see
+    /// [`unit_caps`]); absent here only in a template compiled before that
+    /// default existed, when the check is bounded only by the per-call
+    /// unit budget. Left out of the declaration hash, so changing it keeps
+    /// the evidence gathered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_units: Option<u32>,
+    /// In unit mode, the document name the run journal exports for every
+    /// unit in place of the printed one. Name-shaped
+    /// ([`unit_label_is_valid`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_document: Option<String>,
+    /// In unit mode, the section name the run journal exports for every
+    /// unit in place of the printed one. Name-shaped likewise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_section: Option<String>,
+}
+
+impl DeciderCheckSpec {
+    /// The declaration hash of `criterion` on this check, whose extraction
+    /// command is `command`: [`declaration_hash`] with the check's
+    /// `unit_document` and `unit_section` added when set.
+    pub fn declaration_hash(&self, criterion: &CheckCriterion, command: &str) -> String {
+        fingerprint_hash(
+            criterion,
+            command,
+            self.max_bytes,
+            &self.label,
+            self.units,
+            [
+                ("unit_document", self.unit_document.as_deref()),
+                ("unit_section", self.unit_section.as_deref()),
+            ],
+        )
+    }
+}
+
+/// Whether `s` is a usable `unit_document` or `unit_section`: koto's name
+/// shape, 1 to [`MAX_UNIT_LABEL_BYTES`] bytes of letters, digits and
+/// `._:/@-`, not starting with `/`, `~` or `-`.
+pub fn unit_label_is_valid(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_UNIT_LABEL_BYTES
+        && !s.starts_with(['/', '~', '-'])
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:/@-".contains(&b))
+}
+
+/// The `max_units` each of one state's checks grades at most, in the order
+/// given: `None` for a check outside unit mode, a declared value as
+/// declared, and for a unit-mode check that declares none, its share of
+/// what the declared ones leave of [`MAX_UNIT_CONSULTATIONS_PER_STATE`]:
+/// the remainder divided by the criteria across the undeclared checks,
+/// rounded down, so the shares always fit.
+///
+/// Refused with `E-DECIDER-CHECK-UNITS` when the declared values times
+/// their criteria sum past the bound, or when the share comes to less than
+/// one unit. The compiler writes the result into each spec; validation of a
+/// compiled template runs it again, which then only sums.
+pub fn unit_caps(
+    state: &str,
+    checks: &[(&str, &DeciderCheckSpec)],
+) -> Result<Vec<Option<u32>>, String> {
+    let bound = u64::from(MAX_UNIT_CONSULTATIONS_PER_STATE);
+    let unit_mode = || checks.iter().filter(|(_, s)| s.units.is_some());
+    let declared: u64 = unit_mode()
+        .filter_map(|(_, s)| s.max_units.map(|n| u64::from(n) * s.criteria.len() as u64))
+        .sum();
+    if declared > bound {
+        return Err(format!(
+            "E-DECIDER-CHECK-UNITS: state {:?}: its unit-mode checks' max_units times criteria \
+             sum to {}; a state may declare at most {}\n  \
+             remedy: lower max_units, or move a check to another state",
+            state, declared, bound
+        ));
+    }
+    let undeclared: Vec<&str> = unit_mode()
+        .filter(|(_, s)| s.max_units.is_none())
+        .map(|(n, _)| *n)
+        .collect();
+    let undeclared_criteria: u64 = unit_mode()
+        .filter(|(_, s)| s.max_units.is_none())
+        .map(|(_, s)| s.criteria.len() as u64)
+        .sum();
+    let share = match (bound - declared).checked_div(undeclared_criteria) {
+        // Nothing undeclared, or a check with no criteria, which
+        // `validate_spec` refuses on its own.
+        None => None,
+        Some(0) => {
+            return Err(format!(
+                "E-DECIDER-CHECK-UNITS: state {:?}: the declared max_units times criteria sum to \
+                 {}, which leaves {} of {} for {} criteria on checks without max_units ({}), \
+                 less than one unit each\n  \
+                 remedy: lower a declared max_units, or declare max_units on every unit-mode check",
+                state,
+                declared,
+                bound - declared,
+                bound,
+                undeclared_criteria,
+                undeclared
+                    .iter()
+                    .map(|n| format!("{:?}", n))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        Some(n) => Some(n as u32),
+    };
+    Ok(checks
+        .iter()
+        .map(|(_, s)| match s.units {
+            None => None,
+            Some(_) => s.max_units.or(share),
+        })
+        .collect())
 }
 
 /// Whether `label` is a usable input label.
@@ -218,7 +337,9 @@ pub fn label_is_valid(label: &str) -> bool {
 /// the criterion's `rule_id`, question and three descriptions and its
 /// check's command (as the template wrote it, before substitution), byte
 /// budget and label, and, only for a check in unit mode, `units=jsonl`, so
-/// a check without units keeps the hash it had before units existed.
+/// a check without units keeps the hash it had before units existed. A
+/// check's `unit_document` and `unit_section` are added likewise, only when
+/// set, by [`DeciderCheckSpec::declaration_hash`].
 ///
 /// Mode, threshold, `rule_ref`, `summary` and `rule_text` are left out, so
 /// changing them keeps the evidence gathered under the declaration; the two
@@ -231,6 +352,19 @@ pub fn declaration_hash(
     max_bytes: u32,
     label: &str,
     units: Option<UnitsMode>,
+) -> String {
+    fingerprint_hash(criterion, command, max_bytes, label, units, [])
+}
+
+/// [`declaration_hash`] with each `(key, value)` in `labels` whose value is
+/// set added to the fingerprint under its key.
+fn fingerprint_hash<const N: usize>(
+    criterion: &CheckCriterion,
+    command: &str,
+    max_bytes: u32,
+    label: &str,
+    units: Option<UnitsMode>,
+    labels: [(&str, Option<&str>); N],
 ) -> String {
     let CheckCriterion {
         rule_id,
@@ -257,6 +391,11 @@ pub fn declaration_hash(
     if let Some(units) = units {
         fingerprint["units"] = serde_json::Value::from(units.as_str());
     }
+    for (key, value) in labels {
+        if let Some(value) = value {
+            fingerprint[key] = serde_json::Value::from(value);
+        }
+    }
     let bytes = serde_json::to_vec(&fingerprint).expect("a JSON value always serializes");
     hex::encode(Sha256::digest(&bytes))
 }
@@ -267,6 +406,50 @@ fn at(code: &str, state: &str, gate: &str, rule_id: &str) -> String {
         "{}: state {:?} check {:?} criterion {:?}",
         code, state, gate, rule_id
     )
+}
+
+/// The unit fields' own rules: `max_units`, `unit_document` and
+/// `unit_section` belong to a check with `units` set, `max_units` is at
+/// least 1, and each label has the name shape.
+fn validate_unit_fields(state: &str, gate: &str, spec: &DeciderCheckSpec) -> Result<(), String> {
+    let at = format!("E-DECIDER-CHECK-UNITS: state {:?} check {:?}", state, gate);
+    if spec.units.is_none() {
+        for (key, present) in [
+            ("max_units", spec.max_units.is_some()),
+            ("unit_document", spec.unit_document.is_some()),
+            ("unit_section", spec.unit_section.is_some()),
+        ] {
+            if present {
+                return Err(format!(
+                    "{}: {} is only allowed on a check with units: jsonl\n  \
+                     remedy: set units: jsonl, or remove {}",
+                    at, key, key
+                ));
+            }
+        }
+    }
+    if spec.max_units == Some(0) {
+        return Err(format!(
+            "{}: max_units must be at least 1\n  \
+             remedy: set max_units to the most units one evaluation grades, or omit it",
+            at
+        ));
+    }
+    for (key, value) in [
+        ("unit_document", &spec.unit_document),
+        ("unit_section", &spec.unit_section),
+    ] {
+        let Some(value) = value else { continue };
+        if !unit_label_is_valid(value) {
+            return Err(format!(
+                "{}: {} {:?} must be 1 to {} bytes of letters, digits and ._:/@-, not starting \
+                 with /, ~ or -\n  \
+                 remedy: rename the {}, or omit it",
+                at, key, value, MAX_UNIT_LABEL_BYTES, key
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Check one decider check's spec: its budget, its label, and each
@@ -301,6 +484,7 @@ pub fn validate_spec(state: &str, gate: &str, spec: &DeciderCheckSpec) -> Result
             state, gate
         ));
     }
+    validate_unit_fields(state, gate, spec)?;
     for c in &spec.criteria {
         if c.rule_id.trim().is_empty() || c.rule_id.len() > MAX_RULE_ID_BYTES {
             return Err(format!(
@@ -401,6 +585,8 @@ mod tests {
             criteria: vec![criterion()],
             units: None,
             max_units: None,
+            unit_document: None,
+            unit_section: None,
         }
     }
 
@@ -551,6 +737,131 @@ mod tests {
         assert!(validate_spec("st", "g", &s)
             .unwrap_err()
             .starts_with("E-DECIDER-CHECK-LABEL"));
+    }
+
+    /// A unit-mode spec with `criteria` criteria and `max_units`.
+    fn unit_spec(criteria: usize, max_units: Option<u32>) -> DeciderCheckSpec {
+        let mut s = spec();
+        s.units = Some(UnitsMode::Jsonl);
+        s.max_units = max_units;
+        s.criteria = (0..criteria)
+            .map(|i| {
+                let mut c = criterion();
+                c.rule_id = format!("r{}", i);
+                c
+            })
+            .collect();
+        s
+    }
+
+    fn caps(specs: &[DeciderCheckSpec]) -> Result<Vec<Option<u32>>, String> {
+        let named: Vec<(&str, &DeciderCheckSpec)> = specs.iter().map(|s| ("g", s)).collect();
+        unit_caps("st", &named)
+    }
+
+    #[test]
+    fn an_undeclared_check_gets_its_share_of_the_state_bound() {
+        assert_eq!(caps(&[unit_spec(1, None)]), Ok(vec![Some(32)]));
+        assert_eq!(caps(&[unit_spec(2, None)]), Ok(vec![Some(16)]));
+        assert_eq!(caps(&[unit_spec(3, None)]), Ok(vec![Some(10)]));
+        assert_eq!(
+            caps(&[unit_spec(1, None), unit_spec(1, None)]),
+            Ok(vec![Some(16), Some(16)])
+        );
+        // The declared one leaves 32 - 8 * 2 = 16 for one criterion.
+        assert_eq!(
+            caps(&[unit_spec(2, Some(8)), unit_spec(1, None)]),
+            Ok(vec![Some(8), Some(16)])
+        );
+        // A check outside unit mode gets nothing and takes no share.
+        assert_eq!(
+            caps(&[spec(), unit_spec(1, None)]),
+            Ok(vec![None, Some(32)])
+        );
+    }
+
+    #[test]
+    fn declared_units_past_the_state_bound_are_refused_with_the_sum() {
+        assert_eq!(
+            caps(&[unit_spec(2, Some(16))]),
+            Ok(vec![Some(16)]),
+            "32 fits"
+        );
+        let e = caps(&[unit_spec(3, Some(11))]).unwrap_err();
+        assert!(
+            e.starts_with("E-DECIDER-CHECK-UNITS: state \"st\""),
+            "{}",
+            e
+        );
+        assert!(e.contains("sum to 33"), "{}", e);
+        // A declared check that takes the whole bound leaves no share.
+        let e = caps(&[unit_spec(1, Some(32)), unit_spec(1, None)]).unwrap_err();
+        assert!(e.starts_with("E-DECIDER-CHECK-UNITS"), "{}", e);
+        assert!(e.contains("leaves 0 of 32"), "{}", e);
+    }
+
+    #[test]
+    fn unit_fields_belong_to_unit_mode_and_labels_have_the_name_shape() {
+        let edits: [fn(&mut DeciderCheckSpec); 3] = [
+            |s| s.max_units = Some(3),
+            |s| s.unit_document = Some("prd".into()),
+            |s| s.unit_section = Some("acs".into()),
+        ];
+        for edit in edits {
+            let mut s = spec();
+            edit(&mut s);
+            let e = validate_spec("st", "g", &s).unwrap_err();
+            assert!(e.starts_with("E-DECIDER-CHECK-UNITS"), "{}", e);
+            assert!(e.contains("only allowed on a check with units"), "{}", e);
+        }
+        let longest = "x".repeat(MAX_UNIT_LABEL_BYTES);
+        let too_long = "x".repeat(MAX_UNIT_LABEL_BYTES + 1);
+        for ok in ["prd", "a.b_c:d/e@f-g", longest.as_str()] {
+            assert!(unit_label_is_valid(ok), "{}", ok);
+            let mut s = unit_spec(1, None);
+            s.unit_document = Some(ok.to_string());
+            s.unit_section = Some(ok.to_string());
+            assert!(validate_spec("st", "g", &s).is_ok(), "{}", ok);
+        }
+        for bad in [
+            "",
+            "/abs",
+            "~home",
+            "-opt",
+            "has space",
+            "semi;colon",
+            too_long.as_str(),
+        ] {
+            assert!(!unit_label_is_valid(bad), "{}", bad);
+            let mut s = unit_spec(1, None);
+            s.unit_section = Some(bad.to_string());
+            let e = validate_spec("st", "g", &s).unwrap_err();
+            assert!(e.starts_with("E-DECIDER-CHECK-UNITS"), "{}", e);
+            assert!(e.contains("unit_section"), "{}", e);
+        }
+        let e = validate_spec("st", "g", &unit_spec(1, Some(0))).unwrap_err();
+        assert!(e.starts_with("E-DECIDER-CHECK-UNITS"), "{}", e);
+    }
+
+    #[test]
+    fn unit_labels_join_the_declaration_hash_only_when_set() {
+        let s = unit_spec(1, Some(4));
+        let c = &s.criteria[0];
+        let plain = declaration_hash(c, "cmd", s.max_bytes, &s.label, s.units);
+        assert_eq!(s.declaration_hash(c, "cmd"), plain);
+        let mut with_doc = s.clone();
+        with_doc.unit_document = Some("prd".into());
+        let mut with_section = s.clone();
+        with_section.unit_section = Some("prd".into());
+        let doc = with_doc.declaration_hash(c, "cmd");
+        let section = with_section.declaration_hash(c, "cmd");
+        assert_ne!(doc, plain);
+        assert_ne!(section, plain);
+        assert_ne!(doc, section);
+        // max_units stays out of the hash.
+        let mut more = s.clone();
+        more.max_units = Some(8);
+        assert_eq!(more.declaration_hash(c, "cmd"), plain);
     }
 
     #[test]

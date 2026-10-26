@@ -62,6 +62,10 @@ const TEMPLATE_DIRS: &[(&str, &str)] = &[
     ("tests/fixtures/template-hash", "template-hash"),
     ("tests/fixtures/decider", "decider"),
     ("test/compat/fixtures", "compat"),
+    // Decider checks that use no unit or rule field; their snapshots were
+    // recorded with the released v0.25.0 binary, so they also pin that unit
+    // mode left such checks' compiled bytes alone.
+    ("tests/fixtures/decider_checks", "decider-checks"),
 ];
 
 /// Every fixture template paired with its snapshot path, sorted by source.

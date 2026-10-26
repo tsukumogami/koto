@@ -352,6 +352,75 @@ fn max_units_grades_the_first_units_and_limits_the_rest() {
 }
 
 #[test]
+fn a_defaulted_max_units_caps_the_units_as_a_declared_one_does() {
+    // Two one-criterion unit-mode checks on the state: neither declares
+    // max_units, so each compiles to 32 / 2 = 16. The second prints no
+    // units; without the default the first would grade all twenty, since
+    // the per-call budget of 32 has room for them.
+    let tpl = format!(
+        r#"---
+name: units-default-cap
+version: "1.0"
+initial_state: review
+states:
+  review:
+    gates:
+      {GATE}:
+        type: decider-check
+        command: "cat units.jsonl"
+        label: ac
+        max_bytes: {MAX_BYTES}
+        units: jsonl
+        criteria:
+{first}      ac_other:
+        type: decider-check
+        command: "true"
+        units: jsonl
+        criteria:
+{second}    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## review
+
+Review the acceptance criteria.
+
+## done
+
+Done.
+"#,
+        first = criterion_yaml(RULE),
+        second = criterion_yaml(SECOND),
+    );
+    let h = harness(&tpl, &fixture(20, &[]));
+    for _ in 0..16 {
+        h.stub.push(pass());
+    }
+    let out = run(&h);
+
+    assert_eq!(h.stub.request_count(), 16);
+    for r in h.stub.requests() {
+        let raw = r.body_str();
+        for i in 17..=20 {
+            assert!(!raw.contains(&format!("UNIT-TEXT-{:02}", i)), "{}", raw);
+        }
+    }
+    let expected: Vec<(String, String)> = (17..=20)
+        .map(|i| (key(i), "unit_limit".to_string()))
+        .collect();
+    assert_eq!(fallbacks(&h), expected);
+    for i in 17..=20 {
+        assert_eq!(unit_entry(&out, &key(i))["awaiting"], json!([RULE]));
+    }
+    for i in 1..=16 {
+        assert_eq!(unit_entry(&out, &key(i))["awaiting"], json!([]));
+    }
+    assert_eq!(condition(&out)["status"], "pending");
+}
+
+#[test]
 fn an_empty_unit_is_not_graded_and_falls_back_to_nobody() {
     let units = jsonl(&[
         (key(1), text(1)),

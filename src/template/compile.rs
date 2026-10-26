@@ -503,6 +503,13 @@ struct SourceGate {
     /// `E-DECIDER-CHECK-UNITS` naming the check.
     #[serde(default)]
     max_units: Option<serde_yaml_ng::Value>,
+    /// A `decider-check` gate's unit document and section names, kept raw so
+    /// a value that isn't a name-shaped string is refused with
+    /// `E-DECIDER-CHECK-UNITS` naming the check.
+    #[serde(default)]
+    unit_document: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    unit_section: Option<serde_yaml_ng::Value>,
     /// Every key the fields above don't name. `SourceState` uses
     /// `deny_unknown_fields`, but serde's error for it surfaces only as the
     /// outer "failed to parse front-matter" context, which names neither the
@@ -547,6 +554,8 @@ const SOURCE_GATE_KEYS: &[&str] = &[
     "criteria",
     "units",
     "max_units",
+    "unit_document",
+    "unit_section",
 ];
 
 /// The keys a decider-check criterion may carry.
@@ -615,6 +624,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
             let gate = compile_gate(state_name, gate_name, source_gate)?;
             compiled_gates.insert(gate_name.clone(), gate);
         }
+        resolve_unit_caps(state_name, &mut compiled_gates)?;
 
         // Transform source transitions to compiled transitions.
         let compiled_transitions: Vec<Transition> = source_state
@@ -992,6 +1002,8 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
         ("criteria", source.criteria.is_some()),
         ("units", source.units.is_some()),
         ("max_units", source.max_units.is_some()),
+        ("unit_document", source.unit_document.is_some()),
+        ("unit_section", source.unit_section.is_some()),
     ] {
         if present {
             return Err(anyhow!(
@@ -1307,6 +1319,19 @@ fn compile_decider_check(
             }
         },
     };
+    // The name shape and the unit-mode rule are `validate_spec`'s, so a
+    // cached template gets them too; only the type is checked here.
+    let unit_label = |key: &str, raw: &Option<serde_yaml_ng::Value>| match raw {
+        None => Ok(None),
+        Some(serde_yaml_ng::Value::String(s)) => Ok(Some(s.clone())),
+        Some(v) => Err(err(
+            "E-DECIDER-CHECK-UNITS",
+            format!(": {} must be a string, found {:?}", key, v),
+            "set it to a short name such as prd, or omit it",
+        )),
+    };
+    let unit_document = unit_label("unit_document", &source.unit_document)?;
+    let unit_section = unit_label("unit_section", &source.unit_section)?;
     let mut criteria = Vec::new();
     match &source.criteria {
         None => {}
@@ -1452,8 +1477,36 @@ fn compile_decider_check(
             criteria,
             units,
             max_units,
+            unit_document,
+            unit_section,
         }),
     })
+}
+
+/// Write each unit-mode check on one state that declares no `max_units`
+/// its share of the state's unit bound (`unit_caps`), so the compiled spec
+/// carries the cap the evaluator applies. Refused with
+/// `E-DECIDER-CHECK-UNITS` when the declared caps leave no share.
+fn resolve_unit_caps(state_name: &str, gates: &mut BTreeMap<String, Gate>) -> anyhow::Result<()> {
+    use super::decider_check::{unit_caps, DeciderCheckSpec};
+    let checks: Vec<(&str, &DeciderCheckSpec)> = gates
+        .iter()
+        .filter(|(_, g)| g.gate_type == GATE_TYPE_DECIDER_CHECK)
+        .filter_map(|(n, g)| g.decider_check.as_ref().map(|s| (n.as_str(), s)))
+        .collect();
+    if checks.is_empty() {
+        return Ok(());
+    }
+    let caps = unit_caps(state_name, &checks).map_err(|e| anyhow!("validation error: {}", e))?;
+    let names: Vec<String> = checks.iter().map(|(n, _)| n.to_string()).collect();
+    for (name, cap) in names.iter().zip(caps) {
+        if let Some(spec) = gates.get_mut(name).and_then(|g| g.decider_check.as_mut()) {
+            if spec.units.is_some() {
+                spec.max_units = cap;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Convert a `request-leg` gate's raw `expect` value into its compiled form.

@@ -45,7 +45,7 @@ use crate::engine::types::{Event, EventPayload};
 use crate::findings::{Finding, FindingLevel, GateFailure, MessageSource};
 use crate::gate::{GateOutcome, StructuredGateResult};
 use crate::session::SessionBackend;
-use crate::template::decider_check::{declaration_hash, CheckMode, DeciderCheckSpec, UnitsMode};
+use crate::template::decider_check::{CheckMode, DeciderCheckSpec, UnitsMode};
 use crate::template::types::{Gate, GATE_TYPE_DECIDER_CHECK};
 
 /// Model recorded when no answer named one.
@@ -86,8 +86,10 @@ impl ConsultBudget {
 }
 
 /// Most (unit, criterion) consultations one `koto next` sends for unit-mode
-/// checks (DESIGN-doc-rule-checks-m4.md, Decision 2).
-pub const MAX_UNIT_CONSULTATIONS_PER_CALL: usize = 32;
+/// checks (DESIGN-doc-rule-checks-m4.md, Decision 2). It is the per-state
+/// compile-time bound, so one state's declared units always fit.
+pub const MAX_UNIT_CONSULTATIONS_PER_CALL: usize =
+    crate::template::decider_check::MAX_UNIT_CONSULTATIONS_PER_STATE as usize;
 
 /// The per-`koto next` count of unit-mode consultations. It is separate
 /// from [`ConsultBudget`]: a unit-mode check draws only from this one, so
@@ -230,9 +232,7 @@ pub fn declaration_hashes(gates: &BTreeMap<String, Gate>) -> BTreeMap<String, Ve
                 name.clone(),
                 spec.criteria
                     .iter()
-                    .map(|c| {
-                        declaration_hash(c, &g.command, spec.max_bytes, &spec.label, spec.units)
-                    })
+                    .map(|c| spec.declaration_hash(c, &g.command))
                     .collect(),
             ))
         })
@@ -1427,6 +1427,8 @@ mod tests {
                 .collect(),
             units: None,
             max_units: None,
+            unit_document: None,
+            unit_section: None,
         });
         gate
     }

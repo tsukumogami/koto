@@ -331,13 +331,14 @@ fn max_units_compiles_and_values_below_one_are_refused() {
     assert_eq!(gate.decider_check.as_ref().unwrap().max_units, Some(3));
     let json = serde_json::to_value(gate).unwrap();
     assert_eq!(json["decider_check"]["max_units"], 3);
-    // Without it nothing is added, so the compiled JSON is unchanged.
+    // Without it a unit-mode check is compiled with its share of the
+    // state's bound, all 32 for a lone one-criterion check.
     let plain = expect_ok(&template(
         &check("g", &[criterion("r")], "        units: jsonl\n"),
         PLAIN_TRANSITIONS,
     ));
     let json = serde_json::to_value(&plain.states["review"].gates["g"]).unwrap();
-    assert!(json["decider_check"].get("max_units").is_none(), "{}", json);
+    assert_eq!(json["decider_check"]["max_units"], 32, "{}", json);
     for v in ["0", "-1", "1.5", "three", "[3]"] {
         expect_err(
             &template(
@@ -354,6 +355,283 @@ fn max_units_compiles_and_values_below_one_are_refused() {
     let gates =
         "      g:\n        type: command\n        command: \"true\"\n        max_units: 3\n";
     expect_err(&template(gates, PLAIN_TRANSITIONS), "E-DECIDER-CHECK-FIELD");
+}
+
+/// The compiled `max_units` of check `name` in state `review`.
+fn compiled_max_units(t: &CompiledTemplate, name: &str) -> Option<u32> {
+    t.states["review"].gates[name]
+        .decider_check
+        .as_ref()
+        .unwrap()
+        .max_units
+}
+
+const UNITS: &str = "        units: jsonl\n";
+
+fn criteria(ids: &[&str]) -> Vec<String> {
+    ids.iter().map(|id| criterion(id)).collect()
+}
+
+#[test]
+fn a_state_summing_past_32_units_is_refused_and_32_compiles() {
+    // 11 units times 3 criteria is 33.
+    let over = template(
+        &check(
+            "g",
+            &criteria(&["a", "b", "c"]),
+            "        units: jsonl\n        max_units: 11\n",
+        ),
+        PLAIN_TRANSITIONS,
+    );
+    let e = expect_err(&over, "E-DECIDER-CHECK-UNITS");
+    assert!(e.contains("state \"review\""), "{}", e);
+    assert!(e.contains("33"), "{}", e);
+
+    // Across two checks: 16 * 1 + 17 * 1 is 33, and 16 + 16 is 32.
+    let two = |a: u32, b: u32| {
+        format!(
+            "{}\n{}",
+            check(
+                "first",
+                &[criterion("a")],
+                &format!("{UNITS}        max_units: {a}\n")
+            ),
+            check(
+                "second",
+                &[criterion("b")],
+                &format!("{UNITS}        max_units: {b}\n")
+            )
+        )
+    };
+    let e = expect_err(
+        &template(&two(16, 17), PLAIN_TRANSITIONS),
+        "E-DECIDER-CHECK-UNITS",
+    );
+    assert!(e.contains("33"), "{}", e);
+    let t = expect_ok(&template(&two(16, 16), PLAIN_TRANSITIONS));
+    assert_eq!(compiled_max_units(&t, "first"), Some(16));
+
+    // 16 units times 2 criteria is exactly 32.
+    let t = expect_ok(&template(
+        &check(
+            "g",
+            &criteria(&["a", "b"]),
+            "        units: jsonl\n        max_units: 16\n",
+        ),
+        PLAIN_TRANSITIONS,
+    ));
+    assert_eq!(compiled_max_units(&t, "g"), Some(16));
+}
+
+#[test]
+fn an_undeclared_max_units_compiles_to_its_share_of_32() {
+    for (ids, share) in [
+        (&["a"][..], 32),
+        (&["a", "b"][..], 16),
+        (&["a", "b", "c"][..], 10),
+    ] {
+        let t = expect_ok(&template(
+            &check("g", &criteria(ids), UNITS),
+            PLAIN_TRANSITIONS,
+        ));
+        assert_eq!(compiled_max_units(&t, "g"), Some(share), "{:?}", ids);
+        let json = serde_json::to_value(&t.states["review"].gates["g"]).unwrap();
+        assert_eq!(json["decider_check"]["max_units"], share);
+    }
+
+    // Two one-criterion unit-mode checks on one state get 16 each.
+    let gates = format!(
+        "{}\n{}",
+        check("first", &[criterion("a")], UNITS),
+        check("second", &[criterion("b")], UNITS)
+    );
+    let t = expect_ok(&template(&gates, PLAIN_TRANSITIONS));
+    assert_eq!(compiled_max_units(&t, "first"), Some(16));
+    assert_eq!(compiled_max_units(&t, "second"), Some(16));
+
+    // A check outside unit mode takes no share and gets no max_units.
+    let gates = format!(
+        "{}\n{}",
+        check("plain", &[criterion("a")], ""),
+        check("units", &[criterion("b")], UNITS)
+    );
+    let t = expect_ok(&template(&gates, PLAIN_TRANSITIONS));
+    assert_eq!(compiled_max_units(&t, "plain"), None);
+    assert_eq!(compiled_max_units(&t, "units"), Some(32));
+}
+
+#[test]
+fn a_mixed_state_divides_what_the_declared_checks_leave() {
+    // 8 * 2 declared leaves 16 for the two undeclared criteria: 8 each.
+    let gates = format!(
+        "{}\n{}\n{}",
+        check(
+            "declared",
+            &criteria(&["a", "b"]),
+            "        units: jsonl\n        max_units: 8\n"
+        ),
+        check("first", &[criterion("c")], UNITS),
+        check("second", &[criterion("d")], UNITS)
+    );
+    let t = expect_ok(&template(&gates, PLAIN_TRANSITIONS));
+    assert_eq!(compiled_max_units(&t, "declared"), Some(8));
+    assert_eq!(compiled_max_units(&t, "first"), Some(8));
+    assert_eq!(compiled_max_units(&t, "second"), Some(8));
+
+    // A declared check that takes the whole bound leaves nothing.
+    let gates = format!(
+        "{}\n{}",
+        check(
+            "declared",
+            &[criterion("a")],
+            "        units: jsonl\n        max_units: 32\n"
+        ),
+        check("undeclared", &[criterion("b")], UNITS)
+    );
+    let e = expect_err(
+        &template(&gates, PLAIN_TRANSITIONS),
+        "E-DECIDER-CHECK-UNITS",
+    );
+    assert!(e.contains("state \"review\""), "{}", e);
+    assert!(e.contains("\"undeclared\""), "{}", e);
+}
+
+#[test]
+fn unit_fields_on_a_check_without_units_are_refused_naming_the_field() {
+    for (field, line) in [
+        ("max_units", "        max_units: 3\n"),
+        ("unit_document", "        unit_document: prd\n"),
+        (
+            "unit_section",
+            "        unit_section: acceptance-criteria\n",
+        ),
+    ] {
+        let e = expect_err(
+            &template(&check("g", &[criterion("r")], line), PLAIN_TRANSITIONS),
+            "E-DECIDER-CHECK-UNITS",
+        );
+        assert!(e.contains(field), "{}: {}", field, e);
+        assert!(e.contains("\"g\""), "{}", e);
+    }
+    // On another gate type they are decider-check keys out of place.
+    for line in ["unit_document: prd", "unit_section: acs"] {
+        let gates =
+            format!("      g:\n        type: command\n        command: \"true\"\n        {line}\n");
+        expect_err(
+            &template(&gates, PLAIN_TRANSITIONS),
+            "E-DECIDER-CHECK-FIELD",
+        );
+    }
+}
+
+#[test]
+fn unit_labels_in_the_name_shape_compile_and_others_are_refused() {
+    let longest = "x".repeat(128);
+    for value in [
+        "prd",
+        "acceptance-criteria",
+        "a.b_c:d/e@f-g",
+        longest.as_str(),
+    ] {
+        let extra = format!(
+            "{UNITS}        unit_document: \"{value}\"\n        unit_section: \"{value}\"\n"
+        );
+        let t = expect_ok(&template(
+            &check("g", &[criterion("r")], &extra),
+            PLAIN_TRANSITIONS,
+        ));
+        let spec = t.states["review"].gates["g"]
+            .decider_check
+            .as_ref()
+            .unwrap();
+        assert_eq!(spec.unit_document.as_deref(), Some(value));
+        assert_eq!(spec.unit_section.as_deref(), Some(value));
+        let json = serde_json::to_value(&t.states["review"].gates["g"]).unwrap();
+        assert_eq!(json["decider_check"]["unit_document"], value);
+        assert_eq!(json["decider_check"]["unit_section"], value);
+    }
+    let too_long = "x".repeat(129);
+    for (field, value) in [
+        ("unit_document", "\"\""),
+        ("unit_document", "\"/abs\""),
+        ("unit_section", "\"~home\""),
+        ("unit_section", "\"-opt\""),
+        ("unit_document", "\"has space\""),
+        ("unit_section", "\"semi;colon\""),
+        ("unit_document", too_long.as_str()),
+        ("unit_section", "3"),
+        ("unit_document", "[prd]"),
+    ] {
+        let extra = format!("{UNITS}        {field}: {value}\n");
+        let e = expect_err(
+            &template(&check("g", &[criterion("r")], &extra), PLAIN_TRANSITIONS),
+            "E-DECIDER-CHECK-UNITS",
+        );
+        assert!(e.contains(field), "{}: {}", field, e);
+    }
+    // Without them nothing is added.
+    let t = expect_ok(&template(
+        &check("g", &[criterion("r")], UNITS),
+        PLAIN_TRANSITIONS,
+    ));
+    let json = serde_json::to_value(&t.states["review"].gates["g"]).unwrap();
+    assert!(
+        json["decider_check"].get("unit_document").is_none(),
+        "{}",
+        json
+    );
+    assert!(
+        json["decider_check"].get("unit_section").is_none(),
+        "{}",
+        json
+    );
+}
+
+#[test]
+fn unit_labels_join_the_declaration_hash_only_when_set() {
+    let hashes = |extra: &str| {
+        let t = expect_ok(&template(
+            &check("g", &[criterion("r")], extra),
+            PLAIN_TRANSITIONS,
+        ));
+        koto::cli::check_evaluator::declaration_hashes(&t.states["review"].gates)["g"].clone()
+    };
+    let plain = hashes(UNITS);
+    let doc = hashes(&format!("{UNITS}        unit_document: prd\n"));
+    let section = hashes(&format!("{UNITS}        unit_section: prd\n"));
+    assert_ne!(doc, plain);
+    assert_ne!(section, plain);
+    assert_ne!(doc, section);
+    // The cap, declared or defaulted, stays out of the hash.
+    assert_eq!(hashes(&format!("{UNITS}        max_units: 4\n")), plain);
+}
+
+/// Templates that use none of the unit or rule fields compile to the bytes
+/// and declaration hashes they had on v0.25.0. The bytes are pinned by the
+/// compiled snapshots of `tests/fixtures/decider_checks/` (recorded with the
+/// v0.25.0 binary, checked by `compat_baseline_test`); the hashes, which
+/// the compiled bytes don't hold, are pinned here, computed from v0.25.0's
+/// fingerprint.
+#[test]
+fn a_check_without_the_new_fields_keeps_its_released_declaration_hash() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (fixture, gate, expected) in [
+        (
+            "comment-reason.md",
+            "comment_reasons",
+            "fce2a85a08db7d28e3628d62164f76ccab933004497a1d55fc8bc914899bd0af",
+        ),
+        (
+            "acceptance-criteria.md",
+            "binary_criteria",
+            "c1129ee3eda04070c9272e963a6b9e659e5ee7b85bed2782062ec9f5f909e430",
+        ),
+    ] {
+        let path = root.join("tests/fixtures/decider_checks").join(fixture);
+        let t = compile(&path, false).unwrap();
+        let hashes = koto::cli::check_evaluator::declaration_hashes(&t.states["review"].gates);
+        assert_eq!(hashes[gate], vec![expected.to_string()], "{}", fixture);
+    }
 }
 
 #[test]
