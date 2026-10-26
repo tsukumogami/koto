@@ -158,7 +158,7 @@ leave shadow.
   unit's `text` as that unit's slice, in the order printed.
 - **R3. Unit keys are names.** `key`, `document` and `section` each match
   koto's name shape (letters, digits and `._:/@-`, 1 to 128 bytes, not
-  starting with `/` or `~`). Keys are compared byte for byte and must be
+  starting with `/`, `~` or `-`). Keys are compared byte for byte and must be
   unique within one extraction. A line that isn't a JSON object with string
   `key` and `text`, a field outside the name shape, or a duplicate key makes
   the evaluation an extraction failure: every criterion is `unanswered` with
@@ -265,23 +265,34 @@ leave shadow.
 - **R16. Per-unit decider records.** Each per-unit consultation, fallback
   and agent answer records the unit's key and, when given, its document and
   section, as optional fields on the existing `decider_checked`,
-  `decider_fallback` and `decider_check_answered` events, and the run
-  journal relays them as `koto.unit.key`, `koto.unit.document` and
-  `koto.unit.section` on the records of the same names. Records without a
-  unit are written exactly as today.
+  `decider_fallback` and `decider_check_answered` events in the session
+  log, and the run journal relays them on the records of the same names
+  without exporting any raw value an extraction printed:
+  - `koto.unit.key` is always the key's `sha256:` digest (the same 32-hex
+    form rule ids use outside the name shape), so it joins records about
+    one unit without naming it;
+  - `koto.unit.document` and `koto.unit.section` are the check's declared
+    `unit_document` and `unit_section` when the template declares them
+    (template names such as `prd` and `acceptance-criteria`), and
+    otherwise the digest of the printed value, or absent when none was
+    printed.
+
+  A unit-mode gate may declare `unit_document` and `unit_section`, each in
+  the name shape. Records without a unit are written exactly as today.
 - **R17. Confidence.** A `decider_checked` record whose consultation read an
   answer carries `koto.decider.confidence_bp`: the highest of the decider's
   probabilities for `pass`, `fail` and `unclear`, times 10,000 and rounded
   to the nearest integer (halves up), so 0 to 10,000. It is absent when no
-  answer was read.
-  The run-journal reference records this as the one exception to its rule
-  that records hold no probability.
+  answer was read. The run-journal reference, the journal's module
+  documentation and its no-probability test record this as the one
+  exception to the rule that records hold no probability, and the
+  telemetry definitions' matching rule is amended with it.
 - **R18. Rule deliveries.** Each `rules` entry delivered in a response is
   recorded once, after the response is printed, as a `rule_delivered` event
   relayed to the run journal as a `rule_delivered` record with `koto.state`,
-  `koto.check`, `koto.rule.id`, `koto.rule.level` (`summary` or `full`)
-  and, in unit mode, `koto.rule.unit_count` (how many units failed that
-  rule). koto has one rule-delivery record kind: any other check that
+  `koto.check`, `koto.rule.id`, `koto.rule.delivery` (a closed vocabulary:
+  `summary` or `full`) and, in unit mode, `koto.rule.unit_count` (how many
+  units failed that rule). koto has one rule-delivery record kind: any other check that
   delivers rule text, now or later, writes this kind with these fields.
 - **R19. Names collide with nothing.** Every new attribute is in the `koto.`
   namespace and is neither equal to nor a dot-prefix of an existing one; the
@@ -309,10 +320,10 @@ leave shadow.
 
   | Document | Terms |
   |---|---|
-  | koto-author template-format reference | `units`, `max_units`, `summary`, `rule_text` |
+  | koto-author template-format reference | `units`, `max_units`, `unit_document`, `unit_section`, `summary`, `rule_text` |
   | decider authoring guide | `units`, `max_units`, `summary`, `rule_text`, `rules` |
   | error-code reference | `E-DECIDER-CHECK-UNITS`, `E-DECIDER-CHECK-RULE`, `unit_required`, `unit_not_expected`, `unknown_unit` |
-  | run-journal reference | `koto.unit.key`, `koto.decider.confidence_bp`, `rule_delivered` |
+  | run-journal reference | `koto.unit.key`, `koto.decider.confidence_bp`, `rule_delivered`, `koto.rule.delivery` |
   | session-feed reference | `rule_delivered`, the optional `unit` fields |
   | koto-user skill and its command and response references | `--unit`, `rules`, `units` |
 
@@ -399,16 +410,19 @@ Rule delivery:
 Telemetry and compatibility:
 
 - [ ] The run journal's `decider_checked`, `decider_fallback` and
-  `decider_check_answered` records carry `koto.unit.key`,
-  `koto.unit.document` and `koto.unit.section` for unit-mode checks and
-  omit them otherwise; with the stub answering pass 0.12345, fail 0.8, unclear
+  `decider_check_answered` records carry `koto.unit.key` as the key's
+  `sha256:` digest, and `koto.unit.document` and `koto.unit.section` as the
+  declared `unit_document` and `unit_section` when declared and as digests
+  of the printed values otherwise, for unit-mode checks, and omit them
+  otherwise; no raw key, document path or section printed by an extraction
+  appears in the run journal; with the stub answering pass 0.12345, fail 0.8, unclear
   0.07655, `decider_checked` carries `koto.decider.confidence_bp` 8000, and
   omits it on `over_budget` and `extraction_failed`. (R16, R17)
 - [ ] A shadow criterion whose unit falls back holds the gate pending; the
   agent's `fail` answer to it is recorded and the gate then passes. (R8,
   R10)
 - [ ] Each delivered `rules` entry produces exactly one `rule_delivered`
-  record with `koto.rule.level`, and in unit mode `koto.rule.unit_count`
+  record with `koto.rule.delivery`, and in unit mode `koto.rule.unit_count`
   equal to the entry's key count; twenty failing units of one rule produce
   one record. (R18)
 - [ ] The run journal's doc tests and collision tests pass listing every new
@@ -483,9 +497,14 @@ Telemetry and compatibility:
   records stay small; hundredths of a percent keep the four decimal places
   the session log already stores. The highest probability is used because
   it's defined for every answer, ties and escapes included.
-- **Unit keys must be names.** A free-form key would be digested on export
-  and couldn't be lined up against reviewers' verdicts without the source
-  document. Extraction scripts can always slug a heading.
+- **Unit keys must be names, and export as digests.** Names keep the
+  command line and the session log safe and readable locally. Exported
+  records carry the key's digest and a template-declared document and
+  section name instead of what the extraction printed, because printed
+  paths and headings can carry work names, the same reason context keys
+  never leave the host. A digest still joins every record about one unit,
+  and a reviewer's verdict on the same unit can be joined by digesting its
+  key the same way.
 - **One rule-delivery record kind.** Command gates and decider checks both
   hand back rules; two record shapes would split one readout in two. This
   feature defines `rule_delivered` with fields any check can fill, so
