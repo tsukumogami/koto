@@ -2656,7 +2656,9 @@ fn a_unit_mode_check_relays_the_units_digests_and_declared_labels() {
     let f = session_in_a();
     let unit = UnitRef {
         key: "SENTINEL-KEY-ac-3".into(),
-        document: Some("docs/SENTINEL-DOC.md".into()),
+        // Not path-shaped, so the doc-names check doesn't read it as a
+        // repository path.
+        document: Some("SENTINEL-DOC".into()),
         section: Some("SENTINEL-SECTION".into()),
     };
     let declared = UnitLabels {
@@ -2727,10 +2729,7 @@ fn a_unit_mode_check_relays_the_units_digests_and_declared_labels() {
     assert_eq!(d[0]["koto.unit.document"], "prd");
     assert_eq!(d[0]["koto.unit.section"], "acceptance-criteria");
     assert_eq!(d[0]["koto.decider.confidence_bp"], 5432);
-    assert_eq!(
-        d[1]["koto.unit.document"],
-        digest("docs/SENTINEL-DOC.md").as_str()
-    );
+    assert_eq!(d[1]["koto.unit.document"], digest("SENTINEL-DOC").as_str());
     assert_eq!(
         d[1]["koto.unit.section"],
         digest("SENTINEL-SECTION").as_str()
