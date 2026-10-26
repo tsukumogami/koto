@@ -561,8 +561,31 @@ fn a_session_from_another_worktree_is_origin_mismatch() {
     );
     assert_eq!(code, 2);
     assert_eq!(err["code"], "origin_mismatch", "{err}");
-    assert!(!err["error"].as_str().unwrap().contains("no origin record"));
+    let msg = err["error"].as_str().unwrap();
+    assert!(!msg.contains("no origin record"), "{msg}");
+    assert!(msg.contains("another session name"), "{msg}");
+    let home = std::fs::canonicalize(tmp.path()).unwrap();
+    assert!(
+        msg.contains(&format!(
+            "run the command from {}, where the session belongs",
+            home.display()
+        )),
+        "{msg}"
+    );
+    assert_names_no_removal(msg);
     assert_eq!(state_bytes(tmp.path(), "s"), before);
+}
+
+/// Neither `origin_mismatch` message names a removal as the way forward.
+fn assert_names_no_removal(msg: &str) {
+    for removal in [
+        "session cleanup",
+        "--cleanup",
+        "session prune",
+        "workspace prune",
+    ] {
+        assert!(!msg.contains(removal), "names {removal}: {msg}");
+    }
 }
 
 #[test]
@@ -594,6 +617,9 @@ fn a_session_in_another_store_is_origin_mismatch() {
     assert_eq!(output.status.code(), Some(2));
     let err = json(&String::from_utf8_lossy(&output.stdout));
     assert_eq!(err["code"], "origin_mismatch", "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains("the session store it was started in"), "{msg}");
+    assert_names_no_removal(msg);
     assert_eq!(state_bytes(tmp.path(), "s"), before);
 }
 
@@ -631,7 +657,12 @@ fn a_session_with_no_origin_record_is_refused_and_named() {
     assert_eq!(err["code"], "origin_mismatch", "{err}");
     let msg = err["error"].as_str().unwrap();
     assert!(msg.contains("no origin record"), "{msg}");
-    assert!(msg.contains("koto session cleanup old-s"), "{msg}");
+    assert!(
+        msg.contains("finish it with the koto version that started it"),
+        "{msg}"
+    );
+    assert!(msg.contains("another session name"), "{msg}");
+    assert_names_no_removal(msg);
     assert_eq!(state_bytes(tmp.path(), "old-s"), before);
 }
 
