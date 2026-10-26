@@ -30,7 +30,13 @@
 //!   and is reported.
 //!
 //! Log events, keys and links in the moved sessions are untouched, and no
-//! context key is written anywhere.
+//! context key is written anywhere. Under the cloud backend the continues
+//! relation's back-references follow the move: a moved session holding a
+//! relation names its new self beside its predecessor before it moves and
+//! takes the old name's back-reference out after, and the valid
+//! back-references beside a moved predecessor (at most 64) are carried to
+//! its new name, with any left behind reported and none deleted that
+//! doesn't check out.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -297,9 +303,20 @@ pub(crate) fn move_aside(backend: &dyn SessionBackend, name: &str) -> Result<Mov
 
     // ---- step 3: delete the old remote prefixes; failures roll forward ----
     let mut undeleted = Vec::new();
-    for (old, _) in &renames {
+    for (old, new) in &renames {
         if let Err(e) = backend.delete_remote_checked(old) {
             undeleted.push((old.clone(), format!("{e:#}")));
+        }
+        // The back-references its successors keep beside it move with it,
+        // and its own pointer, written under the new name before the move,
+        // replaces the old one. What doesn't move is reported, never
+        // deleted.
+        for note in backend.repoint_after_move(old, new) {
+            eprintln!(
+                "warning: moving '{}' aside: {}",
+                crate::session::hierarchy::sanitize(old),
+                crate::session::hierarchy::sanitize(&note)
+            );
         }
     }
     Ok(Moved {

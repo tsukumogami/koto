@@ -779,10 +779,18 @@ fn create(
             // lost. A pin set on the old run since it was judged keeps it,
             // and it moves aside instead.
             kept_pinned = super::workspace::sweep_terminal_descendants(backend, backend, name);
-            match crate::session::pin::remove_guarded(backend, name) {
+            match crate::session::pin::remove_by_rule(backend, name) {
                 Ok(crate::session::pin::Removal::Removed) => {}
                 Ok(crate::session::pin::Removal::Kept(guard)) => {
                     disposition = Disposition::pinned(&guard);
+                }
+                // A later session continuing it, whose back-reference was
+                // written since it was judged: it moves aside instead.
+                Ok(crate::session::pin::Removal::KeptByRelation(related)) => {
+                    disposition = Disposition::Related {
+                        reason: crate::session::hierarchy::relation_text(&related).join("; "),
+                        fields: crate::session::hierarchy::relation_json(&related),
+                    };
                 }
                 Err(e) => refuse(
                     entry,

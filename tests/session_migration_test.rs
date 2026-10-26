@@ -372,10 +372,16 @@ fn cleanup_and_a_terminal_tick_leave_the_marker_in_place() {
     // each of the three ticks lists once for its check (a failed listing
     // isn't asked again in that process), and rust-s3 retries a failed
     // request once, so six requests fail and the cleanup's is answered.
+    // The marker names a target the bucket doesn't hold: the removal reads
+    // a marker's target as a later session that could keep the source, and
+    // an absent one keeps nothing.
     start_session(&a, "ticked");
     let ticked = session_prefix(&a, "ticked");
     let marker = format!("{}migrated.json", ticked);
-    s3.put(&marker, br#"{"schema":1}"#);
+    s3.put(
+        &marker,
+        br#"{"schema":1,"target":{"session":"gone","session_id":"00000009-0000-4000-8000-000000000000","workspace":"/elsewhere","prefix":"fedcba9876543210"}}"#,
+    );
     s3.fail_times("LIST", &ticked, 500, 6);
     for args in [
         vec!["next", "ticked"],

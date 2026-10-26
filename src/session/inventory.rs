@@ -130,20 +130,8 @@ pub fn inspect_full(
     };
     let template_state = compiled.states.get(&machine.current_state);
 
-    let status = if cancelled_last(&events) {
-        SessionStatus::Cancelled
-    } else if template_state.is_some_and(|s| s.terminal) {
-        SessionStatus::Terminal
-    } else {
-        SessionStatus::Running
-    };
+    let (status, stopped_at) = status_of(&events, template_state.is_some_and(|s| s.terminal));
     let failure = status == SessionStatus::Terminal && template_state.is_some_and(|s| s.failure);
-    let stopped_at = match status {
-        SessionStatus::Cancelled => trailing_cancel(&events),
-        SessionStatus::Terminal => last_state_change(&events),
-        _ => None,
-    }
-    .map(|e| e.timestamp.clone());
 
     (
         Inspection {
@@ -155,6 +143,30 @@ pub fn inspect_full(
         },
         Some(fields),
     )
+}
+
+/// Where a readable log stands, given whether the state it stands in is
+/// terminal in its template, and when it stopped: the rules [`inspect`]
+/// applies, shared with the bucket walk, which reads a later member's log
+/// from the bucket (`crate::session::continues_bucket`). A trailing cancel
+/// is `Cancelled`, stopped at that cancel; a terminal state is `Terminal`,
+/// stopped at the event that moved the session there; anything else is
+/// `Running`, with no stop.
+pub fn status_of(events: &[Event], terminal: bool) -> (SessionStatus, Option<String>) {
+    let status = if cancelled_last(events) {
+        SessionStatus::Cancelled
+    } else if terminal {
+        SessionStatus::Terminal
+    } else {
+        SessionStatus::Running
+    };
+    let stopped_at = match status {
+        SessionStatus::Cancelled => trailing_cancel(events),
+        SessionStatus::Terminal => last_state_change(events),
+        _ => None,
+    }
+    .map(|e| e.timestamp.clone());
+    (status, stopped_at)
 }
 
 /// True when the log holds a `workflow_cancelled` that no transition,

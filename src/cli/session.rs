@@ -584,6 +584,9 @@ pub fn handle_link(backend: &Backend, session: &str, dispatched_by: &str) -> Res
 pub(crate) struct ContinuesTarget {
     pub pred: String,
     hints: crate::session::links::LinkHints,
+    /// Under the cloud backend, the predecessor's workspace prefix: where
+    /// its back-reference goes and what the relation records.
+    prefix: Option<String>,
 }
 
 /// Why `--continues` was refused: the message and the exit code (2 for
@@ -613,12 +616,15 @@ impl ContinuesError {
 /// successor, an operator by hand and an unrelated agent session record the
 /// relation the same way.
 ///
-/// Under the cloud backend it refuses (exit 2): the relation needs a
-/// back-reference in the predecessor's bucket prefix, which this build
-/// doesn't write, and a relation in the bucket without one would be one a
-/// host that never pulled the successor can't find. On the local backend
-/// there is one store, so `--continues-from` is checked and the predecessor
-/// is looked up there.
+/// Under the cloud backend the predecessor is looked up in this host's copy
+/// when it is in the successor's own workspace and held here, and
+/// otherwise in the bucket, under the workspace `--continues-from` names
+/// (the successor's own by default): a bucket that can't be listed exits 3,
+/// a session the bucket doesn't hold exits 2. A predecessor with the
+/// successor's own name is accepted only from another workspace (an
+/// import's copy naming its source). On the local backend there is one
+/// store, so `--continues-from` is checked and the predecessor is looked up
+/// there.
 pub(crate) fn resolve_continues(
     backend: &Backend,
     successor: &str,
@@ -630,29 +636,70 @@ pub(crate) fn resolve_continues(
 
     links::validate_peer(LinkKind::Continues, pred)
         .map_err(|e| ContinuesError::caller(format!("--continues: {e}")))?;
-    if pred == successor {
+    let from_prefix = match from {
+        Some(from) => Some(
+            crate::session::cloud::workspace_read::WorkspaceId::parse(from)
+                .map_err(|e| ContinuesError::caller(format!("--continues-from: {}", e.message)))?
+                .prefix()
+                .to_string(),
+        ),
+        None => None,
+    };
+    let cloud = backend.as_cloud();
+    let own_prefix = cloud.map(|c| c.workspace_prefix().to_string());
+    let elsewhere = matches!(
+        (&from_prefix, &own_prefix),
+        (Some(f), Some(own)) if f != own
+    );
+    if pred == successor && !elsewhere {
         return Err(ContinuesError::caller(format!(
             "--continues: session '{successor}' can't continue itself"
         )));
     }
-    if let Some(from) = from {
-        crate::session::cloud::workspace_read::WorkspaceId::parse(from)
-            .map_err(|e| ContinuesError::caller(format!("--continues-from: {}", e.message)))?;
-    }
-    if backend.is_cloud() {
-        return Err(ContinuesError::caller(
-            "--continues: the cloud backend can't record a continues relation in this release: \
-             it needs a back-reference beside the predecessor in the bucket, which this koto \
-             doesn't write yet; nothing was written"
-                .to_string(),
-        ));
-    }
-    if !backend.exists(pred) {
-        return Err(ContinuesError::caller(format!(
-            "--continues: no session named '{pred}' in this store"
-        )));
-    }
-    if let Ok(header) = backend.read_header(pred) {
+    let (header, hints, prefix) = match cloud {
+        Some(cloud) if elsewhere || !backend.session_dir(pred).is_dir() => {
+            let pred_prefix = from_prefix
+                .clone()
+                .or(own_prefix.clone())
+                .unwrap_or_default();
+            let header = cloud
+                .remote_header_at(&pred_prefix, pred)
+                .map_err(|e| ContinuesError {
+                    message: format!(
+                        "--continues: the bucket couldn't be read to look '{pred}' up: {e:#}; \
+                         nothing was written"
+                    ),
+                    exit: super::EXIT_INFRASTRUCTURE,
+                })?
+                .ok_or_else(|| {
+                    ContinuesError::caller(format!(
+                        "--continues: no session named '{pred}' in workspace {pred_prefix}"
+                    ))
+                })?;
+            let hints = LinkHints {
+                session_id: Some(header.session_id.clone()).filter(|id| !id.is_empty()),
+                workspace: header
+                    .execution_dir
+                    .clone()
+                    .or_else(|| header.origin.as_ref().map(|o| o.anchor.clone()))
+                    .map(|p| p.to_string_lossy().into_owned()),
+            };
+            (Some(header), hints, Some(pred_prefix))
+        }
+        _ => {
+            if !backend.exists(pred) {
+                return Err(ContinuesError::caller(format!(
+                    "--continues: no session named '{pred}' in this store"
+                )));
+            }
+            (
+                backend.read_header(pred).ok(),
+                LinkHints::for_peer(backend, pred),
+                own_prefix.clone(),
+            )
+        }
+    };
+    if let Some(header) = header {
         match header.session_kind() {
             SessionKind::Anchor => {
                 return Err(ContinuesError::caller(format!(
@@ -671,7 +718,8 @@ pub(crate) fn resolve_continues(
     }
     Ok(ContinuesTarget {
         pred: pred.to_string(),
-        hints: LinkHints::for_peer(backend, pred),
+        hints,
+        prefix,
     })
 }
 
@@ -680,6 +728,12 @@ pub(crate) fn resolve_continues(
 /// session already holds changes nothing. A session already continuing
 /// another predecessor is refused with exit 2, writing nothing; a store
 /// that can't be read or written exits 3.
+///
+/// Under the cloud backend the back-reference goes first: it is PUT beside
+/// the predecessor before the relation is written, and a PUT the bucket
+/// doesn't confirm exits 3 with nothing written. The relation is then
+/// pushed strictly; when that fails, the relation and the pointer are taken
+/// back and the command exits 3, so running it again works (R19).
 pub(crate) fn record_continues(
     backend: &Backend,
     successor: &str,
@@ -691,24 +745,47 @@ pub(crate) fn record_continues(
         .ok()
         .map(|h| h.session_id)
         .filter(|id| !id.is_empty());
+    let cloud = backend.as_cloud();
     let hints = ContinuesHints {
         peer: target.hints.clone(),
-        prefix: None,
-        holder_session_id,
-        holder_prefix: None,
+        prefix: cloud.and(target.prefix.clone()),
+        holder_session_id: holder_session_id.clone(),
+        holder_prefix: cloud.map(|c| c.workspace_prefix().to_string()),
     };
-    links::write_continues(backend, successor, &target.pred, &hints).map_err(|e| {
-        match e.downcast_ref::<ContinuesRefusal>() {
-            Some(refusal) => ContinuesError::caller(format!("--continues: {refusal}")),
-            None => ContinuesError {
-                message: format!(
-                    "could not record that '{successor}' continues '{}': {e:#}",
-                    target.pred
-                ),
-                exit: super::EXIT_INFRASTRUCTURE,
-            },
-        }
-    })
+    let failed = |e: anyhow::Error| match e.downcast_ref::<ContinuesRefusal>() {
+        Some(refusal) => ContinuesError::caller(format!("--continues: {refusal}")),
+        None => ContinuesError {
+            message: format!(
+                "could not record that '{successor}' continues '{}': {e:#}; nothing was written",
+                target.pred
+            ),
+            exit: super::EXIT_INFRASTRUCTURE,
+        },
+    };
+    let write = || links::write_continues(backend, successor, &target.pred, &hints);
+    let (Some(cloud), Some(pred_prefix)) = (cloud, target.prefix.as_deref()) else {
+        return write().map_err(failed);
+    };
+    // A session that already continues another predecessor is refused
+    // before any pointer is written.
+    let held = links::continues_of(backend, successor).map_err(failed)?;
+    if let Some(existing) = held.iter().find(|p| **p != target.pred) {
+        return Err(failed(
+            ContinuesRefusal::OtherPredecessor {
+                existing: existing.clone(),
+            }
+            .into(),
+        ));
+    }
+    let Some(holder_id) = holder_session_id else {
+        return Err(failed(anyhow::anyhow!(
+            "the session's header records no session id, which its back-reference needs"
+        )));
+    };
+    let owed = cloud.pointer_for(successor, pred_prefix, &target.pred, &holder_id);
+    cloud
+        .record_continues_with_pointer(successor, &owed, write)
+        .map_err(failed)
 }
 
 /// Record `koto init --continues` in the session just opened, before the
@@ -765,6 +842,11 @@ pub fn handle_link_continues(
         );
     }
     if let Err(e) = backend.check_not_migrated(session) {
+        refuse(e.to_string(), super::EXIT_CALLER_ERROR);
+    }
+    // Under the cloud backend the back-reference names this directory's
+    // workspace as the successor's: a session bound to another one refuses.
+    if let Err(e) = backend.check_bound_here(session) {
         refuse(e.to_string(), super::EXIT_CALLER_ERROR);
     }
     let outcome =

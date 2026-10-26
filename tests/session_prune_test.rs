@@ -1046,8 +1046,14 @@ fn under_the_cloud_backend_apply_removes_the_remote_copy_first_and_keeps_the_mar
     env.done("stuck");
     settle();
     let prefix = env.prefix();
-    // A migration marker beside a session that is pruned stays.
-    s3.put(&format!("{prefix}/gone/migrated.json"), b"{}");
+    // A migration marker beside a session that is pruned stays. It names a
+    // target the bucket doesn't hold: the removal reads a marker's target as
+    // a later session that could keep the source, and an absent one keeps
+    // nothing.
+    s3.put(
+        &format!("{prefix}/gone/migrated.json"),
+        br#"{"schema":1,"target":{"session":"elsewhere","session_id":"00000009-0000-4000-8000-000000000000","workspace":"/elsewhere","prefix":"fedcba9876543210"}}"#,
+    );
     assert!(s3.keys_under(&format!("{prefix}/gone/")).len() > 1);
 
     // One of `stuck`'s remote objects refuses to be deleted.

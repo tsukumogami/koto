@@ -213,6 +213,21 @@ pub fn relation_report_json(r: &RelationVerdict) -> serde_json::Map<String, Valu
                 .collect::<Vec<_>>()),
         );
     }
+    if let Some(first) = r.unchecked.first() {
+        // The pin guard's `bucket_unchecked` names its `error`; the walk's
+        // adds the sessions it couldn't check, each with its own.
+        fields.insert(
+            "bucket_unchecked".to_string(),
+            json!({
+                "error": first.error.as_str(),
+                "sessions": r
+                    .unchecked
+                    .iter()
+                    .map(|u| json!({"name": sanitize(&u.name), "error": u.error.as_str()}))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
     fields
 }
 
@@ -243,6 +258,13 @@ pub fn relation_text(r: &RelationVerdict) -> Vec<String> {
             "kept: relation unreadable: {} ({})",
             sanitize(&u.holder),
             u.reason.as_str()
+        )
+    }));
+    lines.extend(r.unchecked.iter().map(|u| {
+        format!(
+            "kept: bucket not checked for what continues it: {} ({})",
+            sanitize(&u.name),
+            u.error.as_str()
         )
     }));
     lines

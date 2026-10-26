@@ -590,15 +590,18 @@ fn reclaim(
         }
     }
 
-    // Judge again, under the locks and before anything goes.
+    // Judge again, under the locks and before anything goes, reading the
+    // bucket again for the continues relation.
+    crate::session::continues_bucket::begin_pass(backend);
     let mut judge = Judge::new(graph, settings.clone(), now);
     let mut cleared = Vec::new();
     for (member, lock) in locked {
         let name = member.name.as_str();
         let judged = judge.judge(name, &scope_for(root, name)).map(|j| {
-            // Whether a later session continuing it has standing now. Its
-            // pin is the guard's, at the delete.
-            let related = (!j.verdict.is_kept()).then(|| relation_at_removal(backend, &j, name));
+            // Whether a later session continuing it has standing now, here.
+            // Its pin is the guard's, at the delete, and so is the bucket's
+            // answer about the relation, which reads the guard's listing.
+            let related = (!j.verdict.is_kept()).then(|| j.relation_of(name).clone());
             (j, related.filter(|r| r.keeps()))
         });
         let relation = match &judged {
@@ -659,11 +662,23 @@ fn reclaim(
         // Through the pin guard, under the lock held since the judgment: a
         // pin set during the prompt keeps the member, which is listed as
         // skipped with its pin. Like a member planned as kept by its pin, it
-        // keeps nothing above it.
-        match crate::session::pin::remove_guarded_with(backend, name, &lock, || {
+        // keeps nothing above it. Under the cloud backend a later session
+        // continuing it whose back-reference the judgment didn't see keeps
+        // it the same way.
+        match crate::session::pin::remove_by_rule_with(backend, name, &lock, || {
             backend.cleanup(name)
         }) {
             Ok(crate::session::pin::Removal::Removed) => out.removed.push(name.to_string()),
+            Ok(crate::session::pin::Removal::KeptByRelation(related)) => {
+                let mut entry = json!({
+                    "name": name,
+                    "reason": format!("now {}", hierarchy::relation_text(&related).join("; ")),
+                });
+                for (k, v) in hierarchy::relation_json(&related) {
+                    entry[k] = v;
+                }
+                out.skipped.push(entry);
+            }
             Ok(crate::session::pin::Removal::Kept(guard)) => {
                 // A local pin the guard read was set since the scan; a pin
                 // in the bucket, or a bucket that couldn't be checked, the
@@ -1042,8 +1057,19 @@ impl DescendantVisitor for Sweep<'_> {
         if let Some(record) = super::finished_record_for_child(backend, self.context_store, child) {
             super::write_finished_record(backend, &record);
         }
-        match crate::session::pin::remove_guarded(backend, child) {
+        match crate::session::pin::remove_by_rule(backend, child) {
             Ok(crate::session::pin::Removal::Removed) => true,
+            Ok(crate::session::pin::Removal::KeptByRelation(related)) => {
+                #[cfg(unix)]
+                super::forget_finished_record(backend, child);
+                self.pinned.push(KeptChild {
+                    name: child.to_string(),
+                    reason: "relation",
+                    detail: hierarchy::relation_text(&related).join("; "),
+                    pin: hierarchy::relation_json(&related),
+                });
+                true
+            }
             Ok(crate::session::pin::Removal::Kept(guard)) => {
                 #[cfg(unix)]
                 super::forget_finished_record(backend, child);
@@ -1063,24 +1089,41 @@ impl DescendantVisitor for Sweep<'_> {
 }
 
 /// The `kept_children` entry for a descendant the sweep keeps because the
-/// continues relation keeps it (DESIGN-koto-session-continues.md, R9):
-/// reason `relation`, the keepers as its detail, and the relation's fields.
-/// `None` when no relation keeps it. Judged only when a continues link may
-/// name the child ([`hierarchy::relation_probe`]), so a sweep of children
-/// nothing continues reads what it read before; anything that stops the
-/// judgment keeps the child.
+/// continues relation keeps it (R9): reason `relation`, the keepers as its
+/// detail, and the relation's fields. `None` when no relation keeps it.
+/// The local relation is judged only when a continues link may name the
+/// child ([`hierarchy::relation_probe`]), so a sweep of children nothing
+/// continues reads what it read before; anything that stops the judgment
+/// keeps the child. When nothing local keeps it, the bucket is asked under
+/// the cloud backend
+/// ([`crate::session::continues_bucket::relation_with_bucket`]), as at
+/// every other removal point.
 fn relation_kept_child(backend: &dyn SessionBackend, child: &str) -> Option<KeptChild> {
+    use crate::session::continues_bucket::{relation_with_bucket, Clock};
     let dir = backend.session_dir(child);
     let base = dir.parent()?;
-    if !hierarchy::relation_probe(base, child) {
-        return None;
-    }
     let kept = |detail: String, fields| KeptChild {
         name: child.to_string(),
         reason: "relation",
         detail,
         pin: fields,
     };
+    let report = |related: crate::session::hierarchy::RelationVerdict| {
+        related.keeps().then(|| {
+            kept(
+                hierarchy::relation_text(&related).join("; "),
+                hierarchy::relation_json(&related),
+            )
+        })
+    };
+    if !hierarchy::relation_probe(base, child) {
+        return report(relation_with_bucket(
+            backend,
+            Default::default(),
+            child,
+            &Clock::configured(),
+        ));
+    }
     let settings = match RetentionSettings::load() {
         Ok(s) => s,
         Err(e) => {
@@ -1099,13 +1142,13 @@ fn relation_kept_child(backend: &dyn SessionBackend, child: &str) -> Option<Kept
             ))
         }
     };
-    let related = Judge::new(&graph, settings, std::time::SystemTime::now()).relation(child);
-    related.keeps().then(|| {
-        kept(
-            hierarchy::relation_text(&related).join("; "),
-            hierarchy::relation_json(&related),
-        )
-    })
+    let now = std::time::SystemTime::now();
+    let clock = Clock {
+        keep: settings.keep.value,
+        now,
+    };
+    let local = Judge::new(&graph, settings, now).relation(child);
+    report(relation_with_bucket(backend, local, child, &clock))
 }
 
 /// Every descendant of `root` by koto lineage, whatever state it is in.

@@ -139,8 +139,9 @@ dispatch) reads it. Anyone who can write a session's context can hold a
 predecessor in place this way until the relation's holder is removed; there is
 no unlink verb.
 
-In this release the relation is local: under the cloud backend the verb
-refuses, so no relation reaches a bucket yet.
+Under the cloud backend the relation holds on every host sharing the bucket;
+[the continues relation in the bucket](#the-continues-relation-in-the-bucket)
+says how.
 
 ## Under the cloud backend
 
@@ -175,6 +176,109 @@ the source for it, so `koto session cleanup` in the old workspace and
 lost its pin on the way; check that the moved copy is pinned before removing
 the source.
 
+### The continues relation in the bucket
+
+A successor's relation lives under its own prefix, and nothing in the bucket
+indexes a relation by the session it names. So a successor also writes one
+small object beside its predecessor, a back-reference:
+
+```
+<predecessor prefix>/<predecessor>/ctx/koto/continued-by/<successor prefix>/<successor>
+```
+
+Its body is `{"v":1,"holder_session_id":"<id>"}` and nothing else: no
+workspace path is copied into another workspace's prefix. It is written by a
+direct PUT, never through the context store, so no manifest names it and no
+push deletes it. The listing every removal already makes of a session's
+`ctx/koto/` for its pin finds every successor, under any prefix.
+
+**Writing it.** `--continues` under the cloud backend looks the predecessor
+up (this host's copy when it is in the successor's own workspace, else the
+bucket, under the workspace `--continues-from` names), PUTs the
+back-reference, writes the relation and pushes it strictly. A predecessor the
+bucket doesn't hold exits 2; a bucket that can't be listed, a PUT it doesn't
+confirm, or a push that fails exits 3, and what was written is taken back, so
+running the command again works. A successor in another workspace writes its
+back-reference under the predecessor's prefix, which needs write access
+there. A relation recorded under the local backend (or by an earlier build)
+owes its back-reference: the next cloud command on the session writes it, and
+until it does, the relation stays out of every push. A session directory's
+`.continues-pointer` file, which the sync doesn't track, records the
+back-reference the bucket confirmed. A session renamed by a same-name replace
+or a batch rewind writes its back-reference under the new name before it
+moves, and takes the old one back after. A successor rebound to another
+checkout (`koto session rebind`) keeps its relation; the next command from the
+new checkout pushes the relation under the new prefix, writes the
+back-reference that names it there, and only then takes the old one back. A
+rebound predecessor keeps the back-references beside its first prefix, which
+its header still names, and every removal reads them there. A command the
+rebind fenced off (one still running from the old anchor) writes no
+back-reference.
+
+**What a removal reads.** Before any removal by rule deletes a session from
+the bucket, and only when nothing local keeps it, it walks the
+back-references beside the session. For each one it lists the holder's
+`ctx/koto/` and reads the holder's relation; only a relation that names the
+session by its session id makes the holder a later member. It then reads that
+member's standing from the bucket: its pin object when one is listed, else
+its state file, judged against its compiled template (from this host's cache
+by hash, or one read of the member's `template.json` per hash per run, which
+must hash to what the member's header records). It follows each member's own
+back-references the same way. A later member under another workspace's
+prefix counts, and so does a migration marker's verified target. A second
+host that never pulled the later members keeps the same sessions and names
+the same keepers as the host holding them. The check right before each delete
+lists the session again and walks only the back-references the judgment
+didn't see.
+
+A back-reference is a hint, never a verdict. One whose holder holds no
+relation naming the session (left by a rollback whose DELETE failed, say) is
+stale and ignored. One whose holder's relation names the session's name with
+another session id is a `mismatch` and keeps. A key that doesn't have exactly
+the expected parts, a relation that doesn't parse or check out, and anything
+over its size limit keep the session too, reported in `relation_unreadable`.
+Names read from the bucket are shown sanitized, and one that isn't a valid
+session name is shown as a placeholder.
+
+**What it costs.** A session kept for its own standing, or by a local
+hierarchy or relation, costs no request for the relation. A session about to
+be deleted costs at most 2 requests when nothing names it (one when the pin
+guard's listing is shared), plus at most 3 for each later member reached,
+whatever the number of sessions in the bucket. Every back-reference examined,
+valid or not, stale or not, draws from that allowance (2 for the session,
+3 more for each member reached, a template read counted inside). A
+`continued-by/` area holding more than 64 back-references isn't walked, and
+a walk stops at 16 members or 50 requests.
+
+**When it can't check.** A listing or read that fails for any reason other
+than an absent key, a permission error included, keeps the session, and so
+does running out of the allowance. The entry reports `bucket_unchecked` with
+the `error` (`unreachable`, `unparseable`, `budget` or `too_many_pointers`)
+and the `sessions` it couldn't check, each with its own error; the text line
+is `kept: bucket not checked for what continues it: <name> (<error>)`. A later
+run with the bucket reachable, or with room, clears it. `koto session cleanup`
+and `koto cancel --cleanup` still remove a session whatever its
+back-references say, a flood of them included; a pin still refuses them, and
+a bucket that can't be listed for the pin still makes them exit 3.
+
+**How long back-references stay.** A back-reference outlives its
+predecessor: removing the predecessor leaves the back-references beside it,
+so a new session that later takes the name reads as a `mismatch` on every
+host. Each goes when its holder is removed: the holder takes back the one it
+wrote, built from its own workspace, its own name and the predecessor its own
+relation names, never from anything read from the bucket. Nothing deletes a
+back-reference it can't attribute; a flood written by hand is removed with
+the bucket's own tools. A same-name replace that moves a predecessor aside
+carries the valid back-references beside it to `<name>_r<N>`, at most 64,
+reports anything it didn't carry, and never deletes an invalid one.
+
+**Permissions.** Writing a back-reference needs PUT and DELETE on
+`ctx/koto/continued-by/` keys in the predecessor's prefix; without write
+access the verb exits 3 and writes nothing. A removal's walk needs LIST of
+`<prefix>/<session>/` and its `ctx/koto/`, and GET of relations, pins, state
+files and `template.json`, on the predecessor's, the other successors' and a
+session's `origin.store.prefix` prefixes.
+
 ## Which releases honour pins
 
 The first release that honours pins in full is the first release after koto
@@ -201,6 +305,21 @@ Pin and unpin are one named exception to the rule that a koto command writes
 only into the session it opens, ticks, links or imports: they write the pin and
 the release record into the named session, which may belong to another agent
 session or host. They write only those two records, with no event in the
-session's log and no clock moved. They are tracked with koto's other
-cross-session writers in
+session's log and no clock moved. A successor under the cloud backend is
+another: it writes its back-reference beside its predecessor, which may sit in
+another workspace's prefix, and takes it back when it is removed or renamed.
+These are tracked with koto's other cross-session writers in
 [koto#445](https://github.com/tsukumogami/koto/issues/445).
+
+The continues relation's writers carry risks this release accepts:
+
+- Anyone who can write a relation or a back-reference can hold a session in
+  place until it is removed by hand, and there is no unlink verb. Where
+  `retention.keep` serves data minimization, bucket policy should limit who
+  can write `ctx/koto/` under each workspace prefix.
+- Anyone who can write a successor's own objects (its relation, state or pin)
+  can make it look released and so let its predecessor go, as with pins today.
+- A back-reference another host writes between a removal's final listing and
+  its delete isn't seen, the same window the pin guard accepts.
+- Back-references left after their predecessor is gone carry their holders'
+  names and session ids in that prefix until each holder is removed.

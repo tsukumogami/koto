@@ -523,7 +523,9 @@ agents encounter today for any state that uses `integration:`.
   session naming it; kept with or without `--no-cleanup` until `koto session
   prune` finds its hierarchy released; a session a later session continues
   adds `relation_keepers`, each `{keeper, standing, path}`, naming the later
-  sessions whose standing keeps it), or `{"retained": true, "reason":
+  sessions whose standing keeps it, which under the cloud backend may be
+  sessions only the bucket holds, and `bucket_unchecked` when the bucket
+  couldn't be checked for one), or `{"retained": true, "reason":
   "no_cleanup"}` (a lone session kept because the tick passed `--no-cleanup`). A
   parent kept for `hierarchy` also carries `kept_children`, beside `retention`:
   each terminal child it would once have removed, as `{"name", "reason",

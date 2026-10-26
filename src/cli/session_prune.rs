@@ -1050,6 +1050,9 @@ fn apply(
     verdict: &Verdict,
     outcome: &mut Outcome,
 ) {
+    // The judgments below read the bucket again for the continues
+    // relation, rather than the preview's answers.
+    crate::session::continues_bucket::begin_pass(backend);
     let mut grouping = engine.judge();
     let mut components: BTreeMap<String, Vec<&RemoveEntry>> = BTreeMap::new();
     let mut others = Vec::new();
@@ -1179,8 +1182,10 @@ fn apply_component(
     let mut removed = BTreeSet::new();
     let mut cache = TemplateCache::new();
     for (entry, lock) in &locked {
-        // Asks the bucket only for a member nothing local keeps.
-        let related = relation_at_removal(backend, &judgment, &entry.name);
+        // The local relation here; the bucket's answer comes at the delete,
+        // after the pin guard, whose fresh listing it reads
+        // (`remove_by_rule_with`), so the apply lists nothing twice.
+        let related = judgment.relation_of(&entry.name).clone();
         let result = if judgment.verdict.is_kept() {
             Err(Refusal::Skipped(format!(
                 "now kept by rule h: {}",
@@ -1320,8 +1325,10 @@ fn remove_member(
         ));
     }
     // The pin guard, under the session's lock, the last thing before the
-    // delete: a pin set since the scan keeps the session.
-    let removal = crate::session::pin::remove_guarded_with(backend, name, held, || {
+    // delete: a pin set since the scan keeps the session, and, under the
+    // cloud backend, so does a later session continuing it whose
+    // back-reference the judgment didn't see.
+    let removal = crate::session::pin::remove_by_rule_with(backend, name, held, || {
         // The remote copy goes first, so a failure leaves the local copy
         // for a later prune to retry.
         if let Backend::Cloud(cloud) = backend {
@@ -1335,6 +1342,13 @@ fn remove_member(
     match removal {
         crate::session::pin::Removal::Removed => Ok(()),
         crate::session::pin::Removal::Kept(guard) => Err(Refusal::Pinned(guard)),
+        crate::session::pin::Removal::KeptByRelation(related) => Err(Refusal::SkippedWith(
+            format!(
+                "now kept by rule r: {}",
+                hierarchy::relation_text(&related).join("; ")
+            ),
+            hierarchy::relation_json(&related),
+        )),
     }
 }
 

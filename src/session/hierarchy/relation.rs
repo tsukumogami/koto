@@ -97,13 +97,52 @@ pub struct RelationKeeper {
     pub path: Vec<String>,
 }
 
+/// Why the bucket couldn't be checked for what continues a session, as
+/// `bucket_unchecked`'s `error` spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UncheckedError {
+    /// A listing or a read failed: the bucket couldn't be reached, or
+    /// refused (a permission error included).
+    Unreachable,
+    /// A listing came back as something koto can't parse.
+    Unparseable,
+    /// The walk ran out of the requests it may spend, or reached its
+    /// ceiling on members or requests, before it got there.
+    Budget,
+    /// The session's `continued-by/` area holds more back-references than
+    /// a walk follows.
+    TooManyPointers,
+}
+
+impl UncheckedError {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UncheckedError::Unreachable => "unreachable",
+            UncheckedError::Unparseable => "unparseable",
+            UncheckedError::Budget => "budget",
+            UncheckedError::TooManyPointers => "too_many_pointers",
+        }
+    }
+}
+
+/// A session the bucket walk couldn't check, which keeps the judged
+/// session (R18): `name` is the session whose objects couldn't be listed
+/// or read, or couldn't be afforded.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Unchecked {
+    pub name: String,
+    pub error: UncheckedError,
+}
+
 /// What the relation says about one session: its keepers, ordered by
-/// name, and what couldn't be judged. Empty for a session no relation
-/// names, which the relation doesn't keep.
+/// name, what couldn't be judged, and, under the cloud backend, what in
+/// the bucket couldn't be checked. Empty for a session no relation names,
+/// which the relation doesn't keep.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RelationVerdict {
     pub keepers: Vec<RelationKeeper>,
     pub unreadable: Vec<Unreadable>,
+    pub unchecked: Vec<Unchecked>,
 }
 
 impl RelationVerdict {
@@ -111,17 +150,19 @@ impl RelationVerdict {
     pub const EMPTY: RelationVerdict = RelationVerdict {
         keepers: Vec::new(),
         unreadable: Vec::new(),
+        unchecked: Vec::new(),
     };
 
     /// Whether the relation keeps the session: a keeper has standing, or
-    /// something on the way couldn't be judged.
+    /// something on the way couldn't be judged or checked.
     pub fn keeps(&self) -> bool {
-        !self.keepers.is_empty() || !self.unreadable.is_empty()
+        !self.keepers.is_empty() || !self.unreadable.is_empty() || !self.unchecked.is_empty()
     }
 
-    /// Add `other`'s keepers and unreadable relations to these: the merge a
-    /// removal site makes of the bucket's answer into the local one. Kept
-    /// ordered by name, one keeper per name (the first seen wins).
+    /// Add `other`'s keepers, unreadable relations and unchecked sessions
+    /// to these: the merge a removal site makes of the bucket's answer into
+    /// the local one. Kept ordered by name, one keeper per name (the first
+    /// seen wins).
     pub fn merge(&mut self, other: RelationVerdict) {
         for k in other.keepers {
             if !self.keepers.iter().any(|mine| mine.keeper == k.keeper) {
@@ -129,14 +170,17 @@ impl RelationVerdict {
             }
         }
         self.unreadable.extend(other.unreadable);
+        self.unchecked.extend(other.unchecked);
         self.normalize();
     }
 
-    /// Sort keepers by name and unreadable entries by holder, dropping
-    /// repeats.
-    pub(super) fn normalize(&mut self) {
+    /// Sort keepers by name, unreadable entries by holder and unchecked
+    /// ones by name, dropping repeats.
+    pub(crate) fn normalize(&mut self) {
         self.keepers.sort_by(|a, b| a.keeper.cmp(&b.keeper));
         self.unreadable.sort();
         self.unreadable.dedup();
+        self.unchecked.sort();
+        self.unchecked.dedup();
     }
 }
