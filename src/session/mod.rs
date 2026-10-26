@@ -765,6 +765,11 @@ pub trait SessionBackend: Send + Sync {
 /// This enum allows `build_backend()` to return a single concrete type
 /// that implements both `SessionBackend` and `ContextStore`, regardless
 /// of which backend is selected.
+///
+/// One `Backend` is built per command and passed by reference, so the
+/// cloud variant's size costs nothing worth an extra indirection on every
+/// call; newer clippy releases flag it.
+#[allow(clippy::large_enum_variant)]
 pub enum Backend {
     Local(LocalBackend),
     Cloud(cloud::CloudBackend),
