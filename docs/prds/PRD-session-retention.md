@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 problem: |
   Agent sessions dispatch each other, and the sessions above and below a
   finished worker need its koto log and keys afterwards. koto removes a
@@ -24,7 +24,7 @@ absorbed:
 
 ## Status
 
-In Progress
+Done
 
 Absorbed [BRIEF-session-retention](docs/briefs/BRIEF-session-retention.md); carried in Absorbed Brief.
 

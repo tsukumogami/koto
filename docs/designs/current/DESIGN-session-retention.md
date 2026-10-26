@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 problem: |
   koto removes finished sessions at six points without asking whether a
   related session is alive, knows nothing about agent sessions, and keeps no
@@ -37,7 +37,7 @@ upstream: docs/prds/PRD-session-retention.md
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 
