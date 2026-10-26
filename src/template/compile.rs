@@ -552,6 +552,8 @@ const SOURCE_CRITERION_KEYS: &[&str] = &[
     "escape",
     "threshold",
     "mode",
+    "summary",
+    "rule_text",
 ];
 
 /// Compile a YAML/Markdown template source file to a FormatVersion=1 CompiledTemplate.
@@ -1338,6 +1340,16 @@ fn compile_decider_check(
                 let pass = text("pass")?;
                 let fail = text("fail")?;
                 let escape = text("escape")?;
+                // Absent stays absent; a present but empty text is
+                // refused by `validate_spec` with E-DECIDER-CHECK-RULE.
+                let summary = match fields.get("summary") {
+                    None => None,
+                    Some(_) => Some(text("summary")?),
+                };
+                let rule_text = match fields.get("rule_text") {
+                    None => None,
+                    Some(_) => Some(text("rule_text")?),
+                };
                 let threshold = match fields.get("threshold") {
                     None => DEFAULT_CHECK_THRESHOLD,
                     Some(v) => v.as_f64().ok_or_else(|| {
@@ -1381,6 +1393,8 @@ fn compile_decider_check(
                     escape,
                     threshold,
                     mode,
+                    summary,
+                    rule_text,
                 });
             }
         }

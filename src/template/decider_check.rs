@@ -100,6 +100,57 @@ pub struct CheckCriterion {
     pub escape: String,
     pub threshold: f64,
     pub mode: CheckMode,
+    /// The rule in a sentence, handed back on a criterion's first failure
+    /// in a visit (DESIGN-doc-rule-checks-m4.md, Decision 4). Never sent to
+    /// the decider and never logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// The rule's full text, handed back when the criterion fails again in
+    /// the visit. Never sent to the decider and never logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_text: Option<String>,
+}
+
+/// Longest `summary`, in bytes.
+pub const MAX_SUMMARY_BYTES: usize = 300;
+
+/// Longest `rule_text`, in bytes.
+pub const MAX_RULE_TEXT_BYTES: usize = 4096;
+
+/// How much of a failed criterion's rule a response hands back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleLevel {
+    /// The one-sentence `summary`.
+    Summary,
+    /// The full `rule_text`.
+    Full,
+}
+
+impl RuleLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleLevel::Summary => "summary",
+            RuleLevel::Full => "full",
+        }
+    }
+}
+
+impl CheckCriterion {
+    /// The rule to hand back for this criterion's `visit`-th failing
+    /// evaluation in a visit (`None` when the count is unknown, read as the
+    /// first): the summary on the first and the full text after it, the one
+    /// declared text whenever only one is. `None` when the criterion
+    /// declares neither.
+    pub fn rule_for(&self, visit: Option<u64>) -> Option<(RuleLevel, &str)> {
+        let summary = self.summary.as_deref().map(|t| (RuleLevel::Summary, t));
+        let full = self.rule_text.as_deref().map(|t| (RuleLevel::Full, t));
+        if visit.unwrap_or(1) <= 1 {
+            summary.or(full)
+        } else {
+            full.or(summary)
+        }
+    }
 }
 
 /// How a check's extraction output is split into units
@@ -162,8 +213,9 @@ pub fn label_is_valid(label: &str) -> bool {
 /// budget and label, and, only for a check in unit mode, `units=jsonl`, so
 /// a check without units keeps the hash it had before units existed.
 ///
-/// Mode, threshold and `rule_ref` are left out, so changing them keeps the
-/// evidence gathered under the declaration. The fields are destructured, so
+/// Mode, threshold, `rule_ref`, `summary` and `rule_text` are left out, so
+/// changing them keeps the evidence gathered under the declaration; the two
+/// texts are never sent to the decider. The fields are destructured, so
 /// adding one to [`CheckCriterion`] fails to compile here until someone
 /// decides whether it belongs in the hash.
 pub fn declaration_hash(
@@ -182,6 +234,8 @@ pub fn declaration_hash(
         escape,
         threshold: _,
         mode: _,
+        summary: _,
+        rule_text: _,
     } = criterion;
     let mut fingerprint = serde_json::json!({
         "rule_id": rule_id,
@@ -290,6 +344,24 @@ pub fn validate_spec(state: &str, gate: &str, spec: &DeciderCheckSpec) -> Result
                 DEFAULT_CHECK_THRESHOLD
             ));
         }
+        for (key, text, max) in [
+            ("summary", &c.summary, MAX_SUMMARY_BYTES),
+            ("rule_text", &c.rule_text, MAX_RULE_TEXT_BYTES),
+        ] {
+            let Some(text) = text else { continue };
+            if text.trim().is_empty() || text.len() > max {
+                return Err(format!(
+                    "{}: {} must be 1 to {} bytes, found {}\n  \
+                     remedy: write the {} within {} bytes, or omit it",
+                    at("E-DECIDER-CHECK-RULE"),
+                    key,
+                    max,
+                    text.len(),
+                    key,
+                    max
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -310,6 +382,8 @@ mod tests {
             escape: "No comment, or can't tell.".into(),
             threshold: 0.9,
             mode: CheckMode::Shadow,
+            summary: None,
+            rule_text: None,
         }
     }
 
@@ -354,7 +428,50 @@ mod tests {
         c.mode = CheckMode::Veto;
         c.threshold = 0.95;
         c.rule_ref = "elsewhere".into();
+        c.summary = Some("A sentence.".into());
+        c.rule_text = Some("The whole rule.".into());
         assert_eq!(declaration_hash(&c, "cmd", 2560, "artifact", None), base);
+    }
+
+    #[test]
+    fn a_criterion_without_rule_texts_serializes_without_the_keys() {
+        let v = serde_json::to_value(criterion()).unwrap();
+        assert!(v.get("summary").is_none() && v.get("rule_text").is_none());
+    }
+
+    #[test]
+    fn the_rule_is_the_summary_first_and_the_full_text_on_a_repeat() {
+        let mut c = criterion();
+        assert_eq!(c.rule_for(Some(1)), None);
+        c.summary = Some("S".into());
+        assert_eq!(c.rule_for(Some(1)), Some((RuleLevel::Summary, "S")));
+        assert_eq!(c.rule_for(Some(3)), Some((RuleLevel::Summary, "S")));
+        c.rule_text = Some("F".into());
+        assert_eq!(c.rule_for(None), Some((RuleLevel::Summary, "S")));
+        assert_eq!(c.rule_for(Some(2)), Some((RuleLevel::Full, "F")));
+        c.summary = None;
+        assert_eq!(c.rule_for(Some(1)), Some((RuleLevel::Full, "F")));
+    }
+
+    #[test]
+    fn rule_texts_outside_their_bounds_are_refused_with_the_rule_code() {
+        let edits: Vec<Edit> = vec![
+            Box::new(|c| c.summary = Some(String::new())),
+            Box::new(|c| c.summary = Some(" ".into())),
+            Box::new(|c| c.summary = Some("x".repeat(MAX_SUMMARY_BYTES + 1))),
+            Box::new(|c| c.rule_text = Some(String::new())),
+            Box::new(|c| c.rule_text = Some("x".repeat(MAX_RULE_TEXT_BYTES + 1))),
+        ];
+        for edit in edits {
+            let mut s = spec();
+            edit(&mut s.criteria[0]);
+            let e = validate_spec("st", "g", &s).unwrap_err();
+            assert!(e.starts_with("E-DECIDER-CHECK-RULE"), "{}", e);
+        }
+        let mut s = spec();
+        s.criteria[0].summary = Some("x".repeat(MAX_SUMMARY_BYTES));
+        s.criteria[0].rule_text = Some("x".repeat(MAX_RULE_TEXT_BYTES));
+        assert!(validate_spec("st", "g", &s).is_ok());
     }
 
     #[test]

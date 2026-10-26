@@ -464,6 +464,22 @@ pub struct DeciderCheckAnswered {
     pub unit: Option<UnitRef>,
 }
 
+/// One failed criterion's rule handed back in a `koto next` response: the
+/// payload of the `rule_delivered` event appended after the response prints
+/// (DESIGN-doc-rule-checks-m4.md, Decision 4).
+///
+/// Names, a level and a count only: never the rule's text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuleDelivered {
+    pub state: String,
+    pub gate: String,
+    pub rule_id: String,
+    pub level: crate::template::decider_check::RuleLevel,
+    /// How many units the rule was handed back for, for a unit-mode check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_count: Option<u64>,
+}
+
 /// Round unrounded probabilities for the record.
 pub fn recorded_probabilities(p: &BTreeMap<String, f64>) -> BTreeMap<String, f64> {
     p.iter()
@@ -485,6 +501,8 @@ mod tests {
             escape: "No comment, or can't tell.".into(),
             threshold: 0.9,
             mode: CheckMode::Veto,
+            summary: None,
+            rule_text: None,
         }
     }
 

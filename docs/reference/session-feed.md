@@ -662,6 +662,26 @@ events:
         type: integer
         required: true
 
+  rule_delivered:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      gate:
+        type: string
+        required: true
+      rule_id:
+        type: string
+        required: true
+      level:
+        type: string
+        required: true
+        enum: ["summary", "full"]
+      unit_count:
+        type: integer
+        required: false
+
   finding_disputed:
     tier: 2
     fields:
@@ -2184,6 +2204,38 @@ visit; the latest answer for a slice wins.
 Neither event carries the slice, a question, a description, or anything the
 agent wrote beyond its one-word answer. An agent answer is never a decider
 verdict: it appends no `decider_checked` and no ledger line.
+
+#### `rule_delivered`
+
+Records that a `koto next` response handed back a failed criterion's rule:
+one event per entry in a blocking condition's `rules` list, appended after the
+response has printed. A crash between the two loses the record, never the
+delivery. A criterion that declares neither a `summary` nor a `rule_text`, and
+a shadow criterion, deliver nothing.
+
+```json
+{
+  "type": "rule_delivered",
+  "payload": {
+    "state": "review",
+    "gate": "ac_binary",
+    "rule_id": "ac_binary",
+    "level": "summary",
+    "unit_count": 2
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `state` | string | Yes | The state whose check failed. |
+| `gate` | string | Yes | The decider check's name. |
+| `rule_id` | string | Yes | The failed criterion's id. |
+| `level` | string | Yes | `summary` on the first failing evaluation of this check and rule in the visit, `full` on every later one; a criterion declaring only one text always gets that text's level. |
+| `unit_count` | integer | No | How many units the rule was handed back for. Present only for a check in unit mode. |
+
+The event never carries the rule's text: that lives in the compiled template
+and the printed response only.
 
 #### `finding_disputed`
 

@@ -642,6 +642,13 @@ E-DECIDER-CHECK-UNITS: state "review" check "g": units must be one of jsonl, fou
   remedy: set units to jsonl, or omit it to grade the whole output as one slice
 ```
 
+**E-DECIDER-CHECK-RULE (error)**: a criterion's `summary` is empty or over 300 bytes, or its `rule_text` is empty or over 4,096 bytes. Either text is handed back in `koto next` when the criterion fails, so it has to fit a response.
+
+```
+E-DECIDER-CHECK-RULE: state "review" check "g" criterion "ac_binary": summary must be 1 to 300 bytes, found 0
+  remedy: write the summary within 300 bytes, or omit it
+```
+
 **E-DECIDER-CHECK-DUPLICATE (error)**: two criteria on one state, in the same check or different ones, share a `rule_id`.
 
 ```

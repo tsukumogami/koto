@@ -1407,6 +1407,8 @@ mod tests {
                     escape: "can't tell".into(),
                     threshold: 0.9,
                     mode: *mode,
+                    summary: None,
+                    rule_text: None,
                 })
                 .collect(),
             units: None,
