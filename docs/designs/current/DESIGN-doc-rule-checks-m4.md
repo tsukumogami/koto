@@ -1,6 +1,6 @@
 ---
 schema: design/v1
-status: Planned
+status: Current
 upstream: docs/prds/PRD-doc-rule-checks-m4.md
 problem: |
   koto's check evaluator sends a decider check's whole extraction output to
@@ -34,7 +34,7 @@ decision_provenance: inline-resolved
 
 ## Status
 
-Planned
+Current
 
 ## Context and Problem Statement
 

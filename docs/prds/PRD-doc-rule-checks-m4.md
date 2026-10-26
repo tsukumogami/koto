@@ -1,6 +1,6 @@
 ---
 schema: prd/v1
-status: In Progress
+status: Done
 problem: |
   A decider check grades one slice per evaluation, at most four criteria a
   state and four consultations a `koto next`, under a 2.5 KB budget. The
@@ -23,7 +23,7 @@ absorbed:
 
 ## Status
 
-In Progress
+Done
 
 Absorbed [BRIEF-doc-rule-checks-m4](docs/briefs/BRIEF-doc-rule-checks-m4.md); carried in Absorbed Brief.
 
