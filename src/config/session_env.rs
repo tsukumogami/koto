@@ -100,6 +100,10 @@ pub struct SessionEnv {
     pub invalid: Vec<InvalidEnv>,
     /// The koto credential variable that is unset while the other is set.
     pub pair_missing: Option<&'static str>,
+    /// Under `KOTO_HOME`, the setting that asked for the cloud backend and was
+    /// ignored because it isn't the root's own config file: a variable's
+    /// name, or `project config`. Never its value.
+    pub backend_ignored: Option<String>,
 }
 
 impl Default for SessionEnv {
@@ -115,6 +119,7 @@ impl Default for SessionEnv {
             origins,
             invalid: Vec::new(),
             pair_missing: None,
+            backend_ignored: None,
         }
     }
 }
