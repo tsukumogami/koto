@@ -15,7 +15,8 @@ goals: |
   summary first and full text on a repeat; a unit the decider can't answer
   goes to the agent while the rest are graded. Every per-unit answer,
   fallback and rule delivery is in telemetry that any host can query.
-upstream: docs/briefs/BRIEF-doc-rule-checks-m4.md
+absorbed:
+  - docs/briefs/BRIEF-doc-rule-checks-m4.md
 ---
 
 # PRD: per-unit decider checks that hand back the broken rule
@@ -23,6 +24,35 @@ upstream: docs/briefs/BRIEF-doc-rule-checks-m4.md
 ## Status
 
 Accepted
+
+Absorbed [BRIEF-doc-rule-checks-m4](docs/briefs/BRIEF-doc-rule-checks-m4.md); carried in Absorbed Brief.
+
+## Absorbed Brief
+
+The feature exists because the rules a document is held to hold one unit at
+a time, while a decider check grades one slice per evaluation: a section's
+units can't be graded on their own, and an agent whose work the decider
+fails gets no rule to fix against. The brief also framed the gap behind
+the next decision: no criterion can leave shadow until its verdicts are
+compared with reviewers' unit by unit, and the records don't say which
+unit was graded or which rule text went out. This document's Problem
+Statement states those in full.
+
+The outcome it asked for is a template author who grades every unit of a
+section in one state visit with one check, an agent told which unit failed
+and handed the rule (summary first, full text on a repeat), an ungradable
+unit sent back to the agent while the rest are graded, and a maintainer who
+reads all of it from telemetry on any host. That's this document's Goals.
+Its four journeys (an author grading a PRD's acceptance criteria, an agent
+fixing two failing units and one again, an agent handed one oversized unit,
+a maintainer on another host reading the evidence) are the User Stories,
+with the author attaching rule text added.
+
+Its boundary held the feature to per-unit grading, rule delivery and their
+telemetry: nothing moves out of shadow, no document criteria are written, no
+shirabe check state, no third rung naming an exit, no batching, no budget
+or threshold change, and no change to the telemetry pipeline's series
+limits. Those are this document's Out of Scope.
 
 ## Problem Statement
 
