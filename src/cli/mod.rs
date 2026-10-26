@@ -5574,6 +5574,9 @@ fn handle_next(
     // The per-call consultation cap, shared by the routing decider's port and
     // the check evaluator.
     let consult_budget = crate::cli::check_evaluator::ConsultBudget::new();
+    // The per-call unit budget unit-mode checks draw from, apart from the
+    // shared cap so units never spend the routing decider's allowance.
+    let unit_budget = crate::cli::check_evaluator::UnitBudget::new();
 
     // Check for reserved variable name collisions in the template.
     for reserved in crate::cli::vars::RESERVED_VARIABLE_NAMES {
@@ -5663,6 +5666,7 @@ fn handle_next(
             &command_env,
         )
         .with_ledger_root(ledger_root())
+        .with_unit_budget(unit_budget)
         // Every tick that consults waits for the lock; an evaluator built
         // without this tries it once.
         .with_lock_wait(crate::cli::check_evaluator::lock_wait_for(

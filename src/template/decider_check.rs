@@ -102,15 +102,49 @@ pub struct CheckCriterion {
     pub mode: CheckMode,
 }
 
+/// How a check's extraction output is split into units
+/// (DESIGN-doc-rule-checks-m4.md, Decision 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitsMode {
+    /// One JSON object per line: `key` and `text`, with optional `document`
+    /// and `section`. Each unit's text is graded on its own.
+    Jsonl,
+}
+
+impl UnitsMode {
+    /// Every accepted spelling, in the order error messages list them.
+    pub const NAMES: [&'static str; 1] = ["jsonl"];
+
+    pub fn parse(s: &str) -> Option<UnitsMode> {
+        match s {
+            "jsonl" => Some(UnitsMode::Jsonl),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnitsMode::Jsonl => "jsonl",
+        }
+    }
+}
+
 /// The decider-specific half of a `decider-check` gate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeciderCheckSpec {
-    /// Largest slice, in redacted bytes, that is sent.
+    /// Largest slice, in redacted bytes, that is sent. In unit mode, the
+    /// largest unit text.
     pub max_bytes: u32,
     /// The slice's label in the request.
     pub label: String,
     /// In declaration order: criteria are consulted in this order.
     pub criteria: Vec<CheckCriterion>,
+    /// Set when the extraction prints units, each graded on its own; absent
+    /// for a check that grades its whole output as one slice, which then
+    /// serializes exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub units: Option<UnitsMode>,
 }
 
 /// Whether `label` is a usable input label.
@@ -125,7 +159,8 @@ pub fn label_is_valid(label: &str) -> bool {
 /// The declaration hash of one criterion: SHA-256, as lowercase hex, over
 /// the criterion's `rule_id`, question and three descriptions and its
 /// check's command (as the template wrote it, before substitution), byte
-/// budget and label.
+/// budget and label, and, only for a check in unit mode, `units=jsonl`, so
+/// a check without units keeps the hash it had before units existed.
 ///
 /// Mode, threshold and `rule_ref` are left out, so changing them keeps the
 /// evidence gathered under the declaration. The fields are destructured, so
@@ -136,6 +171,7 @@ pub fn declaration_hash(
     command: &str,
     max_bytes: u32,
     label: &str,
+    units: Option<UnitsMode>,
 ) -> String {
     let CheckCriterion {
         rule_id,
@@ -147,7 +183,7 @@ pub fn declaration_hash(
         threshold: _,
         mode: _,
     } = criterion;
-    let fingerprint = serde_json::json!({
+    let mut fingerprint = serde_json::json!({
         "rule_id": rule_id,
         "question": question,
         "pass": pass,
@@ -157,6 +193,9 @@ pub fn declaration_hash(
         "max_bytes": max_bytes,
         "label": label,
     });
+    if let Some(units) = units {
+        fingerprint["units"] = serde_json::Value::from(units.as_str());
+    }
     let bytes = serde_json::to_vec(&fingerprint).expect("a JSON value always serializes");
     hex::encode(Sha256::digest(&bytes))
 }
@@ -279,22 +318,48 @@ mod tests {
             max_bytes: DEFAULT_CHECK_MAX_BYTES,
             label: DEFAULT_CHECK_LABEL.into(),
             criteria: vec![criterion()],
+            units: None,
         }
     }
 
     #[test]
+    fn declaration_hash_moves_with_units_and_keeps_the_old_hash_without_them() {
+        let c = criterion();
+        // The fingerprint as it was before units existed.
+        let old = serde_json::json!({
+            "rule_id": c.rule_id, "question": c.question, "pass": c.pass,
+            "fail": c.fail, "escape": c.escape, "command": "cmd",
+            "max_bytes": 2560, "label": "artifact",
+        });
+        let old = hex::encode(Sha256::digest(serde_json::to_vec(&old).unwrap()));
+        let without = declaration_hash(&c, "cmd", 2560, "artifact", None);
+        assert_eq!(without, old);
+        let with = declaration_hash(&c, "cmd", 2560, "artifact", Some(UnitsMode::Jsonl));
+        assert_ne!(with, without);
+    }
+
+    #[test]
+    fn a_spec_without_units_serializes_without_the_key() {
+        let v = serde_json::to_value(spec()).unwrap();
+        assert!(v.get("units").is_none(), "{}", v);
+        let mut s = spec();
+        s.units = Some(UnitsMode::Jsonl);
+        assert_eq!(serde_json::to_value(&s).unwrap()["units"], "jsonl");
+    }
+
+    #[test]
     fn declaration_hash_ignores_mode_threshold_and_rule_ref() {
-        let base = declaration_hash(&criterion(), "cmd", 2560, "artifact");
+        let base = declaration_hash(&criterion(), "cmd", 2560, "artifact", None);
         let mut c = criterion();
         c.mode = CheckMode::Veto;
         c.threshold = 0.95;
         c.rule_ref = "elsewhere".into();
-        assert_eq!(declaration_hash(&c, "cmd", 2560, "artifact"), base);
+        assert_eq!(declaration_hash(&c, "cmd", 2560, "artifact", None), base);
     }
 
     #[test]
     fn declaration_hash_covers_the_question_descriptions_and_check() {
-        let base = declaration_hash(&criterion(), "cmd", 2560, "artifact");
+        let base = declaration_hash(&criterion(), "cmd", 2560, "artifact", None);
         let edits: Vec<Edit> = vec![
             Box::new(|c| c.rule_id = "other".into()),
             Box::new(|c| c.question = "Other?".into()),
@@ -305,18 +370,18 @@ mod tests {
         for edit in edits {
             let mut c = criterion();
             edit(&mut c);
-            assert_ne!(declaration_hash(&c, "cmd", 2560, "artifact"), base);
+            assert_ne!(declaration_hash(&c, "cmd", 2560, "artifact", None), base);
         }
         assert_ne!(
-            declaration_hash(&criterion(), "cmd2", 2560, "artifact"),
+            declaration_hash(&criterion(), "cmd2", 2560, "artifact", None),
             base
         );
         assert_ne!(
-            declaration_hash(&criterion(), "cmd", 2561, "artifact"),
+            declaration_hash(&criterion(), "cmd", 2561, "artifact", None),
             base
         );
         assert_ne!(
-            declaration_hash(&criterion(), "cmd", 2560, "comments"),
+            declaration_hash(&criterion(), "cmd", 2560, "comments", None),
             base
         );
     }

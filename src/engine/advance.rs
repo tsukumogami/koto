@@ -7951,6 +7951,7 @@ mod tests {
             rule_ref: None,
             effect_landed: None,
             message_source: crate::findings::MessageSource::Check,
+            unit: None,
         }
     }
 

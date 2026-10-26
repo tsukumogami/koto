@@ -279,6 +279,45 @@ fn budget_bounds() {
 }
 
 #[test]
+fn units_jsonl_compiles_and_other_values_are_refused() {
+    use koto::template::decider_check::UnitsMode;
+    let t = expect_ok(&template(
+        &check("g", &[criterion("r")], "        units: jsonl\n"),
+        PLAIN_TRANSITIONS,
+    ));
+    let spec = t.states["review"].gates["g"]
+        .decider_check
+        .as_ref()
+        .unwrap();
+    assert_eq!(spec.units, Some(UnitsMode::Jsonl));
+    // Without units nothing is added, so the compiled JSON is unchanged.
+    let plain = expect_ok(&template(
+        &check("g", &[criterion("r")], ""),
+        PLAIN_TRANSITIONS,
+    ));
+    let json = serde_json::to_value(&plain.states["review"].gates["g"]).unwrap();
+    assert!(json["decider_check"].get("units").is_none(), "{}", json);
+    let with = serde_json::to_value(&t.states["review"].gates["g"]).unwrap();
+    assert_eq!(with["decider_check"]["units"], "jsonl");
+    for u in ["csv", "\"\"", "1", "[jsonl]"] {
+        expect_err(
+            &template(
+                &check("g", &[criterion("r")], &format!("        units: {}\n", u)),
+                PLAIN_TRANSITIONS,
+            ),
+            "E-DECIDER-CHECK-UNITS",
+        );
+    }
+}
+
+#[test]
+fn units_on_another_gate_type_is_refused() {
+    let gates =
+        "      g:\n        type: command\n        command: \"true\"\n        units: jsonl\n";
+    expect_err(&template(gates, PLAIN_TRANSITIONS), "E-DECIDER-CHECK-FIELD");
+}
+
+#[test]
 fn bad_labels_are_refused() {
     for l in ["\"has space\"", "\"\"", "42"] {
         expect_err(

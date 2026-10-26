@@ -600,7 +600,7 @@ Fix: set the answer's mode to `shadow` or `never`. Nothing else in the template 
 
 A `decider-check` gate (see `docs/guides/decider-authoring.md`, "Checking the agent's work") has these compile-time errors. Each fails compilation, both when a source template compiles and when a cached compiled template is loaded, and each message names the state, the check and, where there is one, the criterion. None is relaxed by `--allow-legacy-gates`.
 
-**E-DECIDER-CHECK-FIELD (error)**: a required part is missing or of the wrong type: an empty command, no criteria, a criterion without `rule_id`, `rule_ref`, `question`, `pass`, `fail` or `escape` (each non-empty; `rule_id` at most 128 bytes and `rule_ref` at most 512), an unknown key in a criterion, a gate key a decider check doesn't take, or `max_bytes`, `label` or `criteria` on a gate that isn't a decider check.
+**E-DECIDER-CHECK-FIELD (error)**: a required part is missing or of the wrong type: an empty command, no criteria, a criterion without `rule_id`, `rule_ref`, `question`, `pass`, `fail` or `escape` (each non-empty; `rule_id` at most 128 bytes and `rule_ref` at most 512), an unknown key in a criterion, a gate key a decider check doesn't take, or `max_bytes`, `label`, `criteria` or `units` on a gate that isn't a decider check.
 
 ```
 E-DECIDER-CHECK-FIELD: state "review" check "g" criterion "r1": question must be non-empty; the decider reads it as part of the question
@@ -633,6 +633,13 @@ E-DECIDER-CHECK-BUDGET: state "review" check "g": max_bytes 0 is outside 1 to 81
 ```
 E-DECIDER-CHECK-LABEL: state "review" check "g": label "has space" must be 1 to 64 bytes of letters, digits, `_` and `-`
   remedy: rename the label, or omit it for "artifact"
+```
+
+**E-DECIDER-CHECK-UNITS (error)**: `units` is set to something other than `jsonl`, the one way a check's extraction can print units.
+
+```
+E-DECIDER-CHECK-UNITS: state "review" check "g": units must be one of jsonl, found String("csv")
+  remedy: set units to jsonl, or omit it to grade the whole output as one slice
 ```
 
 **E-DECIDER-CHECK-DUPLICATE (error)**: two criteria on one state, in the same check or different ones, share a `rule_id`.

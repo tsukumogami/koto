@@ -2420,6 +2420,7 @@ fn criterion_check(rule_id: &str) -> DeciderCheck {
         latency_ms: 12,
         error_class: None,
         endpoint_origin: Some(SettingOrigin::Env),
+        unit: None,
     }
 }
 
@@ -3294,6 +3295,7 @@ fn fallback_event(reason: UnansweredReason) -> EventPayload {
         reason,
         input_sha256: Some("PLANTED-INPUT-HASH".into()),
         input_bytes: Some(34),
+        unit: None,
     })
 }
 
@@ -3308,6 +3310,7 @@ fn check_answered(answer: AgentAnswer, fallback_seq: u64) -> EventPayload {
         input_sha256: Some("PLANTED-INPUT-HASH".into()),
         answer,
         fallback_seq,
+        unit: None,
     })
 }
 
@@ -4476,6 +4479,7 @@ fn fallback(rule_id: &str) -> crate::decider::check::DeciderFallback {
         reason: UnansweredReason::OverBudget,
         input_sha256: Some("PLANTED-INPUT-HASH".into()),
         input_bytes: Some(2561),
+        unit: None,
     }
 }
 

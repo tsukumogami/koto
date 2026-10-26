@@ -3928,6 +3928,7 @@ mod tests {
             latency_ms: 0,
             error_class: None,
             endpoint_origin: None,
+            unit: None,
         });
         assert_eq!(p.type_name(), "decider_checked");
         let e = Event {
@@ -3965,6 +3966,7 @@ mod tests {
             reason: UnansweredReason::OverBudget,
             input_sha256: Some("a".repeat(64)),
             input_bytes: Some(2561),
+            unit: None,
         });
         let answered = EventPayload::DeciderCheckAnswered(DeciderCheckAnswered {
             state: "review".into(),
@@ -3975,6 +3977,7 @@ mod tests {
             input_sha256: Some("a".repeat(64)),
             answer: AgentAnswer::Pass,
             fallback_seq: 5,
+            unit: None,
         });
         for (p, name) in [
             (fallback, "decider_fallback"),

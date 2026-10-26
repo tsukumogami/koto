@@ -494,6 +494,10 @@ struct SourceGate {
     /// criterion, in declaration order.
     #[serde(default)]
     criteria: Option<serde_yaml_ng::Value>,
+    /// A `decider-check` gate's unit mode, kept raw so a value other than
+    /// `jsonl` is refused with `E-DECIDER-CHECK-UNITS` naming the check.
+    #[serde(default)]
+    units: Option<serde_yaml_ng::Value>,
     /// Every key the fields above don't name. `SourceState` uses
     /// `deny_unknown_fields`, but serde's error for it surfaces only as the
     /// outer "failed to parse front-matter" context, which names neither the
@@ -536,6 +540,7 @@ const SOURCE_GATE_KEYS: &[&str] = &[
     "max_bytes",
     "label",
     "criteria",
+    "units",
 ];
 
 /// The keys a decider-check criterion may carry.
@@ -977,6 +982,7 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
         ("max_bytes", source.max_bytes.is_some()),
         ("label", source.label.is_some()),
         ("criteria", source.criteria.is_some()),
+        ("units", source.units.is_some()),
     ] {
         if present {
             return Err(anyhow!(
@@ -1182,8 +1188,8 @@ fn compile_decider_check(
     overridable: bool,
 ) -> anyhow::Result<Gate> {
     use super::decider_check::{
-        CheckCriterion, CheckMode, DeciderCheckSpec, DEFAULT_CHECK_LABEL, DEFAULT_CHECK_MAX_BYTES,
-        DEFAULT_CHECK_THRESHOLD,
+        CheckCriterion, CheckMode, DeciderCheckSpec, UnitsMode, DEFAULT_CHECK_LABEL,
+        DEFAULT_CHECK_MAX_BYTES, DEFAULT_CHECK_THRESHOLD,
     };
     let err = |code: &str, detail: String, remedy: &str| {
         anyhow!(
@@ -1258,6 +1264,23 @@ fn compile_decider_check(
                 "set label to a short name such as comments",
             ))
         }
+    };
+    let units = match &source.units {
+        None => None,
+        Some(v) => match v.as_str().and_then(UnitsMode::parse) {
+            Some(mode) => Some(mode),
+            None => {
+                return Err(err(
+                    "E-DECIDER-CHECK-UNITS",
+                    format!(
+                        ": units must be one of {}, found {:?}",
+                        UnitsMode::NAMES.join(", "),
+                        v
+                    ),
+                    "set units to jsonl, or omit it to grade the whole output as one slice",
+                ))
+            }
+        },
     };
     let mut criteria = Vec::new();
     match &source.criteria {
@@ -1390,6 +1413,7 @@ fn compile_decider_check(
             max_bytes,
             label,
             criteria,
+            units,
         }),
     })
 }

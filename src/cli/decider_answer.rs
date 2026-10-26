@@ -211,6 +211,8 @@ pub fn handle_answer(backend: &dyn SessionBackend, args: AnswerArgs) -> Result<(
         input_sha256: fallback.input_sha256.clone(),
         answer,
         fallback_seq,
+        // An answer binds to the fallback it answers, its unit included.
+        unit: fallback.unit.clone(),
     });
     if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
         fail(1, e.to_string());

@@ -39,6 +39,22 @@ pub enum UnansweredReason {
     CapSpent,
     /// Another `koto next` on the session held the decider lock.
     Busy,
+    /// A unit-mode check's per-call unit budget was already spent, so this
+    /// unit wasn't asked about.
+    UnitLimit,
+}
+
+/// One unit of a unit-mode check, as its extraction printed it
+/// (DESIGN-doc-rule-checks-m4.md, Decision 3): its key and, when printed,
+/// the document and section it came from. Every value is name-shaped, so it
+/// can go into a command line as written. Never its text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UnitRef {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
 }
 
 /// Who a missing verdict comes down to, for the report: the provider
@@ -71,7 +87,9 @@ impl UnansweredReason {
             UnansweredReason::ProviderError | UnansweredReason::UnreadableResponse => {
                 UnansweredCause::Provider
             }
-            UnansweredReason::CapSpent | UnansweredReason::Busy => UnansweredCause::NotAsked,
+            UnansweredReason::CapSpent | UnansweredReason::Busy | UnansweredReason::UnitLimit => {
+                UnansweredCause::NotAsked
+            }
             UnansweredReason::OverBudget | UnansweredReason::ExtractionFailed => {
                 UnansweredCause::Input
             }
@@ -86,6 +104,7 @@ impl UnansweredReason {
             UnansweredReason::ExtractionFailed => "extraction_failed",
             UnansweredReason::CapSpent => "cap_spent",
             UnansweredReason::Busy => "busy",
+            UnansweredReason::UnitLimit => "unit_limit",
         }
     }
 }
@@ -341,6 +360,10 @@ pub struct DeciderCheck {
     /// The configuration layer the endpoint came from; a label, never a URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_origin: Option<SettingOrigin>,
+    /// The unit this consultation graded, for a unit-mode check; absent for
+    /// a check that grades one slice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<UnitRef>,
 }
 
 impl DeciderCheck {
@@ -411,6 +434,9 @@ pub struct DeciderFallback {
     /// The slice's size in bytes, as captured; absent with no slice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_bytes: Option<u64>,
+    /// The unit handed back, for a unit-mode check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<UnitRef>,
 }
 
 /// The agent's answer to one fallback: the payload of the
@@ -432,6 +458,10 @@ pub struct DeciderCheckAnswered {
     pub answer: AgentAnswer,
     /// The `seq` of the `decider_fallback` event this answers.
     pub fallback_seq: u64,
+    /// The answered fallback's unit, for a unit-mode check; an answer
+    /// applies only to the same unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<UnitRef>,
 }
 
 /// Round unrounded probabilities for the record.
@@ -660,6 +690,7 @@ mod tests {
             reason: UnansweredReason::ExtractionFailed,
             input_sha256: None,
             input_bytes: None,
+            unit: None,
         };
         let v = serde_json::to_value(&fb).unwrap();
         assert_eq!(v["reason"], "extraction_failed");
@@ -677,6 +708,7 @@ mod tests {
             input_sha256: Some("abc".into()),
             answer: AgentAnswer::Fail,
             fallback_seq: 9,
+            unit: None,
         };
         let v = serde_json::to_value(&ans).unwrap();
         assert_eq!(v["answer"], "fail");
@@ -713,6 +745,7 @@ mod tests {
             latency_ms: 0,
             error_class: None,
             endpoint_origin: Some(SettingOrigin::Default),
+            unit: None,
         };
         let v = serde_json::to_value(&rec).unwrap();
         assert_eq!(v["outcome"], "unanswered");
