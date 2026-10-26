@@ -216,31 +216,26 @@ pub struct DeciderCheckSpec {
     pub max_units: Option<u32>,
     /// In unit mode, the document name the run journal exports for every
     /// unit in place of the printed one. Name-shaped
-    /// ([`unit_label_is_valid`]).
+    /// ([`unit_label_is_valid`]). It reaches the journal on the decider
+    /// events' `unit_labels`, and stays out of the declaration hash, since
+    /// it is never sent to the decider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit_document: Option<String>,
     /// In unit mode, the section name the run journal exports for every
-    /// unit in place of the printed one. Name-shaped likewise.
+    /// unit in place of the printed one. Name-shaped, and kept out of the
+    /// hash, likewise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit_section: Option<String>,
 }
 
 impl DeciderCheckSpec {
     /// The declaration hash of `criterion` on this check, whose extraction
-    /// command is `command`: [`declaration_hash`] with the check's
-    /// `unit_document` and `unit_section` added when set.
+    /// command is `command` (see [`declaration_hash`]). The check's
+    /// `max_units`, `unit_document` and `unit_section` are left out: none of
+    /// them is sent to the decider, so changing one keeps the evidence
+    /// gathered.
     pub fn declaration_hash(&self, criterion: &CheckCriterion, command: &str) -> String {
-        fingerprint_hash(
-            criterion,
-            command,
-            self.max_bytes,
-            &self.label,
-            self.units,
-            [
-                ("unit_document", self.unit_document.as_deref()),
-                ("unit_section", self.unit_section.as_deref()),
-            ],
-        )
+        declaration_hash(criterion, command, self.max_bytes, &self.label, self.units)
     }
 }
 
@@ -337,34 +332,21 @@ pub fn label_is_valid(label: &str) -> bool {
 /// the criterion's `rule_id`, question and three descriptions and its
 /// check's command (as the template wrote it, before substitution), byte
 /// budget and label, and, only for a check in unit mode, `units=jsonl`, so
-/// a check without units keeps the hash it had before units existed. A
-/// check's `unit_document` and `unit_section` are added likewise, only when
-/// set, by [`DeciderCheckSpec::declaration_hash`].
+/// a check without units keeps the hash it had before units existed.
 ///
 /// Mode, threshold, `rule_ref`, `summary` and `rule_text` are left out, so
 /// changing them keeps the evidence gathered under the declaration; the two
-/// texts are never sent to the decider. The fields are destructured, so
-/// adding one to [`CheckCriterion`] fails to compile here until someone
-/// decides whether it belongs in the hash.
+/// texts are never sent to the decider. The check's `max_units`,
+/// `unit_document` and `unit_section` aren't sent either, and aren't
+/// parameters here. The fields are destructured, so adding one to
+/// [`CheckCriterion`] fails to compile here until someone decides whether
+/// it belongs in the hash.
 pub fn declaration_hash(
     criterion: &CheckCriterion,
     command: &str,
     max_bytes: u32,
     label: &str,
     units: Option<UnitsMode>,
-) -> String {
-    fingerprint_hash(criterion, command, max_bytes, label, units, [])
-}
-
-/// [`declaration_hash`] with each `(key, value)` in `labels` whose value is
-/// set added to the fingerprint under its key.
-fn fingerprint_hash<const N: usize>(
-    criterion: &CheckCriterion,
-    command: &str,
-    max_bytes: u32,
-    label: &str,
-    units: Option<UnitsMode>,
-    labels: [(&str, Option<&str>); N],
 ) -> String {
     let CheckCriterion {
         rule_id,
@@ -390,11 +372,6 @@ fn fingerprint_hash<const N: usize>(
     });
     if let Some(units) = units {
         fingerprint["units"] = serde_json::Value::from(units.as_str());
-    }
-    for (key, value) in labels {
-        if let Some(value) = value {
-            fingerprint[key] = serde_json::Value::from(value);
-        }
     }
     let bytes = serde_json::to_vec(&fingerprint).expect("a JSON value always serializes");
     hex::encode(Sha256::digest(&bytes))
@@ -844,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_labels_join_the_declaration_hash_only_when_set() {
+    fn unit_labels_and_max_units_stay_out_of_the_declaration_hash() {
         let s = unit_spec(1, Some(4));
         let c = &s.criteria[0];
         let plain = declaration_hash(c, "cmd", s.max_bytes, &s.label, s.units);
@@ -852,16 +829,16 @@ mod tests {
         let mut with_doc = s.clone();
         with_doc.unit_document = Some("prd".into());
         let mut with_section = s.clone();
-        with_section.unit_section = Some("prd".into());
-        let doc = with_doc.declaration_hash(c, "cmd");
-        let section = with_section.declaration_hash(c, "cmd");
-        assert_ne!(doc, plain);
-        assert_ne!(section, plain);
-        assert_ne!(doc, section);
-        // max_units stays out of the hash.
+        with_section.unit_section = Some("acs".into());
+        assert_eq!(with_doc.declaration_hash(c, "cmd"), plain);
+        assert_eq!(with_section.declaration_hash(c, "cmd"), plain);
         let mut more = s.clone();
         more.max_units = Some(8);
         assert_eq!(more.declaration_hash(c, "cmd"), plain);
+        // Unit mode itself still moves it.
+        let mut single = s.clone();
+        single.units = None;
+        assert_ne!(single.declaration_hash(c, "cmd"), plain);
     }
 
     #[test]

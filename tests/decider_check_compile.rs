@@ -588,7 +588,7 @@ fn unit_labels_in_the_name_shape_compile_and_others_are_refused() {
 }
 
 #[test]
-fn unit_labels_join_the_declaration_hash_only_when_set() {
+fn unit_labels_stay_out_of_the_declaration_hash() {
     let hashes = |extra: &str| {
         let t = expect_ok(&template(
             &check("g", &[criterion("r")], extra),
@@ -597,13 +597,25 @@ fn unit_labels_join_the_declaration_hash_only_when_set() {
         koto::cli::check_evaluator::declaration_hashes(&t.states["review"].gates)["g"].clone()
     };
     let plain = hashes(UNITS);
-    let doc = hashes(&format!("{UNITS}        unit_document: prd\n"));
-    let section = hashes(&format!("{UNITS}        unit_section: prd\n"));
-    assert_ne!(doc, plain);
-    assert_ne!(section, plain);
-    assert_ne!(doc, section);
+    // Neither label is sent to the decider, so changing one keeps the hash.
+    assert_eq!(
+        hashes(&format!("{UNITS}        unit_document: prd\n")),
+        plain
+    );
+    assert_eq!(
+        hashes(&format!("{UNITS}        unit_section: prd\n")),
+        plain
+    );
+    assert_eq!(
+        hashes(&format!(
+            "{UNITS}        unit_document: other\n        unit_section: acs\n"
+        )),
+        plain
+    );
     // The cap, declared or defaulted, stays out of the hash.
     assert_eq!(hashes(&format!("{UNITS}        max_units: 4\n")), plain);
+    // Adding `units: jsonl` still moves it.
+    assert_ne!(hashes(""), plain);
 }
 
 /// Templates that use none of the unit or rule fields compile to the bytes

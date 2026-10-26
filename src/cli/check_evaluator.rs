@@ -33,7 +33,7 @@ use crate::cli::decider_port::{input_sha256, try_decider_lock, LockHold};
 use crate::decider::check::{
     blocks, build_check_request, effective_check_mode, is_retryable, reason_for_error,
     recorded_probabilities, verdict, AgentAnswer, CheckOutcome, DeciderCheck, DeciderFallback,
-    UnansweredReason, UnitRef,
+    UnansweredReason, UnitLabels, UnitRef,
 };
 use crate::decider::ledger::{append_or_warn, LedgerRecord};
 use crate::decider::types::{
@@ -216,6 +216,9 @@ struct Pair<'s, 'a> {
     /// The input's hash and size; absent with no input.
     input: Option<&'a (String, u64)>,
     unit: Option<&'a UnitRef>,
+    /// The check's declared unit labels, which the records carry beside
+    /// `unit`; absent with no unit.
+    labels: Option<&'a UnitLabels>,
 }
 
 /// The declaration hash of each criterion of every decider check in
@@ -606,6 +609,7 @@ impl<'a> CliCheckEvaluator<'a> {
                     early,
                     input: input.as_ref(),
                     unit: None,
+                    labels: None,
                 },
                 lock.is_some(),
                 (&take, UnansweredReason::CapSpent),
@@ -707,6 +711,7 @@ impl<'a> CliCheckEvaluator<'a> {
                             early: Some(early),
                             input: None,
                             unit: None,
+                            labels: None,
                         },
                         false,
                         (&none, UnansweredReason::UnitLimit),
@@ -715,6 +720,10 @@ impl<'a> CliCheckEvaluator<'a> {
             }
             false => {
                 let take = || self.unit_budget.try_take();
+                let labels = UnitLabels::declared(
+                    spec.unit_document.as_deref(),
+                    spec.unit_section.as_deref(),
+                );
                 for (unit, (requests, early, input)) in units.iter().flatten().zip(&per_unit) {
                     for (i, (criterion, request)) in spec.criteria.iter().zip(requests).enumerate()
                     {
@@ -728,6 +737,7 @@ impl<'a> CliCheckEvaluator<'a> {
                                 early: *early,
                                 input: input.as_ref(),
                                 unit: Some(&unit.reference),
+                                labels: labels.as_ref(),
                             },
                             lock.is_some(),
                             (&take, UnansweredReason::UnitLimit),
@@ -800,7 +810,10 @@ impl<'a> CliCheckEvaluator<'a> {
             early,
             input,
             unit,
+            labels,
         } = pair;
+        // The labels go only beside a unit.
+        let unit_labels = unit.and(labels).cloned();
         let (take, spent) = budget;
         let mode = effective_check_mode(criterion.mode, self.global);
         let sha = input.map(|(sha, _)| sha.as_str());
@@ -852,6 +865,7 @@ impl<'a> CliCheckEvaluator<'a> {
                 input_sha256: input.map(|(sha, _)| sha.clone()),
                 input_bytes: input.map(|(_, n)| *n),
                 unit: unit.cloned(),
+                unit_labels: unit_labels.clone(),
             }),
             _ => None,
         };
@@ -882,6 +896,7 @@ impl<'a> CliCheckEvaluator<'a> {
                 error_class: c.error_class,
                 endpoint_origin: Some(self.endpoint_origin),
                 unit: unit.cloned(),
+                unit_labels,
             }
         });
         Graded {
@@ -1580,6 +1595,7 @@ mod tests {
                     input_sha256: None,
                     input_bytes: None,
                     unit: None,
+                    unit_labels: None,
                 };
                 let graded = vec![Graded {
                     criterion: &spec.criteria[0],
@@ -1746,6 +1762,7 @@ mod tests {
             answer,
             fallback_seq: 3,
             unit: fallback.unit.clone(),
+            unit_labels: fallback.unit_labels.clone(),
         });
         backend
             .append_event("wf", &p, &crate::engine::types::now_iso8601())

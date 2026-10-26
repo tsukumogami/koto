@@ -327,6 +327,9 @@ pub fn handle_answer(backend: &dyn SessionBackend, args: AnswerArgs) -> Result<(
         fallback_seq,
         // An answer binds to the fallback it answers, its unit included.
         unit: fallback.unit.clone(),
+        // Copied so the run journal reads the check's declared labels from
+        // this event, as it does from the fallback's.
+        unit_labels: fallback.unit_labels.clone(),
     });
     if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
         fail(1, e.to_string());

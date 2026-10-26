@@ -68,8 +68,9 @@
 //!   gate's carries the poll's run count and elapsed seconds; a decider
 //!   check's carries the two criterion counts instead.
 //!
-//! Eight more are relayed the same way, with the same two sequence
-//! numbers, from decider, evidence, override and dispute events:
+//! Nine more are relayed the same way, with the same two sequence
+//! numbers, from decider, evidence, override, dispute and rule-delivery
+//! events:
 //!
 //! - `decider_consulted`: one per `decider_consulted` event, with the
 //!   provider, model, outcome, token counts and timings, the field count,
@@ -86,14 +87,26 @@
 //! - `decider_checked`: one per `decider_checked` event (one criterion of a
 //!   decider check), with the gate as `koto.check`, the criterion's id as
 //!   `koto.rule.id` (digested like a rule id), the mode, outcome, reason,
-//!   whether it blocked, tokens and timings. A verdict koto reuses appends
-//!   no event, so it writes no record.
+//!   whether it blocked, tokens and timings, and, when an answer was read,
+//!   `koto.decider.confidence_bp`. A verdict koto reuses appends no event,
+//!   so it writes no record.
 //! - `decider_fallback`: one per `decider_fallback` event (a criterion
 //!   handed to the agent), with the gate as `koto.check`, the criterion's id
 //!   as `koto.rule.id`, the mode, the reason and the slice's size.
 //! - `decider_check_answered`: one per `decider_check_answered` event (the
 //!   agent's answer to a fallback), with the gate, the criterion's id, the
 //!   answer, and the `seq` and reason of the fallback it answers.
+//!
+//!   For a unit-mode check, each of these three also carries the unit:
+//!   `koto.unit.key`, always the key's digest, and `koto.unit.document` and
+//!   `koto.unit.section`, the check's declared label or else the digest of
+//!   the printed value (see `with_unit`). A check without units writes none
+//!   of them.
+//! - `rule_delivered`: one per `rule_delivered` event (a failed criterion's
+//!   rule handed back in a `koto next` response), with the state, the gate
+//!   as `koto.check.name`, the criterion's id as `koto.rule.id`,
+//!   `koto.rule.extent` (`summary` or `full`) and, for a unit-mode check,
+//!   `koto.rule.unit_count`. Never the rule's text.
 //! - `check_overridden`: one per `gate_override_recorded`, with the state
 //!   and gate only.
 //! - `check_disputed`: one per `finding_disputed`, with the state, the gate
@@ -102,11 +115,15 @@
 //!   reason.
 //!
 //! None of them copies a probability, hash, threshold, endpoint, rule
-//! reference, rationale, dispute reason, override value or output, and `koto.visit.seq` is
-//! always koto's visit, never the `visit_seq` a decider event carries. An
-//! answer, a field name and an input label are names the template declares
-//! (an agent's value outside them is written `other`) or koto's own words;
-//! nothing the session wrote is copied.
+//! reference or text, rationale, dispute reason, override value or output,
+//! with one exception: `decider_checked`'s `koto.decider.confidence_bp`,
+//! the highest of the criterion's answer probabilities as an integer in
+//! basis points. `koto.visit.seq` is always koto's visit, never the
+//! `visit_seq` a decider event carries. An answer, a field name, an input
+//! label and a unit label are names the template declares (an agent's value
+//! outside them is written `other`) or koto's own words; nothing the session
+//! wrote is copied, and a unit's key, document and section as an extraction
+//! printed them are written only as digests.
 //!
 //! One more sums a visit's `context_read` events when the visit ends (see
 //! `context_reads`). It carries `koto.seq` (the sequence number of the
@@ -155,8 +172,9 @@
 //!   `workflow_cancelled`, the check kinds for `gate_evaluated` and
 //!   `default_action_executed`, and the decider and override kinds for
 //!   `decider_consulted`, `decider_checked`, `decider_fallback`,
-//!   `decider_check_answered`, `gate_override_recorded` and
-//!   `finding_disputed`, and `decider_answered` for an agent's
+//!   `decider_check_answered`, `gate_override_recorded`,
+//!   `finding_disputed` and `rule_delivered`, and `decider_answered` for an
+//!   agent's
 //!   `evidence_submitted` that answers a consultation.
 //!   A commit that ends a visit (an arrival, a rewind, a cancel, or the
 //!   terminal tick's `request_store.result`) writes the visit's
@@ -284,6 +302,15 @@ pub(crate) fn name_or_digest(value: &str) -> String {
     if is_name(value) {
         return value.to_string();
     }
+    digest(value)
+}
+
+/// `sha256:` and the first 32 lowercase hex characters of the SHA-256 of
+/// `value`'s UTF-8 bytes, whatever its shape: how [`name_or_digest`] writes
+/// an odd id, and how a unit's key, and a document or section an extraction
+/// printed, are always written, so nothing an extraction printed reaches the
+/// journal. The result has the id shape.
+pub(crate) fn digest(value: &str) -> String {
     use sha2::{Digest, Sha256};
     let hex = hex::encode(Sha256::digest(value.as_bytes()));
     format!("sha256:{}", &hex[..32])
@@ -714,6 +741,7 @@ fn relays(payload: &EventPayload) -> bool {
             | EventPayload::DeciderFallback(_)
             | EventPayload::GateOverrideRecorded { .. }
             | EventPayload::FindingDisputed(_)
+            | EventPayload::RuleDelivered(_)
     )
 }
 
@@ -748,6 +776,65 @@ const DISPUTE_SOURCE_FIELD: &str = "koto.dispute.source";
 /// The most `check_finding` records one evaluation writes.
 const MAX_FINDING_RECORDS: usize = 50;
 
+// The names the unit and rule-delivery records add
+// (DESIGN-doc-rule-checks-m4.md, Decision 5). `koto.unit` and `koto.rule`
+// are only ever prefixes, never a field of their own.
+
+/// One record per `rule_delivered` event: a failed criterion's rule handed
+/// back in a `koto next` response.
+const RULE_DELIVERED: &str = "rule_delivered";
+/// On `rule_delivered`: how much of the rule was handed back, `summary` or
+/// `full`. Not called a level, so it can't be read as a severity beside
+/// `koto.finding.level`.
+const RULE_EXTENT_FIELD: &str = "koto.rule.extent";
+/// On `rule_delivered`, for a unit-mode check: how many units the rule was
+/// handed back for.
+const RULE_UNIT_COUNT_FIELD: &str = "koto.rule.unit_count";
+/// On the three decider-check kinds, for a unit-mode check: the unit's key,
+/// always as its digest.
+const UNIT_KEY_FIELD: &str = "koto.unit.key";
+/// Beside `koto.unit.key`: the check's declared `unit_document`, else the
+/// digest of the document the extraction printed for the unit.
+const UNIT_DOCUMENT_FIELD: &str = "koto.unit.document";
+/// Beside `koto.unit.key`: the check's declared `unit_section`, else the
+/// digest of the section the extraction printed for the unit.
+const UNIT_SECTION_FIELD: &str = "koto.unit.section";
+/// On `decider_checked`, when an answer was read: the decider's confidence
+/// in basis points ([`crate::decider::check::confidence_bp`]). The one
+/// probability the journal carries, as an integer.
+const CONFIDENCE_FIELD: &str = "koto.decider.confidence_bp";
+
+/// `record` with the unit fields of a unit-mode decider-check event, or
+/// unchanged when the event names no unit, so a check without units writes
+/// exactly what it wrote before units existed. The key is always digested;
+/// a document or section is the check's declared label when it has one,
+/// otherwise the digest of what the extraction printed, otherwise absent.
+/// Nothing an extraction printed is copied as printed.
+fn with_unit(
+    record: Record,
+    unit: Option<&crate::decider::check::UnitRef>,
+    labels: Option<&crate::decider::check::UnitLabels>,
+) -> Record {
+    let Some(unit) = unit else {
+        return record;
+    };
+    let pick = |declared: Option<&String>, printed: Option<&String>| {
+        declared.cloned().or_else(|| printed.map(|p| digest(p)))
+    };
+    let document = pick(
+        labels.and_then(|l| l.document.as_ref()),
+        unit.document.as_ref(),
+    );
+    let section = pick(
+        labels.and_then(|l| l.section.as_ref()),
+        unit.section.as_ref(),
+    );
+    record
+        .name(UNIT_KEY_FIELD, Some(digest(&unit.key).as_str()))
+        .name(UNIT_DOCUMENT_FIELD, document.as_deref())
+        .name(UNIT_SECTION_FIELD, section.as_deref())
+}
+
 /// What every record placed in a session's log shares: the records relayed
 /// from one committed event, or a `response` record.
 struct Relay<'a> {
@@ -779,15 +866,18 @@ impl Relay<'_> {
 /// `decider_consulted` event writes one record of its own name, followed by
 /// a `decider_field` per field when it asked about several; a
 /// `decider_checked` or `decider_fallback` event writes one record of its
-/// own name, a `gate_override_recorded` one `check_overridden`, and a
-/// `finding_disputed` one `check_disputed`. Every other payload relays
-/// nothing here: `decider_answered` and `decider_check_answered`, which
-/// need the earlier event they answer, come from [`paired`].
+/// own name, a `gate_override_recorded` one `check_overridden`, a
+/// `finding_disputed` one `check_disputed`, and a `rule_delivered` one
+/// record of its own name. Every other payload relays nothing here:
+/// `decider_answered` and `decider_check_answered`, which need the earlier
+/// event they answer, come from [`paired`].
 ///
 /// Each field is copied by name from the event, never by stripping it, so
 /// nothing the event carries beyond these (output, streams, a finding's
 /// message, path or reference, commands, probabilities, hashes, thresholds,
-/// rationales, dispute reasons, override values) can reach the journal.
+/// rationales, dispute reasons, override values, rule texts, a unit as
+/// printed) can reach the journal. The one value derived from a probability
+/// is `decider_checked`'s integer `koto.decider.confidence_bp`.
 fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
     match payload {
         EventPayload::GateEvaluated {
@@ -889,6 +979,15 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
             .int("koto.visit_attempt", d.visit_attempt)
             .name("koto.rule.id", Some(name_or_digest(&d.rule_id).as_str()))
             .name(DISPUTE_SOURCE_FIELD, Some(d.source.as_str()))],
+        // Names, the extent and a count; the rule's text stays in the
+        // template and the printed response.
+        EventPayload::RuleDelivered(r) => vec![relay
+            .record(RULE_DELIVERED)
+            .name("koto.state", Some(r.state.as_str()))
+            .name(CHECK_NAME_FIELD, Some(r.gate.as_str()))
+            .name("koto.rule.id", Some(name_or_digest(&r.rule_id).as_str()))
+            .name(RULE_EXTENT_FIELD, Some(r.level.as_str()))
+            .int(RULE_UNIT_COUNT_FIELD, r.unit_count)],
         _ => Vec::new(),
     }
 }
@@ -1063,11 +1162,12 @@ fn paired(payload: &EventPayload, relay: &Relay<'_>, prior_log: &str) -> Vec<Rec
         }
         EventPayload::DeciderCheckAnswered(a) => {
             let reason = pairing::fallback(prior_log, a.fallback_seq).map(|f| f.reason);
-            vec![relay
+            let answered = relay
                 .record(DECIDER_CHECK_ANSWERED)
                 .name("koto.state", Some(a.state.as_str()))
                 .name("koto.check", Some(a.gate.as_str()))
-                .name("koto.rule.id", Some(name_or_digest(&a.rule_id).as_str()))
+                .name("koto.rule.id", Some(name_or_digest(&a.rule_id).as_str()));
+            vec![with_unit(answered, a.unit.as_ref(), a.unit_labels.as_ref())
                 .name("koto.decider.answer", Some(a.answer.as_str()))
                 .name("koto.decider.reason", reason.map(|r| r.as_str()))
                 .int("koto.decider.fallback_seq", Some(a.fallback_seq))]
@@ -1093,18 +1193,28 @@ fn agent_answer(submitted: &Value, fc: &crate::decider::FieldConsultation) -> St
 
 /// A `decider_checked` record: one decider-check criterion's verdict, under
 /// its gate as `koto.check` and its id (or the id's digest) as
-/// `koto.rule.id`. Like [`decider_consulted`], the event's own `visit_seq`
-/// isn't copied.
+/// `koto.rule.id`, with its unit for a unit-mode check (see [`with_unit`]).
+/// Like [`decider_consulted`], the event's own `visit_seq` isn't copied.
+///
+/// The probabilities aren't copied either. The one exception is
+/// `koto.decider.confidence_bp`, the highest of them as an integer in basis
+/// points, written whenever the event holds an answer's probabilities and
+/// absent when no answer was read.
 fn decider_checked(relay: &Relay<'_>, c: &crate::decider::check::DeciderCheck) -> Record {
-    relay
+    let checked = relay
         .record("decider_checked")
         .name("koto.state", Some(c.state.as_str()))
         .name("koto.check", Some(c.gate.as_str()))
-        .name("koto.rule.id", Some(name_or_digest(&c.rule_id).as_str()))
+        .name("koto.rule.id", Some(name_or_digest(&c.rule_id).as_str()));
+    with_unit(checked, c.unit.as_ref(), c.unit_labels.as_ref())
         .name("koto.decider.provider", Some(c.provider.as_str()))
         .name("koto.decider.model", Some(c.model.as_str()))
         .name("koto.decider.mode", Some(c.mode.as_str()))
         .name("koto.decider.outcome", Some(c.outcome.as_str()))
+        .int(
+            CONFIDENCE_FIELD,
+            crate::decider::check::confidence_bp(&c.probabilities),
+        )
         .name("koto.decider.reason", c.reason.map(|r| r.as_str()))
         .flag("koto.decider.blocked", c.blocked)
         .name(
@@ -1127,13 +1237,15 @@ fn decider_checked(relay: &Relay<'_>, c: &crate::decider::check::DeciderCheck) -
 /// `koto.check` and its id (or the id's digest) as `koto.rule.id`, with its
 /// mode, the reason it got no verdict and the slice's size. Like
 /// [`decider_checked`], the event's own `visit_seq` isn't copied, and no
-/// hash, question or slice is.
+/// hash, question or slice is; a unit-mode check's unit is written as
+/// [`with_unit`] writes it.
 fn decider_fallback(relay: &Relay<'_>, f: &crate::decider::check::DeciderFallback) -> Record {
-    relay
+    let fallback = relay
         .record("decider_fallback")
         .name("koto.state", Some(f.state.as_str()))
         .name("koto.check", Some(f.gate.as_str()))
-        .name("koto.rule.id", Some(name_or_digest(&f.rule_id).as_str()))
+        .name("koto.rule.id", Some(name_or_digest(&f.rule_id).as_str()));
+    with_unit(fallback, f.unit.as_ref(), f.unit_labels.as_ref())
         .name("koto.decider.mode", Some(f.mode.as_str()))
         .name("koto.decider.reason", Some(f.reason.as_str()))
         .int("koto.decider.input_bytes", f.input_bytes)

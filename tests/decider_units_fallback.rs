@@ -81,6 +81,11 @@ fn criterion_yaml(id: &str) -> String {
 /// the given extra check keys and criteria, then goes to `done`.
 fn template(extra: &str, criteria: &[&str]) -> String {
     let criteria: String = criteria.iter().map(|c| criterion_yaml(c)).collect();
+    template_with(extra, &criteria)
+}
+
+/// [`template`] with the criteria given as YAML.
+fn template_with(extra: &str, criteria: &str) -> String {
     format!(
         r#"---
 name: units-fallback
@@ -696,4 +701,268 @@ fn a_check_without_units_is_answered_without_a_unit_as_before() {
     assert!(body.get("unit").is_none(), "{}", body);
     let out = run(&h);
     assert_eq!(out["state"], "done", "{}", out);
+}
+
+// ---------------------------------------------------------------------------
+// the run journal
+// ---------------------------------------------------------------------------
+
+/// A criterion that declares a summary and a rule text, so a failure hands
+/// its rule back and appends a `rule_delivered` event.
+fn ruled_criterion_yaml(id: &str) -> String {
+    format!(
+        "{}            summary: \"State one observable outcome per criterion.\"\n            rule_text: \"Each acceptance criterion names one observable outcome.\"\n",
+        criterion_yaml(id)
+    )
+}
+
+/// The run journal the harness's session store writes: inside the store's
+/// base directory, which the harness points `KOTO_SESSIONS_BASE` at.
+fn journal(h: &Harness) -> Vec<Value> {
+    let raw = journal_text(h);
+    raw.lines()
+        .map(|l| serde_json::from_str(l).expect("every journal line is JSON"))
+        .collect()
+}
+
+fn journal_text(h: &Harness) -> String {
+    std::fs::read_to_string(h.dir.join("sessions").join("_run_journal.jsonl")).unwrap_or_default()
+}
+
+fn records_of(h: &Harness, kind: &str) -> Vec<Value> {
+    journal(h)
+        .into_iter()
+        .filter(|r| r["kind"] == kind)
+        .collect()
+}
+
+/// How the journal writes a printed value: `sha256:` and the first 32 hex
+/// characters of its SHA-256.
+fn digest(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hex = hex::encode(Sha256::digest(value.as_bytes()));
+    format!("sha256:{}", &hex[..32])
+}
+
+/// One unit line with a printed document and section.
+fn located(key: &str, text: &str, document: &str, section: &str) -> String {
+    json!({"key": key, "text": text, "document": document, "section": section}).to_string() + "\n"
+}
+
+#[test]
+fn the_journal_carries_unit_digests_declared_labels_and_the_confidence() {
+    // Four units whose key, document and section carry a sentinel: one
+    // passes, one fails, one gets 0.12345 / 0.8 / 0.07655 (below the 0.9
+    // threshold, so an escape), and one is over the budget and falls back.
+    let unit = |i: usize, text: &str| {
+        located(
+            &format!("SENTINEL-KEY-{}", i),
+            text,
+            "docs/SENTINEL-DOC.md",
+            "SENTINEL-SECTION",
+        )
+    };
+    let units = [
+        unit(1, &text(1)),
+        unit(2, &text(2)),
+        unit(3, &sized(3, MAX_BYTES + 1)),
+        unit(4, &text(4)),
+    ]
+    .concat();
+    let tpl = template_with(
+        "        units: jsonl\n        unit_document: prd\n        unit_section: acceptance-criteria\n",
+        &ruled_criterion_yaml(RULE),
+    );
+    let h = harness(&tpl, &units);
+    h.stub.push(pass());
+    h.stub.push(fail());
+    h.stub.push(reply(RULE, 0.12345, 0.8, 0.07655));
+    let out = run(&h);
+    assert_eq!(condition(&out)["status"], "failed", "{}", out);
+
+    // The agent answers the waiting unit with --unit.
+    let rec = answer(&h, &["--unit", "SENTINEL-KEY-3"]);
+    assert!(rec.status.success(), "{}", describe(&rec));
+
+    let checked = records_of(&h, "decider_checked");
+    assert_eq!(checked.len(), 4, "{:?}", checked);
+    let fallback = records_of(&h, "decider_fallback");
+    assert_eq!(fallback.len(), 1, "{:?}", fallback);
+    let answered = records_of(&h, "decider_check_answered");
+    assert_eq!(answered.len(), 1, "{:?}", answered);
+    for (r, key) in [
+        (&checked[0], "SENTINEL-KEY-1"),
+        (&checked[1], "SENTINEL-KEY-2"),
+        (&checked[2], "SENTINEL-KEY-3"),
+        (&checked[3], "SENTINEL-KEY-4"),
+        (&fallback[0], "SENTINEL-KEY-3"),
+        (&answered[0], "SENTINEL-KEY-3"),
+    ] {
+        assert_eq!(r["koto.unit.key"], digest(key).as_str(), "{}", r);
+        assert_eq!(r["koto.unit.document"], "prd", "{}", r);
+        assert_eq!(r["koto.unit.section"], "acceptance-criteria", "{}", r);
+    }
+    // The confidence, whatever the outcome the answer led to: pass 0.95 and
+    // fail 0.95 are 9500, the highest of 0.12345, 0.8 and 0.07655 is 8000;
+    // the unit over the budget sent nothing and read no answer.
+    assert_eq!(checked[0]["koto.decider.outcome"], "pass");
+    assert_eq!(checked[0]["koto.decider.confidence_bp"], 9500);
+    assert_eq!(checked[1]["koto.decider.outcome"], "fail");
+    assert_eq!(checked[1]["koto.decider.confidence_bp"], 9500);
+    assert_eq!(checked[2]["koto.decider.reason"], "over_budget");
+    assert!(
+        checked[2].get("koto.decider.confidence_bp").is_none(),
+        "{}",
+        checked[2]
+    );
+    assert_eq!(checked[3]["koto.decider.outcome"], "escape");
+    assert_eq!(checked[3]["koto.decider.confidence_bp"], 8000);
+    assert_eq!(answered[0]["koto.decider.answer"], "pass");
+
+    // The failed rule came back once, for one unit.
+    let delivered = records_of(&h, "rule_delivered");
+    assert_eq!(delivered.len(), 1, "{:?}", delivered);
+    let d = &delivered[0];
+    assert_eq!(d["koto.state"], "review");
+    assert_eq!(d["koto.check.name"], GATE);
+    assert_eq!(d["koto.rule.id"], RULE);
+    assert_eq!(d["koto.rule.extent"], "summary");
+    assert_eq!(d["koto.rule.unit_count"], 1);
+    assert!(
+        d["koto.seq"].is_u64() && d["koto.visit.seq"].is_u64(),
+        "{}",
+        d
+    );
+
+    // Nothing the extraction printed, and no rule text, reached the journal.
+    let raw = journal_text(&h);
+    assert!(!raw.contains("SENTINEL"), "{}", raw);
+    assert!(!raw.contains("observable outcome"), "{}", raw);
+    assert!(
+        !raw.contains("0.12345") && !raw.contains("0.07655"),
+        "{}",
+        raw
+    );
+    // The session log keeps the printed unit for a local reader.
+    assert!(h.raw_log().contains("SENTINEL-KEY-2"));
+}
+
+#[test]
+fn without_labels_the_journal_digests_the_printed_document_and_section() {
+    let units = [
+        located("ac-1", &text(1), "docs/SENTINEL-DOC.md", "SENTINEL-SECTION"),
+        json!({"key": "ac-2", "text": text(2)}).to_string() + "\n",
+    ]
+    .concat();
+    let h = harness(&unit_template(), &units);
+    h.stub.push(pass());
+    h.stub.push(Reply::status(401));
+    run(&h);
+    let checked = records_of(&h, "decider_checked");
+    assert_eq!(checked.len(), 2, "{:?}", checked);
+    assert_eq!(checked[0]["koto.unit.key"], digest("ac-1").as_str());
+    assert_eq!(
+        checked[0]["koto.unit.document"],
+        digest("docs/SENTINEL-DOC.md").as_str()
+    );
+    assert_eq!(
+        checked[0]["koto.unit.section"],
+        digest("SENTINEL-SECTION").as_str()
+    );
+    // A unit that printed no document or section has neither.
+    for r in [&checked[1], &records_of(&h, "decider_fallback")[0]] {
+        assert_eq!(r["koto.unit.key"], digest("ac-2").as_str(), "{}", r);
+        assert!(r.get("koto.unit.document").is_none(), "{}", r);
+        assert!(r.get("koto.unit.section").is_none(), "{}", r);
+    }
+    // A provider error read no answer: no confidence.
+    assert_eq!(checked[1]["koto.decider.reason"], "provider_error");
+    assert!(checked[1].get("koto.decider.confidence_bp").is_none());
+    assert!(!journal_text(&h).contains("SENTINEL"));
+
+    // A unit-mode check whose extraction failed names no unit.
+    let h = harness(&unit_template(), "not json\n");
+    run(&h);
+    for kind in ["decider_checked", "decider_fallback"] {
+        let r = &records_of(&h, kind)[0];
+        assert_eq!(r["koto.decider.reason"], "extraction_failed", "{}", r);
+        for absent in [
+            "koto.unit.key",
+            "koto.unit.document",
+            "koto.unit.section",
+            "koto.decider.confidence_bp",
+        ] {
+            assert!(r.get(absent).is_none(), "{} on {}", absent, r);
+        }
+    }
+}
+
+#[test]
+fn a_single_slice_check_carries_the_confidence_and_no_unit() {
+    // One short slice, inside the byte budget.
+    let h = harness(
+        &template_with("", &ruled_criterion_yaml(RULE)),
+        "Exports finish within one batch.\n",
+    );
+    h.stub.push(fail());
+    let out = run(&h);
+    assert_eq!(condition(&out)["status"], "failed");
+    let checked = records_of(&h, "decider_checked");
+    assert_eq!(checked.len(), 1);
+    let r = &checked[0];
+    assert_eq!(r["koto.decider.confidence_bp"], 9500);
+    for absent in ["koto.unit.key", "koto.unit.document", "koto.unit.section"] {
+        assert!(r.get(absent).is_none(), "{} on {}", absent, r);
+    }
+    let delivered = records_of(&h, "rule_delivered");
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0]["koto.rule.extent"], "summary");
+    assert!(delivered[0].get("koto.rule.unit_count").is_none());
+
+    // The same failure again in the visit, its verdict reused, hands back
+    // the full text.
+    run(&h);
+    let delivered = records_of(&h, "rule_delivered");
+    assert_eq!(delivered.len(), 2);
+    assert_eq!(delivered[1]["koto.rule.extent"], "full");
+}
+
+#[test]
+fn twenty_failing_units_write_one_rule_delivered_with_a_count_of_twenty() {
+    let tpl = template_with("        units: jsonl\n", &ruled_criterion_yaml(RULE));
+    let h = harness(&tpl, &fixture(20, &[]));
+    for _ in 0..20 {
+        h.stub.push(fail());
+    }
+    let out = run(&h);
+    assert_eq!(condition(&out)["status"], "failed");
+    let delivered = records_of(&h, "rule_delivered");
+    assert_eq!(delivered.len(), 1, "{:?}", delivered);
+    assert_eq!(delivered[0]["koto.rule.unit_count"], 20);
+    assert_eq!(records_of(&h, "decider_checked").len(), 20);
+}
+
+#[test]
+fn the_unit_count_counts_failing_units_the_finding_cap_left_out() {
+    // 120 units under the default cap of 32: 32 graded and failing, 88
+    // falling back with unit_limit. 120 findings pass the response's cap of
+    // 100, so the findings are cut, but the count isn't.
+    let tpl = template_with("        units: jsonl\n", &ruled_criterion_yaml(RULE));
+    let h = harness(&tpl, &fixture(120, &[]));
+    for _ in 0..32 {
+        h.stub.push(fail());
+    }
+    let out = run(&h);
+    let cond = condition(&out);
+    assert_eq!(cond["status"], "failed");
+    assert_eq!(
+        cond["failure"]["findings_truncated"], true,
+        "the cap cut the findings: {}",
+        cond["failure"]
+    );
+    let delivered = records_of(&h, "rule_delivered");
+    assert_eq!(delivered.len(), 1, "{:?}", delivered);
+    assert_eq!(delivered[0]["koto.rule.unit_count"], 32);
+    let rules = cond["rules"].as_array().unwrap();
+    assert_eq!(rules[0]["units"].as_array().unwrap().len(), 32);
 }

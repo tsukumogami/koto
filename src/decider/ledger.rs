@@ -458,6 +458,7 @@ mod tests {
             error_class: None,
             endpoint_origin: Some(SettingOrigin::Default),
             unit: None,
+            unit_labels: None,
         }
     }
 

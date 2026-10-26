@@ -2280,6 +2280,9 @@ fn decider_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.state",
             "koto.check",
             "koto.rule.id",
+            "koto.unit.key",
+            "koto.unit.document",
+            "koto.unit.section",
             "koto.decider.answer",
             "koto.decider.reason",
             "koto.decider.fallback_seq",
@@ -2288,10 +2291,14 @@ fn decider_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.state",
             "koto.check",
             "koto.rule.id",
+            "koto.unit.key",
+            "koto.unit.document",
+            "koto.unit.section",
             "koto.decider.provider",
             "koto.decider.model",
             "koto.decider.mode",
             "koto.decider.outcome",
+            "koto.decider.confidence_bp",
             "koto.decider.reason",
             "koto.decider.blocked",
             "koto.decider.error_class",
@@ -2306,9 +2313,19 @@ fn decider_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.state",
             "koto.check",
             "koto.rule.id",
+            "koto.unit.key",
+            "koto.unit.document",
+            "koto.unit.section",
             "koto.decider.mode",
             "koto.decider.reason",
             "koto.decider.input_bytes",
+        ],
+        "rule_delivered" => &[
+            "koto.state",
+            "koto.check.name",
+            "koto.rule.id",
+            "koto.rule.extent",
+            "koto.rule.unit_count",
         ],
         "check_overridden" => &["koto.state", "koto.check"],
         other => panic!("not a decider or override kind: {other}"),
@@ -2328,6 +2345,7 @@ fn decider_records(j: &[serde_json::Value]) -> Vec<serde_json::Value> {
                     | "decider_checked"
                     | "decider_fallback"
                     | "decider_check_answered"
+                    | "rule_delivered"
                     | "check_overridden"
             )
         })
@@ -2392,10 +2410,14 @@ fn consultation() -> DeciderConsultation {
 
 /// One criterion's verdict on gate `comments` in state `a`, whose own
 /// `visit_seq` (99) is not koto's visit, with a planted rule reference,
-/// hashes, threshold and probability.
+/// hashes, threshold and probabilities. Only the highest probability, fail's
+/// 0.5432, reaches the journal, as `koto.decider.confidence_bp` 5432; the
+/// planted 0.4321 and 0.0247 reach it in no form.
 fn criterion_check(rule_id: &str) -> DeciderCheck {
     let mut probabilities = std::collections::BTreeMap::new();
-    probabilities.insert("fail".to_string(), 0.4321);
+    probabilities.insert("pass".to_string(), 0.4321);
+    probabilities.insert("fail".to_string(), 0.5432);
+    probabilities.insert("unclear".to_string(), 0.0247);
     DeciderCheck {
         state: "a".into(),
         visit_seq: 99,
@@ -2421,6 +2443,7 @@ fn criterion_check(rule_id: &str) -> DeciderCheck {
         error_class: None,
         endpoint_origin: Some(SettingOrigin::Env),
         unit: None,
+        unit_labels: None,
     }
 }
 
@@ -2428,11 +2451,20 @@ fn criterion_check(rule_id: &str) -> DeciderCheck {
 /// journal. The field's name, `verdict`, is one of them
 /// (`koto.decider.field`); its winning value, `proceed`, isn't, since the
 /// fixture's field got no answer.
+///
+/// No probability reaches it in any form either: not as written, and not
+/// scaled as basis points. The one value derived from one is
+/// `koto.decider.confidence_bp`, the highest probability of a decider-check
+/// criterion, which the fixtures plant as 0.5432 and so is allowed as 5432;
+/// every other planted probability (0.4321, 0.0247) is checked absent, in
+/// either form, from every field.
 fn assert_no_decider_content(f: &Fixture) {
     let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
     for absent in [
         "PLANTED",
         "0.4321",
+        "0.5432",
+        "0.0247",
         "0.875",
         "probabilit",
         "\"threshold\"",
@@ -2442,6 +2474,18 @@ fn assert_no_decider_content(f: &Fixture) {
         "\"env\"",
     ] {
         assert!(!raw.contains(absent), "{absent} in {raw}");
+    }
+    for record in f.journal() {
+        for (key, value) in record.as_object().unwrap() {
+            if let Some(n) = value.as_f64() {
+                for planted in [4321.0, 247.0, 0.4321, 0.0247, 0.5432] {
+                    assert!(n != planted, "{key} carries {n}: {record}");
+                }
+                if n == 5432.0 {
+                    assert_eq!(key, CONFIDENCE_FIELD, "{record}");
+                }
+            }
+        }
     }
 }
 
@@ -2568,6 +2612,12 @@ fn a_criterion_relays_decider_checked_with_the_events_values() {
     for absent in ["koto.decider.reason", "koto.decider.error_class"] {
         assert!(r.get(absent).is_none(), "{absent}: {r}");
     }
+    // An answer was read: its highest probability, as basis points.
+    assert_eq!(r["koto.decider.confidence_bp"], 5432);
+    // A check without units writes no unit field.
+    for absent in ["koto.unit.key", "koto.unit.document", "koto.unit.section"] {
+        assert!(r.get(absent).is_none(), "{absent}: {r}");
+    }
 
     let r = &d[1];
     assert_eq!(r["koto.seq"], 4);
@@ -2587,9 +2637,256 @@ fn a_criterion_relays_decider_checked_with_the_events_values() {
     for absent in ["koto.decider.input_tokens", "koto.decider.output_tokens"] {
         assert!(r.get(absent).is_none(), "{absent}: {r}");
     }
+    // No answer was read, so no confidence.
+    assert!(r.get("koto.decider.confidence_bp").is_none(), "{r}");
     assert_no_decider_content(&f);
     let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
     assert!(!raw.contains("no reason"), "{raw}");
+}
+
+/// A unit-mode criterion's records: the unit's key as its digest, the
+/// check's declared labels where it declares them, the digest of what the
+/// extraction printed where it doesn't, and nothing where neither exists.
+/// No raw key, document or section reaches the journal.
+#[test]
+fn a_unit_mode_check_relays_the_units_digests_and_declared_labels() {
+    use crate::decider::check::{
+        AgentAnswer, DeciderCheckAnswered, DeciderFallback, UnitLabels, UnitRef,
+    };
+    let f = session_in_a();
+    let unit = UnitRef {
+        key: "SENTINEL-KEY-ac-3".into(),
+        document: Some("docs/SENTINEL-DOC.md".into()),
+        section: Some("SENTINEL-SECTION".into()),
+    };
+    let declared = UnitLabels {
+        document: Some("prd".into()),
+        section: Some("acceptance-criteria".into()),
+    };
+    // Declared labels win over the printed values.
+    let labelled = DeciderCheck {
+        unit: Some(unit.clone()),
+        unit_labels: Some(declared.clone()),
+        ..criterion_check("ac_binary")
+    };
+    commit_as(&f, None, "wf", &EventPayload::DeciderChecked(labelled));
+    // No labels: the printed document and section, digested.
+    let printed = DeciderCheck {
+        unit: Some(unit.clone()),
+        ..criterion_check("ac_binary")
+    };
+    commit_as(&f, None, "wf", &EventPayload::DeciderChecked(printed));
+    // Only a declared document, and a unit that printed no section.
+    let partial = DeciderFallback {
+        unit: Some(UnitRef {
+            section: None,
+            ..unit.clone()
+        }),
+        unit_labels: Some(UnitLabels {
+            document: Some("prd".into()),
+            section: None,
+        }),
+        ..fallback("ac_binary")
+    };
+    commit_as(&f, None, "wf", &EventPayload::DeciderFallback(partial));
+    let answered = DeciderCheckAnswered {
+        state: "a".into(),
+        visit_seq: 2,
+        gate: "comments".into(),
+        rule_id: "ac_binary".into(),
+        declaration_hash: "PLANTED-DECLARATION-HASH".into(),
+        input_sha256: Some("PLANTED-INPUT-HASH".into()),
+        answer: AgentAnswer::Pass,
+        fallback_seq: 5,
+        unit: Some(unit.clone()),
+        unit_labels: Some(declared),
+    };
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::DeciderCheckAnswered(answered),
+    );
+
+    let d = decider_records(&f.journal());
+    assert_eq!(
+        kinds(&d),
+        vec![
+            "decider_checked",
+            "decider_checked",
+            "decider_fallback",
+            "decider_check_answered"
+        ]
+    );
+    let key = digest("SENTINEL-KEY-ac-3");
+    assert!(key.starts_with("sha256:") && key.len() == 7 + 32, "{key}");
+    assert!(is_id(&key), "{key}");
+    for r in &d {
+        assert_eq!(r["koto.unit.key"], key.as_str(), "{r}");
+    }
+    assert_eq!(d[0]["koto.unit.document"], "prd");
+    assert_eq!(d[0]["koto.unit.section"], "acceptance-criteria");
+    assert_eq!(d[0]["koto.decider.confidence_bp"], 5432);
+    assert_eq!(
+        d[1]["koto.unit.document"],
+        digest("docs/SENTINEL-DOC.md").as_str()
+    );
+    assert_eq!(
+        d[1]["koto.unit.section"],
+        digest("SENTINEL-SECTION").as_str()
+    );
+    assert_eq!(d[2]["koto.unit.document"], "prd");
+    assert!(d[2].get("koto.unit.section").is_none(), "{}", d[2]);
+    assert_eq!(d[3]["koto.unit.document"], "prd");
+    assert_eq!(d[3]["koto.unit.section"], "acceptance-criteria");
+    assert_eq!(d[3]["koto.decider.answer"], "pass");
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("SENTINEL"), "{raw}");
+    assert_no_decider_content(&f);
+}
+
+/// A unit-mode fallback and answer carry the three unit fields; the same
+/// events without a unit are written exactly as before units existed.
+#[test]
+fn records_of_a_check_without_units_are_unchanged() {
+    let lines = |payload: &EventPayload| -> Vec<serde_json::Value> {
+        let relay = Relay {
+            session: "wf",
+            session_id: "wf-id",
+            run_id: Some("wf-id"),
+            seq: 7,
+            visit_seq: Some(2),
+        };
+        relayed(payload, &relay)
+            .iter()
+            .chain(paired(payload, &relay, "").iter())
+            .map(|r| {
+                // The time is the only field that moves between two writes.
+                let mut v: serde_json::Value = serde_json::from_str(&r.to_line()).unwrap();
+                v.as_object_mut().unwrap().remove("at");
+                v
+            })
+            .collect()
+    };
+    let fb = fallback_event(UnansweredReason::OverBudget);
+    let answered = check_answered(AgentAnswer::Fail, 3);
+    for (payload, expected) in [
+        (
+            &fb,
+            r#"{"kind":"decider_fallback","koto.check":"comments","koto.decider.input_bytes":34,"koto.decider.mode":"veto","koto.decider.reason":"over_budget","koto.rule.id":"comment_reason","koto.run.id":"wf-id","koto.seq":7,"koto.session.id":"wf-id","koto.state":"a","koto.visit.seq":2,"session":"wf","v":1}"#,
+        ),
+        (
+            &answered,
+            r#"{"kind":"decider_check_answered","koto.check":"comments","koto.decider.answer":"fail","koto.decider.fallback_seq":3,"koto.rule.id":"comment_reason","koto.run.id":"wf-id","koto.seq":7,"koto.session.id":"wf-id","koto.state":"a","koto.visit.seq":2,"session":"wf","v":1}"#,
+        ),
+    ] {
+        let expected: serde_json::Value = serde_json::from_str(expected).unwrap();
+        assert_eq!(lines(payload), vec![expected]);
+    }
+}
+
+#[test]
+fn a_rule_delivery_relays_rule_delivered_with_names_and_counts_only() {
+    use crate::decider::check::RuleDelivered;
+    use crate::template::decider_check::RuleLevel;
+    let f = session_in_a();
+    reset_for_test();
+    let unit_mode = RuleDelivered {
+        state: "a".into(),
+        gate: "ac_binary".into(),
+        rule_id: "ac_binary".into(),
+        level: RuleLevel::Summary,
+        unit_count: Some(20),
+    };
+    commit_as(&f, None, "wf", &EventPayload::RuleDelivered(unit_mode));
+    let single = RuleDelivered {
+        state: "a".into(),
+        gate: "comments".into(),
+        rule_id: "no reason [x]".into(),
+        level: RuleLevel::Full,
+        unit_count: None,
+    };
+    commit_as(&f, None, "wf", &EventPayload::RuleDelivered(single));
+    assert_eq!(
+        batches_for_test(),
+        (2, 0),
+        "relayed, so never flushed alone"
+    );
+
+    let d = decider_records(&f.journal());
+    assert_eq!(kinds(&d), vec!["rule_delivered", "rule_delivered"]);
+    let r = &d[0];
+    assert_eq!(r["koto.seq"], 3);
+    assert_eq!(r["koto.visit.seq"], 2);
+    assert_eq!(r["koto.state"], "a");
+    assert_eq!(r["koto.check.name"], "ac_binary");
+    assert!(r.get("koto.check").is_none(), "{r}");
+    assert_eq!(r["koto.rule.id"], "ac_binary");
+    assert_eq!(r["koto.rule.extent"], "summary");
+    assert_eq!(r["koto.rule.unit_count"], 20);
+    let r = &d[1];
+    assert_eq!(r["koto.seq"], 4);
+    assert_eq!(r["koto.rule.extent"], "full");
+    assert_eq!(r["koto.rule.id"], name_or_digest("no reason [x]").as_str());
+    assert!(r.get("koto.rule.unit_count").is_none(), "{r}");
+}
+
+#[test]
+fn unit_and_rule_records_with_the_longest_names_fit_a_line() {
+    use crate::decider::check::{RuleDelivered, UnitLabels, UnitRef};
+    use crate::template::decider_check::RuleLevel;
+    let session = "s".repeat(255);
+    let id = "i".repeat(128);
+    let relay = Relay {
+        session: &session,
+        session_id: &id,
+        run_id: Some(&id),
+        seq: u64::MAX,
+        visit_seq: Some(u64::MAX),
+    };
+    // Three 128-byte names (the state, the check and a declared label) and
+    // a 128-byte rule id, on the widest decider-check record.
+    let checked = DeciderCheck {
+        state: "t".repeat(128),
+        gate: "g".repeat(128),
+        provider: "p".repeat(128),
+        model: "m".repeat(128),
+        input_bytes: Some(u64::MAX),
+        input_tokens: Some(u64::MAX),
+        output_tokens: Some(u64::MAX),
+        latency_ms: u64::MAX,
+        unit: Some(UnitRef {
+            key: "k".repeat(128),
+            document: Some("d".repeat(128)),
+            section: Some("x".repeat(128)),
+        }),
+        unit_labels: Some(UnitLabels {
+            document: Some("l".repeat(128)),
+            section: None,
+        }),
+        ..criterion_check(&"r".repeat(128))
+    };
+    let delivered = RuleDelivered {
+        state: "t".repeat(128),
+        gate: "g".repeat(128),
+        rule_id: "r".repeat(128),
+        level: RuleLevel::Summary,
+        unit_count: Some(32),
+    };
+    for payload in [
+        EventPayload::DeciderChecked(checked),
+        EventPayload::RuleDelivered(delivered),
+    ] {
+        let lines: Vec<String> = relayed(&payload, &relay)
+            .iter()
+            .map(Record::to_line)
+            .collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].len() < MAX_LINE_BYTES, "{} bytes", lines[0].len());
+        let r: serde_json::Value = serde_json::from_str(lines[0].trim_end()).unwrap();
+        assert_eq!(r["koto.rule.id"], "r".repeat(128));
+        assert_eq!(r["koto.state"], "t".repeat(128));
+    }
 }
 
 #[test]
@@ -3296,6 +3593,7 @@ fn fallback_event(reason: UnansweredReason) -> EventPayload {
         input_sha256: Some("PLANTED-INPUT-HASH".into()),
         input_bytes: Some(34),
         unit: None,
+        unit_labels: None,
     })
 }
 
@@ -3311,6 +3609,7 @@ fn check_answered(answer: AgentAnswer, fallback_seq: u64) -> EventPayload {
         answer,
         fallback_seq,
         unit: None,
+        unit_labels: None,
     })
 }
 
@@ -4480,6 +4779,7 @@ fn fallback(rule_id: &str) -> crate::decider::check::DeciderFallback {
         input_sha256: Some("PLANTED-INPUT-HASH".into()),
         input_bytes: Some(2561),
         unit: None,
+        unit_labels: None,
     }
 }
 
