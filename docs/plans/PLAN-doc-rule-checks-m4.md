@@ -149,7 +149,28 @@ Steps 2 and 3 left part of this in place. `E-DECIDER-CHECK-RULE` already refuses
 
 ### Step 5: the run journal carries unit digests, confidence and rule deliveries
 
-Unit-mode `decider_checked`, `decider_fallback` and `decider_check_answered` records carry the key digest and declared or digested document and section, `decider_checked` carries `koto.decider.confidence_bp`, and `rule_delivered` records carry `koto.rule.extent` and `koto.rule.unit_count`, with the no-probability rule amended where koto states it.
+**Goal**: The run journal carries what the telemetry readout needs and nothing an extraction printed: unit-mode `decider_checked`, `decider_fallback` and `decider_check_answered` records carry the unit's key digest and its document and section, `decider_checked` carries the decider's confidence as an integer, and each rule delivery is a `rule_delivered` record.
+
+Steps 1 to 4 left the inputs in place. The three session events already carry an optional `unit` (`UnitRef`, with the raw key, document and section), and the relays in `src/run_journal/mod.rs` (`decider_checked`, `decider_fallback`, the `DeciderCheckAnswered` arm) don't read it yet. The `rule_delivered` session event (step 2) is appended after the response prints, but the journal doesn't relay it. The consultation keeps the decider's unrounded probabilities (`src/decider/check.rs`), and the journal holds none. Step 4 made every compiled unit-mode spec carry `max_units`, and added `unit_document` and `unit_section` to the spec. Step 4 also put those two labels into `declaration_hash`; the design leaves them out, since neither is sent to the decider, so this step takes them back out.
+
+**Acceptance Criteria**:
+
+- [ ] For a unit-mode check, the journal's `decider_checked`, `decider_fallback` and `decider_check_answered` records carry `koto.unit.key` as `sha256:` plus 32 hex characters of the key's digest, and `koto.unit.document` and `koto.unit.section` as the check's declared `unit_document` and `unit_section` when declared, else as the digest of the printed value, else absent. Records of a check without `units` carry none of the three and are byte-identical to before.
+- [ ] No raw unit key, document or section an extraction printed appears anywhere in the run journal; a test plants a sentinel in each and searches the journal for it.
+- [ ] With the stub answering pass 0.12345, fail 0.8 and unclear 0.07655, `decider_checked` carries `koto.decider.confidence_bp` 8000 (the highest probability times 10,000, rounded half up). It's present whenever an answer was read, unit mode or not, and absent on `over_budget`, `extraction_failed` and any other outcome where no answer was read.
+- [ ] The no-probability rule is amended to name `koto.decider.confidence_bp` as its one exception in all four places koto states it: `docs/reference/run-journal.md`, the module documentation in `src/run_journal/mod.rs` (both spots), and the test that a planted probability isn't copied, which now checks that no other probability is.
+- [ ] Each `rule_delivered` session event is relayed as one `rule_delivered` journal record with `koto.state`, `koto.check.name`, `koto.rule.id`, `koto.rule.extent` (`summary` or `full`), `koto.seq` and `koto.visit.seq`, and in unit mode `koto.rule.unit_count` equal to the delivery's key count; twenty failing units of one rule give one record with `koto.rule.unit_count` 20. The record never holds the rule text. Its field names and shape are final here, because later work adds `koto.rule.via` and `koto.rule.delivery` to this same record.
+- [ ] `koto.rule.unit_count` counts every failing unit of the rule, including when the response's finding cap truncated the findings.
+- [ ] `tests/run_journal_doc_test.rs`'s collision tests list every new name; none equals or is a dot-prefix of an existing name, and `koto.unit` and `koto.rule` exist only as prefixes. A record with three 128-byte names and a 128-byte rule id is written.
+- [ ] `unit_document` and `unit_section` are left out of `declaration_hash`: changing either keeps the hash, while adding `units: jsonl` still moves it.
+
+**Check**: Run `cargo test --test run_journal_test` and `cargo test --test run_journal_doc_test` (both extended with this step), plus the stub-driven cases this step adds in `tests/decider_units_fallback.rs` (through the repo's usual test setup). They drive a unit-mode check with declared labels, one without labels, and a single-slice check through `koto next` and `koto decider answer --unit`, and read the journal's records for the fields, digests, confidence, sentinel absence and the `rule_delivered` records listed above.
+
+**Dependencies**: Step 4
+
+**Files**: `src/run_journal/mod.rs`, `src/decider/check.rs`, `src/template/decider_check.rs`, `docs/reference/run-journal.md`, `docs/reference/session-feed.md`, `tests/run_journal_test.rs`, `tests/run_journal_doc_test.rs`, `tests/decider_units_fallback.rs`
+
+**Complexity**: testable
 
 ### Step 6: older readers and the docs and skills cover unit mode and rule delivery
 
