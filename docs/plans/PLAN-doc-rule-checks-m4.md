@@ -174,7 +174,27 @@ Steps 1 to 4 left the inputs in place. The three session events already carry an
 
 ### Step 6: older readers and the docs and skills cover unit mode and rule delivery
 
-The koto v0.14.1 compatibility job reads logs and ledgers holding the new records, the session feed declares them, and the reference docs and koto-author and koto-user skills name every term the PRD's docs table lists.
+**Goal**: An older koto reads what this feature writes, and every document and skill an author or agent reads names the new surface.
+
+Steps 1 to 5 left the session events (`decider_checked`, `decider_fallback` and `decider_check_answered` with an optional `unit` and unit labels, and the new `rule_delivered`) and their journal records, documented in `docs/reference/session-feed.md` and `docs/reference/run-journal.md`, and the error codes in `docs/reference/error-codes.md`. The compatibility job `test/compat/decider-checks-v0_14_1.sh` (CI job `decider-checks-compat-v0-14-1`, fixtures under `test/compat/fixtures-decider-checks/`) drives single-slice decider checks only. Neither the decider authoring guide (`docs/guides/decider-authoring.md`) nor the koto-author and koto-user skills mention units, `max_units`, the unit labels, `--unit`, rule texts or the `rules` field.
+
+**Acceptance Criteria**:
+
+- [ ] The compatibility job also drives a unit-mode decider check (with `unit_document`, `unit_section`, `summary` and `rule_text`) through a failing evaluation, a fallback, a `koto decider answer --unit`, and a rule delivery under the new build; its log holds per-unit `decider_checked`, `decider_fallback` and `decider_check_answered` events and a `rule_delivered` event, and `koto template validate-feed` accepts them.
+- [ ] koto v0.14.1 runs `koto status` and `koto next` on that session after it left the check, exits 0 and reports the state the new build reports, skipping the unknown `rule_delivered` event; `koto decider report` from v0.14.1 over the ledger holding per-unit `checked` lines exits 0.
+- [ ] The job's `--self-test` mutations bite on the new events: dropping a `rule_delivered` line or a per-unit line fails the job.
+- [ ] The new build reads a session log and a ledger written before this feature unchanged.
+- [ ] Each document names the terms beside it: the koto-author template-format reference (`units`, `max_units`, `unit_document`, `unit_section`, `summary`, `rule_text`, the 32-consultation state bound and the default share); the decider authoring guide (`units`, `max_units`, `summary`, `rule_text`, `rules`); the error-code reference (`E-DECIDER-CHECK-UNITS`, `E-DECIDER-CHECK-RULE`, `unit_required`, `unit_not_expected`, `unknown_unit`); the run-journal reference (`koto.unit.key`, `koto.decider.confidence_bp`, `rule_delivered`, `koto.rule.extent`); the session-feed reference (`rule_delivered`, the optional `unit` fields); and the koto-user skill with its command and response references (`--unit`, `rules`, `units`).
+- [ ] `cargo test --test doc_names` passes with every new name resolving.
+- [ ] Public text says "telemetry" for the export and names no vendor or private repository.
+
+**Check**: Run `test/compat/decider-checks-v0_14_1.sh` and its `--self-test` against a v0.14.1 binary and the new release build, as the CI job does, and `cargo test --test doc_names` (through the repo's usual test setup). Then grep each document in the table above for each of its terms; every term is present.
+
+**Dependencies**: Step 5
+
+**Files**: `test/compat/decider-checks-v0_14_1.sh`, `test/compat/fixtures-decider-checks/`, `.github/workflows/validate.yml`, `docs/guides/decider-authoring.md`, `docs/reference/error-codes.md`, `docs/reference/run-journal.md`, `docs/reference/session-feed.md`, `plugins/koto-skills/skills/koto-author/references/template-format.md`, `plugins/koto-skills/skills/koto-user/`
+
+**Complexity**: testable
 
 ### Step 7: the telemetry readout returns this feature's per-unit rows from exported records
 
