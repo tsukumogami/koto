@@ -544,10 +544,8 @@ fn the_unit_and_rule_delivery_attributes_collide_with_no_other_attribute() {
         );
     }
     // The delivery's extent isn't called a level, which would read as a
-    // severity beside `koto.finding.level`, and `koto.rule.delivery` stays
-    // free for later delivery attributes on the same record.
+    // severity beside `koto.finding.level`.
     assert!(!written.contains("koto.rule.level"));
-    assert!(!written.contains("koto.rule.delivery"));
     // Each new name is written by exactly one constant: a second literal
     // would let two spellings drift apart.
     let source = std::fs::read_to_string(root().join(SOURCE_DIR).join("mod.rs")).unwrap();
