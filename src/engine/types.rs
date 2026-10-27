@@ -958,6 +958,22 @@ impl LoggedStreams {
     }
 }
 
+/// Who ran the `koto init --supersede` that fenced a session, as the
+/// [`EventPayload::SessionSuperseded`] event records it. Each field is
+/// whatever the environment said, and absent when it said nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupersedeActor {
+    /// The agent session the command ran in (`CLAUDE_CODE_SESSION_ID`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session: Option<String>,
+    /// The host the command ran on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// The user the command ran as (`USER`, else `LOGNAME`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
 /// Type-specific payload for each event variant.
 ///
 /// Each variant's inner fields are serialized directly as the `payload`
@@ -1368,6 +1384,25 @@ pub enum EventPayload {
         from_session: String,
         from_session_id: String,
         machine_id: String,
+    },
+    /// The fence `koto init --continues PRED --supersede` appends to the
+    /// predecessor's own log: from this event on the session is superseded
+    /// by session `by` (whose header carries `by_session_id`), and koto
+    /// refuses every further write to it with `session_superseded` while
+    /// its reads keep working.
+    ///
+    /// Appended under the log's append lock, so of two successors racing to
+    /// supersede one session the first append wins; a log holding more
+    /// than one is read by its first. `actor` says who ran the command.
+    ///
+    /// State derivation ignores it. Additive: it does not move
+    /// `CURRENT_SCHEMA_VERSION`, and an older build lands it in
+    /// [`Unknown`](EventPayload::Unknown) and keeps reading the log.
+    SessionSuperseded {
+        by: String,
+        by_session_id: String,
+        actor: SupersedeActor,
+        at: String,
     },
     /// A state's `default_action` delivered its stdout under the name the
     /// state declared in `capture_stdout_as`
@@ -1965,6 +2000,7 @@ impl EventPayload {
             EventPayload::EnvironmentAdopted { .. } => "environment_adopted",
             EventPayload::ExecutionAnchorRebound { .. } => "execution_anchor_rebound",
             EventPayload::SessionImported { .. } => "session_imported",
+            EventPayload::SessionSuperseded { .. } => "session_superseded",
             EventPayload::VariableCaptured { .. } => "variable_captured",
             EventPayload::VariablesRebound { .. } => "variables_rebound",
             EventPayload::RequestStoreResult { .. } => "request_store.result",
@@ -2323,6 +2359,16 @@ impl<'de> Deserialize<'de> for Event {
                     from_session: p.from_session,
                     from_session_id: p.from_session_id,
                     machine_id: p.machine_id,
+                }
+            }
+            "session_superseded" => {
+                let p: SessionSupersededPayload = serde_json::from_value(payload_val.clone())
+                    .map_err(serde::de::Error::custom)?;
+                EventPayload::SessionSuperseded {
+                    by: p.by,
+                    by_session_id: p.by_session_id,
+                    actor: p.actor,
+                    at: p.at,
                 }
             }
             "variable_captured" => {
@@ -2735,6 +2781,15 @@ struct SessionImportedPayload {
     from_session: String,
     from_session_id: String,
     machine_id: String,
+}
+
+#[derive(Deserialize)]
+struct SessionSupersededPayload {
+    by: String,
+    by_session_id: String,
+    #[serde(default)]
+    actor: SupersedeActor,
+    at: String,
 }
 
 #[derive(Deserialize)]
@@ -4556,6 +4611,82 @@ mod tests {
         }
         assert_eq!(event.payload.type_name(), "session_imported");
         assert_eq!(serde_json::to_string(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn session_superseded_roundtrips_byte_for_byte() {
+        use super::{Event, EventPayload, SupersedeActor};
+        let json = r#"{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"session_superseded","payload":{"by":"s","by_session_id":"9f2e","actor":{"claude_session":"c-1","host":"box","user":"dev"},"at":"2026-01-01T00:00:00Z"}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        match &event.payload {
+            EventPayload::SessionSuperseded {
+                by,
+                by_session_id,
+                actor,
+                at,
+            } => {
+                assert_eq!(by, "s");
+                assert_eq!(by_session_id, "9f2e");
+                assert_eq!(
+                    actor,
+                    &SupersedeActor {
+                        claude_session: Some("c-1".to_string()),
+                        host: Some("box".to_string()),
+                        user: Some("dev".to_string()),
+                    }
+                );
+                assert_eq!(at, "2026-01-01T00:00:00Z");
+            }
+            other => panic!("expected a session_superseded payload, got {:?}", other),
+        }
+        assert_eq!(event.payload.type_name(), "session_superseded");
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn session_superseded_with_an_empty_actor_roundtrips() {
+        use super::Event;
+        let json = r#"{"seq":4,"timestamp":"2026-01-01T00:00:00Z","type":"session_superseded","payload":{"by":"s","by_session_id":"9f2e","actor":{},"at":"2026-01-01T00:00:00Z"}}"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn session_superseded_does_not_move_the_derived_state() {
+        use super::{Event, EventPayload, SupersedeActor};
+        let at = |seq, payload: EventPayload| Event {
+            seq,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: payload.type_name().to_string(),
+            payload,
+            idempotency_hash: None,
+        };
+        let events = vec![
+            at(
+                1,
+                EventPayload::Transitioned {
+                    from: None,
+                    to: "wait".to_string(),
+                    condition_type: "auto".to_string(),
+                    skip_if_matched: None,
+                    context_assignments: None,
+                    vars_matched: None,
+                },
+            ),
+            at(
+                2,
+                EventPayload::SessionSuperseded {
+                    by: "s".to_string(),
+                    by_session_id: "9f2e".to_string(),
+                    actor: SupersedeActor::default(),
+                    at: "2026-01-01T00:00:00Z".to_string(),
+                },
+            ),
+        ];
+        assert_eq!(
+            crate::engine::persistence::derive_state_from_log(&events).as_deref(),
+            Some("wait")
+        );
     }
 
     #[test]

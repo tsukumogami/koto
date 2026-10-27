@@ -75,6 +75,7 @@ koto init <name> --template <path>
 
 **Predecessor:**
 - `--continues <pred> [--continues-from <workspace>]` -- Record that this session continues session `<pred>`: the continues relation [`koto session link --continues`](#continuing-a-session) writes, in the new (or attached, or replacement) session's own context, before the command reports the session. `<pred>` is checked before anything is created, and a refused one (a name that fails the session-name rule or is the session's own, a name with no session, or an anchor or close record) exits 2 with nothing written; under the cloud backend a bucket that can't be read to look it up exits 3. A relation whose write the bucket doesn't confirm exits 3 with the session opened without it.
+- `--supersede [--carry <prefix>]... [--expect-state <state>]` -- With `--continues <pred>`, take `<pred>`'s work over and fence `<pred>` so nothing drives it again. See [Superseding a session](#superseding-a-session).
 
 **Agent-session anchor:**
 - `KOTO_ANCHOR` -- When this variable names an anchor (see [session anchor](#session-anchor)) other than the session being created, init writes a held-by link, `koto/links/held-by/<anchor>`, into the new session's context, unless it already holds one, and appends an `anchor_activity` event to that anchor. When the anchor reads closed by an observed close and its family has a later anchor (`<anchor>-s2` and so on), the session also gets a held-by link to that one, and the activity goes there. Activity is throttled: at most one event per tenth of the idle period (`retention.idle_period`, default `7d`, see [config](#config-keys-reference)), judged from the anchor's last event; a malformed value falls back to the default here and never fails the command. A variable that is unset, empty, or names no anchor does nothing and prints nothing. koto reads only `KOTO_ANCHOR`, never `KOTO_DISPATCHER_ANCHOR`. No other session is written.
@@ -139,6 +140,55 @@ Without `--attach-live` or `--replace-terminal`, an existing session still gets 
 ```json
 {"name":"scope-t1","state":"work","outcome":"attached","rebound":{"MERGE":"false"},"leg":{"request_id":"req-...","leg":"scope","written":true}}
 ```
+
+#### Superseding a session
+
+A plain `--continues` records that a new session follows an old one and leaves the old one alone: both can still be ticked. `--supersede` is for taking a run over, so that only the new session goes on.
+
+```bash
+koto init <succ> --template <path> --continues <pred> --supersede [--carry <prefix>]... [--expect-state <state>]
+```
+
+The command works in five steps, and the successor's session id is chosen before anything is written:
+
+1. **Check.** koto reads `<pred>`'s log. If `<pred>` is already superseded by `<succ>`, this is a re-run and it goes straight to step 3. If it's superseded by another session, or `--expect-state` names a state `<pred>` isn't in, or the command would loop, it refuses with nothing written.
+2. **Fence.** koto appends a `session_superseded` event to `<pred>`'s own log: `{"by", "by_session_id", "actor": {"claude_session", "host", "user"}, "at"}`, naming the successor by name and session id and recording who ran the command (`CLAUDE_CODE_SESSION_ID`, the host name, and `USER` or `LOGNAME`). The append takes the same per-append lock every write to that log takes, and waits for it at most 10 seconds. The log is checked again under the lock, so when two successors race for one predecessor the first append wins and the second is refused.
+3. **Create.** koto creates `<succ>` with its continues relation, as plain `--continues` does, unless an earlier run of the same command already created it.
+4. **Carry.** For each `--carry <prefix>` (repeatable), koto copies every context key of `<pred>` starting with `<prefix>` into `<succ>`. The match is a plain string prefix, as [`koto context list --prefix`](#context-list) matches it, so `--carry taken_legs` takes `taken_legs/a` and `taken_legs.idx` alike. A key `<succ>` already holds with the same value is skipped, keys under `koto/` are never carried, and reading `<pred>` for the carry logs no read in it. Each copied key is written with writer `koto` and logged as a `context_added` event in `<succ>`. Then koto writes `koto/superseded-carry-complete` in `<succ>`; a later run that finds it carries nothing.
+5. **Ring.** koto rings `<pred>`'s wake file once, best-effort, so anything waiting on it looks again.
+
+Nothing is created before the fence, so a refusal leaves both sessions as they were. Running the same command again finishes a run that was interrupted (a crash after the fence creates `<succ>` with the session id the fence recorded) or, when everything is done, changes nothing and reports `"outcome": "unchanged"`.
+
+**Output (JSON):**
+
+```json
+{"name":"coord-2","state":"plan","outcome":"superseded","superseded":"coord-1","carried":9,"forward":"coord-2"}
+```
+
+`outcome` is `superseded` on the run that wrote the fence and `unchanged` on a re-run; `carried` counts the keys this run copied.
+
+**After the fence.** koto refuses every attempt to drive `<pred>`: `koto next`, `koto context add` and `koto context remove`, `koto decisions record`, `koto overrides record`, `koto rewind`, `koto cancel`, and any other append to its log. The refusal has error code `session_superseded`, exits 2, writes nothing (a `koto context add` doesn't store the value either), and names the newest session in the chain, found by following each session's fence forward (up to 64 hops). It carries `superseded_by` (the direct successor), `newest` and the fence's `actor`. `koto next` prints it in its usual error shape:
+
+```json
+{"error":{"code":"session_superseded","message":"session 'coord-1' was superseded by 'coord-2' (session_superseded), so nothing was written; continue in 'coord-2'","details":[]},"superseded_by":"coord-2","newest":"coord-2","actor":{"host":"build-1","user":"dev"}}
+```
+
+Reads keep working: `koto context get`, `koto context exists`, `koto context list`, `koto status`, `koto workflows` and `koto session hierarchy` all answer for `<pred>` as before.
+
+**Refusals.** Each prints `{"error", "command": "init", "code", ...}` on stdout and writes nothing:
+
+| Code | Exit | When |
+|------|------|------|
+| `superseded_by` | 2 | `<pred>` is already superseded by another session. The message reads `superseded_by=<other>`, and the body carries `superseded_by`, `newest` and `actor`. |
+| `stale_state` | 2 | `--expect-state` names a state `<pred>` isn't in. The body carries `expected` and `actual`. |
+| `self` | 2 | `<succ>` and `<pred>` are the same session. |
+| `cycle` | 2 | `<succ>` exists and `<pred>` already descends from it, through continues relations or supersede fences. |
+| `session_exists` | 2 | `<succ>` exists and no earlier run of this command opened it. |
+| `cloud_unsupported` | 2 | The cloud backend is configured. Its fence isn't supported in this release. |
+| `invalid_usage` | 2 | `--supersede` with `--parent`, `--from-stdin`, `--attach-live`, `--replace-terminal` or `--koto-leg`, or a `--carry` prefix under `koto/`. `--carry` and `--expect-state` require `--supersede`, which requires `--continues`. |
+| `fence_unavailable` | 3 | `<pred>`'s log stayed locked by another writer for 10 seconds. Run the command again. |
+
+The checks plain `--continues` makes on `<pred>` (the session-name rule, a session that exists, not an anchor or close record) refuse as they do there.
 
 ### next
 

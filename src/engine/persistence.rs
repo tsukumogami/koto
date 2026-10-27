@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::engine::errors::EngineError;
 use crate::engine::types::{
-    Event, EventPayload, MachineState, StateFileHeader, CURRENT_SCHEMA_VERSION,
+    Event, EventPayload, MachineState, StateFileHeader, SupersedeActor, CURRENT_SCHEMA_VERSION,
 };
 
 /// What a log's first line must be able to tell the reader.
@@ -220,6 +220,9 @@ fn append_event_reading<H: LogHeader>(
     // processes appending at once can't both take the same seq.
     let _append_lock = AppendLock::acquire(path);
     let tail = prepare_append::<H>(path)?;
+    // Checked on the bytes read under the lock, so no write slips in after
+    // a fence another process just appended.
+    refuse_if_fenced(path, &tail.content, payload)?;
 
     let event = Event {
         seq: tail.next_seq,
@@ -420,6 +423,7 @@ pub fn append_event_idempotent_in<H: LogHeader>(
     // reader can parse. The scan below reads the bytes this read returns,
     // under the lock taken above.
     let tail = prepare_append::<H>(path)?;
+    refuse_if_fenced(path, &tail.content, payload)?;
     let next_seq = tail.next_seq;
 
     // Scan for a prior event with the same hash. A malformed line in the
@@ -533,6 +537,233 @@ impl AppendLock {
     fn acquire(_log: &Path) -> Self {
         AppendLock {}
     }
+
+    /// [`acquire`](Self::acquire) with the wait bounded by `wait`: `None`
+    /// when another process still holds the lock once `wait` has passed.
+    /// Where the lock can't be had at all, the fallback is the one
+    /// `acquire` takes: an unlocked guard.
+    #[cfg(unix)]
+    fn acquire_within(log: &Path, wait: std::time::Duration) -> Option<Self> {
+        use std::os::fd::AsRawFd;
+        let Some(dir) = log.parent() else {
+            return Some(AppendLock { _file: None });
+        };
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(APPEND_LOCK_FILE))
+        {
+            Ok(f) => f,
+            Err(_) => return Some(AppendLock { _file: None }),
+        };
+        match crate::engine::jsonl_append::lock_exclusive(
+            file.as_raw_fd(),
+            Some(wait),
+            std::time::Instant::now(),
+        ) {
+            Ok(()) => Some(AppendLock { _file: Some(file) }),
+            Err(e) if crate::engine::jsonl_append::lock_timeout(&e).is_some() => None,
+            Err(_) => Some(AppendLock { _file: None }),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn acquire_within(_log: &Path, _wait: std::time::Duration) -> Option<Self> {
+        Some(AppendLock {})
+    }
+}
+
+// ===== The supersede fence =====
+
+/// How long `koto init --supersede` waits for a predecessor's append lock
+/// before it gives up with `fence_unavailable`, having written nothing.
+pub const FENCE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A session's supersede fence: the [`EventPayload::SessionSuperseded`]
+/// event in its own log, which names the session that superseded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersedeFence {
+    /// The successor's name.
+    pub by: String,
+    /// The successor's session id, as its header records it.
+    pub by_session_id: String,
+    /// Who ran the command that fenced the session.
+    pub actor: SupersedeActor,
+    /// When the fence was appended.
+    pub at: String,
+}
+
+impl SupersedeFence {
+    /// The fence `payload` carries, if it is one.
+    pub fn from_payload(payload: &EventPayload) -> Option<Self> {
+        match payload {
+            EventPayload::SessionSuperseded {
+                by,
+                by_session_id,
+                actor,
+                at,
+            } => Some(SupersedeFence {
+                by: by.clone(),
+                by_session_id: by_session_id.clone(),
+                actor: actor.clone(),
+                at: at.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The event payload that records this fence.
+    pub fn to_payload(&self) -> EventPayload {
+        EventPayload::SessionSuperseded {
+            by: self.by.clone(),
+            by_session_id: self.by_session_id.clone(),
+            actor: self.actor.clone(),
+            at: self.at.clone(),
+        }
+    }
+}
+
+/// The fence in `events`, if the session was superseded. The first one
+/// wins: it is the one every later append was refused by.
+pub fn superseded_by(events: &[Event]) -> Option<SupersedeFence> {
+    events
+        .iter()
+        .find_map(|e| SupersedeFence::from_payload(&e.payload))
+}
+
+/// [`superseded_by`] over a log's raw bytes, parsing only the lines that
+/// mention the event type, so the check every append makes costs a
+/// substring search on a log with no fence.
+pub fn superseded_by_in_log(content: &str) -> Option<SupersedeFence> {
+    const MARK: &str = "session_superseded";
+    if !content.contains(MARK) {
+        return None;
+    }
+    content
+        .lines()
+        .skip(1)
+        .filter(|line| line.contains(MARK))
+        .find_map(|line| {
+            serde_json::from_str::<Event>(line.trim())
+                .ok()
+                .and_then(|e| SupersedeFence::from_payload(&e.payload))
+        })
+}
+
+/// The fence in the log at `path`, read without a lock. A log that doesn't
+/// exist has none.
+pub fn read_fence(path: &Path) -> anyhow::Result<Option<SupersedeFence>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(superseded_by_in_log(&content)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!(
+            "failed to read state file {}: {}",
+            path.display(),
+            e
+        )),
+    }
+}
+
+/// An append to a superseded session's log, refused with nothing written
+/// (error kind `session_superseded`). `fence` is the session's own fence;
+/// the CLI follows it forward to the newest session when it reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSupersededError {
+    /// The session whose log refused the append.
+    pub session: String,
+    /// Its fence.
+    pub fence: SupersedeFence,
+}
+
+impl std::fmt::Display for SessionSupersededError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session '{}' was superseded by '{}' (session_superseded), so nothing was written; \
+             continue as '{}'",
+            self.session, self.fence.by, self.fence.by
+        )
+    }
+}
+
+impl std::error::Error for SessionSupersededError {}
+
+/// The [`SessionSupersededError`] `e` failed with, whatever context was
+/// added to it since.
+pub fn session_superseded(e: &anyhow::Error) -> Option<&SessionSupersededError> {
+    e.chain()
+        .find_map(|cause| cause.downcast_ref::<SessionSupersededError>())
+}
+
+/// Refuse appending `payload` to a log whose bytes (`content`, read under
+/// the append lock) hold a fence. A `context_read` passes: reads of a
+/// superseded session keep working, and an anchored read records itself
+/// in the session it read.
+fn refuse_if_fenced(path: &Path, content: &str, payload: &EventPayload) -> anyhow::Result<()> {
+    if matches!(payload, EventPayload::ContextRead { .. }) {
+        return Ok(());
+    }
+    match superseded_by_in_log(content) {
+        Some(fence) => Err(SessionSupersededError {
+            session: extract_session_id_from_path(path),
+            fence,
+        }
+        .into()),
+        None => Ok(()),
+    }
+}
+
+/// What [`append_supersede_fence`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FenceOutcome {
+    /// The fence was appended at `seq`.
+    Fenced { seq: u64 },
+    /// The log already held this same fence (same successor name and
+    /// session id): an earlier run of the same command wrote it.
+    AlreadyOurs,
+    /// The log already held a fence naming another successor, which won.
+    SupersededByOther(SupersedeFence),
+    /// The append lock was still held elsewhere when the wait ran out.
+    /// Nothing was written.
+    Unavailable,
+}
+
+/// Append `fence` to the session log at `path`, under the append lock every
+/// append takes, held for this one append. The lock is waited for at most
+/// `wait`; a lock still held then is [`FenceOutcome::Unavailable`] with
+/// nothing written. Under the lock the log is checked for a fence again, so
+/// of two successors the first append wins and the second reads it.
+pub fn append_supersede_fence(
+    path: &Path,
+    fence: &SupersedeFence,
+    timestamp: &str,
+    wait: std::time::Duration,
+) -> anyhow::Result<FenceOutcome> {
+    let Some(_append_lock) = AppendLock::acquire_within(path, wait) else {
+        return Ok(FenceOutcome::Unavailable);
+    };
+    let tail = prepare_append::<StateFileHeader>(path)?;
+    if let Some(existing) = superseded_by_in_log(&tail.content) {
+        return Ok(
+            if existing.by == fence.by && existing.by_session_id == fence.by_session_id {
+                FenceOutcome::AlreadyOurs
+            } else {
+                FenceOutcome::SupersededByOther(existing)
+            },
+        );
+    }
+    let payload = fence.to_payload();
+    let event = Event {
+        seq: tail.next_seq,
+        timestamp: timestamp.to_string(),
+        event_type: payload.type_name().to_string(),
+        payload,
+        idempotency_hash: None,
+    };
+    write_event_line(path, &event, tail.unterminated)?;
+    Ok(FenceOutcome::Fenced { seq: tail.next_seq })
 }
 
 /// Acquire an exclusive `flock(LOCK_EX)` on the state file. The lock
@@ -4412,5 +4643,184 @@ mod tests {
         assert!(split_concatenated(&format!("{a}{}", &b[..5])).is_none());
         assert!(split_concatenated(&format!("{a}{{\"x\":1}}")).is_none());
         assert!(split_concatenated("").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // The supersede fence
+    // -----------------------------------------------------------------------
+
+    fn fence(by: &str, id: &str) -> SupersedeFence {
+        SupersedeFence {
+            by: by.to_string(),
+            by_session_id: id.to_string(),
+            actor: SupersedeActor {
+                claude_session: None,
+                host: Some("box".to_string()),
+                user: Some("dev".to_string()),
+            },
+            at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// A session log `p` holding a header and one transition.
+    fn fenceable_log(dir: &Path) -> std::path::PathBuf {
+        let session = dir.join("p");
+        std::fs::create_dir_all(&session).unwrap();
+        let path = session.join("koto-p.state.jsonl");
+        append_header(&path, &make_header()).unwrap();
+        append_event(
+            &path,
+            &EventPayload::Transitioned {
+                from: None,
+                to: "start".to_string(),
+                condition_type: "auto".to_string(),
+                skip_if_matched: None,
+                context_assignments: None,
+                vars_matched: None,
+            },
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        path
+    }
+
+    fn intent_payload() -> EventPayload {
+        EventPayload::IntentUpdated {
+            intent: "more".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_fence_refuses_every_later_append_but_a_read() {
+        let dir = TempDir::new().unwrap();
+        let path = fenceable_log(dir.path());
+        let outcome = append_supersede_fence(
+            &path,
+            &fence("s", "id-s"),
+            "2026-01-01T00:00:01Z",
+            FENCE_LOCK_WAIT,
+        )
+        .unwrap();
+        assert_eq!(outcome, FenceOutcome::Fenced { seq: 2 });
+        let before = std::fs::read(&path).unwrap();
+
+        let err = append_event(&path, &intent_payload(), "2026-01-01T00:00:02Z").unwrap_err();
+        let refused = session_superseded(&err).expect("a typed refusal");
+        assert_eq!(refused.session, "p");
+        assert_eq!(refused.fence.by, "s");
+        assert!(err.to_string().contains("session_superseded"));
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
+
+        let err = append_event_idempotent(
+            &path,
+            &intent_payload(),
+            "2026-01-01T00:00:02Z",
+            "start",
+            Some("h"),
+        )
+        .unwrap_err();
+        assert!(session_superseded(&err).is_some());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let read = EventPayload::ContextRead {
+            key: "record/a".to_string(),
+            reader: "cli".to_string(),
+            state: "start".to_string(),
+            present: true,
+            hash: None,
+            access: None,
+            gate: None,
+            session: None,
+        };
+        assert_eq!(
+            append_event(&path, &read, "2026-01-01T00:00:03Z").unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn the_first_fence_wins_and_a_rerun_finds_its_own() {
+        let dir = TempDir::new().unwrap();
+        let path = fenceable_log(dir.path());
+        let ts = "2026-01-01T00:00:01Z";
+        assert!(matches!(
+            append_supersede_fence(&path, &fence("s", "id-s"), ts, FENCE_LOCK_WAIT).unwrap(),
+            FenceOutcome::Fenced { .. }
+        ));
+        let after_first = std::fs::read(&path).unwrap();
+        assert_eq!(
+            append_supersede_fence(&path, &fence("s", "id-s"), ts, FENCE_LOCK_WAIT).unwrap(),
+            FenceOutcome::AlreadyOurs
+        );
+        assert_eq!(
+            append_supersede_fence(&path, &fence("t", "id-t"), ts, FENCE_LOCK_WAIT).unwrap(),
+            FenceOutcome::SupersededByOther(fence("s", "id-s"))
+        );
+        // Same name, another session id: another session, not a re-run.
+        assert_eq!(
+            append_supersede_fence(&path, &fence("s", "id-other"), ts, FENCE_LOCK_WAIT).unwrap(),
+            FenceOutcome::SupersededByOther(fence("s", "id-s"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), after_first);
+
+        let (_, events) = read_events(&path).unwrap();
+        assert_eq!(superseded_by(&events), Some(fence("s", "id-s")));
+        assert_eq!(read_fence(&path).unwrap(), Some(fence("s", "id-s")));
+    }
+
+    #[test]
+    fn a_log_with_no_fence_reads_as_none() {
+        let dir = TempDir::new().unwrap();
+        let path = fenceable_log(dir.path());
+        assert_eq!(read_fence(&path).unwrap(), None);
+        assert_eq!(read_fence(&dir.path().join("missing.jsonl")).unwrap(), None);
+        // A line mentioning the name that isn't the event is not a fence.
+        append_event(
+            &path,
+            &EventPayload::IntentUpdated {
+                intent: "session_superseded".to_string(),
+            },
+            "2026-01-01T00:00:01Z",
+        )
+        .unwrap();
+        assert_eq!(read_fence(&path).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_lock_makes_the_fence_unavailable_and_writes_nothing() {
+        use std::os::fd::AsRawFd;
+        let dir = TempDir::new().unwrap();
+        let path = fenceable_log(dir.path());
+        let before = std::fs::read(&path).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.parent().unwrap().join(APPEND_LOCK_FILE))
+            .unwrap();
+        // SAFETY: flock on a descriptor `lock` owns for the whole test.
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let outcome = append_supersede_fence(
+            &path,
+            &fence("s", "id-s"),
+            "2026-01-01T00:00:01Z",
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+        assert_eq!(outcome, FenceOutcome::Unavailable);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(lock);
+        assert!(matches!(
+            append_supersede_fence(
+                &path,
+                &fence("s", "id-s"),
+                "2026-01-01T00:00:01Z",
+                std::time::Duration::from_millis(50),
+            )
+            .unwrap(),
+            FenceOutcome::Fenced { .. }
+        ));
     }
 }

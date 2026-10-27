@@ -655,6 +655,63 @@ pub fn read_links(store: &dyn ContextStore, session: &str) -> anyhow::Result<Vec
     Ok(links)
 }
 
+/// The most supersede hops [`newest_member`] follows. A longer chain stops
+/// at the member reached by then.
+pub const MAX_SUPERSEDE_HOPS: usize = 64;
+
+/// `session`'s supersede fence, read from its local log file without a
+/// lock, a pull or a write. `None` when the session isn't superseded, its
+/// log can't be read, or `session` isn't a session name.
+pub fn supersede_fence(
+    backend: &dyn SessionBackend,
+    session: &str,
+) -> Option<crate::engine::persistence::SupersedeFence> {
+    crate::discover::validate_workflow_name(session).ok()?;
+    let path = backend
+        .session_dir(session)
+        .join(crate::session::state_file_name(session));
+    crate::engine::persistence::read_fence(&path).ok().flatten()
+}
+
+/// Where a superseded session's work went on: its own fence, and the newest
+/// member of its supersede chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Superseded {
+    /// The session's own fence, naming its direct successor.
+    pub fence: crate::engine::persistence::SupersedeFence,
+    /// The session reached by following fences forward from the successor
+    /// until one isn't superseded: the one to continue in.
+    pub newest: String,
+}
+
+/// Follow `session`'s supersede fences forward to the newest member of its
+/// chain, or `None` when `session` isn't superseded.
+///
+/// Each name read from a fence is checked against the session-name rule
+/// before it reaches a path; a name that fails it, a session already
+/// visited, or [`MAX_SUPERSEDE_HOPS`] hops end the walk at the last member
+/// reached. A successor whose session doesn't exist (a crash between the
+/// fence and its creation) is still the newest member: the fence names it.
+pub fn newest_member(backend: &dyn SessionBackend, session: &str) -> Option<Superseded> {
+    let fence = supersede_fence(backend, session)?;
+    let mut visited = std::collections::HashSet::from([session.to_string()]);
+    let mut newest = session.to_string();
+    let mut next = Some(fence.by.clone());
+    for _ in 0..MAX_SUPERSEDE_HOPS {
+        let Some(member) = next.take() else {
+            break;
+        };
+        if crate::discover::validate_workflow_name(&member).is_err()
+            || !visited.insert(member.clone())
+        {
+            break;
+        }
+        next = supersede_fence(backend, &member).map(|f| f.by);
+        newest = member;
+    }
+    Some(Superseded { fence, newest })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,5 +1077,62 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].peer, "p");
         assert!(links[0].body.is_none());
+    }
+
+    /// Fence `session` in favour of `by`.
+    fn fence(b: &LocalBackend, session: &str, by: &str) {
+        let path = b
+            .session_dir(session)
+            .join(crate::session::state_file_name(session));
+        let fence = crate::engine::persistence::SupersedeFence {
+            by: by.to_string(),
+            by_session_id: format!("id-{by}"),
+            actor: Default::default(),
+            at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        crate::engine::persistence::append_supersede_fence(
+            &path,
+            &fence,
+            "2026-01-01T00:00:00Z",
+            crate::engine::persistence::FENCE_LOCK_WAIT,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn newest_member_follows_fences_forward() {
+        let (_tmp, b) = backend();
+        for name in ["a", "b", "c"] {
+            make_session(&b, name, &format!("id-{name}"), None);
+        }
+        assert_eq!(newest_member(&b, "a"), None);
+        fence(&b, "a", "b");
+        fence(&b, "b", "c");
+        let got = newest_member(&b, "a").unwrap();
+        assert_eq!(got.fence.by, "b");
+        assert_eq!(got.newest, "c");
+        assert_eq!(newest_member(&b, "b").unwrap().newest, "c");
+        assert_eq!(newest_member(&b, "c"), None);
+    }
+
+    #[test]
+    fn newest_member_stops_at_a_cycle_a_bad_name_or_a_missing_session() {
+        let (_tmp, b) = backend();
+        for name in ["a", "b"] {
+            make_session(&b, name, &format!("id-{name}"), None);
+        }
+        fence(&b, "a", "b");
+        fence(&b, "b", "a");
+        assert_eq!(newest_member(&b, "a").unwrap().newest, "b");
+
+        let (_tmp, b) = backend();
+        make_session(&b, "a", "id-a", None);
+        fence(&b, "a", "../x");
+        assert_eq!(newest_member(&b, "a").unwrap().newest, "a");
+
+        let (_tmp, b) = backend();
+        make_session(&b, "a", "id-a", None);
+        fence(&b, "a", "ghost");
+        assert_eq!(newest_member(&b, "a").unwrap().newest, "ghost");
     }
 }

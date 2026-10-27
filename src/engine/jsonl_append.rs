@@ -255,7 +255,7 @@ pub fn lock_timeout(e: &anyhow::Error) -> Option<&LockTimeout> {
 /// `started` each time, so `wait` bounds them all together. The lock is
 /// always tried once, even when the time is already up.
 #[cfg(unix)]
-fn lock_exclusive(
+pub(crate) fn lock_exclusive(
     fd: std::os::unix::io::RawFd,
     wait: Option<std::time::Duration>,
     started: std::time::Instant,
