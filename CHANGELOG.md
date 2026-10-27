@@ -50,6 +50,44 @@ to `0.9.x`).
 
 ### Added
 
+- **Check and evidence telemetry in the run journal.** `check_evaluated`
+  gains `koto.check.reason` (why a check didn't pass: `rule_failed`,
+  `undecided`, `no_finding`, `timed_out`, `spawn_failed` or `error`),
+  `koto.check.not_ready` and `koto.check.pre_directive`, and
+  `check_finding` gains `koto.finding.source` (`check` or `fallback`). A
+  check says "not ready" by printing a line that starts with
+  `::koto-not-ready::`, or, on a command gate, by exiting with a code the
+  new optional `not_ready_exit_codes` field lists; it is telemetry only and
+  changes no outcome, route or fallback finding. A new `evidence_field`
+  record carries each enum or boolean field of the agent's evidence (a
+  declared value, its digest, `other`, or `true`/`false`), never string or
+  number values. In the session log, `instructions_delivered` is now
+  appended for every printed directive with an additive
+  `details_included`, which details suppression reads, and
+  `evidence_submitted` gains an additive `exported_fields` map.
+- **Command checks report rule deliveries.** A command gate's check that
+  prints a line starting with `::koto-rule-delivered::` and holding a JSON
+  object with exactly `rule_id`, `extent` (`summary` or `full`) and
+  `delivery` (`printed` or `refused`) has it kept on `gate_evaluated` as
+  `rules_delivered`, and `koto next` appends a `rule_delivered` event per
+  line after its response prints. The event and its run-journal record gain
+  `via` (`check_output`) and `delivery`, as `koto.rule.via` and
+  `koto.rule.delivery`; a decider check's delivery carries neither.
+  Malformed lines are ordinary output, and nothing routes on the record.
+- **`koto review record` records document reviews as telemetry.** Four
+  subcommands, `round-started`, `verdicts --file`, `decision` and
+  `doc-checks --file`, append `review_round_started`,
+  `review_verdict_recorded` (one per entry), `review_decision_recorded` and
+  `doc_check_recorded` (one per entry) to a non-terminal session, and the
+  run journal relays them as `review_round`, `review_verdict`,
+  `review_decision` and `doc_checked`. Every value is checked first and
+  stored in koto's words: closed sets for document type, verdict, decision
+  and check outcome, a schema bucket, validated rule ids, positive counts,
+  and seats and sections the template declares in the new optional
+  `review_vocabulary` field (anything else is `other`). A batch holds at
+  most 200 entries and a session 2,000 review events; one invalid entry
+  refuses the whole batch, and errors never repeat a value the caller gave.
+  Nothing routes on the events.
 - **`KOTO_HOME` moves the whole koto root (koto#459).** Sessions, the
   request store, `config.toml`, the terminal index, coordinator cursors,
   wake files, the decider ledger, the run journal and the root

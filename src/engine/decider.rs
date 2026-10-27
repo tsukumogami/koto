@@ -558,6 +558,7 @@ where
         fields: candidate.into_iter().collect(),
         submitter_cwd: None,
         source: Some(DECIDER_SOURCE.to_string()),
+        exported_fields: None,
     };
     if append_event(&submitted).is_err() {
         return Ok(StopOutcome::NotApplied);
@@ -725,6 +726,7 @@ mod tests {
             fields: Default::default(),
             submitter_cwd: None,
             source: None,
+            exported_fields: None,
         }
     }
 
@@ -1286,6 +1288,7 @@ mod tests {
                 .collect(),
             submitter_cwd: None,
             source: None,
+            exported_fields: None,
         };
 
         assert!(visit_still_open(&with(vec![]), "s1", 2, &fields));

@@ -20,6 +20,7 @@ pub mod next_types;
 pub mod overrides;
 pub mod request;
 pub mod retry;
+pub mod review;
 pub mod session;
 pub mod session_anchor;
 pub(crate) mod session_inventory;
@@ -391,6 +392,12 @@ pub enum Command {
     Disputes {
         #[command(subcommand)]
         subcommand: disputes::DisputesSubcommand,
+    },
+
+    /// Document review event recording, as telemetry (moves nothing)
+    Review {
+        #[command(subcommand)]
+        subcommand: review::ReviewSubcommand,
     },
 
     /// Configuration management subcommands
@@ -2737,6 +2744,10 @@ pub fn run(app: App) -> Result<()> {
             let backend = build_backend()?;
             disputes::handle(&backend, subcommand)
         }
+        Command::Review { subcommand } => {
+            let backend = build_backend()?;
+            review::handle(&backend, subcommand)
+        }
         Command::Config { subcommand } => handle_config(subcommand),
         Command::Decider { subcommand } => match subcommand {
             // The one decider verb that writes to a session. A future verb
@@ -4916,6 +4927,7 @@ fn record_notice_delivery(backend: &dyn SessionBackend, name: &str, abandoned: &
         ),
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     };
     if let Err(e) = backend.append_event(name, &payload, &timestamp) {
         // Losing the audit costs an operator the ability to tell "never
@@ -6503,10 +6515,15 @@ fn handle_next(
                 // see the natural-advancement path for the crash-
                 // direction rationale. Non-fatal on error: the response
                 // has already shipped.
-                if resp.carries_details() {
+                // Every response that prints a directive is recorded, with
+                // whether it carried the details: details suppression counts
+                // only the records that did, and the run journal reads any
+                // record as "the directive was shown".
+                if resp.directive_parts().is_some() {
                     let ts = now_iso8601();
                     let delivery_payload = EventPayload::InstructionsDelivered {
                         state: target.clone(),
+                        details_included: Some(resp.carries_details()),
                     };
                     if let Err(e) = backend.append_event(&name, &delivery_payload, &ts) {
                         eprintln!(
@@ -6811,11 +6828,20 @@ fn handle_next(
             // a failure here (deleted cwd, permission issues) leaves the
             // field `None` and the resolver tolerates the absence.
             let submitter_cwd = std::env::current_dir().ok();
+            // The enum and boolean values telemetry may carry, read against
+            // the state's declared `accepts` while the compiled template is
+            // at hand; the run journal relays them as `evidence_field`.
+            let exported_fields = crate::run_journal::exported_fields(
+                accepts,
+                data.as_object()
+                    .expect("validate_evidence guarantees object input"),
+            );
             let payload = EventPayload::EvidenceSubmitted {
                 state: current_state.clone(),
                 fields,
                 submitter_cwd,
                 source: None,
+                exported_fields,
             };
             if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
                 let ne = NextError {
@@ -6900,6 +6926,9 @@ fn handle_next(
             exit_with_error_code(json, ne.code.exit_code());
         }
     };
+    // The log's last seq before this tick evaluates anything: the check
+    // events past it are this tick's own.
+    let pre_advance_seq = current_events.last().map(|e| e.seq).unwrap_or(0);
     let epoch_events = derive_evidence(&current_events);
     let evidence = merge_epoch_evidence(&epoch_events.into_iter().cloned().collect::<Vec<_>>());
 
@@ -7097,6 +7126,7 @@ fn handle_next(
                             ..Default::default()
                         },
                         stderr_ends_with_note: true,
+                        markers: Default::default(),
                     };
                     return ActionResult::Failed {
                         command,
@@ -8106,8 +8136,15 @@ fn handle_next(
             );
             // Each rule handed back is recorded only after the print, as
             // the delivery below is: a crash in between loses the record,
-            // never the delivery. The record holds no text.
-            for delivery in rule_deliveries {
+            // never the delivery. The record holds no text. A command
+            // check's own reports, kept on this tick's `gate_evaluated`
+            // events, follow the decider check's. This tick wrote those
+            // events locally, so the local read sees them without a pull.
+            let check_deliveries = backend
+                .read_events_local(&name)
+                .map(|(_, events)| check_output_deliveries(&events, pre_advance_seq))
+                .unwrap_or_default();
+            for delivery in rule_deliveries.into_iter().chain(check_deliveries) {
                 let payload = EventPayload::RuleDelivered(delivery);
                 if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
                     eprintln!("warning: failed to append RuleDelivered event: {}", e);
@@ -8120,10 +8157,13 @@ fn handle_next(
             // advancement path", step 4). Non-fatal on error, matching
             // the SchedulerRan/BatchFinalized append idiom above: the
             // response has already shipped and cannot be un-printed.
-            if resp.carries_details() {
+            // Every response that prints a directive is recorded, with
+            // whether it carried the details (see the directed path).
+            if resp.directive_parts().is_some() {
                 let ts = now_iso8601();
                 let payload = EventPayload::InstructionsDelivered {
                     state: final_state.clone(),
+                    details_included: Some(resp.carries_details()),
                 };
                 if let Err(e) = backend.append_event(&name, &payload, &ts) {
                     eprintln!(
@@ -8197,6 +8237,30 @@ fn journal_response(
             details,
         );
     }
+}
+
+/// The `rule_delivered` events for the rules command gates said they
+/// printed or refused this tick: one per entry of `rules_delivered` on each
+/// `gate_evaluated` past `after_seq`, in log order. A check that printed no
+/// `::koto-rule-delivered::` line contributes nothing.
+#[cfg(unix)]
+fn check_output_deliveries(
+    events: &[Event],
+    after_seq: u64,
+) -> Vec<crate::decider::check::RuleDelivered> {
+    events
+        .iter()
+        .filter(|e| e.seq > after_seq)
+        .filter_map(|e| match &e.payload {
+            EventPayload::GateEvaluated {
+                state, gate, check, ..
+            } => Some(check.rules_delivered.iter().map(move |printed| {
+                crate::decider::check::RuleDelivered::from_check_output(state, gate, printed)
+            })),
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 /// Non-unix stub for handle_next.
@@ -9524,6 +9588,7 @@ mod tests {
         );
         CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: name.to_string(),
             version: "1.0".to_string(),
@@ -10288,6 +10353,7 @@ Done.
                     .collect(),
                 submitter_cwd: None,
                 source: None,
+                exported_fields: None,
             },
             idempotency_hash: None,
         }
@@ -10414,6 +10480,7 @@ Done.
         states.insert("done".to_string(), TemplateState::default());
         let compiled = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "child".to_string(),
             version: "1".to_string(),
@@ -10748,6 +10815,7 @@ Done.
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let substituted =
@@ -10816,6 +10884,7 @@ Done.
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -10891,6 +10960,7 @@ Done.
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         };
         for (field, raw) in authored.substitutable_fields() {
             assert!(
@@ -11056,6 +11126,7 @@ Done.
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -11137,6 +11208,7 @@ Done.
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         let expected_command = {

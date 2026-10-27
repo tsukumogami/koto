@@ -2172,11 +2172,18 @@ pub fn latest_epoch_gate_failed(events: &[Event], current_state: &str) -> bool {
 ///
 /// Takes a plain event slice and touches no backend, so a caller that has the
 /// events in memory does not pay a read to ask.
+///
+/// Only a record of a response that carried the details counts: one whose
+/// `details_included` is `true`, or absent, as on every record written
+/// before the field existed (koto then appended the record only for such a
+/// response). A record of a response whose details were suppressed says the
+/// directive was printed, not that the details were.
 pub fn instructions_delivered_this_window(events: &[Event], current_state: &str) -> bool {
     delivery_window(events, current_state).iter().any(|e| {
         matches!(
             &e.payload,
-            EventPayload::InstructionsDelivered { state } if state == current_state
+            EventPayload::InstructionsDelivered { state, details_included }
+                if state == current_state && details_included.unwrap_or(true)
         )
     })
 }
@@ -2615,6 +2622,7 @@ mod tests {
                     },
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
             ),
             make_event(
@@ -2648,6 +2656,7 @@ mod tests {
                     },
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
             ),
         ];
@@ -2692,6 +2701,7 @@ mod tests {
                     },
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
             ),
             make_event(
@@ -2803,6 +2813,7 @@ mod tests {
             fields: HashMap::new(),
             submitter_cwd: None,
             source: None,
+            exported_fields: None,
         }
     }
 
@@ -2908,6 +2919,7 @@ mod tests {
                 fields,
                 submitter_cwd: None,
                 source: None,
+                exported_fields: None,
             },
             ts,
         )
@@ -3965,6 +3977,7 @@ mod tests {
                     fields: HashMap::new(),
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
             ),
             make_event(
@@ -4016,6 +4029,7 @@ mod tests {
                     fields: HashMap::new(),
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
             ),
             make_event(
@@ -4118,8 +4132,34 @@ mod tests {
             seq,
             EventPayload::InstructionsDelivered {
                 state: state.to_string(),
+                details_included: None,
             },
         )
+    }
+
+    #[test]
+    fn only_a_record_of_delivered_details_counts_as_a_delivery() {
+        let with = |details: Option<bool>| {
+            vec![
+                transitioned(1, None, "gather"),
+                make_event(
+                    2,
+                    EventPayload::InstructionsDelivered {
+                        state: "gather".to_string(),
+                        details_included: details,
+                    },
+                ),
+            ]
+        };
+        assert!(instructions_delivered_this_window(
+            &with(Some(true)),
+            "gather"
+        ));
+        assert!(instructions_delivered_this_window(&with(None), "gather"));
+        assert!(!instructions_delivered_this_window(
+            &with(Some(false)),
+            "gather"
+        ));
     }
 
     #[test]
@@ -4140,6 +4180,7 @@ mod tests {
                     fields: HashMap::new(),
                     submitter_cwd: None,
                     source: None,
+                    exported_fields: None,
                 },
             ),
         ];

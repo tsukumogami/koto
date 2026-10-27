@@ -213,6 +213,7 @@ fn commits_map_to_records_and_other_payloads_write_nothing() {
             fields: serde_json::from_str(r#"{"x":"PLANTED-EVIDENCE"}"#).unwrap(),
             submitter_cwd: None,
             source: None,
+            exported_fields: None,
         },
         &ts,
     )
@@ -493,6 +494,7 @@ fn evidence(state: &str) -> EventPayload {
         fields: serde_json::from_str(r#"{"x":"y"}"#).unwrap(),
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     }
 }
 
@@ -687,6 +689,9 @@ fn check_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.check.error",
             "koto.decider.awaiting_count",
             "koto.decider.agent_answered_count",
+            "koto.check.reason",
+            "koto.check.not_ready",
+            "koto.check.pre_directive",
         ],
         "check_finding" => &[
             "koto.state",
@@ -696,6 +701,7 @@ fn check_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.rule.id",
             "koto.finding.level",
             "koto.finding.count",
+            "koto.finding.source",
         ],
         "check_disputed" => &[
             "koto.state",
@@ -2326,6 +2332,8 @@ fn decider_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.rule.id",
             "koto.rule.extent",
             "koto.rule.unit_count",
+            "koto.rule.via",
+            "koto.rule.delivery",
         ],
         "check_overridden" => &["koto.state", "koto.check"],
         other => panic!("not a decider or override kind: {other}"),
@@ -2796,6 +2804,8 @@ fn a_rule_delivery_relays_rule_delivered_with_names_and_counts_only() {
         rule_id: "ac_binary".into(),
         level: RuleLevel::Summary,
         unit_count: Some(20),
+        via: None,
+        delivery: None,
     };
     commit_as(&f, None, "wf", &EventPayload::RuleDelivered(unit_mode));
     let single = RuleDelivered {
@@ -2804,16 +2814,43 @@ fn a_rule_delivery_relays_rule_delivered_with_names_and_counts_only() {
         rule_id: "no reason [x]".into(),
         level: RuleLevel::Full,
         unit_count: None,
+        via: None,
+        delivery: None,
     };
     commit_as(&f, None, "wf", &EventPayload::RuleDelivered(single));
+    let reported = RuleDelivered::from_check_output(
+        "a",
+        "pr_body",
+        &crate::findings::PrintedRuleDelivery {
+            rule_id: "pr-body/one-separator".into(),
+            extent: RuleLevel::Full,
+            delivery: crate::findings::RuleDeliveryOutcome::Refused,
+        },
+    );
+    commit_as(&f, None, "wf", &EventPayload::RuleDelivered(reported));
     assert_eq!(
         batches_for_test(),
-        (2, 0),
+        (3, 0),
         "relayed, so never flushed alone"
     );
 
     let d = decider_records(&f.journal());
-    assert_eq!(kinds(&d), vec!["rule_delivered", "rule_delivered"]);
+    assert_eq!(
+        kinds(&d),
+        vec!["rule_delivered", "rule_delivered", "rule_delivered"]
+    );
+    // A decider check's delivery carries no via or delivery.
+    for r in &d[..2] {
+        assert!(r.get("koto.rule.via").is_none(), "{r}");
+        assert!(r.get("koto.rule.delivery").is_none(), "{r}");
+    }
+    let r = &d[2];
+    assert_eq!(r["koto.check.name"], "pr_body");
+    assert_eq!(r["koto.rule.id"], "pr-body/one-separator");
+    assert_eq!(r["koto.rule.extent"], "full");
+    assert_eq!(r["koto.rule.via"], "check_output");
+    assert_eq!(r["koto.rule.delivery"], "refused");
+    assert!(r.get("koto.rule.unit_count").is_none(), "{r}");
     let r = &d[0];
     assert_eq!(r["koto.seq"], 3);
     assert_eq!(r["koto.visit.seq"], 2);
@@ -2871,6 +2908,8 @@ fn unit_and_rule_records_with_the_longest_names_fit_a_line() {
         rule_id: "r".repeat(128),
         level: RuleLevel::Summary,
         unit_count: Some(32),
+        via: Some(crate::decider::check::RuleVia::CheckOutput),
+        delivery: Some(crate::findings::RuleDeliveryOutcome::Refused),
     };
     for payload in [
         EventPayload::DeciderChecked(checked),
@@ -3310,6 +3349,7 @@ fn agent_evidence(fields: &[(&str, serde_json::Value)]) -> EventPayload {
             .collect(),
         submitter_cwd: Some("/PLANTED/host/path".into()),
         source: None,
+        exported_fields: None,
     }
 }
 
@@ -3544,6 +3584,7 @@ fn evidence_with_no_unapplied_consultation_of_its_visit_writes_no_decider_answer
                 .collect(),
             submitter_cwd: None,
             source: Some(crate::engine::decider::DECIDER_SOURCE.to_string()),
+            exported_fields: None,
         },
     );
     commit_as(&f, None, "wf", &answer());
@@ -3871,6 +3912,7 @@ fn decider_answer_records_fit_the_line_cap_at_the_longest_names() {
             .collect(),
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     };
     records.extend(paired(
         &evidence,
@@ -5476,4 +5518,444 @@ fn a_session_field_outside_an_anchor_is_not_journaled() {
             .all(|r| !(r["kind"] == "context_reads" && r["session"] == "b")),
         "{j:?}"
     );
+}
+
+// ----- Check reasons, readiness, directive timing and evidence fields -----
+
+fn logged_finding(rule: &str, level: crate::findings::FindingLevel) -> crate::findings::Finding {
+    crate::findings::Finding {
+        rule_id: rule.into(),
+        level,
+        message: "PLANTED-MESSAGE".into(),
+        path: None,
+        line: None,
+        column: None,
+        rule_ref: None,
+        effect_landed: None,
+        message_source: crate::findings::MessageSource::Check,
+        unit: None,
+    }
+}
+
+fn delivered_payload(state: &str, details: Option<bool>) -> EventPayload {
+    EventPayload::InstructionsDelivered {
+        state: state.into(),
+        details_included: details,
+    }
+}
+
+#[test]
+fn a_failed_check_carries_its_reason_and_every_check_its_readiness() {
+    use crate::findings::FindingLevel;
+    let f = session_in_a();
+    let mut failed = stamped(1, 1, None);
+    failed.reason = Some("rule_failed".into());
+    failed.not_ready = true;
+    failed.findings = vec![logged_finding("E1", FindingLevel::Error)];
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event("a", "lint", "failed", command_output(1), failed, None),
+    );
+    // A reason outside the closed set is left out; a passing check never
+    // carries one.
+    let mut odd = stamped(2, 2, None);
+    odd.reason = Some("PLANTED reason".into());
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event("a", "odd", "failed", command_output(1), odd, None),
+    );
+    let mut passed = stamped(3, 3, None);
+    passed.reason = Some("no_finding".into());
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event("a", "ok", "passed", command_output(0), passed, None),
+    );
+    let c = check_records(&f.journal());
+    let by = |check: &str| {
+        c.iter()
+            .find(|r| r["kind"] == "check_evaluated" && r["koto.check"] == check)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by("lint")["koto.check.reason"], "rule_failed");
+    assert_eq!(by("lint")["koto.check.not_ready"], true);
+    assert!(by("odd").get("koto.check.reason").is_none());
+    assert!(by("ok").get("koto.check.reason").is_none());
+    assert_eq!(by("odd")["koto.check.not_ready"], false);
+    assert_eq!(by("ok")["koto.check.not_ready"], false);
+    let finding = c.iter().find(|r| r["kind"] == "check_finding").unwrap();
+    assert_eq!(finding["koto.finding.source"], "check");
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("PLANTED"), "{raw}");
+}
+
+#[test]
+fn the_fallback_finding_is_sourced_to_koto_and_the_checks_own_to_the_check() {
+    use crate::findings::FindingLevel;
+    let f = session_in_a();
+    let mut check = stamped(1, 1, None);
+    check.reason = Some("no_finding".into());
+    check.fallback_logged = true;
+    check.findings = vec![
+        logged_finding("W1", FindingLevel::Warning),
+        // A warning the check printed under the gate's own name shares the
+        // rule id with the fallback but not its level.
+        logged_finding("lint", FindingLevel::Warning),
+        logged_finding("lint", FindingLevel::Error),
+    ];
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &gate_event("a", "lint", "failed", command_output(3), check, None),
+    );
+    let c = check_records(&f.journal());
+    let sources: Vec<(String, String, String)> = c
+        .iter()
+        .filter(|r| r["kind"] == "check_finding")
+        .map(|r| {
+            (
+                r["koto.rule.id"].as_str().unwrap().to_string(),
+                r["koto.finding.level"].as_str().unwrap().to_string(),
+                r["koto.finding.source"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        sources,
+        vec![
+            ("lint".into(), "error".into(), "fallback".into()),
+            ("W1".into(), "warning".into(), "check".into()),
+            ("lint".into(), "warning".into(), "check".into()),
+        ]
+    );
+}
+
+#[test]
+fn an_evaluation_before_any_directive_in_its_visit_is_pre_directive() {
+    let f = session_in_a();
+    let gate = |n: u64| {
+        gate_event(
+            "a",
+            "g",
+            "passed",
+            command_output(0),
+            stamped(n, n, None),
+            None,
+        )
+    };
+    // The first tick after init: no directive printed yet.
+    commit_as(&f, None, "wf", &gate(1));
+    // A directive printed for this visit, details suppressed or not.
+    commit_as(&f, None, "wf", &delivered_payload("a", Some(false)));
+    commit_as(&f, None, "wf", &gate(2));
+    // A loop back opens a new visit with no directive shown.
+    commit_as(&f, None, "wf", &transitioned(Some("a"), "b"));
+    commit_as(&f, None, "wf", &delivered_payload("b", Some(true)));
+    commit_as(&f, None, "wf", &transitioned(Some("b"), "a"));
+    commit_as(&f, None, "wf", &gate(3));
+    // An older log's record, without `details_included`, counts as shown.
+    commit_as(&f, None, "wf", &delivered_payload("a", None));
+    commit_as(&f, None, "wf", &gate(4));
+    // A rewind opens a visit too.
+    commit_as(&f, None, "wf", &rewound("a", "a"));
+    commit_as(&f, None, "wf", &gate(5));
+    let pre: Vec<bool> = check_records(&f.journal())
+        .iter()
+        .filter(|r| r["kind"] == "check_evaluated")
+        .map(|r| r["koto.check.pre_directive"].as_bool().unwrap())
+        .collect();
+    assert_eq!(pre, vec![true, false, true, false, true]);
+}
+
+#[test]
+fn exported_fields_keep_declared_enums_digest_odd_ones_and_drop_free_text() {
+    use crate::template::types::FieldSchema;
+    let schema = |field_type: &str, values: &[&str]| FieldSchema {
+        field_type: field_type.into(),
+        required: false,
+        values: values.iter().map(|v| v.to_string()).collect(),
+        description: String::new(),
+        decider: None,
+    };
+    let accepts: std::collections::BTreeMap<String, FieldSchema> = [
+        (
+            "status".to_string(),
+            schema("enum", &["completed", "needs work"]),
+        ),
+        ("odd".to_string(), schema("enum", &["needs work"])),
+        ("verdict".to_string(), schema("enum", &["pass"])),
+        ("ok".to_string(), schema("boolean", &[])),
+        ("no".to_string(), schema("boolean", &[])),
+        ("note".to_string(), schema("string", &[])),
+        ("count".to_string(), schema("number", &[])),
+        ("absent".to_string(), schema("enum", &["x"])),
+    ]
+    .into_iter()
+    .collect();
+    let submitted: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_value(serde_json::json!({
+            "status": "completed",
+            "odd": "needs work",
+            "verdict": "PLANTED-UNDECLARED",
+            "ok": true,
+            "no": false,
+            "note": "PLANTED-TEXT",
+            "count": 7,
+        }))
+        .unwrap();
+    let got = exported_fields(&accepts, &submitted).unwrap();
+    let want: std::collections::BTreeMap<String, String> = [
+        ("status", "completed".to_string()),
+        ("odd", name_or_digest("needs work")),
+        ("verdict", "other".to_string()),
+        ("ok", "true".to_string()),
+        ("no", "false".to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    assert_eq!(got, want);
+    assert!(got["odd"].starts_with("sha256:"));
+    // Nothing exportable: no map at all.
+    let only_text: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_value(serde_json::json!({"note": "x"})).unwrap();
+    assert_eq!(exported_fields(&accepts, &only_text), None);
+}
+
+#[test]
+fn evidence_with_exported_fields_relays_one_evidence_field_per_entry() {
+    let f = session_in_a();
+    let exported: std::collections::BTreeMap<String, String> = [
+        ("approved".to_string(), "true".to_string()),
+        ("status".to_string(), "other".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &EventPayload::EvidenceSubmitted {
+            state: "a".into(),
+            fields: serde_json::from_value(serde_json::json!({
+                "status": "PLANTED-VALUE",
+                "approved": true,
+                "note": "PLANTED-NOTE"
+            }))
+            .unwrap(),
+            submitter_cwd: None,
+            source: None,
+            exported_fields: Some(exported),
+        },
+    );
+    // Evidence without the map relays nothing.
+    commit_as(&f, None, "wf", &evidence("a"));
+    let j = f.journal();
+    let e: Vec<&serde_json::Value> = j.iter().filter(|r| r["kind"] == "evidence_field").collect();
+    assert_eq!(e.len(), 2);
+    for r in &e {
+        let keys: BTreeSet<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();
+        let expected: BTreeSet<&str> = RELAY_FIELDS
+            .iter()
+            .copied()
+            .chain(["koto.state", "koto.evidence.field", "koto.evidence.value"])
+            .collect();
+        assert_eq!(keys, expected, "{r}");
+        assert_eq!(r["koto.seq"], 3);
+        assert_eq!(r["koto.visit.seq"], 2);
+        assert_eq!(r["koto.state"], "a");
+        assert!(r.to_string().len() < MAX_LINE_BYTES);
+    }
+    assert_eq!(e[0]["koto.evidence.field"], "approved");
+    assert_eq!(e[0]["koto.evidence.value"], "true");
+    assert_eq!(e[1]["koto.evidence.field"], "status");
+    assert_eq!(e[1]["koto.evidence.value"], "other");
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    assert!(!raw.contains("PLANTED"), "{raw}");
+}
+
+// ----- Review records -----
+
+/// The fields each review kind carries beyond [`RELAY_FIELDS`].
+fn review_kind_fields(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "review_round" => &[
+            "koto.doc.type",
+            "koto.doc.schema",
+            "koto.review.round",
+            "koto.review.seat_count",
+            "koto.review.fallback",
+        ],
+        "review_verdict" => &[
+            "koto.doc.type",
+            "koto.doc.schema",
+            "koto.review.round",
+            "koto.review.seat",
+            "koto.rule.id",
+            "koto.review.section",
+            "koto.review.verdict",
+        ],
+        "review_decision" => &[
+            "koto.doc.type",
+            "koto.doc.schema",
+            "koto.review.round",
+            "koto.review.decision",
+        ],
+        "doc_checked" => &[
+            "koto.doc.type",
+            "koto.doc.schema",
+            "koto.rule.id",
+            "koto.doc.check_outcome",
+        ],
+        other => panic!("not a review kind: {other}"),
+    }
+}
+
+fn review_verdict(seat: &str, rule_id: &str, section: &str, verdict: &str) -> EventPayload {
+    EventPayload::ReviewVerdictRecorded(crate::engine::types::ReviewVerdictRecorded {
+        doc_type: "prd".into(),
+        schema: "prd/v1".into(),
+        round: 2,
+        seat: seat.into(),
+        rule_id: rule_id.into(),
+        section: section.into(),
+        verdict: verdict.into(),
+    })
+}
+
+/// Each review event relays one record of its kind holding exactly that
+/// kind's fields, each on its own `koto.seq`, and a verdict record differs
+/// from its sibling only in its own attributes.
+#[test]
+fn each_review_event_relays_one_record_with_exactly_its_fields() {
+    use crate::engine::types::{DocCheckRecorded, ReviewDecisionRecorded, ReviewRoundStarted};
+    let f = session_in_a();
+    reset_for_test();
+    let payloads = [
+        EventPayload::ReviewRoundStarted(ReviewRoundStarted {
+            doc_type: "prd".into(),
+            schema: "prd/v1".into(),
+            round: 2,
+            seat_count: 3,
+            fallback: true,
+        }),
+        review_verdict("clarity", "rs-001", "goals", "pass"),
+        review_verdict("other", "rs-002", "other", "fail"),
+        EventPayload::ReviewDecisionRecorded(ReviewDecisionRecorded {
+            doc_type: "prd".into(),
+            schema: "prd/v1".into(),
+            round: 2,
+            decision: "fix_and_proceed".into(),
+        }),
+        EventPayload::DocCheckRecorded(DocCheckRecorded {
+            doc_type: "prd".into(),
+            schema: "absent".into(),
+            rule_id: "r-frontmatter".into(),
+            outcome: "error".into(),
+        }),
+    ];
+    for p in &payloads {
+        commit_as(&f, None, "wf", p);
+    }
+    assert_eq!(batches_for_test(), (5, 0), "relayed records aren't flushed");
+    let j = f.journal();
+    let r: Vec<&serde_json::Value> = j
+        .iter()
+        .filter(|r| {
+            let k = r["kind"].as_str().unwrap();
+            k.starts_with("review_") || k == "doc_checked"
+        })
+        .collect();
+    let kinds: Vec<&str> = r.iter().map(|r| r["kind"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "review_round",
+            "review_verdict",
+            "review_verdict",
+            "review_decision",
+            "doc_checked"
+        ]
+    );
+    for rec in &r {
+        let kind = rec["kind"].as_str().unwrap();
+        let keys: BTreeSet<&str> = rec
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected: BTreeSet<&str> = RELAY_FIELDS
+            .iter()
+            .chain(review_kind_fields(kind))
+            .copied()
+            .collect();
+        assert_eq!(keys, expected, "{rec}");
+        assert_eq!(rec["v"], 1);
+    }
+    let seqs: Vec<u64> = r.iter().map(|r| r["koto.seq"].as_u64().unwrap()).collect();
+    assert_eq!(seqs, vec![3, 4, 5, 6, 7], "each event has its own koto.seq");
+
+    assert_eq!(r[0]["koto.doc.type"], "prd");
+    assert_eq!(r[0]["koto.doc.schema"], "prd/v1");
+    assert_eq!(r[0]["koto.review.round"], 2);
+    assert_eq!(r[0]["koto.review.seat_count"], 3);
+    assert_eq!(r[0]["koto.review.fallback"], true);
+    assert_eq!(r[1]["koto.review.seat"], "clarity");
+    assert_eq!(r[1]["koto.rule.id"], "rs-001");
+    assert_eq!(r[1]["koto.review.section"], "goals");
+    assert_eq!(r[1]["koto.review.verdict"], "pass");
+    assert_eq!(r[3]["koto.review.decision"], "fix_and_proceed");
+    assert_eq!(r[4]["koto.doc.schema"], "absent");
+    assert_eq!(r[4]["koto.rule.id"], "r-frontmatter");
+    assert_eq!(r[4]["koto.doc.check_outcome"], "error");
+
+    // The two verdicts differ only in their own attributes (and their
+    // sequence number and time).
+    let own: BTreeSet<&str> = [
+        "at",
+        "koto.seq",
+        "koto.review.seat",
+        "koto.rule.id",
+        "koto.review.section",
+        "koto.review.verdict",
+    ]
+    .into_iter()
+    .collect();
+    for (key, value) in r[1].as_object().unwrap() {
+        if !own.contains(key.as_str()) {
+            assert_eq!(&r[2][key], value, "{key}");
+        }
+    }
+}
+
+/// A verdict with the longest seat, section and rule id koto stores still
+/// fits the journal's line limit.
+#[test]
+fn a_review_verdict_of_the_longest_values_fits_one_line() {
+    let f = session_in_a();
+    let long = |c: char| c.to_string().repeat(128);
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &review_verdict(&long('s'), &long('r'), &long('x'), "fail"),
+    );
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    let line = raw
+        .lines()
+        .find(|l| l.contains("\"review_verdict\""))
+        .expect("the verdict was written");
+    assert!(line.len() < MAX_LINE_BYTES, "{} bytes", line.len());
+    let rec: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(rec["koto.review.seat"], long('s'));
+    assert_eq!(rec["koto.rule.id"], long('r'));
+    assert_eq!(rec["koto.review.section"], long('x'));
 }

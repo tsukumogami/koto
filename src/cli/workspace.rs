@@ -1637,6 +1637,7 @@ mod tests {
     fn leaf_template() -> CompiledTemplate {
         CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "leaf".to_string(),
             version: "1.0".to_string(),

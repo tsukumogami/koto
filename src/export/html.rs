@@ -95,6 +95,7 @@ mod tests {
                             expect: None,
                             poll: None,
                             decider_check: None,
+                            not_ready_exit_codes: Vec::new(),
                         },
                     );
                     g
@@ -178,6 +179,7 @@ mod tests {
 
         CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "test-workflow".to_string(),
             version: "1.0".to_string(),
@@ -277,6 +279,7 @@ mod tests {
         );
         let t = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "injection-test".to_string(),
             version: "1.0".to_string(),

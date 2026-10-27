@@ -147,6 +147,12 @@ pub struct StructuredGateResult {
     /// `decider_checked` events and before the `gate_evaluated`.
     #[serde(skip)]
     pub decider_fallbacks: Vec<crate::decider::check::DeciderFallback>,
+    /// The telemetry markers the check printed, or `not_ready` from its
+    /// gate's `not_ready_exit_codes`. Beside `output`, never in it, so
+    /// routing, the outcome and the fallback never see them; the advance
+    /// loop logs them on the check's event.
+    #[serde(skip)]
+    pub markers: crate::findings::CheckMarkers,
 }
 
 impl StructuredGateResult {
@@ -198,6 +204,7 @@ impl Default for StructuredGateResult {
             poll: None,
             decider_checks: Vec::new(),
             decider_fallbacks: Vec::new(),
+            markers: Default::default(),
         }
     }
 }
@@ -792,7 +799,14 @@ fn evaluate_command_gate(
 ) -> StructuredGateResult {
     let output = run_shell_command(&gate.command, working_dir, gate.timeout, env);
     env.record(&format!("gate '{}'", name), &output);
-    command_gate_result(name, output, env.redactor())
+    // An exit code the gate lists as "not ready" says so as plainly as the
+    // marker does. Only a status the command really exited with counts: a
+    // timeout, a spawn failure or a wait error has none.
+    let not_ready_exit = output.failure_kind == Some(FailureKind::NonzeroExit)
+        && gate.not_ready_exit_codes.contains(&output.exit_code);
+    let mut result = command_gate_result(name, output, env.redactor());
+    result.markers.not_ready |= not_ready_exit;
+    result
 }
 
 /// A command's captured streams and the findings its stdout carries.
@@ -841,6 +855,7 @@ fn command_gate_result(
     redactor: &Redactor,
 ) -> StructuredGateResult {
     let check = check_output(&output, redactor);
+    let markers = check.markers.clone();
     let duration_ms = Some(output.duration_ms);
     let Some(kind) = output.failure_kind else {
         return StructuredGateResult {
@@ -853,6 +868,7 @@ fn command_gate_result(
             poll: None,
             decider_checks: Vec::new(),
             decider_fallbacks: Vec::new(),
+            markers,
         };
     };
     let (outcome, evidence) = match kind {
@@ -889,6 +905,7 @@ fn command_gate_result(
         poll: None,
         decider_checks: Vec::new(),
         decider_fallbacks: Vec::new(),
+        markers,
     }
 }
 
@@ -1004,6 +1021,7 @@ mod tests {
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         }
     }
 
@@ -1269,6 +1287,47 @@ mod tests {
         assert_eq!(results["slow"].output["error"], "timed_out");
     }
 
+    /// Not ready is read from the marker at a line's start or from an exit
+    /// code the gate lists, and changes nothing the gate routes on.
+    #[test]
+    fn not_ready_comes_from_the_marker_or_a_listed_exit_code_and_changes_nothing_else() {
+        let dir = tmp_dir();
+        let run = |command: &str, codes: Vec<i32>| {
+            let mut gate = make_gate(command, 0);
+            gate.not_ready_exit_codes = codes;
+            let mut gates = BTreeMap::new();
+            gates.insert("g".to_string(), gate);
+            evaluate_gates(&gates, dir.path(), &CommandEnv::inherit(), None, None, None)
+                .remove("g")
+                .unwrap()
+        };
+        let marked = run("echo '::koto-not-ready::'; exit 2", vec![]);
+        let plain = run("echo 'waiting'; exit 2", vec![]);
+        let listed = run("echo 'waiting'; exit 2", vec![2, 4]);
+        let mid_line = run("echo 'x ::koto-not-ready::'; exit 2", vec![]);
+        let indented = run("echo '  ::koto-not-ready::'; exit 2", vec![]);
+        let unlisted = run("exit 3", vec![2]);
+        let passing = run("echo '::koto-not-ready::'", vec![]);
+        assert!(marked.markers.not_ready);
+        assert!(listed.markers.not_ready);
+        assert!(passing.markers.not_ready);
+        for r in [&plain, &mid_line, &indented, &unlisted] {
+            assert!(!r.markers.not_ready);
+        }
+        // Outcome, evidence and the fallback finding are the same with and
+        // without the marker or the listed code.
+        for r in [&marked, &listed] {
+            assert_eq!(r.outcome, plain.outcome);
+            assert_eq!(r.output, plain.output);
+            assert_eq!(
+                r.fallback().map(|f| &f.rule_id),
+                plain.fallback().map(|f| &f.rule_id)
+            );
+            assert_eq!(r.findings, plain.findings);
+        }
+        assert_eq!(passing.outcome, GateOutcome::Passed);
+    }
+
     /// Build a `CommandOutput` for the mapping tests below. `wait_failed`
     /// cannot be provoked from a real command, so the mapping is exercised
     /// directly rather than through `run_shell_command`.
@@ -1517,6 +1576,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -1556,6 +1616,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -1593,6 +1654,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -1629,6 +1691,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -1673,6 +1736,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -1712,6 +1776,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -1748,6 +1813,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -1780,6 +1846,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -1993,6 +2060,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         gates.insert(
@@ -2012,6 +2080,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
         gates.insert(
@@ -2031,6 +2100,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -2083,6 +2153,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             }
         }
 

@@ -107,8 +107,13 @@ fn every_kind_the_reference_names_is_one_koto_writes_and_the_reverse() {
             "decider_fallback",
             "decider_field",
             "driver_seen",
+            "evidence_field",
             "response",
             "rule_delivered",
+            "review_round",
+            "review_verdict",
+            "review_decision",
+            "doc_checked",
             "session_started",
             "state_entered",
             "terminal"
@@ -523,6 +528,8 @@ fn the_unit_and_rule_delivery_attributes_collide_with_no_other_attribute() {
         "koto.decider.confidence_bp",
         "koto.rule.extent",
         "koto.rule.unit_count",
+        "koto.rule.via",
+        "koto.rule.delivery",
     ];
     for new in new {
         assert!(written.contains(new), "{SOURCE_DIR} never writes {new}");

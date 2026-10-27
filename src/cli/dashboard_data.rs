@@ -1781,6 +1781,7 @@ mod tests {
                 fields: HashMap::new(),
                 submitter_cwd: None,
                 source: None,
+                exported_fields: None,
             },
             "2026-01-01T00:01:00Z",
         )

@@ -400,6 +400,7 @@ mod tests {
             fields,
             submitter_cwd: None,
             source: None,
+            exported_fields: None,
         };
         let s = serde_json::to_string(&payload).unwrap();
         let parsed: EventPayload = serde_json::from_str(&s).unwrap();
@@ -449,6 +450,7 @@ mod tests {
             fields,
             submitter_cwd: None,
             source: None,
+            exported_fields: None,
         };
         let s = serde_json::to_string(&payload).unwrap();
         let parsed: EventPayload = serde_json::from_str(&s).unwrap();
@@ -466,6 +468,7 @@ mod tests {
             fields,
             submitter_cwd: None,
             source: None,
+            exported_fields: None,
         };
         let s = serde_json::to_string(&payload).unwrap();
         let parsed: EventPayload = serde_json::from_str(&s).unwrap();
@@ -491,6 +494,7 @@ mod tests {
             fields,
             submitter_cwd: None,
             source: None,
+            exported_fields: None,
         };
         let s = serde_json::to_string(&payload).unwrap();
         let parsed: EventPayload = serde_json::from_str(&s).unwrap();
@@ -519,6 +523,7 @@ mod tests {
             fields,
             submitter_cwd: None,
             source: None,
+            exported_fields: None,
         };
         let s = serde_json::to_string(&payload).unwrap();
         let parsed: EventPayload = serde_json::from_str(&s).unwrap();

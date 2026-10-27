@@ -809,7 +809,49 @@ pub struct CheckEventFields {
     /// Wall-clock run time of the check's command, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Why a judged check didn't pass, one of [`CHECK_REASONS`]: written on
+    /// every evaluation whose outcome is neither `passed` nor `pending`.
+    /// Telemetry only; nothing routes on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The check said its input wasn't ready to judge: it printed a
+    /// `::koto-not-ready::` line, or exited with a code its gate lists in
+    /// `not_ready_exit_codes`. Telemetry only: the outcome, routing and
+    /// fallback finding are the same either way.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub not_ready: bool,
+    /// `findings` holds koto's fallback finding. The fallback is written
+    /// only when the check printed no `error` finding of its own, so it is
+    /// then the one `error` finding whose rule id is the check's name.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fallback_logged: bool,
+    /// The rules a command check said it handed to the agent, or refused
+    /// to, one per `::koto-rule-delivered::` line it printed, at most
+    /// [`LOG_RULE_DELIVERIES_CAP`](crate::findings::LOG_RULE_DELIVERIES_CAP).
+    /// `koto next` appends one `rule_delivered` event per entry once its
+    /// response has printed. Telemetry only; nothing routes on it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules_delivered: Vec<crate::findings::PrintedRuleDelivery>,
 }
+
+/// The values a check event's `reason` takes:
+///
+/// - `rule_failed`: the check printed at least one `error` finding of its
+///   own (a decider check's failed criterion counts).
+/// - `undecided`: it exited 2 with no `error` finding of its own.
+/// - `no_finding`: any other failure with no `error` finding of its own.
+/// - `timed_out`: the command, or a polling gate's window, ran out of time.
+/// - `spawn_failed`: the command could not be started.
+/// - `error`: anything else that kept the check from answering, such as a
+///   failed wait or a decider check's error.
+pub const CHECK_REASONS: &[&str] = &[
+    "rule_failed",
+    "undecided",
+    "no_finding",
+    "timed_out",
+    "spawn_failed",
+    "error",
+];
 
 impl CheckEventFields {
     /// Read the fields out of a raw event payload, keeping each one that
@@ -837,6 +879,18 @@ impl CheckEventFields {
             rule_counts: field(payload, "rule_counts"),
             rule_counts_truncated: field(payload, "rule_counts_truncated").unwrap_or(false),
             duration_ms: field(payload, "duration_ms"),
+            reason: field(payload, "reason"),
+            not_ready: field(payload, "not_ready").unwrap_or(false),
+            fallback_logged: field(payload, "fallback_logged").unwrap_or(false),
+            rules_delivered: payload
+                .get("rules_delivered")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -872,6 +926,78 @@ pub struct FindingDispute {
     /// same rule as `attempt`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visit_attempt: Option<u64>,
+}
+
+// The four events `koto review record` appends. Like a dispute, each is
+// recorded and never obeyed: nothing the advance loop routes on reads them.
+// Every value is koto's own word for it by the time it is stored: a value
+// from a closed set, a schema bucket, a seat or section the session's
+// template declares (or `other`), a validated rule id, a count or a flag.
+// Nothing the caller wrote is stored as written unless it passed one of
+// those checks.
+
+/// The event type `koto review record ... round-started` appends.
+pub const REVIEW_ROUND_STARTED: &str = "review_round_started";
+/// The event type `koto review record ... verdicts` appends, one per entry.
+pub const REVIEW_VERDICT_RECORDED: &str = "review_verdict_recorded";
+/// The event type `koto review record ... decision` appends.
+pub const REVIEW_DECISION_RECORDED: &str = "review_decision_recorded";
+/// The event type `koto review record ... doc-checks` appends, one per entry.
+pub const DOC_CHECK_RECORDED: &str = "doc_check_recorded";
+
+/// A document review round's seats were spawned: the payload of
+/// [`REVIEW_ROUND_STARTED`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewRoundStarted {
+    /// `brief`, `prd`, `design` or `plan`.
+    pub doc_type: String,
+    /// The document's schema, bucketed (see `cli::review::bucket_schema`).
+    pub schema: String,
+    /// The round's number, from 1.
+    pub round: u64,
+    /// How many seats the round spawned, at least 1.
+    pub seat_count: u64,
+    /// Whether the round is a fallback round.
+    pub fallback: bool,
+}
+
+/// One seat's verdict on one rule for one section: the payload of
+/// [`REVIEW_VERDICT_RECORDED`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewVerdictRecorded {
+    pub doc_type: String,
+    pub schema: String,
+    pub round: u64,
+    /// A seat the session's template declares, or `other`.
+    pub seat: String,
+    /// The rule's id, name-shaped and 1 to 128 bytes.
+    pub rule_id: String,
+    /// A section the session's template declares, or `other`.
+    pub section: String,
+    /// `pass` or `fail`.
+    pub verdict: String,
+}
+
+/// What follows a review round: the payload of [`REVIEW_DECISION_RECORDED`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewDecisionRecorded {
+    pub doc_type: String,
+    pub schema: String,
+    pub round: u64,
+    /// `rerun`, `fix_and_proceed`, `loop_back`, `proceed` or `stop`.
+    pub decision: String,
+}
+
+/// One document check's result on a document: the payload of
+/// [`DOC_CHECK_RECORDED`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocCheckRecorded {
+    pub doc_type: String,
+    pub schema: String,
+    /// The check's rule id, name-shaped and 1 to 128 bytes.
+    pub rule_id: String,
+    /// `passed`, `failed` or `error`.
+    pub outcome: String,
 }
 
 /// The event type every `koto session anchor open` appends to its anchor.
@@ -1062,6 +1188,20 @@ pub enum EventPayload {
         /// serializes byte-identically to logs written before it existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+        /// The submission's enum and boolean fields as telemetry may carry
+        /// them, keyed by field name: an enum field's value when the state's
+        /// `accepts` block declares it (as its digest when it doesn't fit
+        /// the run journal's name shape), `other` when it doesn't, and a
+        /// boolean as `true` or `false`. String and number fields, and
+        /// fields the submission left out, have no entry. Written by
+        /// `koto next --with-data`, which has the compiled template; the
+        /// run journal relays one `evidence_field` record per entry.
+        ///
+        /// Additive field: omitted when `None`, so evidence written before
+        /// it existed, and evidence koto writes itself, serializes as
+        /// before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exported_fields: Option<BTreeMap<String, String>>,
     },
     IntegrationInvoked {
         state: String,
@@ -1646,6 +1786,18 @@ pub enum EventPayload {
     /// Additive: an older build lands it in `Unknown`, and a payload this
     /// build can't parse does the same rather than failing the read.
     FindingDisputed(FindingDispute),
+    /// A document review round started, appended by `koto review record`.
+    /// Nothing the advance loop routes on reads it. Additive, and degrades
+    /// like `finding_disputed`; so do the next three.
+    ReviewRoundStarted(ReviewRoundStarted),
+    /// One seat's verdict on one rule and section, appended by
+    /// `koto review record`, one per entry of its batch.
+    ReviewVerdictRecorded(ReviewVerdictRecorded),
+    /// What follows a review round, appended by `koto review record`.
+    ReviewDecisionRecorded(ReviewDecisionRecorded),
+    /// One document check's result, appended by `koto review record`, one
+    /// per entry of its batch.
+    DocCheckRecorded(DocCheckRecorded),
     /// One `koto session anchor open` call against an anchor
     /// (DESIGN-session-retention.md, Decision 2): every call appends one,
     /// whether it created the anchor or continued it. Additive: an older
@@ -1656,9 +1808,19 @@ pub enum EventPayload {
     /// recorded at most once per tenth of the idle period. Additive, and
     /// degrades like `anchor_started`.
     AnchorActivity(AnchorActivity),
+    /// A `koto next` response printed a non-terminal state's directive.
+    /// Appended after the response prints, on every such response.
     InstructionsDelivered {
-        /// The phase whose instructions the response carried.
+        /// The phase whose directive the response carried.
         state: String,
+        /// Whether the response also carried the phase's `details`. Only an
+        /// event whose value is `true`, or absent (every event written before
+        /// the field existed, when the event was appended only for a
+        /// response with details), counts as a delivery of the details.
+        ///
+        /// Additive field: omitted when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details_included: Option<bool>,
     },
     /// Catch-all for event type strings not recognized by this koto version.
     ///
@@ -2016,6 +2178,10 @@ impl EventPayload {
             EventPayload::DeciderCheckAnswered(_) => "decider_check_answered",
             EventPayload::RuleDelivered(_) => "rule_delivered",
             EventPayload::FindingDisputed(_) => FINDING_DISPUTED,
+            EventPayload::ReviewRoundStarted(_) => REVIEW_ROUND_STARTED,
+            EventPayload::ReviewVerdictRecorded(_) => REVIEW_VERDICT_RECORDED,
+            EventPayload::ReviewDecisionRecorded(_) => REVIEW_DECISION_RECORDED,
+            EventPayload::DocCheckRecorded(_) => DOC_CHECK_RECORDED,
             EventPayload::AnchorStarted(_) => ANCHOR_STARTED,
             EventPayload::AnchorActivity(_) => ANCHOR_ACTIVITY,
             EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
@@ -2166,6 +2332,11 @@ impl<'de> Deserialize<'de> for Event {
                         .as_ref()
                         .and_then(|v| v.as_str())
                         .map(str::to_string),
+                    // Lenient like `source`: a map that doesn't read as
+                    // strings is absent rather than failing the log.
+                    exported_fields: p
+                        .exported_fields
+                        .and_then(|v| serde_json::from_value(v).ok()),
                 }
             }
             "directed_transition" => {
@@ -2528,6 +2699,42 @@ impl<'de> Deserialize<'de> for Event {
                     },
                 }
             }
+            REVIEW_ROUND_STARTED => {
+                match serde_json::from_value::<ReviewRoundStarted>(payload_val.clone()) {
+                    Ok(r) => EventPayload::ReviewRoundStarted(r),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            REVIEW_VERDICT_RECORDED => {
+                match serde_json::from_value::<ReviewVerdictRecorded>(payload_val.clone()) {
+                    Ok(v) => EventPayload::ReviewVerdictRecorded(v),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            REVIEW_DECISION_RECORDED => {
+                match serde_json::from_value::<ReviewDecisionRecorded>(payload_val.clone()) {
+                    Ok(d) => EventPayload::ReviewDecisionRecorded(d),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            DOC_CHECK_RECORDED => {
+                match serde_json::from_value::<DocCheckRecorded>(payload_val.clone()) {
+                    Ok(c) => EventPayload::DocCheckRecorded(c),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
             ANCHOR_STARTED => match serde_json::from_value::<AnchorStarted>(payload_val.clone()) {
                 Ok(a) => EventPayload::AnchorStarted(a),
                 Err(_) => EventPayload::Unknown {
@@ -2547,7 +2754,10 @@ impl<'de> Deserialize<'de> for Event {
             "instructions_delivered" => {
                 let p: InstructionsDeliveredPayload = serde_json::from_value(payload_val.clone())
                     .map_err(serde::de::Error::custom)?;
-                EventPayload::InstructionsDelivered { state: p.state }
+                EventPayload::InstructionsDelivered {
+                    state: p.state,
+                    details_included: p.details_included,
+                }
             }
             other => EventPayload::Unknown {
                 type_name: other.to_string(),
@@ -2604,6 +2814,8 @@ struct EvidenceSubmittedPayload {
     submitter_cwd: Option<PathBuf>,
     #[serde(default)]
     source: Option<serde_json::Value>,
+    #[serde(default)]
+    exported_fields: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -2679,6 +2891,8 @@ fn lenient_string(v: Option<serde_json::Value>) -> Option<String> {
 #[derive(Deserialize)]
 struct InstructionsDeliveredPayload {
     state: String,
+    #[serde(default)]
+    details_included: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -3756,6 +3970,7 @@ mod tests {
                 },
                 submitter_cwd: Some(PathBuf::from("/work/repo")),
                 source: None,
+                exported_fields: None,
             },
             idempotency_hash: None,
         };
@@ -3895,6 +4110,7 @@ mod tests {
                 fields,
                 submitter_cwd: None,
                 source: source.map(str::to_string),
+                exported_fields: None,
             },
             idempotency_hash: None,
         }
@@ -5438,6 +5654,7 @@ mod tests {
             },
             EventPayload::InstructionsDelivered {
                 state: "implement".to_string(),
+                details_included: None,
             },
         ] {
             let e = Event {
@@ -5461,6 +5678,7 @@ mod tests {
             event_type: "instructions_delivered".to_string(),
             payload: EventPayload::InstructionsDelivered {
                 state: "implement".to_string(),
+                details_included: None,
             },
             idempotency_hash: None,
         };

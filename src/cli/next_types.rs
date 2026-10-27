@@ -658,9 +658,10 @@ impl NextResponse {
     /// `details` field.
     ///
     /// Callers use this after [`NextResponse::with_details_suppressed_unless_full`]
-    /// to decide whether to append an `InstructionsDelivered` record:
-    /// the response carries the instructions exactly when this is
-    /// `true`, which already accounts for suppression. `Terminal` and
+    /// to set the `details_included` of the `InstructionsDelivered` record
+    /// they append for every printed directive: the response carries the
+    /// instructions exactly when this is `true`, which already accounts for
+    /// suppression. `Terminal` and
     /// `Error` never carry `details` and always answer `false`.
     pub fn carries_details(&self) -> bool {
         match self {
@@ -1341,6 +1342,8 @@ pub fn attach_rules(
                 rule_id,
                 level,
                 unit_count,
+                via: None,
+                delivery: None,
             });
         }
         if !rules.is_empty() {
@@ -2498,6 +2501,7 @@ mod tests {
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         }
     }
 
@@ -2517,6 +2521,7 @@ mod tests {
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         }
     }
 
@@ -2824,6 +2829,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 
@@ -2865,6 +2871,7 @@ mod tests {
             expect: None,
             poll: None,
             decider_check: None,
+            not_ready_exit_codes: Vec::new(),
         };
         let mut gate_defs = BTreeMap::new();
         gate_defs.insert("locked".to_string(), gate(false));
@@ -2913,6 +2920,7 @@ mod tests {
                 expect: None,
                 poll: None,
                 decider_check: None,
+                not_ready_exit_codes: Vec::new(),
             },
         );
 

@@ -536,6 +536,7 @@ fn emit_respawn_event(
         fields,
         submitter_cwd: None,
         source: None,
+        exported_fields: None,
     };
     append_to_requester(exec, &payload, &respawned_at, "RequesterRespawn")
 }

@@ -514,6 +514,51 @@ pub struct RuleDelivered {
     /// How many units the rule was handed back for, for a unit-mode check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit_count: Option<u64>,
+    /// How koto learned of the delivery: `check_output` when a command
+    /// check printed a `::koto-rule-delivered::` line. Absent on a decider
+    /// check's delivery, which koto made itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<RuleVia>,
+    /// For a delivery a check reported, whether it printed the rule or
+    /// refused to release it. Absent on a decider check's delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<crate::findings::RuleDeliveryOutcome>,
+}
+
+/// Where a `rule_delivered` event's delivery was reported from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleVia {
+    /// A command check printed a `::koto-rule-delivered::` line.
+    CheckOutput,
+}
+
+impl RuleVia {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleVia::CheckOutput => "check_output",
+        }
+    }
+}
+
+impl RuleDelivered {
+    /// The `rule_delivered` event for a delivery a command gate's check
+    /// printed in `state`.
+    pub fn from_check_output(
+        state: &str,
+        gate: &str,
+        printed: &crate::findings::PrintedRuleDelivery,
+    ) -> Self {
+        RuleDelivered {
+            state: state.to_string(),
+            gate: gate.to_string(),
+            rule_id: printed.rule_id.clone(),
+            level: printed.extent,
+            unit_count: None,
+            via: Some(RuleVia::CheckOutput),
+            delivery: Some(printed.delivery),
+        }
+    }
 }
 
 /// Round unrounded probabilities for the record.
