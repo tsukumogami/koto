@@ -41,9 +41,9 @@ use std::io::{BufRead, BufReader, Read as _};
 use std::path::{Path, PathBuf};
 
 use crate::engine::types::SessionKind;
+use crate::session::continues_bucket::{is_workspace_prefix, BucketReads};
 use crate::session::hierarchy::Graph;
 use crate::session::inventory::{self, under_dir, SessionStatus, TemplateCache};
-use crate::session::continues_bucket::{is_workspace_prefix, BucketReads};
 use crate::session::state_file_name;
 
 mod bucket;
@@ -382,7 +382,10 @@ mod tests {
     fn an_empty_store_needs_nothing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sessions = tmp.path().join("sessions");
-        assert_eq!(needed(&sessions, tmp.path(), &Bucket::None), Answer::NotNeeded);
+        assert_eq!(
+            needed(&sessions, tmp.path(), &Bucket::None),
+            Answer::NotNeeded
+        );
     }
 
     #[test]

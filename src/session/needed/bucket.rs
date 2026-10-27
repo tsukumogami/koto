@@ -121,12 +121,22 @@ pub(super) fn walk(
                 unchecked = true;
                 break;
             }
-            match member(reads, &at, &pred, pred_id.as_deref(), by_marker, &mut requests) {
+            match member(
+                reads,
+                &at,
+                &pred,
+                pred_id.as_deref(),
+                by_marker,
+                &mut requests,
+            ) {
                 Ok(Some(m)) => {
                     visited.insert(at.clone());
                     members += 1;
                     // Only an anchor read and found outside releases.
-                    if m.anchor.as_deref().is_some_and(|dir| !under_dir(dir, target)) {
+                    if m.anchor
+                        .as_deref()
+                        .is_some_and(|dir| !under_dir(dir, target))
+                    {
                         return Found::Released;
                     }
                     queue.push_back((at, m.id));

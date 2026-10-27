@@ -112,7 +112,9 @@ fn a_successor_only_the_bucket_knows_releases_when_anchored_outside() {
     fake.continues((P2, "v2"), (P1, "v1"), ID1);
     assert_eq!(walk_v1(&fake), Found::Released);
     let requests = fake.requests.borrow();
-    assert!(requests.iter().all(|r| r.starts_with("LIST ") || r.starts_with("GET ")));
+    assert!(requests
+        .iter()
+        .all(|r| r.starts_with("LIST ") || r.starts_with("GET ")));
 }
 
 #[test]
