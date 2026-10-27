@@ -845,9 +845,23 @@ pub fn handle_link_continues(
         refuse(e.to_string(), super::EXIT_CALLER_ERROR);
     }
     // Under the cloud backend the back-reference names this directory's
-    // workspace as the successor's: a session bound to another one refuses.
-    if let Err(e) = backend.check_bound_here(session) {
+    // workspace as the successor's: a session whose own copy is under
+    // another prefix refuses.
+    if let Err(e) = backend.check_located(session) {
         refuse(e.to_string(), super::EXIT_CALLER_ERROR);
+    }
+    if !backend
+        .home_of(session)
+        .is_ok_and(|home| home.own_workspace)
+    {
+        refuse(
+            format!(
+                "session '{session}' keeps its own copy under another directory's prefix, and \
+                 a continues relation is recorded only from the session's own workspace; run \
+                 the command from the directory the session was started in"
+            ),
+            super::EXIT_CALLER_ERROR,
+        );
     }
     let outcome =
         record_continues(backend, session, &target).unwrap_or_else(|e| refuse(e.message, e.exit));
@@ -1354,16 +1368,20 @@ pub(crate) fn record_requester_link(backend: &Backend, session: &str, requested_
 }
 
 /// Refuse `koto session rebind <name>` from a directory that is neither the
-/// session's own workspace nor the one the rebind moves it to (koto#477).
+/// session's own workspace nor the one the rebind moves it to, when koto
+/// can't tell which bucket copy is the session's own (koto#477).
 ///
-/// Under the cloud backend a rebind run from a third directory pushes the
-/// moved session under that directory's prefix, where neither the old
-/// workspace nor the new one reads it. Run from the target (the usual
-/// `koto session rebind <name>` stood in the new checkout) it is accepted
-/// even when every directory the session records is gone, as for a session
-/// whose instance was torn down; the rebind's fence makes any writer left at
-/// the old anchor refuse. The local backend never refuses.
+/// A session that records the prefix it was created under is pushed there
+/// whatever directory the rebind runs in, so it rebinds from anywhere. One
+/// recorded before koto named the prefix would be pushed under the third
+/// directory's prefix, where neither the old workspace nor the new one reads
+/// it. Run from the target (the usual `koto session rebind <name>` stood in
+/// the new checkout) it is accepted even when every directory the session
+/// records is gone, as for a session whose instance was torn down; the
+/// rebind's fence makes any writer left at the old anchor refuse. The local
+/// backend never refuses.
 pub fn rebind_guard(backend: &Backend, name: &str, to: Option<&str>) -> Result<()> {
+    use crate::session::{Unlocated, UnlocatedReason};
     use std::path::{Path, PathBuf};
     let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let here = canonical(&std::env::current_dir()?);
@@ -1371,21 +1389,23 @@ pub fn rebind_guard(backend: &Backend, name: &str, to: Option<&str>) -> Result<(
     if target == here {
         return Ok(());
     }
-    let Err(e) = backend.check_bound_here(name) else {
+    let Err(e) = backend.check_located(name) else {
         return Ok(());
     };
-    let Some(bound) = e.downcast_ref::<crate::session::SessionBoundElsewhere>() else {
+    let Some(Unlocated {
+        reason: UnlocatedReason::NoRecordedPrefix { anchor },
+        ..
+    }) = e.downcast_ref::<Unlocated>()
+    else {
         return Err(e);
     };
-    let at = bound
-        .anchor
+    let at = anchor
         .as_deref()
         .unwrap_or("the directory the session was started in");
     anyhow::bail!(
-        "session_bound_elsewhere: session '{name}' is bound to {at}, not to the directory this \
-         command ran in, and a rebind runs from the session's own workspace or from the \
-         directory it moves to: run `koto session rebind {name} --to {}` from {at}, or \
-         `koto session rebind {name}` from {}",
+        "session_unlocated: session '{name}' records no prefix for its own copy, so a rebind \
+         runs from the directory it is bound to or from the directory it moves to: run \
+         `koto session rebind {name} --to {}` from {at}, or `koto session rebind {name}` from {}",
         target.display(),
         target.display()
     )

@@ -1266,27 +1266,34 @@ pub(super) fn exit_with_error_code(error: serde_json::Value, code: i32) -> ! {
     std::process::exit(code);
 }
 
-/// Refuse, exit 2, when `session` belongs to another directory's workspace
-/// under the cloud backend, before `command` reads or writes it (koto#457).
-/// From here a read would answer from this host's copy without checking the
-/// session's own copy in the bucket, and a write would be pushed under
-/// another workspace's prefix, where the session's own workspace never
-/// reads it. The message names the directory to run from. The local backend
-/// never refuses.
+/// Refuse, exit 2, before `command` reads or writes `session`, when under
+/// the cloud backend koto can't tell which bucket copy is the session's own
+/// (`session_unlocated`), or the check of its own copy fails. A session that
+/// records the prefix it was created under is read and written there from
+/// any directory, so only an unlocated one refuses. The local backend never
+/// refuses.
 ///
-/// A session bound here whose continues relation still owes its
+/// A `session_unlocated` refusal carries `code`, `session`, `reason` and
+/// `locations` (the bucket prefixes the reason names) beside `error` and
+/// `command`.
+///
+/// A located session whose continues relation still owes its
 /// back-reference beside the predecessor (recorded under the local backend,
 /// by an earlier build, or under another name) gets it now, before the
 /// command writes or pushes anything ([`Backend::ensure_backref`]).
-fn refuse_if_bound_elsewhere(backend: &Backend, session: &str, command: &str) {
-    if let Err(e) = backend.check_bound_here(session) {
-        exit_with_error_code(
-            serde_json::json!({
-                "error": e.to_string(),
-                "command": command
-            }),
-            EXIT_CALLER_ERROR,
-        );
+fn refuse_if_unlocated(backend: &Backend, session: &str, command: &str) {
+    if let Err(e) = backend.check_located(session) {
+        let mut error = serde_json::json!({
+            "error": e.to_string(),
+            "command": command
+        });
+        if let Some(unlocated) = e.downcast_ref::<crate::session::Unlocated>() {
+            error["code"] = "session_unlocated".into();
+            error["session"] = unlocated.session.clone().into();
+            error["reason"] = unlocated.reason.as_str().into();
+            error["locations"] = unlocated.reason.locations().into();
+        }
+        exit_with_error_code(error, EXIT_CALLER_ERROR);
     }
     backend.ensure_backref(session);
 }
@@ -2180,19 +2187,19 @@ pub fn run(app: App) -> Result<()> {
         }
         Command::Cancel { name, cleanup } => {
             let backend = build_backend()?;
-            refuse_if_bound_elsewhere(&backend, &name, "cancel");
+            refuse_if_unlocated(&backend, &name, "cancel");
             refuse_if_superseded(&backend, &name, "cancel");
             handle_cancel(&backend, backend.local_base_dir(), &name, cleanup)
         }
         Command::Rewind { name, rationale } => {
             let backend = build_backend()?;
-            refuse_if_bound_elsewhere(&backend, &name, "rewind");
+            refuse_if_unlocated(&backend, &name, "rewind");
             refuse_if_superseded(&backend, &name, "rewind");
             handle_rewind(&backend, &backend, &name, rationale)
         }
         Command::Status { name } => {
             let backend = build_backend()?;
-            refuse_if_bound_elsewhere(&backend, &name, "status");
+            refuse_if_unlocated(&backend, &name, "status");
             handle_status(&backend, &name)
         }
         Command::Workflows {
@@ -2367,7 +2374,7 @@ pub fn run(app: App) -> Result<()> {
                     keep,
                     children,
                 } => {
-                    refuse_if_bound_elsewhere(&backend, &name, "session resolve");
+                    refuse_if_unlocated(&backend, &name, "session resolve");
                     session::handle_resolve(&backend, &name, &keep, children)
                 }
                 SessionCommand::Recover { apply, sessions } => {
@@ -2461,7 +2468,7 @@ pub fn run(app: App) -> Result<()> {
             // where to run the command (koto#457); a session imported away
             // on this host still refuses as migrated, which the guard asks
             // before its own question.
-            refuse_if_bound_elsewhere(&backend, session, command);
+            refuse_if_unlocated(&backend, session, command);
             if let Err(e) = backend.check_not_migrated(session) {
                 exit_with_error_code(
                     serde_json::json!({
@@ -2721,12 +2728,12 @@ pub fn run(app: App) -> Result<()> {
             let backend = build_backend()?;
             match subcommand {
                 DecisionsSubcommand::Record { name, with_data } => {
-                    refuse_if_bound_elsewhere(&backend, &name, "decisions record");
+                    refuse_if_unlocated(&backend, &name, "decisions record");
                     refuse_if_superseded(&backend, &name, "decisions record");
                     handle_decisions_record(&backend, name, with_data)
                 }
                 DecisionsSubcommand::List { name } => {
-                    refuse_if_bound_elsewhere(&backend, &name, "decisions list");
+                    refuse_if_unlocated(&backend, &name, "decisions list");
                     handle_decisions_list(&backend, name)
                 }
             }
@@ -2740,12 +2747,12 @@ pub fn run(app: App) -> Result<()> {
                     rationale,
                     with_data,
                 } => {
-                    refuse_if_bound_elsewhere(&backend, &name, "overrides record");
+                    refuse_if_unlocated(&backend, &name, "overrides record");
                     refuse_if_superseded(&backend, &name, "overrides record");
                     overrides::handle_overrides_record(&backend, name, gate, rationale, with_data)
                 }
                 overrides::OverridesSubcommand::List { name } => {
-                    refuse_if_bound_elsewhere(&backend, &name, "overrides list");
+                    refuse_if_unlocated(&backend, &name, "overrides list");
                     overrides::handle_overrides_list(&backend, name)
                 }
             }

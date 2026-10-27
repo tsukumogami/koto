@@ -281,6 +281,7 @@ impl CloudBackend {
                 listed
             }
         };
+        let home = self.home(id);
         let header = self.local.read_header(id).ok();
         let session_id = header
             .as_ref()
@@ -289,13 +290,13 @@ impl CloudBackend {
         let origin = header
             .and_then(|h| h.origin)
             .and_then(|o| o.store.prefix)
-            .filter(|p| is_workspace_prefix(p) && *p != self.prefix)
+            .filter(|p| is_workspace_prefix(p) && *p != home)
             .map(|p| {
                 let listing = self.ctx_listing(&format!("{p}/{id}/"), &mut requests);
                 (p, listing)
             });
         BucketRemovalFacts {
-            prefix: self.prefix.clone(),
+            prefix: home,
             name: id.to_string(),
             session_id,
             ctx,
@@ -497,7 +498,7 @@ impl CloudBackend {
     pub(crate) fn ensure_backref(&self, id: &str) {
         // From another directory's workspace the pointer would name the
         // wrong prefix: the command refuses there anyway.
-        if self.probes.read_only || self.bound_elsewhere(id).is_some() {
+        if self.probes.read_only || !self.home_prefix(id).is_ok_and(|home| home.own_workspace) {
             return;
         }
         let dir = self.local.session_dir(id);
