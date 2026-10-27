@@ -767,8 +767,12 @@ events:
     fields:
       doc_type:
         type: string
-        required: true
+        required: false
         enum: ["brief", "prd", "design", "plan"]
+      doc_format:
+        type: string
+        required: false
+        enum: ["brief", "prd", "design", "plan", "vision", "strategy", "roadmap"]
       schema:
         type: string
         required: true
@@ -788,8 +792,12 @@ events:
     fields:
       doc_type:
         type: string
-        required: true
+        required: false
         enum: ["brief", "prd", "design", "plan"]
+      doc_format:
+        type: string
+        required: false
+        enum: ["brief", "prd", "design", "plan", "vision", "strategy", "roadmap"]
       schema:
         type: string
         required: true
@@ -816,8 +824,12 @@ events:
     fields:
       doc_type:
         type: string
-        required: true
+        required: false
         enum: ["brief", "prd", "design", "plan"]
+      doc_format:
+        type: string
+        required: false
+        enum: ["brief", "prd", "design", "plan", "vision", "strategy", "roadmap"]
       schema:
         type: string
         required: true
@@ -848,6 +860,63 @@ events:
         type: string
         required: true
         enum: ["passed", "failed", "error"]
+
+  doc_rule_checks_recorded:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      doc_format:
+        type: string
+        required: true
+        enum: ["brief", "prd", "design", "plan", "vision", "strategy", "roadmap"]
+      moment:
+        type: string
+        required: true
+        enum: ["pre_jury", "post_fix", "post_create"]
+      entries:
+        type: array
+        required: true
+
+  doc_section_recorded:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      doc_format:
+        type: string
+        required: true
+        enum: ["brief", "prd", "design", "plan", "vision", "strategy", "roadmap"]
+      section:
+        type: string
+        required: true
+      write:
+        type: string
+        required: true
+        enum: ["first", "rewrite"]
+
+  doc_fix_recorded:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      doc_format:
+        type: string
+        required: true
+        enum: ["brief", "prd", "design", "plan", "vision", "strategy", "roadmap"]
+      answers:
+        type: string
+        required: true
+        enum: ["jury_fail", "check_fail"]
+      round:
+        type: integer
+        required: false
+      entries:
+        type: array
+        required: true
 
   anchor_started:
     tier: 3
@@ -2464,7 +2533,8 @@ the caller wrote reaches the log unchecked:
 
 | Field | Type | Events | Description |
 |-------|------|--------|-------------|
-| `doc_type` | string | all four | `brief`, `prd`, `design` or `plan`. |
+| `doc_type` | string | all four | `brief`, `prd`, `design` or `plan`. Left out of the first three when `doc_format` is `vision`, `strategy` or `roadmap`. |
+| `doc_format` | string | all but `doc_check_recorded`, when the call gave `--doc-format` | `brief`, `prd`, `design`, `plan`, `vision`, `strategy` or `roadmap`. Given with `--doc-type`, both must name the same document; `round-started` and `decision` need one of the two, and a `verdicts` entry may leave out `doc_type` under `--doc-format`. |
 | `schema` | string | all four | The document's schema value, bucketed: `brief/v1`, `prd/v1`, `design/v1`, `plan/v1` or `plan/v2` as given (surrounding whitespace ignored), `absent` for no value or an empty one, `other` for anything else. |
 | `round` | integer | all but `doc_check_recorded` | The round's number, at least 1. |
 | `seat_count` | integer | `review_round_started` | How many seats the round spawned, at least 1. |
@@ -2495,6 +2565,44 @@ The [run journal](run-journal.md#review-records) relays each as one record:
 `review_round`, `review_verdict`, `review_decision` and `doc_checked`.
 Additive: an older koto lands the events in its unknown-event bucket and
 reads the rest of the log.
+
+Three more record a document while it is drafted, recorded the same way and
+under the same checks: `doc_rule_checks_recorded` (a `rule-checks` call),
+`doc_section_recorded` (a `section-written` call) and `doc_fix_recorded` (a
+`fix` call). A `rule-checks` or `fix` call appends one event holding every
+entry of its batch, so the journal's records of one call share its `seq`.
+Each entry counts against the session's cap of 2,000 review entries, as
+each event of the four above does.
+
+| Field | Type | Events | Description |
+|-------|------|--------|-------------|
+| `state` | string | all three | The state the session was in when the call was made. |
+| `doc_format` | string | all three | `brief`, `prd`, `design`, `plan`, `vision`, `strategy` or `roadmap`. |
+| `moment` | string | `doc_rule_checks_recorded` | When the checks ran: `pre_jury`, `post_fix` or `post_create`. |
+| `entries` | array | `doc_rule_checks_recorded`, `doc_fix_recorded` | One object per entry of the batch, at most 200. A rule check's is `{"rule_id", "outcome"}`, `outcome` one of `pass`, `fail`, `not_ready` or `error`; a fix's is `{"rule_id", "section", "check_rule"}`, `check_rule` a rule id or `none`. Rule ids are bound as `rule_id` above, and `section` as on `doc_section_recorded`. |
+| `section` | string | `doc_section_recorded` | The section as given when the session's template declares it in `review_vocabulary.sections`, `other` otherwise, and always `other` when the template declares no vocabulary. |
+| `write` | string | `doc_section_recorded` | `first` or `rewrite`. |
+| `answers` | string | `doc_fix_recorded` | What the fix answers: `jury_fail` or `check_fail`. |
+| `round` | integer | `doc_fix_recorded` | The jury round a `jury_fail` fix answers, 1 to 50, when the call gave `--round`. A `check_fail` fix takes no round. |
+
+```json
+{
+  "type": "doc_fix_recorded",
+  "payload": {
+    "state": "draft",
+    "doc_format": "design",
+    "answers": "jury_fail",
+    "round": 2,
+    "entries": [
+      {"rule_id": "rs-004", "section": "decisions", "check_rule": "doc-required-sections"},
+      {"rule_id": "rs-009", "section": "other", "check_rule": "none"}
+    ]
+  }
+}
+```
+
+The run journal relays `doc_rule_checked` and `doc_fix_applied` records,
+one per entry, and one `doc_section_written` record per section event.
 
 ---
 

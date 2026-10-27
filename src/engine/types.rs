@@ -928,7 +928,7 @@ pub struct FindingDispute {
     pub visit_attempt: Option<u64>,
 }
 
-// The four events `koto review record` appends. Like a dispute, each is
+// The events `koto review record` appends. Like a dispute, each is
 // recorded and never obeyed: nothing the advance loop routes on reads them.
 // Every value is koto's own word for it by the time it is stored: a value
 // from a closed set, a schema bucket, a seat or section the session's
@@ -944,13 +944,28 @@ pub const REVIEW_VERDICT_RECORDED: &str = "review_verdict_recorded";
 pub const REVIEW_DECISION_RECORDED: &str = "review_decision_recorded";
 /// The event type `koto review record ... doc-checks` appends, one per entry.
 pub const DOC_CHECK_RECORDED: &str = "doc_check_recorded";
+/// The event type `koto review record ... rule-checks` appends: one per
+/// call, holding every entry of its batch.
+pub const DOC_RULE_CHECKS_RECORDED: &str = "doc_rule_checks_recorded";
+/// The event type `koto review record ... section-written` appends.
+pub const DOC_SECTION_RECORDED: &str = "doc_section_recorded";
+/// The event type `koto review record ... fix` appends: one per call,
+/// holding every entry of its batch.
+pub const DOC_FIX_RECORDED: &str = "doc_fix_recorded";
 
 /// A document review round's seats were spawned: the payload of
 /// [`REVIEW_ROUND_STARTED`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReviewRoundStarted {
-    /// `brief`, `prd`, `design` or `plan`.
-    pub doc_type: String,
+    /// `brief`, `prd`, `design` or `plan`. Absent when the caller named a
+    /// format outside those four with `--doc-format`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_type: Option<String>,
+    /// One of the seven document formats, when the caller gave
+    /// `--doc-format`; absent otherwise, so a call without the flag stores
+    /// what it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_format: Option<String>,
     /// The document's schema, bucketed (see `cli::review::bucket_schema`).
     pub schema: String,
     /// The round's number, from 1.
@@ -965,7 +980,12 @@ pub struct ReviewRoundStarted {
 /// [`REVIEW_VERDICT_RECORDED`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReviewVerdictRecorded {
-    pub doc_type: String,
+    /// As on [`ReviewRoundStarted`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_type: Option<String>,
+    /// As on [`ReviewRoundStarted`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_format: Option<String>,
     pub schema: String,
     pub round: u64,
     /// A seat the session's template declares, or `other`.
@@ -981,7 +1001,12 @@ pub struct ReviewVerdictRecorded {
 /// What follows a review round: the payload of [`REVIEW_DECISION_RECORDED`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReviewDecisionRecorded {
-    pub doc_type: String,
+    /// As on [`ReviewRoundStarted`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_type: Option<String>,
+    /// As on [`ReviewRoundStarted`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_format: Option<String>,
     pub schema: String,
     pub round: u64,
     /// `rerun`, `fix_and_proceed`, `loop_back`, `proceed` or `stop`.
@@ -998,6 +1023,71 @@ pub struct DocCheckRecorded {
     pub rule_id: String,
     /// `passed`, `failed` or `error`.
     pub outcome: String,
+}
+
+/// One rule's outcome in a [`DocRuleChecksRecorded`] call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocRuleCheck {
+    /// The rule's id, name-shaped and 1 to 128 bytes.
+    pub rule_id: String,
+    /// `pass`, `fail`, `not_ready` or `error`.
+    pub outcome: String,
+}
+
+/// One run of a document's rule checks at one moment: the payload of
+/// [`DOC_RULE_CHECKS_RECORDED`]. One event per call, so every entry shares
+/// the event's sequence number.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocRuleChecksRecorded {
+    /// The session's state when the call was made.
+    pub state: String,
+    /// One of the seven document formats.
+    pub doc_format: String,
+    /// `pre_jury`, `post_fix` or `post_create`.
+    pub moment: String,
+    pub entries: Vec<DocRuleCheck>,
+}
+
+/// A section of a document was written: the payload of
+/// [`DOC_SECTION_RECORDED`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocSectionRecorded {
+    /// The session's state when the call was made.
+    pub state: String,
+    /// One of the seven document formats.
+    pub doc_format: String,
+    /// A section the session's template declares, or `other`.
+    pub section: String,
+    /// `first` or `rewrite`.
+    pub write: String,
+}
+
+/// One (rule, section) a fix answers, in a [`DocFixRecorded`] call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocFix {
+    /// The answered rule's id, name-shaped and 1 to 128 bytes.
+    pub rule_id: String,
+    /// A section the session's template declares, or `other`.
+    pub section: String,
+    /// The check rule that decides the answered rule, name-shaped, or
+    /// `none`.
+    pub check_rule: String,
+}
+
+/// A fix applied to a document: the payload of [`DOC_FIX_RECORDED`]. One
+/// event per call, so every entry shares the event's sequence number.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocFixRecorded {
+    /// The session's state when the call was made.
+    pub state: String,
+    /// One of the seven document formats.
+    pub doc_format: String,
+    /// `jury_fail` or `check_fail`.
+    pub answers: String,
+    /// The jury round the fix answers, 1 to 50; only on a `jury_fail` fix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u64>,
+    pub entries: Vec<DocFix>,
 }
 
 /// The event type every `koto session anchor open` appends to its anchor.
@@ -1799,6 +1889,16 @@ pub enum EventPayload {
     /// One document check's result, appended by `koto review record`, one
     /// per entry of its batch.
     DocCheckRecorded(DocCheckRecorded),
+    /// One run of a document's rule checks, appended by
+    /// `koto review record rule-checks` with every entry in one event.
+    /// Additive, and degrades like `finding_disputed`; so do the next two.
+    DocRuleChecksRecorded(DocRuleChecksRecorded),
+    /// A document section written, appended by
+    /// `koto review record section-written`.
+    DocSectionRecorded(DocSectionRecorded),
+    /// A fix applied to a document, appended by `koto review record fix`
+    /// with every entry in one event.
+    DocFixRecorded(DocFixRecorded),
     /// One `koto session anchor open` call against an anchor
     /// (DESIGN-session-retention.md, Decision 2): every call appends one,
     /// whether it created the anchor or continued it. Additive: an older
@@ -2183,6 +2283,9 @@ impl EventPayload {
             EventPayload::ReviewVerdictRecorded(_) => REVIEW_VERDICT_RECORDED,
             EventPayload::ReviewDecisionRecorded(_) => REVIEW_DECISION_RECORDED,
             EventPayload::DocCheckRecorded(_) => DOC_CHECK_RECORDED,
+            EventPayload::DocRuleChecksRecorded(_) => DOC_RULE_CHECKS_RECORDED,
+            EventPayload::DocSectionRecorded(_) => DOC_SECTION_RECORDED,
+            EventPayload::DocFixRecorded(_) => DOC_FIX_RECORDED,
             EventPayload::AnchorStarted(_) => ANCHOR_STARTED,
             EventPayload::AnchorActivity(_) => ANCHOR_ACTIVITY,
             EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
@@ -2730,6 +2833,33 @@ impl<'de> Deserialize<'de> for Event {
             DOC_CHECK_RECORDED => {
                 match serde_json::from_value::<DocCheckRecorded>(payload_val.clone()) {
                     Ok(c) => EventPayload::DocCheckRecorded(c),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            DOC_RULE_CHECKS_RECORDED => {
+                match serde_json::from_value::<DocRuleChecksRecorded>(payload_val.clone()) {
+                    Ok(c) => EventPayload::DocRuleChecksRecorded(c),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            DOC_SECTION_RECORDED => {
+                match serde_json::from_value::<DocSectionRecorded>(payload_val.clone()) {
+                    Ok(s) => EventPayload::DocSectionRecorded(s),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            DOC_FIX_RECORDED => {
+                match serde_json::from_value::<DocFixRecorded>(payload_val.clone()) {
+                    Ok(f) => EventPayload::DocFixRecorded(f),
                     Err(_) => EventPayload::Unknown {
                         type_name: event_type.clone(),
                         raw_payload: payload_val.clone(),
