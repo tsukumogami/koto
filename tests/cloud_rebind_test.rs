@@ -7,9 +7,9 @@
 //! named the old anchor again and `koto next` from the new directory refused
 //! with `execution_anchor_mismatch` while rebind had reported success.
 //!
-//! The remote prefix is derived from the directory a command runs in, so the
-//! bug shows when rebind runs from the directory `koto next` will run from;
-//! that is how this test runs it.
+//! The bug showed when rebind ran from the directory `koto next` will run
+//! from; that is how this test runs it. The session's copy stays under the
+//! prefix it was created under whichever directory either runs in.
 
 #![cfg(unix)]
 
@@ -123,13 +123,19 @@ fn a_cloud_rebind_reaches_the_remote_and_next_runs_from_the_new_directory() {
     assert!(run.ok(), "rebind: {}", run.describe());
     assert_eq!(run.json["rebound"], serde_json::json!(true));
 
-    // The state file under the prefix the moved directory's commands use
-    // names the new anchor.
-    let key = format!("{}/{name}/koto-{name}.state.jsonl", prefix_of(&moved));
+    // The session's own copy, under the prefix it was created under, names
+    // the new anchor; nothing lands under the moved directory's prefix.
+    let key = format!("{}/{name}/koto-{name}.state.jsonl", prefix_of(&old));
     assert_eq!(
         remote_header(&s3, &key)["execution_dir"],
         serde_json::json!(moved.to_str().unwrap()),
         "the remote header must name the new anchor"
+    );
+    let moved_prefix = format!("{}/", prefix_of(&moved));
+    assert!(
+        s3.keys().iter().all(|k| !k.starts_with(&moved_prefix)),
+        "{:?}",
+        s3.keys()
     );
 
     // The tick from the new directory pulls that copy and runs there.

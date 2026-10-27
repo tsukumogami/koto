@@ -770,7 +770,9 @@ impl CloudBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{cloud_backend_at, serve, Endpoint, PREFIX};
+    use super::super::test_support::{
+        cloud_backend_at, cloud_backend_under, serve, Endpoint, PREFIX,
+    };
     use super::*;
 
     const PRED_WS: &str = "0123456789abcdef";
@@ -861,10 +863,11 @@ mod tests {
         assert!(backend.put_backref(&owed).is_err());
         let owed = backend.pointer_for("s", PRED_WS, "v1", "not-an-id");
         assert!(backend.put_backref(&owed).is_err());
-        // This test backend's own prefix isn't a workspace prefix, so even a
-        // well-formed pointer naming it is refused.
-        let owed = backend.pointer_for("s", PRED_WS, "v1", &holder_id());
-        assert!(backend.put_backref(&owed).is_err());
+        // A backend whose own prefix isn't a workspace prefix refuses even a
+        // well-formed pointer naming it.
+        let odd = cloud_backend_under(tmp.path(), endpoint.url.clone(), "test-prefix");
+        let owed = odd.pointer_for("s", PRED_WS, "v1", &holder_id());
+        assert!(odd.put_backref(&owed).is_err());
         assert!(endpoint.requests().iter().all(|r| r.method != "PUT"));
     }
 }

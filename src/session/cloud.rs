@@ -1311,6 +1311,19 @@ impl CloudBackend {
         format!("{}/{}/", self.home(id), id)
     }
 
+    /// The S3 key prefix `id` has under this directory's own prefix,
+    /// whatever its local copy records: where an import puts the session it
+    /// creates, which on the same host may share its name with the source
+    /// whose local copy records the source's prefix.
+    pub(super) fn own_session_prefix(&self, id: &str) -> String {
+        format!("{}/{}/", self.prefix, id)
+    }
+
+    /// The state file's key under [`CloudBackend::own_session_prefix`].
+    pub(super) fn own_state_key(&self, id: &str) -> String {
+        format!("{}{}", self.own_session_prefix(id), state_file_name(id))
+    }
+
     /// Upload the state file to S3. Non-fatal on failure.
     ///
     /// With a batch open, the upload is the batch's flush, which pushes the
@@ -4970,7 +4983,7 @@ impl CloudBackend {
                 ),
             )
         };
-        let key = self.state_key(target);
+        let key = self.own_state_key(target);
         let could_not_check = |e: &dyn std::fmt::Display| {
             ImportError::new(
                 PushFailed,
@@ -5304,12 +5317,15 @@ impl CloudBackend {
         source: &ImportSource,
         manifest: &crate::session::context::Manifest,
     ) -> Result<Vec<String>, ImportError> {
-        let prefix = self.session_prefix(target);
+        let prefix = self.own_session_prefix(target);
         let hash = &source.log.header.template_hash;
         let mut uploads = vec![
-            (self.state_key(target), staged.join(state_file_name(target))),
             (
-                self.template_key(target),
+                self.own_state_key(target),
+                staged.join(state_file_name(target)),
+            ),
+            (
+                format!("{}{}", prefix, TEMPLATE_OBJECT),
                 staged.join(format!("{}.json", hash)),
             ),
         ];
@@ -5329,7 +5345,10 @@ impl CloudBackend {
             format!("{}ctx/manifest.json", prefix),
             staged.join("ctx").join("manifest.json"),
         ));
-        uploads.push((self.version_key(target), staged.join("version.json")));
+        uploads.push((
+            format!("{}version.json", prefix),
+            staged.join("version.json"),
+        ));
 
         let mut pushed = Vec::new();
         for (key, path) in uploads {
@@ -5772,8 +5791,9 @@ pub(crate) mod test_support {
     use crate::session::local::LocalBackend;
     use crate::session::state_file_name;
 
-    /// The key prefix `cloud_backend_at` gives its backend.
-    pub(crate) const PREFIX: &str = "test-prefix";
+    /// The key prefix `cloud_backend_at` gives its backend, of the shape
+    /// `repo_id` derives, so a header recording it is the session's home.
+    pub(crate) const PREFIX: &str = "7e57000000000000";
 
     /// One request the endpoint answered: method, path (query stripped) and
     /// body.
@@ -5981,6 +6001,15 @@ pub(crate) mod test_support {
     /// A `CloudBackend` storing sessions under `base_dir` and syncing to
     /// `endpoint` (path-style, under [`PREFIX`]).
     pub(crate) fn cloud_backend_at(base_dir: &Path, endpoint: String) -> CloudBackend {
+        cloud_backend_under(base_dir, endpoint, PREFIX)
+    }
+
+    /// [`cloud_backend_at`] with `prefix` as its own.
+    pub(crate) fn cloud_backend_under(
+        base_dir: &Path,
+        endpoint: String,
+        prefix: &str,
+    ) -> CloudBackend {
         let region = Region::Custom {
             region: "us-east-1".to_string(),
             endpoint,
@@ -5991,7 +6020,7 @@ pub(crate) mod test_support {
             .unwrap()
             .with_path_style();
         let local = LocalBackend::with_base_dir(base_dir.to_path_buf());
-        CloudBackend::with_parts(local, bucket, PREFIX.to_string())
+        CloudBackend::with_parts(local, bucket, prefix.to_string())
     }
 
     /// The suffix of the remote key holding `id`'s state file.

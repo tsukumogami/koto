@@ -618,7 +618,7 @@ impl CloudBackend {
         req: &ImportRequest<'_>,
         source: &ImportSource,
     ) -> Result<(), ImportError> {
-        let key = self.state_key(req.target);
+        let key = self.own_state_key(req.target);
         let bytes = match self.get_object_if_present(&key) {
             Ok(Some(b)) => b,
             Ok(None) => return Ok(()),

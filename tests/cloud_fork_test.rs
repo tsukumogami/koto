@@ -262,15 +262,22 @@ fn a_read_from_the_root_after_a_rebind_keeps_every_event() {
         "the header must still name the new anchor"
     );
 
-    // The new anchor keeps writing, and its bucket copy carries everything.
+    // The new anchor keeps writing, and the session's one bucket copy, under
+    // the prefix it was created under, carries everything.
     host.add_ok(&moved, "k3");
     let log = host.local_log();
     for key in ["k1", "k2", "k3"] {
         assert!(has_key_event(&log, key), "{key} missing:\n{log}");
     }
     assert!(has_rebind(&log));
-    let remote = String::from_utf8(s3.object(&state_key(&moved)).unwrap()).unwrap();
-    assert_eq!(remote, log, "the new anchor's bucket copy is the local log");
+    let remote = String::from_utf8(s3.object(&state_key(&root)).unwrap()).unwrap();
+    assert_eq!(remote, log, "the session's bucket copy is the local log");
+    for dir in [&anchor, &moved] {
+        assert!(
+            s3.object(&state_key(dir)).is_none(),
+            "a second copy appeared"
+        );
+    }
 }
 
 /// A bucket copy whose events diverge from the local log's is never written
@@ -363,15 +370,60 @@ fn a_push_over_a_copy_that_moved_refuses_and_keeps_the_copy() {
 }
 
 /// `koto session rebind` from a directory that is neither the session's
-/// own nor the one named by `--to` refuses, naming where to run it.
+/// own nor the one named by `--to` moves a session that records its prefix:
+/// the rebind's header goes up to the session's own copy, and nothing lands
+/// under the third directory's prefix.
 #[test]
-fn a_rebind_from_a_third_directory_refuses() {
+fn a_rebind_from_a_third_directory_pushes_to_the_own_copy() {
     let s3 = FakeS3::start(BUCKET);
     let host = Host::new(&s3);
     let anchor = host.dir("anchor");
     let target = host.dir("target");
     let elsewhere = host.dir("elsewhere");
     host.init(&anchor, &[]);
+
+    host.ok(
+        &elsewhere,
+        &["session", "rebind", WF, "--to", target.to_str().unwrap()],
+    );
+    assert!(has_rebind(&host.local_log()));
+    let remote = String::from_utf8(s3.object(&state_key(&anchor)).unwrap()).unwrap();
+    assert!(has_rebind(&remote), "the rebind went up to the own copy");
+    let third = format!("{}/", prefix_of(&elsewhere));
+    assert!(
+        s3.keys().iter().all(|k| !k.starts_with(&third)),
+        "nothing goes under the third directory's prefix"
+    );
+}
+
+/// A session recorded before koto named the prefix still refuses a rebind
+/// from a third directory, naming where to run it.
+#[test]
+fn a_rebind_of_an_unrecorded_session_from_a_third_directory_refuses() {
+    let s3 = FakeS3::start(BUCKET);
+    let host = Host::new(&s3);
+    let anchor = host.dir("anchor");
+    let target = host.dir("target");
+    let elsewhere = host.dir("elsewhere");
+    host.init(&anchor, &[]);
+    let path = host
+        .home
+        .join(".koto/sessions")
+        .join(WF)
+        .join(format!("koto-{WF}.state.jsonl"));
+    let log = host.local_log();
+    let (first, rest) = log.split_once('\n').unwrap();
+    let mut header: serde_json::Value = serde_json::from_str(first).unwrap();
+    header["origin"]["store"]
+        .as_object_mut()
+        .unwrap()
+        .remove("prefix")
+        .expect("a new session records its prefix");
+    std::fs::write(
+        &path,
+        format!("{}\n{}", serde_json::to_string(&header).unwrap(), rest),
+    )
+    .unwrap();
     let before = host.local_log();
 
     let out = host.koto(
@@ -381,7 +433,7 @@ fn a_rebind_from_a_third_directory_refuses() {
     assert_eq!(out.code, Some(2), "{}", out.describe());
     let err: serde_json::Value = serde_json::from_str(out.stdout.trim()).unwrap();
     let message = err["error"].as_str().unwrap();
-    assert!(message.starts_with("session_bound_elsewhere"), "{message}");
+    assert!(message.starts_with("session_unlocated"), "{message}");
     assert!(message.contains(anchor.to_str().unwrap()), "{message}");
     assert!(
         message.contains(&format!(
