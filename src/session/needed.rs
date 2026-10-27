@@ -120,7 +120,9 @@ pub fn needed(base: &Path, path: &Path) -> Answer {
     let mut needing: Vec<(String, Why)> = Vec::new();
     let mut undecided: Vec<String> = Vec::new();
 
-    let names: Vec<String> = graph.names().map(str::to_string).collect();
+    // Sorted, so the line names the session whose name sorts first.
+    let mut names: Vec<String> = graph.names().map(str::to_string).collect();
+    names.sort();
     for name in &names {
         if graph
             .facts(name)
@@ -202,6 +204,9 @@ fn held(
             if !seen.insert(holder.clone()) {
                 continue;
             }
+            // Only an anchor read and found outside releases: a member with
+            // no anchor recorded, or whose header can't be read, may be
+            // anchored anywhere, so it releases nothing.
             if let Ok(Some(dir)) = anchor_of(anchors, base, &holder) {
                 if !under_dir(&dir, target) {
                     return None;

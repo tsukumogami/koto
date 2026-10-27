@@ -193,12 +193,16 @@ impl Env {
         std::fs::write(&path, format!("{header}\n{rest}")).unwrap();
     }
 
-    /// Make session `name`'s log unparseable past its header.
+    /// Make session `name`'s log unparseable past its header. The garbage
+    /// goes right after the header, ahead of the events: the log reader
+    /// recovers a bad final line as a torn append, so garbage appended at
+    /// the end would still read as running.
     fn corrupt_log(&self, name: &str) {
         let path = self.state_file(name);
-        let mut text = std::fs::read_to_string(&path).unwrap();
-        text.push_str("this is not an event\n");
-        std::fs::write(&path, text).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (header, events) = text.split_once('\n').unwrap();
+        assert!(!events.is_empty(), "session {name} has no events to follow");
+        std::fs::write(&path, format!("{header}\nthis is not an event\n{events}")).unwrap();
     }
 
     /// SHA-256 of every file under the koto root, with its mode, plus every
