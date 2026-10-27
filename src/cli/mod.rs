@@ -4467,9 +4467,10 @@ fn promote_leg_result(
 /// onto the leg, and a self-attached leg refuses the fenced verbs,
 /// `abandon` among them, so its requester could not close it either. The
 /// cancel promotes a failure itself, with `final_state` `cancelled`, the
-/// name attach and init already give a cancelled session. A leg a
-/// coordinator bound is left alone: its requester can still abandon it
-/// under the epoch fence.
+/// name `request_store::attach` and `init_entry` already give a cancelled
+/// session. A leg a coordinator bound is left alone: its requester can
+/// still abandon it under the epoch fence. That is why the leg is read
+/// here before `promote_leg_result`, which would promote onto any leg.
 #[cfg(unix)]
 fn promote_cancel_onto_self_attached_leg(session_dir: &std::path::Path, state: &str) {
     use crate::engine::request_store::{self, ValidatedRequestId};

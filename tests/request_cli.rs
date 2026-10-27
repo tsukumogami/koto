@@ -2082,6 +2082,52 @@ Done.
     assert_eq!(envelope["revision"], 1);
 }
 
+#[test]
+fn cancelling_a_coordinator_bound_child_leaves_its_leg_to_the_requester() {
+    // Only a self-attached leg is answered by a cancel; a leg a coordinator
+    // bound stays open, and its requester abandons it under the fence.
+    let tmp = TempDir::new().unwrap();
+    let id = create(tmp.path(), TWO_LEGS);
+    bindable(tmp.path(), "child-1", 3);
+    run_ok(
+        tmp.path(),
+        &[
+            "request",
+            "bind",
+            &id,
+            "reviewer-a",
+            "--child",
+            "child-1",
+            "--dispatch-epoch",
+            "3",
+        ],
+    );
+
+    let (code, stdout, stderr) = run(tmp.path(), &["cancel", "child-1"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+
+    let envelope = run_ok(tmp.path(), &["request", "get", &id]);
+    let leg = &envelope["legs"]["reviewer-a"];
+    assert_eq!(leg["disposition"], "open", "{leg}");
+    assert_eq!(leg["bound_child"], "child-1", "{leg}");
+    assert!(leg["result"].is_null(), "{leg}");
+
+    let abandoned = run_ok(
+        tmp.path(),
+        &[
+            "request",
+            "abandon",
+            &id,
+            "reviewer-a",
+            "--rationale",
+            "child cancelled",
+            "--dispatch-epoch",
+            "3",
+        ],
+    );
+    assert_eq!(abandoned["legs"]["reviewer-a"]["disposition"], "abandoned");
+}
+
 // ===== Issue 9: wait =====
 
 #[test]

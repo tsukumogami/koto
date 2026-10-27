@@ -562,12 +562,12 @@ fn a_leg_bound_to_another_session_is_refused() {
         "leg_bound_to_different_child",
     );
 
-    // Whatever the other session's state: a finished bound session still
-    // holds its leg.
+    // Whatever the other session's state, a holder that finishes never frees
+    // its leg for another session: it answers the leg on its way out.
     run_ok(tmp.path(), &["next", "scope-t1", "--no-cleanup"]);
     let second = scope_request(tmp.path(), r#""scope.md""#, scope_inputs());
-    // (The first leg is now resolved; take a fresh request to check the
-    // bound case against a terminal holder.)
+    // (The first leg is now resolved; take a fresh request to check a
+    // holder that is cancelled rather than finished.)
     init(
         tmp.path(),
         "scope-holder",
