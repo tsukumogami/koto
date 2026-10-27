@@ -749,9 +749,10 @@ journal lines off the host; a tool that does must leave out every
 
 ### Reads from another agent session
 
-A `koto context get` or `koto context exists` with no reader's anchor
-(`KOTO_ANCHOR` unset, or naming no anchor here) goes to this host's read
-spool beside the session read, not to its log. A visit's sum reads the
+A `koto context get` or `koto context exists` outside the session read's own
+tick with no reader's anchor (`KOTO_ANCHOR` unset, or naming no anchor here),
+or with an anchor that is the session read or holds it, goes to this host's
+read spool beside the session read, not to its log. A visit's sum reads the
 session's log and its spool together, merged by timestamp: a spooled read
 made at or after the event the visit's window starts from counts in that
 visit, in first-read order with the log's reads. The spool is never sent

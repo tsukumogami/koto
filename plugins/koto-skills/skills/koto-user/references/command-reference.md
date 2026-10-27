@@ -1189,7 +1189,9 @@ Retrieves stored content and writes it to stdout, or to `--to-file` if specified
 
 Exit 3 if the key does not exist or an I/O error occurs.
 
-**Where the read is recorded.** `get` and `exists` each log one `context_read` (key name and value hash, never the value). When `KOTO_ANCHOR` names an anchor other than `<session>` and other than one that holds it (through `koto/links/held-by/<anchor>`), which is a read from another agent session, the record goes into that anchor's log with a `session` field naming `<session>`, and `<session>`'s files stay byte-identical. Your own session's reads still log in `<session>`. A read with no anchor (unset, or naming no anchor here) goes to this host's read spool beside `<session>`'s local copy, which never leaves the host and counts as no session's activity, so `<session>`'s files stay byte-identical then too. Under the cloud backend that means an anchorless read now writes nothing to the read session; before, every read was also a write to the bucket. One exception remains: when a transition assigned a key and that store write was lost, the read first restores the assigned value into `<session>` (koto#436). A record that can't be appended prints a warning and the read still answers. `koto context list` and `koto status` record no read anywhere.
+**A read writes nothing into the session it reads.** Outside `<session>`'s own tick, `koto context get`, `exists`, `list` and `koto status` leave `<session>`'s state log, its context key files and, under the cloud backend, its bucket objects byte-identical, whatever `KOTO_ANCHOR` you run them with. When a transition assigned a key and that store write was lost, `get`, `exists` and `list` answer the assigned value from the session's log without storing it; the session's own next `koto next` stores it, since a tick brings the store in line with the log before it evaluates anything.
+
+**Where the read is recorded.** `get` and `exists` each log one `context_read` (key name and value hash, never the value). A read inside `<session>`'s own tick (a gate script or default action reading its own session) logs in `<session>`. When `KOTO_ANCHOR` names an anchor other than `<session>` and other than one that holds it (through `koto/links/held-by/<anchor>`), which is a read from another agent session, the record goes into that anchor's log with a `session` field naming `<session>`. Every other read outside the tick goes to this host's read spool beside `<session>`'s local copy: one with no anchor (unset, or naming no anchor here), and one from your own agent session, whose anchor is `<session>` or holds it. The spool never leaves the host and counts as no session's activity; the run journal still counts its reads. A record that can't be appended prints a warning and the read still answers. `koto context list` and `koto status` record no read anywhere.
 
 ---
 
@@ -1274,6 +1276,8 @@ Lists all context keys as a JSON array sorted alphabetically.
 ```json
 ["alpha.md", "beta.md", "research/r1/lead.md"]
 ```
+
+A key a transition assigned whose store write was lost is listed too, as `koto context get` answers it from the session's log; nothing is stored (see `koto context get`).
 
 `--prefix <prefix>` filters to keys that start with the given prefix. Returns `[]` when no keys exist or no keys match.
 

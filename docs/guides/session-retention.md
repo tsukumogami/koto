@@ -311,6 +311,18 @@ another workspace's prefix, and takes it back when it is removed or renamed.
 These are tracked with koto's other cross-session writers in
 [koto#445](https://github.com/tsukumogami/koto/issues/445).
 
+A read is never one. Outside a session's own tick, `koto status`,
+`koto context get`, `koto context exists` and `koto context list` leave the
+session's state log, its context key files and, under the cloud backend, its
+bucket objects byte-identical, so reading a finished session to decide
+whether to keep it doesn't change it. Such a read is logged in the reader's
+anchor when `KOTO_ANCHOR` names another agent session's anchor, and in this
+host's read spool otherwise, including when the anchor is the session's own.
+Only a read inside the session's own tick, such as a gate script reading its
+session, is logged in the session. When a transition's assigned value never
+reached the store, a read answers it from the session's log without storing
+it; the session's own next `koto next` stores it.
+
 The continues relation's writers carry risks this release accepts:
 
 - Anyone who can write a relation or a back-reference can hold a session in
