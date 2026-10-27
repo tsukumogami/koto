@@ -205,7 +205,7 @@ pub fn generate_machine_id() -> String {
 }
 
 /// Get the system hostname. Falls back to "unknown" on failure.
-fn get_hostname() -> String {
+pub(crate) fn get_hostname() -> String {
     #[cfg(unix)]
     {
         let mut buf = [0u8; 256];

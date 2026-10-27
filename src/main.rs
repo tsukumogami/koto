@@ -1,10 +1,9 @@
 use clap::Parser;
-use koto::cli::{run, App};
+use koto::cli::{report_failure, run, App};
 
 fn main() {
     let app = App::parse();
     if let Err(e) = run(app) {
-        eprintln!("{}", e);
-        std::process::exit(1);
+        std::process::exit(report_failure(&e));
     }
 }

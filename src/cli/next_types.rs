@@ -1062,6 +1062,11 @@ pub enum NextErrorCode {
     /// beside this copy. Caller error: continue the session where the
     /// message says it now lives; ticking this copy would fork it.
     SessionMigrated,
+    /// The session was superseded (`koto init --continues <it>
+    /// --supersede`): its log holds a `session_superseded` fence, and koto
+    /// writes nothing more to it. Caller error: continue in the newest
+    /// session the message names.
+    SessionSuperseded,
 }
 
 impl NextErrorCode {
@@ -1084,6 +1089,7 @@ impl NextErrorCode {
             // re-running the nested tick will refuse identically.
             NextErrorCode::NestedInvocation => 2,
             NextErrorCode::SessionMigrated => 2,
+            NextErrorCode::SessionSuperseded => 2,
             NextErrorCode::TemplateError => 3,
             NextErrorCode::PersistenceError => 3,
             NextErrorCode::ExecutionAnchorUnresolvable => 3,

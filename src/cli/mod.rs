@@ -13,6 +13,7 @@ pub mod decider_port;
 pub mod disputes;
 pub mod init_child;
 pub mod init_entry;
+pub mod init_supersede;
 pub(crate) mod move_aside;
 pub mod next;
 pub mod next_types;
@@ -215,6 +216,39 @@ pub enum Command {
             requires = "continues"
         )]
         continues_from: Option<String>,
+
+        /// Take PRED's work over: fence PRED, then open this session
+        /// continuing it. The fence is a `session_superseded` event
+        /// appended to PRED's own log under its append lock (waited for
+        /// at most 10 seconds); from then on koto refuses every write to
+        /// PRED (`koto next`, context writes, decisions, overrides,
+        /// rewinds, cancels) with `session_superseded`, naming the newest
+        /// session in the chain, while its reads keep working. Requires
+        /// --continues; can't be used with --parent, --from-stdin,
+        /// --attach-live, --replace-terminal or --koto-leg. Refusals exit
+        /// 2 with nothing written: PRED already superseded by another
+        /// session (`superseded_by=<name>`), `stale_state`, `self`,
+        /// `cycle`, `session_exists`, and the cloud backend in this
+        /// release; a lock still held after 10 seconds exits 3
+        /// `fence_unavailable`. Running the same command again finishes
+        /// an interrupted run, or changes nothing.
+        #[arg(long, requires = "continues")]
+        supersede: bool,
+
+        /// With --supersede, copy every context key starting with PREFIX
+        /// (a plain string prefix, as `koto context list --prefix` takes
+        /// it) from PRED into this session, skipping keys this session
+        /// already holds with the same value. Repeatable. Keys under
+        /// `koto/` are never carried. Once the carry is done the session
+        /// holds `koto/superseded-carry-complete`, and a later run carries
+        /// nothing.
+        #[arg(long = "carry", value_name = "PREFIX", requires = "supersede")]
+        carry: Vec<String>,
+
+        /// With --supersede, refuse with `stale_state` (exit 2, nothing
+        /// written) unless PRED is in state STATE.
+        #[arg(long = "expect-state", value_name = "STATE", requires = "supersede")]
+        expect_state: Option<String>,
 
         /// Directory this session's commands run in (its execution
         /// anchor). Defaults to the directory `koto init` is run in,
@@ -1200,10 +1234,12 @@ fn load_compiled_template(path: &str) -> anyhow::Result<CompiledTemplate> {
 
 /// The exit code of a failed `koto context add` or `koto context remove`:
 /// 2 for a key in the reserved `koto/` area, which the caller must not
-/// name, and 3 for anything else.
+/// name, or a session superseded since the command's own check, and 3 for
+/// anything else.
 fn context_write_exit_code(e: &anyhow::Error) -> i32 {
     if e.downcast_ref::<crate::session::links::ReservedKeyError>()
         .is_some()
+        || crate::engine::persistence::session_superseded(e).is_some()
     {
         EXIT_CALLER_ERROR
     } else {
@@ -1246,6 +1282,80 @@ fn refuse_if_bound_elsewhere(backend: &Backend, session: &str, command: &str) {
         );
     }
     backend.ensure_backref(session);
+}
+
+/// The message and fields of a `session_superseded` refusal of `session`,
+/// or `None` when `session` isn't superseded. The message names the newest
+/// session in its supersede chain, the one to continue in; the fields carry
+/// the direct successor, the newest member and the fence's actor.
+fn superseded_refusal(
+    backend: &dyn SessionBackend,
+    session: &str,
+) -> Option<(String, serde_json::Value)> {
+    let superseded = crate::session::links::newest_member(backend, session)?;
+    let message = format!(
+        "session '{session}' was superseded by '{}' (session_superseded), so nothing was \
+         written; continue in '{}'",
+        superseded.fence.by, superseded.newest
+    );
+    let fields = serde_json::json!({
+        "superseded_by": superseded.fence.by,
+        "newest": superseded.newest,
+        "actor": superseded.fence.actor,
+    });
+    Some((message, fields))
+}
+
+/// Refuse, exit 2 with code `session_superseded`, when `session` was
+/// superseded, before `command` writes anything to it. The log append
+/// refuses the same write on its own; checking first keeps a command that
+/// writes a store or a file before it appends from writing that.
+fn refuse_if_superseded(backend: &dyn SessionBackend, session: &str, command: &str) {
+    if let Some((message, fields)) = superseded_refusal(backend, session) {
+        let mut body = serde_json::json!({
+            "error": message,
+            "command": command,
+            "code": "session_superseded",
+        });
+        if let (Some(obj), Some(more)) = (body.as_object_mut(), fields.as_object()) {
+            obj.extend(more.clone());
+        }
+        exit_with_error_code(body, EXIT_CALLER_ERROR);
+    }
+}
+
+/// [`refuse_if_superseded`] for `koto next`, in the error shape `koto next`
+/// prints: `{"error": {"code": "session_superseded", ...}, ...fields}`.
+fn refuse_next_if_superseded(backend: &dyn SessionBackend, session: &str) {
+    use crate::cli::next_types::{NextError, NextErrorCode};
+    if let Some((message, fields)) = superseded_refusal(backend, session) {
+        let err = NextError {
+            code: NextErrorCode::SessionSuperseded,
+            message,
+            details: vec![],
+        };
+        let mut body = serde_json::json!({ "error": err });
+        if let (Some(obj), Some(more)) = (body.as_object_mut(), fields.as_object()) {
+            obj.extend(more.clone());
+        }
+        exit_with_error_code(body, err.code.exit_code());
+    }
+}
+
+/// Report a command's failure on stderr and return its exit code: 2, with
+/// the refusal's own text, for a write a superseded session's log refused
+/// (`session_superseded`), and 1 with the error's text for anything else.
+pub fn report_failure(e: &anyhow::Error) -> i32 {
+    match crate::engine::persistence::session_superseded(e) {
+        Some(refused) => {
+            eprintln!("{refused}");
+            EXIT_CALLER_ERROR
+        }
+        None => {
+            eprintln!("{e}");
+            1
+        }
+    }
 }
 
 /// What `koto next` runs on its way out, however it exits: the flush of
@@ -1773,12 +1883,21 @@ pub fn run(app: App) -> Result<()> {
             dispatched_by,
             continues,
             continues_from,
+            supersede,
+            carry,
+            expect_state,
             execution_dir,
             legacy_environment,
         } => {
             // Entry-flag usage errors come first, before any IO: they are
             // caller mistakes, and there is no leg yet to record them on.
             let entry_flags_used = attach_live || replace_terminal || koto_leg.is_some();
+            if supersede && (entry_flags_used || from_stdin || parent.is_some()) {
+                init_entry::usage_error(
+                    "--supersede can't be used with --parent, --from-stdin, --attach-live, \
+                     --replace-terminal or --koto-leg",
+                );
+            }
             if let Some(dispatcher) = &dispatched_by {
                 use crate::session::links::{validate_peer, LinkKind};
                 if let Err(e) = validate_peer(LinkKind::DispatchedBy, dispatcher) {
@@ -1828,6 +1947,43 @@ pub fn run(app: App) -> Result<()> {
             };
 
             let backend = build_backend()?;
+            let canonical_dir = |dir: String| match std::fs::canonicalize(&dir) {
+                Ok(canonical) => canonical,
+                Err(e) => exit_with_error_code(
+                    serde_json::json!({
+                        "error": format!("--execution-dir {}: {}", dir, e),
+                        "command": "init"
+                    }),
+                    2,
+                ),
+            };
+            if supersede {
+                // `requires` holds both: clap refuses --supersede without
+                // --continues, and the --from-stdin path is refused above.
+                let pred = continues.as_deref().unwrap_or_default();
+                let template = template.unwrap_or_else(|| {
+                    init_entry::usage_error("koto init --supersede requires --template <path>")
+                });
+                let execution_dir = execution_dir.map(canonical_dir);
+                init_supersede::run(
+                    &backend,
+                    &init_supersede::SupersedeArgs {
+                        name: &name,
+                        template: &template,
+                        vars: &vars,
+                        intent: intent.as_deref(),
+                        dispatched_by: dispatched_by.as_deref(),
+                        pred,
+                        continues_from: continues_from.as_deref(),
+                        execution_dir: execution_dir.as_deref(),
+                        legacy_environment,
+                        carry: &carry,
+                        expect_state: expect_state.as_deref(),
+                    },
+                )?;
+                session_anchor::hold_from_env(&backend, &name, "init");
+                return Ok(());
+            }
             // `--continues` is checked before anything is written, so a
             // refused predecessor leaves no session behind (R3); the
             // relation itself is written once the session exists, before
@@ -1844,16 +2000,7 @@ pub fn run(app: App) -> Result<()> {
             // Resolve `--execution-dir` once, before either init path:
             // a directory that does not resolve is a caller error, and
             // both paths record the canonical form.
-            let execution_dir = execution_dir.map(|dir| match std::fs::canonicalize(&dir) {
-                Ok(canonical) => canonical,
-                Err(e) => exit_with_error_code(
-                    serde_json::json!({
-                        "error": format!("--execution-dir {}: {}", dir, e),
-                        "command": "init"
-                    }),
-                    2,
-                ),
-            });
+            let execution_dir = execution_dir.map(canonical_dir);
             if from_stdin {
                 // --from-stdin is the inline (strict-only) path. Reject the
                 // two incompatible flag combinations before reading stdin
@@ -1978,6 +2125,10 @@ pub fn run(app: App) -> Result<()> {
             // Leaked so the exit flush can reach it from any exit path,
             // `std::process::exit` included. One per process, which ends.
             let backend: &'static Backend = Box::leak(Box::new(build_backend()?));
+            // A superseded session is refused before anything below writes
+            // to it or anywhere else: the anchor's held-by link, the tick's
+            // own log appends.
+            refuse_next_if_superseded(backend, &name);
             let tick = name.clone();
             let _ = EXIT_FLUSH.set(Box::new(move || {
                 if let Err(e) = backend.flush_pending(&tick) {
@@ -2023,11 +2174,13 @@ pub fn run(app: App) -> Result<()> {
         Command::Cancel { name, cleanup } => {
             let backend = build_backend()?;
             refuse_if_bound_elsewhere(&backend, &name, "cancel");
+            refuse_if_superseded(&backend, &name, "cancel");
             handle_cancel(&backend, backend.local_base_dir(), &name, cleanup)
         }
         Command::Rewind { name, rationale } => {
             let backend = build_backend()?;
             refuse_if_bound_elsewhere(&backend, &name, "rewind");
+            refuse_if_superseded(&backend, &name, "rewind");
             handle_rewind(&backend, &backend, &name, rationale)
         }
         Command::Status { name } => {
@@ -2334,6 +2487,9 @@ pub fn run(app: App) -> Result<()> {
                             EXIT_CALLER_ERROR,
                         );
                     }
+                    // Before the store is written: the append that follows
+                    // the store write would refuse too, but too late.
+                    refuse_if_superseded(&backend, &session, "context add");
                     if let Err(e) =
                         context::handle_add(store, &backend, &session, &key, from_file.as_deref())
                     {
@@ -2409,6 +2565,7 @@ pub fn run(app: App) -> Result<()> {
                             EXIT_CALLER_ERROR,
                         );
                     }
+                    refuse_if_superseded(&backend, &session, "context remove");
                     if let Err(e) = context::handle_remove(store, &backend, &session, &key) {
                         exit_with_error_code(
                             serde_json::json!({
@@ -2548,6 +2705,7 @@ pub fn run(app: App) -> Result<()> {
             match subcommand {
                 DecisionsSubcommand::Record { name, with_data } => {
                     refuse_if_bound_elsewhere(&backend, &name, "decisions record");
+                    refuse_if_superseded(&backend, &name, "decisions record");
                     handle_decisions_record(&backend, name, with_data)
                 }
                 DecisionsSubcommand::List { name } => {
@@ -2566,6 +2724,7 @@ pub fn run(app: App) -> Result<()> {
                     with_data,
                 } => {
                     refuse_if_bound_elsewhere(&backend, &name, "overrides record");
+                    refuse_if_superseded(&backend, &name, "overrides record");
                     overrides::handle_overrides_record(&backend, name, gate, rationale, with_data)
                 }
                 overrides::OverridesSubcommand::List { name } => {
@@ -2854,6 +3013,47 @@ fn handle_init(
     dispatched_by: Option<&str>,
     continues: Option<&session::ContinuesTarget>,
 ) -> Result<()> {
+    let (initial_state, environment_report) = create_session(
+        backend,
+        name,
+        template,
+        vars,
+        parent,
+        intent,
+        execution_dir,
+        legacy_environment,
+        dispatched_by,
+        continues,
+        None,
+    )?;
+    let mut out = serde_json::json!({
+        "name": name,
+        "state": initial_state
+    });
+    add_environment_report(&mut out, environment_report.as_ref());
+    println!("{}", serde_json::to_string(&out)?);
+    Ok(())
+}
+
+/// [`handle_init`]'s work short of printing: check the name, create the
+/// session, record its intent, continues relation and dispatched-by link,
+/// and return its initial state with the environment report. A refusal
+/// prints its error and exits, as `koto init` always has. `session_id`, for
+/// a top-level session only, is the header's id instead of a fresh one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_session(
+    backend: &Backend,
+    name: &str,
+    template: &str,
+    vars: &[String],
+    parent: Option<&str>,
+    intent: Option<&str>,
+    execution_dir: Option<&Path>,
+    legacy_environment: bool,
+    dispatched_by: Option<&str>,
+    continues: Option<&session::ContinuesTarget>,
+    session_id: Option<&str>,
+) -> Result<(String, Option<crate::engine::command_env::RecordReport>)> {
     // Validate workflow name before any filesystem operation.
     if let Err(msg) = crate::discover::validate_workflow_name(name) {
         exit_with_error_code(
@@ -2909,17 +3109,30 @@ fn handle_init(
     // R8 spawn-time immutability snapshot is populated only by the
     // future batch scheduler, which calls this helper directly with
     // `Some(..)`.
-    let environment_report = match init_child::init_child_from_parent_at(
-        backend,
-        parent,
-        name,
-        template_path,
-        vars,
-        &mut cache,
-        None,
-        execution_dir,
-        legacy_environment,
-    ) {
+    let created = match (session_id, parent) {
+        (Some(id), None) => init_child::init_session_with_id(
+            backend,
+            name,
+            template_path,
+            vars,
+            &mut cache,
+            execution_dir,
+            legacy_environment,
+            id,
+        ),
+        _ => init_child::init_child_from_parent_at(
+            backend,
+            parent,
+            name,
+            template_path,
+            vars,
+            &mut cache,
+            None,
+            execution_dir,
+            legacy_environment,
+        ),
+    };
+    let environment_report = match created {
         Ok(value) => value,
         Err(err) => {
             match err.kind {
@@ -3016,14 +3229,7 @@ fn handle_init(
                 name
             )
         })?;
-
-    let mut out = serde_json::json!({
-        "name": name,
-        "state": initial_state
-    });
-    add_environment_report(&mut out, environment_report.as_ref());
-    println!("{}", serde_json::to_string(&out)?);
-    Ok(())
+    Ok((initial_state, environment_report))
 }
 
 /// Handle the inline `koto init <name> --from-stdin` path.
