@@ -396,7 +396,7 @@ Every subcommand under `koto request` reports failure through the nested envelop
 | `template_mismatch` | 2 | `attach` named a root session built from a template file the leg doesn't name | Attach a session started from one of the leg's templates |
 | `input_mismatch` | 2 | `attach` named a root session whose recorded variable differs from one of the leg's `inputs`, or that doesn't declare it; `details` names the key | Don't attach this session; the leg was asked for different values |
 | `session_terminal` | 2 | `attach` named a finished or cancelled session | A finished session can't answer a leg; start a fresh one |
-| `self_attached_leg` | 2 | `progress`, `resolve`, or `abandon` on a leg a root session attached itself to | Don't. The result arrives from that session's terminal tick; use `abandon-request` to give up on the whole request |
+| `self_attached_leg` | 2 | `progress`, `resolve`, or `abandon` on a leg a root session attached itself to | Don't. The result arrives from that session's terminal tick, or from `koto cancel`; use `abandon-request` to give up on the whole request |
 | `predicate_impossible` | 2 | The `wait` predicate could never hold, caught before polling | Ask for something reachable |
 | `predicate_became_impossible` | 2 | The predicate stopped being reachable while waiting, through abandonment or close | Distinct from a timeout on purpose: this is "never", not "not yet" |
 | `persistence_error` | 3 | The filesystem refused, or the log disagrees with itself | Report to the user; retrying won't help |

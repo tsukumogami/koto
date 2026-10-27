@@ -824,7 +824,7 @@ The code set is closed. A consumer that had to match on `message` to tell "this 
 | `template_mismatch` | 2 | `attach` named a root session built from a template the leg's `template` doesn't name, compared by the source template's file name. A session with no template file (`--from-stdin`) matches nothing. |
 | `input_mismatch` | 2 | `attach` named a root session whose recorded value for one of the leg's `inputs` differs, or whose template doesn't declare that input. `rebind: true` variables aren't compared. `details` names the key and both values. |
 | `session_terminal` | 2 | `attach` named a session at a terminal state, or a cancelled one. |
-| `self_attached_leg` | 2 | `progress`, `resolve`, or leg-scoped `abandon` on a leg a root session attached itself to. Refused whatever `--dispatch-epoch` says: the leg's result arrives only by promotion from that session's terminal tick. `abandon-request` and `close` still work. |
+| `self_attached_leg` | 2 | `progress`, `resolve`, or leg-scoped `abandon` on a leg a root session attached itself to. Refused whatever `--dispatch-epoch` says: the leg's result arrives only by promotion from that session's terminal tick, or from `koto cancel`, which promotes a cancelled result. `abandon-request` and `close` still work. |
 | `request_id_collision` | 2 | The generated identifier already had a record on disk. |
 | `idempotency_conflict` | 2 | A retry presented a known idempotency hash with a different payload, so it isn't the same logical write. |
 | `bound_exceeded` | 2 | One of the bounds below rejected the call. `details` names the dimension. |
