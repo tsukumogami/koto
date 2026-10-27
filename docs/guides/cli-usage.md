@@ -630,6 +630,26 @@ A row for a session koto keeps for its own bookkeeping also carries `kind`: `anc
 
 `excluded_remote_only` counts the cloud backend's remote-only placeholder rows the filter left out: they have no header on this machine, so their execution directory isn't known. A teardown that wants the sessions a piece of work left runs `koto session list --execution-dir <its directory>` and reads `status` to tell the finished ones from the running ones.
 
+#### session needed
+
+Answers whether any workflow session still needs a directory, for a tool deciding whether it may remove it (a workspace manager reclaiming an instance or a worktree, say).
+
+```bash
+koto session needed <path>
+```
+
+The path is needed while a workflow session anchored at it or under it is running and no later member of its lineage is anchored outside it. A session's anchor is its execution directory, matched the way [session list](#session-list) matches `--execution-dir`: by whole path components, after resolving symlinks, so `/a/repo-2` is not under `/a/repo`, and a symlinked spelling of the path gives the same answer. A session anchored above the path doesn't count. The lineage is the continues relation (see [Continuing a session](#continuing-a-session)): the sessions continuing a session, the ones continuing those, and so on. A later member anchored outside the path releases it whatever that member's own state, so a run taken over in another directory, or one that went on to finish there, stops holding its old directory; a later member with no recorded execution directory releases nothing. Terminal and cancelled sessions never need a path. Anchors and their close sessions aren't workflows and don't count.
+
+| Exit | Meaning | Output |
+|------|---------|--------|
+| 0 | Not needed | `not needed` on stdout |
+| 1 | Needed | One line on stdout naming the session whose name sorts first, why, and how many others need the path |
+| 2 | Can't decide | One line on stderr saying why: the path can't be resolved, the sessions directory can't be listed, or a session's header can't be read, so where it is anchored is unknown |
+
+Each line is at most 200 bytes. What can't be judged keeps the path: a session under it whose log or template can't be read (`is unreadable`), and a running one whose continues relation can't be read, are needed and named. A session with an unreadable header gives exit 2 unless another session already needs the path.
+
+The verb reads this host's sessions directory and nothing else: the local store, or under the cloud backend the local copies it keeps. It builds no backend, never pulls, spools or restores, writes nothing, and logs no context read. Under the cloud backend it judges only the sessions this host holds.
+
 #### session recover
 
 Lists, and optionally restores, the sessions the old-layout migration moved aside because their name was already taken. See [Session storage](#session-storage) for how they get there.
