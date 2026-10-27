@@ -104,8 +104,15 @@ pub enum ReviewSubcommand {
     /// Record a document review event as telemetry. Changes no gate
     /// outcome, route or state
     Record {
-        /// Workflow name
-        name: String,
+        /// Workflow name (required)
+        //
+        // Optional to clap and required by the handler: a required
+        // positional ahead of a subcommand can't be filled in by tooling
+        // that builds a verb's argv from its leaf's own required arguments
+        // (the `--workspace` guard's test walks every verb that way). A
+        // missing name is still refused, with exit 2, before anything runs.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
 
         #[command(subcommand)]
         event: ReviewEvent,
@@ -113,6 +120,10 @@ pub enum ReviewSubcommand {
 }
 
 /// The four review events.
+///
+/// Every value flag is a `String`, numbers included, and is checked by
+/// this module rather than by clap: clap's own refusal of a value it can't
+/// parse repeats the value, and koto's never does (see [`Refusal`]).
 #[derive(Subcommand)]
 pub enum ReviewEvent {
     /// A review round's seats were spawned
@@ -610,7 +621,12 @@ fn fail(code: i32, message: String) -> ! {
 
 pub fn handle(backend: &dyn SessionBackend, subcommand: ReviewSubcommand) -> Result<()> {
     match subcommand {
-        ReviewSubcommand::Record { name, event } => handle_record(backend, name, event),
+        ReviewSubcommand::Record { name, event } => {
+            let Some(name) = name else {
+                refuse(Refusal::new(INVALID_VALUE, "the workflow name is missing").field("<NAME>"));
+            };
+            handle_record(backend, name, event)
+        }
     }
 }
 

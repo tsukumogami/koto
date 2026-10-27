@@ -698,6 +698,74 @@ fn a_journal_write_failure_changes_nothing_the_verb_reports() {
     assert_eq!(records(&ok.journal(), "review_round").len(), 1);
 }
 
+/// The per-session cap through the binary: ten full batches fill it, the
+/// next entry is refused with `cap_reached`, and the log is left as it was.
+#[test]
+fn a_call_past_the_session_cap_is_refused_and_appends_nothing() {
+    let env = Env::new();
+    env.init("wf", 1);
+    let batch = Value::Array(vec![verdicts()[0].clone(); 200]).to_string();
+    let file = env.file("full.json", &batch);
+    for i in 0..10 {
+        let out = env.record("wf", &["verdicts", "--file", &file]);
+        assert!(out.status.success(), "batch {i}: {}", describe(&out));
+    }
+    assert_eq!(env.events("wf", "review_verdict_recorded").len(), 2000);
+    let before = env.log("wf");
+    let out = env.record(
+        "wf",
+        &[
+            "decision",
+            "--doc-type",
+            "prd",
+            "--round",
+            "1",
+            "--decision",
+            "stop",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
+    let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body["error"]["code"], "cap_reached");
+    assert_eq!(env.log("wf"), before);
+}
+
+#[test]
+fn an_empty_batch_records_nothing_and_succeeds() {
+    let env = Env::new();
+    env.init("wf", 1);
+    let before = env.log("wf");
+    let file = env.file("empty.json", "[]");
+    let out = env.record("wf", &["doc-checks", "--file", &file]);
+    assert!(out.status.success(), "{}", describe(&out));
+    let printed: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        printed,
+        json!({"status": "recorded", "event": "doc-checks", "count": 0})
+    );
+    assert_eq!(env.log("wf"), before);
+}
+
+#[test]
+fn a_missing_workflow_name_is_refused_with_exit_two() {
+    let env = Env::new();
+    let out = env.run(&[
+        "review",
+        "record",
+        "decision",
+        "--doc-type",
+        "prd",
+        "--round",
+        "1",
+        "--decision",
+        "stop",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
+    let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_value");
+    assert_eq!(body["error"]["field"], "<NAME>");
+}
+
 #[test]
 fn the_help_lists_the_four_events_as_telemetry() {
     let env = Env::new();
