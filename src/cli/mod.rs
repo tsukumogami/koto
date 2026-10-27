@@ -6982,7 +6982,7 @@ fn handle_next(
             {
                 eprintln!(
                     "warning: transition recorded, but writing its context_assignments failed: {}; \
-                     the next read restores them from the log",
+                     reads answer them from the log and the next tick stores them",
                     e
                 );
             }
