@@ -2586,12 +2586,9 @@ pub fn run(app: App) -> Result<()> {
                         .then(|| backend.read_events(&session).ok())
                         .flatten()
                         .map(|(_, events)| events);
-                    if let Err(e) = context::handle_list(
-                        store,
-                        events.as_deref(),
-                        &session,
-                        prefix.as_deref(),
-                    ) {
+                    if let Err(e) =
+                        context::handle_list(store, events.as_deref(), &session, prefix.as_deref())
+                    {
                         context::exit_with_failed_read("context list", &e);
                     }
                     Ok(())

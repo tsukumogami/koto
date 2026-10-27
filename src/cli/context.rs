@@ -328,12 +328,12 @@ pub fn handle_exists(
     let assigned = assigned_value(events, key);
     let present = assigned.is_some() || store.ctx_exists(session, key);
     let record = match &assigned {
-        Some(value) => ContextReadRecord::content(key, Some(value.as_bytes())).map(|r| {
-            ContextReadRecord {
+        Some(value) => {
+            ContextReadRecord::content(key, Some(value.as_bytes())).map(|r| ContextReadRecord {
                 presence_only: true,
                 ..r
-            }
-        }),
+            })
+        }
         None => ContextReadRecord::presence(store, session, key, present),
     };
     log_cli_read(store, backend, session, events, reader_anchor, record);

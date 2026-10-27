@@ -54,8 +54,11 @@ fn koto_cmd(dir: &Path) -> Command {
         cmd.env_remove(var);
     }
     // By default a command runs as the agent session that owns the sessions
-    // `init` starts, so a `koto context get` is an own read, logged in the
-    // session read. A test that wants another reader names it per command.
+    // `init` starts. Its `koto context get` outside the session's own tick
+    // writes nothing into the session read: it goes to the read spool. A test
+    // that wants the read in the session's log runs it as a command the
+    // session's own tick runs ([`run_in_tick`]); one that wants another
+    // reader names it per command.
     cmd.env("KOTO_ANCHOR", OWN_ANCHOR);
     // A gate script shells out to this build's `koto`.
     cmd.env(
@@ -75,6 +78,28 @@ fn run(dir: &Path, args: &[&str]) -> std::process::Output {
 
 fn run_ok(dir: &Path, args: &[&str]) -> std::process::Output {
     let out = run(dir, args);
+    assert!(
+        out.status.success(),
+        "koto {args:?} failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// Run `args` as a command `session`'s own tick runs (a gate script or a
+/// default action): with the tick's marker, `KOTO_TICK_SESSION`, naming
+/// `session`, so a read of `session` logs in its log.
+fn run_in_tick(dir: &Path, session: &str, args: &[&str]) -> std::process::Output {
+    koto_cmd(dir)
+        .env("KOTO_TICK_SESSION", session)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn run_in_tick_ok(dir: &Path, session: &str, args: &[&str]) -> std::process::Output {
+    let out = run_in_tick(dir, session, args);
     assert!(
         out.status.success(),
         "koto {args:?} failed: stdout={} stderr={}",
@@ -385,21 +410,24 @@ fn cli_reads_log_reader_access_state_and_hash_but_never_content() {
     assert_eq!(next(dir, "s", None)["state"], "work");
     let before = reads(dir, "s").len();
 
-    let out = run_ok(dir, &["context", "get", "s", "note"]);
+    // Read as a command in s's own tick, so the reads log in s.
+    let out = run_in_tick_ok(dir, "s", &["context", "get", "s", "note"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), NOTE);
-    let out = run(dir, &["context", "exists", "s", "note"]);
+    let out = run_in_tick(dir, "s", &["context", "exists", "s", "note"]);
     assert_eq!(out.status.code(), Some(0));
     // An absent key: get fails as before, exists says no, both are logged.
-    let out = run(dir, &["context", "get", "s", "missing"]);
+    let out = run_in_tick(dir, "s", &["context", "get", "s", "missing"]);
     assert!(!out.status.success());
-    let out = run(dir, &["context", "exists", "s", "missing"]);
+    let out = run_in_tick(dir, "s", &["context", "exists", "s", "missing"]);
     assert_eq!(out.status.code(), Some(1));
     // Keys failing the key grammar log nothing.
-    assert!(!run(dir, &["context", "get", "s", "has space"])
-        .status
-        .success());
+    assert!(
+        !run_in_tick(dir, "s", &["context", "get", "s", "has space"])
+            .status
+            .success()
+    );
     assert_eq!(
-        run(dir, &["context", "exists", "s", "../escape"])
+        run_in_tick(dir, "s", &["context", "exists", "s", "../escape"])
             .status
             .code(),
         Some(2)
@@ -590,7 +618,8 @@ fn writers_are_recorded_in_the_log_and_the_manifest() {
     let removed = evs.iter().find(|e| e["type"] == "context_removed").unwrap();
     assert_eq!(removed["payload"]["writer"], "agent");
 
-    // A reconcile repair restores the transition's value as `transition`.
+    // A lost assigned value is answered from the log and not stored; the
+    // next tick's reconcile restores it as `transition`.
     let ctx = sessions_base(dir).join("w").join("ctx");
     std::fs::remove_file(ctx.join("spare")).unwrap();
     let manifest_path = ctx.join("manifest.json");
@@ -600,11 +629,14 @@ fn writers_are_recorded_in_the_log_and_the_manifest() {
     std::fs::write(&manifest_path, manifest.to_string()).unwrap();
     let out = run_ok(dir, &["context", "get", "w", "spare"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "also-from-transition");
+    assert!(!ctx.join("spare").exists());
+    assert_eq!(next(dir, "w", None)["state"], "middle");
     assert_eq!(
         manifest_writer(dir, "w", "spare").as_deref(),
         Some("transition")
     );
-    // The repaired read joins to the assignment.
+    // A read of the repaired key joins to the assignment.
+    run_in_tick_ok(dir, "w", &["context", "get", "w", "spare"]);
     let evs = events(dir, "w");
     let read = evs
         .iter()
@@ -647,10 +679,11 @@ fn a_read_after_an_add_over_a_transition_value_joins_to_the_add() {
     init(dir, "w", WRITERS_TEMPLATE);
     assert_eq!(next(dir, "w", Some(r#"{"step": "go"}"#))["state"], "middle");
 
-    // Read the transition's value, overwrite it, read again.
-    run_ok(dir, &["context", "get", "w", "slot"]);
+    // Read the transition's value, overwrite it, read again, each read as a
+    // command in w's own tick so it logs in w.
+    run_in_tick_ok(dir, "w", &["context", "get", "w", "slot"]);
     add(dir, "w", "slot", "from the agent");
-    run_ok(dir, &["context", "get", "w", "slot"]);
+    run_in_tick_ok(dir, "w", &["context", "get", "w", "slot"]);
 
     let evs = events(dir, "w");
     let slot_reads: Vec<&Value> = evs
@@ -708,10 +741,10 @@ fn a_key_from_an_older_koto_reads_as_writer_unknown() {
     log.push('\n');
     std::fs::write(log_path(dir, "w"), log).unwrap();
 
-    let out = run_ok(dir, &["context", "get", "w", "legacy"]);
+    let out = run_in_tick_ok(dir, "w", &["context", "get", "w", "legacy"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), content);
     assert_eq!(
-        run(dir, &["context", "exists", "w", "legacy"])
+        run_in_tick(dir, "w", &["context", "exists", "w", "legacy"])
             .status
             .code(),
         Some(0)
@@ -841,7 +874,8 @@ fn an_unwritable_log_warns_and_reads_answer_as_before() {
         return;
     }
 
-    let out = run(dir, &["context", "get", "s", "note"]);
+    // Read as a command in s's own tick, whose reads go to s's log.
+    let out = run_in_tick(dir, "s", &["context", "get", "s", "note"]);
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout), NOTE);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -849,7 +883,7 @@ fn an_unwritable_log_warns_and_reads_answer_as_before() {
         stderr.contains("warning: failed to record context_read"),
         "{stderr}"
     );
-    let out = run(dir, &["context", "exists", "s", "note"]);
+    let out = run_in_tick(dir, "s", &["context", "exists", "s", "note"]);
     assert_eq!(out.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&out.stderr).contains("warning: failed to record"));
 
@@ -1024,24 +1058,36 @@ fn listing_and_judging_commands_from_another_agent_session_write_nothing() {
     }
 }
 
+/// A read by the session's own agent session (its `KOTO_ANCHOR` holds the
+/// session) outside the session's tick writes nothing into the session or
+/// the anchor: it goes to the read spool. A gate in the session's own tick
+/// still logs its reads in the session.
 #[test]
-fn an_own_read_still_logs_in_the_session_read_including_a_gate_read() {
+fn an_own_anchors_read_outside_the_tick_is_spooled_and_a_gate_read_logs_in_the_session() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     two_agent_sessions(dir);
     let own = [("KOTO_ANCHOR", "anchor-H")];
-    let anchor_before = session_hashes(dir, "anchor-H");
+    let before = store_hashes(dir);
 
     run_env_ok(dir, &["context", "get", "s", "note"], &own);
     run_env_ok(dir, &["context", "exists", "s", "note"], &own);
+    let after = store_hashes(dir);
+    for (name, hashes) in &before {
+        assert_eq!(
+            without_spool(after[name].clone()),
+            without_spool(hashes.clone()),
+            "{name} changed"
+        );
+    }
+    assert!(read_rows(dir, "s").is_empty());
     assert_eq!(
-        read_rows(dir, "s"),
+        spooled_rows(dir, "s"),
         vec![
             ("note".into(), "content".into(), None),
             ("note".into(), "presence".into(), None),
         ]
     );
-    assert_eq!(session_hashes(dir, "anchor-H"), anchor_before);
 
     // s's own tick under its own anchor: the gates' reads go to s.
     run_env_ok(dir, &["next", "s", "--no-cleanup"], &own);
@@ -1056,11 +1102,17 @@ fn an_own_read_still_logs_in_the_session_read_including_a_gate_read() {
     assert!(reads(dir, "anchor-H").is_empty());
     assert!(reads(dir, "anchor-R").is_empty());
 
-    // An anchor reading itself is its own read too.
+    // An anchor reading itself outside its tick is spooled too.
+    let anchor_before = without_spool(session_hashes(dir, "anchor-H"));
     let out = run_env(dir, &["context", "exists", "anchor-H", "nothing"], &own);
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
-        read_rows(dir, "anchor-H"),
+        without_spool(session_hashes(dir, "anchor-H")),
+        anchor_before
+    );
+    assert!(read_rows(dir, "anchor-H").is_empty());
+    assert_eq!(
+        spooled_rows(dir, "anchor-H"),
         vec![("nothing".into(), "presence".into(), None)]
     );
 }
