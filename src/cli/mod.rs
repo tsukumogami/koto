@@ -2508,9 +2508,12 @@ pub fn run(app: App) -> Result<()> {
                     key,
                     to_file,
                 } => {
-                    let events = context::restore_assigned(store, &backend, &session, &key);
-                    // The reader's anchor decides where the read is logged
-                    // (DESIGN-session-retention.md, Decision 5).
+                    // The log answers a value a lost store write left
+                    // behind, without storing it: a read writes nothing
+                    // into the session it reads (DESIGN-koto-trusted-removal.md,
+                    // Decision 5). The reader's anchor decides where the read
+                    // is logged (DESIGN-session-retention.md, Decision 5).
+                    let events = context::read_session_log(&backend, &session, &key);
                     let reader_anchor = context::reader_anchor();
                     if let Err(e) = context::handle_get(
                         store,
@@ -2530,7 +2533,7 @@ pub fn run(app: App) -> Result<()> {
                     // caller that branches on success-versus-failure is
                     // unaffected; exit 2 is "not a key at all", which koto
                     // already uses for input the caller must fix.
-                    let events = context::restore_assigned(store, &backend, &session, &key);
+                    let events = context::read_session_log(&backend, &session, &key);
                     let reader_anchor = context::reader_anchor();
                     match context::handle_exists(
                         store,
@@ -2578,7 +2581,17 @@ pub fn run(app: App) -> Result<()> {
                     Ok(())
                 }
                 ContextCommand::List { session, prefix } => {
-                    if let Err(e) = context::handle_list(store, &session, prefix.as_deref()) {
+                    let events = backend
+                        .exists(&session)
+                        .then(|| backend.read_events(&session).ok())
+                        .flatten()
+                        .map(|(_, events)| events);
+                    if let Err(e) = context::handle_list(
+                        store,
+                        events.as_deref(),
+                        &session,
+                        prefix.as_deref(),
+                    ) {
                         context::exit_with_failed_read("context list", &e);
                     }
                     Ok(())
@@ -6917,8 +6930,9 @@ fn handle_next(
 
     // Repair any transition `context_assignments` an earlier tick recorded
     // but did not get into the store, before a context gate reads it
-    // (koto#204). Non-fatal: the log still holds the value and the next read
-    // tries again.
+    // (koto#204). This is the one place a lost value is stored: a read
+    // answers it from the log and writes nothing. Non-fatal: the log still
+    // holds the value and the next tick tries again.
     if let Err(e) =
         crate::engine::context_assign::reconcile(context_store, &name, &current_events, None)
     {
@@ -6929,8 +6943,9 @@ fn handle_next(
     //
     // A `Transitioned` event carrying `context_assignments` is appended first
     // and then projected into the context store. The append is the commit
-    // point; a store write that fails here is repaired from the log on the
-    // next read, so it is reported rather than failing the tick.
+    // point; a store write that fails here is answered from the log by any
+    // read and stored by the next tick, so it is reported rather than
+    // failing the tick.
     let mut append_closure = |payload: &EventPayload| -> Result<(), String> {
         // The advance loop asks for a clearing by appending its event; the
         // clearing itself (re-derived from the persisted log, keys removed

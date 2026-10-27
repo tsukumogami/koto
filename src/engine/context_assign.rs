@@ -5,7 +5,9 @@
 //! leave a transition without its assignments or the reverse. The store is a
 //! projection of that record. It is written right after the append
 //! ([`write_assignments`]), and if that write fails -- or the process dies
-//! between the two -- the next read repairs it from the log ([`reconcile`]).
+//! between the two -- a read answers the value from the log
+//! ([`outstanding_assignments`]) without storing it, and the session's next
+//! tick repairs the store from the log ([`reconcile`]).
 //!
 //! For each key the latest event that touched it decides what the store should
 //! hold. An assignment is superseded by a later `koto context add` or

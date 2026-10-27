@@ -9,9 +9,9 @@
 //! removed however the command exits.
 //!
 //! A read through `--workspace` logs nothing: `context get` and `exists`
-//! record no `context_read`, anchored or not, and the write-back of an
-//! assigned value a lost store write left behind (`restore_assigned`) is
-//! skipped, since both would write to the session read or to this host.
+//! record no `context_read`, anchored or not, since that would write to the
+//! session read or to this host. It reads no log either, so it answers from
+//! the store alone.
 
 use anyhow::Result;
 
@@ -144,8 +144,8 @@ pub(super) fn run(workspace: &str, command: Command) -> Result<()> {
             to_file,
         } => {
             // No events and no reader anchor: the read is logged nowhere
-            // and nothing is restored into the session (see the module
-            // header), unlike the same verb without `--workspace`.
+            // (see the module header), unlike the same verb without
+            // `--workspace`.
             if let Err(e) = context::handle_get(
                 &backend,
                 &backend,
@@ -179,7 +179,7 @@ pub(super) fn run(workspace: &str, command: Command) -> Result<()> {
             std::process::exit(code);
         }
         ContextCommand::List { session, prefix } => {
-            if let Err(e) = context::handle_list(&backend, &session, prefix.as_deref()) {
+            if let Err(e) = context::handle_list(&backend, None, &session, prefix.as_deref()) {
                 context::exit_with_failed_read(verb, &e);
             }
         }

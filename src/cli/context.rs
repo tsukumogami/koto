@@ -67,24 +67,19 @@ pub fn handle_add(
     Ok(())
 }
 
-/// Restore `key` from the session log when a transition assigned it and the
-/// store write did not land (koto#204), so a read after a failed write still
-/// returns the assigned value.
+/// The log of `session`, read for a `koto context get` or `exists` of `key`
+/// to answer from and to name the session's current state in.
 ///
-/// Best-effort and silent: a session that does not exist, a log that cannot be
-/// read, or a key that is not a usable key leaves the store as it is, and the
-/// read that follows reports whatever it finds.
+/// Read-only: a value a transition assigned to `key` whose store write did
+/// not land (koto#204) is answered from this log by [`handle_get`] and
+/// [`handle_exists`], never stored. The session's own next `koto next`
+/// stores it, since that tick reconciles the store with the log before it
+/// evaluates anything, so a read never writes into the session it reads.
 ///
-/// Returns the log it read, so the read that follows can name the session's
-/// current state without reading it again; `None` exactly when nothing was
-/// read, which is also when the read logs nothing. The check here is
-/// bookkeeping and logs no read of its own.
-///
-/// This is the one place a read still writes into the session it reads:
-/// after a lost store write, `reconcile` stores the assigned value in the
-/// read session, whichever process read it (koto#436 tracks removing it).
-pub fn restore_assigned(
-    store: &dyn ContextStore,
+/// Best-effort and silent: a session that does not exist, a log that cannot
+/// be read, or a key that is not a usable key gives `None`, and the read that
+/// follows answers from the store alone and logs nothing.
+pub fn read_session_log(
     backend: &dyn SessionBackend,
     session: &str,
     key: &str,
@@ -92,28 +87,31 @@ pub fn restore_assigned(
     if crate::session::validate::validate_context_key(key).is_err() || !backend.exists(session) {
         return None;
     }
-    let (_, events) = backend.read_events(session).ok()?;
-    if let Err(e) = crate::engine::context_assign::reconcile(store, session, &events, Some(key)) {
-        eprintln!(
-            "warning: failed to restore assigned context value {:?}: {}",
-            key, e
-        );
-    }
-    Some(events)
+    backend.read_events(session).ok().map(|(_, events)| events)
+}
+
+/// The value a transition assigned to `key` that the store should hold, from
+/// the session's log: `Some` exactly when the latest event touching `key`
+/// in `events` is a transition's assignment. A read answers it in place of
+/// what the store holds, which differs only after a lost store write.
+fn assigned_value(events: Option<&[Event]>, key: &str) -> Option<String> {
+    crate::engine::context_assign::outstanding_assignments(events?).remove(key)
 }
 
 /// Where a `koto context get`/`exists` read of a session is logged
 /// (DESIGN-session-retention.md, Decision 5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadLogTarget {
-    /// The session read: the reader's anchor is the session read or holds
-    /// it, so the read is the session's own.
+    /// The session read: the read runs inside the session's own tick (a
+    /// gate script or default action reading its own session).
     Session,
     /// The reader's anchor, naming the session read in the event's
     /// `session` field, so the session read stays byte-identical.
     Anchor(String),
-    /// No reader's anchor: `KOTO_ANCHOR` is unset or names no anchor here.
-    /// Recorded by [`record_anchorless_read`].
+    /// Outside the session's own tick with no other agent session reading:
+    /// `KOTO_ANCHOR` is unset, names no anchor here, or names an anchor
+    /// that is the session read or holds it. Recorded by
+    /// [`record_anchorless_read`].
     Anchorless,
 }
 
@@ -129,10 +127,12 @@ pub fn reader_anchor() -> Option<String> {
 /// | Reader anchor | Logged in |
 /// |---|---|
 /// | any, from a command `session`'s own tick runs (a gate script's read) | the session read |
-/// | names an existing anchor that is `session`, or that holds `session` (`session` carries `koto/links/held-by/<anchor>`) | the session read |
+/// | names an existing anchor that is `session`, or that holds `session` (`session` carries `koto/links/held-by/<anchor>`) | [`ReadLogTarget::Anchorless`] |
 /// | names an existing anchor otherwise | the reader's anchor |
 /// | unset, or names no existing anchor | [`ReadLogTarget::Anchorless`] |
 ///
+/// Only the session's own tick appends to the session it reads, so a read
+/// outside that tick leaves the session byte-identical whoever runs it.
 /// Nothing here writes to a session's log or context, and the read
 /// session's header and manifest are read in place. Under the cloud backend
 /// the held-by check may refresh the host-local sync cache beside the read
@@ -154,11 +154,8 @@ pub fn read_log_target(
     if !crate::session::anchor::is_anchor(backend, anchor) {
         return ReadLogTarget::Anchorless;
     }
-    if anchor == session {
-        return ReadLogTarget::Session;
-    }
-    if store.ctx_exists(session, &link_key(LinkKind::HeldBy, anchor)) {
-        return ReadLogTarget::Session;
+    if anchor == session || store.ctx_exists(session, &link_key(LinkKind::HeldBy, anchor)) {
+        return ReadLogTarget::Anchorless;
     }
     ReadLogTarget::Anchor(anchor.to_string())
 }
@@ -183,9 +180,9 @@ fn log_cli_read(
     let state = derive_state_from_log(events).unwrap_or_default();
     match read_log_target(store, backend, session, reader_anchor) {
         ReadLogTarget::Session => {
-            // An own read: into the session's log on every backend, which
-            // `append_own_read` tells the cloud backend so it doesn't spool
-            // a read made outside the session's tick.
+            // A read in the session's own tick: into the session's log on
+            // every backend, which `append_own_read` tells the cloud backend
+            // so it logs the read rather than spooling it.
             context_log::append_best_effort(&read.into_event(READER_CLI, &state, None), |p| {
                 backend.append_own_read(session, p, &crate::engine::types::now_iso8601())
             });
@@ -203,8 +200,9 @@ fn log_cli_read(
     }
 }
 
-/// Record a read of `session` made with no reader's anchor: the one place
-/// the anchorless row is written, on either backend.
+/// Record a read of `session` made outside its own tick by no other agent
+/// session (no reader's anchor, or one that is or holds `session`): the one
+/// place the anchorless row is written, on either backend.
 ///
 /// It goes into the reading host's read spool beside the session's local
 /// copy ([`crate::session::read_spool`]), never into the session's log, so
@@ -220,9 +218,14 @@ fn record_anchorless_read(backend: &dyn SessionBackend, session: &str, payload: 
     });
 }
 
-/// Retrieve stored content and write it to stdout.
+/// Retrieve a key's content and write it to stdout.
 ///
 /// When `to_file` is provided, writes to that path instead of stdout.
+///
+/// The content is the value a transition assigned to the key when `events`
+/// (the session's log) says the store should hold one, and the store's
+/// otherwise: after a lost store write the two differ, and the log is the
+/// record. Nothing is stored either way.
 ///
 /// The read is logged as a `context_read` (`reader: "cli"`, `access:
 /// "content"`) when `events` holds the session's log, including a read of an
@@ -238,7 +241,10 @@ pub fn handle_get(
     key: &str,
     to_file: Option<&str>,
 ) -> Result<()> {
-    let result = store.get(session, key);
+    let result = match assigned_value(events, key) {
+        Some(value) => Ok(value.into_bytes()),
+        None => store.get(session, key),
+    };
     log_cli_read(
         store,
         backend,
@@ -301,9 +307,13 @@ pub enum KeyPresence {
 ///
 /// The caller is responsible for mapping the outcome to exit codes.
 ///
+/// A key is present when the store has it or `events` (the session's log)
+/// says a transition assigned it, the answer [`handle_get`] gives too; a
+/// value a lost store write left behind is not stored.
+///
 /// A usable key's answer is logged as a `context_read` (`reader: "cli"`,
-/// `access: "presence"`) when `events` holds the session's log, in the
-/// session's log or the reader's anchor as [`read_log_target`] decides.
+/// `access: "presence"`) when `events` holds the session's log, where
+/// [`read_log_target`] decides.
 pub fn handle_exists(
     store: &dyn ContextStore,
     backend: &dyn SessionBackend,
@@ -315,15 +325,18 @@ pub fn handle_exists(
     if let Some(reason) = crate::session::validate::unusable_context_key_reason(key) {
         return KeyPresence::Unusable(reason);
     }
-    let present = store.ctx_exists(session, key);
-    log_cli_read(
-        store,
-        backend,
-        session,
-        events,
-        reader_anchor,
-        ContextReadRecord::presence(store, session, key, present),
-    );
+    let assigned = assigned_value(events, key);
+    let present = assigned.is_some() || store.ctx_exists(session, key);
+    let record = match &assigned {
+        Some(value) => ContextReadRecord::content(key, Some(value.as_bytes())).map(|r| {
+            ContextReadRecord {
+                presence_only: true,
+                ..r
+            }
+        }),
+        None => ContextReadRecord::presence(store, session, key, present),
+    };
+    log_cli_read(store, backend, session, events, reader_anchor, record);
     if present {
         KeyPresence::Present
     } else {
@@ -365,11 +378,42 @@ pub fn handle_remove(
     Ok(())
 }
 
-/// List all keys as a JSON array, optionally filtered by prefix.
-pub fn handle_list(store: &dyn ContextStore, session: &str, prefix: Option<&str>) -> Result<()> {
-    let keys = store.list_keys(session, prefix)?;
+/// List all keys as a JSON array, optionally filtered by prefix, as
+/// [`list_keys`] finds them.
+pub fn handle_list(
+    store: &dyn ContextStore,
+    events: Option<&[Event]>,
+    session: &str,
+    prefix: Option<&str>,
+) -> Result<()> {
+    let keys = list_keys(store, events, session, prefix)?;
     println!("{}", serde_json::to_string(&keys)?);
     Ok(())
+}
+
+/// The keys `koto context list` prints, sorted: the store's and, when
+/// `events` holds the session's log, the keys a transition assigned that the
+/// store should hold, so a key a lost store write left out is listed as
+/// [`handle_get`] answers it. Nothing is stored, and the listing logs no
+/// read.
+fn list_keys(
+    store: &dyn ContextStore,
+    events: Option<&[Event]>,
+    session: &str,
+    prefix: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut keys = store.list_keys(session, prefix)?;
+    if let Some(events) = events {
+        let assigned = crate::engine::context_assign::outstanding_assignments(events);
+        keys.extend(
+            assigned
+                .into_keys()
+                .filter(|k| prefix.is_none_or(|p| k.starts_with(p))),
+        );
+        keys.sort();
+        keys.dedup();
+    }
+    Ok(keys)
 }
 
 /// The error envelope `command` (`context get` or `context list`) prints
@@ -440,7 +484,7 @@ mod tests {
             .unwrap();
         let out = dir.path().join("out.txt");
 
-        let events = restore_assigned(&backend, &backend, "s", "k");
+        let events = read_session_log(&backend, "s", "k");
         handle_get(
             &backend,
             &backend,
@@ -506,7 +550,7 @@ mod tests {
         // warns about nothing.
         handle_add(&backend, &backend, "s", "k", Some(input.to_str().unwrap())).unwrap();
         assert_eq!(take_warnings(), Vec::<String>::new());
-        let events = restore_assigned(&backend, &backend, "s", "k");
+        let events = read_session_log(&backend, "s", "k");
         handle_get(
             &backend,
             &backend,
@@ -591,7 +635,7 @@ mod tests {
     fn a_session_with_no_log_logs_no_read() {
         let dir = tempfile::TempDir::new().unwrap();
         let backend = LocalBackend::with_base_dir(dir.path().to_path_buf());
-        assert!(restore_assigned(&backend, &backend, "nope", "k").is_none());
+        assert!(read_session_log(&backend, "nope", "k").is_none());
         assert!(handle_get(&backend, &backend, None, None, "nope", "k", None).is_err());
     }
 
@@ -657,7 +701,7 @@ mod tests {
     /// reader's anchor; both must answer as a plain read would.
     fn read_both(backend: &LocalBackend, dir: &std::path::Path, anchor: Option<&str>) {
         let out = dir.join("out.txt");
-        let events = restore_assigned(backend, backend, "s", "k");
+        let events = read_session_log(backend, "s", "k");
         handle_get(
             backend,
             backend,
@@ -706,10 +750,11 @@ mod tests {
     }
 
     /// An anchor the session read holds a held-by link to, or that is the
-    /// session itself, is the session's own agent session: the read logs in
-    /// the session, with no `session` field, and the anchor gets nothing.
+    /// session itself, is the session's own agent session, but its read runs
+    /// outside the session's tick: it takes the anchorless row, so the
+    /// session and the anchor stay byte-identical and the read is spooled.
     #[test]
-    fn an_own_read_still_logs_in_the_session_read() {
+    fn an_own_anchors_read_outside_the_tick_takes_the_anchorless_row() {
         let dir = tempfile::TempDir::new().unwrap();
         let backend = session(dir.path());
         backend
@@ -725,26 +770,105 @@ mod tests {
         )
         .unwrap();
         let anchor_before = files(&dir.path().join("anchor-own"));
+        let session_before = files(&dir.path().join("s"));
 
         assert_eq!(
             read_log_target(&backend, &backend, "s", Some("anchor-own")),
-            ReadLogTarget::Session
+            ReadLogTarget::Anchorless
         );
         read_both(&backend, dir.path(), Some("anchor-own"));
         assert_eq!(files(&dir.path().join("anchor-own")), anchor_before);
-        assert_eq!(
-            reads_in(&backend, "s"),
-            vec![
-                ("k".into(), Some("content".into()), "work".into(), None),
-                ("k".into(), Some("presence".into()), "work".into(), None),
-            ]
-        );
+        assert_eq!(unspooled_files(dir.path()), session_before);
+        assert!(reads_in(&backend, "s").is_empty());
+        assert_eq!(spooled(&backend, "s").len(), 2);
 
-        // An anchor reading itself is its own read too.
+        // An anchor reading itself outside its tick is anchorless too.
         assert_eq!(
             read_log_target(&backend, &backend, "anchor-own", Some("anchor-own")),
-            ReadLogTarget::Session
+            ReadLogTarget::Anchorless
         );
+    }
+
+    /// Every file of session `s` under `dir` but its read spool.
+    fn unspooled_files(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let spool = crate::session::read_spool::SPOOL_FILE;
+        files(&dir.join("s"))
+            .into_iter()
+            .filter(|(p, _)| !p.ends_with(spool))
+            .collect()
+    }
+
+    /// `s` in state `work`, entered by a transition that assigned `k` the
+    /// value `assigned` whose store write did not land: the store holds
+    /// `stale` under `k`, or nothing when `stale` is `None`.
+    fn session_with_a_lost_write(dir: &std::path::Path, stale: Option<&[u8]>) -> LocalBackend {
+        let backend = LocalBackend::with_base_dir(dir.to_path_buf());
+        std::fs::create_dir_all(dir.join("s")).unwrap();
+        std::fs::write(
+            dir.join("s").join(state_file_name("s")),
+            concat!(
+                r#"{"schema_version":1,"workflow":"s","template_hash":"h","created_at":"2026-01-01T00:00:00Z"}"#,
+                "\n",
+                r#"{"seq":1,"timestamp":"2026-01-01T00:00:00Z","type":"transitioned","payload":{"from":null,"to":"start","condition_type":"auto"}}"#,
+                "\n",
+                r#"{"seq":2,"timestamp":"2026-01-01T00:00:01Z","type":"transitioned","payload":{"from":"start","to":"work","condition_type":"auto","context_assignments":{"k":"assigned"}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        if let Some(stale) = stale {
+            backend
+                .add_with_writer("s", "k", stale, WRITER_AGENT)
+                .unwrap();
+        }
+        backend
+    }
+
+    /// After a lost store write (koto#204), `get`, `exists` and `list`
+    /// answer the value the transition assigned, served from the log, and
+    /// store nothing: the session's files are byte-identical but for the
+    /// spooled reads, and the store still holds what it held.
+    #[test]
+    fn a_lost_assigned_value_is_answered_from_the_log_and_never_stored() {
+        for stale in [None, Some(&b"stale"[..])] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let backend = session_with_a_lost_write(dir.path(), stale);
+            let before = unspooled_files(dir.path());
+
+            let events = read_session_log(&backend, "s", "k");
+            let out = dir.path().join("out.txt");
+            handle_get(
+                &backend,
+                &backend,
+                events.as_deref(),
+                None,
+                "s",
+                "k",
+                Some(out.to_str().unwrap()),
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), b"assigned", "{stale:?}");
+            assert!(matches!(
+                handle_exists(&backend, &backend, events.as_deref(), None, "s", "k"),
+                KeyPresence::Present
+            ));
+            assert_eq!(
+                list_keys(&backend, events.as_deref(), "s", None).unwrap(),
+                vec!["k".to_string()]
+            );
+            assert!(list_keys(&backend, events.as_deref(), "s", Some("x"))
+                .unwrap()
+                .is_empty());
+
+            assert_eq!(unspooled_files(dir.path()), before, "{stale:?}");
+            assert_eq!(backend.get("s", "k").ok().as_deref(), stale);
+            // Both reads are logged with the hash of the value answered.
+            let hashes: Vec<_> = spooled(&backend, "s")
+                .into_iter()
+                .map(|r| r["hash"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(hashes, vec![sha256_hex(b"assigned"); 2]);
+        }
     }
 
     /// With no reader anchor, or a name that is no anchor here (absent, or
