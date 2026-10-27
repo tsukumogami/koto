@@ -1336,6 +1336,8 @@ pub fn attach_rules(
                 rule_id,
                 level,
                 unit_count,
+                via: None,
+                delivery: None,
             });
         }
         if !rules.is_empty() {

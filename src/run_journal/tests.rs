@@ -2332,6 +2332,8 @@ fn decider_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.rule.id",
             "koto.rule.extent",
             "koto.rule.unit_count",
+            "koto.rule.via",
+            "koto.rule.delivery",
         ],
         "check_overridden" => &["koto.state", "koto.check"],
         other => panic!("not a decider or override kind: {other}"),
@@ -2802,6 +2804,8 @@ fn a_rule_delivery_relays_rule_delivered_with_names_and_counts_only() {
         rule_id: "ac_binary".into(),
         level: RuleLevel::Summary,
         unit_count: Some(20),
+        via: None,
+        delivery: None,
     };
     commit_as(&f, None, "wf", &EventPayload::RuleDelivered(unit_mode));
     let single = RuleDelivered {
@@ -2810,16 +2814,43 @@ fn a_rule_delivery_relays_rule_delivered_with_names_and_counts_only() {
         rule_id: "no reason [x]".into(),
         level: RuleLevel::Full,
         unit_count: None,
+        via: None,
+        delivery: None,
     };
     commit_as(&f, None, "wf", &EventPayload::RuleDelivered(single));
+    let reported = RuleDelivered::from_check_output(
+        "a",
+        "pr_body",
+        &crate::findings::PrintedRuleDelivery {
+            rule_id: "pr-body/one-separator".into(),
+            extent: RuleLevel::Full,
+            delivery: crate::findings::RuleDeliveryOutcome::Refused,
+        },
+    );
+    commit_as(&f, None, "wf", &EventPayload::RuleDelivered(reported));
     assert_eq!(
         batches_for_test(),
-        (2, 0),
+        (3, 0),
         "relayed, so never flushed alone"
     );
 
     let d = decider_records(&f.journal());
-    assert_eq!(kinds(&d), vec!["rule_delivered", "rule_delivered"]);
+    assert_eq!(
+        kinds(&d),
+        vec!["rule_delivered", "rule_delivered", "rule_delivered"]
+    );
+    // A decider check's delivery carries no via or delivery.
+    for r in &d[..2] {
+        assert!(r.get("koto.rule.via").is_none(), "{r}");
+        assert!(r.get("koto.rule.delivery").is_none(), "{r}");
+    }
+    let r = &d[2];
+    assert_eq!(r["koto.check.name"], "pr_body");
+    assert_eq!(r["koto.rule.id"], "pr-body/one-separator");
+    assert_eq!(r["koto.rule.extent"], "full");
+    assert_eq!(r["koto.rule.via"], "check_output");
+    assert_eq!(r["koto.rule.delivery"], "refused");
+    assert!(r.get("koto.rule.unit_count").is_none(), "{r}");
     let r = &d[0];
     assert_eq!(r["koto.seq"], 3);
     assert_eq!(r["koto.visit.seq"], 2);
@@ -2877,6 +2908,8 @@ fn unit_and_rule_records_with_the_longest_names_fit_a_line() {
         rule_id: "r".repeat(128),
         level: RuleLevel::Summary,
         unit_count: Some(32),
+        via: Some(crate::decider::check::RuleVia::CheckOutput),
+        delivery: Some(crate::findings::RuleDeliveryOutcome::Refused),
     };
     for payload in [
         EventPayload::DeciderChecked(checked),
@@ -5500,6 +5533,7 @@ fn logged_finding(rule: &str, level: crate::findings::FindingLevel) -> crate::fi
         rule_ref: None,
         effect_landed: None,
         message_source: crate::findings::MessageSource::Check,
+        unit: None,
     }
 }
 

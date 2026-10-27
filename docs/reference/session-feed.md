@@ -405,6 +405,9 @@ events:
       fallback_logged:
         type: boolean
         required: false
+      rules_delivered:
+        type: array
+        required: false
 
   child_completed:
     tier: 2
@@ -725,6 +728,14 @@ events:
       unit_count:
         type: integer
         required: false
+      via:
+        type: string
+        required: false
+        enum: ["check_output"]
+      delivery:
+        type: string
+        required: false
+        enum: ["printed", "refused"]
 
   finding_disputed:
     tier: 2
@@ -1709,6 +1720,7 @@ same gate in the same state (e.g., during a polling sequence).
 | `reason` | string | No | Why a judged check didn't pass: `rule_failed` (it printed an `error` finding of its own), `undecided` (exit 2 with none), `no_finding` (any other failure with none), `timed_out`, `spawn_failed` or `error`. Absent when it passed or is pending. Telemetry only; nothing routes on it. |
 | `not_ready` | boolean | No | `true` when the check said its input wasn't ready to judge: it printed a line starting with `::koto-not-ready::`, or exited with a code its gate lists in `not_ready_exit_codes`. Telemetry only: the outcome, routing and fallback finding are unchanged. Absent means `false`. |
 | `fallback_logged` | boolean | No | `true` when `findings` holds koto's fallback finding, which is then the one `error` finding whose `rule_id` is the check's name. Absent means `false`. |
+| `rules_delivered` | array | No | On a command gate: one `{rule_id, extent, delivery}` object per line the check printed starting with `::koto-rule-delivered::` and holding exactly those keys, `extent` `summary` or `full` and `delivery` `printed` or `refused`, at most 50. `koto next` appends a `rule_delivered` event per entry once its response prints. Telemetry only. Absent when the check printed none. |
 
 The fields from `attempt` down are described in
 [Check Findings and Attempts](#check-findings-and-attempts). They're absent on
@@ -2299,6 +2311,13 @@ a shadow criterion, deliver nothing.
 | `rule_id` | string | Yes | The failed criterion's id. |
 | `level` | string | Yes | `summary` on the first failing evaluation of this check and rule in the visit, `full` on every later one; a criterion declaring only one text always gets that text's level. |
 | `unit_count` | integer | No | How many units the rule was handed back for. Present only for a check in unit mode. |
+| `via` | string | No | `check_output` when a command gate's check reported the delivery by printing a `::koto-rule-delivered::` line (see `gate_evaluated`'s `rules_delivered`). Absent on a decider check's delivery. |
+| `delivery` | string | No | Beside `via`: `printed` when the check printed the rule's text, `refused` when it declined to release it. |
+
+A command gate's reported delivery is appended the same way, one event per
+entry of its `gate_evaluated`'s `rules_delivered`, after the response prints
+and after any decider check's deliveries. Its `level` is the `extent` the
+check printed, and it never carries `unit_count`.
 
 The event never carries the rule's text: that lives in the compiled template
 and the printed response only.

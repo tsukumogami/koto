@@ -524,6 +524,8 @@ fn the_unit_and_rule_delivery_attributes_collide_with_no_other_attribute() {
         "koto.decider.confidence_bp",
         "koto.rule.extent",
         "koto.rule.unit_count",
+        "koto.rule.via",
+        "koto.rule.delivery",
     ];
     for new in new {
         assert!(written.contains(new), "{SOURCE_DIR} never writes {new}");

@@ -461,6 +461,8 @@ fn action_event(
 ) -> EventPayload {
     let mut check = check_fields(result, ACTION_CONDITION_NAME, stamp, events, run.state);
     check.duration_ms = Some(run.duration_ms);
+    // Rule deliveries are recorded for command gates only.
+    check.rules_delivered.clear();
     EventPayload::DefaultActionExecuted {
         state: run.state.to_string(),
         command: run.command.to_string(),
@@ -885,6 +887,7 @@ fn check_fields(
         reason: check_reason(result).map(str::to_string),
         not_ready: result.markers.not_ready,
         fallback_logged: result.outcome != GateOutcome::Passed && result.fallback().is_some(),
+        rules_delivered: result.markers.rules_delivered.clone(),
     }
 }
 

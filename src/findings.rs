@@ -26,6 +26,16 @@ pub const FINDING_PREFIX: &str = "::koto-finding::";
 /// never changes the check's outcome, its routing or its fallback finding.
 pub const NOT_READY_PREFIX: &str = "::koto-not-ready::";
 
+/// The bytes a line starts with when a check says it handed a rule's text
+/// to the agent, or refused to: one JSON object with exactly the keys
+/// `rule_id`, `extent` (`summary` or `full`) and `delivery` (`printed` or
+/// `refused`). Read only at the start of a stdout line, and only as
+/// telemetry, like [`NOT_READY_PREFIX`].
+pub const RULE_DELIVERED_PREFIX: &str = "::koto-rule-delivered::";
+
+/// Most rule deliveries a check event records; later lines are dropped.
+pub const LOG_RULE_DELIVERIES_CAP: usize = 50;
+
 /// Most findings a failed check returns in a `koto next` response, the
 /// koto-written finding included.
 pub const RESPONSE_FINDINGS_CAP: usize = 100;
@@ -217,6 +227,11 @@ impl CheckOutput {
         let findings = parse_findings(&captured.stdout, captured.stdout_truncated, redactor);
         let markers = CheckMarkers {
             not_ready: printed_not_ready(captured.stdout.as_str(), captured.stdout_truncated),
+            rules_delivered: parse_rule_deliveries(
+                captured.stdout.as_str(),
+                captured.stdout_truncated,
+                redactor,
+            ),
         };
         CheckOutput {
             findings,
@@ -238,6 +253,10 @@ pub struct CheckMarkers {
     /// its gate lists in `not_ready_exit_codes`. koto never sets it on its
     /// own.
     pub not_ready: bool,
+    /// The rules the check said it handed to the agent, or refused to, one
+    /// per valid [`RULE_DELIVERED_PREFIX`] line, in print order, at most
+    /// [`LOG_RULE_DELIVERIES_CAP`].
+    pub rules_delivered: Vec<PrintedRuleDelivery>,
 }
 
 /// Whether a stdout line starts with [`NOT_READY_PREFIX`]. The marker counts
@@ -248,6 +267,97 @@ pub fn printed_not_ready(stdout: &str, stdout_truncated: bool) -> bool {
     stdout_lines(stdout, stdout_truncated)
         .into_iter()
         .any(|(line, parseable)| parseable && line.starts_with(NOT_READY_PREFIX))
+}
+
+/// Whether a check printed a rule's text or refused to release it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleDeliveryOutcome {
+    Printed,
+    Refused,
+}
+
+impl RuleDeliveryOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleDeliveryOutcome::Printed => "printed",
+            RuleDeliveryOutcome::Refused => "refused",
+        }
+    }
+}
+
+/// One [`RULE_DELIVERED_PREFIX`] line a command check printed: the rule's
+/// id, how much of it was handed back, and whether it was printed or
+/// refused. Never the rule's text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrintedRuleDelivery {
+    pub rule_id: String,
+    pub extent: crate::template::decider_check::RuleLevel,
+    pub delivery: RuleDeliveryOutcome,
+}
+
+/// Every valid [`RULE_DELIVERED_PREFIX`] line in `stdout`, in print order,
+/// capped at [`LOG_RULE_DELIVERIES_CAP`]. A line counts only when the prefix
+/// is its first bytes and the rest is one JSON object with exactly the keys
+/// `rule_id` (a non-empty string), `extent` and `delivery`, each a value its
+/// closed set names, followed by nothing but trailing spaces or tabs and at
+/// most one carriage return. Any other line is ordinary output. As with a
+/// finding line, the unterminated last fragment of a stdout cut at the
+/// capture bound is never read, and the rule id is redacted and capped.
+pub fn parse_rule_deliveries(
+    stdout: &str,
+    stdout_truncated: bool,
+    redactor: &Redactor,
+) -> Vec<PrintedRuleDelivery> {
+    stdout_lines(stdout, stdout_truncated)
+        .into_iter()
+        .filter(|(_, parseable)| *parseable)
+        .filter_map(|(line, _)| decode_rule_delivery(line))
+        .map(|d| PrintedRuleDelivery {
+            rule_id: redact_field(&d.rule_id, RULE_ID_MAX_BYTES, redactor),
+            ..d
+        })
+        .take(LOG_RULE_DELIVERIES_CAP)
+        .collect()
+}
+
+/// Read one line as a rule delivery, or `None` when it is ordinary output.
+fn decode_rule_delivery(line: &str) -> Option<PrintedRuleDelivery> {
+    use crate::template::decider_check::RuleLevel;
+    let rest = line.strip_prefix(RULE_DELIVERED_PREFIX)?;
+    if !rest.starts_with('{') {
+        return None;
+    }
+    let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<serde_json::Value>();
+    let value = stream.next()?.ok()?;
+    let tail = &rest[stream.byte_offset()..];
+    let tail = tail.strip_suffix('\r').unwrap_or(tail);
+    if !tail.chars().all(|c| c == ' ' || c == '\t') {
+        return None;
+    }
+    let obj = value.as_object()?;
+    if obj.len() != 3 {
+        return None;
+    }
+    let rule_id = obj.get("rule_id")?.as_str()?;
+    if rule_id.is_empty() {
+        return None;
+    }
+    let extent = match obj.get("extent")?.as_str()? {
+        "summary" => RuleLevel::Summary,
+        "full" => RuleLevel::Full,
+        _ => return None,
+    };
+    let delivery = match obj.get("delivery")?.as_str()? {
+        "printed" => RuleDeliveryOutcome::Printed,
+        "refused" => RuleDeliveryOutcome::Refused,
+        _ => return None,
+    };
+    Some(PrintedRuleDelivery {
+        rule_id: rule_id.to_string(),
+        extent,
+        delivery,
+    })
 }
 
 /// What koto adds to a failed corrective check beyond the findings it
@@ -1120,5 +1230,62 @@ mod tests {
         assert!(o.markers.not_ready);
         assert_eq!(o.findings.len(), 1);
         assert!(!output(&format!("{finding}\n"), "").markers.not_ready);
+    }
+
+    /// The literal line shirabe's rule library prints for a refused
+    /// full-text release; its own tests carry the same line.
+    const CONTRACT_RULE_DELIVERED: &str = r#"::koto-rule-delivered::{"rule_id":"pr-body/one-separator","extent":"full","delivery":"refused"}"#;
+
+    #[test]
+    fn the_contract_rule_delivered_line_parses() {
+        let parsed = parse_rule_deliveries(
+            &format!("{CONTRACT_RULE_DELIVERED}\n"),
+            false,
+            &Redactor::empty(),
+        );
+        assert_eq!(
+            parsed,
+            vec![PrintedRuleDelivery {
+                rule_id: "pr-body/one-separator".into(),
+                extent: crate::template::decider_check::RuleLevel::Full,
+                delivery: RuleDeliveryOutcome::Refused,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_rule_delivered_line_counts_only_when_well_formed_and_at_line_start() {
+        let parse = |s: &str| parse_rule_deliveries(s, false, &Redactor::empty());
+        let ok =
+            r#"::koto-rule-delivered::{"rule_id":"a/b","extent":"summary","delivery":"printed"}"#;
+        assert_eq!(parse(&format!("x\n{ok}\r\ny\n")).len(), 1);
+        assert_eq!(parse(&format!("{ok}  \n")).len(), 1);
+        for bad in [
+            format!(" {ok}"),
+            format!("say {ok}"),
+            r#"::koto-rule-delivered::{"rule_id":"a/b","delivery":"printed"}"#.to_string(),
+            r#"::koto-rule-delivered::{"rule_id":"a/b","extent":"most","delivery":"printed"}"#
+                .to_string(),
+            r#"::koto-rule-delivered::{"rule_id":"a/b","extent":"full","delivery":"sent"}"#
+                .to_string(),
+            r#"::koto-rule-delivered::{"rule_id":"","extent":"full","delivery":"printed"}"#
+                .to_string(),
+            r#"::koto-rule-delivered::{"rule_id":"a/b","extent":"full","delivery":"printed","text":"t"}"#
+                .to_string(),
+            r#"::koto-rule-delivered::{"rule_id":"a/b","extent":"full","delivery":"printed"} x"#
+                .to_string(),
+            "::koto-rule-delivered::not json".to_string(),
+        ] {
+            assert!(parse(&format!("{bad}\n")).is_empty(), "{bad}");
+        }
+        // The unterminated fragment of a cut stdout isn't read.
+        assert!(parse_rule_deliveries(&format!("a\n{ok}"), true, &Redactor::empty()).is_empty());
+        // Parsed beside the findings, which it leaves alone.
+        let o = output(&format!("{ok}\n"), "");
+        assert_eq!(o.markers.rules_delivered.len(), 1);
+        assert!(o.findings.is_empty());
+        // Capped.
+        let many = format!("{ok}\n").repeat(LOG_RULE_DELIVERIES_CAP + 5);
+        assert_eq!(parse(&many).len(), LOG_RULE_DELIVERIES_CAP);
     }
 }

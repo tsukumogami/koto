@@ -825,6 +825,13 @@ pub struct CheckEventFields {
     /// then the one `error` finding whose rule id is the check's name.
     #[serde(default, skip_serializing_if = "is_false")]
     pub fallback_logged: bool,
+    /// The rules a command check said it handed to the agent, or refused
+    /// to, one per `::koto-rule-delivered::` line it printed, at most
+    /// [`LOG_RULE_DELIVERIES_CAP`](crate::findings::LOG_RULE_DELIVERIES_CAP).
+    /// `koto next` appends one `rule_delivered` event per entry once its
+    /// response has printed. Telemetry only; nothing routes on it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules_delivered: Vec<crate::findings::PrintedRuleDelivery>,
 }
 
 /// The values a check event's `reason` takes:
@@ -875,6 +882,15 @@ impl CheckEventFields {
             reason: field(payload, "reason"),
             not_ready: field(payload, "not_ready").unwrap_or(false),
             fallback_logged: field(payload, "fallback_logged").unwrap_or(false),
+            rules_delivered: payload
+                .get("rules_delivered")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }

@@ -65,6 +65,15 @@ to `0.9.x`).
   appended for every printed directive with an additive
   `details_included`, which details suppression reads, and
   `evidence_submitted` gains an additive `exported_fields` map.
+- **Command checks report rule deliveries.** A command gate's check that
+  prints a line starting with `::koto-rule-delivered::` and holding a JSON
+  object with exactly `rule_id`, `extent` (`summary` or `full`) and
+  `delivery` (`printed` or `refused`) has it kept on `gate_evaluated` as
+  `rules_delivered`, and `koto next` appends a `rule_delivered` event per
+  line after its response prints. The event and its run-journal record gain
+  `via` (`check_output`) and `delivery`, as `koto.rule.via` and
+  `koto.rule.delivery`; a decider check's delivery carries neither.
+  Malformed lines are ordinary output, and nothing routes on the record.
 - **`KOTO_HOME` moves the whole koto root (koto#459).** Sessions, the
   request store, `config.toml`, the terminal index, coordinator cursors,
   wake files, the decider ledger, the run journal and the root

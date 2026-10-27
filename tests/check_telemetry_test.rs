@@ -312,3 +312,71 @@ fn every_printed_directive_records_instructions_delivered_with_its_details_flag(
         assert_eq!(d["payload"]["details_included"], false);
     }
 }
+
+/// The literal line shirabe's rule library prints for a refused full-text
+/// release; its own tests carry the same line.
+const CONTRACT_RULE_DELIVERED: &str = r#"::koto-rule-delivered::{"rule_id":"pr-body/one-separator","extent":"full","delivery":"refused"}"#;
+
+#[test]
+fn a_command_check_reports_its_rule_deliveries_after_the_response_prints() {
+    let marked = Env::new();
+    let plain = Env::new();
+    for env in [&marked, &plain] {
+        env.koto(&["init", "wf", "--template", "t.md"]);
+    }
+    let out = format!(
+        "{CONTRACT_RULE_DELIVERED}\n\
+         ::koto-rule-delivered::{{\"rule_id\":\"pr-body/pr-missing\",\"extent\":\"summary\",\"delivery\":\"printed\"}}\n\
+         ::koto-rule-delivered::{{\"rule_id\":\"no-extent\",\"delivery\":\"printed\"}}\n\
+         ::koto-rule-delivered::{{\"rule_id\":\"bad-extent\",\"extent\":\"most\",\"delivery\":\"printed\"}}\n\
+         ::koto-rule-delivered::{{\"rule_id\":\"bad-delivery\",\"extent\":\"full\",\"delivery\":\"sent\"}}\n\
+         ::koto-rule-delivered::not json\n\
+         \x20::koto-rule-delivered::{{\"rule_id\":\"indented\",\"extent\":\"full\",\"delivery\":\"printed\"}}\n\
+         say ::koto-rule-delivered::{{\"rule_id\":\"mid-line\",\"extent\":\"full\",\"delivery\":\"printed\"}}\n"
+    );
+    marked.set_check(1, &out);
+    plain.set_check(1, "");
+    let a = marked.koto(&["next", "wf"]);
+    let b = plain.koto(&["next", "wf"]);
+    // The lines change nothing the agent sees but the captured output.
+    assert_eq!(a["action"], b["action"]);
+    assert_eq!(a["state"], b["state"]);
+    assert_eq!(
+        a["blocking_conditions"][0]["status"],
+        b["blocking_conditions"][0]["status"]
+    );
+
+    let records = marked.of_kind("rule_delivered");
+    assert_eq!(records.len(), 2, "{records:#?}");
+    let contract = &records[0];
+    assert_eq!(contract["koto.state"], "check");
+    assert_eq!(contract["koto.check.name"], "g");
+    assert_eq!(contract["koto.rule.id"], "pr-body/one-separator");
+    assert_eq!(contract["koto.rule.extent"], "full");
+    assert_eq!(contract["koto.rule.via"], "check_output");
+    assert_eq!(contract["koto.rule.delivery"], "refused");
+    assert_eq!(records[1]["koto.rule.id"], "pr-body/pr-missing");
+    assert_eq!(records[1]["koto.rule.extent"], "summary");
+    assert_eq!(records[1]["koto.rule.delivery"], "printed");
+    assert!(plain.of_kind("rule_delivered").is_empty());
+
+    // The deliveries are kept on the check's event and appended after it,
+    // once the response has printed.
+    let events = marked.events();
+    let kinds: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    let gate_at = kinds.iter().position(|k| *k == "gate_evaluated").unwrap();
+    let first_delivered = kinds.iter().position(|k| *k == "rule_delivered").unwrap();
+    assert!(gate_at < first_delivered, "{kinds:?}");
+    assert_eq!(
+        events[gate_at]["payload"]["rules_delivered"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // A later evaluation that prints no line records no delivery.
+    marked.set_check(1, "");
+    marked.koto(&["next", "wf"]);
+    assert_eq!(marked.of_kind("rule_delivered").len(), 2);
+}

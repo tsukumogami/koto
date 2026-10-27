@@ -938,6 +938,16 @@ gates:
 
 Either one marks the evaluation `not_ready` in its run-journal record and nothing more: the outcome, routing, overrides and the fallback finding are exactly what they'd be without it. A check that echoes text it didn't write (a PR body, a commit message) should prefix those lines so none starts with `::`.
 
+#### Reporting rule deliveries (telemetry only)
+
+A `command` gate's check that hands the agent a rule's text, or declines to, can say so with one stdout line per rule:
+
+```
+::koto-rule-delivered::{"rule_id":"pr-body/one-separator","extent":"full","delivery":"refused"}
+```
+
+The object takes exactly three keys: `rule_id` (non-empty), `extent` (`summary` or `full`) and `delivery` (`printed` or `refused`). Any other shape, or the prefix anywhere but at the start of the line, is ordinary output. koto keeps each valid line on the gate's evaluation and, once the `koto next` response has printed, records a `rule_delivered` event for it. Nothing else changes: the outcome, routing and findings are the same with or without the line.
+
 ### Routing on gate output (`gates.*` paths)
 
 Reference gate output in `when` conditions using `gates.<gate_name>.<field>`. When at least one `when` clause on a state references a `gates.*` key, the engine injects gate outputs and resolves transitions automatically -- no agent action is needed.

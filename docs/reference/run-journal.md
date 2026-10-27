@@ -93,7 +93,7 @@ their digest (see
 | `decider_checked` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.unit.key`, `koto.unit.document`, `koto.unit.section`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.mode`, `koto.decider.outcome`, `koto.decider.confidence_bp`, `koto.decider.reason`, `koto.decider.blocked`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.attempts`, `koto.decider.latency_ms`, `koto.decider.input_bytes` | koto grades one criterion of a decider check, on one unit for a unit-mode check. |
 | `decider_fallback` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.unit.key`, `koto.unit.document`, `koto.unit.section`, `koto.decider.mode`, `koto.decider.reason`, `koto.decider.input_bytes` | A decider-check criterion that got no verdict is handed to the agent. |
 | `decider_check_answered` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.unit.key`, `koto.unit.document`, `koto.unit.section`, `koto.decider.answer`, `koto.decider.reason`, `koto.decider.fallback_seq` | `koto decider answer` records the agent's answer to a criterion handed to it. |
-| `rule_delivered` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check.name`, `koto.rule.id`, `koto.rule.extent`, `koto.rule.unit_count` | A `koto next` response hands back a failed criterion's rule. |
+| `rule_delivered` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check.name`, `koto.rule.id`, `koto.rule.extent`, `koto.rule.unit_count`, `koto.rule.via`, `koto.rule.delivery` | A `koto next` response hands back a failed criterion's rule, or a command check reports a rule it printed or refused. |
 | `check_overridden` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check` | An override is recorded for a gate. |
 | `response` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.response.source`, `koto.response.directive_bytes`, `koto.response.details_bytes` | `koto next` or `koto status` has printed a non-terminal state's directive. |
 | `context_reads` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.context.key`, `koto.context.reader`, `koto.context.access`, `koto.context.overflow`, `koto.context.read_count`, `koto.context.present_count`, `koto.context.first_hash`, `koto.context.last_hash`, `koto.context.read_by` | A state visit that read context keys ends, or a reader's anchor records a read of another session. |
@@ -606,13 +606,26 @@ so the record comes after the gate's `check_evaluated` and its `check_rule`
 records. A criterion that declares neither a `summary` nor a `rule_text`,
 and a shadow criterion, deliver nothing and write no record.
 
+A command gate's check reports its own deliveries. Each stdout line that
+starts with `::koto-rule-delivered::` followed by one JSON object with
+exactly the keys `rule_id`, `extent` (`summary` or `full`) and `delivery`
+(`printed` or `refused`) is kept on the gate's `gate_evaluated` event, and
+`koto next` appends one `rule_delivered` event per line after its response
+prints, after any decider check's. A line with a missing or extra key, a
+value outside those sets, or the marker anywhere but at the start of the
+line is ordinary output and records nothing. At most 50 lines per
+evaluation are kept. These records carry `koto.rule.via` and
+`koto.rule.delivery`; a decider check's carry neither.
+
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|
 | `koto.state` | string | always | The state whose check failed. |
-| `koto.check.name` | string | always | The decider check's gate name, under the same path as on `check_finding`. The record has no `koto.check` of its own. |
-| `koto.rule.id` | string | always | The failed criterion's id, or its digest (see [Rule ids](#rule-ids)). |
-| `koto.rule.extent` | string | always | How much of the rule was handed back: `summary` on the first failing evaluation of the check and rule in the visit, `full` on every later one. A criterion that declares only one text always gets that text's extent. Later koto versions may add values. |
+| `koto.check.name` | string | always | The gate's name, under the same path as on `check_finding`. The record has no `koto.check` of its own. |
+| `koto.rule.id` | string | always | The failed criterion's id, or the rule id the check printed, or its digest (see [Rule ids](#rule-ids)). |
+| `koto.rule.extent` | string | always | How much of the rule was handed back. For a decider check, `summary` on the first failing evaluation of the check and rule in the visit, `full` on every later one; a criterion that declares only one text always gets that text's extent. For a command check, the `extent` it printed. Later koto versions may add values. |
 | `koto.rule.unit_count` | integer | unit mode | How many failing units the rule was handed back for, at least 1: every unit that failed the criterion, by the decider's verdict or the agent's answer, including any the response's finding cap left out. Left out for a check without units. |
+| `koto.rule.via` | string | command check | `check_output`: the check printed a `::koto-rule-delivered::` line. |
+| `koto.rule.delivery` | string | command check | `printed` when the check printed the rule's text, `refused` when it declined to release it. |
 
 The record never holds the rule's text, its summary, or a unit's key. One
 response that fails a rule on twenty units writes one record with

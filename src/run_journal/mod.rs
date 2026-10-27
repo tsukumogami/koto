@@ -114,10 +114,13 @@
 //!   the printed value (see `with_unit`). A check without units writes none
 //!   of them.
 //! - `rule_delivered`: one per `rule_delivered` event (a failed criterion's
-//!   rule handed back in a `koto next` response), with the state, the gate
-//!   as `koto.check.name`, the criterion's id as `koto.rule.id`,
-//!   `koto.rule.extent` (`summary` or `full`) and, for a unit-mode check,
-//!   `koto.rule.unit_count`. Never the rule's text.
+//!   rule handed back in a `koto next` response, or a rule a command check
+//!   said it printed or refused), with the state, the gate as
+//!   `koto.check.name`, the criterion's or rule's id as `koto.rule.id`,
+//!   `koto.rule.extent` (`summary` or `full`), for a unit-mode check
+//!   `koto.rule.unit_count`, and, for a command check's report,
+//!   `koto.rule.via` (`check_output`) and `koto.rule.delivery` (`printed`
+//!   or `refused`). Never the rule's text.
 //! - `check_overridden`: one per `gate_override_recorded`, with the state
 //!   and gate only.
 //! - `check_disputed`: one per `finding_disputed`, with the state, the gate
@@ -822,6 +825,11 @@ const RULE_EXTENT_FIELD: &str = "koto.rule.extent";
 /// On `rule_delivered`, for a unit-mode check: how many units the rule was
 /// handed back for.
 const RULE_UNIT_COUNT_FIELD: &str = "koto.rule.unit_count";
+/// On `rule_delivered`, for a delivery a command check reported:
+/// `check_output`. Absent on a decider check's delivery.
+const RULE_VIA_FIELD: &str = "koto.rule.via";
+/// Beside `koto.rule.via`: `printed` or `refused`, as the check reported.
+const RULE_DELIVERY_FIELD: &str = "koto.rule.delivery";
 /// On the three decider-check kinds, for a unit-mode check: the unit's key,
 /// always as its digest.
 const UNIT_KEY_FIELD: &str = "koto.unit.key";
@@ -1024,7 +1032,9 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
             .name(CHECK_NAME_FIELD, Some(r.gate.as_str()))
             .name("koto.rule.id", Some(name_or_digest(&r.rule_id).as_str()))
             .name(RULE_EXTENT_FIELD, Some(r.level.as_str()))
-            .int(RULE_UNIT_COUNT_FIELD, r.unit_count)],
+            .int(RULE_UNIT_COUNT_FIELD, r.unit_count)
+            .name(RULE_VIA_FIELD, r.via.map(|v| v.as_str()))
+            .name(RULE_DELIVERY_FIELD, r.delivery.map(|d| d.as_str()))],
         _ => Vec::new(),
     }
 }

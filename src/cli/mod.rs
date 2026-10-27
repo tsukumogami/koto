@@ -6684,6 +6684,9 @@ fn handle_next(
             exit_with_error_code(json, ne.code.exit_code());
         }
     };
+    // The log's last seq before this tick evaluates anything: the check
+    // events past it are this tick's own.
+    let pre_advance_seq = current_events.last().map(|e| e.seq).unwrap_or(0);
     let epoch_events = derive_evidence(&current_events);
     let evidence = merge_epoch_evidence(&epoch_events.into_iter().cloned().collect::<Vec<_>>());
 
@@ -7891,8 +7894,15 @@ fn handle_next(
             );
             // Each rule handed back is recorded only after the print, as
             // the delivery below is: a crash in between loses the record,
-            // never the delivery. The record holds no text.
-            for delivery in rule_deliveries {
+            // never the delivery. The record holds no text. A command
+            // check's own reports, kept on this tick's `gate_evaluated`
+            // events, follow the decider check's. This tick wrote those
+            // events locally, so the local read sees them without a pull.
+            let check_deliveries = backend
+                .read_events_local(&name)
+                .map(|(_, events)| check_output_deliveries(&events, pre_advance_seq))
+                .unwrap_or_default();
+            for delivery in rule_deliveries.into_iter().chain(check_deliveries) {
                 let payload = EventPayload::RuleDelivered(delivery);
                 if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
                     eprintln!("warning: failed to append RuleDelivered event: {}", e);
@@ -7985,6 +7995,30 @@ fn journal_response(
             details,
         );
     }
+}
+
+/// The `rule_delivered` events for the rules command gates said they
+/// printed or refused this tick: one per entry of `rules_delivered` on each
+/// `gate_evaluated` past `after_seq`, in log order. A check that printed no
+/// `::koto-rule-delivered::` line contributes nothing.
+#[cfg(unix)]
+fn check_output_deliveries(
+    events: &[Event],
+    after_seq: u64,
+) -> Vec<crate::decider::check::RuleDelivered> {
+    events
+        .iter()
+        .filter(|e| e.seq > after_seq)
+        .filter_map(|e| match &e.payload {
+            EventPayload::GateEvaluated {
+                state, gate, check, ..
+            } => Some(check.rules_delivered.iter().map(move |printed| {
+                crate::decider::check::RuleDelivered::from_check_output(state, gate, printed)
+            })),
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 /// Non-unix stub for handle_next.
