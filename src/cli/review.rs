@@ -1,11 +1,19 @@
 //! `koto review record`: record document review events as telemetry.
 //!
 //! A caller running a document review (a jury of reviewer seats over a
-//! brief, PRD, design or plan) records what happened through four events:
-//! a round starting, each seat's verdict per rule and section, the decision
-//! that follows the round, and publish-time document check results. Each
-//! appends typed session events, and the run journal relays each event as
-//! one telemetry record (see `crate::run_journal`).
+//! brief, PRD, design, plan, vision, strategy or roadmap) records what
+//! happened through four events: a round starting, each seat's verdict per
+//! rule and section, the decision that follows the round, and publish-time
+//! document check results. Each appends typed session events, and the run
+//! journal relays each event as one telemetry record (see
+//! `crate::run_journal`).
+//!
+//! Three more record what happens to the document while it is drafted:
+//! `rule-checks` (each check-held rule's outcome at one moment),
+//! `section-written` (a section written for the first time or rewritten)
+//! and `fix` (the rules and sections a fix answers). Each call appends one
+//! session event holding all its entries, and the journal relays one record
+//! per entry, so the records of one call share the event's `koto.seq`.
 //!
 //! Like `koto disputes record`, the events are recorded, never obeyed:
 //! nothing the advance loop routes on reads them, so no gate outcome, route
@@ -13,15 +21,17 @@
 //! state.
 //!
 //! Every value is checked before anything is appended, and only koto's own
-//! words for it are stored: the document type, verdict, decision and check
-//! outcome come from closed sets; the schema is bucketed into a closed set
+//! words for it are stored: the document type and format, verdict,
+//! decision, check outcome, rule outcome, moment, write and what a fix
+//! answers come from closed sets; the schema is bucketed into a closed set
 //! plus `other`; a seat or section is stored as given only when the
 //! session's template declares it (`review_vocabulary`), and as `other`
-//! otherwise; a rule id must have the journal's name shape; a round and a
-//! seat count are positive integers. One invalid entry refuses the whole
+//! otherwise; a rule id, and a fix's check rule, must have the journal's
+//! name shape; a round and a seat count are positive integers, and a fix's
+//! round is at most [`FIX_ROUND_MAX`]. One invalid entry refuses the whole
 //! batch, so a refused call appends nothing. A batch holds at most
 //! [`BATCH_MAX`] entries, and a session holds at most [`SESSION_CAP`]
-//! recorded review events; a call that would pass the cap appends nothing.
+//! recorded review entries; a call that would pass the cap appends nothing.
 //!
 //! Errors name the entry (its 0-based index in the `--file` array) and the
 //! field, and never echo a value the caller gave, so a document's text that
@@ -42,7 +52,8 @@ use serde_json::{Map, Value};
 
 use crate::engine::persistence::derive_machine_state;
 use crate::engine::types::{
-    now_iso8601, DocCheckRecorded, Event, EventPayload, ReviewDecisionRecorded, ReviewRoundStarted,
+    now_iso8601, DocCheckRecorded, DocFix, DocFixRecorded, DocRuleCheck, DocRuleChecksRecorded,
+    DocSectionRecorded, Event, EventPayload, ReviewDecisionRecorded, ReviewRoundStarted,
     ReviewVerdictRecorded,
 };
 use crate::session::SessionBackend;
@@ -67,9 +78,12 @@ pub const BATCH_TOO_LARGE: &str = "batch_too_large";
 /// The call would take the session past [`SESSION_CAP`] review events.
 pub const CAP_REACHED: &str = "cap_reached";
 
-/// The most entries one `verdicts` or `doc-checks` call records.
+/// The most entries one `verdicts`, `doc-checks`, `rule-checks` or `fix`
+/// call records.
 pub const BATCH_MAX: usize = 200;
-/// The most review events one session holds, all four kinds counted.
+/// The most review entries one session holds, every kind counted: one for
+/// each round, verdict, decision, document check or section write, and one
+/// per entry of a `rule-checks` or `fix` call.
 pub const SESSION_CAP: usize = 2000;
 /// The largest `--file` read, in bytes: far more than [`BATCH_MAX`] entries
 /// of the longest valid values need.
@@ -91,13 +105,35 @@ pub const UNDECLARED: &str = "other";
 pub const DECISIONS: &[&str] = &["rerun", "fix_and_proceed", "loop_back", "proceed", "stop"];
 /// The outcomes of a document check.
 pub const CHECK_OUTCOMES: &[&str] = &["passed", "failed", "error"];
+/// The document formats `--doc-format` names: the four document types and
+/// the three charter formats.
+pub const DOC_FORMATS: &[&str] = &[
+    "brief", "prd", "design", "plan", "vision", "strategy", "roadmap",
+];
+/// The outcomes of one rule in a `rule-checks` call.
+pub const RULE_OUTCOMES: &[&str] = &["pass", "fail", "not_ready", "error"];
+/// When a `rule-checks` call's checks ran.
+pub const CHECK_MOMENTS: &[&str] = &["pre_jury", "post_fix", "post_create"];
+/// How a `section-written` call's section was written.
+pub const SECTION_WRITES: &[&str] = &["first", "rewrite"];
+/// What a `fix` call answers.
+pub const FIX_ANSWERS: &[&str] = &["jury_fail", "check_fail"];
+/// The `fix` answer that takes a `--round`.
+pub const JURY_FAIL: &str = "jury_fail";
+/// The highest jury round a `fix` names.
+pub const FIX_ROUND_MAX: u64 = 50;
 
-/// The keys of a `verdicts` entry; `schema` may be absent or null.
+/// The keys of a `verdicts` entry; `schema` may be absent or null, and
+/// `doc_type` may be absent when the call gives `--doc-format`.
 const VERDICT_KEYS: &[&str] = &[
     "rule_id", "section", "verdict", "seat", "round", "doc_type", "schema",
 ];
 /// The keys of a `doc-checks` entry; `schema` may be absent or null.
 const DOC_CHECK_KEYS: &[&str] = &["rule_id", "outcome", "doc_type", "schema"];
+/// The keys of a `rule-checks` entry, all required.
+const RULE_CHECK_KEYS: &[&str] = &["rule_id", "outcome"];
+/// The keys of a `fix` entry, all required.
+const FIX_KEYS: &[&str] = &["rule_id", "section", "check_rule"];
 
 #[derive(Subcommand)]
 pub enum ReviewSubcommand {
@@ -119,18 +155,26 @@ pub enum ReviewSubcommand {
     },
 }
 
-/// The four review events.
+/// The review events.
 ///
 /// Every value flag is a `String`, numbers included, and is checked by
 /// this module rather than by clap: clap's own refusal of a value it can't
 /// parse repeats the value, and koto's never does (see [`Refusal`]).
+///
+/// `round-started`, `verdicts` and `decision` take `--doc-format` beside
+/// `--doc-type`; `round-started` and `decision` need one of the two, and
+/// when both are given they must name the same document.
 #[derive(Subcommand)]
 pub enum ReviewEvent {
     /// A review round's seats were spawned
     RoundStarted {
         /// The document type: brief, prd, design or plan
         #[arg(long = "doc-type")]
-        doc_type: String,
+        doc_type: Option<String>,
+        /// The document format: brief, prd, design, plan, vision, strategy
+        /// or roadmap
+        #[arg(long = "doc-format")]
+        doc_format: Option<String>,
         /// The document's schema value (e.g. plan/v2); omitted or empty
         /// records `absent`, an unknown value `other`
         #[arg(long)]
@@ -147,17 +191,25 @@ pub enum ReviewEvent {
     },
     /// A batch of seat verdicts: a JSON array of objects with rule_id,
     /// section, verdict (PASS or FAIL), seat, round, doc_type and an
-    /// optional schema, at most 200
+    /// optional schema, at most 200; doc_type is optional with --doc-format
     Verdicts {
         /// The JSON file holding the batch
         #[arg(long)]
         file: PathBuf,
+        /// The document format: brief, prd, design, plan, vision, strategy
+        /// or roadmap
+        #[arg(long = "doc-format")]
+        doc_format: Option<String>,
     },
     /// What follows a review round
     Decision {
         /// The document type: brief, prd, design or plan
         #[arg(long = "doc-type")]
-        doc_type: String,
+        doc_type: Option<String>,
+        /// The document format: brief, prd, design, plan, vision, strategy
+        /// or roadmap
+        #[arg(long = "doc-format")]
+        doc_format: Option<String>,
         /// The document's schema value; omitted or empty records `absent`
         #[arg(long)]
         schema: Option<String>,
@@ -176,6 +228,52 @@ pub enum ReviewEvent {
         #[arg(long)]
         file: PathBuf,
     },
+    /// The outcome of each check-held rule of a document at one moment: a
+    /// JSON array of objects with rule_id and outcome (pass, fail,
+    /// not_ready or error), at most 200
+    RuleChecks {
+        /// The document format: brief, prd, design, plan, vision, strategy
+        /// or roadmap
+        #[arg(long = "doc-format")]
+        doc_format: String,
+        /// When the checks ran: pre_jury, post_fix or post_create
+        #[arg(long)]
+        moment: String,
+        /// The JSON file holding the batch
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// A document section was written for the first time or rewritten
+    SectionWritten {
+        /// The document format: brief, prd, design, plan, vision, strategy
+        /// or roadmap
+        #[arg(long = "doc-format")]
+        doc_format: String,
+        /// The section's slug; one the session's template doesn't declare
+        /// records `other`
+        #[arg(long)]
+        section: String,
+        /// first or rewrite
+        #[arg(long)]
+        write: String,
+    },
+    /// A fix applied to a document: a JSON array of objects with rule_id,
+    /// section and check_rule (a rule id, or none), at most 200
+    Fix {
+        /// The document format: brief, prd, design, plan, vision, strategy
+        /// or roadmap
+        #[arg(long = "doc-format")]
+        doc_format: String,
+        /// What the fix answers: jury_fail or check_fail
+        #[arg(long)]
+        answers: String,
+        /// The jury round the fix answers, 1 to 50; only with jury_fail
+        #[arg(long)]
+        round: Option<String>,
+        /// The JSON file holding the batch
+        #[arg(long)]
+        file: PathBuf,
+    },
 }
 
 impl ReviewEvent {
@@ -186,6 +284,9 @@ impl ReviewEvent {
             ReviewEvent::Verdicts { .. } => "verdicts",
             ReviewEvent::Decision { .. } => "decision",
             ReviewEvent::DocChecks { .. } => "doc-checks",
+            ReviewEvent::RuleChecks { .. } => "rule-checks",
+            ReviewEvent::SectionWritten { .. } => "section-written",
+            ReviewEvent::Fix { .. } => "fix",
         }
     }
 }
@@ -309,18 +410,59 @@ pub fn positive(value: &str) -> Option<u64> {
     value.parse::<u64>().ok().filter(|n| *n > 0)
 }
 
+/// One of [`DOC_FORMATS`].
+pub fn doc_format(value: &str) -> Option<&'static str> {
+    closed(value, DOC_FORMATS)
+}
+
+/// The checked `--doc-format`, refused when it is outside [`DOC_FORMATS`].
+fn format_flag(value: &str) -> Result<&'static str, Refusal> {
+    doc_format(value).ok_or_else(|| bad_value("--doc-format", &one_of(DOC_FORMATS)))
+}
+
+/// The document a review event names, as `(doc_type, doc_format)`, from
+/// `--doc-type` and `--doc-format`. `--doc-format` alone gives the type
+/// when the format is one of the four types, and none for a charter
+/// format; both together must name the same document; neither is refused.
+pub fn doc_identity(
+    doc_type_flag: Option<&str>,
+    doc_format_flag: Option<&str>,
+) -> Result<(Option<String>, Option<String>), Refusal> {
+    let format = doc_format_flag.map(format_flag).transpose()?;
+    let typed = doc_type_flag
+        .map(|t| doc_type(t).ok_or_else(|| bad_value("--doc-type", &one_of(DOC_TYPES))))
+        .transpose()?;
+    match (typed, format) {
+        (None, None) => Err(Refusal::new(
+            INVALID_VALUE,
+            "one of --doc-type or --doc-format is required",
+        )
+        .field("--doc-type")),
+        (Some(t), Some(f)) if t != f => Err(Refusal::new(
+            INVALID_VALUE,
+            "--doc-type and --doc-format must name the same document",
+        )
+        .field("--doc-type")),
+        (t, f) => Ok((
+            t.or_else(|| f.and_then(doc_type)).map(str::to_string),
+            f.map(str::to_string),
+        )),
+    }
+}
+
 /// The `round-started` event, from its flags.
 pub fn round_started(
-    doc_type_flag: &str,
+    doc_type_flag: Option<&str>,
+    doc_format_flag: Option<&str>,
     schema: Option<&str>,
     round: &str,
     seat_count: &str,
     fallback: bool,
 ) -> Result<ReviewRoundStarted, Refusal> {
+    let (doc_type, doc_format) = doc_identity(doc_type_flag, doc_format_flag)?;
     Ok(ReviewRoundStarted {
-        doc_type: doc_type(doc_type_flag)
-            .ok_or_else(|| bad_value("--doc-type", &one_of(DOC_TYPES)))?
-            .to_string(),
+        doc_type,
+        doc_format,
         schema: bucket_schema(schema).to_string(),
         round: positive(round).ok_or_else(|| bad_value("--round", "a positive integer"))?,
         seat_count: positive(seat_count)
@@ -331,15 +473,16 @@ pub fn round_started(
 
 /// The `decision` event, from its flags.
 pub fn decision_recorded(
-    doc_type_flag: &str,
+    doc_type_flag: Option<&str>,
+    doc_format_flag: Option<&str>,
     schema: Option<&str>,
     round: &str,
     decision_flag: &str,
 ) -> Result<ReviewDecisionRecorded, Refusal> {
+    let (doc_type, doc_format) = doc_identity(doc_type_flag, doc_format_flag)?;
     Ok(ReviewDecisionRecorded {
-        doc_type: doc_type(doc_type_flag)
-            .ok_or_else(|| bad_value("--doc-type", &one_of(DOC_TYPES)))?
-            .to_string(),
+        doc_type,
+        doc_format,
         schema: bucket_schema(schema).to_string(),
         round: positive(round).ok_or_else(|| bad_value("--round", "a positive integer"))?,
         decision: decision(decision_flag)
@@ -461,30 +604,66 @@ fn entry_doc_type(index: usize, map: &Map<String, Value>) -> Result<String, Refu
         .ok_or_else(|| bad_entry_value(index, "doc_type", &one_of(DOC_TYPES)))
 }
 
-fn entry_rule_id(index: usize, map: &Map<String, Value>) -> Result<String, Refusal> {
-    let value = string_field(index, map, "rule_id")?;
+/// A `verdicts` entry's document type under the call's `--doc-format`.
+/// Without the flag the entry's `doc_type` is required, as it always was.
+/// With it the entry's `doc_type` may be left out, and when given must name
+/// the flag's document; the type is the format's own when the format is
+/// one of the four types, and none for a charter format.
+fn entry_doc_type_under(
+    index: usize,
+    map: &Map<String, Value>,
+    format: Option<&'static str>,
+) -> Result<Option<String>, Refusal> {
+    let Some(format) = format else {
+        return entry_doc_type(index, map).map(Some);
+    };
+    if map.contains_key("doc_type") {
+        let given = entry_doc_type(index, map)?;
+        if Some(given.as_str()) != doc_type(format) {
+            return Err(bad_entry_value(
+                index,
+                "doc_type",
+                "the document --doc-format names, or left out",
+            ));
+        }
+    }
+    Ok(doc_type(format).map(str::to_string))
+}
+
+/// A rule id field of entry `index` (`rule_id`, or a fix's `check_rule`),
+/// in the bounds koto puts on `koto.rule.id`.
+fn entry_rule_field(index: usize, map: &Map<String, Value>, key: &str) -> Result<String, Refusal> {
+    let value = string_field(index, map, key)?;
     if valid_rule_id(value) {
         Ok(value.to_string())
     } else {
         Err(bad_entry_value(
             index,
-            "rule_id",
+            key,
             "1 to 128 characters from A-Z a-z 0-9 . _ : / @ -, not starting with / or ~",
         ))
     }
 }
 
+fn entry_rule_id(index: usize, map: &Map<String, Value>) -> Result<String, Refusal> {
+    entry_rule_field(index, map, "rule_id")
+}
+
 /// The verdict events of a `verdicts` batch, one per entry, in order. A seat
-/// or section `vocabulary` doesn't declare is stored as `other`.
+/// or section `vocabulary` doesn't declare is stored as `other`. With
+/// `--doc-format` every event carries the format (see
+/// [`entry_doc_type_under`] for the type).
 pub fn verdict_entries(
     text: &str,
     vocabulary: &ReviewVocabulary,
+    doc_format_flag: Option<&str>,
 ) -> Result<Vec<ReviewVerdictRecorded>, Refusal> {
+    let format = doc_format_flag.map(format_flag).transpose()?;
     let entries = batch_entries(text)?;
     let mut out = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let map = entry_object(index, entry, VERDICT_KEYS)?;
-        let doc_type = entry_doc_type(index, map)?;
+        let doc_type = entry_doc_type_under(index, map, format)?;
         let schema = bucket_schema(schema_field(index, map)?).to_string();
         let round = match map.get("round") {
             None => {
@@ -508,6 +687,7 @@ pub fn verdict_entries(
             .to_string();
         out.push(ReviewVerdictRecorded {
             doc_type,
+            doc_format: format.map(str::to_string),
             schema,
             round,
             seat,
@@ -540,6 +720,106 @@ pub fn doc_check_entries(text: &str) -> Result<Vec<DocCheckRecorded>, Refusal> {
         });
     }
     Ok(out)
+}
+
+/// The `rule-checks` event, from its flags and its batch, recorded at
+/// `state`. Every entry goes in the one event.
+pub fn rule_checks_recorded(
+    state: &str,
+    doc_format_flag: &str,
+    moment_flag: &str,
+    text: &str,
+) -> Result<DocRuleChecksRecorded, Refusal> {
+    let doc_format = format_flag(doc_format_flag)?;
+    let moment = closed(moment_flag, CHECK_MOMENTS)
+        .ok_or_else(|| bad_value("--moment", &one_of(CHECK_MOMENTS)))?;
+    let entries = batch_entries(text)?;
+    let mut out = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let map = entry_object(index, entry, RULE_CHECK_KEYS)?;
+        let rule_id = entry_rule_id(index, map)?;
+        let outcome = closed(string_field(index, map, "outcome")?, RULE_OUTCOMES)
+            .ok_or_else(|| bad_entry_value(index, "outcome", &one_of(RULE_OUTCOMES)))?
+            .to_string();
+        out.push(DocRuleCheck { rule_id, outcome });
+    }
+    Ok(DocRuleChecksRecorded {
+        state: state.to_string(),
+        doc_format: doc_format.to_string(),
+        moment: moment.to_string(),
+        entries: out,
+    })
+}
+
+/// The `section-written` event, from its flags, recorded at `state`. A
+/// section `vocabulary` doesn't declare is stored as `other`.
+pub fn section_recorded(
+    state: &str,
+    doc_format_flag: &str,
+    section: &str,
+    write_flag: &str,
+    vocabulary: &ReviewVocabulary,
+) -> Result<DocSectionRecorded, Refusal> {
+    let doc_format = format_flag(doc_format_flag)?;
+    let write = closed(write_flag, SECTION_WRITES)
+        .ok_or_else(|| bad_value("--write", &one_of(SECTION_WRITES)))?;
+    Ok(DocSectionRecorded {
+        state: state.to_string(),
+        doc_format: doc_format.to_string(),
+        section: declared_or_other(section, &vocabulary.sections),
+        write: write.to_string(),
+    })
+}
+
+/// The `fix` event, from its flags and its batch, recorded at `state`.
+/// `--round` is taken only with `--answers jury_fail`, from 1 to
+/// [`FIX_ROUND_MAX`]. A section `vocabulary` doesn't declare is stored as
+/// `other`; `check_rule` is a rule id in `koto.rule.id`'s bounds, `none`
+/// included.
+pub fn fix_recorded(
+    state: &str,
+    doc_format_flag: &str,
+    answers_flag: &str,
+    round: Option<&str>,
+    text: &str,
+    vocabulary: &ReviewVocabulary,
+) -> Result<DocFixRecorded, Refusal> {
+    let doc_format = format_flag(doc_format_flag)?;
+    let answers = closed(answers_flag, FIX_ANSWERS)
+        .ok_or_else(|| bad_value("--answers", &one_of(FIX_ANSWERS)))?;
+    let round = match round {
+        None => None,
+        Some(_) if answers != JURY_FAIL => {
+            return Err(Refusal::new(
+                INVALID_VALUE,
+                "--round is taken only with --answers jury_fail",
+            )
+            .field("--round"))
+        }
+        Some(r) => Some(positive(r).filter(|n| *n <= FIX_ROUND_MAX).ok_or_else(|| {
+            bad_value("--round", &format!("an integer from 1 to {FIX_ROUND_MAX}"))
+        })?),
+    };
+    let entries = batch_entries(text)?;
+    let mut out = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let map = entry_object(index, entry, FIX_KEYS)?;
+        let rule_id = entry_rule_id(index, map)?;
+        let section = declared_or_other(string_field(index, map, "section")?, &vocabulary.sections);
+        let check_rule = entry_rule_field(index, map, "check_rule")?;
+        out.push(DocFix {
+            rule_id,
+            section,
+            check_rule,
+        });
+    }
+    Ok(DocFixRecorded {
+        state: state.to_string(),
+        doc_format: doc_format.to_string(),
+        answers: answers.to_string(),
+        round,
+        entries: out,
+    })
 }
 
 /// The text of a `--file`, refused when it can't be read, is larger than
@@ -575,30 +855,32 @@ fn io_cause(e: &std::io::Error) -> String {
     }
 }
 
-/// Whether `payload` is one of the four review events, the ones
-/// [`SESSION_CAP`] counts.
-pub fn is_review_event(payload: &EventPayload) -> bool {
-    matches!(
-        payload,
+/// How many review entries `payload` holds, the count [`SESSION_CAP`]
+/// bounds: one for each round, verdict, decision, document check and
+/// section write, the entry count of a `rule-checks` or `fix` event, and 0
+/// for anything else.
+pub fn review_entries(payload: &EventPayload) -> usize {
+    match payload {
         EventPayload::ReviewRoundStarted(_)
-            | EventPayload::ReviewVerdictRecorded(_)
-            | EventPayload::ReviewDecisionRecorded(_)
-            | EventPayload::DocCheckRecorded(_)
-    )
+        | EventPayload::ReviewVerdictRecorded(_)
+        | EventPayload::ReviewDecisionRecorded(_)
+        | EventPayload::DocCheckRecorded(_)
+        | EventPayload::DocSectionRecorded(_) => 1,
+        EventPayload::DocRuleChecksRecorded(c) => c.entries.len(),
+        EventPayload::DocFixRecorded(f) => f.entries.len(),
+        _ => 0,
+    }
 }
 
 /// Refuse a call that would take a log holding `events` past
-/// [`SESSION_CAP`] review events by appending `adding` more.
+/// [`SESSION_CAP`] review entries by recording `adding` more.
 pub fn within_cap(events: &[Event], adding: usize) -> Result<(), Refusal> {
-    let held = events
-        .iter()
-        .filter(|e| is_review_event(&e.payload))
-        .count();
+    let held: usize = events.iter().map(|e| review_entries(&e.payload)).sum();
     if held + adding > SESSION_CAP {
         return Err(Refusal::new(
             CAP_REACHED,
             format!(
-                "the session holds {held} review events; recording {adding} more would pass \
+                "the session holds {held} review entries; recording {adding} more would pass \
                  the cap of {SESSION_CAP}"
             ),
         ));
@@ -678,33 +960,92 @@ fn handle_record(backend: &dyn SessionBackend, name: String, event: ReviewEvent)
     }
 
     let event_name = event.name();
+    let state = machine.current_state.as_str();
+    let vocabulary = &template.review_vocabulary;
     let payloads: Vec<EventPayload> = match event {
         ReviewEvent::RoundStarted {
             doc_type,
+            doc_format,
             schema,
             round,
             seat_count,
             fallback,
         } => vec![EventPayload::ReviewRoundStarted(
-            round_started(&doc_type, schema.as_deref(), &round, &seat_count, fallback)
-                .unwrap_or_else(|r| refuse(r)),
+            round_started(
+                doc_type.as_deref(),
+                doc_format.as_deref(),
+                schema.as_deref(),
+                &round,
+                &seat_count,
+                fallback,
+            )
+            .unwrap_or_else(|r| refuse(r)),
         )],
         ReviewEvent::Decision {
             doc_type,
+            doc_format,
             schema,
             round,
             decision,
         } => vec![EventPayload::ReviewDecisionRecorded(
-            decision_recorded(&doc_type, schema.as_deref(), &round, &decision)
-                .unwrap_or_else(|r| refuse(r)),
+            decision_recorded(
+                doc_type.as_deref(),
+                doc_format.as_deref(),
+                schema.as_deref(),
+                &round,
+                &decision,
+            )
+            .unwrap_or_else(|r| refuse(r)),
         )],
-        ReviewEvent::Verdicts { file } => {
+        ReviewEvent::Verdicts { file, doc_format } => {
+            // The flag is checked before the file is read.
+            if let Some(f) = doc_format.as_deref() {
+                format_flag(f).unwrap_or_else(|r| refuse(r));
+            }
             let text = read_batch_file(&file).unwrap_or_else(|r| refuse(r));
-            verdict_entries(&text, &template.review_vocabulary)
+            verdict_entries(&text, vocabulary, doc_format.as_deref())
                 .unwrap_or_else(|r| refuse(r))
                 .into_iter()
                 .map(EventPayload::ReviewVerdictRecorded)
                 .collect()
+        }
+        ReviewEvent::RuleChecks {
+            doc_format,
+            moment,
+            file,
+        } => {
+            format_flag(&doc_format).unwrap_or_else(|r| refuse(r));
+            let text = read_batch_file(&file).unwrap_or_else(|r| refuse(r));
+            let event = rule_checks_recorded(state, &doc_format, &moment, &text)
+                .unwrap_or_else(|r| refuse(r));
+            non_empty(EventPayload::DocRuleChecksRecorded(event))
+        }
+        ReviewEvent::SectionWritten {
+            doc_format,
+            section,
+            write,
+        } => vec![EventPayload::DocSectionRecorded(
+            section_recorded(state, &doc_format, &section, &write, vocabulary)
+                .unwrap_or_else(|r| refuse(r)),
+        )],
+        ReviewEvent::Fix {
+            doc_format,
+            answers,
+            round,
+            file,
+        } => {
+            format_flag(&doc_format).unwrap_or_else(|r| refuse(r));
+            let text = read_batch_file(&file).unwrap_or_else(|r| refuse(r));
+            let event = fix_recorded(
+                state,
+                &doc_format,
+                &answers,
+                round.as_deref(),
+                &text,
+                vocabulary,
+            )
+            .unwrap_or_else(|r| refuse(r));
+            non_empty(EventPayload::DocFixRecorded(event))
         }
         ReviewEvent::DocChecks { file } => {
             let text = read_batch_file(&file).unwrap_or_else(|r| refuse(r));
@@ -715,9 +1056,12 @@ fn handle_record(backend: &dyn SessionBackend, name: String, event: ReviewEvent)
                 .collect()
         }
     };
-    within_cap(&events, payloads.len()).unwrap_or_else(|r| refuse(r));
+    let count: usize = payloads.iter().map(review_entries).sum();
+    within_cap(&events, count).unwrap_or_else(|r| refuse(r));
 
-    // One event per entry, so each journal record gets its own `koto.seq`.
+    // `verdicts` and `doc-checks` append one event per entry, so each
+    // journal record gets its own `koto.seq`; `rule-checks` and `fix`
+    // append one event holding every entry, so their records share one.
     // Everything was validated above, so only an append failure (exit 1)
     // can stop a batch partway.
     for payload in &payloads {
@@ -731,10 +1075,20 @@ fn handle_record(backend: &dyn SessionBackend, name: String, event: ReviewEvent)
         serde_json::to_string(&serde_json::json!({
             "status": "recorded",
             "event": event_name,
-            "count": payloads.len(),
+            "count": count,
         }))?
     );
     Ok(())
+}
+
+/// `payload` as the one event a batch call appends, or nothing when its
+/// batch was empty: an event with no entries would relay no record.
+fn non_empty(payload: EventPayload) -> Vec<EventPayload> {
+    if review_entries(&payload) == 0 {
+        Vec::new()
+    } else {
+        vec![payload]
+    }
 }
 
 #[cfg(test)]
@@ -821,7 +1175,7 @@ mod tests {
             verdict_entry("intruder", "frontmatter"),
             verdict_entry("scope", "not-a-section"),
         ]);
-        let got = verdict_entries(&entries, &v).unwrap();
+        let got = verdict_entries(&entries, &v, None).unwrap();
         let pairs: Vec<(&str, &str)> = got
             .iter()
             .map(|e| (e.seat.as_str(), e.section.as_str()))
@@ -839,7 +1193,7 @@ mod tests {
     #[test]
     fn a_template_that_declares_nothing_gets_other_for_every_seat_and_section() {
         let entries = text(&[verdict_entry("clarity", "goals")]);
-        let got = verdict_entries(&entries, &ReviewVocabulary::default()).unwrap();
+        let got = verdict_entries(&entries, &ReviewVocabulary::default(), None).unwrap();
         assert_eq!(got[0].seat, "other");
         assert_eq!(got[0].section, "other");
     }
@@ -855,11 +1209,12 @@ mod tests {
             "round": 3,
             "doc_type": "design",
         }]);
-        let got = verdict_entries(&entries.to_string(), &v).unwrap();
+        let got = verdict_entries(&entries.to_string(), &v, None).unwrap();
         assert_eq!(
             got,
             vec![ReviewVerdictRecorded {
-                doc_type: "design".into(),
+                doc_type: Some("design".into()),
+                doc_format: None,
                 schema: "absent".into(),
                 round: 3,
                 seat: "clarity".into(),
@@ -874,10 +1229,10 @@ mod tests {
     fn a_batch_of_two_hundred_is_taken_and_two_hundred_and_one_refused() {
         let v = ReviewVocabulary::default();
         let full: Vec<Value> = (0..BATCH_MAX).map(|_| verdict_entry("a", "b")).collect();
-        assert_eq!(verdict_entries(&text(&full), &v).unwrap().len(), 200);
+        assert_eq!(verdict_entries(&text(&full), &v, None).unwrap().len(), 200);
         let mut over = full.clone();
         over.push(verdict_entry("a", "b"));
-        let err = verdict_entries(&text(&over), &v).unwrap_err();
+        let err = verdict_entries(&text(&over), &v, None).unwrap_err();
         assert_eq!(err.code, BATCH_TOO_LARGE);
 
         let check = serde_json::json!({"rule_id": "r1", "outcome": "passed", "doc_type": "plan"});
@@ -896,7 +1251,7 @@ mod tests {
         let v = ReviewVocabulary::default();
         let mut entries: Vec<Value> = (0..5).map(|_| verdict_entry("a", "b")).collect();
         entries[3]["verdict"] = Value::from("MAYBE");
-        let err = verdict_entries(&text(&entries), &v).unwrap_err();
+        let err = verdict_entries(&text(&entries), &v, None).unwrap_err();
         assert_eq!(err.code, INVALID_VALUE);
         assert_eq!(err.entry, Some(3));
         assert_eq!(err.field.as_deref(), Some("verdict"));
@@ -913,7 +1268,7 @@ mod tests {
         ] {
             let mut entries = vec![verdict_entry("a", "b"), verdict_entry("a", "b")];
             entries[1][field] = value.clone();
-            let err = verdict_entries(&text(&entries), &v).unwrap_err();
+            let err = verdict_entries(&text(&entries), &v, None).unwrap_err();
             assert_eq!(err.code, INVALID_VALUE, "{field}={value}");
             assert_eq!(err.entry, Some(1), "{field}={value}");
             assert_eq!(err.field.as_deref(), Some(field), "{field}={value}");
@@ -939,7 +1294,7 @@ mod tests {
         let mut entry = verdict_entry("a", "b");
         entry["rule_id"] = Value::from("r".repeat(128));
         assert_eq!(
-            verdict_entries(&text(&[entry]), &v).unwrap()[0]
+            verdict_entries(&text(&[entry]), &v, None).unwrap()[0]
                 .rule_id
                 .len(),
             128
@@ -980,7 +1335,7 @@ mod tests {
         cases.push(text(&[missing]));
 
         for case in &cases {
-            let err = verdict_entries(case, &v).expect_err(case);
+            let err = verdict_entries(case, &v, None).expect_err(case);
             let body = err.body().to_string();
             assert!(!body.contains(SENTINEL), "{case} -> {body}");
             let err = doc_check_entries(case).expect_err(case);
@@ -1014,11 +1369,12 @@ mod tests {
 
     #[test]
     fn flags_are_checked_like_entries() {
-        let ok = round_started("brief", Some("brief/v1"), "1", "3", true).unwrap();
+        let ok = round_started(Some("brief"), None, Some("brief/v1"), "1", "3", true).unwrap();
         assert_eq!(
             ok,
             ReviewRoundStarted {
-                doc_type: "brief".into(),
+                doc_type: Some("brief".into()),
+                doc_format: None,
                 schema: "brief/v1".into(),
                 round: 1,
                 seat_count: 3,
@@ -1033,17 +1389,17 @@ mod tests {
             (("brief", "1", "0"), "--seat-count"),
             (("brief", "1", "three"), "--seat-count"),
         ] {
-            let err = round_started(args.0, None, args.1, args.2, false).unwrap_err();
+            let err = round_started(Some(args.0), None, None, args.1, args.2, false).unwrap_err();
             assert_eq!(err.code, INVALID_VALUE);
             assert_eq!(err.field.as_deref(), Some(field));
             assert!(!err.message.contains(args.0) || args.0 == "brief");
         }
-        let d = decision_recorded("plan", None, "2", "loop_back").unwrap();
+        let d = decision_recorded(Some("plan"), None, None, "2", "loop_back").unwrap();
         assert_eq!(
             (d.schema.as_str(), d.decision.as_str()),
             ("absent", "loop_back")
         );
-        let err = decision_recorded("plan", None, "2", "retry").unwrap_err();
+        let err = decision_recorded(Some("plan"), None, None, "2", "retry").unwrap_err();
         assert_eq!(err.field.as_deref(), Some("--decision"));
     }
 
@@ -1066,7 +1422,8 @@ mod tests {
             outcome: "passed".into(),
         };
         let round = ReviewRoundStarted {
-            doc_type: "plan".into(),
+            doc_type: Some("plan".into()),
+            doc_format: None,
             schema: "plan/v2".into(),
             round: 1,
             seat_count: 3,
@@ -1083,5 +1440,249 @@ mod tests {
         events.push(event(EventPayload::ReviewRoundStarted(round)));
         assert_eq!(within_cap(&events, 1).unwrap_err().code, CAP_REACHED);
         assert!(within_cap(&events, 0).is_ok());
+    }
+
+    /// A `rule-checks` or `fix` event counts one per entry, so ten events of
+    /// two hundred entries fill the cap.
+    #[test]
+    fn the_cap_counts_entries_of_a_batch_event() {
+        let checks = rule_checks_recorded(
+            "draft",
+            "prd",
+            "pre_jury",
+            &text(&vec![
+                serde_json::json!({"rule_id": "r", "outcome": "pass"});
+                BATCH_MAX
+            ]),
+        )
+        .unwrap();
+        let mut events: Vec<Event> = (0..SESSION_CAP / BATCH_MAX - 1)
+            .map(|_| event(EventPayload::DocRuleChecksRecorded(checks.clone())))
+            .collect();
+        assert!(within_cap(&events, BATCH_MAX).is_ok());
+        assert_eq!(
+            within_cap(&events, BATCH_MAX + 1).unwrap_err().code,
+            CAP_REACHED
+        );
+        let fix = fix_recorded(
+            "draft",
+            "prd",
+            "check_fail",
+            None,
+            &text(&[serde_json::json!({"rule_id": "r", "section": "s", "check_rule": "none"})]),
+            &ReviewVocabulary::default(),
+        )
+        .unwrap();
+        events.push(event(EventPayload::DocFixRecorded(fix)));
+        assert_eq!(
+            within_cap(&events, BATCH_MAX).unwrap_err().code,
+            CAP_REACHED
+        );
+        assert!(within_cap(&events, BATCH_MAX - 1).is_ok());
+    }
+
+    #[test]
+    fn doc_format_names_the_type_for_four_formats_and_none_for_the_charter_three() {
+        for f in DOC_FORMATS {
+            let (t, fmt) = doc_identity(None, Some(f)).unwrap();
+            assert_eq!(fmt.as_deref(), Some(*f));
+            let expected = DOC_TYPES.contains(f).then(|| f.to_string());
+            assert_eq!(t, expected, "{f}");
+        }
+        assert_eq!(
+            doc_identity(Some("plan"), None).unwrap(),
+            (Some("plan".to_string()), None)
+        );
+        assert_eq!(
+            doc_identity(Some("plan"), Some("plan")).unwrap(),
+            (Some("plan".to_string()), Some("plan".to_string()))
+        );
+        for (t, f, field) in [
+            (None, Some("memo"), "--doc-format"),
+            (None, Some("Vision"), "--doc-format"),
+            (Some("plan"), Some("prd"), "--doc-type"),
+            (Some("plan"), Some("vision"), "--doc-type"),
+            (None, None, "--doc-type"),
+        ] {
+            let err = doc_identity(t, f).unwrap_err();
+            assert_eq!(
+                (err.code, err.field.as_deref()),
+                (INVALID_VALUE, Some(field))
+            );
+        }
+        let r = round_started(None, Some("vision"), None, "1", "3", false).unwrap();
+        assert_eq!(
+            (r.doc_type, r.doc_format.as_deref()),
+            (None, Some("vision"))
+        );
+    }
+
+    #[test]
+    fn verdicts_under_doc_format_take_or_leave_out_doc_type() {
+        let v = ReviewVocabulary::default();
+        let mut entry = verdict_entry("a", "b");
+        entry.as_object_mut().unwrap().remove("doc_type");
+        let got = verdict_entries(&text(&[entry.clone()]), &v, Some("strategy")).unwrap();
+        assert_eq!(
+            (got[0].doc_type.as_deref(), got[0].doc_format.as_deref()),
+            (None, Some("strategy"))
+        );
+        let got = verdict_entries(&text(&[entry.clone()]), &v, Some("prd")).unwrap();
+        assert_eq!(
+            (got[0].doc_type.as_deref(), got[0].doc_format.as_deref()),
+            (Some("prd"), Some("prd"))
+        );
+        // Without the flag doc_type stays required.
+        let err = verdict_entries(&text(&[entry]), &v, None).unwrap_err();
+        assert_eq!(
+            (err.code, err.field.as_deref()),
+            (INVALID_ENTRY, Some("doc_type"))
+        );
+        // A doc_type that names another document is refused.
+        let err =
+            verdict_entries(&text(&[verdict_entry("a", "b")]), &v, Some("roadmap")).unwrap_err();
+        assert_eq!(
+            (err.code, err.field.as_deref()),
+            (INVALID_VALUE, Some("doc_type"))
+        );
+        let err = verdict_entries(&text(&[verdict_entry("a", "b")]), &v, Some("memo")).unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("--doc-format"));
+    }
+
+    #[test]
+    fn rule_checks_take_their_sets_and_refuse_the_rest() {
+        let entry = |outcome: &str| serde_json::json!({"rule_id": "docs/x", "outcome": outcome});
+        for m in CHECK_MOMENTS {
+            for o in RULE_OUTCOMES {
+                let got = rule_checks_recorded("s", "vision", m, &text(&[entry(o)])).unwrap();
+                assert_eq!(
+                    got,
+                    DocRuleChecksRecorded {
+                        state: "s".into(),
+                        doc_format: "vision".into(),
+                        moment: m.to_string(),
+                        entries: vec![DocRuleCheck {
+                            rule_id: "docs/x".into(),
+                            outcome: o.to_string(),
+                        }],
+                    }
+                );
+            }
+        }
+        let err = rule_checks_recorded("s", "prd", "later", &text(&[entry("pass")])).unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("--moment"));
+        let err =
+            rule_checks_recorded("s", "spec", "pre_jury", &text(&[entry("pass")])).unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("--doc-format"));
+        let err = rule_checks_recorded(
+            "s",
+            "prd",
+            "pre_jury",
+            &text(&[entry("pass"), entry("passed")]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            (err.code, err.entry, err.field.as_deref()),
+            (INVALID_VALUE, Some(1), Some("outcome"))
+        );
+        let mut extra = entry("pass");
+        extra["section"] = Value::from("goals");
+        let err = rule_checks_recorded("s", "prd", "pre_jury", &text(&[extra])).unwrap_err();
+        assert_eq!(err.code, INVALID_ENTRY);
+    }
+
+    #[test]
+    fn a_section_write_keeps_a_declared_section_and_others_become_other() {
+        let v = vocabulary(&[], &["vision-statement"]);
+        let got = section_recorded("s", "vision", "vision-statement", "first", &v).unwrap();
+        assert_eq!(
+            (got.section.as_str(), got.write.as_str()),
+            ("vision-statement", "first")
+        );
+        let got = section_recorded("s", "vision", "## Some Heading", "rewrite", &v).unwrap();
+        assert_eq!(got.section, "other");
+        let got = section_recorded(
+            "s",
+            "vision",
+            "vision-statement",
+            "rewrite",
+            &ReviewVocabulary::default(),
+        )
+        .unwrap();
+        assert_eq!(got.section, "other");
+        let err = section_recorded("s", "vision", "x", "append", &v).unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("--write"));
+    }
+
+    #[test]
+    fn a_fix_takes_a_round_only_for_a_jury_fail_from_one_to_fifty() {
+        let v = vocabulary(&[], &["goals"]);
+        let batch = text(&[
+            serde_json::json!({"rule_id": "rs-001", "section": "goals", "check_rule": "docs/required-sections"}),
+            serde_json::json!({"rule_id": "rs-002", "section": "Goals text", "check_rule": "none"}),
+        ]);
+        for r in ["1", "50"] {
+            let got = fix_recorded("s", "design", "jury_fail", Some(r), &batch, &v).unwrap();
+            assert_eq!(got.round, r.parse().ok());
+            assert_eq!(got.entries.len(), 2);
+            assert_eq!(got.entries[0].section, "goals");
+            assert_eq!(got.entries[1].section, "other");
+            assert_eq!(got.entries[1].check_rule, "none");
+        }
+        assert_eq!(
+            fix_recorded("s", "design", "jury_fail", None, &batch, &v)
+                .unwrap()
+                .round,
+            None
+        );
+        for r in ["0", "51", "1.5", "two", "-1", ""] {
+            let err = fix_recorded("s", "design", "jury_fail", Some(r), &batch, &v).unwrap_err();
+            assert_eq!(err.field.as_deref(), Some("--round"), "{r:?}");
+        }
+        let got = fix_recorded("s", "design", "check_fail", None, &batch, &v).unwrap();
+        assert_eq!(got.round, None);
+        let err = fix_recorded("s", "design", "check_fail", Some("2"), &batch, &v).unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("--round"));
+        let err = fix_recorded("s", "design", "jury_pass", None, &batch, &v).unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("--answers"));
+    }
+
+    #[test]
+    fn a_fix_check_rule_is_bound_like_a_rule_id() {
+        let v = ReviewVocabulary::default();
+        let digest = crate::run_journal::digest("a rule id outside the name shape");
+        for ok in ["none", "docs/required-sections", digest.as_str()] {
+            let batch =
+                text(&[serde_json::json!({"rule_id": ok, "section": "s", "check_rule": ok})]);
+            assert!(fix_recorded("s", "plan", "check_fail", None, &batch, &v).is_ok());
+        }
+        for (field, bad) in [
+            ("check_rule", "has space".to_string()),
+            ("check_rule", "x".repeat(129)),
+            ("check_rule", "/abs".to_string()),
+            ("check_rule", String::new()),
+            ("rule_id", "~home".to_string()),
+        ] {
+            let mut good =
+                serde_json::json!({"rule_id": "r", "section": "s", "check_rule": "none"});
+            let mut bad_entry = good.clone();
+            bad_entry[field] = Value::from(bad.clone());
+            good["rule_id"] = Value::from("r2");
+            let err = fix_recorded(
+                "s",
+                "plan",
+                "check_fail",
+                None,
+                &text(&[good, bad_entry]),
+                &v,
+            )
+            .unwrap_err();
+            assert_eq!(
+                (err.code, err.entry, err.field.as_deref()),
+                (INVALID_VALUE, Some(1), Some(field)),
+                "{field}={bad}"
+            );
+            assert!(!err.body().to_string().contains("has space"));
+        }
     }
 }

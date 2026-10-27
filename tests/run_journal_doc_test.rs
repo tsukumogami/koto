@@ -114,6 +114,9 @@ fn every_kind_the_reference_names_is_one_koto_writes_and_the_reverse() {
             "review_verdict",
             "review_decision",
             "doc_checked",
+            "doc_rule_checked",
+            "doc_section_written",
+            "doc_fix_applied",
             "session_started",
             "state_entered",
             "terminal"

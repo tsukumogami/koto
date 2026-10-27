@@ -95,10 +95,13 @@ their digest (see
 | `decider_check_answered` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.unit.key`, `koto.unit.document`, `koto.unit.section`, `koto.decider.answer`, `koto.decider.reason`, `koto.decider.fallback_seq` | `koto decider answer` records the agent's answer to a criterion handed to it. |
 | `rule_delivered` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check.name`, `koto.rule.id`, `koto.rule.extent`, `koto.rule.unit_count`, `koto.rule.via`, `koto.rule.delivery` | A `koto next` response hands back a failed criterion's rule, or a command check reports a rule it printed or refused. |
 | `check_overridden` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check` | An override is recorded for a gate. |
-| `review_round` | `koto.seq`, `koto.visit.seq`, `koto.doc.type`, `koto.doc.schema`, `koto.review.round`, `koto.review.seat_count`, `koto.review.fallback` | `koto review record ... round-started` records that a document review round's seats were spawned. |
-| `review_verdict` | `koto.seq`, `koto.visit.seq`, `koto.doc.type`, `koto.doc.schema`, `koto.review.round`, `koto.review.seat`, `koto.rule.id`, `koto.review.section`, `koto.review.verdict` | Once for each entry `koto review record ... verdicts` records. |
-| `review_decision` | `koto.seq`, `koto.visit.seq`, `koto.doc.type`, `koto.doc.schema`, `koto.review.round`, `koto.review.decision` | `koto review record ... decision` records what follows a review round. |
+| `review_round` | `koto.seq`, `koto.visit.seq`, `koto.doc.type`, `koto.doc.format`, `koto.doc.schema`, `koto.review.round`, `koto.review.seat_count`, `koto.review.fallback` | `koto review record ... round-started` records that a document review round's seats were spawned. |
+| `review_verdict` | `koto.seq`, `koto.visit.seq`, `koto.doc.type`, `koto.doc.format`, `koto.doc.schema`, `koto.review.round`, `koto.review.seat`, `koto.rule.id`, `koto.review.section`, `koto.review.verdict` | Once for each entry `koto review record ... verdicts` records. |
+| `review_decision` | `koto.seq`, `koto.visit.seq`, `koto.doc.type`, `koto.doc.format`, `koto.doc.schema`, `koto.review.round`, `koto.review.decision` | `koto review record ... decision` records what follows a review round. |
 | `doc_checked` | `koto.seq`, `koto.visit.seq`, `koto.doc.type`, `koto.doc.schema`, `koto.rule.id`, `koto.doc.check_outcome` | Once for each entry `koto review record ... doc-checks` records. |
+| `doc_rule_checked` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.doc.format`, `koto.rule.id`, `koto.doc.rule_outcome`, `koto.doc.check_moment` | Once for each entry `koto review record ... rule-checks` records; one call's records share its `koto.seq`. |
+| `doc_section_written` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.doc.format`, `koto.doc.section`, `koto.doc.section_write` | `koto review record ... section-written` records a document section written for the first time or rewritten. |
+| `doc_fix_applied` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.doc.format`, `koto.rule.id`, `koto.doc.section`, `koto.doc.fix_answers`, `koto.doc.fix_round`, `koto.doc.fix_check_rule` | Once for each entry `koto review record ... fix` records; one call's records share its `koto.seq`. |
 | `response` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.response.source`, `koto.response.directive_bytes`, `koto.response.details_bytes` | `koto next` or `koto status` has printed a non-terminal state's directive. |
 | `context_reads` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.context.key`, `koto.context.reader`, `koto.context.access`, `koto.context.overflow`, `koto.context.read_count`, `koto.context.present_count`, `koto.context.first_hash`, `koto.context.last_hash`, `koto.context.read_by` | A state visit that read context keys ends, or a reader's anchor records a read of another session. |
 
@@ -725,38 +728,64 @@ writes itself, such as an answer the decider applied, carries no
 ## Review records
 
 `koto review record` records what happened in a document review (a round of
-reviewer seats over a brief, PRD, design or plan) as telemetry: a round
-starting, each seat's verdict per rule and section, the decision that
-follows the round, and publish-time document check results. It appends one
-session event per record (see the [session feed](session-feed.md)), and the
-journal relays each, after it commits, as one record with `koto.seq` and
-`koto.visit.seq` as a check record has them. A batch of verdicts or
-document checks is one event per entry, so each record has its own
-`koto.seq`, and records of one batch differ only in their own fields. None
-of these records changes an outcome, a route or a state.
+reviewer seats over a brief, PRD, design, plan, vision, strategy or roadmap)
+as telemetry: a round starting, each seat's verdict per rule and section,
+the decision that follows the round, and publish-time document check
+results. It appends one session event per record (see the
+[session feed](session-feed.md)), and the journal relays each, after it
+commits, as one record with `koto.seq` and `koto.visit.seq` as a check
+record has them. A batch of verdicts or document checks is one event per
+entry, so each record has its own `koto.seq`, and records of one batch
+differ only in their own fields. None of these records changes an outcome,
+a route or a state.
+
+It also records what happens to a document while it is drafted:
+
+- `doc_rule_checked`, once for each entry of a `rule-checks` call: one
+  check-held rule's outcome at one moment.
+- `doc_section_written`, once for each `section-written` call: a section
+  written for the first time or rewritten.
+- `doc_fix_applied`, once for each entry of a `fix` call: one rule and
+  section a fix answers.
+
+A `rule-checks` or `fix` call is one session event holding every entry, so
+all the records of one call share its `koto.seq`. That sequence number is
+the ordinal of a check or fix within the run.
 
 Every value is one koto validated or mapped before the event was appended;
 nothing the caller wrote is copied as written.
 
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|
-| `koto.doc.type` | string | always | `brief`, `prd`, `design` or `plan`. |
+| `koto.doc.type` | string | `review_round`, `review_verdict`, `review_decision`, `doc_checked`; left out of the first three when `koto.doc.format` is `vision`, `strategy` or `roadmap` | `brief`, `prd`, `design` or `plan`. |
+| `koto.doc.format` | string | `doc_rule_checked`, `doc_section_written`, `doc_fix_applied`; `review_round`, `review_verdict` and `review_decision` when the call gave `--doc-format` | `brief`, `prd`, `design`, `plan`, `vision`, `strategy` or `roadmap`. |
+| `koto.state` | string | `doc_rule_checked`, `doc_section_written`, `doc_fix_applied` | The state the session was in when the call was made. |
+| `koto.doc.rule_outcome` | string | `doc_rule_checked` | `pass`, `fail`, `not_ready` or `error`. |
+| `koto.doc.check_moment` | string | `doc_rule_checked` | When the checks ran: `pre_jury`, `post_fix` or `post_create`. |
+| `koto.doc.section` | string | `doc_section_written`, `doc_fix_applied` | The section, when the session's template declares it among the `sections` of its `review_vocabulary`; `other` otherwise, and always when the template declares none. |
+| `koto.doc.section_write` | string | `doc_section_written` | `first` or `rewrite`. |
+| `koto.doc.fix_answers` | string | `doc_fix_applied` | What the fix answers: `jury_fail` or `check_fail`. |
+| `koto.doc.fix_round` | integer | `doc_fix_applied` answering a `jury_fail`, when the call gave `--round` | The jury round the fix answers, 1 to 50. |
+| `koto.doc.fix_check_rule` | string | `doc_fix_applied` | The check rule that decides the answered rule, in the bounds of `koto.rule.id`, or `none`. |
 | `koto.doc.schema` | string | always | The document's schema value, bucketed: `brief/v1`, `prd/v1`, `design/v1`, `plan/v1` or `plan/v2` as given, `absent` when there was none, `other` for anything else. |
 | `koto.review.round` | integer | `review_round`, `review_verdict`, `review_decision` | The round's number, from 1. |
 | `koto.review.seat_count` | integer | `review_round` | How many seats the round spawned. |
 | `koto.review.fallback` | boolean | `review_round` | Whether the round is a fallback round. |
 | `koto.review.seat` | string | `review_verdict` | The seat, when the session's template declares it among the `seats` of its `review_vocabulary`; `other` otherwise, and always when the template declares none. |
 | `koto.review.section` | string | `review_verdict` | The section, under the same rule with the `sections` of its `review_vocabulary`. |
-| `koto.rule.id` | string | `review_verdict`, `doc_checked` | The rule's id. koto refuses one outside the name shape, so it is never a digest here. |
+| `koto.rule.id` | string | `review_verdict`, `doc_checked`, `doc_rule_checked`, `doc_fix_applied` | The rule's id. koto refuses one outside the name shape, so it is never a digest here. |
 | `koto.review.verdict` | string | `review_verdict` | `pass` or `fail`. |
 | `koto.review.decision` | string | `review_decision` | What follows the round: `rerun`, `fix_and_proceed`, `loop_back`, `proceed` or `stop`. |
 | `koto.doc.check_outcome` | string | `doc_checked` | `passed`, `failed` or `error`. |
 
-A session holds at most 2,000 review events, so one session can't flood
-telemetry with distinct records.
+A session holds at most 2,000 review entries (each round, verdict,
+decision, document check and section write, and each entry of a
+`rule-checks` or `fix` call), so one session can't flood telemetry with
+distinct records.
 
 ```json
 {"kind":"review_verdict","v":1,"at":"2026-10-10T03:22:05.118Z","session":"scope-export","koto.session.id":"7d1e2f30-4a5b-4c6d-8e9f-0a1b2c3d4e5f","koto.run.id":"7d1e2f30-4a5b-4c6d-8e9f-0a1b2c3d4e5f","koto.seq":42,"koto.visit.seq":38,"koto.doc.type":"prd","koto.doc.schema":"prd/v1","koto.review.round":1,"koto.review.seat":"clarity","koto.rule.id":"rs-012","koto.review.section":"goals","koto.review.verdict":"fail"}
+{"kind":"doc_rule_checked","v":1,"at":"2026-10-10T03:21:40.512Z","session":"charter-export","koto.session.id":"3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f","koto.run.id":"3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f","koto.seq":17,"koto.visit.seq":15,"koto.state":"draft","koto.doc.format":"vision","koto.rule.id":"doc-required-sections","koto.doc.rule_outcome":"not_ready","koto.doc.check_moment":"pre_jury"}
 ```
 
 ## Response records

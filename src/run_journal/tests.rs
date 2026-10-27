@@ -5814,13 +5814,36 @@ fn review_kind_fields(kind: &str) -> &'static [&'static str] {
             "koto.rule.id",
             "koto.doc.check_outcome",
         ],
+        "doc_rule_checked" => &[
+            "koto.state",
+            "koto.doc.format",
+            "koto.rule.id",
+            "koto.doc.rule_outcome",
+            "koto.doc.check_moment",
+        ],
+        "doc_section_written" => &[
+            "koto.state",
+            "koto.doc.format",
+            "koto.doc.section",
+            "koto.doc.section_write",
+        ],
+        "doc_fix_applied" => &[
+            "koto.state",
+            "koto.doc.format",
+            "koto.rule.id",
+            "koto.doc.section",
+            "koto.doc.fix_answers",
+            "koto.doc.fix_round",
+            "koto.doc.fix_check_rule",
+        ],
         other => panic!("not a review kind: {other}"),
     }
 }
 
 fn review_verdict(seat: &str, rule_id: &str, section: &str, verdict: &str) -> EventPayload {
     EventPayload::ReviewVerdictRecorded(crate::engine::types::ReviewVerdictRecorded {
-        doc_type: "prd".into(),
+        doc_type: Some("prd".into()),
+        doc_format: None,
         schema: "prd/v1".into(),
         round: 2,
         seat: seat.into(),
@@ -5840,7 +5863,8 @@ fn each_review_event_relays_one_record_with_exactly_its_fields() {
     reset_for_test();
     let payloads = [
         EventPayload::ReviewRoundStarted(ReviewRoundStarted {
-            doc_type: "prd".into(),
+            doc_type: Some("prd".into()),
+            doc_format: None,
             schema: "prd/v1".into(),
             round: 2,
             seat_count: 3,
@@ -5849,7 +5873,8 @@ fn each_review_event_relays_one_record_with_exactly_its_fields() {
         review_verdict("clarity", "rs-001", "goals", "pass"),
         review_verdict("other", "rs-002", "other", "fail"),
         EventPayload::ReviewDecisionRecorded(ReviewDecisionRecorded {
-            doc_type: "prd".into(),
+            doc_type: Some("prd".into()),
+            doc_format: None,
             schema: "prd/v1".into(),
             round: 2,
             decision: "fix_and_proceed".into(),
@@ -5958,4 +5983,148 @@ fn a_review_verdict_of_the_longest_values_fits_one_line() {
     assert_eq!(rec["koto.review.seat"], long('s'));
     assert_eq!(rec["koto.rule.id"], long('r'));
     assert_eq!(rec["koto.review.section"], long('x'));
+}
+
+/// The drafting events relay one record per entry, every record of one
+/// event under that event's `koto.seq`, each holding exactly its kind's
+/// fields; a `check_fail` fix carries no round.
+#[test]
+fn each_drafting_event_relays_one_record_per_entry_under_one_seq() {
+    use crate::engine::types::{
+        DocFix, DocFixRecorded, DocRuleCheck, DocRuleChecksRecorded, DocSectionRecorded,
+    };
+    let f = session_in_a();
+    let check = |rule: &str, outcome: &str| DocRuleCheck {
+        rule_id: rule.into(),
+        outcome: outcome.into(),
+    };
+    let fix = |rule: &str, section: &str, held: &str| DocFix {
+        rule_id: rule.into(),
+        section: section.into(),
+        check_rule: held.into(),
+    };
+    let payloads = [
+        EventPayload::DocRuleChecksRecorded(DocRuleChecksRecorded {
+            state: "a".into(),
+            doc_format: "vision".into(),
+            moment: "pre_jury".into(),
+            entries: vec![
+                check("doc-required-sections", "fail"),
+                check("doc-frontmatter", "not_ready"),
+            ],
+        }),
+        EventPayload::DocSectionRecorded(DocSectionRecorded {
+            state: "a".into(),
+            doc_format: "vision".into(),
+            section: "other".into(),
+            write: "rewrite".into(),
+        }),
+        EventPayload::DocFixRecorded(DocFixRecorded {
+            state: "a".into(),
+            doc_format: "vision".into(),
+            answers: "jury_fail".into(),
+            round: Some(2),
+            entries: vec![
+                fix("rs-001", "goals", "doc-required-sections"),
+                fix("rs-002", "other", "none"),
+            ],
+        }),
+        EventPayload::DocFixRecorded(DocFixRecorded {
+            state: "a".into(),
+            doc_format: "vision".into(),
+            answers: "check_fail".into(),
+            round: None,
+            entries: vec![fix(
+                "doc-required-sections",
+                "goals",
+                "doc-required-sections",
+            )],
+        }),
+    ];
+    for p in &payloads {
+        commit_as(&f, None, "wf", p);
+    }
+    let j = f.journal();
+    let r: Vec<&serde_json::Value> = j
+        .iter()
+        .filter(|r| r["kind"].as_str().unwrap().starts_with("doc_"))
+        .collect();
+    let kinds: Vec<(&str, u64)> = r
+        .iter()
+        .map(|r| (r["kind"].as_str().unwrap(), r["koto.seq"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("doc_rule_checked", 3),
+            ("doc_rule_checked", 3),
+            ("doc_section_written", 4),
+            ("doc_fix_applied", 5),
+            ("doc_fix_applied", 5),
+            ("doc_fix_applied", 6),
+        ]
+    );
+    for rec in &r {
+        let kind = rec["kind"].as_str().unwrap();
+        let keys: BTreeSet<&str> = rec
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut expected: BTreeSet<&str> = RELAY_FIELDS
+            .iter()
+            .chain(review_kind_fields(kind))
+            .copied()
+            .collect();
+        if rec["koto.doc.fix_answers"] == "check_fail" {
+            expected.remove("koto.doc.fix_round");
+        }
+        assert_eq!(keys, expected, "{rec}");
+        assert_eq!(rec["koto.state"], "a");
+        assert_eq!(rec["koto.doc.format"], "vision");
+        assert!(rec.get("koto.doc.type").is_none());
+    }
+    assert_eq!(r[0]["koto.rule.id"], "doc-required-sections");
+    assert_eq!(r[0]["koto.doc.rule_outcome"], "fail");
+    assert_eq!(r[0]["koto.doc.check_moment"], "pre_jury");
+    assert_eq!(r[1]["koto.doc.rule_outcome"], "not_ready");
+    assert_eq!(r[2]["koto.doc.section"], "other");
+    assert_eq!(r[2]["koto.doc.section_write"], "rewrite");
+    assert_eq!(r[3]["koto.rule.id"], "rs-001");
+    assert_eq!(r[3]["koto.doc.section"], "goals");
+    assert_eq!(r[3]["koto.doc.fix_answers"], "jury_fail");
+    assert_eq!(r[3]["koto.doc.fix_round"], 2);
+    assert_eq!(r[3]["koto.doc.fix_check_rule"], "doc-required-sections");
+    assert_eq!(r[4]["koto.doc.fix_check_rule"], "none");
+    assert_eq!(r[5]["koto.doc.fix_answers"], "check_fail");
+}
+
+/// With a format, the three review kinds carry `koto.doc.format`, and for a
+/// charter format no `koto.doc.type`.
+#[test]
+fn a_review_round_with_a_format_carries_it_and_a_charter_format_drops_the_type() {
+    use crate::engine::types::ReviewRoundStarted;
+    let f = session_in_a();
+    for (doc_type, doc_format) in [(None, "roadmap"), (Some("plan"), "plan")] {
+        commit_as(
+            &f,
+            None,
+            "wf",
+            &EventPayload::ReviewRoundStarted(ReviewRoundStarted {
+                doc_type: doc_type.map(str::to_string),
+                doc_format: Some(doc_format.into()),
+                schema: "absent".into(),
+                round: 1,
+                seat_count: 2,
+                fallback: false,
+            }),
+        );
+    }
+    let j = f.journal();
+    let r: Vec<&serde_json::Value> = j.iter().filter(|r| r["kind"] == "review_round").collect();
+    assert_eq!(r[0]["koto.doc.format"], "roadmap");
+    assert!(r[0].get("koto.doc.type").is_none());
+    assert_eq!(r[1]["koto.doc.format"], "plan");
+    assert_eq!(r[1]["koto.doc.type"], "plan");
 }

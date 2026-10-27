@@ -482,6 +482,22 @@ Body text.
                 "doc_check_recorded",
                 serde_json::json!({"doc_type": "brief", "schema": "other", "rule_id": "r1", "outcome": "error"}),
             ),
+            line(
+                "review_round_started",
+                serde_json::json!({"doc_format": "vision", "schema": "absent", "round": 1, "seat_count": 3, "fallback": false}),
+            ),
+            line(
+                "doc_rule_checks_recorded",
+                serde_json::json!({"state": "draft", "doc_format": "roadmap", "moment": "pre_jury", "entries": [{"rule_id": "r1", "outcome": "not_ready"}]}),
+            ),
+            line(
+                "doc_section_recorded",
+                serde_json::json!({"state": "draft", "doc_format": "prd", "section": "other", "write": "first"}),
+            ),
+            line(
+                "doc_fix_recorded",
+                serde_json::json!({"state": "draft", "doc_format": "design", "answers": "jury_fail", "round": 2, "entries": [{"rule_id": "rs-1", "section": "goals", "check_rule": "none"}]}),
+            ),
         ];
         let log = write_temp(&format!(
             "{}\n{}\n",
@@ -507,6 +523,22 @@ Body text.
             line(
                 "doc_check_recorded",
                 serde_json::json!({"doc_type": "brief", "schema": "other", "rule_id": "r1", "outcome": "timed_out"}),
+            ),
+            line(
+                "review_round_started",
+                serde_json::json!({"doc_format": "memo", "schema": "absent", "round": 1, "seat_count": 3, "fallback": false}),
+            ),
+            line(
+                "doc_rule_checks_recorded",
+                serde_json::json!({"state": "draft", "doc_format": "prd", "moment": "later", "entries": []}),
+            ),
+            line(
+                "doc_section_recorded",
+                serde_json::json!({"state": "draft", "doc_format": "prd", "section": "other", "write": "append"}),
+            ),
+            line(
+                "doc_fix_recorded",
+                serde_json::json!({"state": "draft", "doc_format": "design", "answers": "jury_fail"}),
             ),
         ] {
             let log = write_temp(&format!("{}\n{}\n", anchored_header_line(), bad));

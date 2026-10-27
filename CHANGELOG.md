@@ -88,6 +88,22 @@ to `0.9.x`).
   most 200 entries and a session 2,000 review events; one invalid entry
   refuses the whole batch, and errors never repeat a value the caller gave.
   Nothing routes on the events.
+- **`koto review record` records a document's drafting as telemetry.**
+  Three more subcommands: `rule-checks --doc-format --moment --file` (each
+  check-held rule's outcome, `pass`, `fail`, `not_ready` or `error`, at
+  `pre_jury`, `post_fix` or `post_create`), `section-written --doc-format
+  --section --write first|rewrite`, and `fix --doc-format --answers
+  jury_fail|check_fail [--round 1-50] --file` (entries of rule, section and
+  the check rule that decides it, or `none`). Each call appends one event,
+  `doc_rule_checks_recorded`, `doc_section_recorded` or `doc_fix_recorded`,
+  and the run journal relays one `doc_rule_checked`, `doc_section_written`
+  or `doc_fix_applied` record per entry, every record of a call under its
+  `koto.seq` and carrying the session's state and `koto.doc.format`.
+  `round-started`, `verdicts` and `decision` take an optional
+  `--doc-format`, which adds `koto.doc.format` and accepts `vision`,
+  `strategy` and `roadmap`, for which `koto.doc.type` is left out. The
+  session cap of 2,000 now counts review entries, one per entry of a batch
+  call. Checks and refusals work as for the four review events.
 - **`KOTO_HOME` moves the whole koto root (koto#459).** Sessions, the
   request store, `config.toml`, the terminal index, coordinator cursors,
   wake files, the decider ledger, the run journal and the root
