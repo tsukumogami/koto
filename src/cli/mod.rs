@@ -4461,6 +4461,52 @@ fn promote_leg_result(
     }
 }
 
+/// Answer a self-attached leg when its session is cancelled.
+///
+/// A cancel never reaches a terminal tick, so nothing else would promote
+/// onto the leg, and a self-attached leg refuses the fenced verbs,
+/// `abandon` among them, so its requester could not close it either. The
+/// cancel promotes a failure itself, with `final_state` `cancelled`, the
+/// name `request_store::attach` and `init_entry` already give a cancelled
+/// session. A leg a coordinator bound is left alone: its requester can
+/// still abandon it under the epoch fence. That is why the leg is read
+/// here before `promote_leg_result`, which would promote onto any leg.
+#[cfg(unix)]
+fn promote_cancel_onto_self_attached_leg(session_dir: &std::path::Path, state: &str) {
+    use crate::engine::request_store::{self, ValidatedRequestId};
+    use crate::engine::types::{LegDisposition, TerminalOutcome, WorkflowResult};
+
+    let Some(pointer) = crate::engine::leg_pointer::read_pointer_best_effort(session_dir) else {
+        return;
+    };
+    let (Some(root), Ok(request_id)) = (
+        crate::koto_home::koto_home(),
+        ValidatedRequestId::new(&pointer.request_id),
+    ) else {
+        return;
+    };
+    let open_self_attached = match request_store::read_view(&root, &request_id) {
+        Ok(view) => view
+            .leg(&pointer.leg_name)
+            .is_ok_and(|leg| leg.disposition == LegDisposition::Open && leg.is_self_attached()),
+        Err(e) => {
+            eprintln!("warning: leg result promotion skipped: {e}");
+            false
+        }
+    };
+    if !open_self_attached {
+        return;
+    }
+    let result = WorkflowResult::with_string_payload(
+        TerminalOutcome::Failure,
+        format!("cancelled in state '{state}'"),
+        [("outcome", "cancelled"), ("state", state)],
+    );
+    // No later tick retries a cancel, so a retryable failure is only
+    // warned about, as promote_leg_result already does.
+    promote_leg_result(&pointer, &result, "cancelled");
+}
+
 // ===========================================================
 // The bound delegate's leg, and the abandonment notice
 // ===========================================================
@@ -8842,7 +8888,9 @@ fn query_children(backend: &dyn SessionBackend, parent_name: &str) -> Vec<serde_
 /// Handle the `koto cancel` command.
 ///
 /// Appends a `WorkflowCancelled` event to the event log. Rejects double-cancel
-/// and cancel of already-terminal workflows. When `cleanup` is true, also
+/// and cancel of already-terminal workflows. A session self-attached to a
+/// request leg answers it with a cancelled result
+/// ([`promote_cancel_onto_self_attached_leg`]). When `cleanup` is true, also
 /// removes the session directory after the event is written so the name can
 /// be reused without a separate `koto session cleanup` call; the output then
 /// names, under `live_members`, every other live member of its hierarchy in
@@ -8959,6 +9007,10 @@ fn handle_cancel(
             "command": "cancel"
         }));
     }
+
+    // Before any `--cleanup` removal, which takes the leg pointer with it.
+    #[cfg(unix)]
+    promote_cancel_onto_self_attached_leg(&backend.session_dir(name), current_state);
 
     let children = query_children(backend, name);
 

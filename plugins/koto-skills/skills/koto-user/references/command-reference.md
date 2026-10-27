@@ -520,7 +520,7 @@ The epoch recorded on the bind event is read from the child's header, not from y
 
 A root session that attaches itself also gets a dispatched-by link naming the request's `requested_by`, in its own context only (see `koto session link`). With `--issued-by` naming anyone other than the session, the attach still binds the leg but writes no link.
 
-On a self-attached leg, `progress`, `resolve`, and `abandon` are refused with `self_attached_leg` whatever `--dispatch-epoch` says. The result arrives when the session reaches a terminal state, including under `koto next --no-cleanup`. `abandon-request` and `close` still work. A dispatched child passed to `attach` is bound exactly as `bind` binds it; any other child is refused with `child_not_fenceable`.
+On a self-attached leg, `progress`, `resolve`, and `abandon` are refused with `self_attached_leg` whatever `--dispatch-epoch` says. The result arrives when the session reaches a terminal state, including under `koto next --no-cleanup`; `koto cancel` answers the leg with a `failure` result, payload `outcome: cancelled`, `result_final_state` `cancelled`. `abandon-request` and `close` still work. A dispatched child passed to `attach` is bound exactly as `bind` binds it; any other child is refused with `child_not_fenceable`.
 
 ### wait
 
