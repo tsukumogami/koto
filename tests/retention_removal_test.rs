@@ -1208,18 +1208,19 @@ fn under_the_cloud_backend_reads_of_another_session_leave_it_byte_identical() {
         "the spool reached the bucket"
     );
 
-    // An own read, from b's own agent session outside any tick, goes into
-    // b's log under the cloud backend too, not to the spool.
+    // A read from b's own agent session outside any tick writes nothing into
+    // b either: it goes to the spool, and b's log and objects are unchanged.
     let spooled = env.spooled("b").len();
-    let events = env.events_text("b").len();
+    let events = env.events_text("b");
     let out = env.run(&["context", "get", "b", "notes/b"], &own);
     assert!(out.status.success(), "own read: {out:?}");
-    let added = &env.events_text("b")[events..];
-    assert_eq!(added.len(), 1, "{added:?}");
-    let read: Value = serde_json::from_str(&added[0]).unwrap();
-    assert_eq!(read["type"], "context_read");
-    assert!(read["payload"].get("session").is_none());
-    assert_eq!(env.spooled("b").len(), spooled, "an own read was spooled");
+    assert_eq!(env.events_text("b"), events);
+    assert_eq!(objects("b"), before, "b's objects in the bucket changed");
+    assert_eq!(
+        env.spooled("b").len(),
+        spooled + 1,
+        "the read wasn't spooled"
+    );
 }
 
 #[test]
