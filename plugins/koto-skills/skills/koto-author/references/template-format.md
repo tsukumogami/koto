@@ -832,6 +832,67 @@ session never starts or resumes on it; compile the template again from its
 source. The full reference is `docs/guides/decider-authoring.md` ("Checking
 the agent's work").
 
+#### Unit mode: grading each item on its own
+
+A check whose output is a list of items (acceptance criteria, sections,
+findings) can grade each one apart with `units: jsonl`. The command then prints
+one JSON object per line, `{"key": "ac-1", "text": "...", "document": "prd",
+"section": "acceptance-criteria"}`, where `key` and `text` are required and
+`document` and `section` are optional. Each unit is graded against each
+criterion on its own, and only that unit's text is sent:
+
+```yaml
+gates:
+  acceptance:
+    type: decider-check
+    command: "cat units.jsonl"
+    max_bytes: 512             # now the budget for one unit's text
+    units: jsonl
+    max_units: 8               # optional: grade at most this many units
+    unit_document: prd         # optional: the label the run journal exports
+    unit_section: acceptance-criteria
+    criteria:
+      ac_binary:
+        rule_ref: "https://example.org/rules/ac-binary"
+        question: "Can this acceptance criterion be checked pass or fail with no judgment?"
+        pass: "It names one observable outcome a tester can check."
+        fail: "It needs judgment, or names no observable outcome."
+        escape: "It isn't an acceptance criterion."
+        mode: veto
+        summary: "State one observable outcome per criterion."     # optional, 1-300 bytes
+        rule_text: "Each acceptance criterion names one observable outcome a tester can check without judgment."  # optional, 1-4096 bytes
+```
+
+- **The unit bound.** One `koto next` sends at most 32 unit consultations, a
+  budget apart from the four-consultation cap routing and single-slice checks
+  share. The compiler sums `max_units` times criteria over a state's unit-mode
+  checks and refuses more than 32. A check without `max_units` gets the
+  default share: 32 divided by the criteria across the state's unit-mode
+  checks, rounded down (16 for a two-criterion check alone), or of what the
+  checks declaring `max_units` leave. Units past the cap fall back with
+  `unit_limit`.
+- **Per-unit outcomes.** A failing unit gives an error finding whose `unit`
+  names it, and `output.units` lists every printed unit in order with the
+  criteria it `failed`, is `awaiting` on, or the agent answered. A unit over
+  `max_bytes`, or one the decider gives no verdict for, falls back to the agent
+  alone; its waiting finding's command carries `--unit <key>`. An empty unit
+  isn't graded. A line that isn't such an object, a key outside the name shape
+  below (one starting with `-`, say), or a key printed twice fails the
+  extraction (`extraction_failed`) and names no unit.
+- **The labels.** `unit_document` and `unit_section` are names (letters,
+  digits and `._:/@-`, 1 to 128 bytes, not starting with `/`, `~` or `-`). The
+  run journal exports them in place of what the extraction printed, which it
+  only ever exports as a digest. They don't move the declaration hash.
+- **The rule coming back.** A veto criterion that fails hands its rule back in
+  the blocking condition's `rules`: `summary` on the first failing evaluation
+  of that check and rule in the visit, `rule_text` on every one after it. A
+  criterion declaring only one gets that one; declaring neither adds nothing.
+  Shadow criteria deliver nothing. Both texts work on single-slice checks too.
+
+`max_units`, `unit_document` and `unit_section` belong to unit-mode checks
+only (`E-DECIDER-CHECK-UNITS`); an empty or over-long `summary` or `rule_text`
+is `E-DECIDER-CHECK-RULE`.
+
 ### Findings: telling the agent why a check failed
 
 A failed `command`, `context-exists` or `context-matches` gate, and a failed `default_action`, carry a `failure` object on their blocking condition beside `output`. It holds `findings`, `findings_truncated`, and for command gates and actions the `captured` streams. None of it is routable: `when` clauses, `override_default` and recorded overrides see only the fields in the table above.

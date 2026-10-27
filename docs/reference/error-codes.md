@@ -329,7 +329,7 @@ for real on every tick. The same gate reports `agent_actionable: false` in
 the decider gave no verdict on. A missing session prints the flat format with
 exit 1. A session log that can't be read exits with the code its read error
 carries, and an unreadable template exits 3, as `koto overrides record` does.
-Three refusals carry a typed code, each with exit code 2 and nothing appended
+Six refusals carry a typed code, each with exit code 2 and nothing appended
 to the state log. The `error` object names the `gate`, the
 `criterion` and, once the session is loaded, the `state`.
 
@@ -355,6 +355,33 @@ answer:
 
 ```json
 {"error":{"code":"no_fallback","message":"criterion 'comment_reason' of 'comments' has not fallen back to you in this visit to 'review': only a criterion the decider gave no verdict on takes your answer","gate":"comments","criterion":"comment_reason","state":"review"},"command":"decider answer"}
+```
+
+For a check that grades units, `no_fallback` also means the `--unit` key was
+printed by the check's latest evaluation but has no pending fallback for the
+criterion there: the decider gave that unit a verdict.
+
+**`unit_required`** -- the criterion's pending fallbacks in the check's latest
+evaluation name units, and no `--unit` was given. Answer one unit at a time,
+with the `--unit <key>` the waiting finding's command carries:
+
+```json
+{"error":{"code":"unit_required","message":"criterion 'ac_binary' of 'ac_binary' is waiting on your answer for units; name the unit with --unit, as the waiting finding does","gate":"ac_binary","criterion":"ac_binary","state":"review"},"command":"decider answer"}
+```
+
+**`unit_not_expected`** -- `--unit` was given, but the check doesn't grade
+units, or the criterion's pending fallbacks in its latest evaluation name none
+(an extraction that failed, say). Answer without `--unit`:
+
+```json
+{"error":{"code":"unit_not_expected","message":"criterion 'comment_reason' of 'comments' isn't waiting on a unit; answer without --unit","gate":"comments","criterion":"comment_reason","state":"review"},"command":"decider answer"}
+```
+
+**`unknown_unit`** -- the `--unit` key isn't one the check's latest evaluation
+printed, including a unit that has since left the extraction's output:
+
+```json
+{"error":{"code":"unknown_unit","message":"the latest evaluation of 'ac_binary' printed no unit 'ac-99'; run koto next and answer a unit its waiting findings name","gate":"ac_binary","criterion":"ac_binary","state":"review"},"command":"decider answer"}
 ```
 
 ### disputes record
@@ -600,7 +627,7 @@ Fix: set the answer's mode to `shadow` or `never`. Nothing else in the template 
 
 A `decider-check` gate (see `docs/guides/decider-authoring.md`, "Checking the agent's work") has these compile-time errors. Each fails compilation, both when a source template compiles and when a cached compiled template is loaded, and each message names the state, the check and, where there is one, the criterion. None is relaxed by `--allow-legacy-gates`.
 
-**E-DECIDER-CHECK-FIELD (error)**: a required part is missing or of the wrong type: an empty command, no criteria, a criterion without `rule_id`, `rule_ref`, `question`, `pass`, `fail` or `escape` (each non-empty; `rule_id` at most 128 bytes and `rule_ref` at most 512), an unknown key in a criterion, a gate key a decider check doesn't take, or `max_bytes`, `label` or `criteria` on a gate that isn't a decider check.
+**E-DECIDER-CHECK-FIELD (error)**: a required part is missing or of the wrong type: an empty command, no criteria, a criterion without `rule_id`, `rule_ref`, `question`, `pass`, `fail` or `escape` (each non-empty; `rule_id` at most 128 bytes and `rule_ref` at most 512), an unknown key in a criterion, a gate key a decider check doesn't take, or `max_bytes`, `label`, `criteria` or `units` on a gate that isn't a decider check.
 
 ```
 E-DECIDER-CHECK-FIELD: state "review" check "g" criterion "r1": question must be non-empty; the decider reads it as part of the question
@@ -633,6 +660,37 @@ E-DECIDER-CHECK-BUDGET: state "review" check "g": max_bytes 0 is outside 1 to 81
 ```
 E-DECIDER-CHECK-LABEL: state "review" check "g": label "has space" must be 1 to 64 bytes of letters, digits, `_` and `-`
   remedy: rename the label, or omit it for "artifact"
+```
+
+**E-DECIDER-CHECK-UNITS (error)**: a check's unit declaration is refused. The cases:
+
+- `units` is set to something other than `jsonl`, the one way a check's extraction can print units.
+- `max_units` isn't a whole number of at least 1.
+- `max_units`, `unit_document` or `unit_section` is set on a check without `units: jsonl`. The error names the field.
+- `unit_document` or `unit_section` isn't a string in koto's name shape: 1 to 128 bytes of letters, digits and `._:/@-`, not starting with `/`, `~` or `-`.
+- A state's unit-mode checks declare `max_units` times criteria summing to more than 32, the most unit consultations one `koto next` sends. The error names the state and the sum.
+- A unit-mode check without `max_units` is compiled with 32 divided by the criteria across the state's unit-mode checks, rounded down; when some checks declare `max_units`, it divides what they leave. A state whose declared checks leave less than one unit per remaining criterion is refused, naming the state and the checks without `max_units`.
+
+```
+E-DECIDER-CHECK-UNITS: state "review" check "g": units must be one of jsonl, found String("csv")
+  remedy: set units to jsonl, or omit it to grade the whole output as one slice
+```
+
+```
+E-DECIDER-CHECK-UNITS: state "review": its unit-mode checks' max_units times criteria sum to 33; a state may declare at most 32
+  remedy: lower max_units, or move a check to another state
+```
+
+```
+E-DECIDER-CHECK-UNITS: state "review" check "g": max_units is only allowed on a check with units: jsonl
+  remedy: set units: jsonl, or remove max_units
+```
+
+**E-DECIDER-CHECK-RULE (error)**: a criterion's `summary` is empty or over 300 bytes, or its `rule_text` is empty or over 4,096 bytes. Either text is handed back in `koto next` when the criterion fails, so it has to fit a response.
+
+```
+E-DECIDER-CHECK-RULE: state "review" check "g" criterion "ac_binary": summary must be 1 to 300 bytes, found 0
+  remedy: write the summary within 300 bytes, or omit it
 ```
 
 **E-DECIDER-CHECK-DUPLICATE (error)**: two criteria on one state, in the same check or different ones, share a `rule_id`.

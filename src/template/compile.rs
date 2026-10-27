@@ -494,6 +494,22 @@ struct SourceGate {
     /// criterion, in declaration order.
     #[serde(default)]
     criteria: Option<serde_yaml_ng::Value>,
+    /// A `decider-check` gate's unit mode, kept raw so a value other than
+    /// `jsonl` is refused with `E-DECIDER-CHECK-UNITS` naming the check.
+    #[serde(default)]
+    units: Option<serde_yaml_ng::Value>,
+    /// A `decider-check` gate's per-evaluation unit cap, kept raw so a value
+    /// that isn't a whole number of at least 1 is refused with
+    /// `E-DECIDER-CHECK-UNITS` naming the check.
+    #[serde(default)]
+    max_units: Option<serde_yaml_ng::Value>,
+    /// A `decider-check` gate's unit document and section names, kept raw so
+    /// a value that isn't a name-shaped string is refused with
+    /// `E-DECIDER-CHECK-UNITS` naming the check.
+    #[serde(default)]
+    unit_document: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    unit_section: Option<serde_yaml_ng::Value>,
     /// Every key the fields above don't name. `SourceState` uses
     /// `deny_unknown_fields`, but serde's error for it surfaces only as the
     /// outer "failed to parse front-matter" context, which names neither the
@@ -536,6 +552,10 @@ const SOURCE_GATE_KEYS: &[&str] = &[
     "max_bytes",
     "label",
     "criteria",
+    "units",
+    "max_units",
+    "unit_document",
+    "unit_section",
 ];
 
 /// The keys a decider-check criterion may carry.
@@ -547,6 +567,8 @@ const SOURCE_CRITERION_KEYS: &[&str] = &[
     "escape",
     "threshold",
     "mode",
+    "summary",
+    "rule_text",
 ];
 
 /// Compile a YAML/Markdown template source file to a FormatVersion=1 CompiledTemplate.
@@ -602,6 +624,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
             let gate = compile_gate(state_name, gate_name, source_gate)?;
             compiled_gates.insert(gate_name.clone(), gate);
         }
+        resolve_unit_caps(state_name, &mut compiled_gates)?;
 
         // Transform source transitions to compiled transitions.
         let compiled_transitions: Vec<Transition> = source_state
@@ -977,6 +1000,10 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
         ("max_bytes", source.max_bytes.is_some()),
         ("label", source.label.is_some()),
         ("criteria", source.criteria.is_some()),
+        ("units", source.units.is_some()),
+        ("max_units", source.max_units.is_some()),
+        ("unit_document", source.unit_document.is_some()),
+        ("unit_section", source.unit_section.is_some()),
     ] {
         if present {
             return Err(anyhow!(
@@ -1182,8 +1209,8 @@ fn compile_decider_check(
     overridable: bool,
 ) -> anyhow::Result<Gate> {
     use super::decider_check::{
-        CheckCriterion, CheckMode, DeciderCheckSpec, DEFAULT_CHECK_LABEL, DEFAULT_CHECK_MAX_BYTES,
-        DEFAULT_CHECK_THRESHOLD,
+        CheckCriterion, CheckMode, DeciderCheckSpec, UnitsMode, DEFAULT_CHECK_LABEL,
+        DEFAULT_CHECK_MAX_BYTES, DEFAULT_CHECK_THRESHOLD,
     };
     let err = |code: &str, detail: String, remedy: &str| {
         anyhow!(
@@ -1259,6 +1286,52 @@ fn compile_decider_check(
             ))
         }
     };
+    let units = match &source.units {
+        None => None,
+        Some(v) => match v.as_str().and_then(UnitsMode::parse) {
+            Some(mode) => Some(mode),
+            None => {
+                return Err(err(
+                    "E-DECIDER-CHECK-UNITS",
+                    format!(
+                        ": units must be one of {}, found {:?}",
+                        UnitsMode::NAMES.join(", "),
+                        v
+                    ),
+                    "set units to jsonl, or omit it to grade the whole output as one slice",
+                ))
+            }
+        },
+    };
+    let max_units = match &source.max_units {
+        None => None,
+        Some(v) => match v.as_u64() {
+            Some(n) if (1..=u64::from(u32::MAX)).contains(&n) => Some(n as u32),
+            _ => {
+                return Err(err(
+                    "E-DECIDER-CHECK-UNITS",
+                    format!(
+                        ": max_units must be a whole number of units, at least 1, found {:?}",
+                        v
+                    ),
+                    "set max_units to the most units one evaluation grades, or omit it",
+                ))
+            }
+        },
+    };
+    // The name shape and the unit-mode rule are `validate_spec`'s, so a
+    // cached template gets them too; only the type is checked here.
+    let unit_label = |key: &str, raw: &Option<serde_yaml_ng::Value>| match raw {
+        None => Ok(None),
+        Some(serde_yaml_ng::Value::String(s)) => Ok(Some(s.clone())),
+        Some(v) => Err(err(
+            "E-DECIDER-CHECK-UNITS",
+            format!(": {} must be a string, found {:?}", key, v),
+            "set it to a short name such as prd, or omit it",
+        )),
+    };
+    let unit_document = unit_label("unit_document", &source.unit_document)?;
+    let unit_section = unit_label("unit_section", &source.unit_section)?;
     let mut criteria = Vec::new();
     match &source.criteria {
         None => {}
@@ -1315,6 +1388,16 @@ fn compile_decider_check(
                 let pass = text("pass")?;
                 let fail = text("fail")?;
                 let escape = text("escape")?;
+                // Absent stays absent; a present but empty text is
+                // refused by `validate_spec` with E-DECIDER-CHECK-RULE.
+                let summary = match fields.get("summary") {
+                    None => None,
+                    Some(_) => Some(text("summary")?),
+                };
+                let rule_text = match fields.get("rule_text") {
+                    None => None,
+                    Some(_) => Some(text("rule_text")?),
+                };
                 let threshold = match fields.get("threshold") {
                     None => DEFAULT_CHECK_THRESHOLD,
                     Some(v) => v.as_f64().ok_or_else(|| {
@@ -1358,6 +1441,8 @@ fn compile_decider_check(
                     escape,
                     threshold,
                     mode,
+                    summary,
+                    rule_text,
                 });
             }
         }
@@ -1390,8 +1475,38 @@ fn compile_decider_check(
             max_bytes,
             label,
             criteria,
+            units,
+            max_units,
+            unit_document,
+            unit_section,
         }),
     })
+}
+
+/// Write each unit-mode check on one state that declares no `max_units`
+/// its share of the state's unit bound (`unit_caps`), so the compiled spec
+/// carries the cap the evaluator applies. Refused with
+/// `E-DECIDER-CHECK-UNITS` when the declared caps leave no share.
+fn resolve_unit_caps(state_name: &str, gates: &mut BTreeMap<String, Gate>) -> anyhow::Result<()> {
+    use super::decider_check::{unit_caps, DeciderCheckSpec};
+    let checks: Vec<(&str, &DeciderCheckSpec)> = gates
+        .iter()
+        .filter(|(_, g)| g.gate_type == GATE_TYPE_DECIDER_CHECK)
+        .filter_map(|(n, g)| g.decider_check.as_ref().map(|s| (n.as_str(), s)))
+        .collect();
+    if checks.is_empty() {
+        return Ok(());
+    }
+    let caps = unit_caps(state_name, &checks).map_err(|e| anyhow!("validation error: {}", e))?;
+    let names: Vec<String> = checks.iter().map(|(n, _)| n.to_string()).collect();
+    for (name, cap) in names.iter().zip(caps) {
+        if let Some(spec) = gates.get_mut(name).and_then(|g| g.decider_check.as_mut()) {
+            if spec.units.is_some() {
+                spec.max_units = cap;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Convert a `request-leg` gate's raw `expect` value into its compiled form.

@@ -1253,6 +1253,99 @@ pub fn attach_attempts(
     Ok(())
 }
 
+/// Add a `rules` array to each blocking decider-check condition whose
+/// `output.failed` names a criterion that declares a `summary` or a
+/// `rule_text` (DESIGN-doc-rule-checks-m4.md, Decision 4), and return one
+/// [`RuleDelivered`](crate::decider::check::RuleDelivered) per entry added,
+/// for the caller to append once the response has printed.
+///
+/// Each entry has `rule_id`, `level`, `text` and, in unit mode, `units`:
+/// the keys of the units in `output.units` that failed the criterion, in
+/// print order. The level comes from the rule's per-visit count in
+/// `attempts`, which already counts the evaluation being reported: the
+/// summary on the first failing evaluation in the visit, the full text on
+/// every later one, the one declared text when only one is. A rule the
+/// counts leave out (no `attempts`, or a cap dropped it) gets the summary,
+/// the level that never over-delivers. A condition with no such criterion
+/// is left byte-identical.
+pub fn attach_rules(
+    envelope: &mut serde_json::Map<String, serde_json::Value>,
+    state: &str,
+    gates: &BTreeMap<String, Gate>,
+    attempts: Option<&crate::engine::advance::AttemptCounts>,
+) -> Vec<crate::decider::check::RuleDelivered> {
+    let mut delivered = Vec::new();
+    let Some(conditions) = envelope
+        .get_mut("blocking_conditions")
+        .and_then(|b| b.as_array_mut())
+    else {
+        return delivered;
+    };
+    for cond in conditions.iter_mut() {
+        let Some(gate) = cond["name"].as_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(spec) = gates.get(&gate).and_then(|g| g.decider_check.as_ref()) else {
+            continue;
+        };
+        let failed: Vec<String> = cond["output"]["failed"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let units = cond["output"]["units"].as_array().cloned();
+        let mut rules = Vec::new();
+        for rule_id in failed {
+            let Some(criterion) = spec.criteria.iter().find(|c| c.rule_id == rule_id) else {
+                continue;
+            };
+            let visit = attempts
+                .and_then(|a| a.rules.get(&gate))
+                .and_then(|r| r.get(&rule_id))
+                .map(|c| c.visit);
+            let Some((level, text)) = criterion.rule_for(visit) else {
+                continue;
+            };
+            let mut entry = serde_json::json!({
+                "rule_id": rule_id,
+                "level": level.as_str(),
+                "text": text,
+            });
+            let unit_count = units.as_ref().map(|units| {
+                let keys: Vec<serde_json::Value> = units
+                    .iter()
+                    .filter(|u| {
+                        u["failed"]
+                            .as_array()
+                            .is_some_and(|f| f.iter().any(|id| id == rule_id.as_str()))
+                    })
+                    .map(|u| u["key"].clone())
+                    .collect();
+                let count = keys.len() as u64;
+                entry["units"] = serde_json::Value::Array(keys);
+                count
+            });
+            rules.push(entry);
+            delivered.push(crate::decider::check::RuleDelivered {
+                state: state.to_string(),
+                gate: gate.clone(),
+                rule_id,
+                level,
+                unit_count,
+            });
+        }
+        if !rules.is_empty() {
+            if let Some(obj) = cond.as_object_mut() {
+                obj.insert("rules".to_string(), serde_json::Value::Array(rules));
+            }
+        }
+    }
+    delivered
+}
+
 /// The top-level key a `koto next` response carries a passing check's
 /// `warning` findings under.
 pub const ADVISORIES_KEY: &str = "advisories";

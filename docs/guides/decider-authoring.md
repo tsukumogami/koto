@@ -664,6 +664,97 @@ criterion, by reason, and a criterion whose fallbacks are mostly
 failing one, but it isn't how a waiting criterion is meant to be resolved:
 an override skips the judgment, while an answer records it.
 
+### Grading units one at a time
+
+A slice that holds a list (a PRD's acceptance criteria, a design's
+decisions) is better graded item by item: the spike measured one item at a
+time, and a single verdict over twenty items can't say which one broke the
+rule. Declare `units: jsonl` and have the command print one JSON object per
+line:
+
+```yaml
+      acceptance:
+        type: decider-check
+        command: "cat units.jsonl"
+        max_bytes: 512
+        units: jsonl
+        max_units: 8
+        unit_document: prd
+        unit_section: acceptance-criteria
+        criteria:
+          ac_binary:
+            # rule_ref, question, pass, fail, escape and mode as above
+            summary: "State one observable outcome per criterion."
+            rule_text: "Each acceptance criterion names one observable outcome a tester can check without judgment."
+```
+
+```text
+{"key": "ac-1", "text": "The export finishes within a minute.", "document": "prd", "section": "acceptance-criteria"}
+{"key": "ac-2", "text": "The export feels fast."}
+```
+
+`key` and `text` are required; `document` and `section` are optional. Keys
+are names (letters, digits and `._:@/-`, up to 128 bytes, not starting with
+`/` or `-`) and must be unique. A line that breaks either rule fails the
+extraction, with every criterion `unanswered` and no unit named.
+
+Each unit is asked about each criterion in its own request, with only that
+unit's text as input, and `max_bytes` now bounds one unit. A unit over it,
+or one the decider gives no verdict for, falls back to the agent on its own
+while the others keep their verdicts; an empty unit isn't graded. The
+check's output gains `units`, one entry per printed unit in print order with
+its `key` and the criteria it `failed`, is `awaiting` on, or that the agent
+answered. Each failing unit is an error finding with a `unit` field naming
+it, and each waiting unit is a warning finding whose command carries
+`--unit <key>`:
+
+```bash
+koto decider answer <session> --gate <check> --criterion <rule_id> --unit <key> --answer <pass|fail|unclear>
+```
+
+The answer applies to that unit only. `koto decider answer` refuses a unit
+check's answer without `--unit` (`unit_required`), a `--unit` on a check
+that isn't waiting on one (`unit_not_expected`), and a key the latest
+evaluation didn't print (`unknown_unit`).
+
+Unit consultations draw on their own budget of 32 per `koto next`, apart
+from the four-consultation cap routing questions and single-slice checks
+share, so grading a list never starves a routing question. The compiler
+holds a state to it: `max_units` times criteria, summed over the state's
+unit-mode checks, may not pass 32 (`E-DECIDER-CHECK-UNITS`). A check that
+doesn't declare `max_units` is given an equal share of what's left: 32
+divided by the criteria across the state's unit-mode checks, rounded down.
+Units past a check's cap fall back with `unit_limit`.
+
+`unit_document` and `unit_section` are the labels the run journal exports
+for the check's units. The journal never holds what the extraction printed:
+a unit's key goes out as a digest, and so do its document and section when
+the check declares no label. The labels don't change the declaration hash.
+
+### Handing the rule back
+
+A finding that only says a criterion failed leaves the agent guessing at
+the rule. A criterion can carry the rule itself: `summary` (1 to 300 bytes)
+and `rule_text` (1 to 4,096 bytes), each optional, refused outside those
+bounds with `E-DECIDER-CHECK-RULE`. When a veto criterion fails, the
+blocking condition in `koto next` carries `rules`, one entry per failing
+criterion that declares either text:
+
+```json
+"rules": [
+  {"rule_id": "ac_binary", "level": "summary", "text": "State one observable outcome per criterion.", "units": ["ac-2"]}
+]
+```
+
+The first failing evaluation of a check and rule in a visit gets the
+`summary`; every one after it gets the `rule_text` (`level` `full`), so an
+agent that didn't fix the problem from the short form reads the whole rule.
+A new visit starts at the summary again. A criterion that declares only one
+text always gets that one, and one that declares neither adds no entry.
+`units` lists the failing units' keys in unit mode and is absent otherwise.
+Shadow criteria hand nothing back. Each entry appends a `rule_delivered`
+event, which never holds the text.
+
 ### What's recorded for a check
 
 Each consultation appends a `decider_checked` event just before the gate's
@@ -671,7 +762,9 @@ Each consultation appends a `decider_checked` event just before the gate's
 the criterion, its declaration hash, the effective mode, the probabilities,
 the outcome, the model, a hash and length of the slice, the token counts, and
 the attempts. An override of a failed check adds one `check_overridden`
-line per failed criterion. None of them holds the slice. `koto decider
+line per failed criterion. None of them holds the slice. In unit mode each
+unit's consultation is its own event and its own `checked` line, carrying the
+unit's key and the check's declared labels. `koto decider
 report` tallies them per criterion; a criterion that escapes or goes
 unanswered on everything shows as a no-op there, not as silent approval.
 Unanswered consultations are split by reason and grouped by cause:

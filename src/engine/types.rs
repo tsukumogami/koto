@@ -1600,6 +1600,12 @@ pub enum EventPayload {
     /// The agent's answer to a criterion that fell back to it, appended by
     /// `koto decider answer`. Additive, and degrades like `decider_checked`.
     DeciderCheckAnswered(crate::decider::check::DeciderCheckAnswered),
+    /// A failed decider-check criterion's rule, handed back in a printed
+    /// `koto next` response, at `summary` or `full`
+    /// (DESIGN-doc-rule-checks-m4.md, Decision 4). Appended after the
+    /// print, one per `rules` entry; never holds the rule's text. Additive,
+    /// and degrades like `decider_checked`.
+    RuleDelivered(crate::decider::check::RuleDelivered),
     /// A dispute of one rule's finding at a gate, appended by
     /// `koto disputes record`. Nothing the advance loop routes on reads it.
     /// Additive: an older build lands it in `Unknown`, and a payload this
@@ -1972,6 +1978,7 @@ impl EventPayload {
             EventPayload::DeciderChecked(_) => "decider_checked",
             EventPayload::DeciderFallback(_) => "decider_fallback",
             EventPayload::DeciderCheckAnswered(_) => "decider_check_answered",
+            EventPayload::RuleDelivered(_) => "rule_delivered",
             EventPayload::FindingDisputed(_) => FINDING_DISPUTED,
             EventPayload::AnchorStarted(_) => ANCHOR_STARTED,
             EventPayload::AnchorActivity(_) => ANCHOR_ACTIVITY,
@@ -2436,6 +2443,17 @@ impl<'de> Deserialize<'de> for Event {
                     payload_val.clone(),
                 ) {
                     Ok(a) => EventPayload::DeciderCheckAnswered(a),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            "rule_delivered" => {
+                match serde_json::from_value::<crate::decider::check::RuleDelivered>(
+                    payload_val.clone(),
+                ) {
+                    Ok(r) => EventPayload::RuleDelivered(r),
                     Err(_) => EventPayload::Unknown {
                         type_name: event_type.clone(),
                         raw_payload: payload_val.clone(),
@@ -3928,6 +3946,8 @@ mod tests {
             latency_ms: 0,
             error_class: None,
             endpoint_origin: None,
+            unit: None,
+            unit_labels: None,
         });
         assert_eq!(p.type_name(), "decider_checked");
         let e = Event {
@@ -3965,6 +3985,8 @@ mod tests {
             reason: UnansweredReason::OverBudget,
             input_sha256: Some("a".repeat(64)),
             input_bytes: Some(2561),
+            unit: None,
+            unit_labels: None,
         });
         let answered = EventPayload::DeciderCheckAnswered(DeciderCheckAnswered {
             state: "review".into(),
@@ -3975,6 +3997,8 @@ mod tests {
             input_sha256: Some("a".repeat(64)),
             answer: AgentAnswer::Pass,
             fallback_seq: 5,
+            unit: None,
+            unit_labels: None,
         });
         for (p, name) in [
             (fallback, "decider_fallback"),

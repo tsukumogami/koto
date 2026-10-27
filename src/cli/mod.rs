@@ -5683,6 +5683,9 @@ fn handle_next(
     // The per-call consultation cap, shared by the routing decider's port and
     // the check evaluator.
     let consult_budget = crate::cli::check_evaluator::ConsultBudget::new();
+    // The per-call unit budget unit-mode checks draw from, apart from the
+    // shared cap so units never spend the routing decider's allowance.
+    let unit_budget = crate::cli::check_evaluator::UnitBudget::new();
 
     // Check for reserved variable name collisions in the template.
     for reserved in crate::cli::vars::RESERVED_VARIABLE_NAMES {
@@ -5772,6 +5775,7 @@ fn handle_next(
             &command_env,
         )
         .with_ledger_root(ledger_root())
+        .with_unit_budget(unit_budget)
         // Every tick that consults waits for the lock; an evaluator built
         // without this tries it once.
         .with_lock_wait(crate::cli::check_evaluator::lock_wait_for(
@@ -7804,6 +7808,17 @@ fn handle_next(
             // response with blocking conditions
             // (DESIGN-koto-failure-reporting.md, Decision 3).
             next_types::attach_attempts(&mut envelope, attempts.as_ref())?;
+            // A failed decider check's rules, levelled by the counts just
+            // attached (DESIGN-doc-rule-checks-m4.md, Decision 4).
+            let rule_deliveries = match compiled.states.get(final_state.as_str()) {
+                Some(st) => next_types::attach_rules(
+                    &mut envelope,
+                    final_state,
+                    &st.gates,
+                    attempts.as_ref(),
+                ),
+                None => Vec::new(),
+            };
             // A passing check's warnings, after `attempts` and only when
             // there are any.
             next_types::attach_advisories(&mut envelope, &advisories)?;
@@ -7812,6 +7827,15 @@ fn handle_next(
                 "{}",
                 serde_json::to_string(&serde_json::Value::Object(envelope))?
             );
+            // Each rule handed back is recorded only after the print, as
+            // the delivery below is: a crash in between loses the record,
+            // never the delivery. The record holds no text.
+            for delivery in rule_deliveries {
+                let payload = EventPayload::RuleDelivered(delivery);
+                if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
+                    eprintln!("warning: failed to append RuleDelivered event: {}", e);
+                }
+            }
             // The delivery record is appended only after the response
             // prints, so a crash between the two re-delivers on the
             // next tick rather than silently suppressing

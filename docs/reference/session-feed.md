@@ -600,6 +600,12 @@ events:
       endpoint_origin:
         type: string
         required: false
+      unit:
+        type: object
+        required: false
+      unit_labels:
+        type: object
+        required: false
 
   decider_fallback:
     tier: 2
@@ -632,6 +638,12 @@ events:
       input_bytes:
         type: integer
         required: false
+      unit:
+        type: object
+        required: false
+      unit_labels:
+        type: object
+        required: false
 
   decider_check_answered:
     tier: 2
@@ -661,6 +673,32 @@ events:
       fallback_seq:
         type: integer
         required: true
+      unit:
+        type: object
+        required: false
+      unit_labels:
+        type: object
+        required: false
+
+  rule_delivered:
+    tier: 2
+    fields:
+      state:
+        type: string
+        required: true
+      gate:
+        type: string
+        required: true
+      rule_id:
+        type: string
+        required: true
+      level:
+        type: string
+        required: true
+        enum: ["summary", "full"]
+      unit_count:
+        type: integer
+        required: false
 
   finding_disputed:
     tier: 2
@@ -2090,6 +2128,8 @@ appends none.
 | `latency_ms` | integer | Yes | Wall time of the attempts, summed. |
 | `error_class` | string | No | How the last attempt failed, when it did: the routing decider's closed vocabulary (`timeout`, `connect`, `http_status`, `malformed`, `mismatched`). Consumers MUST tolerate values they don't recognize. |
 | `endpoint_origin` | string | No | Which configuration layer supplied the endpoint: `"default"`, `"user"` or `"env"`. A label, never a URL, host, query string or credential. |
+| `unit` | object | No | For a check in unit mode (`units: jsonl`), the unit graded, as its extraction printed it: `key`, and `document` and `section` when printed, each a name-shaped string. Absent for a check that grades one slice, and for a unit-mode check whose extraction failed or printed no unit. |
+| `unit_labels` | object | No | Beside `unit`, the names the check declares for its units: `document` (its `unit_document`) and `section` (its `unit_section`), each present only when declared. Absent when the check declares neither. They are what the run journal exports in place of the printed values. |
 
 **Not graded and escape** are both "not checkable" and stay distinct: `not_graded` means
 the slice was empty or only whitespace, so nothing was asked and nothing sent; `escape` means the
@@ -2145,6 +2185,8 @@ another.
 | `reason` | string | Yes | Why no verdict: `provider_error`, `unreadable_response`, `over_budget`, `extraction_failed`, `cap_spent` or `busy`. Consumers MUST tolerate other values; every value is a fixed identifier, never a message, path or instruction text. |
 | `input_sha256` | string | No | The slice's hash, as for `decider_checked`. Absent with `extraction_failed`, which has no slice. An answer binds to it. |
 | `input_bytes` | integer | No | Byte length of the redacted slice as captured. Present with `input_sha256`. Capture stops at 64 KiB, so 65,536 means at least that many. |
+| `unit` | object | No | For a check in unit mode, the unit handed back, as for `decider_checked`. An answer binds to it. |
+| `unit_labels` | object | No | The check's declared unit labels, as for `decider_checked`. |
 
 #### `decider_check_answered`
 
@@ -2180,10 +2222,44 @@ visit; the latest answer for a slice wins.
 | `input_sha256` | string | No | Copied from the fallback answered; absent when it had none. |
 | `answer` | string | Yes | `pass`, `fail` or `unclear` (the criterion's escape). |
 | `fallback_seq` | integer | Yes | The `seq` of the `decider_fallback` event answered. |
+| `unit` | object | No | Copied from the fallback answered, for a check in unit mode: the answer applies to that unit only. |
+| `unit_labels` | object | No | Copied from the fallback answered. |
 
 Neither event carries the slice, a question, a description, or anything the
 agent wrote beyond its one-word answer. An agent answer is never a decider
 verdict: it appends no `decider_checked` and no ledger line.
+
+#### `rule_delivered`
+
+Records that a `koto next` response handed back a failed criterion's rule:
+one event per entry in a blocking condition's `rules` list, appended after the
+response has printed. A crash between the two loses the record, never the
+delivery. A criterion that declares neither a `summary` nor a `rule_text`, and
+a shadow criterion, deliver nothing.
+
+```json
+{
+  "type": "rule_delivered",
+  "payload": {
+    "state": "review",
+    "gate": "ac_binary",
+    "rule_id": "ac_binary",
+    "level": "summary",
+    "unit_count": 2
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `state` | string | Yes | The state whose check failed. |
+| `gate` | string | Yes | The decider check's name. |
+| `rule_id` | string | Yes | The failed criterion's id. |
+| `level` | string | Yes | `summary` on the first failing evaluation of this check and rule in the visit, `full` on every later one; a criterion declaring only one text always gets that text's level. |
+| `unit_count` | integer | No | How many units the rule was handed back for. Present only for a check in unit mode. |
+
+The event never carries the rule's text: that lives in the compiled template
+and the printed response only.
 
 #### `finding_disputed`
 

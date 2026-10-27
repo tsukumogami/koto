@@ -176,6 +176,11 @@ pub struct Finding {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effect_landed: Option<bool>,
     pub message_source: MessageSource,
+    /// The unit a unit-mode decider check found this on
+    /// (DESIGN-doc-rule-checks-m4.md, Decision 3); absent on every other
+    /// finding, which then serializes as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<crate::decider::check::UnitRef>,
 }
 
 /// A failed check's captured output: the leading 64 KiB of each redacted
@@ -354,6 +359,7 @@ pub fn decode_line(line: &str) -> Option<Finding> {
         rule_ref,
         effect_landed,
         message_source: MessageSource::Check,
+        unit: None,
     })
 }
 
@@ -452,6 +458,7 @@ pub fn fallback_finding(check: &str, output: Option<&CheckOutput>, sentence: &st
         rule_ref: None,
         effect_landed: None,
         message_source,
+        unit: None,
     }
 }
 
@@ -905,6 +912,7 @@ mod tests {
             rule_ref: None,
             effect_landed: None,
             message_source: MessageSource::Check,
+            unit: None,
         }
     }
 
@@ -999,6 +1007,7 @@ mod tests {
             rule_ref: Some("https://docs.example.org/rules/E501".to_string()),
             effect_landed: Some(false),
             message_source: MessageSource::Output,
+            unit: None,
         };
         let json = serde_json::to_value(&finding).unwrap();
         assert_eq!(json["level"], "warning");

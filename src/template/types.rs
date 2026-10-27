@@ -445,7 +445,9 @@ fn validate_decider_check_gate(
 
 /// The per-state decider-check rules: at most
 /// [`MAX_CRITERIA_PER_STATE`](super::decider_check::MAX_CRITERIA_PER_STATE)
-/// criteria across the state's checks, each `rule_id` once, and no `when`
+/// criteria across the state's checks, unit-mode caps within
+/// [`MAX_UNIT_CONSULTATIONS_PER_STATE`](super::decider_check::MAX_UNIT_CONSULTATIONS_PER_STATE)
+/// ([`unit_caps`](super::decider_check::unit_caps)), each `rule_id` once, and no `when`
 /// clause, `skip_if` condition or context assignment reading a decider
 /// check's output. A decider verdict must never route
 /// (DESIGN-koto-decider-checks.md, Decision 1).
@@ -469,6 +471,11 @@ fn validate_state_decider_checks(state_name: &str, state: &TemplateState) -> Res
             state_name, total, MAX_CRITERIA_PER_STATE
         ));
     }
+    // The unit bound: max_units times criteria over the unit-mode checks.
+    // A compiled template carries every cap, so this only sums.
+    let named: Vec<(&str, &super::decider_check::DeciderCheckSpec)> =
+        checks.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+    super::decider_check::unit_caps(state_name, &named)?;
     let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
     for (gate_name, spec) in &checks {
         for c in &spec.criteria {
