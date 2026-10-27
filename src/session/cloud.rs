@@ -3234,10 +3234,11 @@ impl SessionBackend for CloudBackend {
         // passes over `sync` writes (`crate::engine::clear_on_entry`).
         //
         // For reads this is the backstop for a caller that doesn't route
-        // them. `koto context get` and `exists` do: they spool an anchorless
-        // read themselves, send an own read through `append_own_read`,
-        // which skips this, and write a read from another agent session into
-        // the reader's anchor, carrying the session it read in `session`.
+        // them. `koto context get` and `exists` do: they spool a read made
+        // outside `id`'s own tick themselves, send a read made in it through
+        // `append_own_read`, which skips this, and write a read from another
+        // agent session into the reader's anchor, carrying the session it
+        // read in `session`.
         // That one is the anchor's own write and goes into its log like any
         // other; `read_spool::spooled` is false for it.
         if crate::session::read_spool::spooled(payload) && !self.is_own_tick(id) {
@@ -3250,8 +3251,8 @@ impl SessionBackend for CloudBackend {
         self.append_logged(id, payload, timestamp)
     }
 
-    /// The read is `id`'s own, as its reader judged: into the log and
-    /// pushed, like any event, with no spool backstop.
+    /// The read ran in `id`'s own tick, as its reader judged: into the log
+    /// and pushed, like any event, with no spool backstop.
     fn append_own_read(
         &self,
         id: &str,

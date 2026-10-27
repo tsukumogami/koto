@@ -1141,7 +1141,8 @@ pub enum EventPayload {
         /// Recording them here is what makes the write atomic with the
         /// transition: the event is the durable record, and the context store
         /// is brought up to date from it -- right after the append, and again
-        /// on the next read if that write did not land
+        /// at the session's next tick if that write did not land; a read in
+        /// between answers the value from here without storing it
         /// (`crate::engine::context_assign`).
         ///
         /// Additive field: omitted when `None` so pre-feature logs round-trip.

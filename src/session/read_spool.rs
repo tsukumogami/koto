@@ -13,9 +13,11 @@
 //! anchorless read themselves (`src/cli/context.rs`), on both backends, and
 //! the cloud backend's `append_event` spools any other anchorless
 //! `context_read` made outside the session's own tick, as a backstop for a
-//! caller that doesn't route its reads. An own read (the reader's anchor is the session or holds
-//! it, or the read ran in its own tick) still goes into the log, and so does
-//! a read another agent session's anchor records of it, in that anchor's log.
+//! caller that doesn't route its reads. `koto context get` and `exists` also
+//! spool a read whose reader's anchor is the session or holds it, since it
+//! runs outside the session's tick. Only a read in the session's own tick
+//! goes into its log; a read another agent session's anchor records of it
+//! goes into that anchor's log.
 //!
 //! A read of a key another host changed downloads it into this host's local
 //! store first, and the cloud backend records that pull as a `context_added`

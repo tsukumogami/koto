@@ -404,9 +404,8 @@ pub trait SessionBackend: Send + Sync {
         -> anyhow::Result<()>;
 
     /// Append a `context_read` that its reader already judged to be `id`'s
-    /// own (the CLI's `read_log_target` answered `Session`: the
-    /// reader's anchor is `id` or holds it, or the read ran in `id`'s own
-    /// tick) to `id`'s log.
+    /// own (the CLI's `read_log_target` answered `Session`: the read ran in
+    /// `id`'s own tick) to `id`'s log.
     ///
     /// [`SessionBackend::append_event`] on the cloud backend keeps a read
     /// made outside `id`'s own tick out of the log, in the read spool, since

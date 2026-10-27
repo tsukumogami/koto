@@ -76,9 +76,7 @@ fn koto(dir: &Path) -> StdCommand {
     cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd.env_remove("KOTO_WORKFLOWS_DIR");
     cmd.env_remove("KOTO_TICK_SESSION");
-    // Every command runs as `s`'s own agent session, whose anchor holds it,
-    // so a `context get` is an own read and appends to `s`'s log: a read
-    // with no anchor would go to the host's read spool instead.
+    // Every command runs as `s`'s own agent session, whose anchor holds it.
     cmd.env("KOTO_ANCHOR", OWN_ANCHOR);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd
@@ -144,6 +142,12 @@ fn writer(dir: &Path, i: usize) -> StdCommand {
         _ => vec!["decisions", "record", "s", "--with-data", "@decision.json"],
     };
     let mut cmd = koto(dir);
+    if i % 3 == 1 {
+        // A reader carries the tick's marker naming `s`, as a command `s`'s
+        // own tick runs does, so its read appends to `s`'s log: a read
+        // outside the tick would go to the host's read spool instead.
+        cmd.env("KOTO_TICK_SESSION", "s");
+    }
     cmd.args(&args);
     cmd
 }

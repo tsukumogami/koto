@@ -1144,7 +1144,8 @@ reading the log.
 
 The event is the durable record of an assignment: the values ride the same
 append as the transition, and the context store is written from them right
-after. If that write doesn't land, the next read repairs the store from the
+after. If that write doesn't land, a read answers the value from the log
+without storing it, and the session's next tick repairs the store from the
 log. A later `context_added` or `context_removed` for the same key supersedes
 an assignment, so a consumer reconstructing context folds all three in `seq`
 order, last write wins.
@@ -1557,13 +1558,14 @@ environment:
 | Reader's anchor | Where the `context_read` goes |
 |---|---|
 | Any, when the command runs inside the read session's own tick (a gate script or default action reading its own session) | The session read, as above. |
-| Names an existing anchor that is the session read, or that holds the session read (the session read carries `koto/links/held-by/<anchor>`) | The session read, as above. |
+| Names an existing anchor that is the session read, or that holds the session read (the session read carries `koto/links/held-by/<anchor>`) | No log: the reading host's read spool, as the last row. The read is the session's own agent session's, but it runs outside the session's tick, so the session read stays byte-identical. |
 | Names an existing anchor otherwise | The reader's anchor, with `session` naming the session read. The session read stays byte-identical. |
 | Unset, or names no anchor in the local store | No log: the reading host's read spool, `context-reads.jsonl` beside the read session's local copy. The session read stays byte-identical. |
 
-The table holds under both backends. The last row closes the cross-session
-writer koto#412 tracked, where a read from a shell with no anchor appended
-to the session it read. A spooled read is the same `context_read` payload,
+The table holds under both backends. Only the first row writes into the
+session read, so a read outside the session's own tick never does. The last
+row closes the cross-session writer koto#412 tracked, where a read from a
+shell with no anchor appended to the session it read. A spooled read is the same `context_read` payload,
 with no `session` field, on a line of its own with its `timestamp`; the spool
 isn't part of the feed, and koto reads it back only through its one reader,
 for the run journal. Under the cloud backend, a `context_read` some other

@@ -568,7 +568,7 @@ The compiler checks every assignment. Each key must be a usable context key (let
 
 At run time only the edge that fires writes anything. An evidence field that wasn't submitted, or a gate path that isn't in that tick's output, resolves to the empty string and the transition still happens. Resolved values are stored exactly as resolved: a submitted value that contains `{{X}}` or `${context.y}` is written literally, never expanded a second time. A later write to the same key, whether from another transition or `koto context add`, replaces the earlier value.
 
-The resolved values are recorded on the transition's own event in the session log, so a transition and its assignments can't be separated by a crash. If writing them to the context store fails after that, the next `koto context get`, `koto context exists`, or context gate restores them from the log.
+The resolved values are recorded on the transition's own event in the session log, so a transition and its assignments can't be separated by a crash. If writing them to the context store fails after that, `koto context get`, `koto context exists` and `koto context list` answer them from the log without storing them, and the session's next tick restores them in the store before its context gates read it.
 
 A command gate's output is only `exit_code` and `error`, so a gate path can't carry what a script printed. To get a script's output into context, have a `default_action` run `koto context add`.
 
