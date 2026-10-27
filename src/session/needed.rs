@@ -19,12 +19,21 @@
 //! whose header can't be read may be anchored anywhere, so the answer is
 //! undecided unless another session already needs the path.
 //!
-//! The read goes through the same two local reads the rest of koto uses:
+//! An imported copy is a later member too: a local copy whose
+//! `koto/imported-from` names the session, which the hierarchy [`Graph`]
+//! counts as having taken the session over. Under the cloud backend, a
+//! running session the local lineage doesn't release is also looked up in
+//! the bucket ([`bucket`]): successors this host never pulled, recorded by
+//! the back-references they keep beside it, and a copy an import into
+//! another workspace left a migration marker naming. What the bucket can't
+//! answer keeps the path, named as unchecked.
+//!
+//! The local read goes through the same two reads the rest of koto uses:
 //! [`inventory::inspect`] for each session's standing, as
 //! `koto session list --execution-dir` reads it, and the hierarchy
-//! [`Graph`]'s resolved continues links for the lineage. Both read the local
-//! sessions directory only. Nothing here writes, and nothing reaches a
-//! remote store.
+//! [`Graph`]'s resolved continues links for the lineage. The bucket is only
+//! listed and read. Nothing here writes, and nothing pulls, spools or
+//! restores a session.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -34,7 +43,10 @@ use std::path::{Path, PathBuf};
 use crate::engine::types::SessionKind;
 use crate::session::hierarchy::Graph;
 use crate::session::inventory::{self, under_dir, SessionStatus, TemplateCache};
+use crate::session::continues_bucket::{is_workspace_prefix, BucketReads};
 use crate::session::state_file_name;
+
+mod bucket;
 
 /// The longest line the verb prints, in bytes.
 pub const MAX_LINE_BYTES: usize = 200;
@@ -73,6 +85,17 @@ impl Answer {
     }
 }
 
+/// What the verb may ask the bucket.
+pub enum Bucket<'a> {
+    /// The local backend: there is no bucket.
+    None,
+    /// The cloud backend, whose bucket can't be read: every running session
+    /// it would be asked about stays needed.
+    Unavailable,
+    /// The cloud backend's bucket, which is only listed and read.
+    Reads(&'a dyn BucketReads),
+}
+
 /// Why a session needs the path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Why {
@@ -81,6 +104,9 @@ enum Why {
     /// Running, and the continues relation `holder` holds about it can't be
     /// read, so whether it was continued elsewhere is unknown.
     RelationUnreadable(String),
+    /// Running, and the bucket couldn't be asked about its later members,
+    /// or couldn't answer.
+    BucketUnchecked,
 }
 
 impl Why {
@@ -91,6 +117,9 @@ impl Why {
             Why::RelationUnreadable(holder) => {
                 format!("is running, and its continues relation from {holder} is unreadable")
             }
+            Why::BucketUnchecked => {
+                "is running, and its successors in the bucket can't be checked".to_string()
+            }
         }
     }
 }
@@ -98,8 +127,9 @@ impl Why {
 /// What a session's header says about its execution anchor.
 type Anchor = Result<Option<PathBuf>, String>;
 
-/// Judge `path` against the local sessions directory `base`.
-pub fn needed(base: &Path, path: &Path) -> Answer {
+/// Judge `path` against the local sessions directory `base`, and, under the
+/// cloud backend, `bucket`.
+pub fn needed(base: &Path, path: &Path, bucket: &Bucket<'_>) -> Answer {
     let target = match fs::canonicalize(path) {
         Ok(p) => p,
         Err(e) => {
@@ -146,8 +176,30 @@ pub fn needed(base: &Path, path: &Path) -> Answer {
             SessionStatus::Terminal | SessionStatus::Cancelled => {}
             SessionStatus::Unreadable => needing.push((name.clone(), Why::Unreadable)),
             SessionStatus::Running => {
-                if let Some(why) = held(&graph, &mut anchors, base, name, &target) {
-                    needing.push((name.clone(), why));
+                let Some(why) = held(&graph, &mut anchors, base, name, &target) else {
+                    continue;
+                };
+                let found = match bucket {
+                    Bucket::None => bucket::Found::Kept,
+                    Bucket::Unavailable => bucket::Found::Unchecked,
+                    Bucket::Reads(reads) => match read_prefix(base, name) {
+                        Some(prefix) => bucket::walk(
+                            *reads,
+                            &prefix,
+                            name,
+                            graph.facts(name).and_then(|f| f.session_id.as_deref()),
+                            &target,
+                        ),
+                        // Where the bucket keeps it is unknown.
+                        None => bucket::Found::Unchecked,
+                    },
+                };
+                match (found, why) {
+                    (bucket::Found::Released, _) => {}
+                    (bucket::Found::Unchecked, Why::Running) => {
+                        needing.push((name.clone(), Why::BucketUnchecked))
+                    }
+                    (_, why) => needing.push((name.clone(), why)),
                 }
             }
         }
@@ -172,11 +224,12 @@ pub fn needed(base: &Path, path: &Path) -> Answer {
     Answer::NotNeeded
 }
 
-/// Whether running session `name`, anchored under `target`, still holds it:
-/// `None` when a later member of its lineage is anchored outside `target`,
-/// otherwise why it holds. The walk follows every continues link that
-/// resolved to a session, breadth first, and never revisits a session, so
-/// a cycle ends it.
+/// Whether running session `name`, anchored under `target`, still holds it
+/// as far as the local store tells: `None` when a later member of its
+/// lineage is anchored outside `target`, otherwise why it holds. The walk
+/// follows every continues link that resolved to a session, and every local
+/// copy an import moved a member to, breadth first, and never revisits a
+/// session, so a cycle ends it.
 fn held(
     graph: &Graph,
     anchors: &mut BTreeMap<String, Anchor>,
@@ -194,13 +247,18 @@ fn held(
             .filter(|d| d.target == current && d.holder != current)
             .map(|d| d.holder.clone())
             .collect();
+        let later: BTreeSet<String> = resolved
+            .iter()
+            .cloned()
+            .chain(graph.copies_of(&current).iter().cloned())
+            .collect();
         if unreadable.is_none() {
             unreadable = graph
                 .successors_of(&current)
                 .into_iter()
                 .find(|holder| !resolved.contains(holder));
         }
-        for holder in resolved {
+        for holder in later {
             if !seen.insert(holder.clone()) {
                 continue;
             }
@@ -234,6 +292,27 @@ fn anchor_of(anchors: &mut BTreeMap<String, Anchor>, base: &Path, name: &str) ->
 /// says where the session is anchored. `Ok(None)` is a header with no
 /// anchor recorded (a session from before anchoring, never ticked since).
 fn read_anchor(base: &Path, name: &str) -> Anchor {
+    let header = read_header(base, name)?;
+    match header.get("execution_dir") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(dir)) => Ok(Some(PathBuf::from(dir))),
+        Some(_) => Err("its execution_dir isn't a path".to_string()),
+    }
+}
+
+/// The bucket prefix session `name`'s header records it was created under
+/// (`origin.store.prefix`), when it records a well-formed one.
+fn read_prefix(base: &Path, name: &str) -> Option<String> {
+    read_header(base, name)
+        .ok()?
+        .pointer("/origin/store/prefix")?
+        .as_str()
+        .filter(|p| is_workspace_prefix(p))
+        .map(str::to_string)
+}
+
+/// The first line of session `name`'s state file, parsed.
+fn read_header(base: &Path, name: &str) -> Result<serde_json::Value, String> {
     let dir = base.join(name);
     match fs::symlink_metadata(&dir) {
         Ok(meta) if meta.file_type().is_dir() => {}
@@ -249,12 +328,7 @@ fn read_anchor(base: &Path, name: &str) -> Anchor {
     BufReader::new(file.take(MAX_HEADER_BYTES))
         .read_line(&mut line)
         .map_err(|e| e.to_string())?;
-    let header: serde_json::Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-    match header.get("execution_dir") {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(dir)) => Ok(Some(PathBuf::from(dir))),
-        Some(_) => Err("its execution_dir isn't a path".to_string()),
-    }
+    serde_json::from_str(&line).map_err(|e| e.to_string())
 }
 
 /// ` (N sessions)` for a list of `count` sessions, empty for one.
@@ -300,7 +374,7 @@ mod tests {
     #[test]
     fn a_missing_path_is_undecided() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let answer = needed(tmp.path(), &tmp.path().join("no-such-dir"));
+        let answer = needed(tmp.path(), &tmp.path().join("no-such-dir"), &Bucket::None);
         assert_eq!(answer.exit_code(), 2);
     }
 
@@ -308,7 +382,7 @@ mod tests {
     fn an_empty_store_needs_nothing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sessions = tmp.path().join("sessions");
-        assert_eq!(needed(&sessions, tmp.path()), Answer::NotNeeded);
+        assert_eq!(needed(&sessions, tmp.path(), &Bucket::None), Answer::NotNeeded);
     }
 
     #[test]

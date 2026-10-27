@@ -929,13 +929,23 @@ pub fn handle_unpin(backend: &Backend, name: &str, reason: Option<&str>) -> Resu
 /// and the cloud backend's reaches for its bucket. The sessions directory
 /// is the one the configured backend keeps on this host: the cloud
 /// backend's local copies under the koto root, or for the local backend
-/// `KOTO_SESSIONS_BASE` when set. A configuration that can't be loaded or
-/// checked exits 2, like any other undecided answer.
+/// `KOTO_SESSIONS_BASE` when set. Under the cloud backend the bucket is
+/// read through a read-only reader ([`CloudBackend::bucket_reader`]),
+/// which is only listed and read. A reader that can't be made keeps every
+/// running session it would have been asked about. A configuration that
+/// can't be loaded or checked exits 2, like any other undecided answer.
+///
+/// [`CloudBackend::bucket_reader`]: crate::session::cloud::CloudBackend::bucket_reader
 pub fn handle_needed(path: &str) -> Result<()> {
-    use crate::session::needed::{needed, Answer};
+    use crate::session::cloud::CloudBackend;
+    use crate::session::needed::{needed, Answer, Bucket};
 
-    let answer = match needed_base() {
-        Ok(base) => needed(&base, std::path::Path::new(path)),
+    let answer = match needed_store() {
+        Ok((base, None)) => needed(&base, std::path::Path::new(path), &Bucket::None),
+        Ok((base, Some(cloud))) => match CloudBackend::bucket_reader(base.clone(), &cloud) {
+            Ok(reader) => needed(&base, std::path::Path::new(path), &Bucket::Reads(&reader)),
+            Err(_) => needed(&base, std::path::Path::new(path), &Bucket::Unavailable),
+        },
         Err(e) => Answer::Undecided(format!(
             "can't decide: the sessions directory can't be found: {e:#}"
         )),
@@ -948,18 +958,19 @@ pub fn handle_needed(path: &str) -> Result<()> {
 }
 
 /// The sessions directory `koto session needed` reads, resolved the way
-/// `build_backend` resolves it, without building the backend.
-fn needed_base() -> Result<std::path::PathBuf> {
+/// `build_backend` resolves it, without building the backend, and the
+/// cloud configuration when the backend is the cloud one.
+fn needed_store() -> Result<(std::path::PathBuf, Option<crate::config::CloudConfig>)> {
     let config = crate::config::resolve::load_config()?;
     crate::config::session_env::check(&config)?;
     let koto_sessions = || -> Result<std::path::PathBuf> {
         Ok(crate::koto_home::koto_home_or_err()?.join("sessions"))
     };
     match config.session.backend.as_str() {
-        "cloud" => koto_sessions(),
+        "cloud" => Ok((koto_sessions()?, Some(config.session.cloud.clone()))),
         "local" => match std::env::var("KOTO_SESSIONS_BASE") {
-            Ok(base) => Ok(std::path::PathBuf::from(base)),
-            Err(_) => koto_sessions(),
+            Ok(base) => Ok((std::path::PathBuf::from(base), None)),
+            Err(_) => Ok((koto_sessions()?, None)),
         },
         other => anyhow::bail!("unknown backend: {other}"),
     }
