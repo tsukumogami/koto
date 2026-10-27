@@ -498,6 +498,12 @@ impl Graph {
         self.migrated.contains_key(name)
     }
 
+    /// The local copies that hold what `name` held, when it is migrated;
+    /// empty otherwise.
+    pub fn copies_of(&self, name: &str) -> &[String] {
+        self.migrated.get(name).map_or(&[], Vec::as_slice)
+    }
+
     /// Whether `name` is a node that can join sessions: present and not
     /// migrated. Absent and migrated names are leaves.
     pub(super) fn is_node(&self, name: &str) -> bool {

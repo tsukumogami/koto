@@ -270,6 +270,20 @@ impl CloudBackend {
         Ok(backend)
     }
 
+    /// A read-only reader of the bucket `cloud_config` names, for
+    /// `koto session needed`: every write to the bucket and every append
+    /// refuses, and nothing here touches `base`, the sessions directory it
+    /// is given in place of the one [`CloudBackend::new`] would migrate.
+    /// Its workspace prefix is empty, since every read it serves
+    /// ([`crate::session::continues_bucket::BucketReads`]) names its own.
+    /// Constructing it makes no request.
+    pub fn bucket_reader(base: PathBuf, cloud_config: &CloudConfig) -> anyhow::Result<Self> {
+        let local = LocalBackend::with_base_dir(base);
+        let mut backend = Self::with_parts(local, create_bucket(cloud_config)?, String::new());
+        backend.probes.read_only = true;
+        Ok(backend)
+    }
+
     /// Construct a `CloudBackend` with an explicit `LocalBackend` and bucket.
     ///
     /// Intended for tests that need to control both the local storage
