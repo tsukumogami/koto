@@ -878,8 +878,8 @@ pub enum SessionCommand {
     /// be read, or whose continues relation can't be read, keeps it.
     ///
     /// Exits 0 when PATH isn't needed, 1 when it is, printing one line of
-    /// at most 200 bytes naming the session whose name sorts first, why,
-    /// and how many others, and 2 when it can't decide: PATH can't be
+    /// at most 200 bytes naming the session whose name sorts first and why,
+    /// with how many need PATH, and 2 when it can't decide: PATH can't be
     /// resolved, the sessions directory can't be listed, or a session's
     /// header can't be read. Reads this host's sessions directory only,
     /// under either backend, and writes nothing.

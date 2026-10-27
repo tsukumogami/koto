@@ -283,7 +283,10 @@ fn a_running_last_member_under_the_path_keeps_it() {
     assert_eq!(code, 1, "{line}");
     // The session whose name sorts first is named, with the count of others.
     assert!(line.contains("v1"), "{line}");
-    assert!(line.contains("2 other sessions"), "{line}");
+    assert!(
+        line.starts_with("needed (3 sessions): session v1 "),
+        "{line}"
+    );
 }
 
 #[test]
@@ -357,6 +360,26 @@ fn an_unreadable_session_under_the_path_keeps_it_and_is_named() {
     assert_eq!(code, 1, "{line}");
     assert!(line.contains("a-broken"), "{line}");
     assert!(line.contains("unreadable"), "{line}");
+}
+
+#[test]
+fn a_session_whose_header_cannot_be_read_leaves_the_answer_undecided() {
+    let env = Env::new();
+    let repo = env.dir("repo");
+    env.init("garbled", &repo, &[]);
+    std::fs::write(env.state_file("garbled"), "not a header\n").unwrap();
+
+    // Where it is anchored is unknown, so no path is ever answered 0.
+    let (code, line) = env.needed(&repo);
+    assert_eq!(code, 2, "{line}");
+    assert!(line.contains("garbled"), "{line}");
+    assert_eq!(env.needed(&env.dir("elsewhere")).0, 2);
+
+    // A session that does need the path still answers 1.
+    env.init("running", &repo, &[]);
+    let (code, line) = env.needed(&repo);
+    assert_eq!(code, 1, "{line}");
+    assert!(line.contains("session running is running"), "{line}");
 }
 
 #[test]

@@ -151,26 +151,21 @@ pub fn needed(base: &Path, path: &Path) -> Answer {
         }
     }
 
+    // The count comes before the names, so a cut at
+    // MAX_LINE_BYTES never drops it.
     if let Some((first, why)) = needing.first() {
-        let mut line = format!("needed: session {first} {}", why.text());
-        if needing.len() > 1 {
-            let others = needing.len() - 1;
-            line.push_str(&format!(
-                "; {others} other session{} also need{} it",
-                if others == 1 { "" } else { "s" },
-                if others == 1 { "s" } else { "" }
-            ));
-        }
-        return Answer::Needed(line);
+        return Answer::Needed(format!(
+            "needed{}: session {first} {}",
+            count_note(needing.len()),
+            why.text()
+        ));
     }
     if let Some(first) = undecided.first() {
-        let mut line = format!(
-            "can't decide: session {first}'s header can't be read, so where it is anchored is unknown"
-        );
-        if undecided.len() > 1 {
-            line.push_str(&format!("; {} others too", undecided.len() - 1));
-        }
-        return Answer::Undecided(line);
+        return Answer::Undecided(format!(
+            "can't decide{}: session {first}'s header can't be read, so where it is anchored is \
+             unknown",
+            count_note(undecided.len())
+        ));
     }
     Answer::NotNeeded
 }
@@ -254,6 +249,15 @@ fn read_anchor(base: &Path, name: &str) -> Anchor {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::String(dir)) => Ok(Some(PathBuf::from(dir))),
         Some(_) => Err("its execution_dir isn't a path".to_string()),
+    }
+}
+
+/// ` (N sessions)` for a list of `count` sessions, empty for one.
+fn count_note(count: usize) -> String {
+    if count > 1 {
+        format!(" ({count} sessions)")
+    } else {
+        String::new()
     }
 }
 

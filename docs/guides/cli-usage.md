@@ -643,7 +643,7 @@ The path is needed while a workflow session anchored at it or under it is runnin
 | Exit | Meaning | Output |
 |------|---------|--------|
 | 0 | Not needed | `not needed` on stdout |
-| 1 | Needed | One line on stdout naming the session whose name sorts first, why, and how many others need the path |
+| 1 | Needed | One line on stdout naming the session whose name sorts first and why, with the count of sessions that need the path when there is more than one: `needed (3 sessions): session v1 is running` |
 | 2 | Can't decide | One line on stderr saying why: the path can't be resolved, the sessions directory can't be listed, or a session's header can't be read, so where it is anchored is unknown |
 
 Each line is at most 200 bytes. What can't be judged keeps the path: a session under it whose log or template can't be read (`is unreadable`), and a running one whose continues relation can't be read, are needed and named. A session with an unreadable header gives exit 2 unless another session already needs the path.
