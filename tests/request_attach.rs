@@ -585,13 +585,15 @@ fn a_leg_bound_to_another_session_is_refused() {
             "scope-holder",
         ],
     );
+    // A cancelled holder answers its leg with a cancelled result, so the
+    // other session finds the leg closed rather than free.
     run(tmp.path(), &["cancel", "scope-holder"]);
     assert_attach_refused(
         tmp.path(),
         &second,
         "scope",
         "scope-t1-other",
-        "leg_bound_to_different_child",
+        "leg_already_resolved",
     );
 }
 
