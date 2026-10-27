@@ -762,6 +762,93 @@ events:
         type: integer
         required: false
 
+  review_round_started:
+    tier: 2
+    fields:
+      doc_type:
+        type: string
+        required: true
+        enum: ["brief", "prd", "design", "plan"]
+      schema:
+        type: string
+        required: true
+        enum: ["brief/v1", "prd/v1", "design/v1", "plan/v1", "plan/v2", "absent", "other"]
+      round:
+        type: integer
+        required: true
+      seat_count:
+        type: integer
+        required: true
+      fallback:
+        type: boolean
+        required: true
+
+  review_verdict_recorded:
+    tier: 2
+    fields:
+      doc_type:
+        type: string
+        required: true
+        enum: ["brief", "prd", "design", "plan"]
+      schema:
+        type: string
+        required: true
+        enum: ["brief/v1", "prd/v1", "design/v1", "plan/v1", "plan/v2", "absent", "other"]
+      round:
+        type: integer
+        required: true
+      seat:
+        type: string
+        required: true
+      rule_id:
+        type: string
+        required: true
+      section:
+        type: string
+        required: true
+      verdict:
+        type: string
+        required: true
+        enum: ["pass", "fail"]
+
+  review_decision_recorded:
+    tier: 2
+    fields:
+      doc_type:
+        type: string
+        required: true
+        enum: ["brief", "prd", "design", "plan"]
+      schema:
+        type: string
+        required: true
+        enum: ["brief/v1", "prd/v1", "design/v1", "plan/v1", "plan/v2", "absent", "other"]
+      round:
+        type: integer
+        required: true
+      decision:
+        type: string
+        required: true
+        enum: ["rerun", "fix_and_proceed", "loop_back", "proceed", "stop"]
+
+  doc_check_recorded:
+    tier: 2
+    fields:
+      doc_type:
+        type: string
+        required: true
+        enum: ["brief", "prd", "design", "plan"]
+      schema:
+        type: string
+        required: true
+        enum: ["brief/v1", "prd/v1", "design/v1", "plan/v1", "plan/v2", "absent", "other"]
+      rule_id:
+        type: string
+        required: true
+      outcome:
+        type: string
+        required: true
+        enum: ["passed", "failed", "error"]
+
   anchor_started:
     tier: 3
     fields:
@@ -2359,6 +2446,53 @@ The [run journal](run-journal.md#check_disputed) relays each one as a
 `check_disputed` record, with the gate as `koto.check.name` and the two
 attempt numbers, without the reason. Additive: an older koto lands
 the event in its unknown-event bucket and reads the rest of the log.
+
+#### Review events
+
+`koto review record` appends four events that record a document review as
+telemetry: `review_round_started`, `review_verdict_recorded` (one per entry
+of a `verdicts` batch), `review_decision_recorded` and `doc_check_recorded`
+(one per entry of a `doc-checks` batch). Like a dispute, each is recorded,
+not obeyed: nothing that decides a gate outcome, a route or the current state
+reads them, and the next `koto next` responds as it would have without
+them. The verb refuses a session at a terminal state or cancelled.
+
+Every value is koto's own word for it by the time it is stored, so nothing
+the caller wrote reaches the log unchecked:
+
+| Field | Type | Events | Description |
+|-------|------|--------|-------------|
+| `doc_type` | string | all four | `brief`, `prd`, `design` or `plan`. |
+| `schema` | string | all four | The document's schema value, bucketed: `brief/v1`, `prd/v1`, `design/v1`, `plan/v1` or `plan/v2` as given (surrounding whitespace ignored), `absent` for no value or an empty one, `other` for anything else. |
+| `round` | integer | all but `doc_check_recorded` | The round's number, at least 1. |
+| `seat_count` | integer | `review_round_started` | How many seats the round spawned, at least 1. |
+| `fallback` | boolean | `review_round_started` | Whether the round is a fallback round. |
+| `seat` | string | `review_verdict_recorded` | The seat as given when the session's template declares it in `review_vocabulary.seats`, `other` otherwise, and always `other` when the template declares no vocabulary. |
+| `section` | string | `review_verdict_recorded` | The section, under the same rule with `review_vocabulary.sections`. |
+| `rule_id` | string | `review_verdict_recorded`, `doc_check_recorded` | The rule's id: 1 to 128 characters from `A-Z a-z 0-9 . _ : / @ -`, not starting with `/` or `~`. |
+| `verdict` | string | `review_verdict_recorded` | `pass` or `fail`. |
+| `decision` | string | `review_decision_recorded` | `rerun`, `fix_and_proceed`, `loop_back`, `proceed` or `stop`. |
+| `outcome` | string | `doc_check_recorded` | `passed`, `failed` or `error`. |
+
+```json
+{
+  "type": "review_verdict_recorded",
+  "payload": {
+    "doc_type": "prd",
+    "schema": "prd/v1",
+    "round": 1,
+    "seat": "clarity",
+    "rule_id": "rs-012",
+    "section": "goals",
+    "verdict": "fail"
+  }
+}
+```
+
+The [run journal](run-journal.md#review-records) relays each as one record:
+`review_round`, `review_verdict`, `review_decision` and `doc_checked`.
+Additive: an older koto lands the events in its unknown-event bucket and
+reads the rest of the log.
 
 ---
 

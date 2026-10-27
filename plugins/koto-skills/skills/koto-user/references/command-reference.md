@@ -17,6 +17,7 @@ Subcommands confirmed from `src/cli/mod.rs`:
 | `koto overrides record` | Runner — primary |
 | `koto overrides list` | Runner — primary |
 | `koto disputes record` | Runner — when a check's finding is wrong |
+| `koto review record` | Runner — a skill recording a document review as telemetry |
 | `koto decisions record` | Runner — primary |
 | `koto decisions list` | Runner — primary |
 | `koto session dir` | Runner — primary |
@@ -616,6 +617,41 @@ dispute to get unblocked: the check still decides.
 - Exit 2, `error.code: "gate_not_evaluated"`: the session never evaluated that gate to an outcome in the state (never at all, or only pending). Check `--state`, or run `koto next` first.
 - Exit 2, `error.code: "invalid_rule"` or `"invalid_reason"`: the rule id or reason is empty or too long.
 - Exit 2: `--by` other than `agent` or `person`.
+
+---
+
+## koto review record
+
+```
+koto review record <name> round-started --doc-type <type> [--schema <schema>] --round <n> --seat-count <n> [--fallback]
+koto review record <name> verdicts --file <json>
+koto review record <name> decision --doc-type <type> [--schema <schema>] --round <n> --decision <decision>
+koto review record <name> doc-checks --file <json>
+```
+
+Records a document review (a round of reviewer seats over a brief, PRD, design or plan)
+as telemetry. **It moves nothing**: no gate outcome, route or state changes. The session
+must be in a non-terminal state. Values are checked and stored in koto's words: doc type
+`brief|prd|design|plan`; schema bucketed to `brief/v1`, `prd/v1`, `design/v1`, `plan/v1`,
+`plan/v2`, `absent` or `other`; verdict `PASS|FAIL`; decision
+`rerun|fix_and_proceed|loop_back|proceed|stop`; check outcome `passed|failed|error`; a seat
+or section the template's `review_vocabulary` doesn't declare is stored as `other`.
+
+`verdicts` reads a JSON array (at most 200) of `{rule_id, section, verdict, seat, round,
+doc_type, schema?}`; `doc-checks` reads one of `{rule_id, outcome, doc_type, schema?}`. One
+event per entry. The full shape and examples are in `docs/guides/cli-usage.md`.
+
+**Success output:**
+```json
+{"status": "recorded", "event": "verdicts", "count": 12}
+```
+
+**Error cases:**
+- Exit 1: workflow not found, or an append failed.
+- Exit 2, `error.code` one of `session_terminal`, `invalid_value`, `invalid_entry`,
+  `invalid_file`, `batch_too_large`, `cap_reached` (2,000 review events per session).
+  Nothing is appended; `error.entry` and `error.field` name the entry and field at fault.
+  No message repeats a value you gave.
 
 ---
 

@@ -1465,6 +1465,47 @@ Appends one `finding_disputed` event, prints `{"status":"recorded"}` and exits 0
 
 A passing check's `warning` findings reach the agent on the `koto next` response that evaluated it, under a top-level `advisories` list (see the koto-user skill's response reference). They are the findings this command is most often for: a warning doesn't block, so the dispute is how an agent says it disagrees.
 
+### review record
+
+Records what happened in a document review (a round of reviewer seats over a brief, PRD, design or plan) as telemetry. Each call appends typed session events, and the [run journal](../reference/run-journal.md#review-records) relays each event as one record. Like a dispute, the events are recorded, not obeyed: they change no gate outcome, no route and no state, and the next `koto next` responds exactly as it would have without them. The session must be in a non-terminal state.
+
+```bash
+koto review record <name> round-started --doc-type <type> [--schema <schema>] --round <n> --seat-count <n> [--fallback]
+koto review record <name> verdicts --file <json>
+koto review record <name> decision --doc-type <type> [--schema <schema>] --round <n> --decision <decision>
+koto review record <name> doc-checks --file <json>
+```
+
+**Values.** koto checks every value before it appends anything and stores only its own word for it, so nothing a caller wrote reaches telemetry unchecked:
+
+- `--doc-type` / `doc_type` -- `brief`, `prd`, `design` or `plan`.
+- `--schema` / `schema` -- the document's schema value, bucketed: `brief/v1`, `prd/v1`, `design/v1`, `plan/v1` or `plan/v2` are kept (surrounding whitespace ignored), a missing, null or empty value is `absent`, and anything else is `other`. Optional.
+- `--round` / `round`, `--seat-count` -- positive integers (a JSON integer in a file entry).
+- `--fallback` -- the round is a fallback round. Defaults to false.
+- `--decision` -- what follows the round: `rerun` (another round follows), `fix_and_proceed` (the document is edited and the run continues with no further round), `loop_back` (the run returns to drafting and a later round follows), `proceed` (every seat passed) or `stop` (the draft is rejected or the run abandoned).
+- `seat`, `section` -- kept as given when the session's template declares them under `review_vocabulary` (see the koto-author skill's template format reference), and stored as `other` otherwise. A template that declares no vocabulary gets `other` for every seat and section.
+- `rule_id` -- 1 to 128 characters from `A-Z a-z 0-9 . _ : / @ -`, not starting with `/` or `~`.
+- `verdict` -- `PASS` or `FAIL` (lower case is accepted too), stored as `pass` or `fail`.
+- `outcome` -- a document check's result: `passed`, `failed` or `error`.
+
+**The `--file` entry shape.** `verdicts` and `doc-checks` read a JSON array of at most 200 objects, and append one event per entry, in order, so each telemetry record has its own sequence number. A `verdicts` entry has exactly the keys `rule_id`, `section`, `verdict`, `seat`, `round`, `doc_type` and, optionally, `schema`; a `doc-checks` entry has exactly `rule_id`, `outcome`, `doc_type` and, optionally, `schema`. Any other key refuses the entry. A three-seat round with a dozen rubric items is one `verdicts` call:
+
+```json
+[
+  {"rule_id": "rs-012", "section": "goals", "verdict": "FAIL", "seat": "clarity", "round": 1, "doc_type": "prd", "schema": "prd/v1"},
+  {"rule_id": "rs-013", "section": "document", "verdict": "PASS", "seat": "scope", "round": 1, "doc_type": "prd", "schema": "prd/v1"}
+]
+```
+
+```json
+[
+  {"rule_id": "fm-schema", "outcome": "passed", "doc_type": "plan", "schema": "plan/v2"},
+  {"rule_id": "ac-binary", "outcome": "error", "doc_type": "plan", "schema": "plan/v2"}
+]
+```
+
+**Result and exit codes.** On success the command prints `{"status":"recorded","event":"<subcommand>","count":<events appended>}` and exits 0. A missing session, or an append that fails, exits 1. A session log that can't be read exits with the code its read error carries, and one whose state or template can't be read exits 3. Every caller problem exits 2 with a typed `code` and appends nothing: one invalid entry refuses the whole batch. Errors name the entry (its 0-based index in the array) and the field, and never repeat a value the caller gave. A session holds at most 2,000 review events; a call that would pass that cap is refused. See [error-codes.md](../reference/error-codes.md#review-record).
+
 ### decider report
 
 Reads the decider ledger and reports, per question and per value, how often the decider agreed with agents. With `--fixtures` it also runs a golden fixture set against the configured decider and marks each value promotion-eligible or not. The command only reads: it never changes a mode, never writes the ledger or a session log, and compiles the template in memory without touching the compile cache. The promotion workflow it supports is described in [decider-authoring.md](decider-authoring.md#promoting-a-value-to-auto).

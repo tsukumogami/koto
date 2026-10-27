@@ -421,6 +421,65 @@ nothing yet:
 
 ---
 
+### review record
+
+`koto review record` records document review events as telemetry, without
+changing any outcome. A missing session prints the flat format with exit 1
+and appends nothing, and so does an append that fails. A session log that
+can't be read exits with the code its read error carries, and a log whose
+current state or template can't be read exits 3. Every other refusal carries
+a typed code, exits 2 and appends nothing, so one invalid entry refuses the
+whole batch. The `error` object carries `entry`, the 0-based index of the
+`--file` entry at fault, and `field`, the flag or key, when they apply. No
+message repeats a value the caller gave.
+
+**`session_terminal`** -- the session is at a terminal state or was
+cancelled:
+
+```json
+{"error":{"code":"session_terminal","message":"workflow 'scope-export' has finished (terminal state 'done'); review events are recorded only on a session in a non-terminal state"},"command":"review record"}
+```
+
+**`invalid_value`** -- a flag's or an entry field's value is outside its set
+or bounds (a document type, verdict, decision or check outcome outside its
+closed set, a round or seat count that isn't a positive integer, a rule id
+outside its shape):
+
+```json
+{"error":{"code":"invalid_value","message":"entry 3: field verdict must be PASS or FAIL","entry":3,"field":"verdict"},"command":"review record"}
+```
+
+**`invalid_entry`** -- a `--file` entry isn't an object, lacks a field, has a
+field that isn't one of its keys (named only as "an unknown field"), or has a
+field of the wrong type:
+
+```json
+{"error":{"code":"invalid_entry","message":"entry 0: field seat is missing","entry":0,"field":"seat"},"command":"review record"}
+```
+
+**`invalid_file`** -- the `--file` can't be read, is larger than 1 MiB, isn't
+UTF-8, isn't valid JSON (the message gives the line and column) or isn't a
+JSON array:
+
+```json
+{"error":{"code":"invalid_file","message":"--file is not valid JSON (line 1, column 14)","field":"--file"},"command":"review record"}
+```
+
+**`batch_too_large`** -- the `--file` array holds more than 200 entries:
+
+```json
+{"error":{"code":"batch_too_large","message":"--file holds 201 entries; a batch holds at most 200","field":"--file"},"command":"review record"}
+```
+
+**`cap_reached`** -- the session already holds review events, and recording
+these would take it past 2,000:
+
+```json
+{"error":{"code":"cap_reached","message":"the session holds 1990 review events; recording 12 more would pass the cap of 2000"},"command":"review record"}
+```
+
+---
+
 ### template compile
 
 **Compilation failed** — invalid YAML, missing required fields, or unknown gate type:

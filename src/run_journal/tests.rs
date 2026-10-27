@@ -5780,3 +5780,182 @@ fn evidence_with_exported_fields_relays_one_evidence_field_per_entry() {
     let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
     assert!(!raw.contains("PLANTED"), "{raw}");
 }
+
+// ----- Review records -----
+
+/// The fields each review kind carries beyond [`RELAY_FIELDS`].
+fn review_kind_fields(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "review_round" => &[
+            "koto.doc.type",
+            "koto.doc.schema",
+            "koto.review.round",
+            "koto.review.seat_count",
+            "koto.review.fallback",
+        ],
+        "review_verdict" => &[
+            "koto.doc.type",
+            "koto.doc.schema",
+            "koto.review.round",
+            "koto.review.seat",
+            "koto.rule.id",
+            "koto.review.section",
+            "koto.review.verdict",
+        ],
+        "review_decision" => &[
+            "koto.doc.type",
+            "koto.doc.schema",
+            "koto.review.round",
+            "koto.review.decision",
+        ],
+        "doc_checked" => &[
+            "koto.doc.type",
+            "koto.doc.schema",
+            "koto.rule.id",
+            "koto.doc.check_outcome",
+        ],
+        other => panic!("not a review kind: {other}"),
+    }
+}
+
+fn review_verdict(seat: &str, rule_id: &str, section: &str, verdict: &str) -> EventPayload {
+    EventPayload::ReviewVerdictRecorded(crate::engine::types::ReviewVerdictRecorded {
+        doc_type: "prd".into(),
+        schema: "prd/v1".into(),
+        round: 2,
+        seat: seat.into(),
+        rule_id: rule_id.into(),
+        section: section.into(),
+        verdict: verdict.into(),
+    })
+}
+
+/// Each review event relays one record of its kind holding exactly that
+/// kind's fields, each on its own `koto.seq`, and a verdict record differs
+/// from its sibling only in its own attributes.
+#[test]
+fn each_review_event_relays_one_record_with_exactly_its_fields() {
+    use crate::engine::types::{DocCheckRecorded, ReviewDecisionRecorded, ReviewRoundStarted};
+    let f = session_in_a();
+    reset_for_test();
+    let payloads = [
+        EventPayload::ReviewRoundStarted(ReviewRoundStarted {
+            doc_type: "prd".into(),
+            schema: "prd/v1".into(),
+            round: 2,
+            seat_count: 3,
+            fallback: true,
+        }),
+        review_verdict("clarity", "rs-001", "goals", "pass"),
+        review_verdict("other", "rs-002", "other", "fail"),
+        EventPayload::ReviewDecisionRecorded(ReviewDecisionRecorded {
+            doc_type: "prd".into(),
+            schema: "prd/v1".into(),
+            round: 2,
+            decision: "fix_and_proceed".into(),
+        }),
+        EventPayload::DocCheckRecorded(DocCheckRecorded {
+            doc_type: "prd".into(),
+            schema: "absent".into(),
+            rule_id: "r-frontmatter".into(),
+            outcome: "error".into(),
+        }),
+    ];
+    for p in &payloads {
+        commit_as(&f, None, "wf", p);
+    }
+    assert_eq!(batches_for_test(), (5, 0), "relayed records aren't flushed");
+    let j = f.journal();
+    let r: Vec<&serde_json::Value> = j
+        .iter()
+        .filter(|r| {
+            let k = r["kind"].as_str().unwrap();
+            k.starts_with("review_") || k == "doc_checked"
+        })
+        .collect();
+    let kinds: Vec<&str> = r.iter().map(|r| r["kind"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "review_round",
+            "review_verdict",
+            "review_verdict",
+            "review_decision",
+            "doc_checked"
+        ]
+    );
+    for rec in &r {
+        let kind = rec["kind"].as_str().unwrap();
+        let keys: BTreeSet<&str> = rec
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected: BTreeSet<&str> = RELAY_FIELDS
+            .iter()
+            .chain(review_kind_fields(kind))
+            .copied()
+            .collect();
+        assert_eq!(keys, expected, "{rec}");
+        assert_eq!(rec["v"], 1);
+    }
+    let seqs: Vec<u64> = r.iter().map(|r| r["koto.seq"].as_u64().unwrap()).collect();
+    assert_eq!(seqs, vec![3, 4, 5, 6, 7], "each event has its own koto.seq");
+
+    assert_eq!(r[0]["koto.doc.type"], "prd");
+    assert_eq!(r[0]["koto.doc.schema"], "prd/v1");
+    assert_eq!(r[0]["koto.review.round"], 2);
+    assert_eq!(r[0]["koto.review.seat_count"], 3);
+    assert_eq!(r[0]["koto.review.fallback"], true);
+    assert_eq!(r[1]["koto.review.seat"], "clarity");
+    assert_eq!(r[1]["koto.rule.id"], "rs-001");
+    assert_eq!(r[1]["koto.review.section"], "goals");
+    assert_eq!(r[1]["koto.review.verdict"], "pass");
+    assert_eq!(r[3]["koto.review.decision"], "fix_and_proceed");
+    assert_eq!(r[4]["koto.doc.schema"], "absent");
+    assert_eq!(r[4]["koto.rule.id"], "r-frontmatter");
+    assert_eq!(r[4]["koto.doc.check_outcome"], "error");
+
+    // The two verdicts differ only in their own attributes (and their
+    // sequence number and time).
+    let own: BTreeSet<&str> = [
+        "at",
+        "koto.seq",
+        "koto.review.seat",
+        "koto.rule.id",
+        "koto.review.section",
+        "koto.review.verdict",
+    ]
+    .into_iter()
+    .collect();
+    for (key, value) in r[1].as_object().unwrap() {
+        if !own.contains(key.as_str()) {
+            assert_eq!(&r[2][key], value, "{key}");
+        }
+    }
+}
+
+/// A verdict with the longest seat, section and rule id koto stores still
+/// fits the journal's line limit.
+#[test]
+fn a_review_verdict_of_the_longest_values_fits_one_line() {
+    let f = session_in_a();
+    let long = |c: char| c.to_string().repeat(128);
+    commit_as(
+        &f,
+        None,
+        "wf",
+        &review_verdict(&long('s'), &long('r'), &long('x'), "fail"),
+    );
+    let raw = std::fs::read_to_string(f.home.join(JOURNAL_FILE)).unwrap();
+    let line = raw
+        .lines()
+        .find(|l| l.contains("\"review_verdict\""))
+        .expect("the verdict was written");
+    assert!(line.len() < MAX_LINE_BYTES, "{} bytes", line.len());
+    let rec: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(rec["koto.review.seat"], long('s'));
+    assert_eq!(rec["koto.rule.id"], long('r'));
+    assert_eq!(rec["koto.review.section"], long('x'));
+}

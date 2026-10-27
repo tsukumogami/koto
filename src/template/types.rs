@@ -78,6 +78,74 @@ pub struct CompiledTemplate {
     /// that declares none keeps its compiled form and hash.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pass_env: Vec<String>,
+    /// The seat names and section slugs `koto review record` may store as
+    /// given for a session on this template; any other value is stored as
+    /// `other`. Skipped when empty so a template that declares none keeps
+    /// its compiled form and hash.
+    #[serde(default, skip_serializing_if = "ReviewVocabulary::is_empty")]
+    pub review_vocabulary: ReviewVocabulary,
+}
+
+/// The most names one `review_vocabulary` list may declare. Each declared
+/// name can become a telemetry value, so the lists are kept well under the
+/// number of distinct values a telemetry attribute can carry.
+pub const REVIEW_VOCABULARY_MAX: usize = 100;
+
+/// The review vocabulary a template declares (`review_vocabulary:` in its
+/// front matter): which seat names and section slugs `koto review record`
+/// records as given. A value the template doesn't declare is recorded as
+/// `other`, and a template that declares none gets `other` for every
+/// value, so a caller can't put an arbitrary string into telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewVocabulary {
+    /// Seat names, e.g. `clarity`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seats: Vec<String>,
+    /// Section slugs, e.g. `scope-boundary` or `frontmatter`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<String>,
+}
+
+impl ReviewVocabulary {
+    /// Whether the template declares no seat and no section.
+    pub fn is_empty(&self) -> bool {
+        self.seats.is_empty() && self.sections.is_empty()
+    }
+
+    /// Refuse a list longer than [`REVIEW_VOCABULARY_MAX`], a name outside
+    /// the run journal's name shape (1 to 128 characters from
+    /// `A-Z a-z 0-9 . _ : / @ -`, not starting with `/` or `~`), and a name
+    /// declared twice.
+    pub fn validate(&self) -> Result<(), String> {
+        for (list, names) in [("seats", &self.seats), ("sections", &self.sections)] {
+            if names.len() > REVIEW_VOCABULARY_MAX {
+                return Err(format!(
+                    "review_vocabulary.{}: at most {} names; got {}",
+                    list,
+                    REVIEW_VOCABULARY_MAX,
+                    names.len()
+                ));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for name in names {
+                if !crate::run_journal::is_name(name) {
+                    return Err(format!(
+                        "review_vocabulary.{}: {:?} must be 1 to 128 characters from \
+                         A-Z a-z 0-9 . _ : / @ -, not starting with / or ~",
+                        list, name
+                    ));
+                }
+                if !seen.insert(name.as_str()) {
+                    return Err(format!(
+                        "review_vocabulary.{}: {:?} is declared twice",
+                        list, name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The error code a compiled template gets when one of its `decider-check`
@@ -1462,6 +1530,7 @@ impl CompiledTemplate {
         for name in &self.pass_env {
             crate::engine::command_env::validate_declared_name(name)?;
         }
+        self.review_vocabulary.validate()?;
         // Collect the capture names before the per-state loop: a `{{KEY}}`
         // reference resolves against the union of the variables block, every
         // state's capture name, and the runtime names, and a state may read a
@@ -3571,6 +3640,7 @@ mod tests {
         );
         CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "test".to_string(),
             version: "1.0".to_string(),
@@ -6596,6 +6666,7 @@ command: "./check.sh"
         states.insert("done".to_string(), done);
         CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "batch-parent".to_string(),
             version: "1.0".to_string(),

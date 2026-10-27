@@ -928,6 +928,78 @@ pub struct FindingDispute {
     pub visit_attempt: Option<u64>,
 }
 
+// The four events `koto review record` appends. Like a dispute, each is
+// recorded and never obeyed: nothing the advance loop routes on reads them.
+// Every value is koto's own word for it by the time it is stored: a value
+// from a closed set, a schema bucket, a seat or section the session's
+// template declares (or `other`), a validated rule id, a count or a flag.
+// Nothing the caller wrote is stored as written unless it passed one of
+// those checks.
+
+/// The event type `koto review record ... round-started` appends.
+pub const REVIEW_ROUND_STARTED: &str = "review_round_started";
+/// The event type `koto review record ... verdicts` appends, one per entry.
+pub const REVIEW_VERDICT_RECORDED: &str = "review_verdict_recorded";
+/// The event type `koto review record ... decision` appends.
+pub const REVIEW_DECISION_RECORDED: &str = "review_decision_recorded";
+/// The event type `koto review record ... doc-checks` appends, one per entry.
+pub const DOC_CHECK_RECORDED: &str = "doc_check_recorded";
+
+/// A document review round's seats were spawned: the payload of
+/// [`REVIEW_ROUND_STARTED`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewRoundStarted {
+    /// `brief`, `prd`, `design` or `plan`.
+    pub doc_type: String,
+    /// The document's schema, bucketed (see `cli::review::bucket_schema`).
+    pub schema: String,
+    /// The round's number, from 1.
+    pub round: u64,
+    /// How many seats the round spawned, at least 1.
+    pub seat_count: u64,
+    /// Whether the round is a fallback round.
+    pub fallback: bool,
+}
+
+/// One seat's verdict on one rule for one section: the payload of
+/// [`REVIEW_VERDICT_RECORDED`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewVerdictRecorded {
+    pub doc_type: String,
+    pub schema: String,
+    pub round: u64,
+    /// A seat the session's template declares, or `other`.
+    pub seat: String,
+    /// The rule's id, name-shaped and 1 to 128 bytes.
+    pub rule_id: String,
+    /// A section the session's template declares, or `other`.
+    pub section: String,
+    /// `pass` or `fail`.
+    pub verdict: String,
+}
+
+/// What follows a review round: the payload of [`REVIEW_DECISION_RECORDED`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewDecisionRecorded {
+    pub doc_type: String,
+    pub schema: String,
+    pub round: u64,
+    /// `rerun`, `fix_and_proceed`, `loop_back`, `proceed` or `stop`.
+    pub decision: String,
+}
+
+/// One document check's result on a document: the payload of
+/// [`DOC_CHECK_RECORDED`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocCheckRecorded {
+    pub doc_type: String,
+    pub schema: String,
+    /// The check's rule id, name-shaped and 1 to 128 bytes.
+    pub rule_id: String,
+    /// `passed`, `failed` or `error`.
+    pub outcome: String,
+}
+
 /// The event type every `koto session anchor open` appends to its anchor.
 pub const ANCHOR_STARTED: &str = "anchor_started";
 
@@ -1679,6 +1751,18 @@ pub enum EventPayload {
     /// Additive: an older build lands it in `Unknown`, and a payload this
     /// build can't parse does the same rather than failing the read.
     FindingDisputed(FindingDispute),
+    /// A document review round started, appended by `koto review record`.
+    /// Nothing the advance loop routes on reads it. Additive, and degrades
+    /// like `finding_disputed`; so do the next three.
+    ReviewRoundStarted(ReviewRoundStarted),
+    /// One seat's verdict on one rule and section, appended by
+    /// `koto review record`, one per entry of its batch.
+    ReviewVerdictRecorded(ReviewVerdictRecorded),
+    /// What follows a review round, appended by `koto review record`.
+    ReviewDecisionRecorded(ReviewDecisionRecorded),
+    /// One document check's result, appended by `koto review record`, one
+    /// per entry of its batch.
+    DocCheckRecorded(DocCheckRecorded),
     /// One `koto session anchor open` call against an anchor
     /// (DESIGN-session-retention.md, Decision 2): every call appends one,
     /// whether it created the anchor or continued it. Additive: an older
@@ -2058,6 +2142,10 @@ impl EventPayload {
             EventPayload::DeciderCheckAnswered(_) => "decider_check_answered",
             EventPayload::RuleDelivered(_) => "rule_delivered",
             EventPayload::FindingDisputed(_) => FINDING_DISPUTED,
+            EventPayload::ReviewRoundStarted(_) => REVIEW_ROUND_STARTED,
+            EventPayload::ReviewVerdictRecorded(_) => REVIEW_VERDICT_RECORDED,
+            EventPayload::ReviewDecisionRecorded(_) => REVIEW_DECISION_RECORDED,
+            EventPayload::DocCheckRecorded(_) => DOC_CHECK_RECORDED,
             EventPayload::AnchorStarted(_) => ANCHOR_STARTED,
             EventPayload::AnchorActivity(_) => ANCHOR_ACTIVITY,
             EventPayload::InstructionsDelivered { .. } => "instructions_delivered",
@@ -2559,6 +2647,42 @@ impl<'de> Deserialize<'de> for Event {
             FINDING_DISPUTED => {
                 match serde_json::from_value::<FindingDispute>(payload_val.clone()) {
                     Ok(d) => EventPayload::FindingDisputed(d),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            REVIEW_ROUND_STARTED => {
+                match serde_json::from_value::<ReviewRoundStarted>(payload_val.clone()) {
+                    Ok(r) => EventPayload::ReviewRoundStarted(r),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            REVIEW_VERDICT_RECORDED => {
+                match serde_json::from_value::<ReviewVerdictRecorded>(payload_val.clone()) {
+                    Ok(v) => EventPayload::ReviewVerdictRecorded(v),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            REVIEW_DECISION_RECORDED => {
+                match serde_json::from_value::<ReviewDecisionRecorded>(payload_val.clone()) {
+                    Ok(d) => EventPayload::ReviewDecisionRecorded(d),
+                    Err(_) => EventPayload::Unknown {
+                        type_name: event_type.clone(),
+                        raw_payload: payload_val.clone(),
+                    },
+                }
+            }
+            DOC_CHECK_RECORDED => {
+                match serde_json::from_value::<DocCheckRecorded>(payload_val.clone()) {
+                    Ok(c) => EventPayload::DocCheckRecorded(c),
                     Err(_) => EventPayload::Unknown {
                         type_name: event_type.clone(),
                         raw_payload: payload_val.clone(),

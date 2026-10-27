@@ -19,6 +19,7 @@ pub mod next_types;
 pub mod overrides;
 pub mod request;
 pub mod retry;
+pub mod review;
 pub mod session;
 pub mod session_anchor;
 pub(crate) mod session_inventory;
@@ -357,6 +358,12 @@ pub enum Command {
     Disputes {
         #[command(subcommand)]
         subcommand: disputes::DisputesSubcommand,
+    },
+
+    /// Document review event recording, as telemetry (moves nothing)
+    Review {
+        #[command(subcommand)]
+        subcommand: review::ReviewSubcommand,
     },
 
     /// Configuration management subcommands
@@ -2552,6 +2559,10 @@ pub fn run(app: App) -> Result<()> {
         Command::Disputes { subcommand } => {
             let backend = build_backend()?;
             disputes::handle(&backend, subcommand)
+        }
+        Command::Review { subcommand } => {
+            let backend = build_backend()?;
+            review::handle(&backend, subcommand)
         }
         Command::Config { subcommand } => handle_config(subcommand),
         Command::Decider { subcommand } => match subcommand {
@@ -9346,6 +9357,7 @@ mod tests {
         );
         CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: name.to_string(),
             version: "1.0".to_string(),
@@ -10237,6 +10249,7 @@ Done.
         states.insert("done".to_string(), TemplateState::default());
         let compiled = CompiledTemplate {
             pass_env: Vec::new(),
+            review_vocabulary: Default::default(),
             format_version: 1,
             name: "child".to_string(),
             version: "1".to_string(),

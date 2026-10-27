@@ -128,6 +128,25 @@
 //!   rule id (digested like a rule id) and who disputed it, never the
 //!   reason.
 //!
+//! Four more are relayed the same way from the events `koto review record`
+//! appends, one record per event, so each entry of a batch has its own
+//! `koto.seq`. Each carries `koto.doc.type` (`brief`, `prd`, `design`,
+//! `plan`) and `koto.doc.schema` (`brief/v1`, `prd/v1`, `design/v1`,
+//! `plan/v1`, `plan/v2`, `absent` or `other`):
+//!
+//! - `review_round`: one per `review_round_started`, with
+//!   `koto.review.round`, `koto.review.seat_count` and the boolean
+//!   `koto.review.fallback`.
+//! - `review_verdict`: one per `review_verdict_recorded`, with the round,
+//!   `koto.review.seat` and `koto.review.section` (as the session's template
+//!   declares them, or `other`), `koto.rule.id` and `koto.review.verdict`
+//!   (`pass` or `fail`).
+//! - `review_decision`: one per `review_decision_recorded`, with the round
+//!   and `koto.review.decision` (`rerun`, `fix_and_proceed`, `loop_back`,
+//!   `proceed`, `stop`).
+//! - `doc_checked`: one per `doc_check_recorded`, with `koto.rule.id` and
+//!   `koto.doc.check_outcome` (`passed`, `failed`, `error`).
+//!
 //! None of them copies a probability, hash, threshold, endpoint, rule
 //! reference or text, rationale, dispute reason, override value or output,
 //! with one exception: `decider_checked`'s `koto.decider.confidence_bp`,
@@ -187,7 +206,8 @@
 //!   `default_action_executed`, and the decider and override kinds for
 //!   `decider_consulted`, `decider_checked`, `decider_fallback`,
 //!   `decider_check_answered`, `gate_override_recorded`,
-//!   `finding_disputed` and `rule_delivered`, `evidence_field` for an
+//!   `finding_disputed` and `rule_delivered`, the review kinds for the four
+//!   events `koto review record` appends, `evidence_field` for an
 //!   agent's `evidence_submitted` that carries `exported_fields`, and
 //!   `decider_answered` for one that answers a consultation.
 //!   A commit that ends a visit (an arrival, a rewind, a cancel, or the
@@ -761,6 +781,10 @@ fn relays(payload: &EventPayload) -> bool {
             | EventPayload::GateOverrideRecorded { .. }
             | EventPayload::FindingDisputed(_)
             | EventPayload::RuleDelivered(_)
+            | EventPayload::ReviewRoundStarted(_)
+            | EventPayload::ReviewVerdictRecorded(_)
+            | EventPayload::ReviewDecisionRecorded(_)
+            | EventPayload::DocCheckRecorded(_)
             | EventPayload::EvidenceSubmitted {
                 exported_fields: Some(_),
                 ..
@@ -830,6 +854,41 @@ const RULE_UNIT_COUNT_FIELD: &str = "koto.rule.unit_count";
 const RULE_VIA_FIELD: &str = "koto.rule.via";
 /// Beside `koto.rule.via`: `printed` or `refused`, as the check reported.
 const RULE_DELIVERY_FIELD: &str = "koto.rule.delivery";
+// The names the document review records add (`koto review record`). Every
+// value is one the verb already validated or mapped: a closed-set value, a
+// schema bucket, a declared seat or section (or `other`), a rule id, a count
+// or a flag.
+
+/// One record per `review_round_started` event.
+const REVIEW_ROUND: &str = "review_round";
+/// One record per `review_verdict_recorded` event.
+const REVIEW_VERDICT: &str = "review_verdict";
+/// One record per `review_decision_recorded` event.
+const REVIEW_DECISION: &str = "review_decision";
+/// One record per `doc_check_recorded` event.
+const DOC_CHECKED: &str = "doc_checked";
+/// On the four review kinds: `brief`, `prd`, `design` or `plan`.
+const DOC_TYPE_FIELD: &str = "koto.doc.type";
+/// On the four review kinds: the document's schema bucket.
+const DOC_SCHEMA_FIELD: &str = "koto.doc.schema";
+/// On `doc_checked`: `passed`, `failed` or `error`.
+const DOC_CHECK_OUTCOME_FIELD: &str = "koto.doc.check_outcome";
+/// On `review_round`, `review_verdict` and `review_decision`: the round.
+const REVIEW_ROUND_FIELD: &str = "koto.review.round";
+/// On `review_round`: how many seats the round spawned.
+const REVIEW_SEAT_COUNT_FIELD: &str = "koto.review.seat_count";
+/// On `review_round`: whether the round is a fallback round.
+const REVIEW_FALLBACK_FIELD: &str = "koto.review.fallback";
+/// On `review_verdict`: the seat, as the template declares it, or `other`.
+const REVIEW_SEAT_FIELD: &str = "koto.review.seat";
+/// On `review_verdict`: the section, as the template declares it, or
+/// `other`.
+const REVIEW_SECTION_FIELD: &str = "koto.review.section";
+/// On `review_verdict`: `pass` or `fail`.
+const REVIEW_VERDICT_FIELD: &str = "koto.review.verdict";
+/// On `review_decision`: what follows the round.
+const REVIEW_DECISION_FIELD: &str = "koto.review.decision";
+
 /// On the three decider-check kinds, for a unit-mode check: the unit's key,
 /// always as its digest.
 const UNIT_KEY_FIELD: &str = "koto.unit.key";
@@ -1035,6 +1094,38 @@ fn relayed(payload: &EventPayload, relay: &Relay<'_>) -> Vec<Record> {
             .int(RULE_UNIT_COUNT_FIELD, r.unit_count)
             .name(RULE_VIA_FIELD, r.via.map(|v| v.as_str()))
             .name(RULE_DELIVERY_FIELD, r.delivery.map(|d| d.as_str()))],
+        // The review records: `koto review record` stored only validated or
+        // mapped values, and each is copied by name. A rule id is digested
+        // like every other, though the verb already refused one outside the
+        // name shape.
+        EventPayload::ReviewRoundStarted(r) => vec![relay
+            .record(REVIEW_ROUND)
+            .name(DOC_TYPE_FIELD, Some(r.doc_type.as_str()))
+            .name(DOC_SCHEMA_FIELD, Some(r.schema.as_str()))
+            .int(REVIEW_ROUND_FIELD, Some(r.round))
+            .int(REVIEW_SEAT_COUNT_FIELD, Some(r.seat_count))
+            .flag(REVIEW_FALLBACK_FIELD, r.fallback)],
+        EventPayload::ReviewVerdictRecorded(v) => vec![relay
+            .record(REVIEW_VERDICT)
+            .name(DOC_TYPE_FIELD, Some(v.doc_type.as_str()))
+            .name(DOC_SCHEMA_FIELD, Some(v.schema.as_str()))
+            .int(REVIEW_ROUND_FIELD, Some(v.round))
+            .name(REVIEW_SEAT_FIELD, Some(v.seat.as_str()))
+            .name("koto.rule.id", Some(name_or_digest(&v.rule_id).as_str()))
+            .name(REVIEW_SECTION_FIELD, Some(v.section.as_str()))
+            .name(REVIEW_VERDICT_FIELD, Some(v.verdict.as_str()))],
+        EventPayload::ReviewDecisionRecorded(d) => vec![relay
+            .record(REVIEW_DECISION)
+            .name(DOC_TYPE_FIELD, Some(d.doc_type.as_str()))
+            .name(DOC_SCHEMA_FIELD, Some(d.schema.as_str()))
+            .int(REVIEW_ROUND_FIELD, Some(d.round))
+            .name(REVIEW_DECISION_FIELD, Some(d.decision.as_str()))],
+        EventPayload::DocCheckRecorded(c) => vec![relay
+            .record(DOC_CHECKED)
+            .name(DOC_TYPE_FIELD, Some(c.doc_type.as_str()))
+            .name(DOC_SCHEMA_FIELD, Some(c.schema.as_str()))
+            .name("koto.rule.id", Some(name_or_digest(&c.rule_id).as_str()))
+            .name(DOC_CHECK_OUTCOME_FIELD, Some(c.outcome.as_str()))],
         _ => Vec::new(),
     }
 }

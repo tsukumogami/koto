@@ -36,7 +36,7 @@ states:
 
 Required fields: `name`, `version`, `initial_state`, `states`.
 
-Optional fields: `description`, `variables`, `pass_env` (environment variable names a gate or action command reads; see [`pass_env:`](#pass_env--variables-a-command-reads)).
+Optional fields: `description`, `variables`, `pass_env` (environment variable names a gate or action command reads; see [`pass_env:`](#pass_env--variables-a-command-reads)), `review_vocabulary` (seat names and section slugs `koto review record` may record; see [`review_vocabulary:`](#review_vocabulary--seats-and-sections-a-review-may-record)).
 
 ### Variables
 
@@ -1284,6 +1284,18 @@ Declared values are read live on each tick and never written to the session, so 
 **Every declared value is treated as a credential.** koto can't tell a token from a hostname, so any `pass_env:` value 8 bytes or longer that reaches a command is replaced with `[REDACTED:<NAME>]` in that command's output before the response, the session log or a finding sees it. A `capture_stdout_as` whose output holds one is refused with `capture_error.case: "redacted"`, naming the variable and never the value. So don't declare a variable whose value you need a command to print back or capture; pass it through a template variable instead if it isn't secret. A value under 8 bytes is never matched. A template that declares nothing compiles to the same hash as before the field existed. A command can still set variables for itself (`GIT_DIR=/srv/mirror.git git log -1`).
 
 Author with two more facts in mind. `PATH` is recorded without its empty and relative entries (`.`, `node_modules/.bin`), so a command that relied on one must spell the path, such as `./node_modules/.bin/eslint`. And the record can't change after creation: a tool that moves off the recorded `PATH` fails until the session is replaced, and koto's response says so when it happens. For the full picture, including `koto init --legacy-environment` (this release only) and what the fixed environment does and doesn't protect against, see [What a command's environment is](../../../../../docs/guides/default-action-authoring.md#what-a-commands-environment-is).
+
+### `review_vocabulary:` — seats and sections a review may record
+
+`koto review record` records a document review's per-seat verdicts as telemetry (see [review record](../../../../../docs/guides/cli-usage.md#review-record)). A verdict names a seat and a section, and koto stores either one as given only when the session's template declares it; any other value is stored as `other`, so a caller can't put an arbitrary string into telemetry. A template that runs document reviews declares the names it allows:
+
+```yaml
+review_vocabulary:
+  seats: [clarity, scope, feasibility]
+  sections: [problem-statement, goals, scope-boundary, frontmatter, document]
+```
+
+Each name must be 1 to 128 characters from `A-Z a-z 0-9 . _ : / @ -`, not starting with `/` or `~`, appear once in its list, and each list holds at most 100 names; anything else is a compile error. A template that declares no vocabulary gets `other` for every seat and section, and compiles to the same hash as before the field existed.
 
 ### skip_if — automatic transitions
 

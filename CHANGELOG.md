@@ -74,6 +74,20 @@ to `0.9.x`).
   `via` (`check_output`) and `delivery`, as `koto.rule.via` and
   `koto.rule.delivery`; a decider check's delivery carries neither.
   Malformed lines are ordinary output, and nothing routes on the record.
+- **`koto review record` records document reviews as telemetry.** Four
+  subcommands, `round-started`, `verdicts --file`, `decision` and
+  `doc-checks --file`, append `review_round_started`,
+  `review_verdict_recorded` (one per entry), `review_decision_recorded` and
+  `doc_check_recorded` (one per entry) to a non-terminal session, and the
+  run journal relays them as `review_round`, `review_verdict`,
+  `review_decision` and `doc_checked`. Every value is checked first and
+  stored in koto's words: closed sets for document type, verdict, decision
+  and check outcome, a schema bucket, validated rule ids, positive counts,
+  and seats and sections the template declares in the new optional
+  `review_vocabulary` field (anything else is `other`). A batch holds at
+  most 200 entries and a session 2,000 review events; one invalid entry
+  refuses the whole batch, and errors never repeat a value the caller gave.
+  Nothing routes on the events.
 - **`KOTO_HOME` moves the whole koto root (koto#459).** Sessions, the
   request store, `config.toml`, the terminal index, coordinator cursors,
   wake files, the decider ledger, the run journal and the root

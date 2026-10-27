@@ -110,6 +110,10 @@ fn every_kind_the_reference_names_is_one_koto_writes_and_the_reverse() {
             "evidence_field",
             "response",
             "rule_delivered",
+            "review_round",
+            "review_verdict",
+            "review_decision",
+            "doc_checked",
             "session_started",
             "state_entered",
             "terminal"

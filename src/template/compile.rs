@@ -33,6 +33,8 @@ struct SourceFrontmatter {
     states: HashMap<String, SourceState>,
     #[serde(default)]
     pass_env: Vec<String>,
+    #[serde(default)]
+    review_vocabulary: crate::template::types::ReviewVocabulary,
 }
 
 /// YAML front-matter view of a variable declaration.
@@ -779,6 +781,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
         variables,
         states: compiled_states,
         pass_env: fm.pass_env,
+        review_vocabulary: fm.review_vocabulary,
     };
 
     // Run validation rules (includes evidence routing validation).
@@ -1757,6 +1760,76 @@ mod tests {
             let warnings = t.collect_pass_env_warnings();
             assert_eq!(warnings.len(), 2, "{warnings:?}");
             assert!(warnings.iter().all(|w| w.starts_with("W7:")));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // review_vocabulary: (`koto review record`)
+    // -----------------------------------------------------------------------
+
+    mod review_vocabulary {
+        use super::*;
+
+        const BASE: &str = "---\nname: t\nversion: \"1\"\ninitial_state: a\n\
+            VOCAB\
+            states:\n  a:\n    terminal: true\n---\n\n## a\n\nDone.\n";
+
+        fn source(vocab: &str) -> String {
+            BASE.replace("VOCAB", vocab)
+        }
+
+        #[test]
+        fn declared_seats_and_sections_compile_into_the_template() {
+            let f = write_temp(&source(
+                "review_vocabulary:\n  seats: [clarity, scope]\n  sections: [goals, frontmatter]\n",
+            ));
+            let t = compile(f.path(), true).unwrap();
+            assert_eq!(t.review_vocabulary.seats, vec!["clarity", "scope"]);
+            assert_eq!(t.review_vocabulary.sections, vec!["goals", "frontmatter"]);
+            let json = serde_json::to_value(&t).unwrap();
+            assert_eq!(
+                json["review_vocabulary"],
+                serde_json::json!({"seats": ["clarity", "scope"], "sections": ["goals", "frontmatter"]})
+            );
+        }
+
+        #[test]
+        fn a_template_without_a_vocabulary_compiles_to_the_same_json() {
+            let f = write_temp(&source(""));
+            let t = compile(f.path(), true).unwrap();
+            assert!(t.review_vocabulary.is_empty());
+            let json = serde_json::to_value(&t).unwrap();
+            assert!(
+                json.get("review_vocabulary").is_none(),
+                "no key, so the hash is unchanged"
+            );
+        }
+
+        #[test]
+        fn malformed_duplicated_or_unknown_entries_are_errors() {
+            for bad in [
+                "review_vocabulary:\n  seats: [\"has space\"]\n",
+                "review_vocabulary:\n  sections: [\"/abs\"]\n",
+                "review_vocabulary:\n  seats: [\"\"]\n",
+                "review_vocabulary:\n  seats: [a, a]\n",
+                "review_vocabulary:\n  seat: [a]\n",
+            ] {
+                let f = write_temp(&source(bad));
+                let err = compile(f.path(), true).unwrap_err().to_string();
+                assert!(
+                    err.contains("review_vocabulary") || err.contains("unknown field"),
+                    "{bad}: {err}"
+                );
+            }
+            let many: Vec<String> = (0..=crate::template::types::REVIEW_VOCABULARY_MAX)
+                .map(|i| format!("s{i}"))
+                .collect();
+            let f = write_temp(&source(&format!(
+                "review_vocabulary:\n  seats: [{}]\n",
+                many.join(", ")
+            )));
+            let err = compile(f.path(), true).unwrap_err().to_string();
+            assert!(err.contains("at most"), "{err}");
         }
     }
 
