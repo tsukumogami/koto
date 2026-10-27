@@ -11,6 +11,7 @@ pub mod import_links;
 pub mod inventory;
 pub mod links;
 pub mod local;
+pub mod needed;
 pub mod pin;
 pub mod read_spool;
 pub mod rebind_fence;

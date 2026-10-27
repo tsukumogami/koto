@@ -867,6 +867,27 @@ pub enum SessionCommand {
         action: session_anchor::AnchorCommand,
     },
 
+    /// Whether a workflow session still needs a directory.
+    ///
+    /// PATH is needed while a workflow session anchored at it or under it
+    /// (its execution directory, compared by whole path components after
+    /// resolving symlinks) is running and no later member of its lineage
+    /// (the sessions continuing it, theirs, and so on) is anchored outside
+    /// it. Terminal and cancelled sessions don't need it, and a session
+    /// anchored above PATH doesn't count. A session under PATH that can't
+    /// be read, or whose continues relation can't be read, keeps it.
+    ///
+    /// Exits 0 when PATH isn't needed, 1 when it is, printing one line of
+    /// at most 200 bytes naming the session whose name sorts first and why,
+    /// with how many need PATH, and 2 when it can't decide: PATH can't be
+    /// resolved, the sessions directory can't be listed, or a session's
+    /// header can't be read. Reads this host's sessions directory only,
+    /// under either backend, and writes nothing.
+    Needed {
+        /// The directory to judge
+        path: String,
+    },
+
     /// Move a session's execution anchor to another directory.
     ///
     /// The anchor is the directory every tick of a session runs its
@@ -2084,6 +2105,9 @@ pub fn run(app: App) -> Result<()> {
             );
             Ok(())
         }
+        Command::Session {
+            subcommand: SessionCommand::Needed { path },
+        } => session::handle_needed(&path),
         Command::Session { subcommand } => {
             let backend = build_backend()?;
             match subcommand {
@@ -2111,6 +2135,7 @@ pub fn run(app: App) -> Result<()> {
                 SessionCommand::Dir { name: None, .. } => {
                     unreachable!("handled before the backend")
                 }
+                SessionCommand::Needed { .. } => unreachable!("handled before the backend"),
                 SessionCommand::List {
                     pinned: true, json, ..
                 } => session::handle_list_pinned(&backend, json),

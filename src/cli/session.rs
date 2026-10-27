@@ -921,6 +921,50 @@ pub fn handle_unpin(backend: &Backend, name: &str, reason: Option<&str>) -> Resu
     Ok(())
 }
 
+/// Handle `koto session needed <path>`: print one line and exit 0 (not
+/// needed), 1 (needed) or 2 (can't decide), as
+/// [`crate::session::needed`] judges `path`.
+///
+/// Builds no backend: constructing one can migrate an old store layout,
+/// and the cloud backend's reaches for its bucket. The sessions directory
+/// is the one the configured backend keeps on this host: the cloud
+/// backend's local copies under the koto root, or for the local backend
+/// `KOTO_SESSIONS_BASE` when set. A configuration that can't be loaded or
+/// checked exits 2, like any other undecided answer.
+pub fn handle_needed(path: &str) -> Result<()> {
+    use crate::session::needed::{needed, Answer};
+
+    let answer = match needed_base() {
+        Ok(base) => needed(&base, std::path::Path::new(path)),
+        Err(e) => Answer::Undecided(format!(
+            "can't decide: the sessions directory can't be found: {e:#}"
+        )),
+    };
+    match &answer {
+        Answer::Undecided(_) => eprintln!("{}", answer.line()),
+        _ => println!("{}", answer.line()),
+    }
+    std::process::exit(answer.exit_code());
+}
+
+/// The sessions directory `koto session needed` reads, resolved the way
+/// `build_backend` resolves it, without building the backend.
+fn needed_base() -> Result<std::path::PathBuf> {
+    let config = crate::config::resolve::load_config()?;
+    crate::config::session_env::check(&config)?;
+    let koto_sessions = || -> Result<std::path::PathBuf> {
+        Ok(crate::koto_home::koto_home_or_err()?.join("sessions"))
+    };
+    match config.session.backend.as_str() {
+        "cloud" => koto_sessions(),
+        "local" => match std::env::var("KOTO_SESSIONS_BASE") {
+            Ok(base) => Ok(std::path::PathBuf::from(base)),
+            Err(_) => koto_sessions(),
+        },
+        other => anyhow::bail!("unknown backend: {other}"),
+    }
+}
+
 /// Handle `koto session hierarchy <name> [--json]`: judge the hierarchy
 /// `name` belongs to and print the verdict, its members and the settings.
 ///
