@@ -23,6 +23,16 @@
 //! process that made the change, so the file has changed before that
 //! command returns.
 //!
+//! # Superseded principals
+//!
+//! A request names its principals once, when it is created. When a
+//! principal has since been superseded (`koto init --continues
+//! --supersede`), every ring also reaches the newest member of its
+//! supersede chain ([`crate::engine::supersede_chain::newest_member`]),
+//! so a leg an earlier member opened wakes the session now driving the
+//! run. The principal's own file is still rung, and the request is not
+//! changed.
+//!
 //! # Why the file is appended, never replaced
 //!
 //! Subscribers watch the path: `koto request watch` polls it, a harness
@@ -161,18 +171,49 @@ pub fn ring(koto_root: &Path, principal: &str) -> Result<(), WakeSignalError> {
         .map_err(|e| WakeSignalError::io(format!("appending to {}", path.display()), e))
 }
 
-/// Ring each distinct principal a request names.
+/// The newest member of `principal`'s supersede chain, read from the
+/// local backend's sessions directory under `koto_root` (the same
+/// `<koto_root>/sessions` the wake-candidates pass reads). `None` when the
+/// principal isn't superseded or the chain gives nothing usable.
+pub fn forward_member(koto_root: &Path, principal: &str) -> Option<String> {
+    crate::engine::supersede_chain::newest_member(&koto_root.join("sessions"), principal)
+}
+
+/// [`ring`] `principal`, and then the newest member of its supersede
+/// chain when it has been superseded.
+///
+/// The result is the principal's ring. A failed ring of the newest member
+/// is reported as one warning on stderr and doesn't fail the call.
+pub fn ring_forwarded(koto_root: &Path, principal: &str) -> Result<(), WakeSignalError> {
+    let rung = ring(koto_root, principal);
+    if let Some(newest) = forward_member(koto_root, principal) {
+        if let Err(e) = ring(koto_root, &newest) {
+            eprintln!("warning: could not deliver a wake to {newest:?}: {e}");
+        }
+    }
+    rung
+}
+
+/// Ring each distinct principal a request names, and the newest member of
+/// each one's supersede chain, once each.
 ///
 /// Never fails the caller: a principal that is not a valid session id is
 /// skipped, and a ring that fails is reported, each as one warning on
 /// stderr naming the principal. The write that triggered the ring has
 /// already succeeded by the time this runs.
 pub fn ring_principals(koto_root: &Path, requested_by: &str, coordinator_of_record: &str) {
-    let mut principals = vec![coordinator_of_record];
-    if requested_by != coordinator_of_record {
-        principals.push(requested_by);
+    let mut principals: Vec<String> = Vec::new();
+    for named in [coordinator_of_record, requested_by] {
+        if !principals.iter().any(|p| p == named) {
+            principals.push(named.to_string());
+        }
+        if let Some(newest) = forward_member(koto_root, named) {
+            if !principals.contains(&newest) {
+                principals.push(newest);
+            }
+        }
     }
-    for principal in principals {
+    for principal in &principals {
         match ring(koto_root, principal) {
             Ok(()) => {}
             Err(WakeSignalError::InvalidPrincipal { principal, .. }) => {
@@ -601,6 +642,56 @@ mod tests {
         assert_eq!(lines(tmp.path(), "asker").len(), 1);
         assert_eq!(lines(tmp.path(), "coord").len(), 1);
         assert!(lines(tmp.path(), "bystander").is_empty());
+    }
+
+    /// Sessions `names` under `<root>/sessions`, each fenced in favour of
+    /// the next.
+    fn superseded_chain(root: &Path, names: &[&str]) {
+        for (i, name) in names.iter().enumerate() {
+            let dir = root.join("sessions").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut log = format!(
+                "{{\"schema_version\":1,\"workflow\":\"{name}\",\"session_id\":\"id-{name}\"}}\n"
+            );
+            if let Some(next) = names.get(i + 1) {
+                log.push_str(&format!(
+                    "{{\"seq\":1,\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"session_superseded\",\
+                     \"payload\":{{\"by\":\"{next}\",\"by_session_id\":\"id-{next}\",\"actor\":{{}},\
+                     \"at\":\"2026-01-01T00:00:00Z\"}}}}\n"
+                ));
+            }
+            std::fs::write(dir.join(crate::session::state_file_name(name)), log).unwrap();
+        }
+    }
+
+    #[test]
+    fn ring_principals_also_rings_the_newest_member_of_a_superseded_principal() {
+        let tmp = tempfile::tempdir().unwrap();
+        superseded_chain(tmp.path(), &["a", "b", "c"]);
+        ring_principals(tmp.path(), "a", "a");
+        assert_eq!(lines(tmp.path(), "a").len(), 1);
+        assert_eq!(lines(tmp.path(), "c").len(), 1);
+        assert!(lines(tmp.path(), "b").is_empty());
+
+        // Both principals superseded into the same member: it is rung once.
+        let tmp = tempfile::tempdir().unwrap();
+        superseded_chain(tmp.path(), &["a", "b", "c"]);
+        ring_principals(tmp.path(), "a", "b");
+        assert_eq!(lines(tmp.path(), "c").len(), 1);
+        assert_eq!(lines(tmp.path(), "a").len(), 1);
+        assert_eq!(lines(tmp.path(), "b").len(), 1);
+    }
+
+    #[test]
+    fn ring_forwarded_rings_the_principal_and_its_newest_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        superseded_chain(tmp.path(), &["a", "b"]);
+        ring_forwarded(tmp.path(), "a").unwrap();
+        assert_eq!(lines(tmp.path(), "a").len(), 1);
+        assert_eq!(lines(tmp.path(), "b").len(), 1);
+        ring_forwarded(tmp.path(), "b").unwrap();
+        assert_eq!(lines(tmp.path(), "b").len(), 2);
+        assert_eq!(lines(tmp.path(), "a").len(), 1);
     }
 
     #[test]

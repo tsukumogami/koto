@@ -78,6 +78,10 @@ pub trait SubstrateWaker {
 /// record that the wake was intended; the ring is the delivery. A wake
 /// carries no state, so the age-and-activity recovery rule re-ringing a
 /// session costs at most one tick that finds nothing new.
+///
+/// A woken session that has been superseded is rung together with the
+/// newest member of its supersede chain
+/// ([`crate::engine::wake_signal::ring_forwarded`]).
 pub struct SignalWaker {
     /// The koto root the wake file lives under (`~/.koto`).
     pub koto_root: std::path::PathBuf,
@@ -85,7 +89,7 @@ pub struct SignalWaker {
 
 impl SubstrateWaker for SignalWaker {
     fn wake(&self, session_id: &ValidatedSessionId) -> Result<(), EngineError> {
-        crate::engine::wake_signal::ring(&self.koto_root, session_id.as_str())
+        crate::engine::wake_signal::ring_forwarded(&self.koto_root, session_id.as_str())
             .map_err(|e| EngineError::WakeDeliveryFailed(e.to_string()))
     }
 }
@@ -402,6 +406,12 @@ fn sidecar_still_present(child_dir: &Path) -> bool {
 /// wake primitive. NO additional `RequesterWoken` is emitted — the
 /// original event is authoritative.
 ///
+/// When the requester has been superseded, the activity read is the
+/// newest member's log, the session now driving the requester's run
+/// ([`crate::engine::supersede_chain::newest_member`]): the superseded
+/// requester's own log changes only by its fence, which says nothing
+/// about whether the wake was heard.
+///
 /// Returns `Some(())` when the recovery fires (substrate wake
 /// re-invoked); `None` when the rule does not fire (timeout not
 /// exceeded, OR requester showed post-woken_at activity).
@@ -419,10 +429,11 @@ fn maybe_recover_stale_wake(
         return None;
     }
     // Activity check: requester's session log mtime > woken_at →
-    // requester resumed, recovery does NOT fire.
-    let requester_state_path = sessions_dir
-        .join(requested_by)
-        .join(state_file_name(requested_by));
+    // requester resumed, recovery does NOT fire. A superseded requester
+    // is checked through the newest member of its chain.
+    let active = crate::engine::supersede_chain::newest_member(sessions_dir, requested_by);
+    let active = active.as_deref().unwrap_or(requested_by);
+    let requester_state_path = sessions_dir.join(active).join(state_file_name(active));
     let log_mtime = match fs::metadata(&requester_state_path).and_then(|m| m.modified()) {
         Ok(m) => m,
         Err(_) => return None,
@@ -990,6 +1001,73 @@ mod tests {
         // Bump the requester's log mtime to "now" (after woken_at).
         let recent_ft = filetime::FileTime::from_system_time(now);
         filetime::set_file_mtime(&req_path, recent_ft).unwrap();
+        let waker = RecordingWaker::default();
+        let result = maybe_recover_stale_wake(
+            tmp.path(),
+            "parent",
+            woken_at,
+            now,
+            Duration::from_secs(600),
+            &waker,
+        );
+        assert!(result.is_none());
+        assert_eq!(waker.count(), 0);
+    }
+
+    /// `parent` superseded by `succ`: `parent`'s log carries the fence,
+    /// `succ`'s records the id the fence names.
+    fn superseded_parent(sessions: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let mut paths = Vec::new();
+        for (name, body) in [
+            (
+                "parent",
+                "{\"schema_version\":1,\"workflow\":\"parent\",\"session_id\":\"id-parent\"}\n\
+                 {\"seq\":1,\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"session_superseded\",\
+                 \"payload\":{\"by\":\"succ\",\"by_session_id\":\"id-succ\",\"actor\":{},\
+                 \"at\":\"2026-01-01T00:00:00Z\"}}\n",
+            ),
+            (
+                "succ",
+                "{\"schema_version\":1,\"workflow\":\"succ\",\"session_id\":\"id-succ\"}\n",
+            ),
+        ] {
+            std::fs::create_dir_all(sessions.join(name)).unwrap();
+            let path = sessions.join(name).join(state_file_name(name));
+            std::fs::write(&path, body).unwrap();
+            paths.push(path);
+        }
+        (paths.remove(0), paths.remove(0))
+    }
+
+    #[test]
+    fn maybe_recover_reads_a_superseded_requesters_newest_member() {
+        let now = SystemTime::now();
+        let woken_at = now - Duration::from_secs(700);
+        let before = filetime::FileTime::from_system_time(woken_at - Duration::from_secs(60));
+        let after = filetime::FileTime::from_system_time(now);
+
+        // The fence touched parent's log after the wake; succ never ran.
+        let tmp = tempfile::tempdir().unwrap();
+        let (parent, succ) = superseded_parent(tmp.path());
+        filetime::set_file_mtime(&parent, after).unwrap();
+        filetime::set_file_mtime(&succ, before).unwrap();
+        let waker = RecordingWaker::default();
+        let result = maybe_recover_stale_wake(
+            tmp.path(),
+            "parent",
+            woken_at,
+            now,
+            Duration::from_secs(600),
+            &waker,
+        );
+        assert!(result.is_some());
+        assert_eq!(waker.calls(), vec!["parent".to_string()]);
+
+        // succ has run since the wake: nothing to recover.
+        let tmp = tempfile::tempdir().unwrap();
+        let (parent, succ) = superseded_parent(tmp.path());
+        filetime::set_file_mtime(&parent, before).unwrap();
+        filetime::set_file_mtime(&succ, after).unwrap();
         let waker = RecordingWaker::default();
         let result = maybe_recover_stale_wake(
             tmp.path(),
