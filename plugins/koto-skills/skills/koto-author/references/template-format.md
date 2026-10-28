@@ -1243,10 +1243,10 @@ Delivery fails four ways (three under `capture_allow_empty: true`, below), all o
 **`capture_allow_empty: true`** turns the `empty` case into a value: an output that is empty once trimmed is delivered as the empty string, so a directive that interpolates the name renders nothing in its place. Use it for a command whose silence is an answer, such as one that prints a rule only for some runs. A non-empty output still takes every other check, and without the flag an empty output fails exactly as described above. The compiler refuses the flag on an action with no `capture_stdout_as`.
 
 ```yaml
-  near:
+  changelog_rule:
     default_action:
-      command: ./near-text.sh
-      capture_stdout_as: NEAR_RULE
+      command: ./changelog-rule.sh
+      capture_stdout_as: CHANGELOG_RULE
       capture_allow_empty: true
 ```
 
@@ -1482,12 +1482,12 @@ telemetry. Nothing routes on it and the response is unchanged.
 
 ```yaml
 states:
-  pr_creation:
+  open_pr:
     directive_rules:
-      - rule_id: probe/ack-value
-        check: probe_ack
+      - rule_id: release/changelog-entry
+        check: changelog
         extent: full
-        when_set: NEAR_RULE
+        when_set: CHANGELOG_RULE
 ```
 
 Each time `koto next` prints the state's directive (an advance into it, a tick

@@ -6529,14 +6529,14 @@ fn handle_next(
                 };
                 println!("{}", serde_json::to_string(&out)?);
                 // The rules the printed directive carried, recorded after
-                // the print as on the natural path. No gate ran here, so
-                // there is nothing else to record before them.
-                for delivery in directive_deliveries(&compiled, &resp, &variables, &overlay) {
-                    let payload = EventPayload::RuleDelivered(delivery);
-                    if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
-                        eprintln!("warning: failed to append RuleDelivered event: {}", e);
-                    }
-                }
+                // the print and before `instructions_delivered`, in the order
+                // the natural path uses. No gate ran on this path, so there
+                // are no check deliveries to put ahead of them.
+                append_rule_deliveries(
+                    backend,
+                    &name,
+                    directive_deliveries(&compiled, &resp, &variables, &overlay),
+                );
                 // The delivery record is appended only after printing --
                 // see the natural-advancement path for the crash-
                 // direction rationale. Non-fatal on error: the response
@@ -8175,16 +8175,14 @@ fn handle_next(
             // The rules the printed directive carried come last: they were
             // delivered by this print, after every check that ran this tick.
             let carried = directive_deliveries(&compiled, &resp, &variables, &overlay);
-            for delivery in rule_deliveries
-                .into_iter()
-                .chain(check_deliveries)
-                .chain(carried)
-            {
-                let payload = EventPayload::RuleDelivered(delivery);
-                if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
-                    eprintln!("warning: failed to append RuleDelivered event: {}", e);
-                }
-            }
+            append_rule_deliveries(
+                backend,
+                &name,
+                rule_deliveries
+                    .into_iter()
+                    .chain(check_deliveries)
+                    .chain(carried),
+            );
             // The delivery record is appended only after the response
             // prints, so a crash between the two re-delivers on the
             // next tick rather than silently suppressing
@@ -8271,6 +8269,23 @@ fn journal_response(
             directive,
             details,
         );
+    }
+}
+
+/// Append one `rule_delivered` event per delivery, in order. Called only
+/// after the response has printed, so a failed append is a warning: the
+/// delivery already happened and can't be taken back.
+#[cfg(unix)]
+fn append_rule_deliveries(
+    backend: &dyn SessionBackend,
+    name: &str,
+    deliveries: impl IntoIterator<Item = crate::decider::check::RuleDelivered>,
+) {
+    for delivery in deliveries {
+        let payload = EventPayload::RuleDelivered(delivery);
+        if let Err(e) = backend.append_event(name, &payload, &now_iso8601()) {
+            eprintln!("warning: failed to append RuleDelivered event: {}", e);
+        }
     }
 }
 
