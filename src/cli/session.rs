@@ -1372,8 +1372,9 @@ pub(crate) fn record_requester_link(backend: &Backend, session: &str, requested_
 /// can't tell which bucket copy is the session's own (koto#477).
 ///
 /// A session that records the prefix it was created under is pushed there
-/// whatever directory the rebind runs in, so it rebinds from anywhere. One
-/// recorded before koto named the prefix would be pushed under the third
+/// whatever directory the rebind runs in, so it rebinds from anywhere, and
+/// so does one recorded before koto named the prefix once its copy is
+/// located. One that can't be located would be pushed under the third
 /// directory's prefix, where neither the old workspace nor the new one reads
 /// it. Run from the target (the usual `koto session rebind <name>` stood in
 /// the new checkout) it is accepted even when every directory the session
@@ -1393,7 +1394,7 @@ pub fn rebind_guard(backend: &Backend, name: &str, to: Option<&str>) -> Result<(
         return Ok(());
     };
     let Some(Unlocated {
-        reason: UnlocatedReason::NoRecordedPrefix { anchor },
+        reason: UnlocatedReason::NoRecordedPrefix { anchor, .. },
         ..
     }) = e.downcast_ref::<Unlocated>()
     else {
@@ -1403,9 +1404,9 @@ pub fn rebind_guard(backend: &Backend, name: &str, to: Option<&str>) -> Result<(
         .as_deref()
         .unwrap_or("the directory the session was started in");
     anyhow::bail!(
-        "session_unlocated: session '{name}' records no prefix for its own copy, so a rebind \
-         runs from the directory it is bound to or from the directory it moves to: run \
-         `koto session rebind {name} --to {}` from {at}, or `koto session rebind {name}` from {}",
+        "{e}. A rebind of it runs from the directory it is bound to or from the directory it \
+         moves to: run `koto session rebind {name} --to {}` from {at}, or `koto session rebind \
+         {name}` from {}",
         target.display(),
         target.display()
     )

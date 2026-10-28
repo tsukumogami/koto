@@ -10,11 +10,16 @@
 //! workspace, the home is read strictly: a bucket that can't answer is an
 //! error, not the local copy.
 //!
+//! A session recorded before koto named the prefix is located from outside
+//! its own directory among two candidates, its anchor's prefix and the
+//! prefix this host's sync stamp names, and read there once the copy
+//! carries its `session_id`.
+//!
 //! A session koto can't locate refuses with `session_unlocated`: one with
 //! no copy on this host and none under the caller's prefix, one whose
-//! recorded copy is missing or another session's, and, until koto locates
-//! them, one recorded before koto named the prefix, read from outside its
-//! own directory.
+//! recorded copy is missing or another session's, and one recorded before
+//! koto named the prefix whose candidates hold no copy, two, or one that
+//! is another session's.
 //!
 //! Every test drives the koto binary against the in-process endpoint in
 //! `tests/support/fake_s3.rs`; no real bucket is involved.
@@ -737,35 +742,269 @@ fn a_stamp_naming_another_prefix_never_skips_the_own_copy_s_fetch() {
     assert!(asked_under(&s3, &root).is_empty());
 }
 
+/// The prefixes of the delimiter listings in the request log: the listings
+/// that locate a session recording no prefix, one per candidate. Every
+/// other listing koto makes of a session reads its whole prefix.
+fn candidate_listings(s3: &FakeS3) -> Vec<String> {
+    s3.requests()
+        .into_iter()
+        .filter(|r| r.delimiter.is_some())
+        .filter_map(|r| r.list_prefix)
+        .collect()
+}
+
 /// A session recorded before koto named the prefix, and one whose recorded
 /// prefix isn't of the shape koto derives, read as before from their own
-/// directory and refuse from another one with `session_unlocated`.
+/// directory, and from another one too once the copy under the anchor's
+/// prefix carries their `session_id`: a stamp naming a prefix that holds no
+/// copy doesn't stop it.
 #[test]
-fn a_session_without_a_usable_recorded_prefix_reads_only_from_its_own_directory() {
+fn a_session_without_a_usable_recorded_prefix_reads_from_another_directory_once_located() {
     for recorded in [None, Some("NOT-A-PREFIX")] {
         let s3 = FakeS3::start(BUCKET);
         let h = Host::new(&s3, true);
         let ws = h.dir("root/ws");
         let root = h.dir("root");
+        let b = h.dir("b");
         h.init(&ws, &[]);
         h.add(&ws, "k.md", b"value");
         set_recorded_prefix(&h, &s3, &ws, recorded);
         assert_eq!(h.ok(&ws, &["context", "get", WF, "k.md"]).stdout, "value");
-        poison_stamp(&h, &root);
 
-        let out = h.get(&root, "k.md");
-        assert_unlocated(&out, "context get", "no_recorded_prefix");
-        assert!(!out.stdout.contains("\nvalue"), "{}", out.describe());
-        assert!(
-            out.json()["error"]
-                .as_str()
-                .unwrap()
-                .contains(ws.to_str().unwrap()),
-            "the message names the directory: {}",
-            out.describe()
-        );
+        assert_eq!(h.ok(&b, &["context", "get", WF, "k.md"]).stdout, "value");
+        poison_stamp(&h, &root);
+        assert_eq!(h.ok(&root, &["context", "get", WF, "k.md"]).stdout, "value");
+        assert!(objects_under(&s3, &b).is_empty());
+        assert!(objects_under(&s3, &root).is_empty());
         assert_eq!(h.ok(&ws, &["context", "get", WF, "k.md"]).stdout, "value");
     }
+}
+
+/// A session with no recorded prefix whose copy under its anchor's prefix
+/// is missing, and separately carries another `session_id`, refuses from B
+/// with `session_unlocated`, naming the session and the reason, prints no
+/// value and changes no local file.
+#[test]
+fn an_unrecorded_session_s_missing_or_mismatched_copy_refuses() {
+    for (plant, reason) in [
+        ("missing", "no_candidate_copy"),
+        ("other", "candidate_copy_mismatch"),
+    ] {
+        let s3 = FakeS3::start(BUCKET);
+        let h = Host::new(&s3, true);
+        let a = h.dir("a");
+        let b = h.dir("b");
+        h.init(&a, &[]);
+        h.add(&a, "k.md", b"value");
+        set_recorded_prefix(&h, &s3, &a, None);
+        assert_eq!(h.ok(&a, &["context", "get", WF, "k.md"]).stdout, "value");
+        match plant {
+            "missing" => s3.remove(&state_key(&a)),
+            _ => plant_other_session(&s3, &state_key(&a)),
+        }
+        let before = h.local_files();
+
+        let out = h.get(&b, "k.md");
+        assert_unlocated(&out, "context get", reason);
+        assert!(!out.stdout.contains("value"), "{plant}: {}", out.describe());
+        assert_eq!(out.json()["locations"], serde_json::json!([prefix_of(&a)]));
+        let message = out.json()["error"].as_str().unwrap().to_string();
+        assert!(message.contains(a.to_str().unwrap()), "{message}");
+        assert_eq!(h.local_files(), before, "{plant}: a local file changed");
+    }
+}
+
+/// With a copy carrying the session's `session_id` under both its anchor's
+/// prefix and the prefix the sync stamp names, the read from B refuses and
+/// names both.
+#[test]
+fn matching_copies_under_both_candidates_refuse_and_name_both() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let a = h.dir("a");
+    let c = h.dir("c");
+    let b = h.dir("b");
+    h.init(&a, &[]);
+    h.add(&a, "k.md", b"value");
+    set_recorded_prefix(&h, &s3, &a, None);
+    assert_eq!(h.ok(&a, &["context", "get", WF, "k.md"]).stdout, "value");
+    copy_session(&s3, &a, &c);
+    poison_stamp(&h, &c);
+    let before = h.local_files();
+
+    let out = h.get(&b, "k.md");
+    assert_unlocated(&out, "context get", "ambiguous_copies");
+    assert!(!out.stdout.contains("value"), "{}", out.describe());
+    assert_eq!(
+        out.json()["locations"],
+        serde_json::json!([prefix_of(&a), prefix_of(&c)])
+    );
+    let message = out.json()["error"].as_str().unwrap().to_string();
+    assert!(message.contains(&prefix_of(&a)), "{message}");
+    assert!(message.contains(&prefix_of(&c)), "{message}");
+    assert_eq!(h.local_files(), before, "a local file changed");
+}
+
+/// When the anchor's prefix and the sync stamp's are the same, the read
+/// from B lists it once and succeeds, rather than refusing as ambiguous.
+#[test]
+fn one_prefix_for_the_anchor_and_the_stamp_is_listed_once() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let a = h.dir("a");
+    let b = h.dir("b");
+    h.init(&a, &[]);
+    h.add(&a, "k.md", b"value");
+    set_recorded_prefix(&h, &s3, &a, None);
+    assert_eq!(h.ok(&a, &["context", "get", WF, "k.md"]).stdout, "value");
+
+    s3.clear_requests();
+    assert_eq!(h.ok(&b, &["context", "get", WF, "k.md"]).stdout, "value");
+    assert_eq!(
+        candidate_listings(&s3),
+        vec![format!("{}/{WF}/", prefix_of(&a))]
+    );
+}
+
+/// With no copy under the anchor's prefix and one carrying the session's
+/// `session_id` under the prefix the sync stamp names, the read from B uses
+/// the stamp's.
+#[test]
+fn the_stamp_s_copy_is_read_when_the_anchor_s_prefix_holds_none() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let a = h.dir("a");
+    let c = h.dir("c");
+    let b = h.dir("b");
+    h.init(&a, &[]);
+    h.add(&a, "k.md", b"value");
+    set_recorded_prefix(&h, &s3, &a, None);
+    assert_eq!(h.ok(&a, &["context", "get", WF, "k.md"]).stdout, "value");
+    copy_session(&s3, &a, &c);
+    for key in objects_under(&s3, &a) {
+        s3.remove(&key);
+    }
+    change_key_elsewhere(&s3, &c, b"the stamp's copy", true);
+    poison_stamp(&h, &c);
+
+    assert_eq!(
+        h.ok(&b, &["context", "get", WF, "k.md"]).stdout,
+        "the stamp's copy"
+    );
+    assert!(objects_under(&s3, &a).is_empty());
+    assert!(objects_under(&s3, &b).is_empty());
+}
+
+/// A candidate whose listing fails refuses the read from B with
+/// `candidate_unreadable`, printing no value, while the read from the
+/// session's own directory keeps its local copy and warns, as before.
+#[test]
+fn a_failed_candidate_listing_refuses_the_read_from_another_directory() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let a = h.dir("a");
+    let b = h.dir("b");
+    h.init(&a, &[]);
+    h.add(&a, "k.md", b"value");
+    set_recorded_prefix(&h, &s3, &a, None);
+    assert_eq!(h.ok(&a, &["context", "get", WF, "k.md"]).stdout, "value");
+    s3.fail("LIST", &format!("{}/{WF}/", prefix_of(&a)), 500);
+
+    let out = h.get(&b, "k.md");
+    assert_unlocated(&out, "context get", "candidate_unreadable");
+    assert!(!out.stdout.contains("value"), "{}", out.describe());
+    let own = h.get(&a, "k.md");
+    assert_eq!(own.code, Some(0), "{}", own.describe());
+    assert_eq!(own.stdout, "value");
+}
+
+/// The read from B makes one listing per distinct candidate beyond the
+/// same read from the session's own directory, with the same cache state
+/// on both sides: one when only the anchor names a prefix, two when the
+/// stamp names another.
+#[test]
+fn a_located_read_costs_one_listing_per_distinct_candidate() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let a = h.dir("a");
+    let c = h.dir("c");
+    let b = h.dir("b");
+    h.init(&a, &[]);
+    h.add(&a, "k.md", b"value");
+    set_recorded_prefix(&h, &s3, &a, None);
+    let cold = || {
+        for file in ["cloud-sync.json", "cloud-manifest.json", "cloud-check.json"] {
+            let _ = std::fs::remove_file(h.session_dir().join(file));
+        }
+    };
+    let count = |dir: &Path| {
+        s3.clear_requests();
+        assert_eq!(h.ok(dir, &["context", "get", WF, "k.md"]).stdout, "value");
+        (s3.requests().len(), candidate_listings(&s3))
+    };
+
+    cold();
+    let (from_a, listed) = count(&a);
+    assert!(listed.is_empty(), "from A: {listed:?}");
+    cold();
+    let (from_b, listed) = count(&b);
+    assert_eq!(listed, vec![format!("{}/{WF}/", prefix_of(&a))]);
+    assert!(
+        from_b <= from_a + 1,
+        "cold: {from_b} from B, {from_a} from A"
+    );
+
+    // Warm, with the stamp naming a third prefix that holds no copy.
+    h.ok(&a, &["context", "get", WF, "k.md"]);
+    poison_stamp(&h, &c);
+    let (from_a, listed) = count(&a);
+    assert!(listed.is_empty(), "from A: {listed:?}");
+    poison_stamp(&h, &c);
+    let (from_b, listed) = count(&b);
+    assert_eq!(
+        listed,
+        vec![
+            format!("{}/{WF}/", prefix_of(&a)),
+            format!("{}/{WF}/", prefix_of(&c))
+        ]
+    );
+    assert!(
+        from_b <= from_a + 2,
+        "warm: {from_b} from B, {from_a} from A"
+    );
+}
+
+/// The same session read from its own directory makes no candidate
+/// listing, and the same requests as before its prefix was dropped.
+#[test]
+fn an_unrecorded_session_read_from_its_own_directory_is_unchanged() {
+    let s3 = FakeS3::start(BUCKET);
+    let h = Host::new(&s3, true);
+    let a = h.dir("a");
+    h.init(&a, &[]);
+    h.add(&a, "k.md", b"value");
+    let cold = || {
+        for file in ["cloud-sync.json", "cloud-manifest.json", "cloud-check.json"] {
+            let _ = std::fs::remove_file(h.session_dir().join(file));
+        }
+    };
+    let asked = || {
+        s3.requests()
+            .into_iter()
+            .map(|r| (r.method, r.key, r.list_prefix, r.delimiter))
+            .collect::<Vec<_>>()
+    };
+
+    cold();
+    s3.clear_requests();
+    assert_eq!(h.ok(&a, &["context", "get", WF, "k.md"]).stdout, "value");
+    let recorded = asked();
+    set_recorded_prefix(&h, &s3, &a, None);
+    cold();
+    s3.clear_requests();
+    assert_eq!(h.ok(&a, &["context", "get", WF, "k.md"]).stdout, "value");
+    assert_eq!(asked(), recorded);
+    assert!(candidate_listings(&s3).is_empty());
 }
 
 /// A second host with no local copy of the session reads it only from a
