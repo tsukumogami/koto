@@ -1330,11 +1330,16 @@ fn remove_member(
     // back-reference the judgment didn't see.
     let removal = crate::session::pin::remove_by_rule_with(backend, name, held, || {
         // The remote copy goes first, so a failure leaves the local copy
-        // for a later prune to retry.
+        // for a later prune to retry. A bucket copy under the session's home
+        // that is another session's leaves both copies, and the session is
+        // skipped.
         if let Backend::Cloud(cloud) = backend {
-            cloud
-                .delete_remote_session_checked(name)
-                .map_err(|e| Refusal::Failed(format!("the remote copy wasn't removed: {e:#}")))?;
+            cloud.delete_remote_session_checked(name).map_err(|e| {
+                match e.downcast_ref::<crate::session::cloud::CopyNotOwn>() {
+                    Some(not_own) => Refusal::Skipped(not_own.to_string()),
+                    None => Refusal::Failed(format!("the remote copy wasn't removed: {e:#}")),
+                }
+            })?;
         }
         std::fs::remove_dir_all(base.join(name))
             .map_err(|e| Refusal::Failed(format!("the local directory wasn't removed: {e}")))

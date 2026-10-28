@@ -921,7 +921,7 @@ The target is canonicalized before it is recorded, so what lands on the header i
 
 Under the cloud backend the rewritten header is pushed to the bucket, like the event. A failed push doesn't fail the rebind: it succeeds locally, prints a warning to stderr, and the session's next successful push carries the new anchor.
 
-Under the cloud backend, run it from the new directory, or from the session's own workspace with `--to`. From a third directory it refuses with `session_bound_elsewhere` (exit 2, error JSON on stdout), naming the bound directory and the exact `koto session rebind <name> --to <dir>` to run. From the new directory it works even when every directory the session records is gone.
+Under the cloud backend, run it from the new directory, or from any directory with `--to`: the header goes up to the session's own copy, under the prefix it was created under. A session an older koto created without recording its prefix refuses from a third directory with `session_unlocated` (exit 2, error JSON on stdout), naming its directory and the exact `koto session rebind <name> --to <dir>` to run. From the new directory it works even when every directory the session records is gone.
 
 A rebind fences the old anchor: it raises `origin.anchor_epoch` and lists the old anchor in `origin.retired_anchors`. Under the cloud backend, a later write to the session from the old anchor, or from a command that read the session before the rebind, refuses with `session_rebound` and writes nothing.
 
@@ -1091,7 +1091,7 @@ koto --workspace <workspace-path-or-id> context list <name> [--prefix <p>]
 
 Reads a session that lives in another workspace's part of the bucket, where it is, without importing it: for a finished run's session read from another checkout or host. The value is the workspace's absolute path as it was on the host that created the session (what `koto session import --from` takes) or its id, the 16 lowercase hex digits of its bucket prefix. The option goes before the verb.
 
-It is the read-only answer to `session_bound_elsewhere`: a plain `koto status` or `koto context` from another directory refuses, and the same verb with `--workspace <the directory the session was created in>` reads the session from the bucket instead. That is the directory the error names unless the session was started with `koto init --execution-dir`, whose error names the execution directory instead. Output and exit codes are the verb's own. The read writes nothing: no bucket object, no `context_read` record, nothing in this host's session store; what it downloads goes to a temporary directory removed before koto exits. Every other verb refuses the option with `workspace_read_only` (exit 2) before touching anything.
+It is the read-only answer to `session_unlocated`: a plain `koto status` or `koto context` that can't locate the session refuses (on a host with no copy of it, say), and the same verb with `--workspace <the directory the session was created in>` reads the session from the bucket instead. Output and exit codes are the verb's own. The read writes nothing: no bucket object, no `context_read` record, nothing in this host's session store; what it downloads goes to a temporary directory removed before koto exits. Every other verb refuses the option with `workspace_read_only` (exit 2) before touching anything.
 
 | `code` | Exit | Meaning |
 |---|---|---|

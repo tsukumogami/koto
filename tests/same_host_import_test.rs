@@ -1339,22 +1339,18 @@ fn an_import_from_an_agent_session_holds_the_moved_copy_and_its_hierarchy() {
     assert_eq!(refused.code, Some(2), "{}", refused.describe());
     assert!(format!("{}{}", refused.stdout, refused.stderr).contains("session_migrated"));
 
-    // Only coord moved: b is still bound to A, where it was started, so the
-    // reviewer reads b's log and keys from there. From B, whose prefix isn't
-    // b's, the read refuses rather than sync against it (koto#457).
+    // Only coord moved: b's own copy is still under A's prefix, where it
+    // was started, so the reviewer reads b's log and keys from there, and
+    // from B the read takes the same copy rather than anything under B's
+    // prefix.
     let out = ok(&h, &h.a, &["context", "list", "b"], &as_importer);
     assert!(out.stdout.contains("notes.md"), "{}", out.describe());
     let out = ok(&h, &h.a, &["status", "b"], &as_importer);
     assert_eq!(out.json()["is_terminal"], true, "{}", out.describe());
     let out = ok(&h, &h.a, &["context", "get", "b", "notes.md"], &as_importer);
     assert_eq!(out.raw, b"the notes\n");
-    let refused = h.koto(&h.b, &["context", "get", "b", "notes.md"], &as_importer);
-    assert_eq!(refused.code, Some(2), "{}", refused.describe());
-    assert!(
-        refused.stdout.contains("session_bound_elsewhere"),
-        "{}",
-        refused.describe()
-    );
+    let out = ok(&h, &h.b, &["context", "get", "b", "notes.md"], &as_importer);
+    assert_eq!(out.raw, b"the notes\n");
 }
 
 /// A held-by link whose anchor is open here is kept as it is, although the

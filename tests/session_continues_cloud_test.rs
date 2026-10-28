@@ -958,20 +958,23 @@ fn a_rebound_successor_keeps_its_relation_and_its_back_reference() {
         &["session", "rebind", "s", "--to", m.to_str().unwrap()],
     );
     assert_eq!(rebound["rebound"], true, "{rebound:#}");
-    // Until a command runs from the new checkout, the back-reference names
-    // the old prefix, where the relation still is.
+    // The rebind moves nothing in the bucket: the successor's copy, and the
+    // relation in it, stay under the prefix it was created under, which the
+    // back-reference names.
     assert_eq!(
         pointers_beside(&h, &h.w1, "p"),
         [format!("{}/s", prefix_of(&h.w1))]
     );
-    // The next command from there moves it: the relation goes up under the
-    // new prefix and one back-reference names it, the old one taken back.
+    // A command from the new checkout reads and writes that same copy: the
+    // back-reference still names it and nothing goes up under the new
+    // checkout's prefix.
     h.ok(1, &m, &["status", "s"]);
     assert_eq!(
         pointers_beside(&h, &h.w1, "p"),
-        [format!("{}/s", prefix_of(&m))]
+        [format!("{}/s", prefix_of(&h.w1))]
     );
-    assert!(h.s3.object(&relation_object(&m, "s", "p")).is_some());
+    assert!(h.s3.object(&relation_object(&h.w1, "s", "p")).is_some());
+    assert!(h.s3.object(&relation_object(&m, "s", "p")).is_none());
     // Running again changes nothing.
     h.ok(1, &m, &["status", "s"]);
     assert_eq!(pointers_beside(&h, &h.w1, "p").len(), 1);
@@ -1067,7 +1070,10 @@ fn a_rebound_predecessor_is_still_kept_naming_its_successor() {
         "{on1:#}"
     );
     h.compile(2);
-    h.pull(2, &m, "p");
+    // Host 2 has no copy of p, so it finds p only under the prefix of the
+    // directory it runs in: the one p was created under, which the rebind
+    // left its copy at. Once p is local, host 2 reads it from anywhere.
+    h.pull(2, &h.w1, "p");
     let on2 = h.ok(
         2,
         &m,
