@@ -627,8 +627,8 @@ evaluation are kept. These records carry `koto.rule.via` and
 A directive reports the rules it carries through the state's
 `directive_rules` (see the template format reference). Each time `koto next`
 prints that state's directive, on an advance or a `--to` move, it appends one
-`rule_delivered` event per entry whose `when_set` variable or capture renders
-non-empty, after the response prints and after any check's deliveries. These
+`rule_delivered` event per entry whose `when_set` variable or capture holds
+a non-empty value, after the response prints and after any check's deliveries. These
 records carry `koto.rule.via` `directive` and `koto.rule.delivery` `printed`,
 with the entry's declared `rule_id`, `check` and `extent`. An entry whose
 value is empty writes no record, every print writes again (two ticks that

@@ -1259,6 +1259,9 @@ fn compile_directive_rules(
             "write directive_rules as a list, one entry per rule",
         ));
     };
+    // An empty list compiles to the same JSON as no field, so it is refused
+    // like `clear_on_entry: []`: written out, it most likely means rules
+    // were meant to be listed and weren't.
     if entries.is_empty() {
         return Err(err(
             "E-DIRECTIVE-RULE-SHAPE",

@@ -545,14 +545,6 @@ fn validate_decider_check_gate(
     super::decider_check::validate_spec(state_name, gate_name, spec)
 }
 
-/// The per-state decider-check rules: at most
-/// [`MAX_CRITERIA_PER_STATE`](super::decider_check::MAX_CRITERIA_PER_STATE)
-/// criteria across the state's checks, unit-mode caps within
-/// [`MAX_UNIT_CONSULTATIONS_PER_STATE`](super::decider_check::MAX_UNIT_CONSULTATIONS_PER_STATE)
-/// ([`unit_caps`](super::decider_check::unit_caps)), each `rule_id` once, and no `when`
-/// clause, `skip_if` condition or context assignment reading a decider
-/// check's output. A decider verdict must never route
-/// (DESIGN-koto-decider-checks.md, Decision 1).
 /// Refuse `capture_allow_empty` on a `default_action` that names no
 /// capture: there is no value for it to deliver empty.
 fn validate_capture_allow_empty(state_name: &str, state: &TemplateState) -> Result<(), String> {
@@ -568,6 +560,14 @@ fn validate_capture_allow_empty(state_name: &str, state: &TemplateState) -> Resu
     }
 }
 
+/// The per-state decider-check rules: at most
+/// [`MAX_CRITERIA_PER_STATE`](super::decider_check::MAX_CRITERIA_PER_STATE)
+/// criteria across the state's checks, unit-mode caps within
+/// [`MAX_UNIT_CONSULTATIONS_PER_STATE`](super::decider_check::MAX_UNIT_CONSULTATIONS_PER_STATE)
+/// ([`unit_caps`](super::decider_check::unit_caps)), each `rule_id` once, and no `when`
+/// clause, `skip_if` condition or context assignment reading a decider
+/// check's output. A decider verdict must never route
+/// (DESIGN-koto-decider-checks.md, Decision 1).
 fn validate_state_decider_checks(state_name: &str, state: &TemplateState) -> Result<(), String> {
     use super::decider_check::MAX_CRITERIA_PER_STATE;
     let checks: Vec<(&String, &super::decider_check::DeciderCheckSpec)> = state

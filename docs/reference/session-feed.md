@@ -2483,7 +2483,7 @@ check printed, and it never carries `unit_count`.
 A state that declares `directive_rules` records its rules the same way, as
 telemetry: each time `koto next` prints that state's directive (on an advance
 or a `--to` move), one event per entry whose `when_set` variable or capture
-renders non-empty, with `via: directive`, `delivery: printed` and the entry's
+holds a non-empty value, with `via: directive`, `delivery: printed` and the entry's
 `rule_id`, `check` (as `gate`) and `extent` (as `level`). They are appended
 after the response prints and after any check's deliveries. An entry whose
 value is empty records nothing, every print records again (a second tick that

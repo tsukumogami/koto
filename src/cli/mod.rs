@@ -8275,10 +8275,11 @@ fn journal_response(
 }
 
 /// The `rule_delivered` events for the `directive_rules` of the state whose
-/// directive `resp` printed: one per entry whose `when_set` value renders
+/// directive `resp` printed: one per entry whose `when_set` value is
 /// non-empty, in declared order. Nothing for a response that printed no
 /// directive. The value is read through the same lookup the directive's
-/// substitution used, so a rule records exactly when its text was carried.
+/// substitution used, so for a directive that interpolates `when_set` the
+/// rule records exactly when its text was carried.
 #[cfg(unix)]
 fn directive_deliveries(
     compiled: &CompiledTemplate,

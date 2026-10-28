@@ -1492,7 +1492,7 @@ states:
 
 Each time `koto next` prints the state's directive (an advance into it, a tick
 that holds there, a `--to` move), it appends one event per entry whose
-`when_set` value renders non-empty, after the response prints. Each event
+`when_set` value is non-empty (whether or not the directive interpolates it), after the response prints. Each event
 carries the state, `check` as the check name, `rule_id`, `extent`,
 `via: directive` and `delivery: printed`; it never carries the rule's text or a
 `unit_count`. A re-print records again, an entry whose value is empty records
