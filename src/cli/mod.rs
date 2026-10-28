@@ -6528,6 +6528,15 @@ fn handle_next(
                     ),
                 };
                 println!("{}", serde_json::to_string(&out)?);
+                // The rules the printed directive carried, recorded after
+                // the print as on the natural path. No gate ran here, so
+                // there is nothing else to record before them.
+                for delivery in directive_deliveries(&compiled, &resp, &variables, &overlay) {
+                    let payload = EventPayload::RuleDelivered(delivery);
+                    if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
+                        eprintln!("warning: failed to append RuleDelivered event: {}", e);
+                    }
+                }
                 // The delivery record is appended only after printing --
                 // see the natural-advancement path for the crash-
                 // direction rationale. Non-fatal on error: the response
@@ -8163,7 +8172,14 @@ fn handle_next(
                 .read_events_local(&name)
                 .map(|(_, events)| check_output_deliveries(&events, pre_advance_seq))
                 .unwrap_or_default();
-            for delivery in rule_deliveries.into_iter().chain(check_deliveries) {
+            // The rules the printed directive carried come last: they were
+            // delivered by this print, after every check that ran this tick.
+            let carried = directive_deliveries(&compiled, &resp, &variables, &overlay);
+            for delivery in rule_deliveries
+                .into_iter()
+                .chain(check_deliveries)
+                .chain(carried)
+            {
                 let payload = EventPayload::RuleDelivered(delivery);
                 if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
                     eprintln!("warning: failed to append RuleDelivered event: {}", e);
@@ -8256,6 +8272,36 @@ fn journal_response(
             details,
         );
     }
+}
+
+/// The `rule_delivered` events for the `directive_rules` of the state whose
+/// directive `resp` printed: one per entry whose `when_set` value renders
+/// non-empty, in declared order. Nothing for a response that printed no
+/// directive. The value is read through the same lookup the directive's
+/// substitution used, so a rule records exactly when its text was carried.
+#[cfg(unix)]
+fn directive_deliveries(
+    compiled: &CompiledTemplate,
+    resp: &next_types::NextResponse,
+    variables: &crate::engine::substitute::Variables,
+    overlay: &crate::engine::substitute::VariableOverlay,
+) -> Vec<crate::decider::check::RuleDelivered> {
+    let Some((state, _, _)) = resp.directive_parts() else {
+        return Vec::new();
+    };
+    let Some(template_state) = compiled.states.get(state) else {
+        return Vec::new();
+    };
+    template_state
+        .directive_rules
+        .iter()
+        .filter(|rule| {
+            variables
+                .value_with(&rule.when_set, overlay)
+                .is_some_and(|v| !v.is_empty())
+        })
+        .map(|rule| crate::decider::check::RuleDelivered::from_directive(state, rule))
+        .collect()
 }
 
 /// The `rule_delivered` events for the rules command gates said they
@@ -11055,6 +11101,7 @@ Done.
             polling: None,
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         };
         for (field, raw) in authored.substitutable_fields() {
             assert!(

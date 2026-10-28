@@ -3685,6 +3685,7 @@ mod tests {
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         };
         compiled.states.insert("s".to_string(), state.clone());
         assert!(!state_has_materialize_children(&compiled, "s"));

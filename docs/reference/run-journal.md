@@ -93,7 +93,7 @@ their digest (see
 | `decider_checked` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.unit.key`, `koto.unit.document`, `koto.unit.section`, `koto.decider.provider`, `koto.decider.model`, `koto.decider.mode`, `koto.decider.outcome`, `koto.decider.confidence_bp`, `koto.decider.reason`, `koto.decider.blocked`, `koto.decider.error_class`, `koto.decider.input_tokens`, `koto.decider.output_tokens`, `koto.decider.unread_usage_attempts`, `koto.decider.attempts`, `koto.decider.latency_ms`, `koto.decider.input_bytes` | koto grades one criterion of a decider check, on one unit for a unit-mode check. |
 | `decider_fallback` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.unit.key`, `koto.unit.document`, `koto.unit.section`, `koto.decider.mode`, `koto.decider.reason`, `koto.decider.input_bytes` | A decider-check criterion that got no verdict is handed to the agent. |
 | `decider_check_answered` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check`, `koto.rule.id`, `koto.unit.key`, `koto.unit.document`, `koto.unit.section`, `koto.decider.answer`, `koto.decider.reason`, `koto.decider.fallback_seq` | `koto decider answer` records the agent's answer to a criterion handed to it. |
-| `rule_delivered` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check.name`, `koto.rule.id`, `koto.rule.extent`, `koto.rule.unit_count`, `koto.rule.via`, `koto.rule.delivery` | A `koto next` response hands back a failed criterion's rule, or a command check reports a rule it printed or refused. |
+| `rule_delivered` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check.name`, `koto.rule.id`, `koto.rule.extent`, `koto.rule.unit_count`, `koto.rule.via`, `koto.rule.delivery` | A `koto next` response hands back a failed criterion's rule, a command check reports a rule it printed or refused, or `koto next` prints a directive that carries a rule its state declares in `directive_rules`. |
 | `check_overridden` | `koto.seq`, `koto.visit.seq`, `koto.state`, `koto.check` | An override is recorded for a gate. |
 | `review_round` | `koto.seq`, `koto.visit.seq`, `koto.doc.type`, `koto.doc.format`, `koto.doc.schema`, `koto.review.round`, `koto.review.seat_count`, `koto.review.fallback` | `koto review record ... round-started` records that a document review round's seats were spawned. |
 | `review_verdict` | `koto.seq`, `koto.visit.seq`, `koto.doc.type`, `koto.doc.format`, `koto.doc.schema`, `koto.review.round`, `koto.review.seat`, `koto.rule.id`, `koto.review.section`, `koto.review.verdict` | Once for each entry `koto review record ... verdicts` records. |
@@ -624,15 +624,27 @@ line is ordinary output and records nothing. At most 50 lines per
 evaluation are kept. These records carry `koto.rule.via` and
 `koto.rule.delivery`; a decider check's carry neither.
 
+A directive reports the rules it carries through the state's
+`directive_rules` (see the template format reference). Each time `koto next`
+prints that state's directive, on an advance or a `--to` move, it appends one
+`rule_delivered` event per entry whose `when_set` variable or capture renders
+non-empty, after the response prints and after any check's deliveries. These
+records carry `koto.rule.via` `directive` and `koto.rule.delivery` `printed`,
+with the entry's declared `rule_id`, `check` and `extent`. An entry whose
+value is empty writes no record, every print writes again (two ticks that
+print the directive give two records), and `koto status` writes none. Like
+every record here, they are telemetry: the response and routing are
+unchanged.
+
 | Field | Type | Present | Description |
 |-------|------|---------|-------------|
-| `koto.state` | string | always | The state whose check failed. |
-| `koto.check.name` | string | always | The gate's name, under the same path as on `check_finding`. The record has no `koto.check` of its own. |
-| `koto.rule.id` | string | always | The failed criterion's id, or the rule id the check printed, or its digest (see [Rule ids](#rule-ids)). |
-| `koto.rule.extent` | string | always | How much of the rule was handed back. For a decider check, `summary` on the first failing evaluation of the check and rule in the visit, `full` on every later one; a criterion that declares only one text always gets that text's extent. For a command check, the `extent` it printed. Later koto versions may add values. |
-| `koto.rule.unit_count` | integer | unit mode | How many failing units the rule was handed back for, at least 1: every unit that failed the criterion, by the decider's verdict or the agent's answer, including any the response's finding cap left out. Left out for a check without units. |
-| `koto.rule.via` | string | command check | `check_output`: the check printed a `::koto-rule-delivered::` line. |
-| `koto.rule.delivery` | string | command check | `printed` when the check printed the rule's text, `refused` when it declined to release it. |
+| `koto.state` | string | always | The state whose check failed, or whose directive carried the rule. |
+| `koto.check.name` | string | always | The gate's name, under the same path as on `check_finding`, or a directive rule's declared `check`. The record has no `koto.check` of its own. |
+| `koto.rule.id` | string | always | The failed criterion's id, the rule id the check printed, or a directive rule's declared id, or its digest (see [Rule ids](#rule-ids)). |
+| `koto.rule.extent` | string | always | How much of the rule was handed back. For a decider check, `summary` on the first failing evaluation of the check and rule in the visit, `full` on every later one; a criterion that declares only one text always gets that text's extent. For a command check, the `extent` it printed; for a directive rule, the `extent` it declares. Later koto versions may add values. |
+| `koto.rule.unit_count` | integer | unit mode | How many failing units the rule was handed back for, at least 1: every unit that failed the criterion, by the decider's verdict or the agent's answer, including any the response's finding cap left out. Left out for a check without units and for every directive delivery. |
+| `koto.rule.via` | string | command check, directive | `check_output`: the check printed a `::koto-rule-delivered::` line. `directive`: the printed directive carried a rule its state declares in `directive_rules`. |
+| `koto.rule.delivery` | string | command check, directive | `printed` when the check printed the rule's text, `refused` when it declined to release it. Always `printed` for a directive delivery. |
 
 The record never holds the rule's text, its summary, or a unit's key. One
 response that fails a rule on twenty units writes one record with

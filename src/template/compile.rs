@@ -100,6 +100,11 @@ struct SourceState {
     /// read as "not declared".
     #[serde(default)]
     clear_on_entry: Option<Vec<String>>,
+    /// Rules the state's directive carries. Kept as a YAML value so a value
+    /// that isn't a list of entries, an unknown key and a missing field each
+    /// get their own coded error rather than serde's.
+    #[serde(default)]
+    directive_rules: Option<serde_yaml_ng::Value>,
 }
 
 /// YAML front-matter view of a `materialize_children` hook.
@@ -129,6 +134,8 @@ struct SourceActionDecl {
     fallback: Option<String>,
     #[serde(default)]
     capture_stdout_as: Option<String>,
+    #[serde(default)]
+    capture_allow_empty: bool,
 }
 
 /// Polling configuration in source YAML.
@@ -677,6 +684,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
             }),
             fallback: sa.fallback.clone(),
             capture_stdout_as: sa.capture_stdout_as.clone(),
+            capture_allow_empty: sa.capture_allow_empty,
         });
 
         let compiled_materialize_children =
@@ -709,6 +717,11 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
             None => None,
         };
 
+        let directive_rules = match &source_state.directive_rules {
+            Some(value) => compile_directive_rules(state_name, value)?,
+            None => Vec::new(),
+        };
+
         compiled_states.insert(
             state_name.clone(),
             TemplateState {
@@ -726,6 +739,7 @@ pub fn compile(source_path: &Path, strict: bool) -> anyhow::Result<CompiledTempl
                 skip_if: compiled_skip_if,
                 result: compiled_result,
                 clear_on_entry: source_state.clear_on_entry.clone().unwrap_or_default(),
+                directive_rules,
             },
         );
     }
@@ -1211,6 +1225,110 @@ fn compile_gate(state_name: &str, gate_name: &str, source: &SourceGate) -> anyho
             SUPPORTED_GATE_TYPES.join(", ")
         )),
     }
+}
+
+/// The keys a `directive_rules` entry takes, every one required.
+const DIRECTIVE_RULE_KEYS: [&str; 4] = ["rule_id", "check", "extent", "when_set"];
+
+/// Lower a state's `directive_rules` from its YAML value.
+///
+/// Only the shape is checked here: a list of maps, each with exactly the four
+/// keys as strings, and an `extent` of `summary` or `full` (the case matters,
+/// as it does for every closed set a template names). The bounds on
+/// `rule_id` and `check`, and what `when_set` may name, are checked by
+/// `CompiledTemplate::validate`, so a cached template is held to them too.
+fn compile_directive_rules(
+    state_name: &str,
+    value: &serde_yaml_ng::Value,
+) -> anyhow::Result<Vec<super::types::DirectiveRule>> {
+    use super::decider_check::RuleLevel;
+    use serde_yaml_ng::Value;
+    let err = |code: &str, detail: String, remedy: &str| {
+        anyhow!(
+            "validation error: {}: state {:?}: directive_rules{}\n  remedy: {}",
+            code,
+            state_name,
+            detail,
+            remedy
+        )
+    };
+    let Value::Sequence(entries) = value else {
+        return Err(err(
+            "E-DIRECTIVE-RULE-SHAPE",
+            " must be a list of entries".into(),
+            "write directive_rules as a list, one entry per rule",
+        ));
+    };
+    if entries.is_empty() {
+        return Err(err(
+            "E-DIRECTIVE-RULE-SHAPE",
+            " must list at least one entry".into(),
+            "list the rules the directive carries, or remove the field",
+        ));
+    }
+    let mut rules = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let Value::Mapping(map) = entry else {
+            return Err(err(
+                "E-DIRECTIVE-RULE-SHAPE",
+                format!(" entry {} must be a map", i),
+                "give each entry rule_id, check, extent and when_set",
+            ));
+        };
+        let mut fields: BTreeMap<&str, String> = BTreeMap::new();
+        for (k, v) in map {
+            let key = match k.as_str() {
+                Some(key) if DIRECTIVE_RULE_KEYS.contains(&key) => key,
+                _ => {
+                    return Err(err(
+                        "E-DIRECTIVE-RULE-SHAPE",
+                        format!(
+                            " entry {}: unknown key {:?}; an entry takes rule_id, check, \
+                             extent and when_set",
+                            i,
+                            k.as_str().unwrap_or("<not a string>")
+                        ),
+                        "remove the key",
+                    ))
+                }
+            };
+            let Some(text) = v.as_str() else {
+                return Err(err(
+                    "E-DIRECTIVE-RULE-SHAPE",
+                    format!(" entry {}: {} must be a string", i, key),
+                    "write the value as a string",
+                ));
+            };
+            fields.insert(key, text.to_string());
+        }
+        for key in DIRECTIVE_RULE_KEYS {
+            if !fields.contains_key(key) {
+                return Err(err(
+                    "E-DIRECTIVE-RULE-MISSING",
+                    format!(" entry {}: missing {}", i, key),
+                    "give each entry rule_id, check, extent and when_set",
+                ));
+            }
+        }
+        let extent = match fields["extent"].as_str() {
+            "summary" => RuleLevel::Summary,
+            "full" => RuleLevel::Full,
+            other => {
+                return Err(err(
+                    "E-DIRECTIVE-RULE-EXTENT",
+                    format!(" entry {}: extent {:?} is not summary or full", i, other),
+                    "set extent to summary or full",
+                ))
+            }
+        };
+        rules.push(super::types::DirectiveRule {
+            rule_id: fields["rule_id"].clone(),
+            check: fields["check"].clone(),
+            extent,
+            when_set: fields["when_set"].clone(),
+        });
+    }
+    Ok(rules)
 }
 
 /// Compile a `decider-check` gate (DESIGN-koto-decider-checks.md, Decision
@@ -3498,6 +3616,220 @@ Done.
     fn compile_src(src: &str) -> anyhow::Result<CompiledTemplate> {
         let f = write_temp(src);
         compile(f.path(), true)
+    }
+
+    // -----------------------------------------------------------------
+    // directive_rules and capture_allow_empty
+    // -----------------------------------------------------------------
+
+    /// A template whose `work` state carries `rules` (YAML under
+    /// `directive_rules:`, or nothing) and is reached from `probe`, whose
+    /// action captures `NOTE`. `TOPIC` is a declared variable.
+    fn directive_rules_template(rules: &str, action_extra: &str) -> String {
+        format!(
+            r#"---
+name: directive-rules
+version: "1.0"
+initial_state: probe
+variables:
+  TOPIC:
+    default: t
+states:
+  probe:
+    default_action:
+      command: "echo note"
+      capture_stdout_as: NOTE
+{action_extra}    transitions:
+      - target: work
+  work:
+{rules}    transitions:
+      - target: done
+  done:
+    terminal: true
+---
+
+## probe
+
+Probe.
+
+## work
+
+Work. {{{{NOTE}}}}
+
+## done
+
+Done.
+"#
+        )
+    }
+
+    fn one_rule(fields: &str) -> String {
+        format!("    directive_rules:\n      - {}\n", fields)
+    }
+
+    const FULL_RULE: &str =
+        "{rule_id: probe/ack-value, check: probe_ack, extent: full, when_set: NOTE}";
+
+    #[test]
+    fn directive_rules_compile_into_the_state() {
+        let t = compile_src(&directive_rules_template(&one_rule(FULL_RULE), "")).unwrap();
+        let rules = &t.states["work"].directive_rules;
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].rule_id, "probe/ack-value");
+        assert_eq!(rules[0].check, "probe_ack");
+        assert_eq!(
+            rules[0].extent,
+            crate::template::decider_check::RuleLevel::Full
+        );
+        assert_eq!(rules[0].when_set, "NOTE");
+    }
+
+    #[test]
+    fn directive_rules_accept_both_extents_and_a_declared_variable() {
+        let rules = "    directive_rules:\n      \
+             - {rule_id: a, check: c, extent: summary, when_set: TOPIC}\n      \
+             - {rule_id: b, check: c, extent: full, when_set: NOTE}\n";
+        let t = compile_src(&directive_rules_template(rules, "")).unwrap();
+        let extents: Vec<&str> = t.states["work"]
+            .directive_rules
+            .iter()
+            .map(|r| r.extent.as_str())
+            .collect();
+        assert_eq!(extents, vec!["summary", "full"]);
+    }
+
+    #[test]
+    fn a_directive_rule_missing_a_field_is_refused_naming_it() {
+        let all = [
+            ("rule_id", "a"),
+            ("check", "c"),
+            ("extent", "full"),
+            ("when_set", "NOTE"),
+        ];
+        for missing in ["rule_id", "check", "extent", "when_set"] {
+            let fields: Vec<String> = all
+                .iter()
+                .filter(|(k, _)| *k != missing)
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect();
+            let entry = format!("{{{}}}", fields.join(", "));
+            let err = compile_src(&directive_rules_template(&one_rule(&entry), ""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("E-DIRECTIVE-RULE-MISSING"), "{missing}: {err}");
+            assert!(
+                err.contains(&format!("missing {missing}")),
+                "{missing}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directive_rule_id_outside_the_bounds_is_refused() {
+        let long = "r".repeat(129);
+        for id in ["\"\"", "\"  \"", long.as_str()] {
+            let entry = format!("{{rule_id: {id}, check: c, extent: full, when_set: NOTE}}");
+            let err = compile_src(&directive_rules_template(&one_rule(&entry), ""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("E-DIRECTIVE-RULE-ID"), "{id}: {err}");
+        }
+        let at_bound = "r".repeat(128);
+        let entry = format!("{{rule_id: {at_bound}, check: c, extent: full, when_set: NOTE}}");
+        compile_src(&directive_rules_template(&one_rule(&entry), "")).unwrap();
+    }
+
+    #[test]
+    fn a_directive_rule_check_that_is_not_name_shaped_is_refused() {
+        for check in [
+            "\"has space\"",
+            "\"/abs\"",
+            "\"~home\"",
+            "\"\"",
+            "\"semi;colon\"",
+        ] {
+            let entry = format!("{{rule_id: a, check: {check}, extent: full, when_set: NOTE}}");
+            let err = compile_src(&directive_rules_template(&one_rule(&entry), ""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("E-DIRECTIVE-RULE-CHECK"), "{check}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_directive_rule_extent_outside_summary_and_full_is_refused() {
+        for extent in ["Full", "SUMMARY", "most", "\"\""] {
+            let entry = format!("{{rule_id: a, check: c, extent: {extent}, when_set: NOTE}}");
+            let err = compile_src(&directive_rules_template(&one_rule(&entry), ""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("E-DIRECTIVE-RULE-EXTENT"), "{extent}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_directive_rule_when_set_must_name_a_variable_or_a_capture() {
+        for name in ["MISSING", "SESSION_DIR"] {
+            let entry = format!("{{rule_id: a, check: c, extent: full, when_set: {name}}}");
+            let err = compile_src(&directive_rules_template(&one_rule(&entry), ""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("E-DIRECTIVE-RULE-WHEN-SET"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn directive_rules_that_are_not_a_list_of_entries_are_refused() {
+        for value in [
+            "    directive_rules:\n      rule_id: a\n",
+            "    directive_rules: probe/ack-value\n",
+            "    directive_rules: []\n",
+            "    directive_rules:\n      - probe/ack-value\n",
+            "    directive_rules:\n      - {rule_id: a, check: c, extent: full, when_set: NOTE, extra: x}\n",
+            "    directive_rules:\n      - {rule_id: 7, check: c, extent: full, when_set: NOTE}\n",
+        ] {
+            let err = compile_src(&directive_rules_template(value, ""))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("E-DIRECTIVE-RULE-SHAPE"), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn capture_allow_empty_compiles_beside_a_capture() {
+        let t = compile_src(&directive_rules_template(
+            "",
+            "      capture_allow_empty: true\n",
+        ))
+        .unwrap();
+        assert!(
+            t.states["probe"]
+                .default_action
+                .as_ref()
+                .unwrap()
+                .capture_allow_empty
+        );
+    }
+
+    #[test]
+    fn capture_allow_empty_without_a_capture_is_refused() {
+        let src = assignment_template(
+            "    default_action:\n      command: \"true\"\n      capture_allow_empty: true\n",
+            "      - target: done",
+        );
+        let err = compile_src(&src).unwrap_err().to_string();
+        assert!(
+            err.contains("capture_allow_empty needs capture_stdout_as"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_template_without_the_new_fields_omits_them_from_compiled_json() {
+        let t = compile_src(&directive_rules_template("", "")).unwrap();
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(!json.contains("directive_rules"), "got: {json}");
+        assert!(!json.contains("capture_allow_empty"), "got: {json}");
     }
 
     const DETAIL_ACCEPTS: &str = "    accepts:\n      detail:\n        type: string\n";
