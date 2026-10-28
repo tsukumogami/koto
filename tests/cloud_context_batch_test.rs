@@ -923,3 +923,203 @@ fn a_failed_first_version_save_still_flushes_into_a_conflict() {
     assert!(s3.object(&a.key("batch-open.json")).is_some());
     assert!(a.session_dir().join("cloud-batch.jsonl").exists());
 }
+
+// ---------------------------------------------------------------------------
+// Write windows (koto#443): the same batch, opened by a caller outside a tick
+// ---------------------------------------------------------------------------
+
+/// The variable that opens a write window on the session it names.
+const WINDOW_ENV: &str = "KOTO_WRITE_WINDOW";
+
+impl Host {
+    /// `koto` with `args`, run inside a write window on the session.
+    fn in_window(&self, args: &[&str]) -> Out {
+        let mut cmd = self.std_cmd(args);
+        cmd.env(WINDOW_ENV, NAME);
+        Self::out(cmd.output().unwrap())
+    }
+
+    /// `koto context add` inside a write window on the session.
+    fn add_in_window(&self, key: &str, content: &[u8]) -> Out {
+        let mut cmd = self.std_cmd(&["context", "add", NAME, key]);
+        cmd.env(WINDOW_ENV, NAME);
+        Self::out(
+            Command::from_std(cmd)
+                .write_stdin(content.to_vec())
+                .output()
+                .unwrap(),
+        )
+    }
+
+    /// `koto session flush`, closing the window. Run with the variable
+    /// still set, as a caller closing its own window would.
+    fn flush(&self) -> Out {
+        self.in_window(&["session", "flush", NAME])
+    }
+
+    /// A shell running `script` inside a write window, with this host's
+    /// koto settings and nothing else inherited.
+    fn shell_in_window(&self, script: &str) -> Out {
+        let koto = self.std_cmd(&[]);
+        let mut sh = std::process::Command::new("sh");
+        sh.env_clear().current_dir(&self.ws);
+        for (name, value) in koto.get_envs() {
+            if let Some(value) = value {
+                sh.env(name, value);
+            }
+        }
+        sh.env(WINDOW_ENV, NAME).arg("-c").arg(script);
+        Self::out(sh.output().unwrap())
+    }
+}
+
+/// How many of `requests` are a PUT of an object whose key ends in `rest`.
+fn puts(requests: &[String], rest: &str) -> usize {
+    requests
+        .iter()
+        .filter(|r| r.starts_with("PUT ") && r.ends_with(rest))
+        .count()
+}
+
+/// N key writes outside a tick push the state file N times. The same N
+/// writes in one write window, each its own process, push nothing but the
+/// batch-open marker while the window is open, and closing it pushes the
+/// state file once, with one manifest and one `version.json`.
+#[test]
+fn n_writes_in_a_window_push_the_state_file_once_against_n_times_without_it() {
+    const N: usize = 6;
+    let s3 = FakeS3::start(BUCKET);
+
+    let plain = Host::new(&s3);
+    plain.init(&script(0, 0));
+    let without = requests_during(&s3, || {
+        for i in 0..N {
+            let out = plain.add(&format!("key-{i}.md"), format!("value {i}").as_bytes());
+            assert!(out.ok(), "add: {}", out.describe());
+        }
+    });
+    assert_eq!(puts(&without, ".state.jsonl"), N, "{:#?}", without);
+
+    let windowed = Host::new(&s3);
+    windowed.init(&script(0, 0));
+    let writes = requests_during(&s3, || {
+        for i in 0..N {
+            let out =
+                windowed.add_in_window(&format!("key-{i}.md"), format!("value {i}").as_bytes());
+            assert!(out.ok(), "add in window: {}", out.describe());
+        }
+    });
+    for rest in [".state.jsonl", "/ctx/manifest.json", "/version.json", ".md"] {
+        assert_eq!(puts(&writes, rest), 0, "{rest}: {:#?}", writes);
+    }
+    assert_eq!(puts(&writes, "/batch-open.json"), 1, "{:#?}", writes);
+
+    let mut out = None;
+    let close = requests_during(&s3, || out = Some(windowed.flush()));
+    let out = out.unwrap();
+    assert!(out.ok(), "flush: {}", out.describe());
+    assert_eq!(out.json()["flushed"], true, "{}", out.describe());
+    assert_eq!(puts(&close, ".state.jsonl"), 1, "{:#?}", close);
+    assert_eq!(puts(&close, "/ctx/manifest.json"), 1, "{:#?}", close);
+    assert_eq!(puts(&close, "/version.json"), 1, "{:#?}", close);
+    assert_eq!(
+        close
+            .iter()
+            .filter(|r| r.starts_with("DELETE ") && r.ends_with("/batch-open.json"))
+            .count(),
+        1,
+        "{:#?}",
+        close
+    );
+    assert_eq!(assert_remote_consistent(&s3, &windowed).len(), N);
+    assert_eq!(assert_remote_consistent(&s3, &plain).len(), N);
+}
+
+/// While a window is open the bucket keeps the copy from before it, whole,
+/// beside `batch-open.json`, so an import from another host refuses. A read
+/// inside the window answers from the window's writes and pushes nothing.
+/// Closing it pushes every write, after which the import carries them.
+#[test]
+fn an_open_window_marks_the_bucket_and_an_import_refuses_until_it_closes() {
+    let s3 = FakeS3::start(BUCKET);
+    let a = Host::new(&s3);
+    a.init(&script(0, 0));
+    assert!(a.add("base.md", b"base").ok());
+    let out = a.add_in_window("one.md", b"one");
+    assert!(out.ok(), "add in window: {}", out.describe());
+    let out = a.in_window(&["context", "remove", NAME, "base.md"]);
+    assert!(out.ok(), "remove in window: {}", out.describe());
+    let out = a.add_in_window("two.md", b"two");
+    assert!(out.ok(), "add in window: {}", out.describe());
+
+    let keys = assert_remote_consistent(&s3, &a);
+    assert_eq!(keys, vec!["base.md".to_string()]);
+    assert!(s3.object(&a.key("batch-open.json")).is_some());
+    assert!(a.session_dir().join("cloud-batch.jsonl").exists());
+
+    let out = a.in_window(&["context", "get", NAME, "one.md"]);
+    assert!(out.ok(), "get in window: {}", out.describe());
+    assert_eq!(out.stdout, "one");
+    assert!(s3.object(&a.key("batch-open.json")).is_some());
+
+    let b = Host::new(&s3);
+    let ws = a.ws.to_string_lossy().into_owned();
+    let import = || b.koto(&["session", "import", NAME, "--from", &ws, "--trust-template"]);
+    let out = import();
+    assert_eq!(out.code, Some(2), "{}", out.describe());
+    assert_eq!(
+        out.json()["error"]["code"],
+        "import_source_unpushed",
+        "{}",
+        out.describe()
+    );
+
+    let out = a.flush();
+    assert!(out.ok(), "flush: {}", out.describe());
+    assert_eq!(out.json()["flushed"], true, "{}", out.describe());
+    assert!(!a.session_dir().join("cloud-batch.jsonl").exists());
+    assert!(s3.object(&a.key("batch-open.json")).is_none());
+    let keys = assert_remote_consistent(&s3, &a);
+    assert_eq!(keys, vec!["one.md".to_string(), "two.md".to_string()]);
+    let out = a.flush();
+    assert_eq!(out.json()["flushed"], false, "{}", out.describe());
+
+    let out = import();
+    assert!(out.ok(), "import: {}", out.describe());
+    for (key, want) in [("one.md", "one"), ("two.md", "two")] {
+        let out = b.koto(&["context", "get", NAME, key]);
+        assert!(out.ok(), "get {key}: {}", out.describe());
+        assert_eq!(out.stdout, want);
+    }
+}
+
+/// A caller killed with its window open never closes it. The variable dies
+/// with the caller, so the next koto command on the session on its host,
+/// run without it, pushes what the window held, as it does a killed tick's
+/// batch.
+#[test]
+fn a_window_its_killed_caller_left_open_is_flushed_by_the_next_command() {
+    let s3 = FakeS3::start(BUCKET);
+    let a = Host::new(&s3);
+    a.init(&script(0, 0));
+    let out = a.shell_in_window(&format!(
+        "printf one | koto context add {NAME} one.md\nprintf two | koto context add {NAME} \
+         two.md\nkill -9 $$\nkoto session flush {NAME}"
+    ));
+    assert_eq!(
+        out.code,
+        None,
+        "the caller should have been killed: {}",
+        out.describe()
+    );
+    assert!(assert_remote_consistent(&s3, &a).is_empty());
+    assert!(s3.object(&a.key("batch-open.json")).is_some());
+    assert!(a.session_dir().join("cloud-batch.jsonl").exists());
+
+    let out = a.koto(&["status", NAME]);
+    assert!(out.ok(), "status: {}", out.describe());
+    assert!(!a.session_dir().join("cloud-batch.jsonl").exists());
+    assert!(s3.object(&a.key("batch-open.json")).is_none());
+    let keys = assert_remote_consistent(&s3, &a);
+    assert_eq!(keys, vec!["one.md".to_string(), "two.md".to_string()]);
+}

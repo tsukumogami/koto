@@ -1014,6 +1014,16 @@ impl Backend {
         }
     }
 
+    /// Close a write window on `id` (`koto session flush`): push the writes
+    /// it deferred ([`batch`]) and say whether there were any. The local
+    /// backend writes nothing it defers, so it has nothing to push.
+    pub fn flush_window(&self, id: &str) -> anyhow::Result<bool> {
+        match self {
+            Backend::Local(_) => Ok(false),
+            Backend::Cloud(b) => b.flush_window(id),
+        }
+    }
+
     /// The local directory sessions are stored under.
     ///
     /// Both variants have one: `CloudBackend` keeps a `LocalBackend` for

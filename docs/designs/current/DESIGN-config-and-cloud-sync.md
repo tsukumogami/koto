@@ -61,6 +61,23 @@ endpoint and bucket can't come from project config. Without the new
 variables, resolution is as described here. The setup guide documents the
 variables.
 
+**Note (2026-10-28).** Per-key sync on every mutating command, Decision 4
+below, no longer holds for two kinds of write. A `koto context` call made
+from a command that a `koto next` tick runs, on the tick's own session,
+writes the local copy and a batch journal beside it (`cloud-batch.jsonl`),
+and the tick pushes the whole batch once before it returns (koto#376). And a
+caller outside a tick can ask for the same batch with a write window
+(koto#443): koto processes run with `KOTO_WRITE_WINDOW` naming a session
+defer their writes to it, and `koto session flush <name>` pushes the written
+keys, the manifest, the state file and `version.json` once. Either way the
+bucket holds `batch-open.json` while writes wait, so `koto session import`
+refuses the session, and a batch nobody closed, from a killed tick or a
+killed window, is pushed by the next koto command on the session on its
+host that doesn't defer. Each push still uploads the whole state file;
+pushing only its appended part would change the bucket format older
+versions read. The setup guide, `docs/guides/cloud-sync-setup.md`, has the
+details.
+
 ## Context and Problem Statement
 koto's `LocalBackend` is the only storage backend. It's hardcoded in `build_backend()`
 with no way to select an alternative. Sessions live at `~/.koto/sessions/<repo-id>/<name>/`
