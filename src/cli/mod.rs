@@ -760,6 +760,22 @@ pub enum SessionCommand {
         #[arg(long, value_enum, default_value_t = ChildrenPolicy::Auto)]
         children: ChildrenPolicy,
     },
+    /// Close a write window: push the session's deferred writes at once
+    ///
+    /// Under the cloud backend, a koto process run with `KOTO_WRITE_WINDOW`
+    /// naming a session writes that session's local copy only, as a tick's
+    /// commands do, and the bucket shows `batch-open.json` until this
+    /// pushes the keys, the context manifest and the state file together.
+    /// Exit 0 means the bucket holds every write the window made; it prints
+    /// `{"name": ..., "flushed": true}` when this command pushed them and
+    /// `false` when nothing was left to push. A failed push leaves the
+    /// batch open: an unreachable bucket clears on a retry, and a `session
+    /// conflict` needs `koto session resolve`. A no-op under the local
+    /// backend.
+    Flush {
+        /// Session name
+        name: String,
+    },
     /// Update session metadata fields
     Update {
         /// Session name
@@ -2376,6 +2392,18 @@ pub fn run(app: App) -> Result<()> {
                 } => {
                     refuse_if_unlocated(&backend, &name, "session resolve");
                     session::handle_resolve(&backend, &name, &keep, children)
+                }
+                SessionCommand::Flush { name } => {
+                    refuse_if_unlocated(&backend, &name, "session flush");
+                    let flushed = backend.flush_window(&name)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "name": name,
+                            "flushed": flushed
+                        }))?
+                    );
+                    Ok(())
                 }
                 SessionCommand::Recover { apply, sessions } => {
                     session::handle_recover(&backend, apply, &sessions)

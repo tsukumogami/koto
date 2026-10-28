@@ -599,6 +599,20 @@ Intent strings over 1024 characters are rejected. The command exits non-zero if 
 
 Don't reach for this to report progress on a request leg. `--intent` is one sentence about what your whole workflow is for and each write replaces the last; a leg progress append is one entry about what you just finished for the request someone asked you to fill, and every entry is kept in order. See [Requests and legs](#requests-and-legs).
 
+## Writing many context keys outside a tick
+
+Under the cloud backend, each `koto context add` or `remove` you run from your shell or a script pushes the key, the manifest and the session's whole state file, which on a long session is slow. Writes made from a template's command during `koto next` already wait for the tick to push them once. To get the same outside a tick, open a write window: export `KOTO_WRITE_WINDOW` set to the session's name, make the writes, then close it with `koto session flush <name>`, which pushes everything once.
+
+```bash
+export KOTO_WRITE_WINDOW=<name>
+koto context add <name> a.md --from-file a.md
+koto context add <name> b.md --from-file b.md
+koto session flush <name>     # {"name": "<name>", "flushed": true}
+unset KOTO_WRITE_WINDOW
+```
+
+Always close the window you open. Until you do, `koto session import` refuses the session, and the writes reach the bucket only when some koto command without the variable touches the session on this host (that command pushes them first, so a script killed mid-window loses nothing). A failed flush exits non-zero and keeps the writes: run it again when the bucket was unreachable, and settle a `session conflict` with `koto session resolve` as for any conflict. Under the local backend the variable changes nothing. See [command-reference.md](references/command-reference.md#koto-session-flush).
+
 ## Periodic maintenance: koto workspace prune
 
 `koto workspace prune --root <session-id>` removes the sessions of a finished root's subtree that the retention rule releases, deepest first and the root last, and lists the rest with their reasons (a live dispatcher, the retention not yet passed, a stale anchor with its close command). A child whose own dispatcher is still running stays, with everything under it, even though the root finished. It also reclaims the derived files the dispatch substrate accumulates over time — stale scan cursors (`~/.koto/coordinators/<id>/scan_cursor.toml`), stale compaction locks, and stale claim sidecars (`claim.lock`). It leaves request records under `~/.koto/requests/` alone — a closed request stays readable, which is what makes it an audit trail.

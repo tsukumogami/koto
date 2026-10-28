@@ -14,6 +14,15 @@
 //! returns (and at every other point where another process or host could
 //! read the bucket: see that method's callers).
 //!
+//! A caller outside a tick gets the same batch by opening a write window
+//! (koto#443): every koto process it runs with [`WINDOW_ENV`] naming a
+//! session defers its writes to that session as a tick's commands do, and
+//! `koto session flush <name>` closes the window with one push. A process
+//! finds the window by inheriting the variable, as a tick's commands
+//! inherit the tick marker, so a caller killed with its window open takes
+//! the window with it: the journal stays, and the next koto command on the
+//! session without the variable flushes it, as it does a killed tick's.
+//!
 //! The journal lives in the session's local directory, because the writers
 //! are separate processes:
 //!
@@ -49,17 +58,19 @@
 //! The contract the cloud backend keeps, for anything that writes a session
 //! or pushes it:
 //!
-//! - A write from a tick's command to the tick's session (a context add or
-//!   remove, an event append, a header rewrite) opens the batch and records
-//!   itself under the lock; it never pushes.
+//! - A write from a tick's command to the tick's session, or from inside a
+//!   write window on the session (a context add or remove, an event append,
+//!   a header rewrite), opens the batch and records itself under the lock;
+//!   it never pushes.
 //! - Every other push of a session flushes its open batch first and pushes
 //!   nothing of its own while the batch is open: a state file or manifest
 //!   pushed alone would name keys the bucket doesn't hold. `ensure_pushed`
 //!   flushes from any process, a tick's command included, since its caller
 //!   needs the bucket to hold everything.
-//! - A read from outside the tick flushes the batch before it reads the
-//!   bucket, so it can come before the tick's own flush; a read from a
-//!   tick's command answers a key the batch wrote from the local copy.
+//! - A read from a process that doesn't defer flushes the batch before it
+//!   reads the bucket, so it can come before the tick's own flush or the
+//!   window's close; a read from a tick's command, or from inside the
+//!   window, answers a key the batch wrote from the local copy.
 //! - A pull never writes over an open batch.
 //! - A pull, push, flush or resolve that finds a batch begun and never
 //!   opened deletes its marker, when the bucket's marker is the one the
@@ -86,6 +97,18 @@ pub const OPENING_FILE: &str = "cloud-batch.opening";
 
 /// File name of the lock inside a session's local directory.
 pub const LOCK_FILE: &str = "cloud-batch.lock";
+
+/// Environment variable naming the session a caller's write window is open
+/// on. A value naming no session opens no window.
+pub const WINDOW_ENV: &str = "KOTO_WRITE_WINDOW";
+
+/// Whether this process writes `session` inside a write window: the
+/// variable names `session` and this process isn't a `koto next` tick,
+/// which pushes its own session's batch whatever its environment says.
+pub fn in_window_of(session: &str) -> bool {
+    !crate::engine::reentrancy::is_tick_process()
+        && std::env::var(WINDOW_ENV).is_ok_and(|value| value == session)
+}
 
 /// One deferred context write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

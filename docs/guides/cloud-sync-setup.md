@@ -104,7 +104,7 @@ There are no sync commands. These commands read or write the session's copy in t
 
 - `koto init`, `koto next`, `koto status`
 - `koto context add`, `koto context get`, `koto context list`, `koto context exists`, `koto context remove`
-- `koto session list`, `koto session rebind`, `koto session cleanup`, `koto session resolve`, `koto session import`
+- `koto session list`, `koto session rebind`, `koto session cleanup`, `koto session resolve`, `koto session import`, `koto session flush`
 
 That list isn't exhaustive: any command that reads a session's state through the cloud backend checks it against the bucket first. If the bucket is unreachable, a command keeps working on the local copy and prints a warning to stderr. Once the bucket has answered that its copy of the state file, the context manifest or a key changed, though, a failure to fetch that copy fails the command instead: a 404 for a key the manifest names, say. The local copy may be behind the bucket's then, so a read never answers from it silently. Run the command again once the bucket serves the object.
 
@@ -128,7 +128,24 @@ Two checks still run: whether the session was imported elsewhere, which refuses,
 
 While the tick's commands have writes it hasn't pushed, the bucket holds a `batch-open.json` object beside the session's state file, and `koto session import` refuses the session (`import_source_unpushed`). A tick that was killed before it pushed leaves the writes on its host. The next koto command on the session there, `koto status <name>` for instance, pushes them and removes the object. The same command removes an object left by a `koto context` call killed while it was putting the object in the bucket, before it had written anything.
 
-A `koto context add` or `koto context remove` for any other session, or made outside a tick, pushes at once, as before.
+A `koto context add` or `koto context remove` for any other session, or made outside a tick, pushes at once, as before, unless it runs in a write window.
+
+### Writing many keys outside a tick
+
+Outside a tick, each `koto context add` or `remove` pushes the key, the context manifest and the session's whole state file, so a script that writes many keys in a row pays for a full push each time. A write window gives such a script the tick's batch. Set `KOTO_WRITE_WINDOW` to the session's name in the environment of the koto commands that write it, and close the window with `koto session flush <name>`:
+
+```bash
+export KOTO_WRITE_WINDOW=review
+printf '%s' "$summary" | koto context add review summary.md
+koto context add review findings.json --from-file findings.json
+koto context remove review draft.md
+koto session flush review
+unset KOTO_WRITE_WINDOW
+```
+
+Every koto process carrying the variable writes that session's local copy and records the write in the session's batch, the same one a tick's commands use, without pushing it. A command that needs the bucket to hold the session whole before it goes on pushes the whole batch then, as it would a tick's. That covers every write koto makes to the session from such a process, not only context adds and removes: the log events they append, and those of any other command run with the variable, such as `koto decisions record`. The first write of the window pulls the session as any write does, checks whether another host's writes conflict, and puts `batch-open.json` in the bucket. After that the window's processes don't pull the state file again, and a read inside the window answers a key the window wrote from this host's copy. `koto session flush` then pushes the written keys, the manifest, the state file and `version.json` once, deletes the keys the window removed, and removes `batch-open.json`. It prints `{"name": "review", "flushed": true}`. Exit 0 means the bucket holds every write the window made; `"flushed": false` only says this command found nothing left to push, because nothing was written or something else on this host pushed it first. A flush that fails leaves the writes waiting and says why. One the bucket couldn't take, unreachable for instance, goes through when run again. A `session conflict`, another host having written the session since the window's first write, doesn't clear on a retry: settle it with `koto session resolve <name> --keep local` or `--keep remote`, as for any conflict.
+
+While the window holds writes, `koto session import` refuses the session (`import_source_unpushed`), as it does during a tick's batch. A koto command on the session run without the variable pushes the window's writes before it does anything else, so a script killed before it closed its window leaves nothing stuck: the variable goes with the script, and the next koto command on the session on this host, `koto status <name>` for instance, pushes the writes and removes the object. The same holds for any other process on this host that writes or reads the session while the window is open, which ends the batch early but never loses a write. A `koto next` on the session pushes what the window held along with its own writes before it returns, whether or not it carries the variable. The variable only affects the cloud backend; under the local backend there is nothing to push and `koto session flush` changes nothing.
 
 ### Where a session lives in the bucket
 
@@ -356,7 +373,7 @@ A refusal or failure prints `{"error": {"code": "...", "message": "..."}}`. Exit
 | `import_source_unreadable` | 1 | A source object couldn't be fetched, or failed validation (for example, a state log this koto can't carry intact) | If the bucket was unreachable, run it again; if the message names a validation failure, the source needs repair on its host |
 | `import_push_failed` | 1 | Building the session here, pushing it, or moving it into place failed. Before the source is marked, what the run pushed was taken back; once it's marked (a same-host import whose swap failed), everything is kept and the message says so | Fix what the message names (usually connectivity or local disk) and run the same import again; after the marker, that finishes it. When the message names `--as` (a same-host import this host's store can't swap), import under another name instead |
 | `import_source_running` | 2 | Same host only: another process holds the source session's lock | Stop whatever is advancing the session, then import again |
-| `import_source_unpushed` | 2 | The source's host holds writes the bucket lacks. On the same host: the source's local copy holds events or context keys the bucket lacks. From any host: the bucket holds the source's `batch-open.json`, left by a `koto next` that stopped before it pushed its commands' writes | Same host: run `koto session resolve <name> --keep local` in the source workspace. For `batch-open.json`: run any koto command on the session in the source workspace on its host, such as `koto status <name>`. Then import again |
+| `import_source_unpushed` | 2 | The source's host holds writes the bucket lacks. On the same host: the source's local copy holds events or context keys the bucket lacks. From any host: the bucket holds the source's `batch-open.json`, left by a `koto next` that stopped before it pushed its commands' writes, or by a write window not yet closed | Same host: run `koto session resolve <name> --keep local` in the source workspace. For `batch-open.json`: run any koto command on the session in the source workspace on its host, such as `koto status <name>`. Then import again |
 | `import_source_has_children` | 2 | Same host only: a local session names the source as its parent | Finish or clean up the child it names, or import under `--as` |
 | `import_unmarked` | 1 | The session was imported and pushed, but the marker on the source couldn't be written, so the old copy won't refuse yet | Run the same import again; it writes only the marker. Keep the source stopped until it succeeds |
 
