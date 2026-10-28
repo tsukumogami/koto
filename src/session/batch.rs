@@ -67,9 +67,10 @@
 //!   pushed alone would name keys the bucket doesn't hold. `ensure_pushed`
 //!   flushes from any process, a tick's command included, since its caller
 //!   needs the bucket to hold everything.
-//! - A read from outside the tick flushes the batch before it reads the
-//!   bucket, so it can come before the tick's own flush; a read from a
-//!   tick's command answers a key the batch wrote from the local copy.
+//! - A read from a process that doesn't defer flushes the batch before it
+//!   reads the bucket, so it can come before the tick's own flush or the
+//!   window's close; a read from a tick's command, or from inside the
+//!   window, answers a key the batch wrote from the local copy.
 //! - A pull never writes over an open batch.
 //! - A pull, push, flush or resolve that finds a batch begun and never
 //!   opened deletes its marker, when the bucket's marker is the one the

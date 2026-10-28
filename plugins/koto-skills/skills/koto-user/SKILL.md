@@ -611,7 +611,7 @@ koto session flush <name>     # {"name": "<name>", "flushed": true}
 unset KOTO_WRITE_WINDOW
 ```
 
-Always close the window you open. Until you do, `koto session import` refuses the session, and the writes reach the bucket only when some koto command without the variable touches the session on this host (that command pushes them first, so a script killed mid-window loses nothing). A failed flush exits non-zero and keeps the writes; run it again. Under the local backend the variable changes nothing. See [command-reference.md](references/command-reference.md#koto-session-flush).
+Always close the window you open. Until you do, `koto session import` refuses the session, and the writes reach the bucket only when some koto command without the variable touches the session on this host (that command pushes them first, so a script killed mid-window loses nothing). A failed flush exits non-zero and keeps the writes: run it again when the bucket was unreachable, and settle a `session conflict` with `koto session resolve` as for any conflict. Under the local backend the variable changes nothing. See [command-reference.md](references/command-reference.md#koto-session-flush).
 
 ## Periodic maintenance: koto workspace prune
 

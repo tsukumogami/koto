@@ -767,9 +767,9 @@ pub enum SessionCommand {
     /// commands do, and the bucket shows `batch-open.json` until this
     /// pushes the keys, the context manifest and the state file together.
     /// Prints `{"name": ..., "flushed": true}` when it pushed a batch and
-    /// `false` when none was open. A failed push leaves the batch open, and
-    /// the next koto command on the session pushes it. A no-op under the
-    /// local backend.
+    /// `false` when none was open. A failed push leaves the batch open: an
+    /// unreachable bucket clears on a retry, and a `session conflict` needs
+    /// `koto session resolve`. A no-op under the local backend.
     Flush {
         /// Session name
         name: String,

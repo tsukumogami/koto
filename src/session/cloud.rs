@@ -2699,8 +2699,9 @@ impl CloudBackend {
     }
 
     /// Append `payload` to `id`'s log locally, then push the state file;
-    /// inside a tick on `id`, the append joins the tick's batch instead and
-    /// the tick pushes it. The caller has run `local_guard`.
+    /// inside a tick on `id`, or a write window on it, the append joins the
+    /// batch instead and the tick, or `koto session flush`, pushes it. The
+    /// caller has run `local_guard`.
     fn append_logged(
         &self,
         id: &str,
@@ -2850,8 +2851,10 @@ impl CloudBackend {
     }
 
     /// Push everything an open batch of `id` owes the bucket, then close it.
-    /// A no-op in a command a tick on `id` runs, whose batch is the tick's
-    /// to flush. With no batch open there is nothing to push, and the only
+    /// A no-op in a process that defers its writes to `id` (a command a
+    /// tick on `id` runs, or one inside a write window on it), whose batch
+    /// the tick or `koto session flush` pushes. With no batch open there is
+    /// nothing to push, and the only
     /// work is clearing a batch begun and never opened, if one is there.
     ///
     /// The bucket is asked first, uncached, whether `id` was imported
@@ -2883,8 +2886,9 @@ impl CloudBackend {
         Ok(was_open)
     }
 
-    /// [`CloudBackend::flush_pending`] without the exemption for a tick's
-    /// commands: what `ensure_pushed` runs, from whatever process calls it.
+    /// [`CloudBackend::flush_pending`] without the exemption for a process
+    /// that defers: what `ensure_pushed` and `koto session flush` run, from
+    /// whatever process calls them.
     fn flush_batch(&self, id: &str) -> anyhow::Result<()> {
         use crate::session::version::{check_sync, conflict_message, SyncCheck};
 
@@ -4075,8 +4079,9 @@ impl CloudBackend {
         }
         self.check_fence(session)?;
 
-        // Inside a tick on this session: record the key, then write it, and
-        // leave the push to the tick. Recorded first, so a write that stops
+        // Inside a tick on this session, or a write window on it: record the
+        // key, then write it, and leave the push to the tick or the window's
+        // `koto session flush`. Recorded first, so a write that stops
         // half way is still one the flush looks at.
         if self.defers(session) {
             if let Some((journal, lock)) = self.open_batch(session)? {
