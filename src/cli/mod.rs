@@ -766,10 +766,12 @@ pub enum SessionCommand {
     /// naming a session writes that session's local copy only, as a tick's
     /// commands do, and the bucket shows `batch-open.json` until this
     /// pushes the keys, the context manifest and the state file together.
-    /// Prints `{"name": ..., "flushed": true}` when it pushed a batch and
-    /// `false` when none was open. A failed push leaves the batch open: an
-    /// unreachable bucket clears on a retry, and a `session conflict` needs
-    /// `koto session resolve`. A no-op under the local backend.
+    /// Exit 0 means the bucket holds every write the window made; it prints
+    /// `{"name": ..., "flushed": true}` when this command pushed them and
+    /// `false` when nothing was left to push. A failed push leaves the
+    /// batch open: an unreachable bucket clears on a retry, and a `session
+    /// conflict` needs `koto session resolve`. A no-op under the local
+    /// backend.
     Flush {
         /// Session name
         name: String,

@@ -1144,7 +1144,8 @@ impl CloudBackend {
     /// that batch, are what changed the local copy, not the bucket, and the
     /// tick checks the bucket again before it pushes them (koto#439). A
     /// write doesn't pass it, so each write still checks for a migration
-    /// marker that landed during the tick.
+    /// marker that landed during the tick. A process in a write window
+    /// defers too, but runs under no tick, so it is never fresh here.
     fn tick_fresh(&self, id: &str, stamp: Option<&Stamp>, batch_counts: bool) -> bool {
         let Some(stamp) = stamp else {
             return false;
@@ -2854,8 +2855,8 @@ impl CloudBackend {
     /// A no-op in a process that defers its writes to `id` (a command a
     /// tick on `id` runs, or one inside a write window on it), whose batch
     /// the tick or `koto session flush` pushes. With no batch open there is
-    /// nothing to push, and the only
-    /// work is clearing a batch begun and never opened, if one is there.
+    /// nothing to push, and the only work is clearing a batch begun and
+    /// never opened, if one is there.
     ///
     /// The bucket is asked first, uncached, whether `id` was imported
     /// elsewhere while the batch was open (a marker refuses) and whether
@@ -2877,8 +2878,11 @@ impl CloudBackend {
 
     /// Close a write window on `id` (`koto session flush`): push the open
     /// batch as [`CloudBackend::flush_pending`] does, from a process that
-    /// may still carry the window's variable. Whether a batch was open, so
-    /// the caller can say whether anything went up.
+    /// may still carry the window's variable. Whether this call found a
+    /// batch open to push; `false` doesn't mean nothing went up, since a
+    /// pull earlier in the same command (`check_located`, for a session
+    /// homed elsewhere) or another process may have pushed it first. On
+    /// `Ok` the bucket holds every write the batch held either way.
     pub fn flush_window(&self, id: &str) -> anyhow::Result<bool> {
         self.refuse_if_read_only(&format!("flushing '{}'", id))?;
         let was_open = self.journal(id).is_open();
@@ -3036,9 +3040,10 @@ impl CloudBackend {
 
     /// The keys whose local copy answers a read of `session` because an
     /// open batch wrote them, so a read never pulls the bucket's stale copy
-    /// over one. Outside the tick that owns the batch, the batch is flushed
-    /// first and nothing is left to keep local; a flush that fails keeps
-    /// the batch's keys local all the same.
+    /// over one. In a process that doesn't defer to `session` (neither a
+    /// command of the tick that owns the batch nor one inside a write window
+    /// on it), the batch is flushed first and nothing is left to keep local;
+    /// a flush that fails keeps the batch's keys local all the same.
     fn pending_keys(&self, session: &str) -> Option<Pending> {
         let journal = self.journal(session);
         if !journal.is_open() {
