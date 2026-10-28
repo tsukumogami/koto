@@ -451,7 +451,7 @@ Every JSON flag in the group (`--with-data` on `create`, `progress` and `resolve
 
 Output is JSON on stdout unconditionally — there is no format flag.
 
-`watch`, like `list`, doesn't print the request envelope. It reads the session's wake file (`~/.koto/wakes/<session>`, described in `docs/guides/cli-usage.md`, "Leg wakes and request watch"): it blocks until the file changes or `--timeout-secs` passes, exits 0 either way, and prints `{"session", "woke", "cursor", "cli_contract"}`; `woke` is `false` at the timeout. Pass `cursor` back as `--since`. A bad `--session` is `invalid_identifier`, a bad `--since` is `invalid_submission` (both exit 2), an unreadable wake file is `persistence_error` (exit 3), and a signal while polling is `wait_interrupted` (exit 1).
+`watch`, like `list`, doesn't print the request envelope. It reads the session's wake file (`~/.koto/wakes/<session>`, described in `docs/guides/cli-usage.md`, "Leg wakes and request watch"): it blocks until the file changes or `--timeout-secs` passes, exits 0 either way, and prints `{"session", "woke", "cursor", "cli_contract"}`; `woke` is `false` at the timeout. Pass `cursor` back as `--since`. A bad `--session` is `invalid_identifier`, a bad `--since` is `invalid_submission` (both exit 2), an unreadable wake file is `persistence_error` (exit 3), and a signal while polling is `wait_interrupted` (exit 1). A session that superseded another (`koto init --continues --supersede`) is woken by the legs every earlier member of its chain opened: koto rings the newest member of the chain as well as the principal the request names, and the request itself is unchanged. A broken chain is rung up to its last good member; one past 1024 hops reaches the principal only.
 
 ### The response envelope
 

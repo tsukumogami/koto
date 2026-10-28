@@ -516,6 +516,8 @@ koto request resolve <request-id> <leg> --with-data @<file>
 
 When a leg resolves by any route (its worker's terminal tick, an explicit resolve, a refusal) or is abandoned, or its request is closed, koto rings a wake for the request's coordinator of record and requester: it appends a line to `~/.koto/wakes/<session>` before the command that changed the leg returns. The wake means only "look again" — it carries no state — so a missed one costs you latency and a duplicate costs one tick that finds nothing new.
 
+If you took over a run with `koto init <you> --continues <pred> --supersede`, legs your predecessors opened still name them, and `koto request list --requested-by` still shows the member that opened each one. Their results wake you anyway: koto follows the `session_superseded` events from the named principal to the newest member and rings that member's file as well as the principal's, so `koto request watch --session <you>` is the one watch to arm. A broken chain (a missing log, a mismatched session id, a name that isn't a session name, a cycle) is rung up to its last good member, and one longer than 1024 hops reaches the principal only.
+
 If you are parked on a `request-leg` gate and your harness can react to a background command finishing, don't hold your turn open in `koto request wait`. Take a cursor, tick, then watch in the background:
 
 ```bash
