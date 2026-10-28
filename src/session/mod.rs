@@ -154,6 +154,7 @@ pub struct Home {
     /// backend.
     pub prefix: String,
     /// Whether `prefix` is the prefix of the directory the command runs in.
+    /// Never for a [`HomeSource::Located`] home, whatever its prefix.
     /// A copy found any other way is read and written strictly: a failed
     /// bucket request is an error, never a fall-back to the local copy, and
     /// a push never replaces another session's copy there.
@@ -171,6 +172,12 @@ pub enum HomeSource {
     /// a session with no local copy on this host, or one recording no
     /// prefix whose own directory this is.
     Caller,
+    /// The one candidate holding a copy of a session that records no
+    /// prefix, read from outside its own directory: its anchor's prefix or
+    /// the prefix this host's sync stamp names. The copy is taken as the
+    /// session's own only when it carries the local header's `session_id`,
+    /// which the first pull checks.
+    Located,
 }
 
 /// A command refused because koto can't tell which bucket copy is the
@@ -195,11 +202,14 @@ pub enum UnlocatedReason {
         /// The prefix that was asked.
         prefix: String,
     },
-    /// The session was created before koto recorded its prefix, and the
-    /// command runs outside the directory its records name.
+    /// The session was created before koto recorded its prefix, the
+    /// command runs outside the directory its records name, and its
+    /// candidate copies didn't locate it ([`Fallback`]).
     NoRecordedPrefix {
         /// The directory the session is bound to, when its header names one.
         anchor: Option<String>,
+        /// Why the candidates didn't locate it.
+        fallback: Fallback,
     },
     /// The copy under the recorded prefix is missing, or is another
     /// session's (another `session_id`).
@@ -212,13 +222,50 @@ pub enum UnlocatedReason {
     },
 }
 
+/// Why the candidate copies of a session that records no prefix didn't
+/// locate it. The candidates are its anchor's prefix and the prefix this
+/// host's sync stamp names, listed once each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fallback {
+    /// No candidate holds a copy of the session.
+    NoCopy {
+        /// The prefixes listed, in the order they were asked.
+        candidates: Vec<String>,
+    },
+    /// Both candidates hold a copy, so neither can be taken as its own.
+    Ambiguous {
+        /// The two prefixes.
+        prefixes: Vec<String>,
+    },
+    /// The one candidate's copy carries another `session_id`, or one side
+    /// carries none to confirm it by.
+    Mismatch {
+        /// The candidate.
+        prefix: String,
+        /// The `session_id` the copy there carries, when it carries one.
+        found: Option<String>,
+    },
+    /// A candidate's listing failed, so koto can't tell what it holds.
+    Unreadable {
+        /// The candidate.
+        prefix: String,
+        /// What the bucket answered.
+        error: String,
+    },
+}
+
 impl UnlocatedReason {
     /// The reason as the error JSON's `reason` field carries it.
     pub fn as_str(&self) -> &'static str {
         match self {
             UnlocatedReason::NoLocalCopy { .. } => "no_local_copy",
-            UnlocatedReason::NoRecordedPrefix { .. } => "no_recorded_prefix",
             UnlocatedReason::RecordedCopyMismatch { .. } => "recorded_copy_mismatch",
+            UnlocatedReason::NoRecordedPrefix { fallback, .. } => match fallback {
+                Fallback::NoCopy { .. } => "no_candidate_copy",
+                Fallback::Ambiguous { .. } => "ambiguous_copies",
+                Fallback::Mismatch { .. } => "candidate_copy_mismatch",
+                Fallback::Unreadable { .. } => "candidate_unreadable",
+            },
         }
     }
 
@@ -228,7 +275,13 @@ impl UnlocatedReason {
         match self {
             UnlocatedReason::NoLocalCopy { prefix }
             | UnlocatedReason::RecordedCopyMismatch { prefix, .. } => vec![prefix.clone()],
-            UnlocatedReason::NoRecordedPrefix { .. } => Vec::new(),
+            UnlocatedReason::NoRecordedPrefix { fallback, .. } => match fallback {
+                Fallback::NoCopy { candidates } => candidates.clone(),
+                Fallback::Ambiguous { prefixes } => prefixes.clone(),
+                Fallback::Mismatch { prefix, .. } | Fallback::Unreadable { prefix, .. } => {
+                    vec![prefix.clone()]
+                }
+            },
         }
     }
 }
@@ -243,20 +296,53 @@ impl fmt::Display for Unlocated {
                  holds none under this directory's prefix {prefix}, so nothing was read; run \
                  the command from the directory the session was started in"
             ),
-            UnlocatedReason::NoRecordedPrefix {
-                anchor: Some(anchor),
-            } => write!(
-                f,
-                "session_unlocated: session '{name}' records no prefix for its own copy, so \
-                 it is read only from the directory it is bound to; run the command from \
-                 {anchor}"
-            ),
-            UnlocatedReason::NoRecordedPrefix { anchor: None } => write!(
-                f,
-                "session_unlocated: session '{name}' records no prefix for its own copy, so \
-                 it is read only from its own workspace; run the command from the directory \
-                 the session was started in"
-            ),
+            UnlocatedReason::NoRecordedPrefix { anchor, fallback } => {
+                write!(
+                    f,
+                    "session_unlocated: session '{name}' records no prefix for its own copy, "
+                )?;
+                match fallback {
+                    Fallback::NoCopy { candidates } => write!(
+                        f,
+                        "and the bucket holds no copy of it under {}",
+                        candidates.join(" or ")
+                    )?,
+                    Fallback::Ambiguous { prefixes } => write!(
+                        f,
+                        "and the bucket holds a copy of it under both {}, and koto can't tell \
+                         which is its own",
+                        prefixes.join(" and ")
+                    )?,
+                    Fallback::Mismatch {
+                        prefix,
+                        found: Some(id),
+                    } => write!(
+                        f,
+                        "and the copy under prefix {prefix} is another session's (session_id \
+                         {id})"
+                    )?,
+                    Fallback::Mismatch {
+                        prefix,
+                        found: None,
+                    } => write!(
+                        f,
+                        "and the copy under prefix {prefix} can't be confirmed as its own, \
+                         since one side carries no session_id"
+                    )?,
+                    Fallback::Unreadable { prefix, error } => write!(
+                        f,
+                        "and listing its copy under prefix {prefix} failed ({error})"
+                    )?,
+                }
+                let at = anchor
+                    .as_deref()
+                    .unwrap_or("the directory the session was started in");
+                write!(
+                    f,
+                    ", so nothing was read or written; run the command from {at}, where it reads \
+                     as before"
+                )
+            }
             UnlocatedReason::RecordedCopyMismatch {
                 prefix,
                 found: None,

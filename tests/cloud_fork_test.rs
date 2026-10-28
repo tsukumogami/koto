@@ -396,16 +396,9 @@ fn a_rebind_from_a_third_directory_pushes_to_the_own_copy() {
     );
 }
 
-/// A session recorded before koto named the prefix still refuses a rebind
-/// from a third directory, naming where to run it.
-#[test]
-fn a_rebind_of_an_unrecorded_session_from_a_third_directory_refuses() {
-    let s3 = FakeS3::start(BUCKET);
-    let host = Host::new(&s3);
-    let anchor = host.dir("anchor");
-    let target = host.dir("target");
-    let elsewhere = host.dir("elsewhere");
-    host.init(&anchor, &[]);
+/// Drop the `origin.store.prefix` of `WF`'s local header, as an older koto
+/// left it.
+fn forget_recorded_prefix(host: &Host) {
     let path = host
         .home
         .join(".koto/sessions")
@@ -424,6 +417,51 @@ fn a_rebind_of_an_unrecorded_session_from_a_third_directory_refuses() {
         format!("{}\n{}", serde_json::to_string(&header).unwrap(), rest),
     )
     .unwrap();
+}
+
+/// A session recorded before koto named the prefix, whose copy is under
+/// its anchor's prefix, rebinds from a third directory: the rebind goes up
+/// to that copy, and nothing goes under the third directory's prefix.
+#[test]
+fn a_rebind_of_a_located_unrecorded_session_from_a_third_directory_goes_to_its_copy() {
+    let s3 = FakeS3::start(BUCKET);
+    let host = Host::new(&s3);
+    let anchor = host.dir("anchor");
+    let target = host.dir("target");
+    let elsewhere = host.dir("elsewhere");
+    host.init(&anchor, &[]);
+    forget_recorded_prefix(&host);
+
+    host.ok(
+        &elsewhere,
+        &["session", "rebind", WF, "--to", target.to_str().unwrap()],
+    );
+    assert!(has_rebind(&host.local_log()));
+    let remote = String::from_utf8(s3.object(&state_key(&anchor)).unwrap()).unwrap();
+    assert!(
+        has_rebind(&remote),
+        "the rebind went up to the located copy"
+    );
+    let third = format!("{}/", prefix_of(&elsewhere));
+    assert!(
+        s3.keys().iter().all(|k| !k.starts_with(&third)),
+        "nothing goes under the third directory's prefix"
+    );
+}
+
+/// A session recorded before koto named the prefix, with no copy under
+/// any candidate prefix, refuses a rebind from a third directory, naming
+/// where to run it.
+#[test]
+fn a_rebind_of_an_unrecorded_session_from_a_third_directory_refuses() {
+    let s3 = FakeS3::start(BUCKET);
+    let host = Host::new(&s3);
+    let anchor = host.dir("anchor");
+    let target = host.dir("target");
+    let elsewhere = host.dir("elsewhere");
+    host.init(&anchor, &[]);
+    forget_recorded_prefix(&host);
+    s3.remove(&state_key(&anchor));
     let before = host.local_log();
 
     let out = host.koto(

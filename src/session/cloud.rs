@@ -33,8 +33,8 @@ use crate::session::state_log;
 use crate::session::sync::{self, ManifestCache};
 use crate::session::sync_stamp::{self, Stamp};
 use crate::session::{
-    state_file_name, Home, HomeSource, SessionBackend, SessionError, SessionInfo, SessionLock,
-    SessionMigrated, Unlocated, UnlocatedReason,
+    state_file_name, Fallback, Home, HomeSource, SessionBackend, SessionError, SessionInfo,
+    SessionLock, SessionMigrated, Unlocated, UnlocatedReason,
 };
 
 /// File name of the marker `koto session import` leaves beside a source
@@ -324,6 +324,12 @@ struct Probes {
     /// file it was read from: a session moved or re-created under the name
     /// is read again. Kept here, in the box, for the same reason.
     homes: Mutex<HashMap<String, KnownHome>>,
+    /// [`CloudBackend::locate`]'s answers for sessions that record no
+    /// prefix, read from outside their own directory, by session id: the
+    /// listings are made once per process. The answer stands even after a
+    /// pull rewrites the stamp to the located prefix, which changes the
+    /// candidates but not where the copy is.
+    located: Mutex<HashMap<String, Result<Home, Unlocated>>>,
 }
 
 impl CloudBackend {
@@ -378,6 +384,7 @@ impl CloudBackend {
                 read_only: false,
                 walk: Mutex::default(),
                 homes: Mutex::default(),
+                located: Mutex::default(),
             }),
             epochs_read: Box::new(Mutex::new(HashMap::new())),
         }
@@ -670,7 +677,7 @@ impl CloudBackend {
     /// - a home that isn't this directory's own is pulled now, strictly
     ///   ([`CloudBackend::sync_pull_state`]): a bucket that can't answer is
     ///   an error, and a copy there that is missing or another session's is
-    ///   `RecordedCopyMismatch`, before anything is read or written.
+    ///   `Unlocated`, before anything is read or written.
     pub fn check_located(&self, id: &str) -> anyhow::Result<()> {
         self.local_guard(id)?;
         let home = self.home_prefix(id).map_err(anyhow::Error::new)?;
@@ -716,9 +723,11 @@ impl CloudBackend {
     ///   execution anchor (`execution_dir`, else `origin.anchor`), and with
     ///   no anchor either to the prefix of this host's sync stamp; from that
     ///   directory, or when it records none of these, its home is this
-    ///   directory's prefix, as before, and from anywhere else it is
-    ///   `NoRecordedPrefix`. The stamp comes last because any sync rewrites
-    ///   it to the prefix the syncing command ran under.
+    ///   directory's prefix, as before, with no request. From anywhere else
+    ///   it is located among two candidates, the anchor's prefix and the
+    ///   stamp's, listed once each ([`CloudBackend::locate`]). The stamp
+    ///   comes last because any sync rewrites it to the prefix the syncing
+    ///   command ran under.
     ///
     /// A read-only backend (`koto --workspace`) always answers its own
     /// prefix: its local copy is a scratch one it pulled from that very
@@ -770,22 +779,150 @@ impl CloudBackend {
             return Ok(home);
         }
         let anchor = field("/execution_dir").or_else(|| field("/origin/anchor"));
-        let own = match &anchor {
-            Some(a) => crate::session::local::prefix_for_workspace(Path::new(a)).ok(),
-            None => Stamp::load(&dir).and_then(|s| {
-                s.state_key
-                    .split('/')
-                    .next()
-                    .filter(|p| is_workspace_prefix(p))
-                    .map(str::to_string)
-            }),
+        let anchored = anchor
+            .as_deref()
+            .and_then(|a| crate::session::local::prefix_for_workspace(Path::new(a)).ok());
+        let stamped = Stamp::load(&dir).and_then(|s| {
+            s.state_key
+                .split('/')
+                .next()
+                .filter(|p| is_workspace_prefix(p))
+                .map(str::to_string)
+        });
+        let own = if anchor.is_some() {
+            anchored.clone()
+        } else {
+            stamped.clone()
         };
         match own {
-            Some(own) if own != self.prefix => Err(Unlocated {
-                session: id.to_string(),
-                reason: UnlocatedReason::NoRecordedPrefix { anchor },
-            }),
+            Some(own) if own != self.prefix => {
+                let mut candidates: Vec<String> = anchored.into_iter().collect();
+                if let Some(stamped) = stamped.filter(|s| !candidates.contains(s)) {
+                    candidates.push(stamped);
+                }
+                self.locate(id, anchor, candidates)
+            }
             _ => Ok(caller()),
+        }
+    }
+
+    /// The home of `id`, a session that records no prefix, named from
+    /// outside the directory its records name: the one of `candidates` (its
+    /// anchor's prefix, then the prefix this host's sync stamp names, with
+    /// no prefix twice) whose listing shows the session's state object.
+    ///
+    /// Each candidate is listed once per process, with a delimiter, so the
+    /// listing reads only the session's top level. No candidate holding the
+    /// state object, both holding one, and a listing that fails are
+    /// [`Unlocated`], naming every candidate concerned. A listing alone
+    /// can't say whose copy it found: the copy is the session's own only
+    /// when it carries the local header's `session_id`, and the first pull
+    /// checks that ([`CloudBackend::sync_pull_state`]), so locating it costs
+    /// no extra fetch.
+    fn locate(
+        &self,
+        id: &str,
+        anchor: Option<String>,
+        candidates: Vec<String>,
+    ) -> Result<Home, Unlocated> {
+        if let Some(answer) = self
+            .probes
+            .located
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+        {
+            return answer.clone();
+        }
+        let unlocated = |fallback| Unlocated {
+            session: id.to_string(),
+            reason: UnlocatedReason::NoRecordedPrefix {
+                anchor: anchor.clone(),
+                fallback,
+            },
+        };
+        let mut held = Vec::new();
+        let mut failed = None;
+        for candidate in &candidates {
+            let session = format!("{candidate}/{id}/");
+            let state = format!("{session}{}", state_file_name(id));
+            match self.bucket.list(session, Some("/".to_string())) {
+                Ok(pages) => {
+                    if pages
+                        .iter()
+                        .flat_map(|page| page.contents.iter())
+                        .any(|obj| obj.key == state)
+                    {
+                        held.push(candidate.clone());
+                    }
+                }
+                Err(e) => {
+                    failed = Some(Fallback::Unreadable {
+                        prefix: candidate.clone(),
+                        error: without_url_userinfo(&e.to_string()),
+                    });
+                    break;
+                }
+            }
+        }
+        let answer = match (failed, held.as_slice()) {
+            (Some(fallback), _) => Err(unlocated(fallback)),
+            // Never this directory's own, even when the stamp names its
+            // prefix: a located copy is read strictly and never replaced.
+            (None, [prefix]) => Ok(Home {
+                own_workspace: false,
+                prefix: prefix.clone(),
+                via: HomeSource::Located,
+            }),
+            (None, []) => Err(unlocated(Fallback::NoCopy {
+                candidates: candidates.clone(),
+            })),
+            (None, _) => Err(unlocated(Fallback::Ambiguous { prefixes: held })),
+        };
+        self.probes
+            .located
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), answer.clone());
+        answer
+    }
+
+    /// The refusal of a strict pull that found `home`'s copy missing
+    /// (`found` is `None` and `missing`) or carrying `found` as its
+    /// `session_id`: [`UnlocatedReason::RecordedCopyMismatch`] for a
+    /// recorded home, and for a located one the fallback's own reason,
+    /// naming the session's anchor as the place it still reads from.
+    fn copy_mismatch(
+        &self,
+        id: &str,
+        home: &Home,
+        found: Option<String>,
+        missing: bool,
+    ) -> Unlocated {
+        let prefix = home.prefix.clone();
+        let reason = if home.via == HomeSource::Located {
+            let header = first_line(&self.local.session_dir(id).join(state_file_name(id)))
+                .and_then(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok());
+            let anchor = header.as_ref().and_then(|h| {
+                h.get("execution_dir")
+                    .or_else(|| h.pointer("/origin/anchor"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
+            let fallback = if missing {
+                Fallback::NoCopy {
+                    candidates: vec![prefix],
+                }
+            } else {
+                Fallback::Mismatch { prefix, found }
+            };
+            UnlocatedReason::NoRecordedPrefix { anchor, fallback }
+        } else {
+            UnlocatedReason::RecordedCopyMismatch { prefix, found }
+        };
+        Unlocated {
+            session: id.to_string(),
+            reason,
         }
     }
 
@@ -1516,22 +1653,19 @@ impl CloudBackend {
         }
         // A home that isn't this directory's own is read strictly: a bucket
         // that can't answer is an error rather than the local copy, and so
-        // is a recorded copy that isn't there.
+        // is a copy that isn't there.
+        let strict = !home.own_workspace;
         let remote_etag = match self.probe(id) {
             Ok(probe) => match probe.state_etag {
                 Some(etag) => etag,
-                None if !home.own_workspace => {
-                    return Err(anyhow::Error::new(Unlocated {
-                        session: id.to_string(),
-                        reason: UnlocatedReason::RecordedCopyMismatch {
-                            prefix: home.prefix,
-                            found: None,
-                        },
-                    }))
+                None if strict => {
+                    return Err(anyhow::Error::new(
+                        self.copy_mismatch(id, &home, None, true),
+                    ))
                 }
                 None => return Ok(()), // Not in the bucket: use local.
             },
-            Err(e) if !home.own_workspace => {
+            Err(e) if strict => {
                 return Err(e.context(format!(
                     "cloud sync: the bucket's copy of session '{}' under prefix {} couldn't be \
                      checked, so the local copy may be stale",
@@ -1584,22 +1718,22 @@ impl CloudBackend {
         // A home found any other way than as this directory's own holds the
         // session's copy only when it carries the local header's
         // `session_id`: one that carries another is a different session
-        // under the name, and is neither read nor written.
-        if !home.own_workspace {
+        // under the name, and is neither read nor written. A located home
+        // needs both ids to confirm it, since nothing else says the copy
+        // the listing found is this session's.
+        if strict {
             let local_id = first_line(&state_path)
                 .and_then(|line| header_session_id(line.as_bytes()))
                 .filter(|s| !s.is_empty());
             let remote_id = header_session_id(response.bytes()).filter(|s| !s.is_empty());
-            if let (Some(local_id), Some(remote_id)) = (local_id, remote_id) {
-                if local_id != remote_id {
-                    return Err(anyhow::Error::new(Unlocated {
-                        session: id.to_string(),
-                        reason: UnlocatedReason::RecordedCopyMismatch {
-                            prefix: home.prefix,
-                            found: Some(remote_id),
-                        },
-                    }));
-                }
+            let confirmed = match (&local_id, &remote_id) {
+                (Some(local_id), Some(remote_id)) => local_id == remote_id,
+                _ => home.via != HomeSource::Located,
+            };
+            if !confirmed {
+                return Err(anyhow::Error::new(
+                    self.copy_mismatch(id, &home, remote_id, false),
+                ));
             }
         }
         refuse_cross_import_pull(id, &state_path, response.bytes())?;
