@@ -109,6 +109,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         states.insert(
@@ -132,6 +133,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         states.insert(
@@ -155,6 +157,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         states.insert(
@@ -174,6 +177,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
 
@@ -275,6 +279,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         );
         let t = CompiledTemplate {

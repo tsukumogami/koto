@@ -731,7 +731,7 @@ events:
       via:
         type: string
         required: false
-        enum: ["check_output"]
+        enum: ["check_output", "directive"]
       delivery:
         type: string
         required: false
@@ -2001,7 +2001,7 @@ only the in-memory view of the same write.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `key` | string | Yes | The name the state declared in `capture_stdout_as`. Later states reference it as `{{BRANCH}}` for a key of `BRANCH`. |
-| `value` | string | Yes | The command's stdout, already trimmed and checked against the variable allowlist. A value that reached the log is one substitution can use. |
+| `value` | string | Yes | The command's stdout, already trimmed and checked against the variable allowlist. A value that reached the log is one substitution can use. Empty only when the action sets `capture_allow_empty: true` and printed nothing but whitespace. |
 
 Consumers fold these in event order: re-entering the producing state means the
 later value wins. A rewind past that state leaves the value in place — the log is
@@ -2010,7 +2010,10 @@ never truncated — so a captured name outlives the state that produced it.
 The event appears only on a successful delivery. A command that ran but whose
 output could not be delivered (empty, over 4096 bytes, or holding a character
 the allowlist forbids) appends no `variable_captured`; the tick stops instead,
-and the reason reaches the caller on the response.
+and the reason reaches the caller on the response. With
+`capture_allow_empty: true` an empty output is delivered: the event carries
+the empty string and a directive that interpolates the name renders nothing
+in its place.
 
 A capture is delivered on a tick that stops for confirmation as well as on one
 that advances, so this event does not imply the workflow moved. It has to work
@@ -2464,18 +2467,28 @@ a shadow criterion, deliver nothing.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `state` | string | Yes | The state whose check failed. |
-| `gate` | string | Yes | The decider check's name. |
-| `rule_id` | string | Yes | The failed criterion's id. |
-| `level` | string | Yes | `summary` on the first failing evaluation of this check and rule in the visit, `full` on every later one; a criterion declaring only one text always gets that text's level. |
+| `state` | string | Yes | The state whose check failed, or whose directive carried the rule. |
+| `gate` | string | Yes | The decider check's name, the command gate's name, or a directive rule's declared `check`. |
+| `rule_id` | string | Yes | The failed criterion's id, the id the check printed, or a directive rule's declared `rule_id`. |
+| `level` | string | Yes | `summary` on the first failing evaluation of this check and rule in the visit, `full` on every later one; a criterion declaring only one text always gets that text's level. For a command check or a directive rule, the declared or printed extent. |
 | `unit_count` | integer | No | How many units the rule was handed back for. Present only for a check in unit mode. |
-| `via` | string | No | `check_output` when a command gate's check reported the delivery by printing a `::koto-rule-delivered::` line (see `gate_evaluated`'s `rules_delivered`). Absent on a decider check's delivery. |
-| `delivery` | string | No | Beside `via`: `printed` when the check printed the rule's text, `refused` when it declined to release it. |
+| `via` | string | No | `check_output` when a command gate's check reported the delivery by printing a `::koto-rule-delivered::` line (see `gate_evaluated`'s `rules_delivered`); `directive` when the state's `directive_rules` declared it and its directive was printed. Absent on a decider check's delivery. |
+| `delivery` | string | No | Beside `via`: `printed` when the check printed the rule's text, `refused` when it declined to release it. Always `printed` for `directive`. |
 
 A command gate's reported delivery is appended the same way, one event per
 entry of its `gate_evaluated`'s `rules_delivered`, after the response prints
 and after any decider check's deliveries. Its `level` is the `extent` the
 check printed, and it never carries `unit_count`.
+
+A state that declares `directive_rules` records its rules the same way, as
+telemetry: each time `koto next` prints that state's directive (on an advance
+or a `--to` move), one event per entry whose `when_set` variable or capture
+holds a non-empty value, with `via: directive`, `delivery: printed` and the entry's
+`rule_id`, `check` (as `gate`) and `extent` (as `level`). They are appended
+after the response prints and after any check's deliveries. An entry whose
+value is empty records nothing, every print records again (a second tick that
+re-prints the directive, a rewind back into the state), `koto status` records
+nothing, and `unit_count` is never present.
 
 The event never carries the rule's text: that lives in the compiled template
 and the printed response only.

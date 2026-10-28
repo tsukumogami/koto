@@ -50,6 +50,20 @@ to `0.9.x`).
 
 ### Added
 
+- **Rules a directive carries, recorded as telemetry.** A state's new
+  `directive_rules` list names the rules its directive hands the agent
+  (`rule_id`, `check`, `extent` and `when_set`). Each time `koto next`
+  prints that directive, it appends one `rule_delivered` event per entry
+  whose `when_set` variable or capture is non-empty, after the response
+  prints, with the new `via` value `directive` and `delivery: printed`.
+  `koto status` records nothing, and the response is unchanged. The
+  compiler checks each entry (`E-DIRECTIVE-RULE-*`).
+- **`capture_allow_empty` on a `default_action`.** Beside
+  `capture_stdout_as`, it delivers an empty output as the empty string
+  instead of failing the tick, so a directive that interpolates it renders
+  nothing. Without it an empty output fails as before. A template that uses
+  neither new field compiles to the same bytes and hash; one that uses
+  either needs this koto.
 - **Check and evidence telemetry in the run journal.** `check_evaluated`
   gains `koto.check.reason` (why a check didn't pass: `rule_failed`,
   `undecided`, `no_finding`, `timed_out`, `spawn_failed` or `error`),

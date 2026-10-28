@@ -1206,6 +1206,7 @@ states:
 |---|---|---|---|
 | `command` | Yes | string | The command line, passed to `/bin/sh -c` as a single string |
 | `capture_stdout_as` | No | string | A name the command's trimmed stdout is delivered under, readable by later states |
+| `capture_allow_empty` | No | bool | With `capture_stdout_as`: deliver an empty output as the empty string instead of failing the tick |
 | `fallback` | No | string | Prose the agent reads when the action fails. Spliced onto `directive` after substitution, so write it as literal text |
 | `working_dir` | No | string | A **relative** path under the session's execution anchor. An absolute literal is a compile error |
 | `requires_confirmation` | No | bool | After a *successful* run, stop for confirmation before transitioning |
@@ -1237,7 +1238,17 @@ Read it anywhere a variable can be read: a later directive or details section, a
 
 Two bounds apply and they do different jobs. **64KB per stream** bounds what the response and event log carry. **4096 bytes** bounds what a capture may deliver, measured after trimming -- far smaller because a captured value is a token landing in prose and possibly a shell word, not a transcript.
 
-Delivery fails four ways, all of them action failures with `failure_kind: "capture_failed"` and a `capture_error` object naming the case: the trimmed output is `empty`, it held a known credential that koto replaced with a `[REDACTED:<source>]` marker (`redacted`, with `source` naming where the credential came from), it is `too_large` (over 4096 bytes), or it holds a `disallowed_character` -- the same allowlist declared variables pass, `^[a-zA-Z0-9._/:@+ \-]*$`, which forbids newlines and so makes multi-line capture unrepresentable. A skip would be a silent drop, and it would move the error to the reading state where the message names a variable instead of the command that failed to produce it.
+Delivery fails four ways (three under `capture_allow_empty: true`, below), all of them action failures with `failure_kind: "capture_failed"` and a `capture_error` object naming the case: the trimmed output is `empty`, it held a known credential that koto replaced with a `[REDACTED:<source>]` marker (`redacted`, with `source` naming where the credential came from), it is `too_large` (over 4096 bytes), or it holds a `disallowed_character` -- the same allowlist declared variables pass, `^[a-zA-Z0-9._/:@+ \-]*$`, which forbids newlines and so makes multi-line capture unrepresentable. A skip would be a silent drop, and it would move the error to the reading state where the message names a variable instead of the command that failed to produce it.
+
+**`capture_allow_empty: true`** turns the `empty` case into a value: an output that is empty once trimmed is delivered as the empty string, so a directive that interpolates the name renders nothing in its place. Use it for a command whose silence is an answer, such as one that prints a rule only for some runs. A non-empty output still takes every other check, and without the flag an empty output fails exactly as described above. The compiler refuses the flag on an action with no `capture_stdout_as`.
+
+```yaml
+  changelog_rule:
+    default_action:
+      command: ./changelog-rule.sh
+      capture_stdout_as: CHANGELOG_RULE
+      capture_allow_empty: true
+```
 
 Reading a name the run never delivered stops the tick with the `capture_unset` error code rather than rendering an empty string or a raw `{{NAME}}` token. That covers a state's own action: a `{{NAME}}` in `command` or in `working_dir` is checked before either is substituted, so the token never reaches `sh -c` and nothing is spawned. It is a stop and not an action failure, so `fallback` prose is not delivered for it.
 
@@ -1460,6 +1471,50 @@ reserved `koto/` area (a first component of `koto`, in any case), no
 duplicates, not
 on a terminal state, not an empty list, and not a key any transition writes
 through `context_assignments`.
+
+### `directive_rules` — rules a directive carries, recorded as telemetry
+
+A directive can carry a rule the agent must follow, in place of (or before) a
+check's finding that would hand it back. `directive_rules` names those rules so
+koto records each delivery the way it records a check's: as a
+`rule_delivered` event with `via: directive`, which the run journal relays as
+telemetry. Nothing routes on it and the response is unchanged.
+
+```yaml
+states:
+  open_pr:
+    directive_rules:
+      - rule_id: release/changelog-entry
+        check: changelog
+        extent: full
+        when_set: CHANGELOG_RULE
+```
+
+Each time `koto next` prints the state's directive (an advance into it, a tick
+that holds there, a `--to` move), it appends one event per entry whose
+`when_set` value is non-empty (whether or not the directive interpolates it), after the response prints. Each event
+carries the state, `check` as the check name, `rule_id`, `extent`,
+`via: directive` and `delivery: printed`; it never carries the rule's text or a
+`unit_count`. A re-print records again, an entry whose value is empty records
+nothing, and `koto status` records nothing. Pair `when_set` with a capture
+that uses `capture_allow_empty` when the rule is carried in some runs and not
+others: the empty run renders nothing and records nothing.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `rule_id` | Yes | The rule's id: not blank, at most 128 bytes |
+| `check` | Yes | The check the rule belongs to: 1 to 128 letters, digits and `. _ : / @ -`, not starting with `/` or `~` |
+| `extent` | Yes | `summary` or `full`, exactly (the case matters) |
+| `when_set` | Yes | A declared variable or a `capture_stdout_as` name whose value carries the rule; a runtime name is refused |
+
+Compile-time rules, each with its own code: a value that isn't a non-empty
+list of maps, an unknown key or a non-string value
+(`E-DIRECTIVE-RULE-SHAPE`); a missing field, named in the message
+(`E-DIRECTIVE-RULE-MISSING`); `rule_id` out of bounds (`E-DIRECTIVE-RULE-ID`);
+`check` out of shape (`E-DIRECTIVE-RULE-CHECK`); another `extent`
+(`E-DIRECTIVE-RULE-EXTENT`); and a `when_set` that names neither a variable
+nor a capture (`E-DIRECTIVE-RULE-WHEN-SET`). A template without the field
+compiles to the same bytes and hash as before it existed.
 
 ### Self-loops
 

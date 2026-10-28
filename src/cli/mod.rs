@@ -6528,6 +6528,15 @@ fn handle_next(
                     ),
                 };
                 println!("{}", serde_json::to_string(&out)?);
+                // The rules the printed directive carried, recorded after
+                // the print and before `instructions_delivered`, in the order
+                // the natural path uses. No gate ran on this path, so there
+                // are no check deliveries to put ahead of them.
+                append_rule_deliveries(
+                    backend,
+                    &name,
+                    directive_deliveries(&compiled, &resp, &variables, &overlay),
+                );
                 // The delivery record is appended only after printing --
                 // see the natural-advancement path for the crash-
                 // direction rationale. Non-fatal on error: the response
@@ -8163,12 +8172,17 @@ fn handle_next(
                 .read_events_local(&name)
                 .map(|(_, events)| check_output_deliveries(&events, pre_advance_seq))
                 .unwrap_or_default();
-            for delivery in rule_deliveries.into_iter().chain(check_deliveries) {
-                let payload = EventPayload::RuleDelivered(delivery);
-                if let Err(e) = backend.append_event(&name, &payload, &now_iso8601()) {
-                    eprintln!("warning: failed to append RuleDelivered event: {}", e);
-                }
-            }
+            // The rules the printed directive carried come last: they were
+            // delivered by this print, after every check that ran this tick.
+            let carried = directive_deliveries(&compiled, &resp, &variables, &overlay);
+            append_rule_deliveries(
+                backend,
+                &name,
+                rule_deliveries
+                    .into_iter()
+                    .chain(check_deliveries)
+                    .chain(carried),
+            );
             // The delivery record is appended only after the response
             // prints, so a crash between the two re-delivers on the
             // next tick rather than silently suppressing
@@ -8256,6 +8270,54 @@ fn journal_response(
             details,
         );
     }
+}
+
+/// Append one `rule_delivered` event per delivery, in order. Called only
+/// after the response has printed, so a failed append is a warning: the
+/// delivery already happened and can't be taken back.
+#[cfg(unix)]
+fn append_rule_deliveries(
+    backend: &dyn SessionBackend,
+    name: &str,
+    deliveries: impl IntoIterator<Item = crate::decider::check::RuleDelivered>,
+) {
+    for delivery in deliveries {
+        let payload = EventPayload::RuleDelivered(delivery);
+        if let Err(e) = backend.append_event(name, &payload, &now_iso8601()) {
+            eprintln!("warning: failed to append RuleDelivered event: {}", e);
+        }
+    }
+}
+
+/// The `rule_delivered` events for the `directive_rules` of the state whose
+/// directive `resp` printed: one per entry whose `when_set` value is
+/// non-empty, in declared order. Nothing for a response that printed no
+/// directive. The value is read through the same lookup the directive's
+/// substitution used, so for a directive that interpolates `when_set` the
+/// rule records exactly when its text was carried.
+#[cfg(unix)]
+fn directive_deliveries(
+    compiled: &CompiledTemplate,
+    resp: &next_types::NextResponse,
+    variables: &crate::engine::substitute::Variables,
+    overlay: &crate::engine::substitute::VariableOverlay,
+) -> Vec<crate::decider::check::RuleDelivered> {
+    let Some((state, _, _)) = resp.directive_parts() else {
+        return Vec::new();
+    };
+    let Some(template_state) = compiled.states.get(state) else {
+        return Vec::new();
+    };
+    template_state
+        .directive_rules
+        .iter()
+        .filter(|rule| {
+            variables
+                .value_with(&rule.when_set, overlay)
+                .is_some_and(|v| !v.is_empty())
+        })
+        .map(|rule| crate::decider::check::RuleDelivered::from_directive(state, rule))
+        .collect()
 }
 
 /// The `rule_delivered` events for the rules command gates said they
@@ -11055,6 +11117,7 @@ Done.
             polling: None,
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         };
         for (field, raw) in authored.substitutable_fields() {
             assert!(

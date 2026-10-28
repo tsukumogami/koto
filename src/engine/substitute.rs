@@ -447,6 +447,13 @@ impl Variables {
     pub fn is_bound(&self, key: &str) -> bool {
         self.vars.contains_key(key)
     }
+
+    /// The value `{{KEY}}` renders as, in the tick's lookup order: the
+    /// overlay, then the bindings read from the log. `None` when neither
+    /// holds `key`, such as a capture no state has delivered.
+    pub fn value_with(&self, key: &str, overlay: &VariableOverlay) -> Option<String> {
+        overlay.get(key).or_else(|| self.vars.get(key).cloned())
+    }
 }
 
 /// The first `{{KEY}}` reference in `input` that names a declared capture no

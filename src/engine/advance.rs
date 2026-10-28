@@ -500,10 +500,16 @@ fn record_successful_action<F>(
 where
     F: FnMut(&EventPayload) -> Result<(), String>,
 {
-    let capture = action
-        .capture_stdout_as
-        .as_ref()
-        .map(|key| (key, prepare_capture(key, run.stdout)));
+    let capture = action.capture_stdout_as.as_ref().map(|key| {
+        // `capture_allow_empty` turns only the empty case into a value:
+        // the empty string passes the allowlist and renders as nothing.
+        // Anything else still takes every check below.
+        if action.capture_allow_empty && run.stdout.trim().is_empty() {
+            (key, Ok(String::new()))
+        } else {
+            (key, prepare_capture(key, run.stdout))
+        }
+    });
     if let Some((_, Err(error))) = &capture {
         let mut conditions = capture_failure_conditions(
             run.state,
@@ -2731,6 +2737,7 @@ mod tests {
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         }
     }
 
@@ -3422,6 +3429,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -3441,6 +3449,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -3463,6 +3472,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -3482,6 +3492,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -3559,6 +3570,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -3634,6 +3646,7 @@ mod tests {
                         skip_if: None,
                         result: None,
                         clear_on_entry: Vec::new(),
+                        directive_rules: Vec::new(),
                     },
                 ),
                 (
@@ -3653,6 +3666,7 @@ mod tests {
                         skip_if: None,
                         result: None,
                         clear_on_entry: Vec::new(),
+                        directive_rules: Vec::new(),
                     },
                 ),
             ])
@@ -3732,6 +3746,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -3783,6 +3798,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -3862,6 +3878,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -3973,6 +3990,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -3992,6 +4010,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4011,6 +4030,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -4110,6 +4130,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4129,6 +4150,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4148,6 +4170,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -4246,6 +4269,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4265,6 +4289,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -4361,6 +4386,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4380,6 +4406,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -4554,6 +4581,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4573,6 +4601,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -4625,6 +4654,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -4684,6 +4714,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ));
         }
@@ -4705,6 +4736,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         ));
 
@@ -4749,6 +4781,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -4794,6 +4827,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4813,6 +4847,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4832,6 +4867,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -4881,6 +4917,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4900,6 +4937,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -4919,6 +4957,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -4963,6 +5002,7 @@ mod tests {
             polling: None,
             fallback: None,
             capture_stdout_as: None,
+            capture_allow_empty: false,
         }
     }
 
@@ -5081,6 +5121,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )])
     }
@@ -5173,6 +5214,73 @@ mod tests {
         assert!(overlay.is_empty(), "a failed capture writes nothing");
     }
 
+    /// Run `capturing_template("NOTE")` with `capture_allow_empty` set, its
+    /// action printing `stdout`; returns the stop, the overlay's `NOTE` and
+    /// the appended events.
+    fn run_allow_empty(stdout: &'static str) -> (AdvanceResult, Option<String>, Vec<EventPayload>) {
+        let mut template = capturing_template("NOTE");
+        template
+            .states
+            .get_mut("detect")
+            .unwrap()
+            .default_action
+            .as_mut()
+            .unwrap()
+            .capture_allow_empty = true;
+        let appended = std::cell::RefCell::new(Vec::new());
+        let mut append = |p: &EventPayload| -> Result<(), String> {
+            appended.borrow_mut().push(p.clone());
+            Ok(())
+        };
+        let shutdown = AtomicBool::new(false);
+        let overlay = VariableOverlay::new();
+        let action = move |_: &str, _: &ActionDecl, _: bool| executed(stdout);
+        let result = advance_until_stop(
+            "detect",
+            &template,
+            &BTreeMap::new(),
+            &[],
+            &mut append,
+            &noop_gates,
+            &unavailable_integration,
+            &action,
+            &overlay,
+            &shutdown,
+        )
+        .unwrap();
+        let note = overlay.get("NOTE");
+        (result, note, appended.into_inner())
+    }
+
+    #[test]
+    fn capture_allow_empty_delivers_empty_output_as_the_empty_string() {
+        let (result, note, appended) = run_allow_empty(" \n\t ");
+        assert!(
+            !matches!(result.stop_reason, StopReason::GateBlocked(_)),
+            "an allowed empty capture doesn't fail the tick: {:?}",
+            result.stop_reason
+        );
+        assert_eq!(note.as_deref(), Some(""));
+        assert!(appended.iter().any(|p| matches!(
+            p,
+            EventPayload::VariableCaptured { key, value } if key == "NOTE" && value.is_empty()
+        )));
+    }
+
+    #[test]
+    fn capture_allow_empty_still_checks_a_non_empty_output() {
+        let (_, note, _) = run_allow_empty("  ready\n");
+        assert_eq!(note.as_deref(), Some("ready"));
+
+        let (result, note, _) = run_allow_empty("a;b\n");
+        let StopReason::GateBlocked(conditions) = result.stop_reason else {
+            panic!("expected a gate-blocked stop, got {:?}", result.stop_reason);
+        };
+        let output = &conditions[ACTION_CONDITION_NAME].output;
+        assert_eq!(output["capture_error"]["case"], "disallowed_character");
+        assert_eq!(note, None);
+    }
+
     #[test]
     fn a_state_without_a_capture_name_writes_no_overlay_entry() {
         let template = make_template(vec![(
@@ -5195,6 +5303,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
         let appended = std::cell::RefCell::new(Vec::new());
@@ -5253,6 +5362,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -5315,6 +5425,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -5362,6 +5473,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -5455,6 +5567,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -5474,6 +5587,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ])
@@ -5771,6 +5885,7 @@ mod tests {
                 skip_if: None,
                 result: None,
                 clear_on_entry: Vec::new(),
+                directive_rules: Vec::new(),
             },
         )]);
 
@@ -5837,6 +5952,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -5856,6 +5972,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -5922,6 +6039,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -5941,6 +6059,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -6067,6 +6186,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -6086,6 +6206,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -6164,6 +6285,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -6183,6 +6305,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -6438,6 +6561,7 @@ mod tests {
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         };
         let template = make_template(vec![
             (
@@ -6466,6 +6590,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             ("merged", terminal("Merged.")),
@@ -6555,6 +6680,7 @@ mod tests {
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         };
         let template = make_template(vec![
             (
@@ -6583,6 +6709,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             ("merged", terminal("Merged.")),
@@ -6657,6 +6784,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -6676,6 +6804,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -6793,6 +6922,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -6812,6 +6942,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -6904,6 +7035,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -6923,6 +7055,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -7043,6 +7176,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             ("complete", {
@@ -7142,6 +7276,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             ("complete", {
@@ -7523,6 +7658,7 @@ mod tests {
                     },
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -7542,6 +7678,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -7639,6 +7776,7 @@ mod tests {
                     },
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
             (
@@ -7658,6 +7796,7 @@ mod tests {
                     skip_if: None,
                     result: None,
                     clear_on_entry: Vec::new(),
+                    directive_rules: Vec::new(),
                 },
             ),
         ]);
@@ -8180,6 +8319,7 @@ mod tests {
             skip_if: None,
             result: None,
             clear_on_entry: Vec::new(),
+            directive_rules: Vec::new(),
         }
     }
 

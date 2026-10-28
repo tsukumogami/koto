@@ -154,6 +154,10 @@ Two protocol steps an agent used to do from prose are koto's to do:
 
 The [template format guide](references/template-format.md) has both field schemas and their compile rules.
 
+### Recording a rule a directive carries
+
+When a directive hands the agent a rule (rather than a check's finding handing it back), declare it in the state's `directive_rules` (`rule_id`, `check`, `extent` of `summary` or `full`, and `when_set`, a variable or capture that carries the rule's text). Each time `koto next` prints that directive with the `when_set` value non-empty, koto appends a `rule_delivered` event with `via: directive`, which reaches the run journal as telemetry; nothing routes on it. For a rule carried in some runs and not others, produce the text with a `default_action` that sets `capture_stdout_as` and `capture_allow_empty: true`: a run with no rule captures the empty string, renders nothing and records nothing. The [template format guide](references/template-format.md#directive_rules--rules-a-directive-carries-recorded-as-telemetry) has the fields and their compile codes.
+
 ## Reference material
 
 The skill bundles reference material, loaded during specific states:

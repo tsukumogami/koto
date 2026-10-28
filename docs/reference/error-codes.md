@@ -796,6 +796,27 @@ E-DECIDER-CHECK-SPEC: state "review" check "comments": the compiled template has
 
 Fix: compile the template again from its source with this koto. A session whose cached template has lost its spec can't be resumed; start a new one.
 
+#### `directive_rules` codes
+
+A state's `directive_rules` list (rules its directive carries, recorded as telemetry) has six compile-time errors. Each names the state and, past the shape check, the entry's index.
+
+**E-DIRECTIVE-RULE-SHAPE (error)**: the value isn't a non-empty list, an entry isn't a map, an entry has a key other than `rule_id`, `check`, `extent` and `when_set`, or a value isn't a string.
+
+**E-DIRECTIVE-RULE-MISSING (error)**: an entry lacks one of the four fields; the message names it.
+
+```
+validation error: E-DIRECTIVE-RULE-MISSING: state "pr_creation": directive_rules entry 0: missing when_set
+  remedy: give each entry rule_id, check, extent and when_set
+```
+
+**E-DIRECTIVE-RULE-EXTENT (error)**: `extent` is something other than `summary` or `full`, including another case such as `Full`.
+
+**E-DIRECTIVE-RULE-ID (error)**: `rule_id` is blank or longer than 128 bytes.
+
+**E-DIRECTIVE-RULE-CHECK (error)**: `check` isn't a check name: 1 to 128 letters, digits and `. _ : / @ -`, not starting with `/` or `~`.
+
+**E-DIRECTIVE-RULE-WHEN-SET (error)**: `when_set` names neither a declared variable nor a `capture_stdout_as` name.
+
 ---
 
 ### template validate

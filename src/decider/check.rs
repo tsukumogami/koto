@@ -531,12 +531,16 @@ pub struct RuleDelivered {
 pub enum RuleVia {
     /// A command check printed a `::koto-rule-delivered::` line.
     CheckOutput,
+    /// `koto next` printed a directive whose state declares the rule in
+    /// `directive_rules`, with the entry's `when_set` value non-empty.
+    Directive,
 }
 
 impl RuleVia {
     pub fn as_str(self) -> &'static str {
         match self {
             RuleVia::CheckOutput => "check_output",
+            RuleVia::Directive => "directive",
         }
     }
 }
@@ -557,6 +561,21 @@ impl RuleDelivered {
             unit_count: None,
             via: Some(RuleVia::CheckOutput),
             delivery: Some(printed.delivery),
+        }
+    }
+
+    /// The `rule_delivered` event for a `directive_rules` entry of `state`
+    /// whose directive `koto next` printed. A directive delivery is never in
+    /// unit mode, so `unit_count` is absent rather than zero.
+    pub fn from_directive(state: &str, rule: &crate::template::types::DirectiveRule) -> Self {
+        RuleDelivered {
+            state: state.to_string(),
+            gate: rule.check.clone(),
+            rule_id: rule.rule_id.clone(),
+            level: rule.extent,
+            unit_count: None,
+            via: Some(RuleVia::Directive),
+            delivery: Some(crate::findings::RuleDeliveryOutcome::Printed),
         }
     }
 }
