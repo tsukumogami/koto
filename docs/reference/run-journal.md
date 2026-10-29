@@ -825,7 +825,7 @@ one review entry for itself and one per seat against the session's 2,000.
 | `koto.code_review.seat_count` | integer | `code_review_round` | How many seats the round recorded: the number of `code_review_verdict` records that follow it. |
 | `koto.code_review.head` | string | `code_review_round` | The reviewed head as koto's digest of the value the caller gave: `sha256:` and 32 lowercase hex characters. Never a commit id; the same head gives the same digest in every session, so rounds at one head compare equal. |
 | `koto.code_review.seat` | string | `code_review_verdict` | The seat, when the session's template declares it among the `seats` of its `review_vocabulary`; `other` otherwise, and always when the template declares none. |
-| `koto.code_review.model` | string | `code_review_verdict` | The model the seat ran on, as given when it has the name shape: 1 to 128 characters from `A-Z a-z 0-9 . _ : / @ -`, not starting with `/` or `~` (`^[A-Za-z0-9._:/@-]{1,128}$`). Any other model, such as an id with a `[1m]` suffix, is recorded as `other`, as an undeclared seat is, and the round is kept; it is never a digest here. A missing or empty model still refuses the call. |
+| `koto.code_review.model` | string | `code_review_verdict` | The model the seat ran on, as given when it has the name shape: 1 to 128 characters from `A-Z a-z 0-9 . _ : / @ -`, not starting with `/` or `~` (`^[A-Za-z0-9._:/@-]{1,128}$`). Any other model, such as an id with a `[1m]` suffix, is recorded as `other`, as an undeclared seat is, and the round is kept, so a model in an event koto wrote is never a digest. A missing or empty model still refuses the call. |
 | `koto.code_review.verdict` | string | `code_review_verdict` | `pass` or `fail`. |
 
 ```json
