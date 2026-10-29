@@ -891,6 +891,18 @@ pub fn code_round_recorded(
     vocabulary: &ReviewVocabulary,
 ) -> Result<CodeReviewRoundRecorded, Refusal> {
     let (round, head) = code_round_flags(round, head)?;
+    code_round_seats(state, round, head, text, vocabulary)
+}
+
+/// [`code_round_recorded`] from flags [`code_round_flags`] already checked:
+/// `round` and `head`, the head's digest, as it returned them.
+fn code_round_seats(
+    state: &str,
+    round: u64,
+    head: String,
+    text: &str,
+    vocabulary: &ReviewVocabulary,
+) -> Result<CodeReviewRoundRecorded, Refusal> {
     let entries = batch_entries(text)?;
     let mut out = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
@@ -1156,9 +1168,10 @@ fn handle_record(backend: &dyn SessionBackend, name: String, event: ReviewEvent)
         }
         ReviewEvent::CodeRound { round, head, file } => {
             // The flags are checked before the file is read.
-            code_round_flags(&round, &head).unwrap_or_else(|r| refuse(r));
+            let flags = code_round_flags(&round, &head);
+            let (round, head) = flags.unwrap_or_else(|r| refuse(r));
             let text = read_batch_file(&file).unwrap_or_else(|r| refuse(r));
-            let event = code_round_recorded(state, &round, &head, &text, vocabulary)
+            let event = code_round_seats(state, round, head, &text, vocabulary)
                 .unwrap_or_else(|r| refuse(r));
             non_empty(EventPayload::CodeReviewRoundRecorded(event))
         }
